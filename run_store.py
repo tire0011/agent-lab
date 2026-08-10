@@ -68,9 +68,20 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS problems (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            title TEXT NOT NULL,
+            details TEXT NOT NULL,
+            source TEXT NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0 CHECK (resolved IN (0, 1))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_tool_calls_run_id ON tool_calls(run_id);
         CREATE INDEX IF NOT EXISTS idx_model_prices_lookup ON model_prices(provider, model, valid_from);
+        CREATE INDEX IF NOT EXISTS idx_problems_resolved_timestamp ON problems(resolved, timestamp);
         """
     )
     conn.commit()
@@ -221,3 +232,55 @@ def insert_tool_calls(
         rows,
     )
     conn.commit()
+
+
+def insert_problem(
+    conn: sqlite3.Connection,
+    *,
+    timestamp: str,
+    severity: str,
+    title: str,
+    details: str,
+    source: str,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO problems (timestamp, severity, title, details, source)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (timestamp, severity, title, details, source),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def list_problems(
+    conn: sqlite3.Connection,
+    *,
+    unresolved_only: bool = True,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    where = "WHERE resolved = 0" if unresolved_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT id, timestamp, severity, title, details, source, resolved
+        FROM problems
+        {where}
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    return [
+        {
+            "id": int(row[0]),
+            "timestamp": row[1],
+            "severity": row[2],
+            "title": row[3],
+            "details": row[4],
+            "source": row[5],
+            "resolved": bool(row[6]),
+        }
+        for row in rows
+    ]
