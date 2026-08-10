@@ -17,6 +17,7 @@ if [[ -d "$node_home/bin" ]]; then
     export PATH="$node_home/bin:$PATH"
 fi
 
+export AZURE_OPENAI_ENDPOINT="https://openai-tire0011.openai.azure.com/"
 export AGENT_FS_ROOT="/agent"
 
 case "${AZURE_OPENAI_AUTH:-azure_cli}" in
