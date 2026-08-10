@@ -1,19 +1,13 @@
-import os
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI
 
-app = FastAPI()
+from web_api import router
 
-API_KEY = os.environ["AGENT_API_KEY"]
+app = FastAPI(title="agent-lab API", version="0.1")
 
-def authorize(x_api_key: str | None):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.get("/secure-health")
-def secure_health(x_api_key: str | None = Header(default=None)):
-    authorize(x_api_key)
-    return {"status": "ok", "auth": "ok"}
+
+app.include_router(router)
