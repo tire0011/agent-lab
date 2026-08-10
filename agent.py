@@ -11,6 +11,13 @@ from typing import Any
 from uuid import uuid4
 
 from cost_monitor import AzureCostMonitor
+from run_store import (
+    calculate_estimated_cost,
+    get_applicable_price,
+    init_db,
+    insert_run,
+    insert_tool_calls,
+)
 
 from agents import (
     Agent,
@@ -209,6 +216,25 @@ def print_cost_summary(cost: dict[str, Any]) -> None:
         print("Actual Azure cost: unavailable; see run artifact")
 
 
+def print_run_summary(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    estimated_cost: float | None,
+    estimated_cost_currency: str | None,
+    runtime_ms: int,
+    run_id: int,
+) -> None:
+    print(f"Tokens: {prompt_tokens} input / {completion_tokens} output")
+    if estimated_cost is None:
+        print("Estimated cost: pricing unavailable")
+    else:
+        currency = estimated_cost_currency or "USD"
+        print(f"Estimated cost: {currency} {estimated_cost:.6f}")
+    print(f"Runtime: {runtime_ms} ms")
+    print(f"Run ID: {run_id}")
+
+
 def main() -> int:
     args = parse_args()
     task = " ".join(args.task).strip()
@@ -217,6 +243,9 @@ def main() -> int:
         return 2
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    provider = "azure_openai"
+    model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    db = init_db()
     cost_monitor = AzureCostMonitor()
     cost_before = cost_monitor.capture()
     started = time.perf_counter()
@@ -227,10 +256,28 @@ def main() -> int:
             prompt_tokens,
             completion_tokens,
             total_tokens,
-            model_name,
+            _,
             tool_trace,
         ) = asyncio.run(run_agent(task))
         runtime_seconds = round(time.perf_counter() - started, 3)
+        runtime_ms = int(round(runtime_seconds * 1000))
+
+        price = get_applicable_price(db, provider, model_name, timestamp)
+        estimated_cost: float | None = None
+        estimated_cost_currency: str | None = None
+        if price is not None:
+            estimated_cost = calculate_estimated_cost(
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                input_price_per_million_tokens=price[
+                    "input_price_per_million_tokens"
+                ],
+                output_price_per_million_tokens=price[
+                    "output_price_per_million_tokens"
+                ],
+            )
+            estimated_cost_currency = str(price["currency"])
+
         cost_after = cost_monitor.capture()
         azure_cost = cost_monitor.summarize(cost_before, cost_after)
 
@@ -248,16 +295,43 @@ def main() -> int:
         }
         log_run(entry)
 
+        run_id = insert_run(
+            db,
+            timestamp=timestamp,
+            provider=provider,
+            model=model_name,
+            input_description=task,
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            runtime_ms=runtime_ms,
+            estimated_cost=estimated_cost,
+            actual_cost=None,
+            cost_status="estimated",
+            success=True,
+            error=None,
+        )
+        insert_tool_calls(db, run_id, timestamp, tool_trace)
+
         print(response_text)
         print_cost_summary(azure_cost)
+        print_run_summary(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            estimated_cost=estimated_cost,
+            estimated_cost_currency=estimated_cost_currency,
+            runtime_ms=runtime_ms,
+            run_id=run_id,
+        )
         return 0
     except Exception as exc:
         runtime_seconds = round(time.perf_counter() - started, 3)
+        runtime_ms = int(round(runtime_seconds * 1000))
         cost_after = cost_monitor.capture()
         azure_cost = cost_monitor.summarize(cost_before, cost_after)
         error_entry = {
             "timestamp": timestamp,
-            "model": os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+            "model": model_name,
             "task": task,
             "response": f"ERROR: {exc}",
             "prompt_tokens": 0,
@@ -268,7 +342,33 @@ def main() -> int:
             "azure_cost": azure_cost,
         }
         log_run(error_entry)
+
+        run_id = insert_run(
+            db,
+            timestamp=timestamp,
+            provider=provider,
+            model=model_name,
+            input_description=task,
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            runtime_ms=runtime_ms,
+            estimated_cost=None,
+            actual_cost=None,
+            cost_status="estimated",
+            success=False,
+            error=str(exc),
+        )
+
         print_cost_summary(azure_cost)
+        print_run_summary(
+            prompt_tokens=0,
+            completion_tokens=0,
+            estimated_cost=None,
+            estimated_cost_currency=None,
+            runtime_ms=runtime_ms,
+            run_id=run_id,
+        )
         print(str(exc), file=sys.stderr)
         return 1
 

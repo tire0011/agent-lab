@@ -44,6 +44,12 @@ Decision log for architecture and operating choices.
 - Why: The MCP filesystem server is intentionally limited to `/agent`; storing secrets in `/etc/agent-lab/agent.env` prevents tool-mediated exposure of runtime credentials/config.
 - Evidence: `run-agent.sh` sources `/etc/agent-lab/agent.env` and keeps `AGENT_FS_ROOT` constrained to `/agent`.
 
+### D-011: V2 run persistence uses SQLite with table-driven estimated pricing
+
+- Status: Accepted
+- Why: Queryable structured run history is required for controlled experiments; table-driven pricing enables historical model-rate changes without hard-coding prices in calculation logic.
+- Scope: SQLite at `/agent/state/agent.db` with `runs`, `model_prices`, `tool_calls`, and `knowledge`; estimated cost is recorded per run, while actual Azure reconciliation is deferred to V2.1.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

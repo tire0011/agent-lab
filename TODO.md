@@ -3,7 +3,7 @@
 ## Priority roadmap
 
 1. [ ] Finish and test MCP-based V1.
-2. [ ] Establish persistent structured logging/database (SQLite first).
+2. [x] Establish persistent structured logging/database (SQLite first).
 3. [ ] Benchmark V0 vs V1 with reproducible tasks and metrics.
 4. [ ] Add model/provider abstraction.
 5. [ ] Evaluate cheaper Azure models and additional providers.
@@ -20,9 +20,13 @@
 
 ### 2) Persistent structured storage
 
-- [ ] Define SQLite schema for runs, tool calls, evaluations, and experiment metadata.
-- [ ] Add migration/bootstrap logic.
-- [ ] Keep JSON run artifacts initially for audit/debug parity.
+- [x] Define SQLite schema for runs, tool calls, model prices, and simple knowledge entries.
+- [x] Add bootstrap logic for `/agent/state/agent.db`.
+- [x] Keep JSON run artifacts initially for audit/debug parity.
+
+## Next milestone
+
+- [ ] **V2.1: Azure actual-cost reconciliation**
 
 ### 3) Benchmarking
 
