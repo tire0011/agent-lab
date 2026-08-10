@@ -1,4 +1,6 @@
 .env
+.venv/
+.venv-agent/
 __pycache__/
 *.py[cod]
 state/runs/*.json
