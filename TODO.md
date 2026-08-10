@@ -27,6 +27,14 @@
 - [ ] Load only relevant memory into LLM context instead of continuously growing one large prompt.
 - [ ] Reuse the existing SQLite store for structured memories and experiment history before adding embeddings/RAG.
 
+### Communication interface
+
+- [ ] Use the Web API as the primary, provider-independent communication interface for humans, UIs, tools, and later other agents.
+- [ ] Define a simple message endpoint (for example `POST /messages`) plus status/experiment endpoints without coupling the agent core to a specific client.
+- [ ] Build a small mobile-friendly Web UI for chat, agent status, current goal, experiments, costs, and approvals.
+- [ ] Keep communication adapters separate so messenger integrations such as WhatsApp can be added later without changing the agent core.
+- [ ] Explore using the same communication contract later for agent-to-agent communication.
+
 ### First self-improvement loop
 
 - [ ] Agent reviews previous runs and identifies one measurable weakness.
