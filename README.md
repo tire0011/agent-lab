@@ -7,9 +7,13 @@ Experimental project for distributed self-improving LLM agents under strict budg
 - V0 (`agent.py`) works locally and on Azure VM.
 - V0 supports Azure OpenAI calls and logs run artifacts under `state/runs/`.
 - V1 (MCP-based) is in progress.
-- API service (`api.py`) provides:
+- API service (`api.py` + `web_api.py`) provides:
 	- public `GET /health`
 	- authenticated `GET /secure-health`
+	- authenticated `GET /status`
+	- authenticated `POST /messages` for human/tool -> agent communication
+	- authenticated `POST /problems` for agent/tool -> human/system problem reporting
+	- authenticated `GET /problems` for reading persisted problem reports
 
 ## Project priorities
 
@@ -33,6 +37,7 @@ Environment variables:
 - Required:
 	- `AZURE_OPENAI_ENDPOINT` (example: `https://<resource>.openai.azure.com`)
 	- `AZURE_OPENAI_API_KEY`
+	- `AGENT_API_KEY` for authenticated API endpoints
 - Optional:
 	- `AZURE_OPENAI_DEPLOYMENT` (default: `gpt-4o`)
 	- `AGENT_FS_ROOT` (default: `/agent`)
