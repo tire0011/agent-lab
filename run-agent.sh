@@ -4,6 +4,13 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$project_dir"
 
+legacy_env_file="$project_dir/.env"
+if [[ -e "$legacy_env_file" ]]; then
+    echo "Refusing to start: $legacy_env_file is visible to the MCP filesystem." >&2
+    echo "Move runtime secrets to /etc/agent-lab/agent.env and remove the repo copy." >&2
+    exit 2
+fi
+
 agent_env_file="/etc/agent-lab/agent.env"
 if [[ -f "$agent_env_file" ]]; then
     set -a
