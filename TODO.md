@@ -10,6 +10,53 @@
 6. [ ] Add evaluation gate before self-modification.
 7. [ ] Begin controlled self-improvement experiments.
 
+## Current direction — 2026-08-10
+
+### Immediate next steps
+
+- [ ] Resolve current `agent-api`/Uvicorn startup issue and confirm the VM baseline is healthy.
+- [ ] Run one reproducible end-to-end baseline task and persist quality, tokens, runtime, estimated cost, and resource usage.
+- [ ] Increase the main VM RAM enough to run coding/LLM CLI tools directly on Linux; target a low-cost 2 vCPU / 4 GB class first.
+- [ ] Install and evaluate one coding/LLM CLI directly on the VM so Windows is not required for the normal development loop.
+- [ ] Keep the VM as the primary persistent home of the agent, repository, memory, orchestration, tests, and CLI tooling.
+
+### Memory and self model
+
+- [ ] Add a persistent self model (`SELF.json` or SQLite-backed equivalent) containing version, capabilities, known weaknesses, resources, goals, and current constraints.
+- [ ] Separate memory into current task context, project memory, experience/experiment memory, and self model.
+- [ ] Load only relevant memory into LLM context instead of continuously growing one large prompt.
+- [ ] Reuse the existing SQLite store for structured memories and experiment history before adding embeddings/RAG.
+
+### First self-improvement loop
+
+- [ ] Agent reviews previous runs and identifies one measurable weakness.
+- [ ] Agent proposes one bounded improvement before being allowed to modify itself automatically.
+- [ ] Evaluate candidate against a fixed baseline.
+- [ ] Accept only improvements that pass quality/cost/runtime gates; otherwise rollback.
+- [ ] Persist experiment hypothesis, change, metrics, result, decision, and cost.
+
+### Test isolation / second VM
+
+- [ ] Investigate a second Azure VM as an ephemeral test worker.
+- [ ] Compare cost of local tests on the main VM vs starting a disposable test VM only for risky changes.
+- [ ] Preferred flow: create/start test VM -> fresh checkout -> tests/benchmarks -> return result -> deallocate/delete.
+- [ ] Main agent should eventually choose test isolation level based on risk and expected cost.
+- [ ] Do not keep a second VM running 24/7 unless measurements justify it.
+
+### Coding CLI as an agent tool
+
+- [ ] Treat coding CLIs as replaceable tools rather than building all coding-agent capabilities ourselves.
+- [ ] Let the orchestrator request a code change from a CLI, capture diff/test results, then independently evaluate the result.
+- [ ] Later compare multiple coding CLIs/models by task quality, cost, tokens, and runtime and route tasks accordingly.
+
+### Autonomy stages
+
+- [ ] Level 0: human assigns every task.
+- [ ] Level 1: agent proposes its own next experiment.
+- [ ] Level 2: agent executes cheap, reversible, bounded experiments automatically.
+- [ ] Level 3: continuous improvement loop with automatic evaluation and rollback.
+- [ ] Level 4: architecture/model/resource changes within explicit budgets and safety limits.
+
 ## Task details
 
 ### 1) V1 MCP completion
@@ -64,4 +111,6 @@
 - Which evaluation strategy is robust enough for automated gating.
 - Which low-cost model mix offers acceptable quality.
 - How much autonomy is safe on current infrastructure limits.
-
+- Which VM size gives the best cost/performance for coding CLI workloads.
+- Whether an ephemeral second VM is cheaper and safer than testing on the main VM.
+- Which memory retrieval strategy remains simple enough while still scaling with accumulated experience.
