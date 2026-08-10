@@ -3,21 +3,21 @@ param(
     [string]$Prompt
 )
 
-$endpoint = az cognitiveservices account show `
-    --name openAI-tire0011 `
-    --resource-group DefaultResourceGroup-DEWC `
-    --query properties.endpoint -o tsv
+$endpoint = "https://openai-tire0011.openai.azure.com"
 
-$key = az cognitiveservices account keys list `
-    --name openAI-tire0011 `
-    --resource-group DefaultResourceGroup-DEWC `
-    --query key1 -o tsv
+$accessToken = az account get-access-token `
+    --resource https://cognitiveservices.azure.com `
+    --query accessToken `
+    --output tsv
 
-$headers = @{
-    "api-key"      = $key
-    "Content-Type" = "application/json"
+if (-not $accessToken) {
+    throw "Could not obtain Azure access token."
 }
 
+$headers = @{
+    "Authorization" = "Bearer $accessToken"
+    "Content-Type"  = "application/json"
+}
 $body = @{
     model = "gpt-4o"
     messages = @(
