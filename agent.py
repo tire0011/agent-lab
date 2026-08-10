@@ -1,13 +1,26 @@
 import argparse
+import asyncio
 import json
 import os
+import shlex
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
+
+from agents import (
+    Agent,
+    Runner,
+    set_default_openai_api,
+    set_default_openai_client,
+    set_tracing_disabled,
+)
+from agents.items import ToolCallItem, ToolCallOutputItem
+from agents.mcp import MCPServerStdio, create_static_tool_filter
+from agents.model_settings import ModelSettings
+from openai import AsyncOpenAI
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,55 +36,143 @@ def get_required_env(name: str) -> str:
     return value
 
 
-def extract_text(message_content: object) -> str:
-    if isinstance(message_content, str):
-        return message_content
-
-    if isinstance(message_content, list):
-        parts: list[str] = []
-        for item in message_content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
-
-    return ""
+def to_jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, dict):
+        return {str(k): to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_jsonable(v) for v in value]
+    if isinstance(value, tuple):
+        return [to_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
-def call_azure_openai(task: str) -> dict:
+def to_json_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(to_jsonable(value), ensure_ascii=False)
+
+
+def build_openai_client() -> AsyncOpenAI:
     endpoint = get_required_env("AZURE_OPENAI_ENDPOINT").rstrip("/")
     api_key = get_required_env("AZURE_OPENAI_API_KEY")
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-
-    url = (
-        f"{endpoint}/openai/deployments/{deployment}/chat/completions"
-        f"?api-version={api_version}"
-    )
-    payload = {
-        "messages": [{"role": "user", "content": task}],
-        "temperature": 0,
-    }
-
-    req = urllib.request.Request(
-        url=url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "api-key": api_key,
-        },
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url=f"{endpoint}/openai/v1/",
     )
 
-    try:
-        with urllib.request.urlopen(req) as res:
-            return json.loads(res.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Azure OpenAI request failed ({err.code}): {body}") from err
-    except urllib.error.URLError as err:
-        raise RuntimeError(f"Azure OpenAI connection failed: {err.reason}") from err
+
+def build_filesystem_server() -> MCPServerStdio:
+    allowed_root = os.getenv("AGENT_FS_ROOT", "/agent")
+    command = os.getenv("MCP_FILESYSTEM_SERVER_COMMAND", "npx")
+    args_env = os.getenv("MCP_FILESYSTEM_SERVER_ARGS")
+    if args_env:
+        args = shlex.split(args_env)
+    else:
+        args = ["-y", "@modelcontextprotocol/server-filesystem", allowed_root]
+
+    return MCPServerStdio(
+        name="filesystem",
+        params={"command": command, "args": args},
+        cache_tools_list=True,
+        tool_filter=create_static_tool_filter(
+            allowed_tool_names=["list_directory", "read_file"]
+        ),
+    )
+
+
+def extract_usage_totals(result: Any) -> tuple[int, int, int]:
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+
+    for response in getattr(result, "raw_responses", []):
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            continue
+        prompt_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+        completion_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+        total_tokens += int(getattr(usage, "total_tokens", 0) or 0)
+
+    return prompt_tokens, completion_tokens, total_tokens
+
+
+def extract_tool_trace(result: Any) -> list[dict[str, Any]]:
+    trace: list[dict[str, Any]] = []
+    by_call_id: dict[str, dict[str, Any]] = {}
+
+    for item in getattr(result, "new_items", []):
+        if isinstance(item, ToolCallItem):
+            raw_item = getattr(item, "raw_item", None)
+            call_id = item.call_id or f"call-{len(trace) + 1}"
+            arguments = getattr(raw_item, "arguments", None)
+            entry = {
+                "tool_call_id": call_id,
+                "tool_name": item.tool_name or getattr(raw_item, "name", "unknown"),
+                "arguments": to_json_string(arguments if arguments is not None else {}),
+            }
+            trace.append(entry)
+            by_call_id[call_id] = entry
+            continue
+
+        if isinstance(item, ToolCallOutputItem):
+            call_id = item.call_id or ""
+            output_text = to_json_string(getattr(item, "output", None))
+
+            if call_id and call_id in by_call_id:
+                by_call_id[call_id]["result"] = output_text
+            else:
+                trace.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": "unknown",
+                        "arguments": "{}",
+                        "result": output_text,
+                    }
+                )
+
+    return trace
+
+
+async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, Any]]]:
+    model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+
+    set_tracing_disabled(True)
+    set_default_openai_client(build_openai_client(), use_for_tracing=False)
+    set_default_openai_api("chat_completions")
+
+    async with build_filesystem_server() as fs_server:
+        agent = Agent(
+            name="Filesystem Reader",
+            model=model_name,
+            instructions=(
+                "You are a minimal read-only coding agent. "
+                "Use MCP tools only when needed to answer the task. "
+                "Available tools are list_directory and read_file only. "
+                "All paths must stay under /agent. "
+                "Never invent file contents; read files first when needed."
+            ),
+            mcp_servers=[fs_server],
+            model_settings=ModelSettings(temperature=0),
+        )
+
+        result = await Runner.run(agent, task, max_turns=8)
+
+    response_text = to_json_string(getattr(result, "final_output", ""))
+    prompt_tokens, completion_tokens, total_tokens = extract_usage_totals(result)
+    tool_trace = extract_tool_trace(result)
+
+    return (
+        response_text,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        model_name,
+        tool_trace,
+    )
 
 
 def log_run(entry: dict) -> None:
@@ -93,18 +194,16 @@ def main() -> int:
     timestamp = datetime.now(timezone.utc).isoformat()
 
     try:
-        result = call_azure_openai(task)
-        choice = (result.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        response_text = extract_text(message.get("content"))
-
-        usage = result.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        total_tokens = int(usage.get("total_tokens") or 0)
+        (
+            response_text,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            model_name,
+            tool_trace,
+        ) = asyncio.run(run_agent(task))
         runtime_seconds = round(time.perf_counter() - started, 3)
 
-        model_name = result.get("model") or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         entry = {
             "timestamp": timestamp,
             "model": model_name,
@@ -114,6 +213,7 @@ def main() -> int:
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
             "runtime_seconds": runtime_seconds,
+            "mcp_tool_calls": tool_trace,
         }
         log_run(entry)
 
@@ -130,6 +230,7 @@ def main() -> int:
             "completion_tokens": 0,
             "total_tokens": 0,
             "runtime_seconds": runtime_seconds,
+            "mcp_tool_calls": [],
         }
         log_run(error_entry)
         print(str(exc), file=sys.stderr)
