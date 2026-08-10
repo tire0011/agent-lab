@@ -4,10 +4,11 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$project_dir"
 
-if [[ -f .env ]]; then
+agent_env_file="/etc/agent-lab/agent.env"
+if [[ -f "$agent_env_file" ]]; then
     set -a
-    # shellcheck disable=SC1091
-    source .env
+    # shellcheck disable=SC1090
+    source "$agent_env_file"
     set +a
 fi
 
@@ -16,7 +17,7 @@ if [[ -d "$node_home/bin" ]]; then
     export PATH="$node_home/bin:$PATH"
 fi
 
-export AGENT_FS_ROOT="${AGENT_FS_ROOT:-$project_dir}"
+export AGENT_FS_ROOT="/agent"
 
 case "${AZURE_OPENAI_AUTH:-azure_cli}" in
     azure_cli)

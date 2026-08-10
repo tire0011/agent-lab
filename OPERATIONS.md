@@ -48,6 +48,8 @@ For API auth in `api.py`:
 ## Security operations
 
 - Never commit secrets.
+- Runtime secrets/config for `run-agent.sh` must be stored in `/etc/agent-lab/agent.env` (outside `/agent`).
+- Set ownership/permissions so only `agent` and root can read it (owner `agent`, mode `600`).
 - Keep `.env` local and excluded from VCS.
 - Rotate keys immediately if accidental exposure is suspected.
 - Apply least privilege for VM managed identity and Azure roles.

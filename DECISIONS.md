@@ -38,6 +38,12 @@ Decision log for architecture and operating choices.
 - Status: Accepted
 - Why: Prevent credential leakage and reduce operational risk.
 
+### D-010: Store runtime secrets outside `/agent`
+
+- Status: Accepted
+- Why: The MCP filesystem server is intentionally limited to `/agent`; storing secrets in `/etc/agent-lab/agent.env` prevents tool-mediated exposure of runtime credentials/config.
+- Evidence: `run-agent.sh` sources `/etc/agent-lab/agent.env` and keeps `AGENT_FS_ROOT` constrained to `/agent`.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns
