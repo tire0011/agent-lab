@@ -1,23 +1,10 @@
 import argparse
 import asyncio
-import json
 import os
-import shlex
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
-from uuid import uuid4
-
-from cost_monitor import AzureCostMonitor
-from run_store import (
-    calculate_estimated_cost,
-    get_applicable_price,
-    init_db,
-    insert_run,
-    insert_tool_calls,
-)
 
 from agents import (
     Agent,
@@ -26,124 +13,27 @@ from agents import (
     set_default_openai_client,
     set_tracing_disabled,
 )
-from agents.items import ToolCallItem, ToolCallOutputItem
-from agents.mcp import MCPServerStdio, create_static_tool_filter
 from agents.model_settings import ModelSettings
-from openai import AsyncOpenAI
+
+from modules.agent_clients import build_filesystem_server, build_openai_client
+from modules.agent_result import extract_tool_trace, extract_usage_totals
+from modules.cli_output import print_cost_summary, print_run_summary
+from modules.cost_monitor import AzureCostMonitor
+from modules.run_log import log_run
+from modules.run_store import (
+    calculate_estimated_cost,
+    get_applicable_price,
+    init_db,
+    insert_run,
+    insert_tool_calls,
+)
+from modules.serialization import to_json_string
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Azure OpenAI task runner")
     parser.add_argument("task", nargs="+", help="Task prompt to send")
     return parser.parse_args()
-
-
-def get_required_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
-def to_jsonable(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if isinstance(value, dict):
-        return {str(k): to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [to_jsonable(v) for v in value]
-    if isinstance(value, tuple):
-        return [to_jsonable(v) for v in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-def to_json_string(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(to_jsonable(value), ensure_ascii=False)
-
-
-def build_openai_client() -> AsyncOpenAI:
-    endpoint = get_required_env("AZURE_OPENAI_ENDPOINT").rstrip("/")
-    api_key = get_required_env("AZURE_OPENAI_API_KEY")
-    return AsyncOpenAI(
-        api_key=api_key,
-        base_url=f"{endpoint}/openai/v1/",
-    )
-
-
-def build_filesystem_server() -> MCPServerStdio:
-    allowed_root = os.getenv("AGENT_FS_ROOT", "/agent")
-    command = os.getenv("MCP_FILESYSTEM_SERVER_COMMAND", "npx")
-    args_env = os.getenv("MCP_FILESYSTEM_SERVER_ARGS")
-    if args_env:
-        args = shlex.split(args_env)
-    else:
-        args = ["-y", "@modelcontextprotocol/server-filesystem", allowed_root]
-
-    return MCPServerStdio(
-        name="filesystem",
-        params={"command": command, "args": args},
-        cache_tools_list=True,
-        tool_filter=create_static_tool_filter(
-            allowed_tool_names=["list_directory", "read_file"]
-        ),
-    )
-
-
-def extract_usage_totals(result: Any) -> tuple[int, int, int]:
-    prompt_tokens = 0
-    completion_tokens = 0
-    total_tokens = 0
-
-    for response in getattr(result, "raw_responses", []):
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            continue
-        prompt_tokens += int(getattr(usage, "input_tokens", 0) or 0)
-        completion_tokens += int(getattr(usage, "output_tokens", 0) or 0)
-        total_tokens += int(getattr(usage, "total_tokens", 0) or 0)
-
-    return prompt_tokens, completion_tokens, total_tokens
-
-
-def extract_tool_trace(result: Any) -> list[dict[str, Any]]:
-    trace: list[dict[str, Any]] = []
-    by_call_id: dict[str, dict[str, Any]] = {}
-
-    for item in getattr(result, "new_items", []):
-        if isinstance(item, ToolCallItem):
-            raw_item = getattr(item, "raw_item", None)
-            call_id = item.call_id or f"call-{len(trace) + 1}"
-            arguments = getattr(raw_item, "arguments", None)
-            entry = {
-                "tool_call_id": call_id,
-                "tool_name": item.tool_name or getattr(raw_item, "name", "unknown"),
-                "arguments": to_json_string(arguments if arguments is not None else {}),
-            }
-            trace.append(entry)
-            by_call_id[call_id] = entry
-            continue
-
-        if isinstance(item, ToolCallOutputItem):
-            call_id = item.call_id or ""
-            output_text = to_json_string(getattr(item, "output", None))
-
-            if call_id and call_id in by_call_id:
-                by_call_id[call_id]["result"] = output_text
-            else:
-                trace.append(
-                    {
-                        "tool_call_id": call_id,
-                        "tool_name": "unknown",
-                        "arguments": "{}",
-                        "result": output_text,
-                    }
-                )
-
-    return trace
 
 
 async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, Any]]]:
@@ -182,57 +72,6 @@ async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, 
         model_name,
         tool_trace,
     )
-
-
-def log_run(entry: dict) -> None:
-    runs_dir = Path("state/runs")
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{entry['timestamp'].replace(':', '-').replace('.', '-')}_{uuid4().hex}.json"
-    filepath = runs_dir / filename
-    filepath.write_text(json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def print_cost_summary(cost: dict[str, Any]) -> None:
-    before = cost["before"]
-    after = cost["after"]
-    if before.get("status") == "ok":
-        print(
-            f"Azure cost before run: {before['amount']} {before['currency']} "
-            f"({before['period']})"
-        )
-    if after.get("status") == "ok":
-        print(
-            f"Azure cost after run: {after['amount']} {after['currency']} "
-            f"({after['period']})"
-        )
-    if cost["status"] == "updated":
-        print(
-            f"Actual Azure cost delta: {cost['actual_cost_delta']} "
-            f"{cost['currency']}"
-        )
-    elif cost["status"] == "pending":
-        print("Actual Azure run cost: pending Azure Cost Management refresh")
-    elif cost["status"] != "disabled":
-        print("Actual Azure cost: unavailable; see run artifact")
-
-
-def print_run_summary(
-    *,
-    prompt_tokens: int,
-    completion_tokens: int,
-    estimated_cost: float | None,
-    estimated_cost_currency: str | None,
-    runtime_ms: int,
-    run_id: int,
-) -> None:
-    print(f"Tokens: {prompt_tokens} input / {completion_tokens} output")
-    if estimated_cost is None:
-        print("Estimated cost: pricing unavailable")
-    else:
-        currency = estimated_cost_currency or "USD"
-        print(f"Estimated cost: {currency} {estimated_cost:.6f}")
-    print(f"Runtime: {runtime_ms} ms")
-    print(f"Run ID: {run_id}")
 
 
 def main() -> int:

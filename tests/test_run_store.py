@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run_store import (
+from modules.run_store import (
     calculate_estimated_cost,
     get_applicable_price,
     init_db,

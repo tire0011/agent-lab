@@ -4,7 +4,16 @@
 
 ### 1) Agent runtime
 
-- File: `agent.py`
+- File: `agent.py` (thin CLI orchestration only)
+- Supporting modules under `modules/`:
+  - `modules/agent_clients.py` — Azure OpenAI client + MCP filesystem server construction
+  - `modules/agent_result.py` — usage/tool-trace extraction from agent run results
+  - `modules/serialization.py` — JSON-safe serialization helpers
+  - `modules/env.py` — required environment variable lookup
+  - `modules/run_log.py` — writes JSON run artifacts to `state/runs/`
+  - `modules/cli_output.py` — CLI print helpers for cost/run summaries
+  - `modules/cost_monitor.py` — `AzureCostMonitor`/`AzureCostSnapshot` (Azure Cost Management)
+  - `modules/run_store.py` — SQLite-backed run/tool-call/price persistence
 - Execution model: CLI task runner
 - Model backend: Azure OpenAI via OpenAI SDK client configured with Azure base URL
 - Agent framework: OpenAI Agents SDK (`Agent`, `Runner`)
@@ -21,14 +30,20 @@
 
 ### 3) API surface
 
-- File: `api.py`
+- File: `api.py`, models in `models.py`, read-only data adapters in `data_sources.py`, rule-based chat in `chat.py`
 - Framework: FastAPI
 - Endpoints:
   - `GET /health` (public)
   - `GET /secure-health` (requires `x-api-key` matching `AGENT_API_KEY`)
+  - `GET /status`, `GET /problems`, `GET /todos`, `POST /chat` (read-only; consistent data via `data_sources.py`)
 - Deployment context: FastAPI behind nginx on VM with HTTPS
 
-### 4) Infrastructure
+### 4) Client
+
+- Files: `Client/client.py` (CLI), `Client/Invoke-Client.ps1` (PowerShell wrapper)
+- Subcommands: `health`, `status`, `problems`, `todos`, `chat`
+
+### 5) Infrastructure
 
 - Single low-cost VM (`Standard_B1s`) in `germanywestcentral`
 - Azure OpenAI deployment: `gpt-4o` (GlobalStandard)

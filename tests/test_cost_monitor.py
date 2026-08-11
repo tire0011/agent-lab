@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import Mock
 
-from agent import AzureCostMonitor
+from modules.cost_monitor import AzureCostMonitor
 
 
 class AzureCostMonitorTests(unittest.TestCase):
