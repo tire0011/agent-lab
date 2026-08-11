@@ -12,6 +12,10 @@ Experimental project for distributed self-improving LLM agents under strict budg
 	- authenticated `GET /secure-health`
 	- `GET /status`, `GET /problems`, `GET /todos`, `POST /chat` (read-only over
 	  existing data; see `data_sources.py` and `chat.py`)
+	- authenticated Codex task endpoints (`POST /codex/tasks`,
+	  `GET /codex/tasks`, `GET /codex/tasks/{id}`,
+	  `POST /codex/tasks/{id}/run`) — synchronous, `read-only` sandbox,
+	  `working_dir` fixed to `/agent`; see "Codex task API" below
 
 ## Project priorities
 
@@ -59,6 +63,47 @@ CLI runner):
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
 - Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests`
+
+## Codex task API
+
+Small, authenticated FastAPI wrapper around `modules.codex_task_service.CodexTaskService`,
+which itself reuses `modules.codex_worker.CodexWorker` (`codex exec`, never
+`shell=True`). Currently synchronous only, no chat/Web UI integration, no
+background queue, no parallel execution.
+
+Server-enforced boundaries (not client-selectable):
+
+- `working_dir` is always `/agent`.
+- `sandbox` is always `read-only`.
+- `timeout_seconds` defaults to 120s and cannot exceed 120s.
+
+All four endpoints require the same `x-api-key` header as `/secure-health`.
+
+- `POST /codex/tasks` — create a task (`{"prompt": "..."}`), returns it `queued` (`201`).
+- `GET /codex/tasks?limit=20` — list the most recent tasks (newest first, summary shape).
+- `GET /codex/tasks/{id}` — fetch one task's full state (`404` if unknown).
+- `POST /codex/tasks/{id}/run` — run a `queued` task synchronously and return
+  its final persisted state (`409` if not `queued`, `404` if unknown). Worker
+  failures/timeouts are returned as a stored task status, not an HTTP 500.
+
+Example flow:
+
+```
+curl -X POST -H "x-api-key: $AGENT_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt": "Inspect README.md and summarize the project."}' \
+  http://127.0.0.1:8000/codex/tasks
+# -> {"id": "...", "status": "queued", ...}
+
+curl -X POST -H "x-api-key: $AGENT_API_KEY" \
+  http://127.0.0.1:8000/codex/tasks/<id>/run
+# -> {"id": "...", "status": "succeeded", "final_message": "...", ...}
+
+curl -H "x-api-key: $AGENT_API_KEY" http://127.0.0.1:8000/codex/tasks/<id>
+```
+
+Orphaned `running` tasks (left behind by a crash/restart) are marked `failed`
+exactly once at API startup via `mark_interrupted_tasks_failed()`; startup
+never restarts execution or starts a Codex process.
 
 ## Security
 

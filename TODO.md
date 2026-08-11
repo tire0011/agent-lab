@@ -27,20 +27,31 @@
 
 ### Immediate next milestone — Codex worker
 
-- [ ] Inspect the current agent/module boundaries and define the smallest `CodexWorker` interface.
-- [ ] Add a replaceable coding-tool adapter that invokes `codex exec` through an argument list, never through a shell command string.
-- [ ] Start with read-only jobs in an explicitly configured repository working directory.
-- [ ] Capture exit code, stdout, stderr, duration, Codex session/run identifier when available, and timeout state.
-- [ ] Add configurable timeout and output-size limits.
-- [ ] Reject missing, relative, or non-allowlisted working directories.
-- [ ] Do not accept arbitrary shell commands; the worker accepts a natural-language coding task only.
-- [ ] Persist a minimal audit record using the existing run/logging infrastructure.
-- [ ] Add unit tests with a fake process runner so tests do not consume Codex quota.
-- [ ] Run one real read-only smoke test: inspect `README.md` and summarize the project without modifying files.
-- [ ] Verify after the smoke test that the Git working tree is unchanged.
-- [ ] Measure runtime and record whether token/usage information is available.
-- [ ] Keep the worker internal initially; do not expose execution through the public chat/API yet.
-- [ ] After the internal worker is stable, design an authenticated task endpoint with approval, status, cancellation, and result retrieval.
+- [x] Inspect the current agent/module boundaries and define the smallest `CodexWorker` interface.
+- [x] Add a replaceable coding-tool adapter that invokes `codex exec` through an argument list, never through a shell command string.
+- [x] Start with read-only jobs in an explicitly configured repository working directory.
+- [x] Capture exit code, stdout, stderr, duration, Codex session/run identifier when available, and timeout state.
+- [x] Add configurable timeout and output-size limits.
+- [x] Reject missing, relative, or non-allowlisted working directories.
+- [x] Do not accept arbitrary shell commands; the worker accepts a natural-language coding task only.
+- [x] Persist a minimal audit record using the existing run/logging infrastructure.
+- [x] Add unit tests with a fake process runner so tests do not consume Codex quota.
+- [x] Run one real read-only smoke test: inspect `README.md` and summarize the project without modifying files.
+- [x] Verify after the smoke test that the Git working tree is unchanged.
+- [x] Measure runtime and record whether token/usage information is available.
+- [x] Keep the worker internal initially; do not expose execution through the public chat/API yet. (superseded below — now exposed via an authenticated task API)
+- [x] After the internal worker is stable, design an authenticated task endpoint with approval, status, cancellation, and result retrieval. (approval/cancellation intentionally deferred; see below)
+
+### Codex task API (implemented, small first step)
+
+- [x] Add authenticated `POST/GET /codex/tasks`, `GET /codex/tasks/{id}`, `POST /codex/tasks/{id}/run` in `api.py`, reusing `CodexTaskService`/`CodexWorker` with no duplicated worker logic.
+- [x] Enforce `working_dir=/agent`, `sandbox=read-only`, and a fixed max `timeout_seconds` (120s) server-side; client cannot override.
+- [x] Run `mark_interrupted_tasks_failed()` once at API startup via FastAPI lifespan.
+- [x] Add `codex create|list|get|run` subcommands to `Client/client.py`.
+- [x] Fix a thread-safety bug surfaced by wiring `CodexTaskService`'s SQLite connection into FastAPI's sync threadpool (`check_same_thread=False` + a lock).
+- [ ] Add approval workflow (currently: any `queued` task can be run immediately by an authenticated caller).
+- [ ] Add task cancellation (currently: a running task cannot be stopped once started).
+- [ ] Move execution off the request thread (currently strictly synchronous; a long Codex call blocks the HTTP response) once background execution is deliberately in scope.
 
 ### Baseline measurement
 
@@ -69,7 +80,7 @@
 - [x] Use the Web API as the primary, provider-independent communication interface for humans, UIs, tools, and later other agents.
 - [x] Provide structured status, problem, todo, and chat endpoints without coupling the agent core to a specific client.
 - [x] Build a small mobile-friendly Web UI for chat, agent status, problems, and todos.
-- [ ] Add authentication before exposing task execution, detailed operational data, or write operations.
+- [x] Add authentication before exposing task execution, detailed operational data, or write operations. (`x-api-key` now enforced on the new `/codex/tasks*` endpoints, same as `/secure-health`)
 - [ ] Add experiment, cost, and approval views after the corresponding backend contracts exist.
 - [ ] Keep communication adapters separate so messenger integrations such as WhatsApp can be added later without changing the agent core.
 - [ ] Explore using the same communication contract later for agent-to-agent communication.

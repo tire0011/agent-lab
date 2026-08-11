@@ -36,6 +36,15 @@
   - `GET /health` (public)
   - `GET /secure-health` (requires `x-api-key` matching `AGENT_API_KEY`)
   - `GET /status`, `GET /problems`, `GET /todos`, `POST /chat` (read-only; consistent data via `data_sources.py`)
+  - `POST /codex/tasks`, `GET /codex/tasks`, `GET /codex/tasks/{id}`,
+    `POST /codex/tasks/{id}/run` (all require `x-api-key`) — thin routes over
+    the existing `modules.codex_task_service.CodexTaskService`; no worker
+    logic duplicated in `api.py`. `working_dir` (`/agent`) and `sandbox`
+    (`read-only`) are fixed server-side; `timeout_seconds` is capped at
+    120s. Synchronous only — no queue, no parallel execution, no chat/Web UI
+    wiring yet. `mark_interrupted_tasks_failed()` runs once via FastAPI's
+    lifespan startup hook to mark orphaned `running` tasks as `failed`
+    without restarting them.
 - Deployment context: FastAPI behind nginx on VM with HTTPS
 
 ### 4) Client

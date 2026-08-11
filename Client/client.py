@@ -250,6 +250,103 @@ def cmd_todos(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_api_key(args: argparse.Namespace) -> str | None:
+    return args.api_key or os.getenv("AGENT_API_KEY")
+
+
+def _require_api_key(args: argparse.Namespace) -> str | None:
+    api_key = _resolve_api_key(args)
+    if not api_key:
+        print(
+            "Missing API key. Provide --api-key or set AGENT_API_KEY.",
+            file=sys.stderr,
+        )
+    return api_key
+
+
+def cmd_codex_create(args: argparse.Namespace) -> int:
+    api_key = _require_api_key(args)
+    if not api_key:
+        return 2
+
+    base_url = resolve_base_url(args.base_url)
+    body: dict[str, Any] = {"prompt": args.prompt}
+    if args.timeout is not None:
+        body["timeout_seconds"] = args.timeout
+
+    try:
+        status, payload = request_json(
+            "POST",
+            f"{base_url}/codex/tasks",
+            body=body,
+            headers={"x-api-key": api_key},
+        )
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"HTTP {status}")
+    print_json(payload)
+    return 0 if status == 201 else 1
+
+
+def cmd_codex_list(args: argparse.Namespace) -> int:
+    api_key = _require_api_key(args)
+    if not api_key:
+        return 2
+
+    base_url = resolve_base_url(args.base_url)
+    url = f"{base_url}/codex/tasks?limit={args.limit}"
+
+    try:
+        status, payload = request_json("GET", url, headers={"x-api-key": api_key})
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"HTTP {status}")
+    print_json(payload)
+    return 0 if status == 200 else 1
+
+
+def cmd_codex_get(args: argparse.Namespace) -> int:
+    api_key = _require_api_key(args)
+    if not api_key:
+        return 2
+
+    base_url = resolve_base_url(args.base_url)
+    url = f"{base_url}/codex/tasks/{args.task_id}"
+
+    try:
+        status, payload = request_json("GET", url, headers={"x-api-key": api_key})
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"HTTP {status}")
+    print_json(payload)
+    return 0 if status == 200 else 1
+
+
+def cmd_codex_run(args: argparse.Namespace) -> int:
+    api_key = _require_api_key(args)
+    if not api_key:
+        return 2
+
+    base_url = resolve_base_url(args.base_url)
+    url = f"{base_url}/codex/tasks/{args.task_id}/run"
+
+    try:
+        status, payload = request_json("POST", url, headers={"x-api-key": api_key})
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"HTTP {status}")
+    print_json(payload)
+    return 0 if status == 200 else 1
+
+
 def send_chat_message(base_url: str, chat_path: str, message: str) -> dict[str, Any] | list[Any] | str:
     operation = get_chat_operation(base_url, chat_path)
     payload = build_chat_body(operation, message)
@@ -347,6 +444,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Chat endpoint path (overrides AGENT_API_CHAT_PATH)",
     )
     chat_parser.set_defaults(func=cmd_chat)
+
+    codex_parser = subparsers.add_parser(
+        "codex", help="Manage Codex coding tasks (authenticated, synchronous, read-only)"
+    )
+    codex_subparsers = codex_parser.add_subparsers(dest="codex_command", required=True)
+
+    codex_create_parser = codex_subparsers.add_parser(
+        "create", help="Create a Codex task (POST /codex/tasks)"
+    )
+    codex_create_parser.add_argument("prompt", help="Natural-language coding task")
+    codex_create_parser.add_argument(
+        "--timeout", type=int, default=None,
+        help="Requested timeout in seconds (server enforces a fixed maximum)",
+    )
+    codex_create_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
+    codex_create_parser.set_defaults(func=cmd_codex_create)
+
+    codex_list_parser = codex_subparsers.add_parser(
+        "list", help="List recent Codex tasks (GET /codex/tasks)"
+    )
+    codex_list_parser.add_argument(
+        "--limit", type=int, default=20, help="Max number of tasks to list (default: 20)"
+    )
+    codex_list_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
+    codex_list_parser.set_defaults(func=cmd_codex_list)
+
+    codex_get_parser = codex_subparsers.add_parser(
+        "get", help="Fetch a Codex task by id (GET /codex/tasks/{id})"
+    )
+    codex_get_parser.add_argument("task_id", help="Codex task id")
+    codex_get_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
+    codex_get_parser.set_defaults(func=cmd_codex_get)
+
+    codex_run_parser = codex_subparsers.add_parser(
+        "run", help="Run a queued Codex task synchronously (POST /codex/tasks/{id}/run)"
+    )
+    codex_run_parser.add_argument("task_id", help="Codex task id")
+    codex_run_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
+    codex_run_parser.set_defaults(func=cmd_codex_run)
 
     return parser
 

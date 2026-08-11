@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -204,6 +205,13 @@ class CodexTaskService:
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
+        # A single sqlite3.Connection is kept for the service's lifetime, but
+        # FastAPI runs sync route handlers in a threadpool, so a given call
+        # may arrive on a different OS thread each time. sqlite3 connections
+        # are not safe for concurrent multi-thread access; this lock
+        # serializes access to ``self._conn`` (short-held, per DB statement
+        # group) without adding a queue or background execution.
+        self._lock = threading.Lock()
 
     def close(self) -> None:
         self._conn.close()
@@ -231,7 +239,7 @@ class CodexTaskService:
         created_at = _utcnow_iso()
         stored_prompt = _truncate_text(prompt, self.max_prompt_bytes) or ""
 
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO codex_tasks (
@@ -260,9 +268,10 @@ class CodexTaskService:
     # ------------------------------------------------------------------
 
     def get_task(self, task_id: str) -> CodexTask:
-        row = self._conn.execute(
-            "SELECT * FROM codex_tasks WHERE id = ?", (task_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM codex_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
         if row is None:
             raise TaskNotFoundError(f"no task with id {task_id!r}")
         return _row_to_task(row)
@@ -270,10 +279,11 @@ class CodexTaskService:
     def list_tasks(self, limit: int = 20) -> list[CodexTask]:
         if limit <= 0:
             return []
-        rows = self._conn.execute(
-            "SELECT * FROM codex_tasks ORDER BY created_at DESC, id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM codex_tasks ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [_row_to_task(row) for row in rows]
 
     # ------------------------------------------------------------------
@@ -295,7 +305,7 @@ class CodexTaskService:
         task = self.get_task(task_id)  # raises TaskNotFoundError if missing
 
         started_at = _utcnow_iso()
-        with self._conn:
+        with self._lock, self._conn:
             cursor = self._conn.execute(
                 "UPDATE codex_tasks SET status = ?, started_at = ? "
                 "WHERE id = ? AND status = ?",
@@ -361,7 +371,7 @@ class CodexTaskService:
         final_message_capped = _truncate_text(final_message, self.max_final_message_bytes)
         error_capped = _truncate_text(error, self.max_error_bytes)
 
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 """
                 UPDATE codex_tasks
@@ -397,32 +407,33 @@ class CodexTaskService:
 
         Returns the list of task ids that were marked.
         """
-        rows = self._conn.execute(
-            "SELECT id FROM codex_tasks WHERE status = ?", (STATUS_RUNNING,)
-        ).fetchall()
-        ids = [row["id"] for row in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM codex_tasks WHERE status = ?", (STATUS_RUNNING,)
+            ).fetchall()
+            ids = [row["id"] for row in rows]
 
-        ended_at = _utcnow_iso()
-        with self._conn:
-            self._conn.executemany(
-                """
-                UPDATE codex_tasks
-                SET status = ?, ended_at = ?, error = ?
-                WHERE id = ? AND status = ?
-                """,
-                [
-                    (
-                        STATUS_FAILED,
-                        ended_at,
-                        "interrupted: task was still 'running' at service "
-                        "startup (process restart or crash); no automatic "
-                        "recovery is implemented",
-                        task_id,
-                        STATUS_RUNNING,
-                    )
-                    for task_id in ids
-                ],
-            )
+            ended_at = _utcnow_iso()
+            with self._conn:
+                self._conn.executemany(
+                    """
+                    UPDATE codex_tasks
+                    SET status = ?, ended_at = ?, error = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    [
+                        (
+                            STATUS_FAILED,
+                            ended_at,
+                            "interrupted: task was still 'running' at service "
+                            "startup (process restart or crash); no automatic "
+                            "recovery is implemented",
+                            task_id,
+                            STATUS_RUNNING,
+                        )
+                        for task_id in ids
+                    ],
+                )
         return ids
 
 

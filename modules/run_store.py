@@ -8,7 +8,12 @@ DEFAULT_DB_PATH = "/agent/state/agent.db"
 def _connect(db_path: str) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # check_same_thread=False: callers that keep a long-lived connection
+    # (e.g. CodexTaskService) may be invoked from FastAPI's sync-route
+    # threadpool, where a given connection can legitimately be used from a
+    # different thread on each call. Callers that share a connection across
+    # threads remain responsible for serializing concurrent access.
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
