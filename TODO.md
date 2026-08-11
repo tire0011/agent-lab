@@ -47,6 +47,16 @@
 - [ ] Run one reproducible end-to-end baseline task and persist quality, tokens, runtime, estimated cost, and resource usage.
 - [ ] Keep the VM as the primary persistent home of the agent, repository, memory, orchestration, tests, and CLI tooling.
 
+### Web research worker
+
+- [ ] Evaluate a self-hosted SearXNG instance as the primary low-cost search backend.
+- [ ] Build a small `WebResearchWorker` that searches through SearXNG, fetches a bounded number of result pages, and returns answers with source URLs.
+- [ ] Add strict request, page-count, download-size, timeout, and concurrency limits.
+- [ ] Respect robots.txt, provider terms, rate limits, and website access restrictions; do not scrape Google AI Overviews as a production dependency.
+- [ ] Log search count, fetched pages, tokens, runtime, failures, and estimated cost per research task.
+- [ ] Compare SearXNG against Gemini Grounding with Google Search on a small fixed question set for answer quality, source quality, freshness, runtime, and total cost.
+- [ ] When testing Gemini 3.x, account separately for the monthly 5,000 included Google Search requests and the model input/output token charges; one prompt may trigger multiple search requests.
+
 ### Memory and self model
 
 - [ ] Add a persistent self model (`SELF.json` or SQLite-backed equivalent) containing version, capabilities, known weaknesses, resources, goals, and current constraints.
