@@ -76,6 +76,15 @@
 - [ ] Load only relevant memory into LLM context instead of continuously growing one large prompt.
 - [ ] Reuse the existing SQLite store for structured memories and experiment history before adding embeddings/RAG.
 
+### Prompt library and work modes
+
+- [ ] Add a versioned prompt library for distinct work modes such as `explore`, `research`, `plan`, `implement`, and `evaluate`.
+- [ ] Let the orchestrator select the appropriate prompt and permitted tools for each task instead of assuming every task is a code change.
+- [ ] Allow the agent to propose, create, and improve its own prompts and add new work modes when a capability gap is identified.
+- [ ] Evaluate every prompt change against a baseline for quality, cost, tokens, and runtime before adoption.
+- [ ] Keep prompt history and automatically roll back changes that perform worse or violate constraints.
+- [ ] Store prompt versions, hypotheses, evaluations, and adoption decisions in SQLite.
+
 ### Communication interface
 
 - [x] Use the Web API as the primary, provider-independent communication interface for humans, UIs, tools, and later other agents.
