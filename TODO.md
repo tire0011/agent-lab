@@ -10,14 +10,41 @@
 6. [ ] Add evaluation gate before self-modification.
 7. [ ] Begin controlled self-improvement experiments.
 
-## Current direction — 2026-08-10
+## Current direction — 2026-08-11
 
-### Immediate next steps
+### Completed infrastructure and communication baseline
 
-- [ ] Resolve current `agent-api`/Uvicorn startup issue and confirm the VM baseline is healthy.
+- [x] Resolve the `agent-api`/Uvicorn startup issue and confirm the VM baseline is healthy.
+- [x] Increase the main VM to a low-cost 2 vCPU / 4 GB class (`Standard_B2s`).
+- [x] Install GitHub Copilot CLI and Codex CLI on the VM.
+- [x] Install system `bubblewrap` for the Codex sandbox.
+- [x] Expose the API through Nginx and HTTPS.
+- [x] Add read-only API endpoints for health, status, problems, and todos.
+- [x] Add the initial chat endpoint.
+- [x] Build and publish a small mobile-friendly Web UI for status, problems, todos, and chat.
+- [x] Add a separate CLI client for the API.
+- [ ] Update README and AGENTS.md so the documented VM size, API endpoints, clients, and Web UI match reality.
+
+### Immediate next milestone — Codex worker
+
+- [ ] Inspect the current agent/module boundaries and define the smallest `CodexWorker` interface.
+- [ ] Add a replaceable coding-tool adapter that invokes `codex exec` through an argument list, never through a shell command string.
+- [ ] Start with read-only jobs in an explicitly configured repository working directory.
+- [ ] Capture exit code, stdout, stderr, duration, Codex session/run identifier when available, and timeout state.
+- [ ] Add configurable timeout and output-size limits.
+- [ ] Reject missing, relative, or non-allowlisted working directories.
+- [ ] Do not accept arbitrary shell commands; the worker accepts a natural-language coding task only.
+- [ ] Persist a minimal audit record using the existing run/logging infrastructure.
+- [ ] Add unit tests with a fake process runner so tests do not consume Codex quota.
+- [ ] Run one real read-only smoke test: inspect `README.md` and summarize the project without modifying files.
+- [ ] Verify after the smoke test that the Git working tree is unchanged.
+- [ ] Measure runtime and record whether token/usage information is available.
+- [ ] Keep the worker internal initially; do not expose execution through the public chat/API yet.
+- [ ] After the internal worker is stable, design an authenticated task endpoint with approval, status, cancellation, and result retrieval.
+
+### Baseline measurement
+
 - [ ] Run one reproducible end-to-end baseline task and persist quality, tokens, runtime, estimated cost, and resource usage.
-- [ ] Increase the main VM RAM enough to run coding/LLM CLI tools directly on Linux; target a low-cost 2 vCPU / 4 GB class first.
-- [ ] Install and evaluate one coding/LLM CLI directly on the VM so Windows is not required for the normal development loop.
 - [ ] Keep the VM as the primary persistent home of the agent, repository, memory, orchestration, tests, and CLI tooling.
 
 ### Memory and self model
@@ -29,9 +56,11 @@
 
 ### Communication interface
 
-- [ ] Use the Web API as the primary, provider-independent communication interface for humans, UIs, tools, and later other agents.
-- [ ] Define a simple message endpoint (for example `POST /messages`) plus status/experiment endpoints without coupling the agent core to a specific client.
-- [ ] Build a small mobile-friendly Web UI for chat, agent status, current goal, experiments, costs, and approvals.
+- [x] Use the Web API as the primary, provider-independent communication interface for humans, UIs, tools, and later other agents.
+- [x] Provide structured status, problem, todo, and chat endpoints without coupling the agent core to a specific client.
+- [x] Build a small mobile-friendly Web UI for chat, agent status, problems, and todos.
+- [ ] Add authentication before exposing task execution, detailed operational data, or write operations.
+- [ ] Add experiment, cost, and approval views after the corresponding backend contracts exist.
 - [ ] Keep communication adapters separate so messenger integrations such as WhatsApp can be added later without changing the agent core.
 - [ ] Explore using the same communication contract later for agent-to-agent communication.
 
@@ -53,7 +82,7 @@
 
 ### Coding CLI as an agent tool
 
-- [ ] Treat coding CLIs as replaceable tools rather than building all coding-agent capabilities ourselves.
+- [x] Treat coding CLIs as replaceable tools rather than building all coding-agent capabilities ourselves.
 - [ ] Let the orchestrator request a code change from a CLI, capture diff/test results, then independently evaluate the result.
 - [ ] Later compare multiple coding CLIs/models by task quality, cost, tokens, and runtime and route tasks accordingly.
 
@@ -78,10 +107,6 @@
 - [x] Define SQLite schema for runs, tool calls, model prices, and simple knowledge entries.
 - [x] Add bootstrap logic for `/agent/state/agent.db`.
 - [x] Keep JSON run artifacts initially for audit/debug parity.
-
-## Next milestone
-
-- [ ] **V2.1: Azure actual-cost reconciliation**
 
 ### 3) Benchmarking
 
@@ -114,6 +139,10 @@
 - [ ] Require rollback strategy for each experiment.
 - [ ] Record experiment design, result, and cost.
 
+## Later milestone
+
+- [ ] **V2.1: Azure actual-cost reconciliation**
+
 ## Unknowns
 
 - Which evaluation strategy is robust enough for automated gating.
@@ -122,3 +151,4 @@
 - Which VM size gives the best cost/performance for coding CLI workloads.
 - Whether an ephemeral second VM is cheaper and safer than testing on the main VM.
 - Which memory retrieval strategy remains simple enough while still scaling with accumulated experience.
+- Which stable Codex CLI output or event format exposes usage and session metadata reliably.
