@@ -71,3 +71,46 @@ Run output:
 - `DECISIONS.md` - decision log
 - `COSTS.md` - budget and cost tracking policy
 - `OPERATIONS.md` - operational runbook
+
+## API CLI client
+
+A small standalone API client is available as `client.py`.
+
+Examples:
+
+- `python -m client health`
+- `python -m client status`
+- `python -m client status --api-key <your-key>`
+- `python -m client chat "Was ist dein aktueller Status?"`
+- `python -m client chat --interactive`
+
+Base URL configuration priority:
+
+1. `--base-url`
+2. `AGENT_API_BASE_URL`
+3. default `http://127.0.0.1:8000`
+
+Notes:
+
+- Secrets are never stored in source; pass keys via environment variables or CLI.
+- Current `api.py` exposes only `/health` and `/secure-health`. If no chat endpoint exists,
+  the `chat` command returns a clear error.
+
+## Integration tests (live API)
+
+Integration tests are intentionally separated from unit tests and only run when
+`AGENT_API_URL` is explicitly set.
+
+Example:
+
+- `AGENT_API_URL=https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com python -m unittest discover -s tests/integration -v`
+
+Covered checks:
+
+- HTTPS connectivity
+- `GET /health`
+- all currently existing OpenAPI endpoints whose path includes `health`, `status`, `problem`, or `chat`
+- one full `client chat` invocation against the configured API
+- understandable behavior for a non-existing endpoint (`HTTP 404`)
+
+These tests avoid administrative actions and do not require secrets.
