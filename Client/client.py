@@ -188,6 +188,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  {exc}", file=sys.stderr)
         exit_code = 1
 
+    print("Agent status:")
+    try:
+        agent_status_code, agent_status_payload = request_json(
+            "GET", f"{base_url}/status"
+        )
+        print(f"  HTTP {agent_status_code}")
+        print_json(agent_status_payload)
+    except ClientError as exc:
+        print(f"  {exc}", file=sys.stderr)
+        exit_code = 1
+
     api_key = args.api_key or os.getenv("AGENT_API_KEY")
     if not api_key:
         print("Secure health: skipped (no API key provided via --api-key or AGENT_API_KEY)")
@@ -207,6 +218,36 @@ def cmd_status(args: argparse.Namespace) -> int:
         exit_code = 1
 
     return exit_code
+
+
+def cmd_problems(args: argparse.Namespace) -> int:
+    base_url = resolve_base_url(args.base_url)
+    url = f"{base_url}/problems"
+
+    try:
+        status, payload = request_json("GET", url)
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"HTTP {status}")
+    print_json(payload)
+    return 0
+
+
+def cmd_todos(args: argparse.Namespace) -> int:
+    base_url = resolve_base_url(args.base_url)
+    url = f"{base_url}/todos"
+
+    try:
+        status, payload = request_json("GET", url)
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"HTTP {status}")
+    print_json(payload)
+    return 0
 
 
 def send_chat_message(base_url: str, chat_path: str, message: str) -> dict[str, Any] | list[Any] | str:
@@ -275,10 +316,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser(
         "status",
-        help="Show public and optional secure status/problem information",
+        help="Show public health, agent status (/status), and optional secure health",
     )
     status_parser.add_argument("--api-key", help="API key for /secure-health")
     status_parser.set_defaults(func=cmd_status)
+
+    problems_parser = subparsers.add_parser(
+        "problems", help="List currently detected problems (/problems)"
+    )
+    problems_parser.set_defaults(func=cmd_problems)
+
+    todos_parser = subparsers.add_parser(
+        "todos", help="List open todos (/todos)"
+    )
+    todos_parser.set_defaults(func=cmd_todos)
 
     chat_parser = subparsers.add_parser("chat", help="Send a message to chat endpoint")
     chat_parser.add_argument("message", nargs="?", help="Message text")

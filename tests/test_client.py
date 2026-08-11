@@ -72,6 +72,52 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Connection problem", stderr.getvalue())
 
+    @patch("client.request.urlopen")
+    def test_problems_command_prints_payload(self, mock_urlopen):
+        payload = {"count": 1, "problems": [{"id": "x", "summary": "boom"}]}
+        mock_urlopen.return_value = _FakeResponse(json.dumps(payload), status=200)
+        stdout = io.StringIO()
+
+        with patch("sys.stdout", stdout):
+            code = client.main(["--base-url", "http://127.0.0.1:8000", "problems"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("boom", stdout.getvalue())
+
+    @patch("client.request.urlopen")
+    def test_todos_command_prints_payload(self, mock_urlopen):
+        payload = {"count": 1, "todos": [{"id": "todo-1", "text": "do the thing"}]}
+        mock_urlopen.return_value = _FakeResponse(json.dumps(payload), status=200)
+        stdout = io.StringIO()
+
+        with patch("sys.stdout", stdout):
+            code = client.main(["--base-url", "http://127.0.0.1:8000", "todos"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("do the thing", stdout.getvalue())
+
+    @patch("client.request.urlopen")
+    def test_status_command_includes_agent_status_endpoint(self, mock_urlopen):
+        health_payload = {"status": "ok"}
+        agent_status_payload = {
+            "agent_status": "idle",
+            "api_version": "0.2.0",
+            "components": ["health", "status", "problems", "todos", "chat"],
+        }
+        mock_urlopen.side_effect = [
+            _FakeResponse(json.dumps(health_payload), status=200),
+            _FakeResponse(json.dumps(agent_status_payload), status=200),
+        ]
+        stdout = io.StringIO()
+
+        with patch.dict(os.environ, {}, clear=True), patch("sys.stdout", stdout):
+            code = client.main(["--base-url", "http://127.0.0.1:8000", "status"])
+
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertIn("Agent status:", output)
+        self.assertIn("api_version", output)
+
 
 if __name__ == "__main__":
     unittest.main()
