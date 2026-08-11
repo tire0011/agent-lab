@@ -68,9 +68,30 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS codex_tasks (
+            id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            working_dir TEXT NOT NULL,
+            sandbox TEXT NOT NULL,
+            timeout_seconds INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT NULL,
+            ended_at TEXT NULL,
+            thread_id TEXT NULL,
+            exit_code INTEGER NULL,
+            runtime_ms INTEGER NULL,
+            timed_out INTEGER NULL CHECK (timed_out IN (0, 1) OR timed_out IS NULL),
+            usage_json TEXT NULL,
+            final_message TEXT NULL,
+            error TEXT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_tool_calls_run_id ON tool_calls(run_id);
         CREATE INDEX IF NOT EXISTS idx_model_prices_lookup ON model_prices(provider, model, valid_from);
+        CREATE INDEX IF NOT EXISTS idx_codex_tasks_created_at ON codex_tasks(created_at);
+        CREATE INDEX IF NOT EXISTS idx_codex_tasks_status ON codex_tasks(status);
         """
     )
     conn.commit()
