@@ -10,6 +10,8 @@ Experimental project for distributed self-improving LLM agents under strict budg
 - API service (`api.py`) provides:
 	- public `GET /health`
 	- authenticated `GET /secure-health`
+	- `GET /status`, `GET /problems`, `GET /todos`, `POST /chat` (read-only over
+	  existing data; see `data_sources.py` and `chat.py`)
 
 ## Project priorities
 
@@ -47,6 +49,16 @@ Run output:
 
 - Response prints to stdout.
 - Structured run log is written to `state/runs/*.json`.
+
+## API service quick start
+
+Dependencies for `api.py` and its tests are pinned in `requirements-api.txt`
+(separate from `requirements-agent.txt`, which is for the Azure OpenAI/MCP
+CLI runner):
+
+- `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
+- `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
+- Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests`
 
 ## Security
 
