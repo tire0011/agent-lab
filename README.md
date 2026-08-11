@@ -105,8 +105,7 @@ Base URL configuration priority:
 Notes:
 
 - Secrets are never stored in source; pass keys via environment variables or CLI.
-- Current `api.py` exposes only `/health` and `/secure-health`. If no chat endpoint exists,
-  the `chat` command returns a clear error.
+- `api.py` exposes `/health`, `/secure-health`, `/status`, `/problems`, `/todos`, and `/chat`.
 
 ## Integration tests (live API)
 
