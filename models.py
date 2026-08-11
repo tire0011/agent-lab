@@ -88,8 +88,10 @@ class CodexTaskResponse(BaseModel):
 
 
 class CodexTaskSummary(BaseModel):
-    """Smaller listing shape: omits the (potentially large) prompt and
-    final_message fields present on ``CodexTaskResponse``."""
+    """Smaller listing shape: omits the full (potentially large) prompt and
+    final_message fields present on ``CodexTaskResponse``, but keeps a short
+    ``prompt_preview`` so list output remains useful without printing a
+    long prompt."""
 
     id: str
     status: str
@@ -104,6 +106,7 @@ class CodexTaskSummary(BaseModel):
     runtime_ms: int | None = None
     timed_out: bool | None = None
     error: str | None = None
+    prompt_preview: str
 
 
 class CodexTaskListResponse(BaseModel):

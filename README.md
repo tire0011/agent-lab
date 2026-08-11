@@ -131,15 +131,16 @@ never restarts execution or starts a Codex process.
 
 ## API CLI client
 
-A small standalone API client is available as `client.py`.
+A small standalone API client is available as `Client/client.py`
+(run as `python -m Client.client ...` from the repo root).
 
 Examples:
 
-- `python -m client health`
-- `python -m client status`
-- `python -m client status --api-key <your-key>`
-- `python -m client chat "Was ist dein aktueller Status?"`
-- `python -m client chat --interactive`
+- `python -m Client.client health`
+- `python -m Client.client status`
+- `python -m Client.client status --api-key <your-key>`
+- `python -m Client.client chat "Was ist dein aktueller Status?"`
+- `python -m Client.client chat --interactive`
 
 Base URL configuration priority:
 
@@ -150,7 +151,53 @@ Base URL configuration priority:
 Notes:
 
 - Secrets are never stored in source; pass keys via environment variables or CLI.
-- `api.py` exposes `/health`, `/secure-health`, `/status`, `/problems`, `/todos`, and `/chat`.
+- `api.py` exposes `/health`, `/secure-health`, `/status`, `/problems`, `/todos`, `/chat`, and `/codex/tasks*`.
+
+### Codex task commands
+
+Thin HTTP wrappers around the Codex task API (see "Codex task API" above).
+The client never invokes `CodexWorker`/`CodexTaskService` directly and cannot
+choose `working_dir` or `sandbox` — those remain server-enforced. All five
+commands require `x-api-key` (same auth as the other endpoints).
+
+- `codex create --prompt "..." [--timeout-seconds N]` — create a task, print
+  its id/status/timeout/sandbox/working_dir. Returns `201`.
+- `codex get TASK_ID` — fetch and print a task's full state (`404` if unknown).
+- `codex list [--limit N]` — compact, newest-first list (id, status, created
+  time, runtime, short prompt preview). Uses the server's default/maximum
+  limit; invalid values are rejected by the API.
+- `codex run TASK_ID` — run an already-created `queued` task synchronously
+  and print its final state. Not retried automatically on `409`/timeout/
+  connection failure — inspect the task afterwards with `codex get`.
+- `codex execute --prompt "..." [--timeout-seconds N]` — convenience command:
+  create one task, print its id, run exactly that task, print the final
+  state. Never creates a second task as a retry.
+
+Create + run example:
+
+```
+python -m Client.client codex create --prompt "Inspect README.md and summarize the project." --api-key $AGENT_API_KEY
+# -> Task created (HTTP 201) ... id: <TASK_ID> ...
+
+python -m Client.client codex run <TASK_ID> --api-key $AGENT_API_KEY
+# -> HTTP 200 ... status: succeeded ...
+```
+
+Execute example (create + run in one step):
+
+```
+python -m Client.client codex execute --prompt "Inspect README.md and summarize the project." --timeout-seconds 60 --api-key $AGENT_API_KEY
+```
+
+`codex run`/`codex execute` are synchronous: the HTTP request stays open for
+up to the task's timeout (server max 120s). The client's own HTTP timeout is
+sized to the task timeout plus a small margin, not unlimited. If the
+connection is lost or the client-side timeout is hit, the task's real
+outcome is unknown from the CLI's point of view — the command does **not**
+retry; use the printed task id with `codex get TASK_ID` to check whether it
+actually completed. Exit codes: `0` success (task not `failed`/`timed_out`),
+`1` HTTP/transport failure, `2` usage error (e.g. missing API key), `3` HTTP
+call succeeded but the task's own status is `failed` or `timed_out`.
 
 ## Integration tests (live API)
 

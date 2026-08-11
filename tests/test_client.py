@@ -53,7 +53,7 @@ class ClientTests(unittest.TestCase):
             "http://127.0.0.1:8000", "/custom-chat", "Ping"
         )
 
-    @patch("client.request.urlopen")
+    @patch("Client.client.request.urlopen")
     def test_request_json_returns_parsed_json(self, mock_urlopen):
         payload = {"status": "ok"}
         mock_urlopen.return_value = _FakeResponse(json.dumps(payload), status=200)
@@ -63,7 +63,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, payload)
 
-    @patch("client.request.urlopen")
+    @patch("Client.client.request.urlopen")
     def test_request_json_reports_connection_problem(self, mock_urlopen):
         mock_urlopen.side_effect = error.URLError("connection refused")
 
@@ -72,7 +72,7 @@ class ClientTests(unittest.TestCase):
 
         self.assertIn("Connection problem", str(ctx.exception))
 
-    @patch("client.request.urlopen")
+    @patch("Client.client.request.urlopen")
     def test_request_json_reports_invalid_json(self, mock_urlopen):
         mock_urlopen.return_value = _FakeResponse("<html>not-json</html>", status=200)
 
@@ -81,7 +81,7 @@ class ClientTests(unittest.TestCase):
 
         self.assertIn("Invalid JSON response", str(ctx.exception))
 
-    @patch("client.request.urlopen")
+    @patch("Client.client.request.urlopen")
     def test_health_command_returns_error_code_on_connection_failure(self, mock_urlopen):
         mock_urlopen.side_effect = error.URLError("connection refused")
         stderr = io.StringIO()
@@ -92,7 +92,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Connection problem", stderr.getvalue())
 
-    @patch("client.request.urlopen")
+    @patch("Client.client.request.urlopen")
     def test_problems_command_prints_payload(self, mock_urlopen):
         payload = {"count": 1, "problems": [{"id": "x", "summary": "boom"}]}
         mock_urlopen.return_value = _FakeResponse(json.dumps(payload), status=200)
@@ -104,7 +104,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("boom", stdout.getvalue())
 
-    @patch("client.request.urlopen")
+    @patch("Client.client.request.urlopen")
     def test_todos_command_prints_payload(self, mock_urlopen):
         payload = {"count": 1, "todos": [{"id": "todo-1", "text": "do the thing"}]}
         mock_urlopen.return_value = _FakeResponse(json.dumps(payload), status=200)
@@ -116,7 +116,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("do the thing", stdout.getvalue())
 
-    @patch("client.request.urlopen")
+    @patch("Client.client.request.urlopen")
     def test_status_command_includes_agent_status_endpoint(self, mock_urlopen):
         health_payload = {"status": "ok"}
         agent_status_payload = {

@@ -47,8 +47,9 @@
 - [x] Add authenticated `POST/GET /codex/tasks`, `GET /codex/tasks/{id}`, `POST /codex/tasks/{id}/run` in `api.py`, reusing `CodexTaskService`/`CodexWorker` with no duplicated worker logic.
 - [x] Enforce `working_dir=/agent`, `sandbox=read-only`, and a fixed max `timeout_seconds` (120s) server-side; client cannot override.
 - [x] Run `mark_interrupted_tasks_failed()` once at API startup via FastAPI lifespan.
-- [x] Add `codex create|list|get|run` subcommands to `Client/client.py`.
+- [x] Add `codex create|list|get|run|execute` subcommands to `Client/client.py` (thin HTTP client only, no direct `CodexWorker`/`CodexTaskService` use; `execute` is a create+run convenience with no automatic retries).
 - [x] Fix a thread-safety bug surfaced by wiring `CodexTaskService`'s SQLite connection into FastAPI's sync threadpool (`check_same_thread=False` + a lock).
+- [x] Fix `tests/test_client.py`'s pre-existing import/patch-target failures (`@patch("client...")` pointed at a nonexistent top-level module instead of `Client.client`).
 - [ ] Add approval workflow (currently: any `queued` task can be run immediately by an authenticated caller).
 - [ ] Add task cancellation (currently: a running task cannot be stopped once started).
 - [ ] Move execution off the request thread (currently strictly synchronous; a long Codex call blocks the HTTP response) once background execution is deliberately in scope.

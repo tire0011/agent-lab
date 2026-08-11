@@ -42,6 +42,7 @@ CODEX_DEFAULT_TIMEOUT_SECONDS = 120
 CODEX_MAX_TIMEOUT_SECONDS = 120
 CODEX_LIST_DEFAULT_LIMIT = 20
 CODEX_LIST_MAX_LIMIT = 100
+CODEX_LIST_PROMPT_PREVIEW_CHARS = 80
 
 
 @lru_cache(maxsize=1)
@@ -159,6 +160,13 @@ def create_codex_task(
     return CodexTaskResponse(**task.to_dict())
 
 
+def _prompt_preview(prompt: str, max_chars: int = CODEX_LIST_PROMPT_PREVIEW_CHARS) -> str:
+    stripped = prompt.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+    return stripped[:max_chars].rstrip() + "…"
+
+
 @app.get("/codex/tasks", response_model=CodexTaskListResponse)
 def list_codex_tasks(
     x_api_key: str | None = Header(default=None),
@@ -170,7 +178,13 @@ def list_codex_tasks(
     tasks = service.list_tasks(limit=limit)
     return CodexTaskListResponse(
         count=len(tasks),
-        tasks=[CodexTaskSummary(**task.to_dict()) for task in tasks],
+        tasks=[
+            CodexTaskSummary(
+                **task.to_dict(),
+                prompt_preview=_prompt_preview(task.prompt),
+            )
+            for task in tasks
+        ],
     )
 
 

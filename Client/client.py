@@ -10,9 +10,46 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_TIMEOUT_SECONDS = 10
 DEFAULT_CHAT_PATH = "/chat"
 
+# ---------------------------------------------------------------------------
+# Codex task API client constants.
+#
+# The CLI is a thin HTTP client: it never imports CodexWorker/CodexTaskService
+# and never chooses working_dir/sandbox (both are server-enforced). These
+# constants mirror the server-side limits documented in api.py so the CLI can
+# size its own HTTP timeout safely without an extra round trip.
+# ---------------------------------------------------------------------------
+CODEX_SERVER_MAX_TIMEOUT_SECONDS = 120  # mirrors api.py CODEX_MAX_TIMEOUT_SECONDS
+CODEX_RUN_TIMEOUT_MARGIN_SECONDS = int(
+    os.getenv("AGENT_CODEX_RUN_TIMEOUT_MARGIN_SECONDS", "15")
+)
+CODEX_TERMINAL_FAILURE_STATUSES = {"failed", "timed_out"}
+
+# Exit code convention (documented in README.md):
+#   0 = success (request succeeded; for run/execute the task also reached a
+#       non-failure terminal status, e.g. 'succeeded')
+#   1 = HTTP/transport-level failure (connection, timeout, 4xx/5xx, bad JSON)
+#   2 = client-side usage error (e.g. missing API key)
+#   3 = the HTTP call succeeded but the task's own terminal status is
+#       'failed' or 'timed_out' (a real, but non-transport, failure)
+EXIT_OK = 0
+EXIT_HTTP_ERROR = 1
+EXIT_USAGE_ERROR = 2
+EXIT_TASK_TERMINAL_FAILURE = 3
+
 
 class ClientError(Exception):
-    pass
+    """Raised for any failed request.
+
+    ``http_status`` is set when the server returned a definitive HTTP
+    response (e.g. 401/404/409/422/500): the outcome is known, just
+    unsuccessful. It is left ``None`` for genuine transport-level failures
+    (connection refused, client-side timeout, malformed JSON) where whether
+    the server-side action happened at all is ambiguous.
+    """
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
 
 
 def resolve_base_url(cli_value: str | None) -> str:
@@ -54,7 +91,8 @@ def request_json(
         raw = exc.read().decode("utf-8", errors="replace")
         detail = raw.strip() or exc.reason
         raise ClientError(
-            f"HTTP {exc.code} for {method.upper()} {url}: {detail}"
+            f"HTTP {exc.code} for {method.upper()} {url}: {detail}",
+            http_status=exc.code,
         ) from exc
     except error.URLError as exc:
         reason = getattr(exc, "reason", exc)
@@ -264,15 +302,77 @@ def _require_api_key(args: argparse.Namespace) -> str | None:
     return api_key
 
 
+def _task_exit_code(task: Any) -> int:
+    """Map a task's own terminal status to a CLI exit code.
+
+    A successful HTTP response whose task ended in 'failed' or 'timed_out'
+    is still a real failure from the caller's point of view (see README.md
+    for the full exit-code convention), so it is surfaced as a non-zero
+    exit code distinct from transport-level errors.
+    """
+    if isinstance(task, dict) and task.get("status") in CODEX_TERMINAL_FAILURE_STATUSES:
+        return EXIT_TASK_TERMINAL_FAILURE
+    return EXIT_OK
+
+
+def _print_task_summary(task: dict[str, Any]) -> None:
+    """Compact summary shown right after task creation."""
+    print(f"  id:              {task.get('id')}")
+    print(f"  status:          {task.get('status')}")
+    print(f"  timeout_seconds: {task.get('timeout_seconds')}")
+    print(f"  sandbox:         {task.get('sandbox')}")
+    print(f"  working_dir:     {task.get('working_dir')}")
+
+
+def _print_task_details(task: dict[str, Any]) -> None:
+    """Full, human-readable task state (used by get/run/execute)."""
+    usage = task.get("usage")
+    usage_display = json.dumps(usage, ensure_ascii=False) if usage is not None else None
+
+    fields = [
+        ("id", task.get("id")),
+        ("status", task.get("status")),
+        ("prompt", task.get("prompt")),
+        ("working_dir", task.get("working_dir")),
+        ("sandbox", task.get("sandbox")),
+        ("timeout_seconds", task.get("timeout_seconds")),
+        ("created_at", task.get("created_at")),
+        ("started_at", task.get("started_at")),
+        ("ended_at", task.get("ended_at")),
+        ("thread_id", task.get("thread_id")),
+        ("exit_code", task.get("exit_code")),
+        ("runtime_ms", task.get("runtime_ms")),
+        ("timed_out", task.get("timed_out")),
+        ("usage", usage_display),
+        ("final_message", task.get("final_message")),
+        ("error", task.get("error")),
+    ]
+    for name, value in fields:
+        if value is None:
+            value = "-"
+        print(f"  {name}: {value}")
+
+
+def _print_task_list_line(task: dict[str, Any]) -> None:
+    """One compact, wrap-friendly line per task (narrow-terminal friendly)."""
+    short_id = str(task.get("id", ""))[:8]
+    status = task.get("status", "?")
+    created_at = task.get("created_at", "-")
+    runtime_ms = task.get("runtime_ms")
+    runtime_display = f"{runtime_ms}ms" if runtime_ms is not None else "-"
+    preview = task.get("prompt_preview") or ""
+    print(f"{short_id}  {status:<10} created={created_at} runtime={runtime_display} prompt=\"{preview}\"")
+
+
 def cmd_codex_create(args: argparse.Namespace) -> int:
     api_key = _require_api_key(args)
     if not api_key:
-        return 2
+        return EXIT_USAGE_ERROR
 
     base_url = resolve_base_url(args.base_url)
     body: dict[str, Any] = {"prompt": args.prompt}
-    if args.timeout is not None:
-        body["timeout_seconds"] = args.timeout
+    if args.timeout_seconds is not None:
+        body["timeout_seconds"] = args.timeout_seconds
 
     try:
         status, payload = request_json(
@@ -283,36 +383,24 @@ def cmd_codex_create(args: argparse.Namespace) -> int:
         )
     except ClientError as exc:
         print(str(exc), file=sys.stderr)
-        return 1
+        return EXIT_HTTP_ERROR
 
-    print(f"HTTP {status}")
-    print_json(payload)
-    return 0 if status == 201 else 1
+    if args.json:
+        print_json(payload)
+        return EXIT_OK if status == 201 else EXIT_HTTP_ERROR
 
-
-def cmd_codex_list(args: argparse.Namespace) -> int:
-    api_key = _require_api_key(args)
-    if not api_key:
-        return 2
-
-    base_url = resolve_base_url(args.base_url)
-    url = f"{base_url}/codex/tasks?limit={args.limit}"
-
-    try:
-        status, payload = request_json("GET", url, headers={"x-api-key": api_key})
-    except ClientError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    print(f"HTTP {status}")
-    print_json(payload)
-    return 0 if status == 200 else 1
+    print(f"Task created (HTTP {status})")
+    if isinstance(payload, dict):
+        _print_task_summary(payload)
+    else:
+        print_json(payload)
+    return EXIT_OK if status == 201 else EXIT_HTTP_ERROR
 
 
 def cmd_codex_get(args: argparse.Namespace) -> int:
     api_key = _require_api_key(args)
     if not api_key:
-        return 2
+        return EXIT_USAGE_ERROR
 
     base_url = resolve_base_url(args.base_url)
     url = f"{base_url}/codex/tasks/{args.task_id}"
@@ -321,30 +409,178 @@ def cmd_codex_get(args: argparse.Namespace) -> int:
         status, payload = request_json("GET", url, headers={"x-api-key": api_key})
     except ClientError as exc:
         print(str(exc), file=sys.stderr)
-        return 1
+        return EXIT_HTTP_ERROR
+
+    if args.json:
+        print_json(payload)
+        return _task_exit_code(payload)
 
     print(f"HTTP {status}")
+    if isinstance(payload, dict):
+        _print_task_details(payload)
+        return _task_exit_code(payload)
     print_json(payload)
-    return 0 if status == 200 else 1
+    return EXIT_OK
+
+
+def cmd_codex_list(args: argparse.Namespace) -> int:
+    api_key = _require_api_key(args)
+    if not api_key:
+        return EXIT_USAGE_ERROR
+
+    base_url = resolve_base_url(args.base_url)
+    url = f"{base_url}/codex/tasks?limit={args.limit}"
+
+    try:
+        status, payload = request_json("GET", url, headers={"x-api-key": api_key})
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_HTTP_ERROR
+
+    if args.json:
+        print_json(payload)
+        return EXIT_OK
+
+    if not isinstance(payload, dict):
+        print_json(payload)
+        return EXIT_OK
+
+    count = payload.get("count", 0)
+    tasks = payload.get("tasks", [])
+    print(f"HTTP {status} ({count} task(s))")
+    for task in tasks:
+        _print_task_list_line(task)
+    return EXIT_OK
 
 
 def cmd_codex_run(args: argparse.Namespace) -> int:
     api_key = _require_api_key(args)
     if not api_key:
-        return 2
+        return EXIT_USAGE_ERROR
 
     base_url = resolve_base_url(args.base_url)
     url = f"{base_url}/codex/tasks/{args.task_id}/run"
+    # The stored task's exact timeout isn't known without an extra GET, so a
+    # conservative HTTP timeout sized to the server's maximum is used; it is
+    # always >= the task's actual server-side timeout, plus a small margin.
+    http_timeout = CODEX_SERVER_MAX_TIMEOUT_SECONDS + CODEX_RUN_TIMEOUT_MARGIN_SECONDS
+
+    print(
+        f"Running task {args.task_id} synchronously; this may take up to "
+        f"{CODEX_SERVER_MAX_TIMEOUT_SECONDS}s (server-enforced Codex timeout)..."
+    )
 
     try:
-        status, payload = request_json("POST", url, headers={"x-api-key": api_key})
+        status, payload = request_json(
+            "POST", url, headers={"x-api-key": api_key}, timeout=http_timeout
+        )
     except ClientError as exc:
         print(str(exc), file=sys.stderr)
-        return 1
+        if exc.http_status is None:
+            print(
+                f"Execution outcome for task {args.task_id} is unknown after a "
+                f"transport-level failure. Inspect it with: codex get {args.task_id}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Task {args.task_id} was not started (server responded "
+                f"HTTP {exc.http_status}). Inspect it with: codex get {args.task_id}",
+                file=sys.stderr,
+            )
+        return EXIT_HTTP_ERROR
+
+    if args.json:
+        print_json(payload)
+        return _task_exit_code(payload)
 
     print(f"HTTP {status}")
+    if isinstance(payload, dict):
+        _print_task_details(payload)
+        return _task_exit_code(payload)
     print_json(payload)
-    return 0 if status == 200 else 1
+    return EXIT_OK
+
+
+def cmd_codex_execute(args: argparse.Namespace) -> int:
+    api_key = _require_api_key(args)
+    if not api_key:
+        return EXIT_USAGE_ERROR
+
+    base_url = resolve_base_url(args.base_url)
+    body: dict[str, Any] = {"prompt": args.prompt}
+    if args.timeout_seconds is not None:
+        body["timeout_seconds"] = args.timeout_seconds
+
+    try:
+        create_status, create_payload = request_json(
+            "POST",
+            f"{base_url}/codex/tasks",
+            body=body,
+            headers={"x-api-key": api_key},
+        )
+    except ClientError as exc:
+        # Creation itself failed at HTTP/transport level: no task exists,
+        # nothing to run, and no retry is attempted.
+        print(str(exc), file=sys.stderr)
+        return EXIT_HTTP_ERROR
+
+    if not isinstance(create_payload, dict) or not create_payload.get("id"):
+        print("Task creation response did not include a task id.", file=sys.stderr)
+        return EXIT_HTTP_ERROR
+
+    task_id = create_payload["id"]
+    # Print the task id immediately: if the following run call fails at the
+    # transport level, the id must still be visible so the task can be
+    # inspected later with `codex get`.
+    print(f"Created task {task_id} (HTTP {create_status})")
+
+    requested_timeout = create_payload.get("timeout_seconds") or CODEX_SERVER_MAX_TIMEOUT_SECONDS
+    http_timeout = requested_timeout + CODEX_RUN_TIMEOUT_MARGIN_SECONDS
+
+    print(
+        f"Running task {task_id} synchronously; this may take up to "
+        f"{requested_timeout}s (server-enforced Codex timeout)..."
+    )
+
+    try:
+        run_status, run_payload = request_json(
+            "POST",
+            f"{base_url}/codex/tasks/{task_id}/run",
+            headers={"x-api-key": api_key},
+            timeout=http_timeout,
+        )
+    except ClientError as exc:
+        # Transport-level failure while running: the task may or may not
+        # have started on the server. Never create a second task as a retry;
+        # point the caller at `codex get` to check the real outcome.
+        print(str(exc), file=sys.stderr)
+        if exc.http_status is None:
+            print(
+                f"Task {task_id} was created but its execution outcome is "
+                f"unknown after a transport-level failure. Inspect it with: "
+                f"codex get {task_id}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Task {task_id} was created but was not started (server "
+                f"responded HTTP {exc.http_status}). Inspect it with: "
+                f"codex get {task_id}",
+                file=sys.stderr,
+            )
+        return EXIT_HTTP_ERROR
+
+    if args.json:
+        print_json(run_payload)
+        return _task_exit_code(run_payload)
+
+    print(f"HTTP {run_status}")
+    if isinstance(run_payload, dict):
+        _print_task_details(run_payload)
+        return _task_exit_code(run_payload)
+    print_json(run_payload)
+    return EXIT_OK
 
 
 def send_chat_message(base_url: str, chat_path: str, message: str) -> dict[str, Any] | list[Any] | str:
@@ -450,41 +686,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     codex_subparsers = codex_parser.add_subparsers(dest="codex_command", required=True)
 
-    codex_create_parser = codex_subparsers.add_parser(
-        "create", help="Create a Codex task (POST /codex/tasks)"
+    # Shared, common Codex sub-arguments (API key, optional raw JSON output).
+    codex_common = argparse.ArgumentParser(add_help=False)
+    codex_common.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
+    codex_common.add_argument(
+        "--json", action="store_true",
+        help="Print the raw JSON response instead of a human-readable summary",
     )
-    codex_create_parser.add_argument("prompt", help="Natural-language coding task")
+
+    codex_create_parser = codex_subparsers.add_parser(
+        "create", parents=[codex_common], help="Create a Codex task (POST /codex/tasks)"
+    )
     codex_create_parser.add_argument(
-        "--timeout", type=int, default=None,
+        "--prompt", required=True, help="Natural-language coding task"
+    )
+    codex_create_parser.add_argument(
+        "--timeout-seconds", type=int, default=None,
         help="Requested timeout in seconds (server enforces a fixed maximum)",
     )
-    codex_create_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
     codex_create_parser.set_defaults(func=cmd_codex_create)
 
     codex_list_parser = codex_subparsers.add_parser(
-        "list", help="List recent Codex tasks (GET /codex/tasks)"
+        "list", parents=[codex_common], help="List recent Codex tasks (GET /codex/tasks)"
     )
     codex_list_parser.add_argument(
         "--limit", type=int, default=20, help="Max number of tasks to list (default: 20)"
     )
-    codex_list_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
     codex_list_parser.set_defaults(func=cmd_codex_list)
 
     codex_get_parser = codex_subparsers.add_parser(
-        "get", help="Fetch a Codex task by id (GET /codex/tasks/{id})"
+        "get", parents=[codex_common], help="Fetch a Codex task by id (GET /codex/tasks/{id})"
     )
     codex_get_parser.add_argument("task_id", help="Codex task id")
-    codex_get_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
     codex_get_parser.set_defaults(func=cmd_codex_get)
 
     codex_run_parser = codex_subparsers.add_parser(
-        "run", help="Run a queued Codex task synchronously (POST /codex/tasks/{id}/run)"
+        "run", parents=[codex_common],
+        help="Run a queued Codex task synchronously (POST /codex/tasks/{id}/run)",
     )
     codex_run_parser.add_argument("task_id", help="Codex task id")
-    codex_run_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
     codex_run_parser.set_defaults(func=cmd_codex_run)
 
+    codex_execute_parser = codex_subparsers.add_parser(
+        "execute", parents=[codex_common],
+        help="Create and immediately run one Codex task (convenience: create + run)",
+    )
+    codex_execute_parser.add_argument(
+        "--prompt", required=True, help="Natural-language coding task"
+    )
+    codex_execute_parser.add_argument(
+        "--timeout-seconds", type=int, default=None,
+        help="Requested timeout in seconds (server enforces a fixed maximum)",
+    )
+    codex_execute_parser.set_defaults(func=cmd_codex_execute)
+
     return parser
+
 
 
 def main(argv: list[str] | None = None) -> int:
