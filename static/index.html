@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Agent Lab</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="page-header">
+      <div>
+        <p class="eyebrow">agent-lab</p>
+        <h1>Agent Lab</h1>
+        <p class="subtitle">Status, Aufgaben und Chat auf einen Blick</p>
+      </div>
+      <button id="refresh-button" class="secondary" type="button">Aktualisieren</button>
+    </header>
+
+    <main>
+      <section class="status-grid" aria-label="Systemstatus">
+        <article class="card status-card">
+          <div class="card-heading">
+            <h2>API</h2>
+            <span id="health-indicator" class="indicator pending">Lädt …</span>
+          </div>
+          <p id="health-detail" class="muted" aria-live="polite">Status wird abgerufen.</p>
+        </article>
+
+        <article class="card status-card">
+          <div class="card-heading">
+            <h2>Agent</h2>
+            <span id="agent-indicator" class="indicator pending">Lädt …</span>
+          </div>
+          <p id="agent-detail" class="muted" aria-live="polite">Status wird abgerufen.</p>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="card">
+          <div class="card-heading">
+            <h2>Aktuelle Probleme</h2>
+            <span id="problems-count" class="count">–</span>
+          </div>
+          <div id="problems-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </article>
+
+        <article class="card">
+          <div class="card-heading">
+            <h2>Offene Todos</h2>
+            <span id="todos-count" class="count">–</span>
+          </div>
+          <div id="todos-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </article>
+      </section>
+
+      <section class="card chat-card">
+        <div class="card-heading">
+          <div>
+            <h2>Chat</h2>
+            <p class="muted">Fragen zu Status, Problemen und Todos</p>
+          </div>
+          <span id="chat-state" class="muted" aria-live="polite"></span>
+        </div>
+        <div id="messages" class="messages" aria-live="polite" aria-label="Nachrichtenverlauf"></div>
+        <form id="chat-form" class="chat-form">
+          <label for="chat-input" class="sr-only">Nachricht</label>
+          <textarea id="chat-input" rows="2" maxlength="2000" placeholder="Nachricht eingeben …" required></textarea>
+          <button id="send-button" type="submit">Senden</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>

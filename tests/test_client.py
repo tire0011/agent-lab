@@ -33,6 +33,26 @@ class ClientTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(client.resolve_base_url(None), client.DEFAULT_BASE_URL)
 
+    def test_chat_respects_explicit_chat_path(self):
+        with patch.object(
+            client, "send_chat_message", return_value={"reply": "ok"}
+        ) as mock_send_chat_message, patch("sys.stdout", io.StringIO()):
+            code = client.main(
+                [
+                    "--base-url",
+                    "http://127.0.0.1:8000",
+                    "chat",
+                    "--chat-path",
+                    "/custom-chat",
+                    "Ping",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        mock_send_chat_message.assert_called_once_with(
+            "http://127.0.0.1:8000", "/custom-chat", "Ping"
+        )
+
     @patch("client.request.urlopen")
     def test_request_json_returns_parsed_json(self, mock_urlopen):
         payload = {"status": "ok"}

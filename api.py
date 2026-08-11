@@ -1,5 +1,9 @@
 import os
+from pathlib import Path
+
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 import chat as chat_module
 from data_sources import list_problems, list_todos
@@ -16,7 +20,16 @@ from models import (
 
 app = FastAPI()
 
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 API_KEY = os.environ["AGENT_API_KEY"]
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+
 
 def authorize(x_api_key: str | None):
     if x_api_key != API_KEY:

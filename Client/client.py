@@ -260,7 +260,11 @@ def send_chat_message(base_url: str, chat_path: str, message: str) -> dict[str, 
 def cmd_chat(args: argparse.Namespace) -> int:
     base_url = resolve_base_url(args.base_url)
     requested_chat_path = resolve_chat_path(args.chat_path)
-    chat_path = find_chat_path(base_url, requested_chat_path)
+    chat_path = (
+        requested_chat_path
+        if args.chat_path
+        else find_chat_path(base_url, requested_chat_path)
+    )
 
     if args.interactive:
         print(f"Interactive chat mode. Endpoint: {chat_path}")

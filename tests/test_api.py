@@ -49,6 +49,25 @@ class HealthEndpointTests(ApiTestsBase):
         self.assertEqual(response.json(), {"status": "ok"})
 
 
+class WebClientTests(ApiTestsBase):
+    def test_index_returns_html(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/html"))
+        self.assertIn("Agent Lab", response.text)
+
+    def test_stylesheet_is_reachable(self):
+        response = self.client.get("/static/styles.css")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/css"))
+
+    def test_javascript_is_reachable(self):
+        response = self.client.get("/static/app.js")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("javascript", response.headers["content-type"])
+        self.assertIn("textContent", response.text)
+
+
 class StatusEndpointTests(ApiTestsBase):
     def test_status_returns_expected_fields(self):
         response = self.client.get("/status")
