@@ -28,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -178,6 +179,8 @@ class CodexWorker:
         working_dir: str,
         sandbox: str = _DEFAULT_SANDBOX,
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+        output_schema: dict | None = None,
+        skip_git_repo_check: bool = False,
     ) -> CodexResult:
         """Execute *task* non-interactively via ``codex exec``.
 
@@ -194,6 +197,24 @@ class CodexWorker:
         timeout_seconds:
             Hard wall-clock timeout. The process is killed on expiry and the
             result carries ``timed_out=True``.
+        output_schema:
+            Optional JSON Schema (as a plain dict) describing the shape of
+            the model's final response. When provided, it is written to a
+            secure temporary file and passed to Codex via
+            ``--output-schema <FILE>``; the temp file is always removed
+            afterwards (success, timeout, or exception). Defaults to
+            ``None``, which preserves the exact previous command-line
+            behavior for all existing callers (including the public
+            ``/codex/tasks`` API).
+        skip_git_repo_check:
+            Passes ``--skip-git-repo-check`` to ``codex exec``. Codex
+            normally refuses to run outside a trusted git repository; this
+            is required for working directories that are intentionally
+            NOT a git repository (e.g. an isolated, empty scratch
+            directory used to guarantee no further repository research is
+            possible). Defaults to ``False`` (preserves prior behavior for
+            all existing callers, all of which operate inside the real
+            repository or a git worktree).
         """
         timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -218,8 +239,22 @@ class CodexWorker:
                 error=str(exc),
             )
 
-        cmd = self._build_command(task, working_dir, sandbox)
-        result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox)
+        schema_path: str | None = None
+        try:
+            if output_schema is not None:
+                fd, schema_path = tempfile.mkstemp(prefix="codex_schema_", suffix=".json")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(output_schema, f)
+
+            cmd = self._build_command(task, working_dir, sandbox, schema_path, skip_git_repo_check)
+            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox)
+        finally:
+            if schema_path is not None:
+                try:
+                    os.remove(schema_path)
+                except OSError:
+                    pass
+
         self._audit(result, timestamp)
         return result
 
@@ -259,21 +294,39 @@ class CodexWorker:
     # Command construction (no shell=True, no string composition)
     # ------------------------------------------------------------------
 
-    def _build_command(self, task: str, working_dir: str, sandbox: str) -> list[str]:
+    def _build_command(
+        self,
+        task: str,
+        working_dir: str,
+        sandbox: str,
+        schema_path: str | None = None,
+        skip_git_repo_check: bool = False,
+    ) -> list[str]:
         cmd = [
             self.codex_bin,
             "exec",
             "--ephemeral",
             "--json",
-            "--sandbox", sandbox,
             "-C", working_dir,
         ]
-        # --approve-for-me is only compatible with workspace-write.
+        if skip_git_repo_check:
+            cmd.append("--skip-git-repo-check")
+        # --approve-for-me is only compatible with workspace-write, and the
+        # installed Codex CLI rejects `--sandbox` when `--approve-for-me` is
+        # also given ("cannot be used with '--approve-for-me'") because
+        # --approve-for-me already routes approvals through the
+        # workspace-write sandbox. So for workspace-write we pass only
+        # --approve-for-me (never --sandbox); for every other mode we pass
+        # --sandbox and never --approve-for-me.
         # In read-only mode, writes are blocked outright (no approval dialog).
         # In danger-full-access mode, use --dangerously-bypass-approvals-and-sandbox
         # only when explicitly requested; we do not set it by default.
         if sandbox == "workspace-write":
             cmd.append("--approve-for-me")
+        else:
+            cmd += ["--sandbox", sandbox]
+        if schema_path is not None:
+            cmd += ["--output-schema", schema_path]
         cmd += ["--", task]
         return cmd
 
@@ -346,7 +399,7 @@ class CodexWorker:
                 error=proc_error,
             )
 
-        thread_id, final_message, usage = _parse_jsonl(stdout_capped)
+        thread_id, final_message, usage = _parse_jsonl(stdout_raw)
         success = (exit_code == 0)
 
         return CodexResult(

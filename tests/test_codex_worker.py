@@ -4,6 +4,7 @@ All tests use a fake subprocess runner — no real Codex calls, no quota used.
 """
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -81,6 +82,48 @@ class ParseJsonlTests(unittest.TestCase):
         ])
         _, msg, _ = _parse_jsonl(lines)
         self.assertEqual(msg, "last")
+
+    def test_selects_correct_final_message_amid_multiple_event_types(self):
+        # Real Codex JSONL streams interleave thread/turn lifecycle events,
+        # command_execution tool-call items, and agent_message items. Only
+        # the last item.completed agent_message text must be used.
+        lines = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "tid-1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "planning..."}}),
+            json.dumps({"type": "item.started", "item": {"id": "item_1", "type": "command_execution", "command": "ls", "status": "in_progress"}}),
+            json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": "ls", "aggregated_output": "file.txt", "exit_code": 0, "status": "completed"}}),
+            json.dumps({"type": "item.completed", "item": {"id": "item_2", "type": "agent_message", "text": '{"title": "final"}'}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 1}}),
+        ])
+        thread_id, msg, usage = _parse_jsonl(lines)
+        self.assertEqual(thread_id, "tid-1")
+        self.assertEqual(msg, '{"title": "final"}')
+        self.assertEqual(usage["input_tokens"], 5)
+
+    def test_command_execution_items_never_become_final_message(self):
+        lines = "\n".join([
+            json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "real answer"}}),
+            json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": "cat secret.txt", "aggregated_output": "should not be final_message", "exit_code": 0}}),
+        ])
+        _, msg, _ = _parse_jsonl(lines)
+        self.assertEqual(msg, "real answer")
+
+    def test_reasoning_items_never_become_final_message(self):
+        # Some Codex versions may emit reasoning/thinking items with their
+        # own "type" (e.g. "reasoning"); these must never be treated as the
+        # final agent response even if they carry a "text" field.
+        lines = "\n".join([
+            json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning", "text": "thinking about it..."}}),
+            json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "actual final answer"}}),
+        ])
+        _, msg, _ = _parse_jsonl(lines)
+        self.assertEqual(msg, "actual final answer")
+
+    def test_reasoning_only_stream_yields_no_final_message(self):
+        lines = json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning", "text": "just thinking"}})
+        _, msg, _ = _parse_jsonl(lines)
+        self.assertIsNone(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +221,36 @@ class SuccessfulRunTests(unittest.TestCase):
         self.assertIsNone(result.error)
 
     @patch("subprocess.run")
+    def test_usage_preserved_when_stdout_exceeds_max_output_bytes(self, mock_run):
+        # Regression test: a long-running, tool-heavy phase (e.g. research
+        # investigation with many command_execution events) can easily
+        # produce raw stdout larger than max_output_bytes. The trailing
+        # turn.completed event (which carries usage) must still be parsed
+        # from the *full* stdout, not from the truncated copy that is
+        # stored/displayed.
+        worker = _make_worker(allowed_roots=(self.tmp.name,), max_output_bytes=200)
+        noise_line = json.dumps({
+            "type": "item.completed",
+            "item": {"id": "noise", "type": "agent_message", "text": "x" * 500},
+        })
+        full_stdout = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "tid-big"}),
+            noise_line,
+            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "final answer"}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 999, "output_tokens": 42}}),
+        ])
+        self.assertGreater(len(full_stdout.encode("utf-8")), 200)
+        mock_run.return_value = _completed_proc(stdout=full_stdout, returncode=0)
+
+        result = worker.run("investigate", self.tmp.name)
+
+        self.assertEqual(result.usage, {"input_tokens": 999, "output_tokens": 42})
+        self.assertEqual(result.final_message, "final answer")
+        # The *stored* stdout is still capped, even though usage/parsing
+        # used the full, untruncated stream.
+        self.assertTrue(result.stdout_truncated)
+
+    @patch("subprocess.run")
     def test_command_built_without_shell(self, mock_run):
         mock_run.return_value = _completed_proc(stdout=SAMPLE_JSONL)
         self.worker.run("task", self.tmp.name)
@@ -224,6 +297,118 @@ class SuccessfulRunTests(unittest.TestCase):
         self.assertIn("--", cmd)
         sep_idx = cmd.index("--")
         self.assertEqual(cmd[sep_idx + 1], task)
+
+    # ------------------------------------------------------------------
+    # output_schema (native structured output support)
+    # ------------------------------------------------------------------
+
+    @patch("subprocess.run")
+    def test_no_output_schema_flag_when_schema_is_none(self, mock_run):
+        mock_run.return_value = _completed_proc(stdout=SAMPLE_JSONL)
+        self.worker.run("task", self.tmp.name)
+
+        cmd = mock_run.call_args[0][0]
+        self.assertNotIn("--output-schema", cmd)
+
+    @patch("subprocess.run")
+    def test_output_schema_flag_present_only_when_schema_given(self, mock_run):
+        mock_run.return_value = _completed_proc(stdout=SAMPLE_JSONL)
+        schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+        self.worker.run("task", self.tmp.name, output_schema=schema)
+
+        cmd = mock_run.call_args[0][0]
+        self.assertIn("--output-schema", cmd)
+        idx = cmd.index("--output-schema")
+        schema_path = cmd[idx + 1]
+        self.assertTrue(os.path.isabs(schema_path))
+
+    @patch("subprocess.run")
+    def test_schema_file_contains_expected_json(self, mock_run):
+        captured_path = {}
+
+        def fake_run(cmd, **kwargs):
+            if "--output-schema" in cmd:
+                idx = cmd.index("--output-schema")
+                path = cmd[idx + 1]
+                with open(path) as f:
+                    captured_path["content"] = json.load(f)
+            return _completed_proc(stdout=SAMPLE_JSONL)
+
+        mock_run.side_effect = fake_run
+        schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+        self.worker.run("task", self.tmp.name, output_schema=schema)
+
+        self.assertEqual(captured_path["content"], schema)
+
+    @patch("subprocess.run")
+    def test_schema_file_removed_after_successful_run(self, mock_run):
+        captured_path = {}
+
+        def fake_run(cmd, **kwargs):
+            if "--output-schema" in cmd:
+                idx = cmd.index("--output-schema")
+                captured_path["path"] = cmd[idx + 1]
+            return _completed_proc(stdout=SAMPLE_JSONL)
+
+        mock_run.side_effect = fake_run
+        schema = {"type": "object"}
+        self.worker.run("task", self.tmp.name, output_schema=schema)
+
+        self.assertFalse(os.path.exists(captured_path["path"]))
+
+    @patch("subprocess.run")
+    def test_schema_file_removed_after_timeout(self, mock_run):
+        captured_path = {}
+
+        def fake_run(cmd, **kwargs):
+            if "--output-schema" in cmd:
+                idx = cmd.index("--output-schema")
+                captured_path["path"] = cmd[idx + 1]
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+
+        mock_run.side_effect = fake_run
+        schema = {"type": "object"}
+        result = self.worker.run("task", self.tmp.name, output_schema=schema, timeout_seconds=1)
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(os.path.exists(captured_path["path"]))
+
+    # ------------------------------------------------------------------
+    # skip_git_repo_check (required for isolated, non-git scratch dirs)
+    # ------------------------------------------------------------------
+
+    @patch("subprocess.run")
+    def test_no_skip_git_repo_check_flag_by_default(self, mock_run):
+        mock_run.return_value = _completed_proc(stdout=SAMPLE_JSONL)
+        self.worker.run("task", self.tmp.name)
+
+        cmd = mock_run.call_args[0][0]
+        self.assertNotIn("--skip-git-repo-check", cmd)
+
+    @patch("subprocess.run")
+    def test_skip_git_repo_check_flag_present_when_requested(self, mock_run):
+        mock_run.return_value = _completed_proc(stdout=SAMPLE_JSONL)
+        self.worker.run("task", self.tmp.name, skip_git_repo_check=True)
+
+        cmd = mock_run.call_args[0][0]
+        self.assertIn("--skip-git-repo-check", cmd)
+
+    @patch("subprocess.run")
+    def test_schema_file_removed_after_exception(self, mock_run):
+        captured_path = {}
+
+        def fake_run(cmd, **kwargs):
+            if "--output-schema" in cmd:
+                idx = cmd.index("--output-schema")
+                captured_path["path"] = cmd[idx + 1]
+            raise OSError("boom")
+
+        mock_run.side_effect = fake_run
+        schema = {"type": "object"}
+        result = self.worker.run("task", self.tmp.name, output_schema=schema)
+
+        self.assertIsNotNone(result.error)
+        self.assertFalse(os.path.exists(captured_path["path"]))
 
 
 # ---------------------------------------------------------------------------

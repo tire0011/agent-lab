@@ -92,15 +92,94 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             error TEXT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS experiments (
+            id TEXT PRIMARY KEY,
+            goal TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            selection_started_at TEXT NULL,
+            selection_ended_at TEXT NULL,
+            research_task_id TEXT NULL,
+            research_started_at TEXT NULL,
+            research_ended_at TEXT NULL,
+            research_runtime_ms INTEGER NULL,
+            research_usage_json TEXT NULL,
+            research_raw_summary TEXT NULL,
+            research_diagnostic_log TEXT NULL,
+            implementation_started_at TEXT NULL,
+            implementation_ended_at TEXT NULL,
+            ended_at TEXT NULL,
+            plan_json TEXT NULL,
+            worktree_path TEXT NULL,
+            branch_name TEXT NULL,
+            selection_task_id TEXT NULL,
+            reformat_retry_task_id TEXT NULL,
+            reformat_retry_runtime_ms INTEGER NULL,
+            reformat_retry_usage_json TEXT NULL,
+            policy_replan_task_id TEXT NULL,
+            policy_replan_runtime_ms INTEGER NULL,
+            policy_replan_usage_json TEXT NULL,
+            selection_raw_message TEXT NULL,
+            reformat_raw_message TEXT NULL,
+            policy_replan_raw_message TEXT NULL,
+            selection_diagnostic_log TEXT NULL,
+            reformat_diagnostic_log TEXT NULL,
+            policy_replan_diagnostic_log TEXT NULL,
+            implementation_task_id TEXT NULL,
+            selection_runtime_ms INTEGER NULL,
+            implementation_runtime_ms INTEGER NULL,
+            selection_usage_json TEXT NULL,
+            implementation_usage_json TEXT NULL,
+            test_command_json TEXT NULL,
+            test_exit_code INTEGER NULL,
+            test_output TEXT NULL,
+            git_status TEXT NULL,
+            diff_stat TEXT NULL,
+            diff_text TEXT NULL,
+            error TEXT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_tool_calls_run_id ON tool_calls(run_id);
         CREATE INDEX IF NOT EXISTS idx_model_prices_lookup ON model_prices(provider, model, valid_from);
         CREATE INDEX IF NOT EXISTS idx_codex_tasks_created_at ON codex_tasks(created_at);
         CREATE INDEX IF NOT EXISTS idx_codex_tasks_status ON codex_tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_experiments_created_at ON experiments(created_at);
+        CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
         """
     )
+    _migrate_experiments_columns(conn)
     conn.commit()
     return conn
+
+
+# Columns that may be missing on an already-existing ``experiments`` table
+# (created by an older version of this module). ``CREATE TABLE IF NOT
+# EXISTS`` never retroactively adds columns, so any new, additive columns
+# must be migrated in explicitly via ``ALTER TABLE ... ADD COLUMN``.
+_EXPERIMENTS_ADDITIVE_COLUMNS = [
+    ("research_task_id", "TEXT"),
+    ("research_started_at", "TEXT"),
+    ("research_ended_at", "TEXT"),
+    ("research_runtime_ms", "INTEGER"),
+    ("research_usage_json", "TEXT"),
+    ("research_raw_summary", "TEXT"),
+    ("research_diagnostic_log", "TEXT"),
+    ("policy_replan_task_id", "TEXT"),
+    ("policy_replan_runtime_ms", "INTEGER"),
+    ("policy_replan_usage_json", "TEXT"),
+    ("policy_replan_raw_message", "TEXT"),
+    ("policy_replan_diagnostic_log", "TEXT"),
+]
+
+
+def _migrate_experiments_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(experiments)")}
+    for column_name, column_type in _EXPERIMENTS_ADDITIVE_COLUMNS:
+        if column_name not in existing:
+            conn.execute(
+                f"ALTER TABLE experiments ADD COLUMN {column_name} {column_type} NULL"
+            )
 
 
 def get_applicable_price(

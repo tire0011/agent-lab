@@ -157,6 +157,17 @@ class RunTaskSuccessTests(CodexTaskServiceTestCase):
             timeout_seconds=99,
         )
 
+    def test_public_api_does_not_pass_output_schema(self):
+        # The public /codex/tasks API must remain unaffected by the
+        # experiment service's structured output_schema feature: no
+        # output_schema kwarg is ever passed to the worker here.
+        self.worker.run.return_value = _make_result()
+        task = self.service.create_task(prompt="do the thing", working_dir="/agent", sandbox="read-only")
+        self.service.run_task(task.id)
+
+        call_kwargs = self.worker.run.call_args.kwargs
+        self.assertNotIn("output_schema", call_kwargs)
+
 
 class RunTaskFailureTests(CodexTaskServiceTestCase):
     def test_worker_error_yields_failed(self):
