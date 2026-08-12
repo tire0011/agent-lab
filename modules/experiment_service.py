@@ -27,9 +27,10 @@ attempt end to end:
      the worktree directory only (a worker instance whose ``allowed_roots``
      is limited to that single path). The prompt is built entirely from the
      reviewed plan; no free-form client prompt can reach this phase.
-  5. Verification — ``git status --short``, ``git diff --stat``,
-     ``git diff``, and ``git diff --check`` are captured for the worktree
-     (all via fixed ``subprocess`` argument lists, never ``shell=True``).
+  5. Verification — ``git status --short`` and a combined diff against
+     ``HEAD`` are captured for the worktree. The diff uses an isolated
+     temporary index so tracked and untracked changes are included without
+     modifying the real index (all Git calls use fixed argument lists).
      A test command is chosen only from a small server-side allowlist; if
      none applies, the experiment becomes ``needs_review`` instead of being
      scored as successful.
@@ -43,6 +44,7 @@ subprocess/worker logic) and the existing SQLite store from
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -1187,7 +1189,12 @@ def _build_implementation_prompt(plan: ExperimentPlan) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _run_git(args: list[str], cwd: str, timeout: int = 60) -> subprocess.CompletedProcess:
+def _run_git(
+    args: list[str],
+    cwd: str,
+    timeout: int = 60,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
         cwd=cwd,
@@ -1195,6 +1202,7 @@ def _run_git(args: list[str], cwd: str, timeout: int = 60) -> subprocess.Complet
         text=True,
         timeout=timeout,
         shell=False,
+        env=env,
     )
 
 
@@ -1790,9 +1798,34 @@ class ExperimentService:
     def _verify(self, experiment_id: str, worktree_path: str) -> Experiment:
         try:
             status_proc = _run_git(["status", "--short"], cwd=worktree_path)
-            stat_proc = _run_git(["diff", "--stat"], cwd=worktree_path)
-            diff_proc = _run_git(["diff"], cwd=worktree_path)
-            check_proc = _run_git(["diff", "--check"], cwd=worktree_path)
+            with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
+                index_env = dict(os.environ)
+                index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
+                read_tree_proc = _run_git(
+                    ["read-tree", "HEAD"], cwd=worktree_path, env=index_env
+                )
+                add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env)
+                if read_tree_proc.returncode != 0 or add_proc.returncode != 0:
+                    failed_proc = read_tree_proc if read_tree_proc.returncode != 0 else add_proc
+                    raise subprocess.CalledProcessError(
+                        failed_proc.returncode,
+                        failed_proc.args,
+                        output=failed_proc.stdout,
+                        stderr=failed_proc.stderr,
+                    )
+                stat_proc = _run_git(
+                    ["diff", "--cached", "--stat", "HEAD"],
+                    cwd=worktree_path,
+                    env=index_env,
+                )
+                diff_proc = _run_git(
+                    ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env
+                )
+                check_proc = _run_git(
+                    ["diff", "--cached", "--check", "HEAD"],
+                    cwd=worktree_path,
+                    env=index_env,
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             self._force_status(
                 experiment_id, STATUS_NEEDS_REVIEW,

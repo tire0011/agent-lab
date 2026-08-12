@@ -461,6 +461,44 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertIsNotNone(result.test_command)
         self.assertIsNotNone(result.test_output)
 
+    def test_untracked_file_is_in_combined_diff_without_changing_real_index(self):
+        untracked_path = "new_experiment_file.txt"
+        untracked_contents = "new untracked contents\nsecond line\n"
+        index_before: bytes | None = None
+        index_path: Path | None = None
+
+        def factory(path):
+            nonlocal index_before, index_path
+            git_index = subprocess.run(
+                ["git", "-C", path, "rev-parse", "--git-path", "index"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            index_path = Path(git_index)
+            if not index_path.is_absolute():
+                index_path = Path(path) / index_path
+            index_before = index_path.read_bytes()
+            Path(path, untracked_path).write_text(untracked_contents)
+            return self.implementation_worker
+
+        self.service.worker_factory = factory
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+
+        self.assertIn(f"?? {untracked_path}", result.git_status or "")
+        self.assertIn(untracked_path, result.diff_stat or "")
+        self.assertIn(f"+++ b/{untracked_path}", result.diff_text or "")
+        self.assertIn("+new untracked contents", result.diff_text or "")
+        self.assertEqual(index_path.read_bytes(), index_before)
+
+        reloaded = self.service.get_experiment(experiment.id)
+        self.assertEqual(reloaded.diff_stat, result.diff_stat)
+        self.assertEqual(reloaded.diff_text, result.diff_text)
+        serialized = reloaded.to_dict()
+        self.assertIn(untracked_path, serialized["diff_stat"])
+        self.assertIn("+new untracked contents", serialized["diff_text"])
+
     def test_usage_of_both_phases_persisted(self):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
@@ -729,10 +767,8 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
         def factory2(path):
             self.worker_factory_calls_large.append(path)
-            # Simulate the implementation phase modifying a tracked file
-            # directly, since our fake worker doesn't actually invoke Codex.
-            # Untracked files would not show up in `git diff`.
-            Path(path, "TODO.md").write_text("# TODO\n\n" + ("x" * 5000) + "\n")
+            # Exercise the cap on newly included untracked-file content.
+            Path(path, "large_untracked.txt").write_text(("x" * 5000) + "\n")
             return self.implementation_worker
 
         svc.worker_factory = factory2
