@@ -102,6 +102,10 @@
 - [ ] Evaluate candidate against a fixed baseline.
 - [ ] Accept only improvements that pass quality/cost/runtime gates; otherwise rollback.
 - [ ] Persist experiment hypothesis, change, metrics, result, decision, and cost.
+- [ ] Fix the experiment diff collector to also detect and include new,
+      untracked files (not only modifications to tracked files), so
+      newly created files show up in the stored diff/diff_stat and are
+      available for evaluation and reports.
 
 ### Test isolation / second VM
 
