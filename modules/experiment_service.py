@@ -64,6 +64,12 @@ from modules.run_store import DEFAULT_DB_PATH, init_db
 # Status constants — small deterministic state machine.
 # ---------------------------------------------------------------------------
 
+_NEXUS_IDENTITY_PROMPT = """You are operating as a reasoning and execution worker for Nexus, the persistent agent system. This task originates from Nexus unless explicitly marked as a human instruction. Refer to the acting system as "Nexus", not as "the user". You are not independently Nexus; you are temporarily working on Nexus's behalf."""
+
+def _with_nexus_identity(prompt: str) -> str:
+    return f"{_NEXUS_IDENTITY_PROMPT}\n\n{prompt}"
+
+
 STATUS_QUEUED = "queued"
 STATUS_SELECTING = "selecting"
 STATUS_REJECTED = "rejected"
@@ -998,7 +1004,7 @@ and no code fence.
 
 
 def _build_research_prompt(goal: str) -> str:
-    return _RESEARCH_PROMPT_TEMPLATE.format(goal=goal)
+    return _with_nexus_identity(_RESEARCH_PROMPT_TEMPLATE.format(goal=goal))
 
 
 # ---------------------------------------------------------------------------
@@ -1050,7 +1056,9 @@ in "motivation" (still exactly one JSON object and nothing else).
 
 
 def _build_plan_prompt(goal: str, research_summary: str) -> str:
-    return _PLAN_PROMPT_TEMPLATE.format(goal=goal, research_summary=research_summary)
+    return _with_nexus_identity(
+        _PLAN_PROMPT_TEMPLATE.format(goal=goal, research_summary=research_summary)
+    )
 
 
 _REFORMAT_RETRY_PROMPT_TEMPLATE = """Reformat the previous plan as exactly one JSON object matching this schema. Do not select or modify the feature. Output JSON only.
@@ -1071,7 +1079,9 @@ prose, no markdown code fence, no explanation outside the JSON.
 
 
 def _build_reformat_retry_prompt(previous_output: str) -> str:
-    return _REFORMAT_RETRY_PROMPT_TEMPLATE.format(previous_output=previous_output)
+    return _with_nexus_identity(
+        _REFORMAT_RETRY_PROMPT_TEMPLATE.format(previous_output=previous_output)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1141,11 +1151,13 @@ where "title" is exactly "NONE" and briefly explain why in "motivation"
 def _build_policy_replan_prompt(
     goal: str, research_summary: str, rejected_plan_json: str, rejection_reason: str
 ) -> str:
-    return _POLICY_REPLAN_PROMPT_TEMPLATE.format(
-        goal=goal,
-        research_summary=research_summary,
-        rejected_plan_json=rejected_plan_json,
-        rejection_reason=rejection_reason,
+    return _with_nexus_identity(
+        _POLICY_REPLAN_PROMPT_TEMPLATE.format(
+            goal=goal,
+            research_summary=research_summary,
+            rejected_plan_json=rejected_plan_json,
+            rejection_reason=rejection_reason,
+        )
     )
 
 
@@ -1174,13 +1186,15 @@ Instructions:
 
 
 def _build_implementation_prompt(plan: ExperimentPlan) -> str:
-    return _IMPLEMENTATION_PROMPT_TEMPLATE.format(
-        title=plan.title,
-        motivation=plan.motivation,
-        affected_files=", ".join(plan.affected_files),
-        expected_changes=plan.expected_changes,
-        success_criteria=plan.success_criteria,
-        planned_tests=plan.planned_tests,
+    return _with_nexus_identity(
+        _IMPLEMENTATION_PROMPT_TEMPLATE.format(
+            title=plan.title,
+            motivation=plan.motivation,
+            affected_files=", ".join(plan.affected_files),
+            expected_changes=plan.expected_changes,
+            success_criteria=plan.success_criteria,
+            planned_tests=plan.planned_tests,
+        )
     )
 
 
