@@ -2,6 +2,12 @@
 
 Purpose: enable any future AI agent to continue this project without prior chat history.
 
+## Identity
+
+The persistent agent system is named **Nexus**. Read `NEXUS.md` before acting.
+Codex, Copilot, and other LLMs are workers acting on Nexus's behalf, not human
+users and not independent persistent identities.
+
 ## Mission
 
 Build and evaluate a distributed self-improving LLM agent system under strict budget limits.
