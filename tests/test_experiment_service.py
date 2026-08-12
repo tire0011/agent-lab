@@ -31,6 +31,7 @@ from modules.experiment_service import (
     ExperimentNotRunnableError,
     ExperimentService,
     _build_plan_prompt,
+    _build_implementation_prompt,
     _build_policy_replan_prompt,
     _build_reformat_retry_prompt,
     _build_research_prompt,
@@ -1749,6 +1750,26 @@ class DiagnosticLogPipelineTestCase(unittest.TestCase):
         result = self.service.run_experiment(experiment.id)
 
         self.assertNotIn("sk-verysecretvalue1234", result.selection_diagnostic_log or "")
+
+
+class NexusIdentityPromptTestCase(unittest.TestCase):
+    def test_all_llm_prompts_identify_nexus(self):
+        plan = parse_plan(VALID_PLAN_JSON)
+        prompts = [
+            _build_research_prompt("goal"),
+            _build_plan_prompt("goal", "research"),
+            _build_reformat_retry_prompt(VALID_PLAN_JSON),
+            _build_policy_replan_prompt(
+                "goal", "research", VALID_PLAN_JSON, "reason"
+            ),
+            _build_implementation_prompt(plan),
+        ]
+        for prompt in prompts:
+            with self.subTest(prompt=prompt[:80]):
+                self.assertTrue(prompt.startswith("You are operating"))
+                self.assertIn("worker for Nexus", prompt)
+                self.assertIn('not as "the user"', prompt)
+                self.assertIn("not independently Nexus", prompt)
 
 
 class ResearchPromptRequirementsTestCase(unittest.TestCase):
