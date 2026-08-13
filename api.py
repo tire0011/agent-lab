@@ -1,8 +1,12 @@
 import os
 import re
+import subprocess
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -22,6 +26,8 @@ from modules.mailbox_task_service import (
     MailboxTaskWorker,
 )
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
+from modules import redaction
+from modules.run_store import calculate_estimated_cost, get_applicable_price
 from models import (
     DiagnosticActivityResponse,
     ChatRequest,
@@ -39,12 +45,21 @@ from models import (
     MailboxTaskApproval,
     MailboxTaskApprovalsResponse,
     MailboxTaskRejectRequest,
+    PublicDiagnosticExperiment,
+    PublicDiagnosticMailboxStatus,
+    PublicDiagnosticMailboxTask,
+    PublicDiagnosticServiceStatus,
+    PublicDiagnosticsResponse,
     Problem,
     ProblemsResponse,
     PublicActivityResponse,
     PublicExperimentSummary,
     StatusResponse,
 )
+
+_PROCESS_START_TIME = time.time()
+
+
 
 # ---------------------------------------------------------------------------
 # Codex task API: fixed server-side execution boundaries.
@@ -417,15 +432,7 @@ def _public_phase(status: str | None) -> str:
 
 def _changed_file_names(git_status: str | None) -> list[str]:
     """Extract basenames only; public responses must never contain paths."""
-    names: list[str] = []
-    for line in (git_status or "").splitlines():
-        candidate = line[3:].strip() if len(line) > 3 else ""
-        if " -> " in candidate:
-            candidate = candidate.rsplit(" -> ", 1)[-1]
-        name = candidate.replace("\\", "/").rsplit("/", 1)[-1]
-        if name and re.fullmatch(r"[A-Za-z0-9_. -]{1,120}", name) and name not in names:
-            names.append(name)
-    return names[:100]
+    return redaction.changed_file_names(git_status)
 
 
 def _failure_reason(experiment) -> str | None:
@@ -484,29 +491,23 @@ def get_public_experiment(
     return _public_experiment(experiment, _mailbox_task_id(service, experiment.id))
 
 
-_SECRET_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)(\s*[:=]\s*|\s+)\S+"
-)
-_PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
+_SECRET_PATTERN = redaction._SECRET_PATTERN
+_PATH_PATTERN = redaction._PATH_PATTERN
 
 
 def _redact(text: str) -> str:
-    text = _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
-    text = _PATH_PATTERN.sub("[PATH]", text)
-    return text
+    return redaction.redact(text)
 
 
 def _diagnostic_lines(raw: str | None) -> list[str]:
     """Return bounded, redacted test diagnostics; never return raw output."""
-    lines = (raw or "").splitlines()[-100:]
-    return [_redact(line)[:500] for line in lines]
+    return redaction.bounded_lines(raw)
 
 
 def _sanitized_rejection_reason(raw: str | None) -> str | None:
     """Bounded, redacted single-line rejection/error reason for diagnostics."""
-    if not raw:
-        return None
-    return _redact(raw)[:500]
+    return redaction.sanitized_reason(raw)
+
 
 
 @app.get("/activity/public", response_model=PublicActivityResponse)
@@ -572,3 +573,190 @@ def list_activity(
             "test_output_lines": _diagnostic_lines(experiment.test_output),
         })
     return DiagnosticActivityResponse(count=len(diagnostics), activity=diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# GET /diagnostics/public — single public, strictly allowlisted endpoint for
+# remote diagnosis. Built exclusively from the explicit allowlist below;
+# never derived from a generic to_dict()/model_dump() of internal records.
+#
+# Excluded by construction (never touched by this handler): API keys,
+# tokens, credentials, headers, prompts/task bodies, environment variables,
+# source code/diffs/file contents, stack traces with internal paths, and
+# unrestricted/raw command output.
+# ---------------------------------------------------------------------------
+
+_DIAGNOSTICS_DEFAULT_LIMIT = 10
+_DIAGNOSTICS_MAX_LIMIT = 100
+
+
+@lru_cache(maxsize=1)
+def _git_revision() -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        revision = completed.stdout.strip()
+        return revision or None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _deployment_time() -> str | None:
+    """Process start time, used as a proxy for 'when this build was deployed'."""
+    try:
+        return datetime.fromtimestamp(_PROCESS_START_TIME, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except Exception:
+        return None
+
+
+def _phase_duration_ms(started_at: str | None, ended_at: str | None) -> int | None:
+    if not started_at or not ended_at:
+        return None
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+        return max(0, int((end - start).total_seconds() * 1000))
+    except (ValueError, TypeError):
+        return None
+
+
+def _experiment_lifecycle(experiment) -> list[dict[str, Any]]:
+    phases = (
+        ("research", experiment.research_started_at, experiment.research_ended_at),
+        ("selecting", experiment.selection_started_at, experiment.selection_ended_at),
+        ("implementing", experiment.implementation_started_at, experiment.implementation_ended_at),
+    )
+    lifecycle = []
+    for name, started_at, ended_at in phases:
+        if not started_at and not ended_at:
+            continue
+        lifecycle.append({
+            "phase": name,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_ms": _phase_duration_ms(started_at, ended_at),
+        })
+    return lifecycle
+
+
+def _aggregate_usage(experiment) -> dict[str, int] | None:
+    """Sum token usage across all phases; never returns raw prompts/messages."""
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    found = False
+    for usage in (
+        experiment.research_usage,
+        experiment.selection_usage,
+        experiment.reformat_retry_usage,
+        experiment.policy_replan_usage,
+        experiment.implementation_usage,
+    ):
+        if not usage:
+            continue
+        found = True
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        totals["input_tokens"] += input_tokens
+        totals["output_tokens"] += output_tokens
+        totals["total_tokens"] += int(usage.get("total_tokens", 0) or (input_tokens + output_tokens))
+    return totals if found else None
+
+
+def _estimated_cost(usage: dict[str, int] | None) -> dict[str, Any] | None:
+    """Best-effort estimated cost from configured model prices; omitted when unavailable."""
+    if not usage:
+        return None
+    provider = os.environ.get("AGENT_COST_PROVIDER", "azure")
+    model = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    try:
+        conn = get_experiment_service()._conn  # same shared connection/db as run_store
+        price = get_applicable_price(conn, provider, model, datetime.now(timezone.utc).isoformat())
+    except Exception:
+        price = None
+    if not price:
+        return {"status": "unavailable"}
+    cost = calculate_estimated_cost(
+        usage["input_tokens"],
+        usage["output_tokens"],
+        price["input_price_per_million_tokens"],
+        price["output_price_per_million_tokens"],
+    )
+    return {"status": "ok", "amount": round(cost, 6), "currency": price["currency"]}
+
+
+def _diagnostic_experiment(service: ExperimentService, experiment) -> PublicDiagnosticExperiment:
+    diagnostic_messages = []
+    for entry in service.list_activity(limit=20, experiment_id=experiment.id):
+        message = redaction.sanitized_reason(entry.get("message"))
+        if message:
+            diagnostic_messages.append(message)
+
+    usage = _aggregate_usage(experiment)
+    return PublicDiagnosticExperiment(
+        id=experiment.id,
+        mailbox_task_id=_mailbox_task_id(service, experiment.id),
+        phase=_public_phase(experiment.status),
+        status=experiment.status,
+        created_at=experiment.created_at,
+        ended_at=experiment.ended_at,
+        lifecycle=_experiment_lifecycle(experiment),
+        rejection_reason=redaction.sanitized_reason(experiment.error),
+        policy_rule=experiment.policy_rule,
+        test_command=redaction.test_command_name(experiment.test_command),
+        test_exit_code=experiment.test_exit_code,
+        failure_summary=_failure_reason(experiment),
+        changed_files=_changed_file_names(experiment.git_status),
+        diagnostic_messages=diagnostic_messages[:20],
+        usage=usage,
+        estimated_cost=_estimated_cost(usage),
+    )
+
+
+def _diagnostic_mailbox_task(approval) -> PublicDiagnosticMailboxTask:
+    return PublicDiagnosticMailboxTask(
+        id=approval.id,
+        status=approval.status,
+        received_at=approval.received_at,
+        experiment_id=approval.experiment_id,
+    )
+
+
+@app.get("/diagnostics/public", response_model=PublicDiagnosticsResponse)
+def get_public_diagnostics(
+    limit: int = Query(default=_DIAGNOSTICS_DEFAULT_LIMIT, ge=1, le=_DIAGNOSTICS_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+    mailbox_service: MailboxTaskService = Depends(get_mailbox_task_service),
+) -> PublicDiagnosticsResponse:
+    experiments = service.list_experiments(limit=limit)
+    diagnostic_experiments = [_diagnostic_experiment(service, exp) for exp in experiments]
+
+    try:
+        pending = mailbox_service.list_pending(limit=200)
+        recent = mailbox_service.list_recent(limit=limit)
+        mailbox_status = PublicDiagnosticMailboxStatus(
+            status="ok",
+            pending_count=len(pending),
+            latest_tasks=[_diagnostic_mailbox_task(a) for a in recent],
+        )
+    except Exception:
+        mailbox_status = PublicDiagnosticMailboxStatus(status="unavailable", pending_count=0, latest_tasks=[])
+
+    return PublicDiagnosticsResponse(
+        service=PublicDiagnosticServiceStatus(
+            status="ok",
+            git_revision=_git_revision(),
+            deployment_time=_deployment_time(),
+        ),
+        mailbox=mailbox_status,
+        experiments=diagnostic_experiments,
+        problems=list_problems(),
+    )
+

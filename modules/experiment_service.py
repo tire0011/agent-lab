@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.codex_worker import CodexResult, CodexWorker
+from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
 
 logger = logging.getLogger(__name__)
@@ -1539,7 +1540,7 @@ class ExperimentService:
                     event="status_changed",
                     from_status=from_status,
                     to_status=to_status,
-                    message=str(fields.get("error")) if fields.get("error") else None,
+                    message=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
                 )
         if moved:
             level = logging.WARNING if to_status in _WARNING_STATUSES else logging.INFO
@@ -1574,7 +1575,7 @@ class ExperimentService:
                 entity_id=experiment_id,
                 event="status_forced",
                 to_status=status,
-                message=str(fields.get("error")) if fields.get("error") else None,
+                message=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
             )
         level = logging.WARNING if status in _WARNING_STATUSES else logging.INFO
         logger.log(

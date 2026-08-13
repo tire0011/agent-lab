@@ -70,58 +70,42 @@ function Get-NexusLogs {
     journalctl @Arguments
 
     if ($Follow) {
-        # -f never returns; everything below (public activity, problems,
-        # authenticated details) only makes sense for a single snapshot.
+        # -f never returns; everything below (diagnostics, authenticated
+        # details) only makes sense for a single snapshot.
         return
     }
 
-    Write-Section 'Problems'
+    # Single public, strictly allowlisted endpoint: service/mailbox status,
+    # git revision/deployment time, latest experiments (full ids, lifecycle
+    # phases+durations, sanitized selection/rejection reason, matched policy
+    # rule, test command/exit code, changed files, bounded sanitized
+    # diagnostic messages, token usage/cost), and current problems. Never
+    # includes secrets, prompts, env data, diffs, or raw command output.
+    Write-Section 'Diagnostics (/diagnostics/public)'
+    $Diagnostics = $null
     try {
-        $Problems = Invoke-RestMethod -Uri "$ApiBaseUrl/problems" -TimeoutSec 10
-        $Problems | ConvertTo-Json -Depth 8
+        $Diagnostics = Invoke-RestMethod -Uri "$ApiBaseUrl/diagnostics/public?limit=$ExperimentCount" -TimeoutSec 10
+        $Diagnostics | ConvertTo-Json -Depth 8
     }
     catch {
-        Write-Host "GET /problems FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "GET /diagnostics/public FAILED: $($_.Exception.Message)" -ForegroundColor Red
     }
 
-    Write-Section 'Recent public activity'
-    $PublicActivity = $null
-    try {
-        $PublicActivity = Invoke-RestMethod -Uri "$ApiBaseUrl/activity/public" -TimeoutSec 10
-        $PublicActivity | ConvertTo-Json -Depth 8
-    }
-    catch {
-        Write-Host "GET /activity/public FAILED: $($_.Exception.Message)" -ForegroundColor Red
-    }
-
-    # Auto-discover the newest distinct experiment ids from public activity
+    # Auto-discover the newest experiment ids from the diagnostics response
     # (already newest-first). These are full experiment ids, but only an
     # 8+ char prefix is ever required by either the public or authenticated
     # /experiments/{id} endpoint, so a prefix is all we need downstream.
     $ExperimentIds = @()
-    if ($PublicActivity -and $PublicActivity.activity) {
+    if ($Diagnostics -and $Diagnostics.experiments) {
         $ExperimentIds = @(
-            $PublicActivity.activity |
-                Where-Object { $_.experiment_id } |
-                Select-Object -ExpandProperty experiment_id -Unique |
+            $Diagnostics.experiments |
+                Select-Object -ExpandProperty id -Unique |
                 Select-Object -First $ExperimentCount
         )
     }
 
-    if ($ExperimentIds.Count -gt 0) {
-        Write-Section "Newest experiments (auto-discovered, $($ExperimentIds.Count))"
-        foreach ($ExperimentId in $ExperimentIds) {
-            try {
-                $Public = Invoke-RestMethod -Uri "$ApiBaseUrl/experiments/$ExperimentId/public" -TimeoutSec 10
-                $Public | ConvertTo-Json -Depth 8
-            }
-            catch {
-                Write-Host "GET /experiments/$ExperimentId/public FAILED: $($_.Exception.Message)" -ForegroundColor Red
-            }
-        }
-    }
-    else {
-        Write-Host "No experiments discovered from /activity/public." -ForegroundColor Yellow
+    if ($ExperimentIds.Count -eq 0) {
+        Write-Host "No experiments discovered from /diagnostics/public." -ForegroundColor Yellow
     }
 
     if (-not $Details) {

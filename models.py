@@ -290,3 +290,66 @@ class PublicExperimentSummary(BaseModel):
     test_exit_code: int | None = None
     changed_files: list[str] = Field(default_factory=list)
     test_summary: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Public diagnostics model (GET /diagnostics/public)
+#
+# Every field here is drawn from an explicit allowlist assembled in api.py;
+# nothing is derived from a generic ``to_dict()``/``model_dump()`` call, so
+# adding a new internal field to ``Experiment`` or ``MailboxTaskApproval``
+# can never silently widen this public response.
+# ---------------------------------------------------------------------------
+
+
+class DiagnosticLifecyclePhase(BaseModel):
+    phase: str
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_ms: int | None = None
+
+
+class PublicDiagnosticMailboxTask(BaseModel):
+    id: str
+    status: str
+    received_at: str
+    experiment_id: str | None = None
+
+
+class PublicDiagnosticExperiment(BaseModel):
+    id: str
+    mailbox_task_id: str | None = None
+    phase: str
+    status: str
+    created_at: str
+    ended_at: str | None = None
+    lifecycle: list[DiagnosticLifecyclePhase] = Field(default_factory=list)
+    rejection_reason: str | None = None
+    policy_rule: str | None = None
+    test_command: str | None = None
+    test_exit_code: int | None = None
+    failure_summary: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    diagnostic_messages: list[str] = Field(default_factory=list)
+    usage: dict[str, int] | None = None
+    estimated_cost: dict[str, Any] | None = None
+
+
+class PublicDiagnosticServiceStatus(BaseModel):
+    status: str
+    git_revision: str | None = None
+    deployment_time: str | None = None
+
+
+class PublicDiagnosticMailboxStatus(BaseModel):
+    status: str
+    pending_count: int
+    latest_tasks: list[PublicDiagnosticMailboxTask] = Field(default_factory=list)
+
+
+class PublicDiagnosticsResponse(BaseModel):
+    service: PublicDiagnosticServiceStatus
+    mailbox: PublicDiagnosticMailboxStatus
+    experiments: list[PublicDiagnosticExperiment] = Field(default_factory=list)
+    problems: list[Problem] = Field(default_factory=list)
+

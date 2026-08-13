@@ -195,6 +195,40 @@ Authenticated `GET /activity` accepts `experiment_id` and `mailbox_task_id` filt
 and includes at most the final 100 sanitized test-output lines per event.
 Authenticated `GET /experiments/{id}` retains the detailed experiment diagnostics.
 
+## Nexus diagnostics API
+
+`GET /diagnostics/public` (optional `?limit=1..100`, default 10) is a single,
+unauthenticated endpoint that consolidates everything needed to remotely
+diagnose Nexus in one call. It is built exclusively from an explicit field
+allowlist — never from a generic serialization of internal records — and
+redaction is applied *before* persistence (in `modules/redaction.py`), so
+activity events stored in the database are already safe to return.
+
+**Public fields:**
+
+- `service`: `status`, `git_revision` (short commit hash), `deployment_time`.
+- `mailbox`: `status`, `pending_count`, `latest_tasks` (each: `id`, `status`,
+  `received_at`, `experiment_id` only — never `task_body`, `sender`, or
+  `file_path`).
+- `experiments` (newest first, up to `limit`), each with: `id` (full
+  experiment ID), `mailbox_task_id`, `phase`, `status`, `created_at`,
+  `ended_at`, `lifecycle` (per-phase `phase`/`started_at`/`ended_at`/
+  `duration_ms` for research, selecting, implementing), `rejection_reason`
+  (sanitized, bounded), `policy_rule` (matched safety-policy rule name),
+  `test_command` (a redacted command name, e.g. `python -m unittest`, never
+  raw argv with filesystem paths), `test_exit_code`, `failure_summary`,
+  `changed_files` (basenames only), `diagnostic_messages` (bounded,
+  sanitized activity-log messages), `usage` (aggregated token counts), and
+  `estimated_cost` (best-effort, present only when pricing data is
+  configured).
+- `problems`: the same sanitized summaries as `GET /problems`.
+
+**Never returned:** API keys, tokens, credentials, or headers; prompts or
+user-provided task bodies; environment variables; source code, diffs, or
+file contents; stack traces with internal paths; or unrestricted/raw
+command output. The website's Diagnostics card and
+`./scripts/nexus-logs.ps1` both display this same model.
+
 ## Security
 
 - Never commit credentials, API keys, private keys, or tokens.

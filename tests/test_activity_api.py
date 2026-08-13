@@ -27,6 +27,17 @@ def experiment(**changes):
         "git_status": " M modules/private/worker.py\n?? /tmp/raw/token.txt\n",
         "error": f"exception at /agent/private.py token={SECRET}",
         "policy_rule": None,
+        "research_started_at": "2026-08-13T11:58:00+00:00",
+        "research_ended_at": "2026-08-13T11:58:30+00:00",
+        "selection_started_at": "2026-08-13T11:58:30+00:00",
+        "selection_ended_at": "2026-08-13T11:59:00+00:00",
+        "implementation_started_at": "2026-08-13T11:59:00+00:00",
+        "implementation_ended_at": "2026-08-13T12:00:00+00:00",
+        "research_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        "selection_usage": {"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+        "reformat_retry_usage": None,
+        "policy_replan_usage": None,
+        "implementation_usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
     }
     values.update(changes)
     obj = SimpleNamespace(**values)
@@ -165,6 +176,13 @@ class ActivityApiTests(unittest.TestCase):
         self.assertIn("public-activity-content", html)
         self.assertIn('requestJson("/activity/public")', js)
         self.assertIn("setInterval(loadPublicActivity, 10000)", js)
+
+    def test_website_loads_diagnostics_every_ten_seconds(self):
+        html = self.client.get("/").text
+        js = self.client.get("/static/app.js").text
+        self.assertIn("diagnostics-content", html)
+        self.assertIn('requestJson("/diagnostics/public")', js)
+        self.assertIn("setInterval(loadDiagnostics, 10000)", js)
 
 
 if __name__ == "__main__":

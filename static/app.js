@@ -22,6 +22,8 @@ const elements = {
   messages: document.querySelector("#messages"),
   publicActivityCount: document.querySelector("#public-activity-count"),
   publicActivityContent: document.querySelector("#public-activity-content"),
+  diagnosticsCount: document.querySelector("#diagnostics-count"),
+  diagnosticsContent: document.querySelector("#diagnostics-content"),
 };
 
 async function requestJson(url, options = {}) {
@@ -179,6 +181,49 @@ async function loadPublicActivity() {
   } catch (error) {
     elements.publicActivityCount.textContent = "!";
     showError(elements.publicActivityContent, error.message);
+  }
+}
+
+function renderDiagnostics(data) {
+  elements.diagnosticsContent.replaceChildren();
+  const experiments = data.experiments || [];
+  if (!experiments.length) {
+    elements.diagnosticsContent.textContent = "Noch keine Experimente vorhanden.";
+    return;
+  }
+  const list = document.createElement("ul");
+  list.className = "item-list";
+  for (const item of experiments) {
+    const row = document.createElement("li");
+    const title = document.createElement("div");
+    title.className = "item-title";
+    title.textContent = `${item.phase} · Experiment ${item.id.slice(0, 8)}`;
+    const meta = document.createElement("div");
+    meta.className = "item-meta";
+    const details = [item.created_at];
+    if (item.policy_rule) details.push(`Regel: ${item.policy_rule}`);
+    if (item.rejection_reason) details.push(item.rejection_reason);
+    if (item.failure_summary) details.push(item.failure_summary);
+    if (item.test_command) details.push(item.test_command);
+    if (item.test_exit_code !== null && item.test_exit_code !== undefined) {
+      details.push(`Exit-Code ${item.test_exit_code}`);
+    }
+    if (item.changed_files.length) details.push(`Dateien: ${item.changed_files.join(", ")}`);
+    meta.textContent = details.join(" · ");
+    row.append(title, meta);
+    list.append(row);
+  }
+  elements.diagnosticsContent.append(list);
+}
+
+async function loadDiagnostics() {
+  try {
+    const data = await requestJson("/diagnostics/public");
+    elements.diagnosticsCount.textContent = String((data.experiments || []).length);
+    renderDiagnostics(data);
+  } catch (error) {
+    elements.diagnosticsCount.textContent = "!";
+    showError(elements.diagnosticsContent, error.message);
   }
 }
 
@@ -380,3 +425,5 @@ addMessage("Hallo! Ich beantworte Fragen zu Status, Problemen und Ideen.", "agen
 loadOverview();
 loadPublicActivity();
 setInterval(loadPublicActivity, 10000);
+loadDiagnostics();
+setInterval(loadDiagnostics, 10000);
