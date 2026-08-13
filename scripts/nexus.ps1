@@ -6,7 +6,17 @@ param(
     [ValidateRange(1, 1000)]
     [int]$Lines = 100,
 
-    [switch]$Follow
+    [switch]$Follow,
+
+    # When supplied on the 'logs' action, prompts for AGENT_API_KEY (never
+    # echoed, never written to disk) and additionally fetches authenticated
+    # diagnostic detail (phase, matched policy rule, test command/exit
+    # code, changed files, bounded test output) for the newest experiments
+    # auto-discovered from /activity/public.
+    [switch]$Details,
+
+    [ValidateRange(1, 20)]
+    [int]$ExperimentCount = 5
 )
 
 Set-StrictMode -Version Latest
@@ -48,6 +58,7 @@ function Get-NexusState {
 }
 
 function Get-NexusLogs {
+    Write-Section 'Journal'
     $Arguments = @(
         '-u', 'agent-api.service',
         '-u', 'nexus-mailbox.service',
@@ -57,6 +68,136 @@ function Get-NexusLogs {
     )
     if ($Follow) { $Arguments += '-f' }
     journalctl @Arguments
+
+    if ($Follow) {
+        # -f never returns; everything below (public activity, problems,
+        # authenticated details) only makes sense for a single snapshot.
+        return
+    }
+
+    Write-Section 'Problems'
+    try {
+        $Problems = Invoke-RestMethod -Uri "$ApiBaseUrl/problems" -TimeoutSec 10
+        $Problems | ConvertTo-Json -Depth 8
+    }
+    catch {
+        Write-Host "GET /problems FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    Write-Section 'Recent public activity'
+    $PublicActivity = $null
+    try {
+        $PublicActivity = Invoke-RestMethod -Uri "$ApiBaseUrl/activity/public" -TimeoutSec 10
+        $PublicActivity | ConvertTo-Json -Depth 8
+    }
+    catch {
+        Write-Host "GET /activity/public FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    # Auto-discover the newest distinct experiment ids from public activity
+    # (already newest-first). These are full experiment ids, but only an
+    # 8+ char prefix is ever required by either the public or authenticated
+    # /experiments/{id} endpoint, so a prefix is all we need downstream.
+    $ExperimentIds = @()
+    if ($PublicActivity -and $PublicActivity.activity) {
+        $ExperimentIds = @(
+            $PublicActivity.activity |
+                Where-Object { $_.experiment_id } |
+                Select-Object -ExpandProperty experiment_id -Unique |
+                Select-Object -First $ExperimentCount
+        )
+    }
+
+    if ($ExperimentIds.Count -gt 0) {
+        Write-Section "Newest experiments (auto-discovered, $($ExperimentIds.Count))"
+        foreach ($ExperimentId in $ExperimentIds) {
+            try {
+                $Public = Invoke-RestMethod -Uri "$ApiBaseUrl/experiments/$ExperimentId/public" -TimeoutSec 10
+                $Public | ConvertTo-Json -Depth 8
+            }
+            catch {
+                Write-Host "GET /experiments/$ExperimentId/public FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+    }
+    else {
+        Write-Host "No experiments discovered from /activity/public." -ForegroundColor Yellow
+    }
+
+    if (-not $Details) {
+        return
+    }
+
+    # --- Authenticated diagnostic detail -------------------------------
+    # Prompt for AGENT_API_KEY only now, only in-memory, never echoed and
+    # never written to disk/env/log. The plaintext copy is cleared as soon
+    # as the authenticated calls below are done.
+    Write-Section 'Authenticated diagnostics (-Details)'
+    $SecureApiKey = Read-Host -Prompt 'AGENT_API_KEY' -AsSecureString
+    $PlainApiKey = [System.Net.NetworkCredential]::new('', $SecureApiKey).Password
+    try {
+        if ([string]::IsNullOrEmpty($PlainApiKey)) {
+            Write-Host 'No API key entered; skipping authenticated diagnostics.' -ForegroundColor Yellow
+            return
+        }
+        $AuthHeaders = @{ 'x-api-key' = $PlainApiKey }
+
+        if ($ExperimentIds.Count -eq 0) {
+            Write-Host 'No experiments to inspect.' -ForegroundColor Yellow
+            return
+        }
+
+        foreach ($ExperimentId in $ExperimentIds) {
+            Write-Section "Experiment $ExperimentId"
+            try {
+                # /experiments/{id} accepts an unambiguous 8+ char prefix,
+                # matching the public endpoint, so the short id from
+                # /activity/public resolves to the full experiment id here.
+                $Full = Invoke-RestMethod -Uri "$ApiBaseUrl/experiments/$ExperimentId" -Headers $AuthHeaders -TimeoutSec 10
+                [pscustomobject]@{
+                    id                    = $Full.id
+                    status                = $Full.status
+                    policy_rule           = $Full.policy_rule
+                    test_command          = $Full.test_command
+                    test_exit_code        = $Full.test_exit_code
+                    created_at            = $Full.created_at
+                    ended_at              = $Full.ended_at
+                } | ConvertTo-Json -Depth 4
+            }
+            catch {
+                Write-Host "GET /experiments/$ExperimentId FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                continue
+            }
+
+            try {
+                $Diagnostics = Invoke-RestMethod -Uri "$ApiBaseUrl/activity?experiment_id=$ExperimentId&limit=10" -Headers $AuthHeaders -TimeoutSec 10
+                foreach ($Entry in $Diagnostics.activity) {
+                    [pscustomobject]@{
+                        timestamp         = $Entry.timestamp
+                        phase             = $Entry.phase
+                        from_status       = $Entry.from_status
+                        to_status         = $Entry.to_status
+                        policy_rule       = $Entry.policy_rule
+                        rejection_reason  = $Entry.rejection_reason
+                        test_command      = $Entry.test_command
+                        test_exit_code    = $Entry.test_exit_code
+                        changed_files     = $Entry.changed_files
+                        test_output_lines = $Entry.test_output_lines
+                    } | ConvertTo-Json -Depth 4
+                }
+            }
+            catch {
+                Write-Host "GET /activity FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+    }
+    finally {
+        # Best-effort in-memory cleanup; never persisted to disk or env.
+        $PlainApiKey = $null
+        $AuthHeaders = $null
+        Remove-Variable -Name PlainApiKey, SecureApiKey, AuthHeaders -ErrorAction SilentlyContinue
+        [System.GC]::Collect()
+    }
 }
 
 function Invoke-NexusMailbox {

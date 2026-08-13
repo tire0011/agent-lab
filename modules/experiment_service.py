@@ -44,6 +44,7 @@ subprocess/worker logic) and the existing SQLite store from
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -59,6 +60,16 @@ from typing import Any, Callable
 
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
+
+logger = logging.getLogger(__name__)
+
+# Statuses that represent a problem worth surfacing at WARNING level in the
+# journal (as opposed to ordinary forward progress, logged at INFO). Kept
+# as a small fixed set here so lifecycle logging in ``_transition``/
+# ``_force_status`` stays centralized and consistent.
+_WARNING_STATUSES = frozenset(
+    {"rejected", "failed", "timed_out", "needs_review"}
+)
 
 # ---------------------------------------------------------------------------
 # Status constants — small deterministic state machine.
@@ -609,6 +620,7 @@ class Experiment:
     diff_stat: str | None = None
     diff_text: str | None = None
     error: str | None = None
+    policy_rule: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -656,6 +668,7 @@ class Experiment:
             "diff_stat": self.diff_stat,
             "diff_text": self.diff_text,
             "error": self.error,
+            "policy_rule": self.policy_rule,
         }
 
 
@@ -708,6 +721,7 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         diff_stat=row["diff_stat"],
         diff_text=row["diff_text"],
         error=row["error"],
+        policy_rule=row["policy_rule"] if "policy_rule" in row.keys() else None,
     )
 
 
@@ -966,6 +980,47 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
             return f"plan references a path outside the repository: {path!r}"
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Policy rule classification — turns a free-text rejection reason (produced
+# by plan_violates_policy() or by the surrounding pipeline) into a short,
+# stable rule identifier. This never carries any plan-derived free text
+# (which could echo something from the model's own output); it is only a
+# fixed vocabulary word matched against the *known, hard-coded* reason
+# prefixes above, so it is always safe to log and to expose over the API.
+# ---------------------------------------------------------------------------
+_POLICY_RULE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("plan output could not be reliably parsed", "unparseable_plan"),
+    ("policy replan output could not be reliably parsed", "unparseable_plan"),
+    ("agent found no suitable improvement", "no_suitable_improvement"),
+    ("agent found no suitable alternative improvement", "no_suitable_improvement"),
+    ("plan mentions disallowed keyword", "disallowed_keyword"),
+    ("plan describes an actual infrastructure/deployment action", "infra_action"),
+    ("plan describes an actual secret/credential action", "secret_action"),
+    ("plan title looks like a placeholder/intention-only statement", "placeholder_title"),
+    ("plan does not touch any concrete code or test file", "documentation_only"),
+    ("plan touches too many files", "too_many_files"),
+    ("plan references a path outside the repository", "path_outside_repo"),
+    ("research phase timed out", "research_timed_out"),
+    ("plan phase timed out", "plan_timed_out"),
+    ("policy replan failed", "policy_replan_failed"),
+)
+
+
+def _policy_rule_for_reason(reason: str | None) -> str | None:
+    """Classify a rejection reason into a short, fixed policy-rule id.
+
+    Returns ``None`` when the reason does not match any known rule (e.g. an
+    upstream worker error message) rather than guessing.
+    """
+    if not reason:
+        return None
+    lowered = reason.lower()
+    for prefix, rule in _POLICY_RULE_PREFIXES:
+        if lowered.startswith(prefix):
+            return rule
+    return "policy_check_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -1346,6 +1401,7 @@ class ExperimentService:
             )
 
         self._implementation_timeout_seconds = timeout_seconds
+        logger.info("experiment %s created (status=%s)", experiment_id, STATUS_QUEUED)
         return self.get_experiment(experiment_id)
 
     # ------------------------------------------------------------------
@@ -1361,18 +1417,42 @@ class ExperimentService:
             raise ExperimentNotFoundError(f"no experiment with id {experiment_id!r}")
         return _row_to_experiment(row)
 
-    def resolve_public_experiment(self, experiment_id: str) -> Experiment:
-        """Resolve an exact id or a unique public prefix of at least 8 hex chars."""
+    def _resolve_by_prefix(self, experiment_id: str) -> Experiment:
+        """Resolve an exact id or an unambiguous >=8 hex-char id prefix.
+
+        Shared by both the public and the authenticated single-experiment
+        lookups so an operator can use the same short id (e.g. copied from
+        ``/activity/public`` or a log line) against either endpoint.
+        """
         if re.fullmatch(r"[0-9a-f]{8,64}", experiment_id) is None:
-            raise ExperimentNotFoundError("invalid public experiment id")
+            raise ExperimentNotFoundError("invalid experiment id")
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM experiments WHERE id LIKE ? ORDER BY id LIMIT 2",
                 (experiment_id + "%",),
             ).fetchall()
         if len(rows) != 1:
-            raise ExperimentNotFoundError("public experiment id is missing or ambiguous")
+            raise ExperimentNotFoundError("experiment id is missing or ambiguous")
         return _row_to_experiment(rows[0])
+
+    def resolve_public_experiment(self, experiment_id: str) -> Experiment:
+        """Resolve an exact id or a unique public prefix of at least 8 hex chars."""
+        return self._resolve_by_prefix(experiment_id)
+
+    def resolve_experiment(self, experiment_id: str) -> Experiment:
+        """Authenticated equivalent of ``resolve_public_experiment``.
+
+        Accepts either a full experiment id or an unambiguous >=8 hex-char
+        prefix, exactly like the public endpoint, so an operator holding
+        only a short id (e.g. from ``/activity/public``) can still look up
+        full authenticated detail without first resolving it elsewhere.
+        Falls back to an exact-id lookup for ids that don't look like a
+        valid hex prefix (e.g. legacy/non-hex ids), preserving the previous
+        ``get_experiment`` behavior for exact matches.
+        """
+        if re.fullmatch(r"[0-9a-f]{8,64}", experiment_id) is not None:
+            return self._resolve_by_prefix(experiment_id)
+        return self.get_experiment(experiment_id)
 
     def list_experiments(self, limit: int = 20) -> list[Experiment]:
         if limit <= 0:
@@ -1449,6 +1529,16 @@ class ExperimentService:
                     to_status=to_status,
                     message=str(fields.get("error")) if fields.get("error") else None,
                 )
+        if moved:
+            level = logging.WARNING if to_status in _WARNING_STATUSES else logging.INFO
+            logger.log(
+                level,
+                "experiment %s: %s -> %s%s",
+                experiment_id,
+                from_status,
+                to_status,
+                f" (policy_rule={fields['policy_rule']})" if fields.get("policy_rule") else "",
+            )
         return moved
 
     def _force_status(self, experiment_id: str, status: str, **fields: Any) -> None:
@@ -1474,6 +1564,14 @@ class ExperimentService:
                 to_status=status,
                 message=str(fields.get("error")) if fields.get("error") else None,
             )
+        level = logging.WARNING if status in _WARNING_STATUSES else logging.INFO
+        logger.log(
+            level,
+            "experiment %s: forced -> %s%s",
+            experiment_id,
+            status,
+            f" (policy_rule={fields['policy_rule']})" if fields.get("policy_rule") else "",
+        )
 
     # ------------------------------------------------------------------
     # run_experiment — the whole pipeline, single entry point
@@ -1777,6 +1875,7 @@ class ExperimentService:
                 experiment_id, STATUS_SELECTING, STATUS_REJECTED,
                 ended_at=_utcnow_iso(),
                 error=rejection_reason,
+                policy_rule=_policy_rule_for_reason(rejection_reason),
                 **common_selection_fields,
             )
             return self.get_experiment(experiment_id)

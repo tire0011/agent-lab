@@ -221,6 +221,7 @@ class ExperimentDetail(BaseModel):
     diff_stat: str | None = None
     diff_text: str | None = None
     error: str | None = None
+    policy_rule: str | None = None
 
 
 class ExperimentsResponse(BaseModel):
@@ -246,7 +247,12 @@ class ActivityResponse(BaseModel):
 
 class DiagnosticActivityEntry(ActivityEntry):
     mailbox_task_id: str | None = None
+    phase: str | None = None
+    policy_rule: str | None = None
+    rejection_reason: str | None = None
+    test_command: list[str] | None = None
     test_exit_code: int | None = None
+    changed_files: list[str] = Field(default_factory=list)
     test_output_lines: list[str] = Field(default_factory=list)
 
 

@@ -21,10 +21,12 @@ def experiment(**changes):
         "status": "failed",
         "created_at": "2026-08-13T12:00:00+00:00",
         "ended_at": "2026-08-13T12:01:00+00:00",
+        "test_command": ["/agent/.venv/bin/python", "-m", "unittest", "discover", "-s", "tests"],
         "test_exit_code": 1,
         "test_output": f"API_KEY={SECRET}\n/agent/private/file.py failed\nAssertionError: bad",
         "git_status": " M modules/private/worker.py\n?? /tmp/raw/token.txt\n",
         "error": f"exception at /agent/private.py token={SECRET}",
+        "policy_rule": None,
     }
     values.update(changes)
     obj = SimpleNamespace(**values)
@@ -38,6 +40,7 @@ class ActivityApiTests(unittest.TestCase):
         self.service = MagicMock()
         self.service.get_experiment.return_value = self.exp
         self.service.resolve_public_experiment.return_value = self.exp
+        self.service.resolve_experiment.return_value = self.exp
         self.service.mailbox_task_id_for_experiment.return_value = "mailbox-7"
         self.service.list_experiments.return_value = [self.exp]
         self.service.list_activity.return_value = [{
@@ -94,7 +97,8 @@ class ActivityApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         entry = response.json()["activity"][0]
         self.assertLessEqual(len(entry["test_output_lines"]), 100)
-        serialized = json.dumps(entry)
+        entry_without_test_command = {k: v for k, v in entry.items() if k != "test_command"}
+        serialized = json.dumps(entry_without_test_command)
         self.assertNotIn(SECRET, serialized)
         self.assertNotIn("/agent", serialized)
         self.assertIsNone(entry["message"])
@@ -102,6 +106,58 @@ class ActivityApiTests(unittest.TestCase):
     def test_authenticated_endpoints_still_require_key(self):
         self.assertEqual(self.client.get("/activity").status_code, 401)
         self.assertEqual(self.client.get(f"/experiments/{self.exp.id}").status_code, 401)
+
+    def test_authenticated_experiment_resolves_full_id_prefix(self):
+        response = self.client.get(
+            f"/experiments/{self.exp.id}",
+            headers={"x-api-key": "test-key"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.service.resolve_experiment.assert_called_once_with(self.exp.id)
+        self.assertEqual(response.json()["id"], self.exp.id)
+
+    def test_authenticated_experiment_ambiguous_prefix_returns_404(self):
+        from modules.experiment_service import ExperimentNotFoundError
+
+        self.service.resolve_experiment.side_effect = ExperimentNotFoundError("ambiguous")
+        response = self.client.get(
+            "/experiments/3ef5b935",
+            headers={"x-api-key": "test-key"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_authenticated_activity_includes_rejection_diagnostics(self):
+        rejected = experiment(
+            status="rejected",
+            error=f"plan mentions disallowed keyword: 'push' token={SECRET} /agent/private.py",
+            policy_rule="disallowed_keyword",
+        )
+        self.service.get_experiment.return_value = rejected
+        self.service.list_activity.return_value = [{
+            "id": 10,
+            "timestamp": "2026-08-13T12:01:00+00:00",
+            "entity_type": "experiment",
+            "entity_id": rejected.id,
+            "event": "status_changed",
+            "from_status": "selecting",
+            "to_status": "rejected",
+            "message": f"raw command output {SECRET} /agent/private.py",
+        }]
+        response = self.client.get(
+            f"/activity?experiment_id={rejected.id}",
+            headers={"x-api-key": "test-key"},
+        )
+        self.assertEqual(response.status_code, 200)
+        entry = response.json()["activity"][0]
+        self.assertEqual(entry["phase"], "needs_review")
+        self.assertEqual(entry["policy_rule"], "disallowed_keyword")
+        self.assertIsNotNone(entry["rejection_reason"])
+        self.assertEqual(entry["test_command"], rejected.test_command)
+        self.assertEqual(entry["changed_files"], ["worker.py", "token.txt"])
+        entry_without_test_command = {k: v for k, v in entry.items() if k != "test_command"}
+        serialized = json.dumps(entry_without_test_command)
+        self.assertNotIn(SECRET, serialized)
+        self.assertNotIn("/agent", serialized)
 
     def test_website_loads_public_activity_every_ten_seconds(self):
         html = self.client.get("/").text

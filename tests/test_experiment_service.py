@@ -519,6 +519,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
+        self.assertEqual(result.policy_rule, "unparseable_plan")
         self.implementation_worker.run.assert_not_called()
 
     def test_unparseable_plan_is_rejected(self):
@@ -526,7 +527,47 @@ class ExperimentServiceTestCase(unittest.TestCase):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
+        self.assertEqual(result.policy_rule, "unparseable_plan")
         self.implementation_worker.run.assert_not_called()
+
+    def test_policy_violation_persists_matched_policy_rule(self):
+        rejected_plan = json.loads(VALID_PLAN_JSON)
+        rejected_plan["expected_changes"] = "run git commit and git push after the change"
+        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(rejected_plan))
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.assertEqual(result.policy_rule, "disallowed_keyword")
+        self.assertIsNotNone(result.error)
+        self.implementation_worker.run.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Prefix resolution (resolve_experiment / resolve_public_experiment)
+    # ------------------------------------------------------------------
+
+    def test_resolve_experiment_accepts_unambiguous_prefix(self):
+        experiment = self.service.create_experiment(goal="g")
+        prefix = experiment.id[:8]
+        resolved = self.service.resolve_experiment(prefix)
+        self.assertEqual(resolved.id, experiment.id)
+
+    def test_resolve_experiment_rejects_short_prefix(self):
+        experiment = self.service.create_experiment(goal="g")
+        with self.assertRaises(ExperimentNotFoundError):
+            self.service.resolve_experiment(experiment.id[:7])
+
+    def test_resolve_experiment_rejects_ambiguous_prefix(self):
+        # Force two experiment ids sharing a common 8-char prefix by
+        # inserting directly (uuid4 ids won't collide naturally).
+        shared_prefix = "abcdef01"
+        with self.service._lock, self.service._conn:
+            for suffix in ("11111111111111111111111111", "22222222222222222222222222"):
+                self.service._conn.execute(
+                    "INSERT INTO experiments (id, goal, status, created_at) VALUES (?, ?, ?, ?)",
+                    (shared_prefix + suffix, "g", STATUS_QUEUED, "2026-08-13T00:00:00Z"),
+                )
+        with self.assertRaises(ExperimentNotFoundError):
+            self.service.resolve_experiment(shared_prefix)
 
     def test_plan_mentioning_commit_is_rejected(self):
         plan = json.loads(VALID_PLAN_JSON)

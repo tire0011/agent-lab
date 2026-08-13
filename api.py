@@ -398,7 +398,7 @@ def get_experiment(
 ) -> ExperimentDetail:
     authorize(x_api_key)
     try:
-        experiment = service.get_experiment(experiment_id)
+        experiment = service.resolve_experiment(experiment_id)
     except ExperimentNotFoundError:
         raise HTTPException(status_code=404, detail="experiment not found")
     return ExperimentDetail(**experiment.to_dict())
@@ -484,17 +484,29 @@ def get_public_experiment(
     return _public_experiment(experiment, _mailbox_task_id(service, experiment.id))
 
 
+_SECRET_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)(\s*[:=]\s*|\s+)\S+"
+)
+_PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
+
+
+def _redact(text: str) -> str:
+    text = _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
+    text = _PATH_PATTERN.sub("[PATH]", text)
+    return text
+
+
 def _diagnostic_lines(raw: str | None) -> list[str]:
     """Return bounded, redacted test diagnostics; never return raw output."""
     lines = (raw or "").splitlines()[-100:]
-    safe: list[str] = []
-    secret = re.compile(r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)(\s*[:=]\s*|\s+)\S+")
-    path = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
-    for line in lines:
-        line = secret.sub(r"\1=[REDACTED]", line)
-        line = path.sub("[PATH]", line)
-        safe.append(line[:500])
-    return safe
+    return [_redact(line)[:500] for line in lines]
+
+
+def _sanitized_rejection_reason(raw: str | None) -> str | None:
+    """Bounded, redacted single-line rejection/error reason for diagnostics."""
+    if not raw:
+        return None
+    return _redact(raw)[:500]
 
 
 @app.get("/activity/public", response_model=PublicActivityResponse)
@@ -551,7 +563,12 @@ def list_activity(
             **entry,
             "message": None,
             "mailbox_task_id": _mailbox_task_id(service, experiment.id),
+            "phase": _public_phase(entry.get("to_status") or experiment.status),
+            "policy_rule": experiment.policy_rule,
+            "rejection_reason": _sanitized_rejection_reason(experiment.error),
+            "test_command": experiment.test_command,
             "test_exit_code": experiment.test_exit_code,
+            "changed_files": _changed_file_names(experiment.git_status),
             "test_output_lines": _diagnostic_lines(experiment.test_output),
         })
     return DiagnosticActivityResponse(count=len(diagnostics), activity=diagnostics)
