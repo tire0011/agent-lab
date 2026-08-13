@@ -20,17 +20,17 @@ class ApiTestsBase(unittest.TestCase):
 
         self.runs_dir = Path(self.temp_dir.name) / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.todo_path = Path(self.temp_dir.name) / "TODO.md"
+        self.ideas_path = Path(self.temp_dir.name) / "IDEAS.md"
 
         self._orig_runs_dir = data_sources.RUNS_DIR
-        self._orig_todo_path = data_sources.TODO_PATH
+        self._orig_ideas_path = data_sources.IDEAS_PATH
         data_sources.RUNS_DIR = self.runs_dir
-        data_sources.TODO_PATH = self.todo_path
+        data_sources.IDEAS_PATH = self.ideas_path
         self.addCleanup(self._restore_paths)
 
     def _restore_paths(self) -> None:
         data_sources.RUNS_DIR = self._orig_runs_dir
-        data_sources.TODO_PATH = self._orig_todo_path
+        data_sources.IDEAS_PATH = self._orig_ideas_path
 
     def _write_run(self, name: str, response: str, timestamp: str = "2026-08-10T00:00:00+00:00") -> None:
         (self.runs_dir / name).write_text(
@@ -38,8 +38,8 @@ class ApiTestsBase(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _write_todo_md(self, content: str) -> None:
-        self.todo_path.write_text(content, encoding="utf-8")
+    def _write_ideas_md(self, content: str) -> None:
+        self.ideas_path.write_text(content, encoding="utf-8")
 
 
 class HealthEndpointTests(ApiTestsBase):
@@ -78,7 +78,7 @@ class StatusEndpointTests(ApiTestsBase):
         self.assertIn("components", body)
         self.assertIsInstance(body["components"], list)
         self.assertIn("problems", body["components"])
-        self.assertIn("todos", body["components"])
+        self.assertIn("ideas", body["components"])
 
     def test_status_does_not_leak_env_or_paths(self):
         response = self.client.get("/status")
@@ -119,26 +119,44 @@ class ProblemsEndpointTests(ApiTestsBase):
         self.assertEqual(body["problems"][0]["summary"], "valid error entry")
 
 
-class TodosEndpointTests(ApiTestsBase):
-    def test_todos_empty_when_no_file(self):
-        response = self.client.get("/todos")
+class IdeasEndpointTests(ApiTestsBase):
+    def test_ideas_empty_when_no_file(self):
+        response = self.client.get("/ideas")
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["count"], 0)
-        self.assertEqual(body["todos"], [])
+        self.assertEqual(body["ideas"], [])
 
-    def test_todos_lists_open_items_only(self):
-        self._write_todo_md(
-            "# TODO.md\n\n## Section A\n\n- [ ] open item one\n- [x] done item\n"
-            "\n## Section B\n\n- [ ] open item two\n"
+    def test_ideas_lists_items_in_ideas_section_only(self):
+        self._write_ideas_md(
+            "# IDEAS.md\n\n## Intro\n\n- not an idea, just intro prose\n\n"
+            "## Ideas\n\n### Section A\n\n- open idea one `exploring`\n"
+            "- open idea two\n"
+            "\n### Section B\n\n- open idea three `rejected`\n"
+            "\n## Open unknowns\n\n- not an idea, an unknown\n"
         )
-        response = self.client.get("/todos")
+        response = self.client.get("/ideas")
         body = response.json()
-        self.assertEqual(body["count"], 2)
-        texts = {t["text"] for t in body["todos"]}
-        self.assertEqual(texts, {"open item one", "open item two"})
-        sections = {t["section"] for t in body["todos"]}
+        self.assertEqual(body["count"], 3)
+        texts = {i["text"] for i in body["ideas"]}
+        self.assertEqual(texts, {"open idea one", "open idea two", "open idea three"})
+        sections = {i["section"] for i in body["ideas"]}
         self.assertEqual(sections, {"Section A", "Section B"})
+
+    def test_ideas_default_state_is_new(self):
+        self._write_ideas_md("## Ideas\n\n### Section\n\n- idea without state\n")
+        response = self.client.get("/ideas")
+        body = response.json()
+        self.assertEqual(body["ideas"][0]["state"], "new")
+
+    def test_ideas_parses_trailing_state_marker(self):
+        self._write_ideas_md(
+            "## Ideas\n\n### Section\n\n- idea one `adopted`\n- idea two `tested`\n"
+        )
+        response = self.client.get("/ideas")
+        body = response.json()
+        states = {i["text"]: i["state"] for i in body["ideas"]}
+        self.assertEqual(states, {"idea one": "adopted", "idea two": "tested"})
 
 
 class ChatEndpointTests(ApiTestsBase):
@@ -164,14 +182,14 @@ class ChatEndpointTests(ApiTestsBase):
         self.assertEqual(body["intent"], "problems")
         self.assertIn("disk full", body["reply"])
 
-    def test_chat_answers_todo_question(self):
-        self._write_todo_md("## Section\n\n- [ ] do the thing\n")
+    def test_chat_answers_idea_question(self):
+        self._write_ideas_md("## Ideas\n\n### Section\n\n- do the thing\n")
         response = self.client.post(
-            "/chat", json={"message": "Was steht als Naechstes an?"}
+            "/chat", json={"message": "Was gibt es an Ideen?"}
         )
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["intent"], "todos")
+        self.assertEqual(body["intent"], "ideas")
         self.assertIn("do the thing", body["reply"])
 
     def test_chat_answers_status_question(self):
@@ -200,15 +218,15 @@ class ConsistencyTests(ApiTestsBase):
             problems_response["problems"][0]["summary"], chat_response["reply"]
         )
 
-    def test_chat_todos_match_todos_endpoint(self):
-        self._write_todo_md("## Section\n\n- [ ] shared todo item\n")
-        todos_response = self.client.get("/todos").json()
+    def test_chat_ideas_match_ideas_endpoint(self):
+        self._write_ideas_md("## Ideas\n\n### Section\n\n- shared idea item\n")
+        ideas_response = self.client.get("/ideas").json()
         chat_response = self.client.post(
-            "/chat", json={"message": "next todo?"}
+            "/chat", json={"message": "next idea?"}
         ).json()
 
-        self.assertEqual(todos_response["count"], 1)
-        self.assertIn(todos_response["todos"][0]["text"], chat_response["reply"])
+        self.assertEqual(ideas_response["count"], 1)
+        self.assertIn(ideas_response["ideas"][0]["text"], chat_response["reply"])
 
 
 if __name__ == "__main__":

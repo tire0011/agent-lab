@@ -1,13 +1,17 @@
 """Read-only adapters over existing data sources.
 
-No new persistent storage is introduced here. Problems and todos are derived
+No new persistent storage is introduced here. Problems and ideas are derived
 from files that already exist in the repository/runtime state:
 
 - Problems: error entries already logged by agent.py under state/runs/*.json
   (any run whose "response" starts with "ERROR:").
-- Todos: open checklist items ("- [ ] ...") already tracked in TODO.md.
+- Ideas: entries under "## Ideas" in IDEAS.md, each an open-ended thought
+  rather than a task; an optional trailing `` `state` `` marker (one of
+  new/exploring/selected/tested/adopted/rejected) is parsed if present and
+  defaults to "new" otherwise. Ideas are never a fixed roadmap or priority
+  list.
 
-Both /problems and /todos as well as the chat endpoint call these same
+Both /problems and /ideas as well as the chat endpoint call these same
 functions, so structured endpoints and chat answers never diverge.
 """
 
@@ -18,15 +22,20 @@ import os
 import re
 from pathlib import Path
 
-from models import Problem, Todo
+from models import Idea, Problem
 
 REPO_ROOT = Path(__file__).resolve().parent
 
 RUNS_DIR = Path(os.environ.get("AGENT_RUNS_DIR", str(REPO_ROOT / "state" / "runs")))
-TODO_PATH = Path(os.environ.get("AGENT_TODO_PATH", str(REPO_ROOT / "TODO.md")))
+IDEAS_PATH = Path(os.environ.get("AGENT_IDEAS_PATH", str(REPO_ROOT / "IDEAS.md")))
 
-_TODO_ITEM_RE = re.compile(r"^-\s\[\sx?\]\s+(?P<text>.+)$", re.IGNORECASE)
+_IDEA_ITEM_RE = re.compile(
+    r"^-\s+(?P<text>.+?)(?:\s+`(?P<state>new|exploring|selected|tested|adopted|rejected)`)?$",
+    re.IGNORECASE,
+)
 _SECTION_RE = re.compile(r"^(#{1,6})\s+(?P<title>.+)$")
+_IDEAS_HEADING_RE = re.compile(r"^##\s+Ideas\s*$", re.IGNORECASE)
+_KNOWN_STATES = {"new", "exploring", "selected", "tested", "adopted", "rejected"}
 
 
 def list_problems() -> list[Problem]:
@@ -73,42 +82,65 @@ def list_problems() -> list[Problem]:
     return problems
 
 
-def list_todos() -> list[Todo]:
-    """Return open (unchecked) todo items parsed from TODO.md.
+def list_ideas() -> list[Idea]:
+    """Return ideas parsed from the "## Ideas" section of IDEAS.md.
 
-    Missing or unreadable file yields an empty list rather than an error,
-    matching the read-only, best-effort contract of this adapter.
+    Only list items inside the "## Ideas" section are returned (the
+    surrounding intro/states/unknowns sections are prose, not ideas).
+    "###" headings within that section become the ``section`` field. Each
+    item may end with a trailing `` `state` `` marker (one of new,
+    exploring, selected, tested, adopted, rejected); items without one
+    default to "new". Missing or unreadable file yields an empty list
+    rather than an error, matching the read-only, best-effort contract of
+    this adapter.
     """
-    todos: list[Todo] = []
+    ideas: list[Idea] = []
 
     try:
-        text = TODO_PATH.read_text(encoding="utf-8")
+        text = IDEAS_PATH.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return todos
+        return ideas
 
     current_section = ""
+    in_ideas_section = False
     index = 0
     for line in text.splitlines():
-        section_match = _SECTION_RE.match(line.strip())
-        if section_match:
-            current_section = section_match.group("title").strip()
-            continue
-
         stripped = line.strip()
-        if stripped.startswith("- [x]") or stripped.startswith("- [X]"):
+
+        if _IDEAS_HEADING_RE.match(stripped):
+            in_ideas_section = True
+            current_section = ""
             continue
 
-        item_match = _TODO_ITEM_RE.match(stripped)
+        section_match = _SECTION_RE.match(stripped)
+        if section_match:
+            level = len(section_match.group(1))
+            if level <= 2:
+                # Any other top-level ("##") heading ends the ideas section.
+                in_ideas_section = False
+                continue
+            if in_ideas_section:
+                current_section = section_match.group("title").strip()
+            continue
+
+        if not in_ideas_section:
+            continue
+
+        item_match = _IDEA_ITEM_RE.match(stripped)
         if not item_match:
             continue
 
         index += 1
-        todos.append(
-            Todo(
-                id=f"todo-{index}",
+        state = (item_match.group("state") or "new").lower()
+        if state not in _KNOWN_STATES:
+            state = "new"
+        ideas.append(
+            Idea(
+                id=f"idea-{index}",
                 section=current_section or "General",
                 text=item_match.group("text").strip(),
+                state=state,
             )
         )
 
-    return todos
+    return ideas

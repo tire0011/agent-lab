@@ -361,7 +361,7 @@ _PLACEHOLDER_PHRASES: tuple[str, ...] = (
 # File extensions/names considered "concrete code or test files" for the
 # purpose of rejecting investigation-only or documentation-only plans. Any
 # plan whose affected_files consists solely of non-code documents (e.g.
-# only TODO.md/README.md) does not describe an implementable feature. This
+# only IDEAS.md/README.md) does not describe an implementable feature. This
 # is intentionally an allowlist of source-like suffixes, not a denylist of
 # documentation formats, so it never blocks a legitimate feature that
 # happens to also touch documentation alongside real code/tests.
@@ -374,7 +374,7 @@ _CODE_OR_TEST_FILE_SUFFIXES: tuple[str, ...] = (
 
 def _is_code_or_test_file(path: str) -> bool:
     """True if *path* looks like a concrete source, test, or config file
-    rather than a plain documentation/notes file (e.g. TODO.md, README.md,
+    rather than a plain documentation/notes file (e.g. IDEAS.md, README.md,
     or a bare directory name)."""
     name = Path(path).name.lower()
     if not name:
@@ -936,11 +936,11 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
             return f"plan title looks like a placeholder/intention-only statement: {plan.title!r}"
 
     # A plan whose affected_files are all non-code/non-test documents (e.g.
-    # only TODO.md) describes an investigation or documentation note, not
+    # only IDEAS.md) describes an investigation or documentation note, not
     # an implementable feature. This does not forbid legitimate
     # documentation *features* in general — it only requires that at least
     # one affected file be a concrete code or test file; a plan may still
-    # additionally touch README.md/TODO.md/etc. alongside a real code file.
+    # additionally touch README.md/IDEAS.md/etc. alongside a real code file.
     if not any(_is_code_or_test_file(path) for path in plan.affected_files):
         return (
             "plan does not touch any concrete code or test file; "
@@ -978,7 +978,7 @@ a READ-ONLY investigation phase. Do not modify any files.
 Goal: {goal}
 
 Steps:
-1. Inspect TODO.md and the repository structure using read-only tools
+1. Inspect IDEAS.md and the repository structure using read-only tools
    (read files, search, list directories) to understand what small,
    low-risk, testable improvements are plausible.
 2. Consider one or more candidate features or fixes that:
@@ -989,11 +989,11 @@ Steps:
    - need no secrets or credentials,
    - are not an authentication or security relaxation,
    - do not commit, push, or merge anything,
-   - prefer existing small TODO.md entries, tests, observability, or
+   - prefer existing small IDEAS.md entries, tests, observability, or
      internal developer-experience improvements.
 3. Write a concise, factual research summary (plain text, NOT JSON) that
    states which candidate(s) you considered, the concrete evidence you
-   found for each (e.g. exact TODO.md line, existing file/test names), and
+   found for each (e.g. exact IDEAS.md line, existing file/test names), and
    which single candidate you recommend as the best next feature and why.
 
 Do NOT emit a final structured plan or any JSON object in this phase — a

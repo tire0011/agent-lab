@@ -35,7 +35,7 @@
 - Endpoints:
   - `GET /health` (public)
   - `GET /secure-health` (requires `x-api-key` matching `AGENT_API_KEY`)
-  - `GET /status`, `GET /problems`, `GET /todos`, `POST /chat` (read-only; consistent data via `data_sources.py`)
+  - `GET /status`, `GET /problems`, `GET /ideas`, `POST /chat` (read-only; consistent data via `data_sources.py`)
   - `POST /codex/tasks`, `GET /codex/tasks`, `GET /codex/tasks/{id}`,
     `POST /codex/tasks/{id}/run` (all require `x-api-key`) — thin routes over
     the existing `modules.codex_task_service.CodexTaskService`; no worker
@@ -50,7 +50,7 @@
 ### 4) Client
 
 - Files: `Client/client.py` (CLI), `Client/Invoke-Client.ps1` (PowerShell wrapper)
-- Subcommands: `health`, `status`, `problems`, `todos`, `chat`
+- Subcommands: `health`, `status`, `problems`, `ideas`, `chat`
 
 ### 5) Infrastructure
 

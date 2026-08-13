@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import chat as chat_module
-from data_sources import list_problems, list_todos
+from data_sources import list_ideas, list_problems
 from modules.codex_task_service import (
     CodexTaskService,
     TaskNotFoundError,
@@ -22,11 +22,11 @@ from models import (
     CodexTaskResponse,
     CodexTaskSummary,
     HealthResponse,
+    Idea,
+    IdeasResponse,
     Problem,
     ProblemsResponse,
     StatusResponse,
-    Todo,
-    TodosResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -113,10 +113,10 @@ def problems() -> ProblemsResponse:
     return ProblemsResponse(count=len(found), problems=found)
 
 
-@app.get("/todos", response_model=TodosResponse)
-def todos() -> TodosResponse:
-    found: list[Todo] = list_todos()
-    return TodosResponse(count=len(found), todos=found)
+@app.get("/ideas", response_model=IdeasResponse)
+def ideas() -> IdeasResponse:
+    found: list[Idea] = list_ideas()
+    return IdeasResponse(count=len(found), ideas=found)
 
 
 @app.post("/chat", response_model=ChatResponse)

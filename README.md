@@ -10,22 +10,22 @@ Experimental project for distributed self-improving LLM agents under strict budg
 - API service (`api.py`) provides:
 	- public `GET /health`
 	- authenticated `GET /secure-health`
-	- `GET /status`, `GET /problems`, `GET /todos`, `POST /chat` (read-only over
+	- `GET /status`, `GET /problems`, `GET /ideas`, `POST /chat` (read-only over
 	  existing data; see `data_sources.py` and `chat.py`)
 	- authenticated Codex task endpoints (`POST /codex/tasks`,
 	  `GET /codex/tasks`, `GET /codex/tasks/{id}`,
 	  `POST /codex/tasks/{id}/run`) — synchronous, `read-only` sandbox,
 	  `working_dir` fixed to `/agent`; see "Codex task API" below
 
-## Project priorities
+## Current direction
 
-1. Finish/test MCP-based V1.
-2. Add persistent structured logging/database (SQLite first).
-3. Benchmark V0 vs V1.
-4. Add model/provider abstraction.
-5. Evaluate cheaper Azure models and additional providers.
-6. Add evaluation gates before self-modification.
-7. Start controlled self-improvement experiments.
+The project is not run from a fixed roadmap. Open, unprioritized ideas
+for future work live in `IDEAS.md` and may be added to by humans or
+agents at any time; see that file for current candidate ideas (V1 MCP
+completion, benchmarking, provider abstraction, cheaper models,
+evaluation gating, controlled self-improvement, and more) and their
+lightweight states (`new`, `exploring`, `selected`, `tested`, `adopted`,
+`rejected`).
 
 ## Local quick start
 
@@ -124,7 +124,7 @@ never restarts execution or starts a Codex process.
 - `AGENTS.md` - handoff rules for future AI agents
 - `PROJECT.md` - scope, goals, unknowns
 - `ARCHITECTURE.md` - current architecture and target evolution
-- `TODO.md` - prioritized implementation backlog
+- `IDEAS.md` - open, continuously extensible idea repository (not a roadmap)
 - `DECISIONS.md` - decision log
 - `COSTS.md` - budget and cost tracking policy
 - `OPERATIONS.md` - operational runbook
@@ -151,7 +151,7 @@ Base URL configuration priority:
 Notes:
 
 - Secrets are never stored in source; pass keys via environment variables or CLI.
-- `api.py` exposes `/health`, `/secure-health`, `/status`, `/problems`, `/todos`, `/chat`, and `/codex/tasks*`.
+- `api.py` exposes `/health`, `/secure-health`, `/status`, `/problems`, `/ideas`, `/chat`, and `/codex/tasks*`.
 
 ### Codex task commands
 

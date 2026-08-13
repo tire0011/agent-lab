@@ -460,10 +460,10 @@ class ExistingCommandsStillWorkTests(unittest.TestCase):
         self.assertIn("ok", stdout)
 
     @patch("Client.client.request.urlopen")
-    def test_todos_command_still_works(self, mock_urlopen):
-        payload = {"count": 1, "todos": [{"id": "t1", "text": "do it"}]}
+    def test_ideas_command_still_works(self, mock_urlopen):
+        payload = {"count": 1, "ideas": [{"id": "idea-1", "text": "do it", "section": "General", "state": "new"}]}
         mock_urlopen.return_value = _FakeResponse(json.dumps(payload), status=200)
-        code, stdout, _ = _run_cli(BASE_ARGS + ["todos"])
+        code, stdout, _ = _run_cli(BASE_ARGS + ["ideas"])
         self.assertEqual(code, 0)
         self.assertIn("do it", stdout)
 

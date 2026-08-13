@@ -8,8 +8,8 @@ const elements = {
   agentDetail: document.querySelector("#agent-detail"),
   problemsCount: document.querySelector("#problems-count"),
   problemsContent: document.querySelector("#problems-content"),
-  todosCount: document.querySelector("#todos-count"),
-  todosContent: document.querySelector("#todos-content"),
+  ideasCount: document.querySelector("#ideas-count"),
+  ideasContent: document.querySelector("#ideas-content"),
   form: document.querySelector("#chat-form"),
   input: document.querySelector("#chat-input"),
   send: document.querySelector("#send-button"),
@@ -87,16 +87,16 @@ async function loadOverview() {
   setIndicator(elements.healthIndicator, "Lädt …", "pending");
   setIndicator(elements.agentIndicator, "Lädt …", "pending");
   elements.problemsContent.textContent = "Wird geladen …";
-  elements.todosContent.textContent = "Wird geladen …";
+  elements.ideasContent.textContent = "Wird geladen …";
 
   const results = await Promise.allSettled([
     requestJson("/health"),
     requestJson("/status"),
     requestJson("/problems"),
-    requestJson("/todos"),
+    requestJson("/ideas"),
   ]);
 
-  const [health, status, problems, todos] = results;
+  const [health, status, problems, ideas] = results;
   if (health.status === "fulfilled") {
     const ok = health.value.status === "ok";
     setIndicator(elements.healthIndicator, ok ? "Online" : "Unbekannt", ok ? "good" : "bad");
@@ -122,12 +122,12 @@ async function loadOverview() {
     showError(elements.problemsContent, problems.reason.message);
   }
 
-  if (todos.status === "fulfilled") {
-    elements.todosCount.textContent = String(todos.value.count);
-    renderItems(elements.todosContent, todos.value.todos, "Keine offenen Todos.", { title: "text", meta: "section" });
+  if (ideas.status === "fulfilled") {
+    elements.ideasCount.textContent = String(ideas.value.count);
+    renderItems(elements.ideasContent, ideas.value.ideas, "Keine Ideen erfasst.", { title: "text", meta: "section" });
   } else {
-    elements.todosCount.textContent = "!";
-    showError(elements.todosContent, todos.reason.message);
+    elements.ideasCount.textContent = "!";
+    showError(elements.ideasContent, ideas.reason.message);
   }
 
   elements.refresh.disabled = false;
@@ -181,5 +181,5 @@ elements.input.addEventListener("keydown", (event) => {
   }
 });
 
-addMessage("Hallo! Ich beantworte Fragen zu Status, Problemen und offenen Todos.", "agent");
+addMessage("Hallo! Ich beantworte Fragen zu Status, Problemen und Ideen.", "agent");
 loadOverview();

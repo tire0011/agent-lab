@@ -73,4 +73,4 @@ If agent/API behavior regresses:
 2. Correlate with latest `state/runs/*.json` entries.
 3. Confirm env var presence and endpoint credentials.
 4. Re-run minimal known-good task.
-5. Log findings in `TODO.md`/`DECISIONS.md` before broad changes.
+5. Log findings in `IDEAS.md`/`DECISIONS.md` before broad changes.

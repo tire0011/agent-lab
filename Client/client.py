@@ -273,9 +273,9 @@ def cmd_problems(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_todos(args: argparse.Namespace) -> int:
+def cmd_ideas(args: argparse.Namespace) -> int:
     base_url = resolve_base_url(args.base_url)
-    url = f"{base_url}/todos"
+    url = f"{base_url}/ideas"
 
     try:
         status, payload = request_json("GET", url)
@@ -663,10 +663,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     problems_parser.set_defaults(func=cmd_problems)
 
-    todos_parser = subparsers.add_parser(
-        "todos", help="List open todos (/todos)"
+    ideas_parser = subparsers.add_parser(
+        "ideas", help="List recorded ideas (/ideas)"
     )
-    todos_parser.set_defaults(func=cmd_todos)
+    ideas_parser.set_defaults(func=cmd_ideas)
 
     chat_parser = subparsers.add_parser("chat", help="Send a message to chat endpoint")
     chat_parser.add_argument("message", nargs="?", help="Message text")

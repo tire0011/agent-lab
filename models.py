@@ -33,15 +33,16 @@ class ProblemsResponse(BaseModel):
     problems: list[Problem]
 
 
-class Todo(BaseModel):
+class Idea(BaseModel):
     id: str
     section: str
     text: str
+    state: str = "new"
 
 
-class TodosResponse(BaseModel):
+class IdeasResponse(BaseModel):
     count: int
-    todos: list[Todo]
+    ideas: list[Idea]
 
 
 class ChatRequest(BaseModel):

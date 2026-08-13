@@ -1,4 +1,4 @@
-"""Minimal, non-LLM chat for agent status/problems/todos questions.
+"""Minimal, non-LLM chat for agent status/problems/ideas questions.
 
 IMPORTANT / documented gap: there is no LLM-backed chat wired into the API
 yet. agent.py's Azure OpenAI + MCP agent is a separate, task-oriented CLI
@@ -7,17 +7,17 @@ because doing so would let /chat execute MCP tools / shell-adjacent actions,
 which is explicitly disallowed for this endpoint.
 
 This module only does keyword-based intent matching over the same
-structured data exposed by /status, /problems, and /todos, so answers are
+structured data exposed by /status, /problems, and /ideas, so answers are
 always consistent with those endpoints. It never executes shell commands,
 tools, or arbitrary code, and never fabricates a general-purpose AI answer.
 """
 
 from __future__ import annotations
 
-from data_sources import list_problems, list_todos
+from data_sources import list_ideas, list_problems
 
 API_VERSION = "0.2.0"
-COMPONENTS = ["health", "status", "problems", "todos", "chat"]
+COMPONENTS = ["health", "status", "problems", "ideas", "chat"]
 
 
 def build_status() -> dict:
@@ -36,12 +36,12 @@ def _format_problems() -> str:
     return f"Es sind {len(problems)} Problem(e) erkannt:\n" + "\n".join(lines)
 
 
-def _format_todos() -> str:
-    todos = list_todos()
-    if not todos:
-        return "Aktuell stehen keine offenen Aufgaben an."
-    lines = [f"- [{t.section}] {t.text}" for t in todos[:10]]
-    return f"Es stehen {len(todos)} offene Aufgabe(n) an:\n" + "\n".join(lines)
+def _format_ideas() -> str:
+    ideas = list_ideas()
+    if not ideas:
+        return "Aktuell sind keine Ideen erfasst."
+    lines = [f"- [{i.section}] {i.text} ({i.state})" for i in ideas[:10]]
+    return f"Es gibt {len(ideas)} Idee(n):\n" + "\n".join(lines)
 
 
 def answer(message: str) -> tuple[str, str]:
@@ -54,8 +54,8 @@ def answer(message: str) -> tuple[str, str]:
     if any(kw in text for kw in ("problem", "fehler", "issue")):
         return _format_problems(), "problems"
 
-    if any(kw in text for kw in ("todo", "aufgabe", "next", "nächst", "naechst")):
-        return _format_todos(), "todos"
+    if any(kw in text for kw in ("idee", "idea", "next", "nächst", "naechst")):
+        return _format_ideas(), "ideas"
 
     if any(kw in text for kw in ("status", "version", "komponente")):
         status = build_status()
@@ -68,8 +68,8 @@ def answer(message: str) -> tuple[str, str]:
 
     return (
         "Ich bin ein minimaler, regelbasierter Chat (kein LLM). "
-        "Ich kann Fragen zu Status, Problemen und offenen Aufgaben "
+        "Ich kann Fragen zu Status, Problemen und offenen Ideen "
         "beantworten, z.B. 'Welche Probleme gibt es?' oder "
-        "'Was steht als Nächstes an?'.",
+        "'Was gibt es an Ideen?'.",
         "unhandled",
     )

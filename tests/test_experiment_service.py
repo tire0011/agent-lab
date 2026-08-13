@@ -53,7 +53,7 @@ from modules.experiment_service import (
 # "extra prose" / "code fence" / "nested braces in strings" variants below.
 REAL_SANITIZED_PLAN_JSON = (
     '{"title":"Add unit tests for MCP filesystem client construction",'
-    '"motivation":"TODO.md explicitly calls for tests covering the V1 MCP '
+    '"motivation":"IDEAS.md explicitly calls for tests covering the V1 MCP '
     'path, while modules/agent_clients.py currently has no dedicated tests. '
     'Testing its configuration boundary is small, low-risk, requires no '
     'credentials or live MCP process, and verifies the read-only tool '
@@ -139,7 +139,7 @@ def _init_git_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q", str(path)], check=True)
     subprocess.run(["git", "-C", str(path), "config", "user.email", "a@example.com"], check=True)
     subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
-    (path / "TODO.md").write_text("# TODO\n\n- [ ] small thing\n")
+    (path / "IDEAS.md").write_text("# IDEAS\n\n- small thing\n")
     (path / "tests").mkdir()
     (path / "tests" / "test_placeholder.py").write_text(
         "import unittest\n\n"
@@ -164,7 +164,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
         self.selection_worker = MagicMock()
         self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: investigated TODO.md and repo structure."
+            final_message="Research summary: investigated IDEAS.md and repo structure."
         )
 
         self.plan_worker = MagicMock()
@@ -278,7 +278,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
                     "item": {
                         "id": "i0",
                         "type": "command_execution",
-                        "command": "cat TODO.md",
+                        "command": "cat IDEAS.md",
                         "exit_code": 0,
                         "status": "completed",
                     },
@@ -321,7 +321,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
                     "item": {
                         "id": "c0",
                         "type": "command_execution",
-                        "command": "cat TODO.md",
+                        "command": "cat IDEAS.md",
                         "exit_code": 0,
                         "status": "completed",
                         "aggregated_output": "full file contents that must not be persisted",
@@ -553,7 +553,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         plan = json.loads(VALID_PLAN_JSON)
         plan["motivation"] = (
             "README.md still says the VM runs on Azure as Standard_B1s, "
-            "while TODO.md records that it was already resized to "
+            "while IDEAS.md records that it was already resized to "
             "Standard_B2s. Fix the outdated VM size mentioned in the docs."
         )
         self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
@@ -900,7 +900,7 @@ class PlanPolicyTestCase(unittest.TestCase):
         data = json.loads(VALID_PLAN_JSON)
         data["motivation"] = (
             "README.md still says the VM runs Standard_B1s on Azure, but "
-            "TODO.md records that it was already resized to Standard_B2s."
+            "IDEAS.md records that it was already resized to Standard_B2s."
         )
         plan = parse_plan(json.dumps(data))
         self.assertIsNotNone(plan)
@@ -1054,7 +1054,7 @@ class PolicyActionSecretTestCase(unittest.TestCase):
         data = {
             "title": "Add focused unit tests for MCP filesystem client construction",
             "motivation": (
-                "This directly advances TODO.md's highest-priority MCP V1 work "
+                "This directly advances IDEAS.md's highest-priority MCP V1 work "
                 "and its explicit request for MCP path success/failure tests, "
                 "while adding measurable coverage without changing production "
                 "behavior or requiring external services, credentials, or "
@@ -1113,7 +1113,7 @@ class ReformatRetryTestCase(unittest.TestCase):
 
         self.selection_worker = MagicMock()
         self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: looked at TODO.md and repo layout."
+            final_message="Research summary: looked at IDEAS.md and repo layout."
         )
         self.plan_worker = MagicMock()
 
@@ -1401,7 +1401,7 @@ class PolicyReplanTestCase(unittest.TestCase):
 
         self.selection_worker = MagicMock()
         self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: looked at TODO.md and repo layout."
+            final_message="Research summary: looked at IDEAS.md and repo layout."
         )
         self.plan_worker = MagicMock()
 
@@ -1534,7 +1534,7 @@ class PolicyReplanTestCase(unittest.TestCase):
         replan_call = self.plan_worker.run.call_args_list[1]
         replan_prompt = replan_call.kwargs.get("task") or replan_call.args[0]
         self.assertIn("my special goal", replan_prompt)
-        self.assertIn("Research summary: looked at TODO.md and repo layout.", replan_prompt)
+        self.assertIn("Research summary: looked at IDEAS.md and repo layout.", replan_prompt)
         self.assertIn("Create a new Azure VM", replan_prompt)
         self.assertIn("infrastructure/deployment", replan_prompt)
         self.assertEqual(replan_call.kwargs.get("sandbox"), "read-only")
@@ -1685,7 +1685,7 @@ class DiagnosticLogPipelineTestCase(unittest.TestCase):
 
         self.selection_worker = MagicMock()
         self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: looked at TODO.md and repo layout."
+            final_message="Research summary: looked at IDEAS.md and repo layout."
         )
         self.plan_worker = MagicMock()
 
@@ -1780,7 +1780,7 @@ class ResearchPromptRequirementsTestCase(unittest.TestCase):
         prompt = " ".join(_build_research_prompt("some goal").split())
         self.assertIn("READ-ONLY", prompt)
         self.assertIn("Do not modify any files", prompt)
-        self.assertIn("TODO.md", prompt)
+        self.assertIn("IDEAS.md", prompt)
 
     def test_research_prompt_forbids_final_json_or_plan(self):
         prompt = " ".join(_build_research_prompt("some goal").split())
@@ -1859,32 +1859,32 @@ class PlaceholderPlanPolicyTestCase(unittest.TestCase):
         plan = self._plan_with_title("Repository inspection")
         self.assertIsNotNone(plan_violates_policy(plan, json.dumps(plan.to_dict())))
 
-    def test_todo_only_affected_files_is_rejected(self):
-        # Investigation/documentation-only plans that touch only TODO.md
+    def test_ideas_only_affected_files_is_rejected(self):
+        # Investigation/documentation-only plans that touch only IDEAS.md
         # (no code or test file) are not an implementable feature.
         data = json.loads(VALID_PLAN_JSON)
         data["title"] = "Document the next steps"
-        data["affected_files"] = ["TODO.md"]
+        data["affected_files"] = ["IDEAS.md"]
         plan = parse_plan(json.dumps(data))
         self.assertIsNotNone(plan)
         reason = plan_violates_policy(plan, json.dumps(plan.to_dict()))
         self.assertIsNotNone(reason)
         self.assertIn("code or test file", reason)
 
-    def test_readme_and_todo_only_affected_files_is_rejected(self):
+    def test_readme_and_ideas_only_affected_files_is_rejected(self):
         data = json.loads(VALID_PLAN_JSON)
         data["title"] = "Update project notes"
-        data["affected_files"] = ["TODO.md", "README.md"]
+        data["affected_files"] = ["IDEAS.md", "README.md"]
         plan = parse_plan(json.dumps(data))
         self.assertIsNotNone(plan_violates_policy(plan, json.dumps(plan.to_dict())))
 
-    def test_plan_with_todo_plus_code_file_is_not_rejected_for_this_rule(self):
-        # A legitimate feature may still touch TODO.md alongside a real
+    def test_plan_with_ideas_plus_code_file_is_not_rejected_for_this_rule(self):
+        # A legitimate feature may still touch IDEAS.md alongside a real
         # code/test file — only pure documentation/investigation plans are
         # rejected by this rule.
         data = json.loads(VALID_PLAN_JSON)
-        data["title"] = "Add retry test and update TODO"
-        data["affected_files"] = ["TODO.md", "tests/test_foo.py"]
+        data["title"] = "Add retry test and update IDEAS"
+        data["affected_files"] = ["IDEAS.md", "tests/test_foo.py"]
         plan = parse_plan(json.dumps(data))
         self.assertIsNone(plan_violates_policy(plan, json.dumps(plan.to_dict())))
 

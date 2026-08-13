@@ -105,13 +105,13 @@ class ClientTests(unittest.TestCase):
         self.assertIn("boom", stdout.getvalue())
 
     @patch("Client.client.request.urlopen")
-    def test_todos_command_prints_payload(self, mock_urlopen):
-        payload = {"count": 1, "todos": [{"id": "todo-1", "text": "do the thing"}]}
+    def test_ideas_command_prints_payload(self, mock_urlopen):
+        payload = {"count": 1, "ideas": [{"id": "idea-1", "text": "do the thing", "section": "General", "state": "new"}]}
         mock_urlopen.return_value = _FakeResponse(json.dumps(payload), status=200)
         stdout = io.StringIO()
 
         with patch("sys.stdout", stdout):
-            code = client.main(["--base-url", "http://127.0.0.1:8000", "todos"])
+            code = client.main(["--base-url", "http://127.0.0.1:8000", "ideas"])
 
         self.assertEqual(code, 0)
         self.assertIn("do the thing", stdout.getvalue())
@@ -122,7 +122,7 @@ class ClientTests(unittest.TestCase):
         agent_status_payload = {
             "agent_status": "idle",
             "api_version": "0.2.0",
-            "components": ["health", "status", "problems", "todos", "chat"],
+            "components": ["health", "status", "problems", "ideas", "chat"],
         }
         mock_urlopen.side_effect = [
             _FakeResponse(json.dumps(health_payload), status=200),

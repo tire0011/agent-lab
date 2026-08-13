@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("health", "status", "problems", "todos", "chat")]
+  [ValidateSet("health", "status", "problems", "ideas", "chat")]
   [string]$Command = "health",
 
   [string]$Message,

@@ -4,7 +4,8 @@
 ``modules/run_store.py`` (table ``codex_tasks``), executes them through the
 existing ``CodexWorker`` (never duplicated), and persists their final state.
 
-Scope of this step (see TODO.md "Immediate next milestone — Codex worker"):
+Scope of this step (implemented; see ARCHITECTURE.md "3) API surface" and
+"4) Client" for the resulting Codex task API/CLI surface):
   - No API, web, chat, or background-queue wiring.
   - No parallel processing, no background threads, no external queue system.
   - Tasks are created (``queued``) and later executed one at a time via

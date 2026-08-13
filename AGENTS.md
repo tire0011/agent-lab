@@ -69,7 +69,7 @@ Primary objective: learn how far the system can improve itself safely and measur
 1. `README.md` (quick start + repo overview)
 2. `PROJECT.md` (scope, goals, non-goals)
 3. `ARCHITECTURE.md` (current architecture and planned evolution)
-4. `TODO.md` (next tasks)
+4. `IDEAS.md` (open idea repository, not a fixed task list)
 5. `DECISIONS.md` (decision log)
 6. `COSTS.md` (budget guardrails)
 7. `OPERATIONS.md` (runbook)
