@@ -1,6 +1,6 @@
 ---
 type: task
-sender: rene-and-chatgpt
+created_by: rene-and-chatgpt
 created_at: 2026-08-13T14:00:00Z
 title: Add a public sanitized Outbox view
 ---
