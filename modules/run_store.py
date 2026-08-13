@@ -146,6 +146,25 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_codex_tasks_status ON codex_tasks(status);
         CREATE INDEX IF NOT EXISTS idx_experiments_created_at ON experiments(created_at);
         CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
+
+        CREATE TABLE IF NOT EXISTS mailbox_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT NOT NULL,
+            source_commit_sha TEXT NOT NULL,
+            msg_type TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            status TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            processed_at TEXT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NULL,
+            idea_id TEXT NULL,
+            outbox_file TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mailbox_file_path ON mailbox_messages(file_path);
+        CREATE INDEX IF NOT EXISTS idx_mailbox_status ON mailbox_messages(status);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge(category);
         """
     )
     _migrate_experiments_columns(conn)

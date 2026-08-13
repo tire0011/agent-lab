@@ -1,0 +1,15 @@
+[Unit]
+Description=Nexus mailbox processor
+After=network.target
+
+[Service]
+Type=oneshot
+User=agent
+WorkingDirectory=/agent
+EnvironmentFile=/etc/agent-lab/agent.env
+ExecStart=/agent/.venv/bin/python /agent/mailbox_processor.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

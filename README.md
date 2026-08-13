@@ -2,6 +2,46 @@
 
 Experimental project for distributed self-improving LLM agents under strict budget constraints.
 
+## Mailbox
+
+Nexus polls an inbox/outbox Git-backed mailbox every minute via a systemd timer.
+
+**Inbox** (`communication/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus.
+
+Supported message types: `idea`, `task`, `question`, `context`.
+
+Example (`communication/examples/idea-template.md`):
+
+```markdown
+---
+type: idea
+created_by: rene
+---
+
+Add local model action selection so the agent picks the cheapest model for simple tasks.
+```
+
+**Outbox** (`communication/outbox/`): Nexus writes a response file here for each processed message.
+
+**Processing rules:**
+
+- `idea` — appended to `IDEAS.md` under `### Mailbox submissions` with state `new`; response committed and pushed.
+- `task` — recorded in SQLite; queued for human review (not auto-executed).
+- `question` — acknowledged; response placed in outbox.
+- `context` — stored in the `knowledge` table under category `mailbox_context`.
+
+**Safety:**
+
+- Files over 64 KB, binary files, symlinks, path traversals, unknown types, and files containing secrets (e.g. `sk-`, `API_KEY=`) are rejected.
+- Maximum 3 retries per message.
+- Single-process lock prevents concurrent runs.
+
+**Run manually:**
+
+```bash
+python mailbox_processor.py [--dry-run] [--db-path PATH] [--repo-path PATH]
+```
+
 ## Current status
 
 - V0 (`agent.py`) works locally and on Azure VM.

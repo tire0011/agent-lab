@@ -74,6 +74,10 @@ Primary objective: learn how far the system can improve itself safely and measur
 6. `COSTS.md` (budget guardrails)
 7. `OPERATIONS.md` (runbook)
 
+## Mailbox polling
+
+Nexus polls `communication/inbox/` every minute via a systemd timer (`deploy/nexus-mailbox.timer`). Drop a Markdown file with YAML front matter (`type`, `created_by`) to communicate with Nexus. Responses appear in `communication/outbox/`. See `README.md` "Mailbox" section and `OPERATIONS.md` "Mailbox systemd service" for full details.
+
 ## Unknowns to Resolve Early
 
 - Exact V1 MCP feature completeness and test coverage.

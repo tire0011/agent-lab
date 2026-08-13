@@ -65,6 +65,57 @@ For API auth in `api.py`:
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.
 - Persistent structured DB logging is not yet implemented (JSON logs are current source).
 
+## Mailbox systemd service
+
+The mailbox processor runs as a systemd oneshot service on a 1-minute timer.
+
+### Service unit (`deploy/nexus-mailbox.service`)
+
+```
+[Unit]
+Description=Nexus mailbox processor
+After=network.target
+
+[Service]
+Type=oneshot
+User=agent
+WorkingDirectory=/agent
+EnvironmentFile=/etc/agent-lab/agent.env
+ExecStart=/agent/.venv/bin/python /agent/mailbox_processor.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Timer unit (`deploy/nexus-mailbox.timer`)
+
+```
+[Unit]
+Description=Run Nexus mailbox processor every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+Unit=nexus-mailbox.service
+
+[Install]
+WantedBy=timers.target
+```
+
+### Installation
+
+```bash
+sudo cp deploy/nexus-mailbox.service /etc/systemd/system/
+sudo cp deploy/nexus-mailbox.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable nexus-mailbox.timer
+sudo systemctl start nexus-mailbox.timer
+# Verify
+systemctl status nexus-mailbox.timer
+```
+
 ## Incident triage (minimal)
 
 If agent/API behavior regresses:

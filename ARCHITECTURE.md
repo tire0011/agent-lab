@@ -62,6 +62,17 @@
 - Single low-cost VM (`Standard_B1s`) in `germanywestcentral`
 - Azure OpenAI deployment: `gpt-4o` (GlobalStandard)
 
+### 6) Mailbox
+
+- Files: `modules/mailbox.py` (core logic), `mailbox_processor.py` (CLI entry point)
+- Inbox: `communication/inbox/` — Markdown files with YAML front matter
+- Outbox: `communication/outbox/` — response files written per processed message
+- Message types: `idea` (appended to IDEAS.md), `task` (queued for review), `question` (acknowledged), `context` (stored in `knowledge` table)
+- Safety: max 64 KB, no binary/symlinks/path-traversal, secret pattern detection, max 3 retries
+- Git integration: commits outbox + IDEAS.md (idea type only), pushes to tracked branch
+- Lock: `state/mailbox.lock` via `fcntl.flock` prevents concurrent runs
+- Deployment: systemd oneshot service + 1-minute timer (see `deploy/nexus-mailbox.{service,timer}`)
+
 ## Near-term target architecture (planned, not complete)
 
 1. **V1 MCP agent path**
