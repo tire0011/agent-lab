@@ -20,13 +20,17 @@ from modules.mailbox_task_service import (
     MailboxTaskService,
     MailboxTaskWorker,
 )
+from modules.experiment_service import ExperimentNotFoundError, ExperimentService
 from models import (
+    ActivityResponse,
     ChatRequest,
     ChatResponse,
     CodexTaskCreateRequest,
     CodexTaskListResponse,
     CodexTaskResponse,
     CodexTaskSummary,
+    ExperimentDetail,
+    ExperimentsResponse,
     HealthResponse,
     Idea,
     IdeaCreateRequest,
@@ -65,14 +69,33 @@ def get_codex_service() -> CodexTaskService:
 
 
 @lru_cache(maxsize=1)
+def get_experiment_service() -> ExperimentService:
+    """Singleton ExperimentService for the process.
+
+    Shared with ``MailboxTaskService`` so both the mailbox approval bridge
+    and the read-only ``/experiments`` and ``/activity`` endpoints observe
+    the same in-process state (single SQLite connection/lock), rather than
+    each opening its own separate connection to the same database file.
+
+    Overridable in tests via ``app.dependency_overrides[get_experiment_service]``.
+    """
+    return ExperimentService()
+
+
+@lru_cache(maxsize=1)
 def get_mailbox_task_service() -> MailboxTaskService:
     """Singleton MailboxTaskService for the process.
 
     Overridable in tests via ``app.dependency_overrides[get_mailbox_task_service]``.
     """
-    from modules.experiment_service import ExperimentService
-    exp_service = ExperimentService()
-    return MailboxTaskService(experiment_service=exp_service)
+    return MailboxTaskService(experiment_service=_resolve_experiment_service())
+
+
+def _resolve_experiment_service() -> ExperimentService:
+    override = app.dependency_overrides.get(get_experiment_service)
+    if override is not None:
+        return override()
+    return get_experiment_service()
 
 
 def _resolve_codex_service() -> CodexTaskService:
@@ -340,3 +363,51 @@ def reject_mailbox_task(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return _approval_to_response(approval)
+
+
+# ---------------------------------------------------------------------------
+# Experiment and activity log endpoints (authenticated, read-only)
+#
+# Thin routes over the existing ExperimentService/run_store persistence;
+# no experiment orchestration or new SQLite access is added here.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/experiments", response_model=ExperimentsResponse)
+def list_experiments(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ExperimentsResponse:
+    authorize(x_api_key)
+    experiments = service.list_experiments(limit=limit)
+    return ExperimentsResponse(
+        count=len(experiments),
+        experiments=[exp.to_dict() for exp in experiments],
+    )
+
+
+@app.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
+def get_experiment(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ExperimentDetail:
+    authorize(x_api_key)
+    try:
+        experiment = service.get_experiment(experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return ExperimentDetail(**experiment.to_dict())
+
+
+@app.get("/activity", response_model=ActivityResponse)
+def list_activity(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    experiment_id: str | None = Query(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ActivityResponse:
+    authorize(x_api_key)
+    entries = service.list_activity(limit=limit, experiment_id=experiment_id)
+    return ActivityResponse(count=len(entries), activity=entries)

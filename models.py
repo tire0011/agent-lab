@@ -150,3 +150,95 @@ class MailboxTaskApprovalsResponse(BaseModel):
 
 class MailboxTaskRejectRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
+
+
+# ---------------------------------------------------------------------------
+# Experiment activity log models
+# ---------------------------------------------------------------------------
+
+
+class ExperimentSummary(BaseModel):
+    """Compact experiment listing shape (omits large text/JSON fields)."""
+
+    id: str
+    goal: str
+    status: str
+    created_at: str
+    selection_started_at: str | None = None
+    selection_ended_at: str | None = None
+    implementation_started_at: str | None = None
+    implementation_ended_at: str | None = None
+    ended_at: str | None = None
+    branch_name: str | None = None
+    test_exit_code: int | None = None
+    error: str | None = None
+
+
+class ExperimentDetail(BaseModel):
+    """Full experiment record, mirroring ``modules.experiment_service.Experiment``."""
+
+    id: str
+    goal: str
+    status: str
+    created_at: str
+    selection_started_at: str | None = None
+    selection_ended_at: str | None = None
+    implementation_started_at: str | None = None
+    implementation_ended_at: str | None = None
+    ended_at: str | None = None
+    plan: dict[str, Any] | None = None
+    worktree_path: str | None = None
+    branch_name: str | None = None
+    research_task_id: str | None = None
+    research_started_at: str | None = None
+    research_ended_at: str | None = None
+    research_runtime_ms: int | None = None
+    research_usage: dict[str, Any] | None = None
+    research_raw_summary: str | None = None
+    research_diagnostic_log: str | None = None
+    selection_task_id: str | None = None
+    reformat_retry_task_id: str | None = None
+    policy_replan_task_id: str | None = None
+    implementation_task_id: str | None = None
+    selection_runtime_ms: int | None = None
+    reformat_retry_runtime_ms: int | None = None
+    policy_replan_runtime_ms: int | None = None
+    implementation_runtime_ms: int | None = None
+    selection_usage: dict[str, Any] | None = None
+    reformat_retry_usage: dict[str, Any] | None = None
+    policy_replan_usage: dict[str, Any] | None = None
+    implementation_usage: dict[str, Any] | None = None
+    selection_raw_message: str | None = None
+    reformat_raw_message: str | None = None
+    policy_replan_raw_message: str | None = None
+    selection_diagnostic_log: str | None = None
+    reformat_diagnostic_log: str | None = None
+    policy_replan_diagnostic_log: str | None = None
+    test_command: list[str] | None = None
+    test_exit_code: int | None = None
+    test_output: str | None = None
+    git_status: str | None = None
+    diff_stat: str | None = None
+    diff_text: str | None = None
+    error: str | None = None
+
+
+class ExperimentsResponse(BaseModel):
+    count: int
+    experiments: list[ExperimentSummary]
+
+
+class ActivityEntry(BaseModel):
+    id: int
+    timestamp: str
+    entity_type: str
+    entity_id: str
+    event: str
+    from_status: str | None = None
+    to_status: str | None = None
+    message: str | None = None
+
+
+class ActivityResponse(BaseModel):
+    count: int
+    activity: list[ActivityEntry]

@@ -26,6 +26,11 @@
 - `model_prices` table stores provider/model token prices with `valid_from` history and source attribution; estimated cost uses this table only.
 - `tool_calls` table stores per-run MCP tool call records.
 - `knowledge` table stores simple structured observations from runs for later analysis.
+- `activity_log` table stores a persistent, append-only log of entity lifecycle
+  events (currently experiment creation and status transitions), written by
+  `ExperimentService` inside the same locked connection/transaction as the
+  state change it records, so activity rows and experiment state never
+  diverge. Exposed read-only via `GET /activity`.
 - JSON artifacts under `state/runs/` are kept for lightweight audit/debug parity.
 
 ### 3) API surface
@@ -50,6 +55,16 @@
     wiring yet. `mark_interrupted_tasks_failed()` runs once via FastAPI's
     lifespan startup hook to mark orphaned `running` tasks as `failed`
     without restarting them.
+  - `GET /experiments`, `GET /experiments/{id}` (require `x-api-key`) — thin,
+    read-only routes over `modules.experiment_service.ExperimentService`;
+    no experiment orchestration is triggered from these routes.
+  - `GET /activity` (requires `x-api-key`) — persistent experiment activity
+    log (see `activity_log` table above), optionally filtered by
+    `experiment_id`, newest first.
+  - `ExperimentService` is now a process-wide singleton
+    (`api.get_experiment_service()`) shared between the mailbox task
+    approval bridge and the `/experiments`/`/activity` endpoints, so all
+    routes observe the same in-process state.
 - Deployment context: FastAPI behind nginx on VM with HTTPS
 
 ### 4) Client

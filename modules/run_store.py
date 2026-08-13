@@ -194,6 +194,20 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_mailbox_file_path ON mailbox_messages(file_path);
         CREATE INDEX IF NOT EXISTS idx_mailbox_status ON mailbox_messages(status);
         CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge(category);
+
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            event TEXT NOT NULL,
+            from_status TEXT NULL,
+            to_status TEXT NULL,
+            message TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id);
         """
     )
     _migrate_experiments_columns(conn)
@@ -452,3 +466,76 @@ def insert_tool_calls(
         rows,
     )
     conn.commit()
+
+
+def insert_activity(
+    conn: sqlite3.Connection,
+    *,
+    timestamp: str,
+    entity_type: str,
+    entity_id: str,
+    event: str,
+    from_status: str | None = None,
+    to_status: str | None = None,
+    message: str | None = None,
+) -> int:
+    """Append one persistent activity log entry (e.g. an experiment lifecycle event).
+
+    Callers are responsible for their own commit/locking semantics when
+    inserting as part of a larger transaction (e.g. ``ExperimentService``
+    inserts activity rows inside the same ``with self._conn:`` block used
+    for the state transition itself, so a failed transition never leaves an
+    orphaned activity row and vice versa).
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO activity_log (
+            timestamp,
+            entity_type,
+            entity_id,
+            event,
+            from_status,
+            to_status,
+            message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (timestamp, entity_type, entity_id, event, from_status, to_status, message),
+    )
+    return int(cursor.lastrowid)
+
+
+def list_activity(
+    conn: sqlite3.Connection,
+    limit: int = 50,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the most recent activity log entries, newest first."""
+    query = "SELECT id, timestamp, entity_type, entity_id, event, from_status, to_status, message FROM activity_log"
+    conditions: list[str] = []
+    params: list[Any] = []
+    if entity_type is not None:
+        conditions.append("entity_type = ?")
+        params.append(entity_type)
+    if entity_id is not None:
+        conditions.append("entity_id = ?")
+        params.append(entity_id)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+    return [
+        {
+            "id": row[0],
+            "timestamp": row[1],
+            "entity_type": row[2],
+            "entity_id": row[3],
+            "event": row[4],
+            "from_status": row[5],
+            "to_status": row[6],
+            "message": row[7],
+        }
+        for row in rows
+    ]

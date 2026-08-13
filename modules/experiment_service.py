@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.codex_worker import CodexResult, CodexWorker
-from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
 
 # ---------------------------------------------------------------------------
 # Status constants — small deterministic state machine.
@@ -1335,6 +1335,15 @@ class ExperimentService:
                 """,
                 (experiment_id, goal.strip(), STATUS_QUEUED, created_at),
             )
+            insert_activity(
+                self._conn,
+                timestamp=created_at,
+                entity_type="experiment",
+                entity_id=experiment_id,
+                event="created",
+                to_status=STATUS_QUEUED,
+                message=goal.strip(),
+            )
 
         self._implementation_timeout_seconds = timeout_seconds
         return self.get_experiment(experiment_id)
@@ -1363,6 +1372,26 @@ class ExperimentService:
         return [_row_to_experiment(row) for row in rows]
 
     # ------------------------------------------------------------------
+    # list_activity — persistent activity log (experiment lifecycle events)
+    # ------------------------------------------------------------------
+
+    def list_activity(
+        self, limit: int = 50, experiment_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return recent persisted activity log entries, newest first.
+
+        Reuses ``modules.run_store.list_activity`` against the same
+        connection/lock used for all other experiment reads/writes.
+        """
+        with self._lock:
+            return list_activity(
+                self._conn,
+                limit=limit,
+                entity_type="experiment",
+                entity_id=experiment_id,
+            )
+
+    # ------------------------------------------------------------------
     # Internal: status transition helper
     # ------------------------------------------------------------------
 
@@ -1386,7 +1415,19 @@ class ExperimentService:
                 "WHERE id = ? AND status = ?",
                 values,
             )
-        return cursor.rowcount == 1
+            moved = cursor.rowcount == 1
+            if moved:
+                insert_activity(
+                    self._conn,
+                    timestamp=_utcnow_iso(),
+                    entity_type="experiment",
+                    entity_id=experiment_id,
+                    event="status_changed",
+                    from_status=from_status,
+                    to_status=to_status,
+                    message=str(fields.get("error")) if fields.get("error") else None,
+                )
+        return moved
 
     def _force_status(self, experiment_id: str, status: str, **fields: Any) -> None:
         """Set status unconditionally (used for terminal/failure bookkeeping)."""
@@ -1401,6 +1442,15 @@ class ExperimentService:
             self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} WHERE id = ?",
                 values,
+            )
+            insert_activity(
+                self._conn,
+                timestamp=_utcnow_iso(),
+                entity_type="experiment",
+                entity_id=experiment_id,
+                event="status_forced",
+                to_status=status,
+                message=str(fields.get("error")) if fields.get("error") else None,
             )
 
     # ------------------------------------------------------------------
