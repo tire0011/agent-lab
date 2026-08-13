@@ -139,6 +139,10 @@ not a significance ranking.
 
 - Azure actual-cost reconciliation against estimated cost. `new`
 
+### Mailbox submissions
+- Evaluate whether a small local LLM can run continuously on the main VM as Nexus's low-cost decision layer: selecting the next action, classifying messages, choosing tools or larger models, and recognizing when human help is needed. Compare it against rule-based routing for decision quality, runtime, memory usage, energy/resource consumption, and avoided API cost. `new`
+
+
 ## Open unknowns
 
 Unknowns worth tracking without necessarily turning each into an idea above:
