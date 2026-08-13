@@ -49,6 +49,8 @@ python mailbox_processor.py [--dry-run] [--db-path PATH] [--repo-path PATH]
 - V1 (MCP-based) is in progress.
 - API service (`api.py`) provides:
 	- public `GET /health`
+	- public `GET /activity/public` and `GET /experiments/{id}/public` with
+	  strict allowlisted observability fields (no prompts, diffs, raw logs, or paths)
 	- authenticated `GET /secure-health`
 	- `GET /status`, `GET /problems`, `GET /ideas`, `POST /chat` (read-only over
 	  existing data; see `data_sources.py` and `chat.py`)
@@ -180,6 +182,16 @@ A background `MailboxTaskWorker` daemon (10 s poll interval) calls
 `submit_approved()` + `poll_running()` on each tick.  Experiments run
 serially (one VM, one budget). The Web UI Task Approvals card shows all records
 and provides Approve/Reject buttons when an API key is entered.
+
+## Nexus activity API
+
+`GET /activity/public` returns the latest 100 sanitized lifecycle events without
+authentication. `GET /experiments/{id}/public` returns the corresponding public
+experiment summary. The website displays this feed and refreshes it every 10 seconds.
+
+Authenticated `GET /activity` accepts `experiment_id` and `mailbox_task_id` filters
+and includes at most the final 100 sanitized test-output lines per event.
+Authenticated `GET /experiments/{id}` retains the detailed experiment diagnostics.
 
 ## Security
 

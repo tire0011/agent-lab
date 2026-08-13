@@ -73,6 +73,7 @@ button.secondary { border: 1px solid var(--border); background: var(--surface); 
 .error-text { color: var(--bad); }
 
 .chat-card { margin-top: 16px; }
+#public-activity-section { margin-top: 16px; }
 .messages { min-height: 150px; max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--background); }
 .message { max-width: 82%; padding: 10px 12px; border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message.user { align-self: flex-end; background: var(--accent); color: white; }

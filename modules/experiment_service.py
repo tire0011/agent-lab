@@ -1391,6 +1391,15 @@ class ExperimentService:
                 entity_id=experiment_id,
             )
 
+    def mailbox_task_id_for_experiment(self, experiment_id: str) -> str | None:
+        """Return the approval id linked to an experiment, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM mailbox_task_approvals WHERE experiment_id = ? LIMIT 1",
+                (experiment_id,),
+            ).fetchone()
+        return str(row[0]) if row else None
+
     # ------------------------------------------------------------------
     # Internal: status transition helper
     # ------------------------------------------------------------------

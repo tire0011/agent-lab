@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -22,7 +23,7 @@ from modules.mailbox_task_service import (
 )
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
 from models import (
-    ActivityResponse,
+    DiagnosticActivityResponse,
     ChatRequest,
     ChatResponse,
     CodexTaskCreateRequest,
@@ -40,6 +41,8 @@ from models import (
     MailboxTaskRejectRequest,
     Problem,
     ProblemsResponse,
+    PublicActivityResponse,
+    PublicExperimentSummary,
     StatusResponse,
 )
 
@@ -366,7 +369,7 @@ def reject_mailbox_task(
 
 
 # ---------------------------------------------------------------------------
-# Experiment and activity log endpoints (authenticated, read-only)
+# Experiment and activity log endpoints (public allowlisted + authenticated)
 #
 # Thin routes over the existing ExperimentService/run_store persistence;
 # no experiment orchestration or new SQLite access is added here.
@@ -401,13 +404,154 @@ def get_experiment(
     return ExperimentDetail(**experiment.to_dict())
 
 
-@app.get("/activity", response_model=ActivityResponse)
+_PUBLIC_PHASES = {
+    "queued": "queued", "selecting": "selecting", "implementing": "implementing",
+    "verifying": "verifying", "succeeded": "succeeded", "failed": "failed",
+    "needs_review": "needs_review", "timed_out": "failed", "rejected": "needs_review",
+}
+
+
+def _public_phase(status: str | None) -> str:
+    return _PUBLIC_PHASES.get(status or "", "needs_review")
+
+
+def _changed_file_names(git_status: str | None) -> list[str]:
+    """Extract basenames only; public responses must never contain paths."""
+    names: list[str] = []
+    for line in (git_status or "").splitlines():
+        candidate = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in candidate:
+            candidate = candidate.rsplit(" -> ", 1)[-1]
+        name = candidate.replace("\\", "/").rsplit("/", 1)[-1]
+        if name and re.fullmatch(r"[A-Za-z0-9_. -]{1,120}", name) and name not in names:
+            names.append(name)
+    return names[:100]
+
+
+def _failure_reason(experiment) -> str | None:
+    """Classify failures without copying raw error or exception text."""
+    if experiment.status == "timed_out":
+        return "Experiment timed out."
+    if experiment.status == "rejected":
+        return "Experiment was rejected by the safety policy."
+    if experiment.status == "needs_review":
+        return "Experiment requires human review."
+    if experiment.status == "failed":
+        if experiment.test_exit_code is not None:
+            return "Automated tests failed."
+        return "Experiment failed before verification completed."
+    return None
+
+
+def _test_summary(experiment) -> str | None:
+    if experiment.test_exit_code == 0:
+        return "Automated tests passed."
+    if experiment.test_exit_code is not None:
+        return f"Automated tests failed with exit code {experiment.test_exit_code}."
+    return None
+
+
+def _mailbox_task_id(service: ExperimentService, experiment_id: str) -> str | None:
+    lookup = getattr(service, "mailbox_task_id_for_experiment", None)
+    return lookup(experiment_id) if lookup else None
+
+
+def _public_experiment(experiment, mailbox_task_id: str | None) -> PublicExperimentSummary:
+    # Strict allowlist: never derive this response from to_dict/model_dump.
+    return PublicExperimentSummary(
+        id=experiment.id,
+        mailbox_task_id=mailbox_task_id,
+        phase=_public_phase(experiment.status),
+        status=experiment.status,
+        created_at=experiment.created_at,
+        ended_at=experiment.ended_at,
+        failure_reason=_failure_reason(experiment),
+        test_exit_code=experiment.test_exit_code,
+        changed_files=_changed_file_names(experiment.git_status),
+        test_summary=_test_summary(experiment),
+    )
+
+
+@app.get("/experiments/{experiment_id}/public", response_model=PublicExperimentSummary)
+def get_public_experiment(
+    experiment_id: str,
+    service: ExperimentService = Depends(get_experiment_service),
+) -> PublicExperimentSummary:
+    try:
+        experiment = service.get_experiment(experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return _public_experiment(experiment, _mailbox_task_id(service, experiment_id))
+
+
+def _diagnostic_lines(raw: str | None) -> list[str]:
+    """Return bounded, redacted test diagnostics; never return raw output."""
+    lines = (raw or "").splitlines()[-100:]
+    safe: list[str] = []
+    secret = re.compile(r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)(\s*[:=]\s*|\s+)\S+")
+    path = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
+    for line in lines:
+        line = secret.sub(r"\1=[REDACTED]", line)
+        line = path.sub("[PATH]", line)
+        safe.append(line[:500])
+    return safe
+
+
+@app.get("/activity/public", response_model=PublicActivityResponse)
+def list_public_activity(
+    service: ExperimentService = Depends(get_experiment_service),
+) -> PublicActivityResponse:
+    result = []
+    for entry in service.list_activity(limit=100):
+        try:
+            experiment = service.get_experiment(entry["entity_id"])
+        except ExperimentNotFoundError:
+            continue
+        status = entry.get("to_status") or experiment.status
+        result.append({
+            "timestamp": entry["timestamp"],
+            "phase": _public_phase(status),
+            "status": status,
+            "message": f"Experiment phase is {_public_phase(status)}.",
+            "mailbox_task_id": _mailbox_task_id(service, experiment.id),
+            "experiment_id": experiment.id,
+            "failure_reason": _failure_reason(experiment) if status in _PUBLIC_PHASES and _public_phase(status) in {"failed", "needs_review"} else None,
+            "test_exit_code": experiment.test_exit_code,
+            "changed_files": _changed_file_names(experiment.git_status),
+            "test_summary": _test_summary(experiment),
+        })
+    return PublicActivityResponse(count=len(result), activity=result)
+
+
+@app.get("/activity", response_model=DiagnosticActivityResponse)
 def list_activity(
     x_api_key: str | None = Header(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     experiment_id: str | None = Query(default=None),
+    mailbox_task_id: str | None = Query(default=None),
     service: ExperimentService = Depends(get_experiment_service),
-) -> ActivityResponse:
+) -> DiagnosticActivityResponse:
     authorize(x_api_key)
+    if mailbox_task_id:
+        approval_service = _resolve_mailbox_task_service()
+        try:
+            approval = approval_service.get(mailbox_task_id)
+        except ApprovalNotFoundError:
+            return DiagnosticActivityResponse(count=0, activity=[])
+        if experiment_id and approval.experiment_id != experiment_id:
+            return DiagnosticActivityResponse(count=0, activity=[])
+        experiment_id = approval.experiment_id
+        if not experiment_id:
+            return DiagnosticActivityResponse(count=0, activity=[])
     entries = service.list_activity(limit=limit, experiment_id=experiment_id)
-    return ActivityResponse(count=len(entries), activity=entries)
+    diagnostics = []
+    for entry in entries:
+        experiment = service.get_experiment(entry["entity_id"])
+        diagnostics.append({
+            **entry,
+            "message": None,
+            "mailbox_task_id": _mailbox_task_id(service, experiment.id),
+            "test_exit_code": experiment.test_exit_code,
+            "test_output_lines": _diagnostic_lines(experiment.test_output),
+        })
+    return DiagnosticActivityResponse(count=len(diagnostics), activity=diagnostics)

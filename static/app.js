@@ -20,6 +20,8 @@ const elements = {
   send: document.querySelector("#send-button"),
   chatState: document.querySelector("#chat-state"),
   messages: document.querySelector("#messages"),
+  publicActivityCount: document.querySelector("#public-activity-count"),
+  publicActivityContent: document.querySelector("#public-activity-content"),
 };
 
 async function requestJson(url, options = {}) {
@@ -140,6 +142,44 @@ async function loadOverview() {
 
   elements.refresh.disabled = false;
   elements.refresh.textContent = "Aktualisieren";
+}
+
+function renderPublicActivity(items) {
+  elements.publicActivityContent.replaceChildren();
+  if (!items.length) {
+    elements.publicActivityContent.textContent = "Noch keine Aktivität vorhanden.";
+    return;
+  }
+  const list = document.createElement("ul");
+  list.className = "item-list";
+  for (const item of items) {
+    const row = document.createElement("li");
+    const title = document.createElement("div");
+    title.className = "item-title";
+    title.textContent = `${item.phase} · ${item.message}`;
+    const meta = document.createElement("div");
+    meta.className = "item-meta";
+    const details = [item.timestamp, `Experiment ${item.experiment_id.slice(0, 8)}`];
+    if (item.mailbox_task_id) details.push(`Mailbox ${item.mailbox_task_id.slice(0, 8)}`);
+    if (item.test_summary) details.push(item.test_summary);
+    if (item.changed_files.length) details.push(`Dateien: ${item.changed_files.join(", ")}`);
+    if (item.failure_reason) details.push(item.failure_reason);
+    meta.textContent = details.join(" · ");
+    row.append(title, meta);
+    list.append(row);
+  }
+  elements.publicActivityContent.append(list);
+}
+
+async function loadPublicActivity() {
+  try {
+    const data = await requestJson("/activity/public");
+    elements.publicActivityCount.textContent = String(data.count);
+    renderPublicActivity(data.activity);
+  } catch (error) {
+    elements.publicActivityCount.textContent = "!";
+    showError(elements.publicActivityContent, error.message);
+  }
 }
 
 function addMessage(text, type) {
@@ -338,3 +378,5 @@ if (taskLoadButton) {
 
 addMessage("Hallo! Ich beantworte Fragen zu Status, Problemen und Ideen.", "agent");
 loadOverview();
+loadPublicActivity();
+setInterval(loadPublicActivity, 10000);

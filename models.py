@@ -242,3 +242,45 @@ class ActivityEntry(BaseModel):
 class ActivityResponse(BaseModel):
     count: int
     activity: list[ActivityEntry]
+
+
+class DiagnosticActivityEntry(ActivityEntry):
+    mailbox_task_id: str | None = None
+    test_exit_code: int | None = None
+    test_output_lines: list[str] = Field(default_factory=list)
+
+
+class DiagnosticActivityResponse(BaseModel):
+    count: int
+    activity: list[DiagnosticActivityEntry]
+
+
+class PublicActivityEntry(BaseModel):
+    timestamp: str
+    phase: str
+    status: str
+    message: str
+    mailbox_task_id: str | None = None
+    experiment_id: str
+    failure_reason: str | None = None
+    test_exit_code: int | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    test_summary: str | None = None
+
+
+class PublicActivityResponse(BaseModel):
+    count: int
+    activity: list[PublicActivityEntry]
+
+
+class PublicExperimentSummary(BaseModel):
+    id: str
+    mailbox_task_id: str | None = None
+    phase: str
+    status: str
+    created_at: str
+    ended_at: str | None = None
+    failure_reason: str | None = None
+    test_exit_code: int | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    test_summary: str | None = None
