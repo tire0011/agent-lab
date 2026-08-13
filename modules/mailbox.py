@@ -383,20 +383,29 @@ def _process_task(
     except Exception:
         logger.warning("_process_task: failed to store task_body for msg %s", db_msg_id)
 
-    # Create a pending_approval record via MailboxTaskService (lazy import avoids circular deps)
+    # Create a pending_approval record directly on the shared connection so that
+    # the correct database is always used (temp DB in tests, production DB in
+    # production) without hardcoding DEFAULT_DB_PATH here.
     try:
-        from modules.mailbox_task_service import MailboxTaskService
-        from modules.run_store import DEFAULT_DB_PATH
-
-        svc = MailboxTaskService(db_path=DEFAULT_DB_PATH, repo_path=repo_path)
-        received_at = _now_iso()
-        svc.create_approval(
-            mailbox_msg_id=db_msg_id,
-            task_body=msg.body,
-            sender=msg.created_by,
-            file_path=str(msg.file_path),
-            received_at=received_at,
-        )
+        existing = conn.execute(
+            "SELECT id FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
+            (db_msg_id,),
+        ).fetchone()
+        if not existing:
+            import uuid as _uuid
+            now = _now_iso()
+            approval_id = _uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO mailbox_task_approvals
+                    (id, mailbox_msg_id, task_body, sender, file_path,
+                     received_at, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+                """,
+                (approval_id, db_msg_id, msg.body, msg.created_by,
+                 str(msg.file_path), now, now, now),
+            )
+            conn.commit()
     except Exception:
         logger.warning("_process_task: failed to create approval for msg %s", db_msg_id, exc_info=True)
 
