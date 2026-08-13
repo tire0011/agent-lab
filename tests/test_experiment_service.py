@@ -1136,6 +1136,115 @@ class PolicyActionSecretTestCase(unittest.TestCase):
         reason = plan_violates_policy(plan, json.dumps(data))
         self.assertIsNotNone(reason)
 
+    def test_secrets_are_absent_from_output_is_not_rejected(self):
+        # Regression: "absent"/"excluded"/"omitted" describe the lack of a
+        # secret, not an action performed on one. The old matcher treated
+        # the ambiguous verb "output" (a common noun in phrases like
+        # "activity output") as a real disclosure action whenever a secret
+        # noun appeared anywhere nearby in the same sentence.
+        data = json.loads(VALID_PLAN_JSON)
+        data["planned_tests"] = (
+            "Add a failure-path assertion that raw commands, paths, stack "
+            "traces, and secrets are absent from public activity output."
+        )
+        plan = parse_plan(json.dumps(data))
+        self.assertIsNotNone(plan)
+        self.assertIsNone(plan_violates_policy(plan, json.dumps(data)))
+
+    def test_credentials_excluded_from_response_is_not_rejected(self):
+        data = json.loads(VALID_PLAN_JSON)
+        data["expected_changes"] = (
+            "Ensure credentials are excluded from the public response and "
+            "tokens are omitted from any returned field."
+        )
+        plan = parse_plan(json.dumps(data))
+        self.assertIsNotNone(plan)
+        self.assertIsNone(plan_violates_policy(plan, json.dumps(data)))
+
+    def test_security_test_asserting_non_disclosure_is_not_rejected(self):
+        data = json.loads(VALID_PLAN_JSON)
+        data["planned_tests"] = (
+            "Add a security test asserting the api key and other secrets "
+            "never appear in the response, and that credentials are not "
+            "present in logs."
+        )
+        plan = parse_plan(json.dumps(data))
+        self.assertIsNotNone(plan)
+        self.assertIsNone(plan_violates_policy(plan, json.dumps(data)))
+
+    def test_real_secret_action_still_rejected_after_absent_fix(self):
+        # Ensure the narrow negation-word addition did not weaken real
+        # detection: a genuine action ("store the api key") elsewhere in
+        # the same plan must still be rejected even though the plan also
+        # contains defensive, non-disclosure language.
+        data = json.loads(VALID_PLAN_JSON)
+        data["expected_changes"] = (
+            "Secrets are absent from the public response, but internally "
+            "the plan will store the api key in the database for reuse."
+        )
+        plan = parse_plan(json.dumps(data))
+        self.assertIsNotNone(plan)
+        reason = plan_violates_policy(plan, json.dumps(data))
+        self.assertIsNotNone(reason)
+        self.assertIn("api key", reason)
+
+    def test_outbox_view_plan_is_now_accepted(self):
+        # Regression fixture: this is the exact plan produced for the
+        # "Add public sanitized Outbox view" goal that was previously
+        # rejected with "plan describes an actual secret/credential
+        # action: 'secrets are absent from public activity output'" due
+        # to the ambiguous "output" verb false-positive. It must now pass.
+        data = {
+            "title": "Cover untracked files in experiment diff collection",
+            "motivation": (
+                "Improve experiment observability by ensuring newly "
+                "created, untracked files are represented in collected "
+                "diffs instead of being silently omitted. This is a "
+                "distinct, narrowly scoped fix identified in IDEAS.md and "
+                "does not alter authentication or public data exposure."
+            ),
+            "affected_files": ["api.py", "tests/test_activity_api.py"],
+            "expected_changes": (
+                "Adjust the existing experiment diff-collection path to "
+                "include bounded diff information for untracked files "
+                "using repository-native Git behavior, while preserving "
+                "the current sanitized public activity response and "
+                "avoiding raw command errors, filesystem details, or "
+                "environment data."
+            ),
+            "success_criteria": (
+                "Experiment results account for both tracked modifications "
+                "and newly created untracked files; existing tracked-file "
+                "behavior remains unchanged; collection failures remain "
+                "sanitized through the current activity patterns; and no "
+                "dependency, infrastructure, authentication, or deployment "
+                "changes are introduced."
+            ),
+            "planned_tests": (
+                "Add focused coverage with a temporary repository "
+                "containing tracked edits and an untracked file, asserting "
+                "both are reflected by diff collection. Add a failure-path "
+                "assertion that raw commands, paths, stack traces, and "
+                "secrets are absent from public activity output. Run the "
+                "complete test suite."
+            ),
+            "risks": (
+                "Untracked files may be binary, large, or sensitive. Keep "
+                "collection bounded, exclude unsupported binary content, "
+                "reuse existing sanitization behavior, and test that raw "
+                "file contents and operational errors cannot leak through "
+                "public responses."
+            ),
+            "estimated_scope": (
+                "Small change limited to the existing diff-collection "
+                "implementation and its closely related activity tests; no "
+                "new dependencies and implementable within 20 minutes."
+            ),
+        }
+        plan = parse_plan(json.dumps(data))
+        self.assertIsNotNone(plan)
+        self.assertIsNone(plan_violates_policy(plan, json.dumps(data)))
+
 
 class ReformatRetryTestCase(unittest.TestCase):
     """Covers the exactly-one-shot read-only reformat retry."""

@@ -240,11 +240,23 @@ _INFRA_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
 # match alone cannot tell "create a VM" apart from "will not create a VM",
 # so any negation word found inside the matched span turns off the
 # rejection for that specific match (the search continues past it).
+#
+# Also includes non-disclosure/absence state words ("absent", "missing",
+# "excluded") for the secret/credential check specifically: defensive
+# statements like "secrets are absent from public activity output" or
+# "credentials are excluded from the response" describe the *lack* of a
+# secret/credential rather than an action performed on one, and are easily
+# confused with a real action match only because of an unrelated, later
+# noun/verb-homograph word (e.g. "output") appearing further in the same
+# sentence. Treating these as negation-equivalent state words keeps the
+# fix narrowly scoped to negation/non-disclosure handling rather than
+# adding a broad secret-domain keyword exception.
 _INFRA_ACTION_NEGATION_WORDS = frozenset(
     {
         "not", "no", "never", "without", "cannot", "avoid", "don't",
         "doesn't", "won't", "wouldn't", "shouldn't", "didn't", "isn't",
         "aren't", "n't",
+        "absent", "missing", "excluded", "omitted",
     }
 )
 
