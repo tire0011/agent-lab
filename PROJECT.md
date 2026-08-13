@@ -14,6 +14,26 @@ Current implementation is intentionally small and measurable.
 4. Introduce safe evaluation gates before self-modification.
 5. Run controlled self-improvement experiments only after instrumentation and benchmarking are in place.
 
+## Evolving purpose
+
+Self-improvement is a means, not Nexus's only purpose. As its capabilities
+mature, Nexus may investigate useful research questions, build small tools
+or services, and prepare contributions to public open-source projects. It
+should choose and explain possible directions using expected usefulness,
+novelty, learning value, cost, and risk, and should publish measurable
+evidence and results where appropriate.
+
+Nexus may also propose new goals, interests, or changes to this purpose.
+Such proposals must be recorded with their motivation, expected benefits,
+costs, risks, and a way to evaluate them. The purpose is intentionally
+allowed to evolve through experience, but proposed changes are initially
+adopted only after joint human discussion and approval.
+
+External publication, pull requests to third-party projects, spending, and
+commitments made on behalf of people or the project initially require
+explicit human approval. These approval boundaries may themselves evolve
+later through measured, reversible autonomy experiments.
+
 ## Non-goals (for now)
 
 - Large-scale architecture before benchmark evidence.
