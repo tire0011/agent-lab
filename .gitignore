@@ -4,3 +4,4 @@
 __pycache__/
 *.py[cod]
 state/runs/*.json
+state/mailbox.lock
