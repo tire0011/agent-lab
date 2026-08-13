@@ -1361,6 +1361,19 @@ class ExperimentService:
             raise ExperimentNotFoundError(f"no experiment with id {experiment_id!r}")
         return _row_to_experiment(row)
 
+    def resolve_public_experiment(self, experiment_id: str) -> Experiment:
+        """Resolve an exact id or a unique public prefix of at least 8 hex chars."""
+        if re.fullmatch(r"[0-9a-f]{8,64}", experiment_id) is None:
+            raise ExperimentNotFoundError("invalid public experiment id")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM experiments WHERE id LIKE ? ORDER BY id LIMIT 2",
+                (experiment_id + "%",),
+            ).fetchall()
+        if len(rows) != 1:
+            raise ExperimentNotFoundError("public experiment id is missing or ambiguous")
+        return _row_to_experiment(rows[0])
+
     def list_experiments(self, limit: int = 20) -> list[Experiment]:
         if limit <= 0:
             return []

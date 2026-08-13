@@ -188,6 +188,8 @@ and provides Approve/Reject buttons when an API key is entered.
 `GET /activity/public` returns the latest 100 sanitized lifecycle events without
 authentication. `GET /experiments/{id}/public` returns the corresponding public
 experiment summary. The website displays this feed and refreshes it every 10 seconds.
+Public experiment lookups accept either the full ID or a unique lowercase hexadecimal
+prefix of at least eight characters.
 
 Authenticated `GET /activity` accepts `experiment_id` and `mailbox_task_id` filters
 and includes at most the final 100 sanitized test-output lines per event.

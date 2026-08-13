@@ -37,6 +37,7 @@ class ActivityApiTests(unittest.TestCase):
         self.exp = experiment()
         self.service = MagicMock()
         self.service.get_experiment.return_value = self.exp
+        self.service.resolve_public_experiment.return_value = self.exp
         self.service.mailbox_task_id_for_experiment.return_value = "mailbox-7"
         self.service.list_experiments.return_value = [self.exp]
         self.service.list_activity.return_value = [{
@@ -82,6 +83,7 @@ class ActivityApiTests(unittest.TestCase):
         self.assertNotIn("test_output", body)
         self.assertNotIn("error", body)
         self.assertNotIn(SECRET, json.dumps(body))
+        self.service.resolve_public_experiment.assert_called_once_with("3ef5b935")
 
     def test_authenticated_activity_has_filters_and_bounded_sanitized_output(self):
         self.exp.test_output = "\n".join([f"line {i}" for i in range(105)] + [f"token={SECRET} /agent/x.py"])

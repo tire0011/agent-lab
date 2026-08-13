@@ -478,10 +478,10 @@ def get_public_experiment(
     service: ExperimentService = Depends(get_experiment_service),
 ) -> PublicExperimentSummary:
     try:
-        experiment = service.get_experiment(experiment_id)
+        experiment = service.resolve_public_experiment(experiment_id)
     except ExperimentNotFoundError:
         raise HTTPException(status_code=404, detail="experiment not found")
-    return _public_experiment(experiment, _mailbox_task_id(service, experiment_id))
+    return _public_experiment(experiment, _mailbox_task_id(service, experiment.id))
 
 
 def _diagnostic_lines(raw: str | None) -> list[str]:
