@@ -70,6 +70,10 @@ not a significance ranking.
 - Persist experiment hypothesis, change, metrics, result, decision, and cost. `new`
 - Fix the experiment diff collector to also detect and include new, untracked files, so newly created files show up in the stored diff/diff_stat and are available for evaluation and reports. `new`
 
+### Azure GPU worker VM
+
+- Evaluate a separate on-demand Azure GPU VM as Nexus's model-compute worker: start it only for local-LLM inference, benchmarking, fine-tuning, or other GPU experiments; measure model quality, tokens/second, startup time, VRAM/RAM use, energy/resource use, and total cost against hosted APIs and non-GPU execution; enforce spending limits and automatically stop/deallocate it when idle. `new`
+
 ### Test isolation / second VM
 
 - Investigate a second Azure VM as an ephemeral test worker; compare cost of local tests on the main VM vs a disposable test VM for risky changes. `new`
