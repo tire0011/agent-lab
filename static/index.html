@@ -52,6 +52,14 @@
             <span id="ideas-count" class="count">–</span>
           </div>
           <div id="ideas-content" class="list-state" aria-live="polite">Wird geladen …</div>
+          <form id="idea-form" class="idea-form">
+            <label for="idea-input" class="sr-only">Neue Idee</label>
+            <input id="idea-input" type="text" maxlength="500" placeholder="Neue Idee …" required>
+            <label for="idea-api-key" class="sr-only">API-Key</label>
+            <input id="idea-api-key" type="password" placeholder="API-Key" autocomplete="off">
+            <button id="idea-submit" type="submit">Idee hinzufügen</button>
+            <span id="idea-state" class="muted" aria-live="polite"></span>
+          </form>
         </article>
       </section>
 

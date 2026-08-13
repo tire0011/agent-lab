@@ -159,6 +159,98 @@ class IdeasEndpointTests(ApiTestsBase):
         self.assertEqual(states, {"idea one": "adopted", "idea two": "tested"})
 
 
+class CreateIdeaEndpointTests(ApiTestsBase):
+    HEADERS = {"x-api-key": "test-key"}
+
+    def test_create_idea_requires_api_key(self):
+        response = self.client.post("/ideas", json={"text": "no auth"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_create_idea_rejects_wrong_api_key(self):
+        response = self.client.post(
+            "/ideas", json={"text": "wrong key"}, headers={"x-api-key": "nope"}
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_create_idea_rejects_empty_text(self):
+        response = self.client.post("/ideas", json={"text": ""}, headers=self.HEADERS)
+        self.assertEqual(response.status_code, 422)
+
+    def test_create_idea_rejects_whitespace_only_text(self):
+        response = self.client.post("/ideas", json={"text": "   "}, headers=self.HEADERS)
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_idea_rejects_too_long_text(self):
+        response = self.client.post(
+            "/ideas", json={"text": "x" * 501}, headers=self.HEADERS
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_create_idea_appends_with_new_state(self):
+        self._write_ideas_md("## Ideas\n\n### Section\n\n- existing idea\n")
+        response = self.client.post(
+            "/ideas", json={"text": "a fresh idea"}, headers=self.HEADERS
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["text"], "a fresh idea")
+        self.assertEqual(body["state"], "new")
+        self.assertEqual(body["section"], "Inbox")
+
+    def test_create_idea_is_reflected_by_get_ideas(self):
+        self._write_ideas_md("## Ideas\n\n### Section\n\n- existing idea\n")
+        self.client.post("/ideas", json={"text": "second idea"}, headers=self.HEADERS)
+        response = self.client.get("/ideas")
+        body = response.json()
+        self.assertEqual(body["count"], 2)
+        texts = {i["text"] for i in body["ideas"]}
+        self.assertIn("second idea", texts)
+
+    def test_create_idea_creates_ideas_section_when_missing(self):
+        self._write_ideas_md("# IDEAS.md\n\nSome intro text.\n")
+        response = self.client.post(
+            "/ideas", json={"text": "first ever idea"}, headers=self.HEADERS
+        )
+        self.assertEqual(response.status_code, 201)
+        get_response = self.client.get("/ideas")
+        self.assertEqual(get_response.json()["count"], 1)
+
+    def test_create_idea_strips_backticks_to_prevent_forged_state(self):
+        response = self.client.post(
+            "/ideas",
+            json={"text": "sneaky `adopted` idea"},
+            headers=self.HEADERS,
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["state"], "new")
+        self.assertNotIn("`", body["text"])
+
+    def test_create_idea_strips_leading_markdown_markers(self):
+        response = self.client.post(
+            "/ideas", json={"text": "## fake heading injection"}, headers=self.HEADERS
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["text"], "fake heading injection")
+
+    def test_create_idea_collapses_newlines_and_whitespace(self):
+        response = self.client.post(
+            "/ideas",
+            json={"text": "line one\nline two\n\n   line three"},
+            headers=self.HEADERS,
+        )
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["text"], "line one line two line three")
+
+    def test_create_idea_does_not_leak_api_key(self):
+        response = self.client.post(
+            "/ideas", json={"text": "no leak"}, headers=self.HEADERS
+        )
+        self.assertNotIn("test-key", json.dumps(response.json()))
+
+
 class ChatEndpointTests(ApiTestsBase):
     def test_chat_rejects_empty_message(self):
         response = self.client.post("/chat", json={"message": ""})

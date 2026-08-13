@@ -36,6 +36,11 @@
   - `GET /health` (public)
   - `GET /secure-health` (requires `x-api-key` matching `AGENT_API_KEY`)
   - `GET /status`, `GET /problems`, `GET /ideas`, `POST /chat` (read-only; consistent data via `data_sources.py`)
+  - `POST /ideas` (requires `x-api-key`) — appends a sanitized, state-`new`
+    idea to a fixed `### Inbox` subsection at the end of `IDEAS.md`'s
+    `## Ideas` section; `data_sources.add_idea()` guards the read-modify-write
+    with an exclusive `fcntl.flock` so concurrent requests cannot corrupt
+    the file or clobber each other's entries.
   - `POST /codex/tasks`, `GET /codex/tasks`, `GET /codex/tasks/{id}`,
     `POST /codex/tasks/{id}/run` (all require `x-api-key`) — thin routes over
     the existing `modules.codex_task_service.CodexTaskService`; no worker

@@ -12,6 +12,8 @@ Experimental project for distributed self-improving LLM agents under strict budg
 	- authenticated `GET /secure-health`
 	- `GET /status`, `GET /problems`, `GET /ideas`, `POST /chat` (read-only over
 	  existing data; see `data_sources.py` and `chat.py`)
+	- authenticated `POST /ideas` to append a new idea (state `new`) to
+	  `IDEAS.md`; see "Adding ideas" below
 	- authenticated Codex task endpoints (`POST /codex/tasks`,
 	  `GET /codex/tasks`, `GET /codex/tasks/{id}`,
 	  `POST /codex/tasks/{id}/run`) — synchronous, `read-only` sandbox,
@@ -63,6 +65,22 @@ CLI runner):
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
 - Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests`
+
+## Adding ideas
+
+`POST /ideas` (authenticated with `x-api-key`, same as `/secure-health` and
+`/codex/tasks*`) appends a new idea to `IDEAS.md`:
+
+- Request body: `{"text": "..."}` — non-empty after trimming, at most 500
+  characters.
+- The idea is sanitized (collapsed to one line, backticks stripped, no
+  leading `#`/`-`/`>`) so it cannot forge a Markdown heading or a
+  `` `state` `` marker, then appended with state `new` under a fixed
+  `### Inbox` subsection at the end of the `## Ideas` section.
+- Writes are guarded by an exclusive file lock (`fcntl.flock`) so
+  concurrent requests append one at a time instead of racing.
+- The Web UI's "Idee hinzufügen" field/button on `/` calls this endpoint
+  and refreshes the ideas list on success.
 
 ## Codex task API
 

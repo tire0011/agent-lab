@@ -11,12 +11,18 @@ from files that already exist in the repository/runtime state:
   defaults to "new" otherwise. Ideas are never a fixed roadmap or priority
   list.
 
+``add_idea`` is the one write path in this module: it appends a new,
+sanitized, state-``new`` idea under a fixed "### Inbox" subsection at the
+end of "## Ideas", guarded by an exclusive file lock so concurrent
+appends cannot interleave and corrupt IDEAS.md.
+
 Both /problems and /ideas as well as the chat endpoint call these same
 functions, so structured endpoints and chat answers never diverge.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -36,6 +42,18 @@ _IDEA_ITEM_RE = re.compile(
 _SECTION_RE = re.compile(r"^(#{1,6})\s+(?P<title>.+)$")
 _IDEAS_HEADING_RE = re.compile(r"^##\s+Ideas\s*$", re.IGNORECASE)
 _KNOWN_STATES = {"new", "exploring", "selected", "tested", "adopted", "rejected"}
+
+# Subsection new ideas submitted via the API are appended under. Kept as a
+# single fixed location so appends are simple, predictable, and easy to
+# find, rather than guessing which existing subsection an idea belongs in.
+_INBOX_SECTION_TITLE = "Inbox"
+_INBOX_HEADING_RE = re.compile(r"^###\s+" + re.escape(_INBOX_SECTION_TITLE) + r"\s*$", re.IGNORECASE)
+
+MAX_IDEA_TEXT_LENGTH = 500
+
+
+class InvalidIdeaTextError(ValueError):
+    """Raised when submitted idea text fails validation/sanitization."""
 
 
 def list_problems() -> list[Problem]:
@@ -94,12 +112,20 @@ def list_ideas() -> list[Idea]:
     rather than an error, matching the read-only, best-effort contract of
     this adapter.
     """
-    ideas: list[Idea] = []
-
     try:
         text = IDEAS_PATH.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return ideas
+        return []
+
+    return _parse_ideas(text)
+
+
+def _parse_ideas(text: str) -> list[Idea]:
+    """Parse ideas out of raw IDEAS.md *text* (see ``list_ideas`` for the
+    exact rules). Split out so ``add_idea`` can parse its own just-written
+    content directly, without a second disk read that could race with
+    another concurrent writer."""
+    ideas: list[Idea] = []
 
     current_section = ""
     in_ideas_section = False
@@ -144,3 +170,133 @@ def list_ideas() -> list[Idea]:
         )
 
     return ideas
+
+
+def _sanitize_idea_text(raw: str) -> str:
+    """Validate and normalize idea text before it is written to IDEAS.md.
+
+    Collapses internal whitespace/newlines to single spaces (so an idea is
+    always exactly one Markdown list item, never a stray heading or a
+    multi-line block) and strips backticks (so a submitted idea can never
+    forge a trailing `` `state` `` marker or break the surrounding
+    Markdown code span). Raises ``InvalidIdeaTextError`` for empty,
+    whitespace-only, or too-long input.
+    """
+    normalized = " ".join(raw.split())
+    normalized = normalized.replace("`", "'")
+    if not normalized:
+        raise InvalidIdeaTextError("idea text must not be empty")
+    if len(normalized) > MAX_IDEA_TEXT_LENGTH:
+        raise InvalidIdeaTextError(
+            f"idea text must be at most {MAX_IDEA_TEXT_LENGTH} characters"
+        )
+    # A leading "#"/"-"/">" would be interpreted as Markdown structure
+    # (heading, list marker, blockquote) rather than plain text once
+    # written as "- <text>", so strip any such leading markers.
+    normalized = re.sub(r"^[#\->\s]+", "", normalized).strip()
+    if not normalized:
+        raise InvalidIdeaTextError("idea text must not be empty")
+    return normalized
+
+
+def add_idea(raw_text: str) -> Idea:
+    """Append a new idea (state ``new``) to the "## Ideas" / "### Inbox"
+    section of IDEAS.md and return it.
+
+    Uses an exclusive advisory file lock (``fcntl.flock``) around the
+    read-modify-write so concurrent requests append one at a time instead
+    of racing and corrupting the file. Text is sanitized first so a
+    submitted idea can never inject a fake heading, state marker, or
+    multi-line content into the document. The returned ``Idea`` is parsed
+    from the content this call just wrote (still under the lock), never
+    from a fresh disk read, so a concurrent writer appending immediately
+    afterwards cannot make this call report the wrong idea.
+    """
+    text = _sanitize_idea_text(raw_text)
+
+    IDEAS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # "a+" creates the file if missing without truncating an existing one;
+    # the lock is acquired on this same handle before reading, so no other
+    # writer can observe or produce an interleaved partial write.
+    with open(IDEAS_PATH, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            original = handle.read()
+            updated = _insert_idea_into_inbox(original, text)
+            handle.seek(0)
+            handle.truncate()
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+            ideas = _parse_ideas(updated)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+    if not ideas or ideas[-1].text != text:
+        # Should be unreachable given the insert logic below always adds
+        # the new idea at the end of the "## Ideas" section (i.e. last in
+        # document order); guard defensively rather than silently
+        # returning a mismatched idea.
+        raise RuntimeError("failed to append idea to IDEAS.md")
+    return ideas[-1]
+
+
+def _insert_idea_into_inbox(original: str, text: str) -> str:
+    """Return *original* with a new "- <text> `new`" bullet appended under
+    an "### Inbox" subsection at the end of the "## Ideas" section,
+    creating that subsection if it does not already exist."""
+    lines = original.splitlines()
+    bullet = f"- {text} `new`"
+
+    ideas_start = None
+    for i, line in enumerate(lines):
+        if _IDEAS_HEADING_RE.match(line.strip()):
+            ideas_start = i
+            break
+
+    if ideas_start is None:
+        # No "## Ideas" section yet: create one at the end of the file.
+        prefix = original if original.endswith("\n") or not original else original + "\n"
+        if prefix and not prefix.endswith("\n\n") and prefix.strip():
+            prefix += "\n"
+        return prefix + f"## Ideas\n\n### {_INBOX_SECTION_TITLE}\n\n{bullet}\n"
+
+    # Find the end of the "## Ideas" section: the next line at heading
+    # level <= 2, or end of file.
+    ideas_end = len(lines)
+    for i in range(ideas_start + 1, len(lines)):
+        match = _SECTION_RE.match(lines[i].strip())
+        if match and len(match.group(1)) <= 2:
+            ideas_end = i
+            break
+
+    inbox_start = None
+    for i in range(ideas_start + 1, ideas_end):
+        if _INBOX_HEADING_RE.match(lines[i].strip()):
+            inbox_start = i
+            break
+
+    if inbox_start is not None:
+        # Existing "### Inbox" subsection: append after its last non-blank
+        # line, before the next subsection (or end of the Ideas section).
+        inbox_end = ideas_end
+        for i in range(inbox_start + 1, ideas_end):
+            match = _SECTION_RE.match(lines[i].strip())
+            if match:
+                inbox_end = i
+                break
+        insert_at = inbox_end
+        while insert_at > inbox_start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        new_lines = lines[:insert_at] + [bullet] + lines[insert_at:]
+        return "\n".join(new_lines) + "\n"
+
+    # No "### Inbox" subsection yet: create it at the end of the Ideas
+    # section, right before the next "##" heading (or end of file).
+    insert_at = ideas_end
+    while insert_at > ideas_start + 1 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    block = ["", f"### {_INBOX_SECTION_TITLE}", "", bullet]
+    new_lines = lines[:insert_at] + block + lines[insert_at:]
+    return "\n".join(new_lines) + "\n"

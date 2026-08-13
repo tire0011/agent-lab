@@ -10,6 +10,11 @@ const elements = {
   problemsContent: document.querySelector("#problems-content"),
   ideasCount: document.querySelector("#ideas-count"),
   ideasContent: document.querySelector("#ideas-content"),
+  ideaForm: document.querySelector("#idea-form"),
+  ideaInput: document.querySelector("#idea-input"),
+  ideaApiKey: document.querySelector("#idea-api-key"),
+  ideaSubmit: document.querySelector("#idea-submit"),
+  ideaState: document.querySelector("#idea-state"),
   form: document.querySelector("#chat-form"),
   input: document.querySelector("#chat-input"),
   send: document.querySelector("#send-button"),
@@ -81,22 +86,31 @@ function renderItems(container, items, emptyMessage, fields) {
   container.append(list);
 }
 
+async function refreshIdeas() {
+  elements.ideasContent.textContent = "Wird geladen …";
+  try {
+    const ideas = await requestJson("/ideas");
+    elements.ideasCount.textContent = String(ideas.count);
+    renderItems(elements.ideasContent, ideas.ideas, "Keine Ideen erfasst.", { title: "text", meta: "section" });
+  } catch (error) {
+    elements.ideasCount.textContent = "!";
+    showError(elements.ideasContent, error.message);
+  }
+}
+
 async function loadOverview() {
   elements.refresh.disabled = true;
   elements.refresh.textContent = "Lädt …";
   setIndicator(elements.healthIndicator, "Lädt …", "pending");
   setIndicator(elements.agentIndicator, "Lädt …", "pending");
   elements.problemsContent.textContent = "Wird geladen …";
-  elements.ideasContent.textContent = "Wird geladen …";
 
-  const results = await Promise.allSettled([
+  const [health, status, problems] = await Promise.allSettled([
     requestJson("/health"),
     requestJson("/status"),
     requestJson("/problems"),
-    requestJson("/ideas"),
   ]);
 
-  const [health, status, problems, ideas] = results;
   if (health.status === "fulfilled") {
     const ok = health.value.status === "ok";
     setIndicator(elements.healthIndicator, ok ? "Online" : "Unbekannt", ok ? "good" : "bad");
@@ -122,13 +136,7 @@ async function loadOverview() {
     showError(elements.problemsContent, problems.reason.message);
   }
 
-  if (ideas.status === "fulfilled") {
-    elements.ideasCount.textContent = String(ideas.value.count);
-    renderItems(elements.ideasContent, ideas.value.ideas, "Keine Ideen erfasst.", { title: "text", meta: "section" });
-  } else {
-    elements.ideasCount.textContent = "!";
-    showError(elements.ideasContent, ideas.reason.message);
-  }
+  await refreshIdeas();
 
   elements.refresh.disabled = false;
   elements.refresh.textContent = "Aktualisieren";
@@ -172,8 +180,35 @@ async function sendMessage(event) {
   }
 }
 
+async function submitIdea(event) {
+  event.preventDefault();
+  const text = elements.ideaInput.value.trim();
+  if (!text || elements.ideaSubmit.disabled) return;
+
+  elements.ideaSubmit.disabled = true;
+  elements.ideaSubmit.textContent = "Speichert …";
+  elements.ideaState.textContent = "";
+
+  try {
+    await requestJson("/ideas", {
+      method: "POST",
+      headers: { "x-api-key": elements.ideaApiKey.value },
+      body: JSON.stringify({ text }),
+    });
+    elements.ideaInput.value = "";
+    elements.ideaState.textContent = "Idee gespeichert.";
+    await refreshIdeas();
+  } catch (error) {
+    elements.ideaState.textContent = error.message;
+  } finally {
+    elements.ideaSubmit.disabled = false;
+    elements.ideaSubmit.textContent = "Idee hinzufügen";
+  }
+}
+
 elements.refresh.addEventListener("click", loadOverview);
 elements.form.addEventListener("submit", sendMessage);
+elements.ideaForm.addEventListener("submit", submitIdea);
 elements.input.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
