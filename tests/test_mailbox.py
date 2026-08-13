@@ -10,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 
+import mailbox_processor
 from modules.mailbox import (
     MAX_FILE_SIZE,
     MailboxLock,
@@ -51,6 +52,27 @@ def _make_repo(tmp: Path) -> Path:
         capture_output=True,
     )
     return tmp
+
+
+def _make_repo_with_remote(tmp: Path) -> tuple[Path, Path]:
+    remote = tmp / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    repo = tmp / "repo"
+    repo.mkdir()
+    _make_repo(repo)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "master"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    return repo, remote
 
 
 def _make_inbox_file(inbox: Path, name: str, content: str) -> Path:
@@ -362,6 +384,224 @@ class TestRetryCounter(_ProcessorTestBase):
         results = self.processor.process_inbox()
         self.assertEqual(results[0]["status"], "skipped")
         self.assertIn("max retries", results[0]["reason"])
+
+
+class TestMailboxGitCommitBehavior(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.repo, self.remote = _make_repo_with_remote(self.base)
+        (self.repo / "communication" / "inbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "communication" / "outbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "state").mkdir(exist_ok=True)
+        (self.repo / "IDEAS.md").write_text(
+            "# IDEAS.md\n\n## Ideas\n\n### Existing\n\n- Old idea `new`\n"
+        )
+        subprocess.run(
+            ["git", "add", "communication", "IDEAS.md"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "prepare mailbox dirs"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "push"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        self.db_path = str(self.repo / "state" / "agent.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _processor(self) -> MailboxProcessor:
+        return MailboxProcessor(repo_path=self.repo, db_path=self.db_path, dry_run=False)
+
+    def test_inbox_deletion_is_in_same_commit(self):
+        inbox_file = self.repo / "communication" / "inbox" / "idea.md"
+        inbox_file.write_text(
+            "---\ntype: idea\ncreated_by: rene\n---\n\nCommit cleanup coverage."
+        )
+        subprocess.run(
+            ["git", "add", "communication/inbox/idea.md"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "add inbox message"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
+
+        processor = self._processor()
+        try:
+            results = processor.process_inbox()
+        finally:
+            processor.close()
+        self.assertEqual(results[0]["status"], "done")
+        self.assertFalse(inbox_file.exists())
+
+        show = subprocess.run(
+            ["git", "--no-pager", "show", "--name-status", "--pretty=format:", "HEAD"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertIn("D\tcommunication/inbox/idea.md", show)
+        self.assertIn("A\tcommunication/outbox/", show)
+        self.assertIn("M\tIDEAS.md", show)
+
+    def test_already_done_message_is_cleaned_from_inbox(self):
+        inbox_file = self.repo / "communication" / "inbox" / "q.md"
+        inbox_file.write_text(
+            "---\ntype: question\ncreated_by: rene\n---\n\nIs cleanup safe?"
+        )
+        outbox_name = "20260101000000-question-aaaaaaaa.md"
+        outbox_file = self.repo / "communication" / "outbox" / outbox_name
+        outbox_file.write_text("done\n")
+        subprocess.run(
+            ["git", "add", "communication/inbox/q.md", "communication/outbox/" + outbox_name],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "simulate stale inbox"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
+
+        processor = self._processor()
+        try:
+            processor.conn.execute(
+                """
+                INSERT INTO mailbox_messages
+                    (file_path, source_commit_sha, msg_type, created_by, status, received_at, processed_at, outbox_file)
+                VALUES (?, 'sha', 'question', 'rene', 'done', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', ?)
+                """,
+                (str(inbox_file), outbox_name),
+            )
+            processor.conn.commit()
+            results = processor.process_inbox()
+        finally:
+            processor.close()
+
+        self.assertEqual(results[0]["status"], "done")
+        self.assertFalse(inbox_file.exists())
+
+        show = subprocess.run(
+            ["git", "--no-pager", "show", "--name-status", "--pretty=format:", "HEAD"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertIn("D\tcommunication/inbox/q.md", show)
+
+    def test_push_failure_recovery_retries_without_reprocessing(self):
+        inbox_file = self.repo / "communication" / "inbox" / "task.md"
+        inbox_file.write_text("---\ntype: task\ncreated_by: bot\n---\n\nDo thing.")
+        subprocess.run(
+            ["git", "add", "communication/inbox/task.md"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "add inbox task"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
+
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", str(self.repo / "missing-remote.git")],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+
+        processor = self._processor()
+        try:
+            processor.process_inbox()
+            rows = processor.conn.execute(
+                "SELECT COUNT(*) FROM mailbox_messages"
+            ).fetchone()[0]
+            self.assertEqual(rows, 1)
+            self.assertFalse(inbox_file.exists())
+        finally:
+            processor.close()
+
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", str(self.remote)],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        processor = self._processor()
+        try:
+            processor.retry_unpushed_commits()
+            results = processor.process_inbox()
+        finally:
+            processor.close()
+
+        self.assertEqual(results, [])
+        outbox_count = len(list((self.repo / "communication" / "outbox").glob("*.md")))
+        self.assertEqual(outbox_count, 1)
+        local_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        remote_head = subprocess.run(
+            ["git", "rev-parse", "origin/master"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(local_head, remote_head)
+
+
+class TestMailboxProcessorCliGuards(unittest.TestCase):
+    def test_dirty_tree_refuses_processing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_repo(root)
+            (root / "communication" / "inbox").mkdir(parents=True)
+            (root / "communication" / "outbox").mkdir(parents=True)
+            (root / "state").mkdir()
+            (root / "IDEAS.md").write_text("# IDEAS.md\n\n## Ideas\n")
+            (root / "dirty.txt").write_text("dirty")
+            db_path = str(root / "state" / "agent.db")
+            lock_path = str(root / "state" / "mailbox.lock")
+
+            rc = mailbox_processor.main(
+                [
+                    "--repo-path",
+                    str(root),
+                    "--db-path",
+                    db_path,
+                    "--lock-path",
+                    lock_path,
+                ]
+            )
+            self.assertEqual(rc, 1)
 
 
 class TestLock(unittest.TestCase):

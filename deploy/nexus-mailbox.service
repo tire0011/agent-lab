@@ -6,7 +6,10 @@ After=network.target
 Type=oneshot
 User=agent
 WorkingDirectory=/agent
+StateDirectory=nexus
 EnvironmentFile=/etc/agent-lab/agent.env
+Environment=AGENT_DB_PATH=/var/lib/nexus/agent.db
+Environment=AGENT_MAILBOX_LOCK_PATH=/var/lib/nexus/mailbox.lock
 ExecStart=/agent/.venv/bin/python /agent/mailbox_processor.py
 StandardOutput=journal
 StandardError=journal

@@ -1,15 +1,11 @@
 import sqlite3
 import tempfile
 import unittest
+import importlib
+import os
 from pathlib import Path
 
-from modules.run_store import (
-    calculate_estimated_cost,
-    get_applicable_price,
-    init_db,
-    insert_run,
-    insert_tool_calls,
-)
+import modules.run_store as run_store
 
 
 class RunStoreTests(unittest.TestCase):
@@ -24,7 +20,7 @@ class RunStoreTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def _init_db(self) -> sqlite3.Connection:
-        conn = init_db(self.db_path)
+        conn = run_store.init_db(self.db_path)
         self.connections.append(conn)
         return conn
 
@@ -46,7 +42,7 @@ class RunStoreTests(unittest.TestCase):
     def test_storing_run_persists_row(self):
         conn = self._init_db()
 
-        run_id = insert_run(
+        run_id = run_store.insert_run(
             conn,
             timestamp="2026-08-10T00:00:00+00:00",
             provider="azure_openai",
@@ -124,7 +120,7 @@ class RunStoreTests(unittest.TestCase):
         )
         conn.commit()
 
-        price = get_applicable_price(
+        price = run_store.get_applicable_price(
             conn,
             provider="azure_openai",
             model="gpt-4o",
@@ -138,7 +134,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(price["currency"], "EUR")
 
     def test_estimated_cost_calculation(self):
-        cost = calculate_estimated_cost(
+        cost = run_store.calculate_estimated_cost(
             input_tokens=1200,
             output_tokens=80,
             input_price_per_million_tokens=2.5,
@@ -151,7 +147,7 @@ class RunStoreTests(unittest.TestCase):
     def test_unknown_model_price_returns_none(self):
         conn = self._init_db()
 
-        price = get_applicable_price(
+        price = run_store.get_applicable_price(
             conn,
             provider="azure_openai",
             model="unknown-model",
@@ -162,7 +158,7 @@ class RunStoreTests(unittest.TestCase):
 
     def test_tool_calls_are_stored(self):
         conn = self._init_db()
-        run_id = insert_run(
+        run_id = run_store.insert_run(
             conn,
             timestamp="2026-08-10T00:00:00+00:00",
             provider="azure_openai",
@@ -180,7 +176,7 @@ class RunStoreTests(unittest.TestCase):
         )
 
         trace = [{"tool_name": "list_directory", "arguments": "{}", "result": "ok"}]
-        insert_tool_calls(conn, run_id, "2026-08-10T00:00:00+00:00", trace)
+        run_store.insert_tool_calls(conn, run_id, "2026-08-10T00:00:00+00:00", trace)
 
         row = conn.execute(
             "SELECT run_id, tool_name, success FROM tool_calls WHERE run_id = ?",
@@ -191,6 +187,48 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(row[0], run_id)
         self.assertEqual(row[1], "list_directory")
         self.assertEqual(row[2], 1)
+
+    def test_init_db_uses_external_default_path_from_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_db = Path(tmp) / "external" / "agent.db"
+            old_env = os.environ.get("AGENT_DB_PATH")
+            os.environ["AGENT_DB_PATH"] = str(custom_db)
+            try:
+                reloaded = importlib.reload(run_store)
+                conn = reloaded.init_db()
+                self.connections.append(conn)
+            finally:
+                if old_env is None:
+                    os.environ.pop("AGENT_DB_PATH", None)
+                else:
+                    os.environ["AGENT_DB_PATH"] = old_env
+                importlib.reload(run_store)
+            self.assertTrue(custom_db.exists())
+
+    def test_legacy_db_is_migrated_to_external_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy_db = Path(tmp) / "legacy.db"
+            target_db = Path(tmp) / "var" / "lib" / "nexus" / "agent.db"
+            legacy_conn = sqlite3.connect(legacy_db)
+            legacy_conn.execute("CREATE TABLE migrate_check (v TEXT NOT NULL)")
+            legacy_conn.execute("INSERT INTO migrate_check (v) VALUES ('ok')")
+            legacy_conn.commit()
+            legacy_conn.close()
+
+            original_legacy = run_store.LEGACY_DB_PATH
+            original_default = run_store.DEFAULT_DB_PATH
+            run_store.LEGACY_DB_PATH = str(legacy_db)
+            run_store.DEFAULT_DB_PATH = str(target_db)
+            try:
+                conn = run_store.init_db(str(target_db))
+                self.connections.append(conn)
+                row = conn.execute("SELECT v FROM migrate_check").fetchone()
+            finally:
+                run_store.LEGACY_DB_PATH = original_legacy
+                run_store.DEFAULT_DB_PATH = original_default
+
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], "ok")
 
 
 if __name__ == "__main__":

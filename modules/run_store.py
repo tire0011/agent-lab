@@ -1,12 +1,41 @@
 import sqlite3
+import os
 from pathlib import Path
 from typing import Any
 
-DEFAULT_DB_PATH = "/agent/state/agent.db"
+DEFAULT_DB_PATH = os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db")
+LEGACY_DB_PATH = "/agent/state/agent.db"
+
+
+def _migrate_legacy_db_if_needed(target_path: Path) -> None:
+    legacy_path = Path(LEGACY_DB_PATH)
+    default_target = Path(DEFAULT_DB_PATH)
+    if target_path != default_target:
+        return
+    if target_path == legacy_path:
+        return
+    if target_path.exists() or not legacy_path.exists():
+        return
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(".migrating")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    source_conn = sqlite3.connect(f"file:{legacy_path}?mode=ro", uri=True)
+    target_conn = sqlite3.connect(tmp_path)
+    try:
+        source_conn.backup(target_conn)
+        target_conn.commit()
+    finally:
+        target_conn.close()
+        source_conn.close()
+    tmp_path.replace(target_path)
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
     path = Path(db_path)
+    _migrate_legacy_db_if_needed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # check_same_thread=False: callers that keep a long-lived connection
     # (e.g. CodexTaskService) may be invoked from FastAPI's sync-route

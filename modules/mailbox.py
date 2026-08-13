@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 65536  # 64 KB
 MAX_RETRY = 3
+STATUS_DONE = "done"
+STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
 SUPPORTED_TYPES = {"idea", "task", "question", "context"}
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
@@ -214,6 +216,14 @@ def git_is_clean(repo_path: Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == ""
 
 
+def git_dirty_entries(repo_path: Path) -> list[str]:
+    """Return porcelain status entries for dirty worktree paths."""
+    result = _git(["status", "--porcelain"], repo_path, check=False)
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
 def git_current_commit(repo_path: Path) -> str:
     result = _git(["rev-parse", "HEAD"], repo_path, check=False)
     return result.stdout.strip() if result.returncode == 0 else "unknown"
@@ -221,9 +231,6 @@ def git_current_commit(repo_path: Path) -> str:
 
 def git_pull_ff_only(repo_path: Path) -> bool:
     """Pull with --ff-only. Return True on success."""
-    if not git_is_clean(repo_path):
-        logger.warning("Working tree is not clean; skipping git pull")
-        return False
     result = _git(["pull", "--ff-only"], repo_path, check=False)
     if result.returncode != 0:
         logger.warning("git pull --ff-only failed: %s", result.stderr.strip())
@@ -239,7 +246,10 @@ def git_add_and_commit(repo_path: Path, files: list[Path], message: str) -> bool
         top = parts[0] if len(parts) == 1 else "/".join(parts[:2])
         if top not in ALLOWED_WRITE_PATHS and str(rel) not in ALLOWED_WRITE_PATHS:
             raise PermissionError(f"Not allowed to commit: {rel}")
-        _git(["add", str(rel)], repo_path)
+        if f.exists():
+            _git(["add", "--", str(rel)], repo_path)
+        else:
+            _git(["rm", "--", str(rel)], repo_path)
 
     result = _git(
         ["commit", "--no-verify", "-m", message],
@@ -465,6 +475,32 @@ class MailboxProcessor:
     def pull(self) -> bool:
         return git_pull_ff_only(self.repo_path)
 
+    def ensure_clean_worktree(self) -> bool:
+        return git_is_clean(self.repo_path)
+
+    def retry_pending_git_commits(self) -> None:
+        rows = self.conn.execute(
+            """
+            SELECT id, file_path, msg_type, created_by, outbox_file, status
+            FROM mailbox_messages
+            WHERE status IN (?, ?)
+            ORDER BY id ASC
+            """,
+            (STATUS_DONE_PENDING_COMMIT, STATUS_DONE),
+        ).fetchall()
+        for row in rows:
+            msg = {
+                "id": row[0],
+                "file_path": Path(row[1]),
+                "msg_type": row[2],
+                "created_by": row[3],
+                "outbox_file": row[4],
+                "status": row[5],
+            }
+            if msg["status"] == STATUS_DONE and not msg["file_path"].exists():
+                continue
+            self._finalize_git_commit(msg)
+
     def process_inbox(self) -> list[dict[str, Any]]:
         """Process all pending inbox messages. Returns list of result dicts."""
         files = self._get_inbox_files()
@@ -479,6 +515,8 @@ class MailboxProcessor:
 
     def _get_inbox_files(self) -> list[Path]:
         """Return .md files sorted by (mtime, name), skipping .gitkeep."""
+        if not self.inbox.exists():
+            return []
         files = [
             f for f in self.inbox.iterdir()
             if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
@@ -495,15 +533,26 @@ class MailboxProcessor:
 
     def _get_existing_record(self, file_path: Path) -> dict | None:
         row = self.conn.execute(
-            "SELECT id, status, retry_count FROM mailbox_messages WHERE file_path = ?",
+            """
+            SELECT id, status, retry_count, msg_type, created_by, outbox_file
+            FROM mailbox_messages
+            WHERE file_path = ?
+            """,
             (str(file_path),),
         ).fetchone()
         if row is None:
             return None
-        return {"id": row[0], "status": row[1], "retry_count": row[2]}
+        return {
+            "id": row[0],
+            "status": row[1],
+            "retry_count": row[2],
+            "msg_type": row[3],
+            "created_by": row[4],
+            "outbox_file": row[5],
+        }
 
     def _should_retry(self, record: dict) -> bool:
-        if record["status"] == "done":
+        if record["status"] in (STATUS_DONE, STATUS_DONE_PENDING_COMMIT):
             return False
         if record["retry_count"] >= MAX_RETRY:
             return False
@@ -514,7 +563,20 @@ class MailboxProcessor:
 
         existing = self._get_existing_record(file_path)
         if existing:
-            if existing["status"] == "done":
+            if existing["status"] in (STATUS_DONE, STATUS_DONE_PENDING_COMMIT):
+                if self.dry_run:
+                    return {"file": rel, "status": "skipped", "reason": "already done"}
+                if self._finalize_git_commit(
+                    {
+                        "id": existing["id"],
+                        "file_path": file_path,
+                        "msg_type": existing["msg_type"],
+                        "created_by": existing["created_by"],
+                        "outbox_file": existing["outbox_file"],
+                        "status": existing["status"],
+                    }
+                ):
+                    return {"file": rel, "status": "done", "reason": "cleaned already-done inbox file"}
                 return {"file": rel, "status": "skipped", "reason": "already done"}
             if not self._should_retry(existing):
                 return {
@@ -572,33 +634,78 @@ class MailboxProcessor:
         if not self.dry_run:
             _atomic_write(outbox_path, outbox_content)
 
-        # Mark done in DB
+        # Mark processing result durable before inbox deletion/commit.
         self.conn.execute(
             """
             UPDATE mailbox_messages
-            SET status='done', processed_at=?, idea_id=?, outbox_file=?, last_error=NULL
+            SET status=?, processed_at=?, idea_id=?, outbox_file=?, last_error=NULL
             WHERE id=?
             """,
-            (processed_at, idea_id, outbox_name, db_msg_id),
+            (STATUS_DONE_PENDING_COMMIT, processed_at, idea_id, outbox_name, db_msg_id),
         )
         self.conn.commit()
 
-        # Git commit + push
+        committed = False
         if not self.dry_run:
-            files_to_commit: list[Path] = [outbox_path]
-            if msg.msg_type == "idea":
-                files_to_commit.append(self.repo_path / "IDEAS.md")
-            commit_msg = f"mailbox: process {msg.msg_type} from {msg.created_by} [{file_path.name}]"
-            if git_add_and_commit(self.repo_path, files_to_commit, commit_msg):
-                git_push(self.repo_path)
+            committed = self._finalize_git_commit(
+                {
+                    "id": db_msg_id,
+                    "file_path": file_path,
+                    "msg_type": msg.msg_type,
+                    "created_by": msg.created_by,
+                    "outbox_file": outbox_name,
+                    "status": STATUS_DONE_PENDING_COMMIT,
+                }
+            )
+        else:
+            self.conn.execute(
+                "UPDATE mailbox_messages SET status=? WHERE id=?",
+                (STATUS_DONE, db_msg_id),
+            )
+            self.conn.commit()
 
         return {
             "file": rel,
-            "status": "done",
+            "status": "done" if committed or self.dry_run else "skipped",
             "type": msg.msg_type,
             "outbox": outbox_name,
             "idea_id": idea_id,
         }
+
+    def _finalize_git_commit(self, message_row: dict[str, Any]) -> bool:
+        msg_id = int(message_row["id"])
+        file_path = Path(message_row["file_path"])
+        msg_type = str(message_row["msg_type"] or "unknown")
+        created_by = str(message_row["created_by"] or "unknown")
+        outbox_file = message_row.get("outbox_file")
+        if not outbox_file:
+            logger.warning("Cannot finalize mailbox row %s: missing outbox_file", msg_id)
+            return False
+
+        outbox_path = self.outbox / str(outbox_file)
+        if not outbox_path.exists():
+            logger.warning("Cannot finalize mailbox row %s: missing outbox %s", msg_id, outbox_path)
+            return False
+
+        if file_path.exists():
+            file_path.unlink()
+
+        files_to_commit: list[Path] = [file_path, outbox_path]
+        if msg_type == "idea":
+            files_to_commit.append(self.repo_path / "IDEAS.md")
+        commit_msg = (
+            f"mailbox: process {msg_type} from {created_by} [{Path(file_path).name}]"
+        )
+        if not git_add_and_commit(self.repo_path, files_to_commit, commit_msg):
+            return False
+
+        self.conn.execute(
+            "UPDATE mailbox_messages SET status=? WHERE id=?",
+            (STATUS_DONE, msg_id),
+        )
+        self.conn.commit()
+        git_push(self.repo_path)
+        return True
 
     def _record_failure(
         self, file_path: Path, error: str, existing: dict | None

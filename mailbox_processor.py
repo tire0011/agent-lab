@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+from modules.run_store import DEFAULT_DB_PATH
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,8 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--db-path",
-        default="/agent/state/agent.db",
-        help="Path to SQLite database (default: /agent/state/agent.db)",
+        default=DEFAULT_DB_PATH,
+        help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})",
     )
     parser.add_argument(
         "--repo-path",
@@ -32,10 +35,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Parse and validate messages but do not write files or commit",
     )
+    parser.add_argument(
+        "--lock-path",
+        default=None,
+        help="Path to mailbox lock file (default: AGENT_MAILBOX_LOCK_PATH or /var/lib/nexus/mailbox.lock)",
+    )
     args = parser.parse_args(argv)
 
     repo_path = Path(args.repo_path)
-    lock_path = repo_path / "state" / "mailbox.lock"
+    lock_path = Path(
+        args.lock_path or os.environ.get("AGENT_MAILBOX_LOCK_PATH", "/var/lib/nexus/mailbox.lock")
+    )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     from modules.mailbox import MailboxLock, MailboxProcessor
@@ -55,10 +65,16 @@ def main(argv: list[str] | None = None) -> int:
             # 1. Retry any previously committed-but-not-pushed commits
             if not args.dry_run:
                 processor.retry_unpushed_commits()
+                processor.retry_pending_git_commits()
+                if not processor.ensure_clean_worktree():
+                    logger.error("Working tree is dirty; refusing mailbox processing")
+                    return 1
 
             # 2. git pull --ff-only when safe
             if not args.dry_run:
-                processor.pull()
+                if not processor.pull():
+                    logger.error("git pull --ff-only failed; refusing mailbox processing")
+                    return 1
 
             # 3. Process inbox messages
             results = processor.process_inbox()

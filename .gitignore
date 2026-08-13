@@ -5,3 +5,5 @@ __pycache__/
 *.py[cod]
 state/runs/*.json
 state/mailbox.lock
+state/*.db
+state/*.db-*

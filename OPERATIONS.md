@@ -68,6 +68,10 @@ For API auth in `api.py`:
 ## Mailbox systemd service
 
 The mailbox processor runs as a systemd oneshot service on a 1-minute timer.
+Runtime state now defaults outside the Git worktree:
+
+- SQLite DB: `/var/lib/nexus/agent.db`
+- Mailbox lock: `/var/lib/nexus/mailbox.lock`
 
 ### Service unit (`deploy/nexus-mailbox.service`)
 
@@ -80,7 +84,10 @@ After=network.target
 Type=oneshot
 User=agent
 WorkingDirectory=/agent
+StateDirectory=nexus
 EnvironmentFile=/etc/agent-lab/agent.env
+Environment=AGENT_DB_PATH=/var/lib/nexus/agent.db
+Environment=AGENT_MAILBOX_LOCK_PATH=/var/lib/nexus/mailbox.lock
 ExecStart=/agent/.venv/bin/python /agent/mailbox_processor.py
 StandardOutput=journal
 StandardError=journal
@@ -115,6 +122,55 @@ sudo systemctl start nexus-mailbox.timer
 # Verify
 systemctl status nexus-mailbox.timer
 ```
+
+### Database migration (`/agent/state/agent.db` -> `/var/lib/nexus/agent.db`)
+
+Do this once on the VM before/with service rollout.
+
+```bash
+sudo systemctl stop nexus-mailbox.timer nexus-mailbox.service
+sudo install -d -o agent -g agent -m 770 /var/lib/nexus
+sudo -u agent /agent/.venv/bin/python /agent/mailbox_processor.py --dry-run
+```
+
+The first DB open on the new path auto-migrates data from `/agent/state/agent.db`
+when `/var/lib/nexus/agent.db` does not yet exist. After that:
+
+```bash
+sudo ls -l /var/lib/nexus/agent.db
+sudo -u agent /agent/.venv/bin/python - <<'PY'
+import sqlite3
+conn = sqlite3.connect("/var/lib/nexus/agent.db")
+print(conn.execute("SELECT COUNT(*) FROM mailbox_messages").fetchone()[0])
+conn.close()
+PY
+```
+
+Then remove the temporary index workaround and restart:
+
+```bash
+cd /agent
+git update-index --no-skip-worktree state/agent.db || true
+sudo systemctl daemon-reload
+sudo systemctl start nexus-mailbox.timer
+```
+
+Keep `/agent/state/agent.db` as backup until validation is complete.
+
+### Rollback
+
+If needed, point services back to the in-repo DB temporarily by overriding env vars:
+
+```bash
+sudo systemctl stop nexus-mailbox.timer nexus-mailbox.service
+echo 'AGENT_DB_PATH=/agent/state/agent.db' | sudo tee -a /etc/agent-lab/agent.env
+echo 'AGENT_MAILBOX_LOCK_PATH=/agent/state/mailbox.lock' | sudo tee -a /etc/agent-lab/agent.env
+sudo systemctl daemon-reload
+sudo systemctl start nexus-mailbox.timer
+```
+
+For a clean rollback, remove duplicate keys from `/etc/agent-lab/agent.env` and
+keep only the intended values.
 
 ## Incident triage (minimal)
 
