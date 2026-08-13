@@ -122,6 +122,7 @@ not a significance ranking.
 
 ### Communication interface
 
+- Extend the existing Problems system into a persistent two-way communication channel: the agent can report blockers or needs with a concrete question, humans can reply in a problem-specific thread, the agent can read and respond to those replies, and the conversation remains available until the problem is resolved. `new`
 - Add experiment, cost, and approval views once the corresponding backend contracts exist. `new`
 - Keep communication adapters separate so messenger integrations such as WhatsApp can be added later without changing the agent core. `new`
 - Explore using the same communication contract for agent-to-agent communication. `exploring`
