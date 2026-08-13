@@ -3,6 +3,7 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock
 
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
@@ -10,13 +11,35 @@ from fastapi.testclient import TestClient
 
 import data_sources
 import api
+from api import get_codex_service, get_mailbox_task_service
+
+
+def _mock_codex_service():
+    svc = MagicMock()
+    svc.mark_interrupted_tasks_failed.return_value = None
+    svc.list_tasks.return_value = []
+    return svc
+
+
+def _mock_mailbox_task_service():
+    svc = MagicMock()
+    svc.recover_after_restart.return_value = None
+    svc.list_recent.return_value = []
+    svc.list_pending.return_value = []
+    return svc
 
 
 class ApiTestsBase(unittest.TestCase):
     def setUp(self) -> None:
+        # Override heavy singletons so tests never touch the production DB
+        # or spawn background workers.
+        api.app.dependency_overrides[get_codex_service] = _mock_codex_service
+        api.app.dependency_overrides[get_mailbox_task_service] = _mock_mailbox_task_service
+
         self.client = TestClient(api.app)
         self.temp_dir = TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(api.app.dependency_overrides.clear)
 
         self.runs_dir = Path(self.temp_dir.name) / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
