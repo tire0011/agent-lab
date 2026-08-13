@@ -117,3 +117,36 @@ class CodexTaskSummary(BaseModel):
 class CodexTaskListResponse(BaseModel):
     count: int
     tasks: list[CodexTaskSummary]
+
+
+# ---------------------------------------------------------------------------
+# Mailbox task approval models
+# ---------------------------------------------------------------------------
+
+
+class MailboxTaskApproval(BaseModel):
+    id: str
+    mailbox_msg_id: int
+    task_body: str
+    sender: str
+    file_path: str
+    received_at: str
+    status: str
+    approved_at: str | None = None
+    rejected_at: str | None = None
+    rejection_reason: str | None = None
+    experiment_id: str | None = None
+    outbox_file: str | None = None
+    result_summary: str | None = None
+    error: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class MailboxTaskApprovalsResponse(BaseModel):
+    count: int
+    tasks: list[MailboxTaskApproval]
+
+
+class MailboxTaskRejectRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)

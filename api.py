@@ -14,6 +14,12 @@ from modules.codex_task_service import (
     TaskNotFoundError,
     TaskNotRunnableError,
 )
+from modules.mailbox_task_service import (
+    ApprovalNotFoundError,
+    ApprovalStateError,
+    MailboxTaskService,
+    MailboxTaskWorker,
+)
 from models import (
     ChatRequest,
     ChatResponse,
@@ -25,6 +31,9 @@ from models import (
     Idea,
     IdeaCreateRequest,
     IdeasResponse,
+    MailboxTaskApproval,
+    MailboxTaskApprovalsResponse,
+    MailboxTaskRejectRequest,
     Problem,
     ProblemsResponse,
     StatusResponse,
@@ -55,6 +64,17 @@ def get_codex_service() -> CodexTaskService:
     return CodexTaskService()
 
 
+@lru_cache(maxsize=1)
+def get_mailbox_task_service() -> MailboxTaskService:
+    """Singleton MailboxTaskService for the process.
+
+    Overridable in tests via ``app.dependency_overrides[get_mailbox_task_service]``.
+    """
+    from modules.experiment_service import ExperimentService
+    exp_service = ExperimentService()
+    return MailboxTaskService(experiment_service=exp_service)
+
+
 def _resolve_codex_service() -> CodexTaskService:
     """Look up the (possibly test-overridden) Codex service for startup use.
 
@@ -68,11 +88,22 @@ def _resolve_codex_service() -> CodexTaskService:
     return get_codex_service()
 
 
+def _resolve_mailbox_task_service() -> MailboxTaskService:
+    override = app.dependency_overrides.get(get_mailbox_task_service)
+    if override is not None:
+        return override()
+    return get_mailbox_task_service()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
     # Never restarts execution and never starts a Codex process.
     _resolve_codex_service().mark_interrupted_tasks_failed()
+    mts = _resolve_mailbox_task_service()
+    mts.recover_after_restart()
+    worker = MailboxTaskWorker(mts)
+    worker.start()
     yield
 
 
@@ -237,3 +268,75 @@ def run_codex_task(
         # unexpected internal error; never leak tracebacks/secrets.
         raise HTTPException(status_code=500, detail="internal error running codex task")
     return CodexTaskResponse(**task.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Mailbox task approval endpoints (authenticated)
+# ---------------------------------------------------------------------------
+
+
+def _approval_to_response(approval) -> MailboxTaskApproval:
+    return MailboxTaskApproval(**approval.to_dict())
+
+
+@app.get("/mailbox/tasks", response_model=MailboxTaskApprovalsResponse)
+def list_mailbox_tasks(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    service: MailboxTaskService = Depends(get_mailbox_task_service),
+) -> MailboxTaskApprovalsResponse:
+    authorize(x_api_key)
+    tasks = service.list_recent(limit=limit)
+    return MailboxTaskApprovalsResponse(
+        count=len(tasks),
+        tasks=[_approval_to_response(t) for t in tasks],
+    )
+
+
+@app.get("/mailbox/tasks/{approval_id}", response_model=MailboxTaskApproval)
+def get_mailbox_task(
+    approval_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: MailboxTaskService = Depends(get_mailbox_task_service),
+) -> MailboxTaskApproval:
+    authorize(x_api_key)
+    try:
+        approval = service.get(approval_id)
+    except ApprovalNotFoundError:
+        raise HTTPException(status_code=404, detail="approval not found")
+    return _approval_to_response(approval)
+
+
+@app.post("/mailbox/tasks/{approval_id}/approve", response_model=MailboxTaskApproval)
+def approve_mailbox_task(
+    approval_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: MailboxTaskService = Depends(get_mailbox_task_service),
+) -> MailboxTaskApproval:
+    authorize(x_api_key)
+    try:
+        approval = service.approve(approval_id)
+    except ApprovalNotFoundError:
+        raise HTTPException(status_code=404, detail="approval not found")
+    except ApprovalStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _approval_to_response(approval)
+
+
+@app.post("/mailbox/tasks/{approval_id}/reject", response_model=MailboxTaskApproval)
+def reject_mailbox_task(
+    approval_id: str,
+    request: MailboxTaskRejectRequest,
+    x_api_key: str | None = Header(default=None),
+    service: MailboxTaskService = Depends(get_mailbox_task_service),
+) -> MailboxTaskApproval:
+    authorize(x_api_key)
+    try:
+        approval = service.reject(approval_id, request.reason)
+    except ApprovalNotFoundError:
+        raise HTTPException(status_code=404, detail="approval not found")
+    except ApprovalStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _approval_to_response(approval)

@@ -78,6 +78,19 @@
           <button id="send-button" type="submit">Senden</button>
         </form>
       </section>
+
+      <section class="card" id="task-approvals-section">
+        <div class="card-heading">
+          <h2>Task Approvals</h2>
+          <span id="task-approvals-count" class="count">–</span>
+        </div>
+        <div class="api-key-row" style="margin-bottom:12px;display:flex;gap:8px;">
+          <label for="task-api-key" class="sr-only">API-Key</label>
+          <input id="task-api-key" type="password" placeholder="API-Key" autocomplete="off" style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:8px;">
+          <button id="task-load-button" type="button" class="secondary">Laden</button>
+        </div>
+        <div id="task-approvals-content" class="list-state" aria-live="polite">API-Key eingeben und Laden klicken.</div>
+      </section>
     </main>
   </body>
 </html>

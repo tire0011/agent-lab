@@ -197,6 +197,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         """
     )
     _migrate_experiments_columns(conn)
+    _migrate_mailbox_messages_task_body(conn)
+    _migrate_mailbox_task_approvals(conn)
     conn.commit()
     return conn
 
@@ -228,6 +230,82 @@ def _migrate_experiments_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE experiments ADD COLUMN {column_name} {column_type} NULL"
             )
+
+
+def _migrate_mailbox_messages_task_body(conn: sqlite3.Connection) -> None:
+    """Add task_body column to mailbox_messages if not already present."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(mailbox_messages)")}
+    if "task_body" not in existing:
+        conn.execute("ALTER TABLE mailbox_messages ADD COLUMN task_body TEXT NULL")
+
+
+def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
+    """Create mailbox_task_approvals table and backfill from existing task messages."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mailbox_task_approvals (
+            id TEXT PRIMARY KEY,
+            mailbox_msg_id INTEGER NOT NULL REFERENCES mailbox_messages(id),
+            task_body TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            approved_at TEXT NULL,
+            rejected_at TEXT NULL,
+            rejection_reason TEXT NULL,
+            experiment_id TEXT NULL,
+            outbox_file TEXT NULL,
+            result_summary TEXT NULL,
+            error TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mta_status ON mailbox_task_approvals(status);
+        CREATE INDEX IF NOT EXISTS idx_mta_mailbox_msg_id ON mailbox_task_approvals(mailbox_msg_id);
+        CREATE INDEX IF NOT EXISTS idx_mta_experiment_id ON mailbox_task_approvals(experiment_id);
+        """
+    )
+
+    # Backfill: create pending_approval records for any task messages that
+    # don't already have one.
+    import uuid
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    orphan_tasks = conn.execute(
+        """
+        SELECT m.id, m.created_by, m.file_path, m.received_at, m.task_body, m.outbox_file
+        FROM mailbox_messages m
+        WHERE m.msg_type = 'task'
+          AND NOT EXISTS (
+              SELECT 1 FROM mailbox_task_approvals a
+              WHERE a.mailbox_msg_id = m.id
+          )
+        """
+    ).fetchall()
+
+    for row in orphan_tasks:
+        msg_id, created_by, file_path, received_at, task_body, outbox_file = row
+        if not task_body:
+            fallback = (
+                "[Task body was not stored at processing time."
+                + (f" See outbox: {outbox_file}" if outbox_file else "")
+                + "]"
+            )
+            task_body = fallback
+        approval_id = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO mailbox_task_approvals
+                (id, mailbox_msg_id, task_body, sender, file_path, received_at,
+                 status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+            """,
+            (approval_id, msg_id, task_body, created_by or "", file_path or "",
+             received_at or now, now, now),
+        )
 
 
 def get_applicable_price(

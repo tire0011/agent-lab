@@ -372,7 +372,34 @@ def _process_task(
     conn: sqlite3.Connection,
     db_msg_id: int,
 ) -> tuple[str, None]:
-    """Record task request. Returns (result_body, None)."""
+    """Record task request, store body, create pending approval. Returns (result_body, None)."""
+    # Store the task body in mailbox_messages (column added by migration)
+    try:
+        conn.execute(
+            "UPDATE mailbox_messages SET task_body = ? WHERE id = ?",
+            (msg.body, db_msg_id),
+        )
+        conn.commit()
+    except Exception:
+        logger.warning("_process_task: failed to store task_body for msg %s", db_msg_id)
+
+    # Create a pending_approval record via MailboxTaskService (lazy import avoids circular deps)
+    try:
+        from modules.mailbox_task_service import MailboxTaskService
+        from modules.run_store import DEFAULT_DB_PATH
+
+        svc = MailboxTaskService(db_path=DEFAULT_DB_PATH, repo_path=repo_path)
+        received_at = _now_iso()
+        svc.create_approval(
+            mailbox_msg_id=db_msg_id,
+            task_body=msg.body,
+            sender=msg.created_by,
+            file_path=str(msg.file_path),
+            received_at=received_at,
+        )
+    except Exception:
+        logger.warning("_process_task: failed to create approval for msg %s", db_msg_id, exc_info=True)
+
     result_body = (
         "Your task request has been recorded and is queued for human review.\n\n"
         "Tasks submitted via the mailbox require human approval before execution. "

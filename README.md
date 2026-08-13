@@ -26,7 +26,7 @@ Add local model action selection so the agent picks the cheapest model for simpl
 **Processing rules:**
 
 - `idea` — appended to `IDEAS.md` under `### Mailbox submissions` with state `new`; response committed and pushed.
-- `task` — recorded in SQLite; queued for human review (not auto-executed).
+- `task` — body stored in SQLite, `pending_approval` record created in `mailbox_task_approvals`; requires human approval via API/Web UI before execution by `ExperimentService`.
 - `question` — acknowledged; response placed in outbox.
 - `context` — stored in the `knowledge` table under category `mailbox_context`.
 
@@ -162,6 +162,24 @@ curl -H "x-api-key: $AGENT_API_KEY" http://127.0.0.1:8000/codex/tasks/<id>
 Orphaned `running` tasks (left behind by a crash/restart) are marked `failed`
 exactly once at API startup via `mark_interrupted_tasks_failed()`; startup
 never restarts execution or starts a Codex process.
+
+## Mailbox task approval API
+
+Task messages from the mailbox create `pending_approval` records that must be
+reviewed and approved by a human operator before any code runs.
+
+All endpoints require the `x-api-key` header.
+
+- `GET /mailbox/tasks?limit=20` — list recent approvals (all statuses, newest first).
+- `GET /mailbox/tasks/{id}` — fetch one approval.
+- `POST /mailbox/tasks/{id}/approve` — approve; triggers `ExperimentService` in background.
+- `POST /mailbox/tasks/{id}/reject` — reject (`{"reason": "..."}`).
+
+State machine: `pending_approval → approved → submitted → running → succeeded / failed / needs_review`.
+A background `MailboxTaskWorker` daemon (10 s poll interval) calls
+`submit_approved()` + `poll_running()` on each tick.  Experiments run
+serially (one VM, one budget). The Web UI Task Approvals card shows all records
+and provides Approve/Reject buttons when an API key is entered.
 
 ## Security
 

@@ -26,7 +26,7 @@ Primary objective: learn how far the system can improve itself safely and measur
 5. Treat unknowns as first-class: document them explicitly.
 6. Do not mark work complete without evidence (logs, tests, benchmarks, artifacts).
 
-## Current State (as of 2026-08-10)
+## Current State (as of 2026-08-13)
 
 - `agent.py` V0 runs locally and on Azure VM with env vars.
 - V0 logs model calls, token usage, runtime, and MCP tool calls to `state/runs/*.json`.
@@ -34,6 +34,12 @@ Primary objective: learn how far the system can improve itself safely and measur
 - FastAPI app exists in `api.py` with:
   - public `GET /health`
   - authenticated `GET /secure-health` via `AGENT_API_KEY`
+  - authenticated `GET/POST /mailbox/tasks/{id}/approve|reject` — task approval bridge
+- Mailbox task approval bridge implemented: `modules/mailbox_task_service.py`
+  - `task` mailbox messages create `pending_approval` records; human approves/rejects via API/Web UI
+  - On approval, `ExperimentService` runs the task in a background daemon thread
+  - State machine: `pending_approval → approved → submitted → running → succeeded/failed/needs_review`
+  - Web UI Task Approvals card added to `static/index.html`
 - FastAPI + nginx are running on VM with HTTPS and Let's Encrypt.
 - Azure OpenAI API connectivity has been tested successfully.
 

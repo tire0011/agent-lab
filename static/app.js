@@ -216,5 +216,125 @@ elements.input.addEventListener("keydown", (event) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Task approvals
+// ---------------------------------------------------------------------------
+
+const taskApiKeyInput = document.querySelector("#task-api-key");
+const taskLoadButton = document.querySelector("#task-load-button");
+const taskApprovalsContent = document.querySelector("#task-approvals-content");
+const taskApprovalsCount = document.querySelector("#task-approvals-count");
+
+let taskRefreshTimer = null;
+
+async function loadTaskApprovals() {
+  const apiKey = taskApiKeyInput ? taskApiKeyInput.value.trim() : "";
+  if (!apiKey) {
+    taskApprovalsContent.textContent = "API-Key eingeben und Laden klicken.";
+    return;
+  }
+  taskApprovalsContent.textContent = "Wird geladen …";
+  try {
+    const data = await requestJson("/mailbox/tasks?limit=20", {
+      headers: { "x-api-key": apiKey },
+    });
+    taskApprovalsCount.textContent = String(data.count);
+    renderTaskApprovals(data.tasks, apiKey);
+    if (!taskRefreshTimer) {
+      taskRefreshTimer = setInterval(() => loadTaskApprovals(), 30000);
+    }
+  } catch (error) {
+    taskApprovalsCount.textContent = "!";
+    showError(taskApprovalsContent, error.message);
+    if (taskRefreshTimer) { clearInterval(taskRefreshTimer); taskRefreshTimer = null; }
+  }
+}
+
+function renderTaskApprovals(tasks, apiKey) {
+  taskApprovalsContent.replaceChildren();
+  if (!tasks.length) {
+    taskApprovalsContent.textContent = "Keine Task Approvals vorhanden.";
+    return;
+  }
+  const list = document.createElement("ul");
+  list.className = "item-list";
+  for (const task of tasks) {
+    const li = document.createElement("li");
+
+    const title = document.createElement("div");
+    title.className = "item-title";
+    const preview = (task.task_body || "").slice(0, 200);
+    title.textContent = `[${task.status}] ${task.sender} — ${preview}${preview.length < (task.task_body || "").length ? "…" : ""}`;
+    li.append(title);
+
+    const meta = document.createElement("div");
+    meta.className = "item-meta";
+    let metaText = `Empfangen: ${task.received_at}`;
+    if (task.experiment_id) metaText += ` · Experiment: ${task.experiment_id.slice(0, 8)}`;
+    if (task.result_summary) metaText += ` · ${task.result_summary}`;
+    meta.textContent = metaText;
+    li.append(meta);
+
+    if (task.status === "pending_approval") {
+      const actions = document.createElement("div");
+      actions.style.marginTop = "6px";
+      actions.style.display = "flex";
+      actions.style.gap = "8px";
+
+      const approveBtn = document.createElement("button");
+      approveBtn.textContent = "Genehmigen";
+      approveBtn.type = "button";
+      approveBtn.addEventListener("click", async () => {
+        approveBtn.disabled = true;
+        approveBtn.textContent = "…";
+        try {
+          await requestJson(`/mailbox/tasks/${task.id}/approve`, {
+            method: "POST",
+            headers: { "x-api-key": apiKey },
+          });
+          await loadTaskApprovals();
+        } catch (err) {
+          approveBtn.textContent = "Fehler";
+          approveBtn.disabled = false;
+          alert(err.message);
+        }
+      });
+
+      const rejectBtn = document.createElement("button");
+      rejectBtn.textContent = "Ablehnen";
+      rejectBtn.type = "button";
+      rejectBtn.className = "secondary";
+      rejectBtn.addEventListener("click", async () => {
+        const reason = prompt("Ablehnungsgrund (1–500 Zeichen):");
+        if (!reason || !reason.trim()) return;
+        rejectBtn.disabled = true;
+        rejectBtn.textContent = "…";
+        try {
+          await requestJson(`/mailbox/tasks/${task.id}/reject`, {
+            method: "POST",
+            headers: { "x-api-key": apiKey },
+            body: JSON.stringify({ reason: reason.trim() }),
+          });
+          await loadTaskApprovals();
+        } catch (err) {
+          rejectBtn.textContent = "Fehler";
+          rejectBtn.disabled = false;
+          alert(err.message);
+        }
+      });
+
+      actions.append(approveBtn, rejectBtn);
+      li.append(actions);
+    }
+
+    list.append(li);
+  }
+  taskApprovalsContent.append(list);
+}
+
+if (taskLoadButton) {
+  taskLoadButton.addEventListener("click", loadTaskApprovals);
+}
+
 addMessage("Hallo! Ich beantworte Fragen zu Status, Problemen und Ideen.", "agent");
 loadOverview();

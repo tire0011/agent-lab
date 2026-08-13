@@ -37,6 +37,8 @@ For API auth in `api.py`:
 
 - Public health endpoint: `GET /health`
 - Protected endpoint example: `GET /secure-health` requires `x-api-key` header
+- Task approval endpoints: `GET /mailbox/tasks`, `POST /mailbox/tasks/{id}/approve|reject` — require `x-api-key`
+- `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for approved tasks to submit
 
 ## Operational checks
 
@@ -44,6 +46,7 @@ For API auth in `api.py`:
 2. Verify protected endpoint rejects missing/invalid key.
 3. Validate agent run writes new artifact in `state/runs/`.
 4. Review run logs for token/runtime anomalies.
+5. Check `GET /mailbox/tasks` for pending approvals requiring human review.
 
 ## Security operations
 
