@@ -139,6 +139,10 @@ not a significance ranking.
 - Level 3: continuous improvement loop with automatic evaluation and rollback. `new`
 - Level 4: architecture/model/resource changes within explicit budgets and safety limits. `new`
 
+### Economic sustainability experiments
+
+- Investigate whether Nexus can generate enough measurable economic value to offset or fund part of its own operating costs: search public repositories and communities for small problems with demonstrated demand, paid open-source bounties, or opportunities for useful tools and services; estimate effort, expected value, implementation risk, and API/cloud cost; then propose one bounded low-risk experiment at a time. Track revenue or verified value generated minus all operating costs as the net project contribution. External communication, account creation, publication, pricing, contracts, payment handling, and spending remain subject to explicit human approval; income is legally received and controlled by the human project owner, who may allocate an agreed portion back to Nexus's budget. `new`
+
 ### Later / no timeline
 
 - Azure actual-cost reconciliation against estimated cost. `new`
