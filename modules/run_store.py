@@ -217,6 +217,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_mailbox_task_approvals(conn)
     _migrate_experiment_adoptions(conn)
     _migrate_operations_audit(conn)
+    _migrate_operation_chains(conn)
     conn.commit()
     return conn
 
@@ -383,7 +384,34 @@ def _migrate_operations_audit(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
+    """Create operation_chains table (idempotent additive migration)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS operation_chains (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT NULL,
+            ended_at TEXT NULL,
+            request_json TEXT NOT NULL,
+            result_json TEXT NULL,
+            steps_successful INTEGER DEFAULT 0,
+            steps_failed INTEGER DEFAULT 0,
+            outbox_file TEXT NULL,
+            error TEXT NULL,
+            updated_at TEXT NOT NULL
+        );
 
+        CREATE INDEX IF NOT EXISTS idx_operation_chains_status
+            ON operation_chains(status);
+        CREATE INDEX IF NOT EXISTS idx_operation_chains_request_id
+            ON operation_chains(request_id);
+        CREATE INDEX IF NOT EXISTS idx_operation_chains_created_at
+            ON operation_chains(created_at);
+        """
+    )
 def get_applicable_price(
     conn: sqlite3.Connection,
     provider: str,

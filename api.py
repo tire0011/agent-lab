@@ -29,6 +29,7 @@ from modules.mailbox_task_service import (
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
 from modules.operations_registry import OperationValidationError, OperationsRegistry
+from modules.operation_chain_service import OperationChainService
 from modules import redaction
 from modules.run_store import calculate_estimated_cost, get_applicable_price
 from models import (
@@ -57,6 +58,8 @@ from models import (
     MailboxTaskApproval,
     MailboxTaskApprovalsResponse,
     MailboxTaskRejectRequest,
+    OperationChainRequest,
+    OperationChainResult,
     PublicDiagnosticExperiment,
     PublicDiagnosticMailboxStatus,
     PublicDiagnosticMailboxTask,
@@ -134,6 +137,14 @@ def get_operations_service() -> OperationsRegistry:
     return OperationsRegistry(experiment_service=_resolve_experiment_service())
 
 
+@lru_cache(maxsize=1)
+def get_operation_chain_service() -> OperationChainService:
+    """Singleton operation chain service for the process."""
+    return OperationChainService(
+        operations_registry=_resolve_operations_service(),
+    )
+
+
 def _resolve_experiment_service() -> ExperimentService:
     override = app.dependency_overrides.get(get_experiment_service)
     if override is not None:
@@ -168,6 +179,20 @@ def _resolve_experiment_adoption_service() -> ExperimentAdoptionService:
     return get_experiment_adoption_service()
 
 
+def _resolve_operations_service() -> OperationsRegistry:
+    override = app.dependency_overrides.get(get_operations_service)
+    if override is not None:
+        return override()
+    return get_operations_service()
+
+
+def _resolve_operation_chain_service() -> OperationChainService:
+    override = app.dependency_overrides.get(get_operation_chain_service)
+    if override is not None:
+        return override()
+    return get_operation_chain_service()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
@@ -176,6 +201,7 @@ async def lifespan(app: FastAPI):
     mts = _resolve_mailbox_task_service()
     mts.recover_after_restart()
     _resolve_experiment_adoption_service().recover_after_restart()
+    _resolve_operation_chain_service().recover_after_restart()
     worker = MailboxTaskWorker(mts)
     worker.start()
     yield
@@ -972,6 +998,57 @@ def _diagnostic_mailbox_task(approval) -> PublicDiagnosticMailboxTask:
         received_at=approval.received_at,
         experiment_id=approval.experiment_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Operation Chain endpoints (authenticated, sequential operation execution)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/operations/chains", response_model=OperationChainResult, status_code=202)
+def start_operation_chain(
+    request: OperationChainRequest,
+    x_api_key: str | None = Header(default=None),
+    service: OperationChainService = Depends(get_operation_chain_service),
+) -> OperationChainResult:
+    authorize(x_api_key)
+    try:
+        result = service.start_chain(request)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid chain: {str(exc)}")
+
+
+@app.get("/operations/chains/{request_id}", response_model=OperationChainResult)
+def get_operation_chain(
+    request_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: OperationChainService = Depends(get_operation_chain_service),
+) -> OperationChainResult:
+    authorize(x_api_key)
+    result = service.get_chain(request_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Chain not found")
+    return result
+
+
+@app.get("/operations/chains", response_model=list[OperationChainResult])
+def list_operation_chains(
+    limit: int = Query(default=20, ge=1, le=100),
+    x_api_key: str | None = Header(default=None),
+    service: OperationChainService = Depends(get_operation_chain_service),
+) -> list[OperationChainResult]:
+    authorize(x_api_key)
+    return service.list_chains(limit=limit)
+
+
+@app.get("/operations/catalog")
+def get_operations_catalog(
+    x_api_key: str | None = Header(default=None),
+    service: OperationsRegistry = Depends(get_operations_service),
+) -> dict[str, Any]:
+    authorize(x_api_key)
+    return {"operations": service.get_catalog_metadata()}
 
 
 @app.get("/diagnostics/public", response_model=PublicDiagnosticsResponse)

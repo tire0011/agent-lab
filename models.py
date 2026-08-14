@@ -478,3 +478,51 @@ class ExperimentLogsResponse(BaseModel):
     experiment_id: str
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
 
+
+# ---------------------------------------------------------------------------
+# Operation Chain models
+# ---------------------------------------------------------------------------
+
+
+class OperationChainStep(BaseModel):
+    id: str = Field(..., min_length=1, max_length=80, pattern="^[a-zA-Z0-9_-]+$")
+    action: str = Field(..., min_length=1, max_length=80)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperationChainRequest(BaseModel):
+    steps: list[OperationChainStep] = Field(..., min_items=1, max_items=10)
+    stop_on_error: bool = False
+    request_id: str | None = None
+
+    @staticmethod
+    def validate_unique_ids(v: list[OperationChainStep]) -> list[OperationChainStep]:
+        ids = [s.id for s in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate step IDs")
+        return v
+
+
+class OperationChainStepResult(BaseModel):
+    id: str
+    action: str
+    status: str  # "success", "failed", "skipped"
+    started_at: str
+    duration_ms: int
+    output: list[str] = Field(default_factory=list)
+    error: str | None = None
+    truncated: bool = False
+
+
+class OperationChainResult(BaseModel):
+    request_id: str
+    overall_status: str  # "queued", "running", "completed", "completed_with_errors", "failed", "rejected", "interrupted"
+    created_at: str
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_ms: int | None = None
+    steps_successful: int
+    steps_failed: int
+    steps: list[OperationChainStepResult] = Field(default_factory=list)
+    rejection_reason: str | None = None
+

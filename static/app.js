@@ -825,8 +825,7 @@ operationsElements.form.addEventListener("submit", async (event) => {
       body: JSON.stringify({ operation, args }),
     });
     operationsElements.status.textContent = result.success ? "Fertig" : "Fehler";
-    operationsElements.output.textContent = (result.output_lines || []).join("
-") || (result.error_summary || "Keine Ausgabe.");
+    operationsElements.output.textContent = (result.output_lines || []).join("\n") || (result.error_summary || "Keine Ausgabe.");
     state.operationsHistory.unshift({
       operation: result.operation,
       success: result.success,

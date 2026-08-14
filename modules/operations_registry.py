@@ -142,6 +142,7 @@ class OperationsRegistry:
         limit10 = OperationArgSpec("limit", "integer", "Maximale Anzahl Zeilen/Einträge.", default=10, minimum=1, maximum=100)
         limit50 = OperationArgSpec("limit", "integer", "Maximale Anzahl Zeilen/Einträge.", default=50, minimum=1, maximum=500)
         experiment_id = OperationArgSpec("experiment_id", "string", "Experiment-ID oder eindeutiges Präfix.", required=True)
+        adoption_id = OperationArgSpec("adoption_id", "string", "Adoption-ID.", required=True)
         return {
             "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts."),
             "experiment logs": OperationSpec("experiment logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50]),
@@ -154,6 +155,10 @@ class OperationsRegistry:
             "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo."),
             "service logs": OperationSpec("service logs", "journalctl-Auszug für den API-Service.", [limit50]),
             "service status": OperationSpec("service status", "systemctl-Status des API-Service."),
+            "adoption show": OperationSpec("adoption show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id]),
+            "problems list": OperationSpec("problems list", "Liste der letzten Probleme."),
+            "inbox status": OperationSpec("inbox status", "Status der Mailbox-Inbox."),
+            "outbox status": OperationSpec("outbox status", "Neueste Dateien in der Mailbox-Outbox."),
         }
 
     def _audit(self, operation: str, args: dict[str, Any], result: OperationResult, *, caller: str) -> None:
@@ -344,3 +349,174 @@ class OperationsRegistry:
             if key in interesting:
                 lines.append(f"{key}: {value.strip()}")
         return OperationResult("memory", True, lines, 0)
+
+    def _op_problems_list(self, args: dict[str, Any]) -> OperationResult:
+        del args
+        from data_sources import list_problems
+        problems = list_problems()
+        lines = [f"{p.id}: {p.summary}" for p in problems[:20]]
+        return OperationResult("problems list", True, lines, 0)
+
+    def _op_adoption_show(self, args: dict[str, Any]) -> OperationResult:
+        adoption_id = args.get("adoption_id")
+        if not isinstance(adoption_id, str) or not adoption_id.strip():
+            raise OperationValidationError("adoption_id ist erforderlich.")
+        if not self.experiment_service:
+            raise OperationValidationError("experiment_service nicht initialisiert.")
+        try:
+            adoption = self.experiment_service.get_adoption(adoption_id.strip())
+            lines = [
+                f"id: {adoption.id}",
+                f"experiment_id: {adoption.experiment_id}",
+                f"status: {adoption.status}",
+                f"started_at: {adoption.started_at or '-'}",
+                f"ended_at: {adoption.ended_at or '-'}",
+                f"target_branch: {adoption.target_branch}",
+                f"test_exit_code: {adoption.test_exit_code if adoption.test_exit_code is not None else '-'}",
+            ]
+            return OperationResult("adoption show", True, lines, 0)
+        except Exception as exc:
+            raise OperationValidationError(f"adoption not found: {exc}")
+
+    def _op_inbox_status(self, args: dict[str, Any]) -> OperationResult:
+        del args
+        conn = init_db(self.db_path)
+        try:
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM mailbox_messages WHERE status NOT IN ('done', 'done_pending_commit')"
+            ).fetchone()[0]
+            return OperationResult("inbox status", True, [f"pending_count: {pending}"], 0)
+        finally:
+            conn.close()
+
+    def _op_outbox_status(self, args: dict[str, Any]) -> OperationResult:
+        del args
+        from pathlib import Path
+        outbox_dir = Path("/agent/communication/outbox")
+        if not outbox_dir.exists():
+            return OperationResult("outbox status", True, ["outbox_dir does not exist"], 0)
+        files = sorted(outbox_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+        lines = [f"{f.name}" for f in files]
+        return OperationResult("outbox status", True, lines, 0)
+
+    def get_catalog_metadata(self) -> dict[str, dict[str, Any]]:
+        """Return metadata for all operations (for use in chains)."""
+        return {
+            "disk": {
+                "name": "disk",
+                "description": "Datenträgerbelegung des Hosts.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 10,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+            "memory": {
+                "name": "memory",
+                "description": "Speicherbelegung aus /proc/meminfo.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 20,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+            "git_status": {
+                "name": "git_status",
+                "description": "Git-Status des Haupt-Repositories.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 100,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+            "git_log": {
+                "name": "git_log",
+                "description": "Kurze Git-Historie des Haupt-Repositories.",
+                "arguments": {"limit": {"type": "int", "min": 1, "max": 100, "default": 10}},
+                "read_only": True,
+                "max_output_lines": 100,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+            "git_worktrees": {
+                "name": "git_worktrees",
+                "description": "Liste der registrierten Git-Worktrees.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 50,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+            "experiment_show": {
+                "name": "experiment_show",
+                "description": "Sichere Kurzübersicht zu einem Experiment.",
+                "arguments": {"experiment_id": {"type": "str", "required": True}},
+                "read_only": True,
+                "max_output_lines": 50,
+                "max_line_chars": 500,
+                "timeout_seconds": 15,
+            },
+            "experiment_logs": {
+                "name": "experiment_logs",
+                "description": "Gekürzte JSONL-Logausgabe eines Experiments.",
+                "arguments": {"experiment_id": {"type": "str", "required": True}, "limit": {"type": "int", "min": 1, "max": 500, "default": 50}},
+                "read_only": True,
+                "max_output_lines": 500,
+                "max_line_chars": 500,
+                "timeout_seconds": 20,
+            },
+            "adoption_show": {
+                "name": "adoption_show",
+                "description": "Sichere Kurzübersicht zu einer Experiment-Adoption.",
+                "arguments": {"adoption_id": {"type": "str", "required": True}},
+                "read_only": True,
+                "max_output_lines": 50,
+                "max_line_chars": 500,
+                "timeout_seconds": 15,
+            },
+            "service_status": {
+                "name": "service_status",
+                "description": "systemctl-Status des API-Service.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 50,
+                "max_line_chars": 500,
+                "timeout_seconds": 15,
+            },
+            "service_logs": {
+                "name": "service_logs",
+                "description": "journalctl-Auszug für den API-Service.",
+                "arguments": {"limit": {"type": "int", "min": 1, "max": 500, "default": 50}},
+                "read_only": True,
+                "max_output_lines": 500,
+                "max_line_chars": 500,
+                "timeout_seconds": 20,
+            },
+            "problems_list": {
+                "name": "problems_list",
+                "description": "Liste der letzten bekannten Probleme.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 50,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+            "inbox_status": {
+                "name": "inbox_status",
+                "description": "Status der Mailbox-Inbox.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 10,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+            "outbox_status": {
+                "name": "outbox_status",
+                "description": "Neueste Dateien in der Mailbox-Outbox.",
+                "arguments": {},
+                "read_only": True,
+                "max_output_lines": 50,
+                "max_line_chars": 500,
+                "timeout_seconds": 10,
+            },
+        }
