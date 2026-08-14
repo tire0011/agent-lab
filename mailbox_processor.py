@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from modules.mailbox import MailboxLock, MailboxProcessor
     from modules.experiment_service import ExperimentService
+    from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
 
@@ -77,9 +78,11 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             operation_chain_service=chain_service,
         )
+        publisher = OperationChainPublisher(db_path=args.db_path, repo_root=str(repo_path))
         try:
             # 1. Retry any previously committed-but-not-pushed commits
             if not args.dry_run:
+                publisher.publish_pending()
                 processor.retry_unpushed_commits()
                 processor.retry_pending_git_commits()
                 if not processor.ensure_clean_worktree():
@@ -112,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             processor.close()
             chain_service.close()
+            publisher.close()
             operations_registry.close()
     finally:
         lock.release()

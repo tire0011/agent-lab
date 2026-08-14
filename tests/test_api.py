@@ -466,13 +466,13 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         self.operations_service = MagicMock()
         self.operations_service.catalog.return_value = [
             SimpleNamespace(to_dict=lambda: {
-                "operation": "git log",
+                "operation": "git_log",
                 "description": "History",
                 "arguments": [{"name": "limit", "type": "integer", "description": "Max", "required": False, "default": 10, "minimum": 1, "maximum": 100}],
             })
         ]
         self.operations_service.execute.return_value = SimpleNamespace(to_dict=lambda: {
-            "operation": "git log",
+            "operation": "git_log",
             "success": True,
             "output_lines": ["abc init"],
             "duration_ms": 5,
@@ -524,16 +524,16 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         catalog = self.client.get("/operations/catalog", headers=self.HEADERS)
         self.assertEqual(catalog.status_code, 200)
         self.assertEqual(catalog.json()["count"], 1)
-        execute = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git log", "args": {"limit": 5}})
+        execute = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git_log", "args": {"limit": 5}})
         self.assertEqual(execute.status_code, 200)
-        self.operations_service.execute.assert_called_with("git log", {"limit": 5})
+        self.operations_service.execute.assert_called_with("git_log", {"limit": 5})
         self.assertEqual(execute.json()["output_lines"], ["abc init"])
 
     def test_operations_execute_maps_validation_errors_to_400(self):
         from modules.operations_registry import OperationValidationError
 
         self.operations_service.execute.side_effect = OperationValidationError("bad op")
-        response = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git log", "args": {}})
+        response = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git_log", "args": {}})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "bad op")
 

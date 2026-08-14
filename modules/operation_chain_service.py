@@ -103,13 +103,30 @@ class OperationChainService:
         self.repo_root = Path(repo_root)
         self.outbox_dir = Path(outbox_dir)
         self.operations_registry = operations_registry
-        self._lock = threading.Lock()
+        # RLock (not Lock): several code paths call locked helper methods while
+        # already holding the lock (e.g. the exception handler in
+        # _run_chain_pipeline calls _get_created_at/_get_started_at/_store_result
+        # while holding self._lock). A plain Lock would deadlock there; an RLock
+        # allows safe reentrant acquisition from the same thread while still
+        # serializing all sqlite3 access across threads (the shared connection
+        # is opened with check_same_thread=False and is not safe for
+        # unsynchronized concurrent use).
+        self._lock = threading.RLock()
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
         self._running_threads: dict[str, threading.Thread] = {}
 
     def close(self) -> None:
+        """Join any still-running chain-execution threads before closing the
+        shared sqlite3 connection. The connection is opened with
+        check_same_thread=False specifically so the background pipeline
+        threads can use it, so it must not be closed (or its backing file
+        removed) while one of those threads might still be executing a
+        query -- doing so corrupts the connection and can segfault the
+        interpreter."""
+        for thread in list(self._running_threads.values()):
+            thread.join(timeout=10)
         self._conn.close()
 
     def start_chain(self, request: OperationChainRequest) -> OperationChainResult:
@@ -187,10 +204,11 @@ class OperationChainService:
 
     def get_chain(self, request_id: str) -> OperationChainResult | None:
         """Retrieve a chain's current status and results."""
-        row = self._conn.execute(
-            "SELECT * FROM operation_chains WHERE request_id = ?",
-            (request_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM operation_chains WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
 
         if not row:
             return None
@@ -199,10 +217,11 @@ class OperationChainService:
 
     def list_chains(self, limit: int = 20) -> list[OperationChainResult]:
         """List the most recent chains."""
-        rows = self._conn.execute(
-            "SELECT * FROM operation_chains ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM operation_chains ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
         return [self._row_to_result(row) for row in rows]
 
@@ -243,7 +262,7 @@ class OperationChainService:
                         if arg_spec.name in step.arguments:
                             arg_val = step.arguments[arg_spec.name]
                             # Basic type check: if int, must be int
-                            if arg_spec.type == "int":
+                            if arg_spec.type == "integer":
                                 try:
                                     arg_val = int(arg_val)
                                 except (ValueError, TypeError):
@@ -333,6 +352,9 @@ class OperationChainService:
                 )
                 self._store_result(result)
                 self._write_outbox_result(request.request_id, result)
+
+        finally:
+            self._running_threads.pop(chain_id, None)
 
     def _execute_step(self, step: OperationChainStep) -> OperationChainStepResult:
         """Execute one step and return result."""
@@ -469,8 +491,8 @@ status: {result.overall_status}
             _atomic_write(filepath, content)
             with self._lock:
                 self._conn.execute(
-                    "UPDATE operation_chains SET outbox_file = ? WHERE request_id = ?",
-                    (str(filepath), result.request_id),
+                    "UPDATE operation_chains SET outbox_file = ?, publish_status = ?, updated_at = ? WHERE request_id = ?",
+                    (str(filepath.relative_to(self.repo_root)), "pending", _now_iso(), result.request_id),
                 )
                 self._conn.commit()
         except Exception as exc:
@@ -478,26 +500,29 @@ status: {result.overall_status}
 
     def _get_chain_by_request_id(self, request_id: str) -> dict | None:
         """Get chain row by request_id."""
-        row = self._conn.execute(
-            "SELECT * FROM operation_chains WHERE request_id = ?",
-            (request_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM operation_chains WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
         return dict(row) if row else None
 
     def _get_created_at(self, chain_id: str) -> str | None:
         """Get created_at timestamp for chain."""
-        row = self._conn.execute(
-            "SELECT created_at FROM operation_chains WHERE id = ?",
-            (chain_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT created_at FROM operation_chains WHERE id = ?",
+                (chain_id,),
+            ).fetchone()
         return row["created_at"] if row else None
 
     def _get_started_at(self, chain_id: str) -> str | None:
         """Get started_at timestamp for chain."""
-        row = self._conn.execute(
-            "SELECT started_at FROM operation_chains WHERE id = ?",
-            (chain_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT started_at FROM operation_chains WHERE id = ?",
+                (chain_id,),
+            ).fetchone()
         return row["started_at"] if row else None
 
     def _row_to_result(self, row: sqlite3.Row) -> OperationChainResult:

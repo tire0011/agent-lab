@@ -386,15 +386,20 @@ class TestApiAuth(unittest.TestCase):
         import os
         os.environ.setdefault("AGENT_API_KEY", "test-key-abc")
         from fastapi.testclient import TestClient
-        import importlib
-        import api as api_module
-        importlib.reload(api_module)
         # Override dependency to avoid real DB
         svc = MagicMock()
         svc.list_recent.return_value = []
         svc.recover_after_restart.return_value = None
 
-        # Use a fresh import to avoid lru_cache issues
+        # NOTE: do NOT importlib.reload(api) here. Reloading mutates the
+        # single shared `api` module in place, so any other test file that
+        # imported `app`/dependency functions at collection time (module
+        # top-level `from api import ...`) keeps stale references while
+        # in-function `from api import ...` calls elsewhere start resolving
+        # to the freshly reloaded objects. That mismatch makes
+        # app.dependency_overrides[...] silently no-op for those objects,
+        # letting requests fall through to the real, production-backed
+        # service. A plain import is sufficient here.
         from api import app, get_mailbox_task_service, get_codex_service
         codex_svc = MagicMock()
         codex_svc.mark_interrupted_tasks_failed.return_value = None

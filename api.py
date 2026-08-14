@@ -1042,15 +1042,6 @@ def list_operation_chains(
     return service.list_chains(limit=limit)
 
 
-@app.get("/operations/catalog")
-def get_operations_catalog(
-    x_api_key: str | None = Header(default=None),
-    service: OperationsRegistry = Depends(get_operations_service),
-) -> dict[str, Any]:
-    authorize(x_api_key)
-    return {"operations": service.get_catalog_metadata()}
-
-
 @app.get("/diagnostics/public", response_model=PublicDiagnosticsResponse)
 def get_public_diagnostics(
     limit: int = Query(default=_DIAGNOSTICS_DEFAULT_LIMIT, ge=1, le=_DIAGNOSTICS_MAX_LIMIT),

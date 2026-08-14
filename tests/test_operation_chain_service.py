@@ -2,10 +2,12 @@
 
 import json
 import sqlite3
+import subprocess
 import tempfile
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -24,7 +26,9 @@ from modules.operation_chain_service import (
     STATUS_RUNNING,
     STATUS_QUEUED,
     STATUS_INTERRUPTED,
+    _CHAIN_OPERATION_ALLOWLIST,
 )
+from modules.operations_registry import OperationsRegistry
 from modules.run_store import init_db
 
 
@@ -359,3 +363,157 @@ class TestOperationChainService:
         # Check file was written
         files = list(outbox_dir.glob("*operation-chain-result*"))
         assert len(files) > 0
+
+
+def _fake_subprocess_runner(command, **kwargs):
+    """Deterministic stand-in for subprocess.run: every command succeeds
+    without touching the real system (no git/systemctl/journalctl needed)."""
+    return subprocess.CompletedProcess(args=command, returncode=0, stdout="ok\n", stderr="")
+
+
+@pytest.fixture
+def real_registry():
+    """Build a real OperationsRegistry (no mocking of `execute`/`_specs`) so
+    the regression test below exercises the actual name resolution and
+    handler dispatch used by OperationChainService in production."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        meminfo = root / "meminfo"
+        meminfo.write_text(
+            "MemTotal:       1000 kB\nMemFree:         500 kB\nMemAvailable:    700 kB\n"
+            "SwapTotal:       0 kB\nSwapFree:        0 kB\n",
+            encoding="utf-8",
+        )
+        log_path = root / "exp.jsonl"
+        log_path.write_text(
+            json.dumps({
+                "timestamp": "2026-08-14T12:00:00Z",
+                "level": "INFO",
+                "phase": "adoption",
+                "event": "detail",
+                "message": "ok",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        experiment = SimpleNamespace(
+            id="abc12345def67890",
+            status="succeeded",
+            created_at="2026-08-14T12:00:00Z",
+            ended_at="2026-08-14T12:10:00Z",
+            test_command=["python", "-m", "unittest"],
+            test_exit_code=0,
+            git_status=" M modules/demo.py\n",
+            error=None,
+        )
+        adoption = SimpleNamespace(
+            id="adoption-1",
+            experiment_id=experiment.id,
+            status="succeeded",
+            started_at="2026-08-14T12:00:00Z",
+            ended_at="2026-08-14T12:10:00Z",
+            target_branch="main",
+            test_exit_code=0,
+        )
+        experiment_service = MagicMock()
+        experiment_service.resolve_experiment.return_value = experiment
+        experiment_service.experiment_log_path.return_value = log_path
+        experiment_service.get_adoption.return_value = adoption
+
+        registry = OperationsRegistry(
+            experiment_service=experiment_service,
+            db_path=str(root / "agent.db"),
+            repo_root=str(root),
+            mailbox_lock_path=str(root / "mailbox.lock"),
+            subprocess_runner=_fake_subprocess_runner,
+            meminfo_path=str(meminfo),
+        )
+        try:
+            yield registry, experiment, adoption
+        finally:
+            registry.close()
+
+
+class TestOperationChainServiceRealRegistryIntegration:
+    """Regression test for the canonical-name mismatch that made every chain
+    action except `disk` and `memory` fail: OperationChainService used to
+    pass underscore action names (e.g. "git_status") straight into
+    OperationsRegistry.execute(), while the registry's own catalog/handler
+    dispatch was keyed on space-separated names (e.g. "git status"). Pure
+    allowlist validation could not catch this because the allowlist and the
+    registry disagreed on names in the same way. This test runs every
+    allowlisted chain action through the *real* OperationsRegistry (no
+    mocked `execute`/`_specs`) end to end via OperationChainService, so a
+    reintroduced name mismatch fails loudly here instead of only in
+    production Nexus operation chains.
+    """
+
+    def _run_actions(self, real_registry, temp_outbox, actions_with_args):
+        registry, _experiment, _adoption = real_registry
+        with tempfile.TemporaryDirectory() as db_dir:
+            service = OperationChainService(
+                db_path=str(Path(db_dir) / "chains.db"),
+                outbox_dir=temp_outbox,
+                operations_registry=registry,
+            )
+            try:
+                steps = [
+                    OperationChainStep(id=f"step_{action}", action=action, arguments=args)
+                    for action, args in actions_with_args
+                ]
+                request = OperationChainRequest(steps=steps)
+                result = service.start_chain(request)
+
+                deadline = time.time() + 15
+                final = service.get_chain(result.request_id)
+                while final is not None and final.overall_status not in (
+                    STATUS_COMPLETED,
+                    STATUS_COMPLETED_WITH_ERRORS,
+                    STATUS_FAILED,
+                ) and time.time() < deadline:
+                    time.sleep(0.05)
+                    final = service.get_chain(result.request_id)
+                return final
+            finally:
+                service.close()
+
+    def test_every_allowlisted_action_reaches_registry_handler(self, real_registry, temp_outbox):
+        experiment_id = real_registry[1].id[:8]
+        adoption_id = real_registry[2].id
+
+        action_args = {
+            "git_status": {},
+            "git_log": {"limit": 1},
+            "git_worktrees": {},
+            "experiment_show": {"experiment_id": experiment_id},
+            "experiment_logs": {"experiment_id": experiment_id, "limit": 5},
+            "adoption_show": {"adoption_id": adoption_id},
+            "service_status": {},
+            "service_logs": {"limit": 5},
+            "disk": {},
+            "memory": {},
+            "problems_list": {},
+            "inbox_status": {},
+            "outbox_status": {},
+        }
+        # Make sure this test tracks the real allowlist, not a stale copy.
+        assert set(action_args) == _CHAIN_OPERATION_ALLOWLIST
+
+        actions = list(action_args.items())
+        # OperationChainRequest caps chains at 10 steps, so split into batches.
+        batch_size = 10
+        for start in range(0, len(actions), batch_size):
+            batch = actions[start:start + batch_size]
+            final = self._run_actions(real_registry, temp_outbox, batch)
+
+            assert final is not None, "chain did not reach a terminal status in time"
+            assert final.overall_status == STATUS_COMPLETED, (
+                f"chain did not complete cleanly: {final.overall_status} "
+                f"steps={[(s.action, s.status, s.error) for s in final.steps]}"
+            )
+            for step in final.steps:
+                assert step.status == "success", (step.action, step.error)
+                assert step.error is None
+                # The historical bug produced exactly this error for every
+                # non-disk/memory action; guard against its reintroduction
+                # even if some other assertion above is loosened later.
+                assert step.error != "Operation ist nicht erlaubt."

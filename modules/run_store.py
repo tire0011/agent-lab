@@ -394,6 +394,20 @@ def _migrate_operations_audit(conn: sqlite3.Connection) -> None:
     )
 
 
+# Columns that may be missing on an already-existing ``operation_chains``
+# table (created before the publish-status columns existed). ``CREATE TABLE
+# IF NOT EXISTS`` never retroactively adds columns, so any new, additive
+# columns must be migrated in explicitly via ``ALTER TABLE ... ADD COLUMN``.
+_OPERATION_CHAINS_ADDITIVE_COLUMNS = [
+    ("outbox_file", "TEXT"),
+    ("publish_status", "TEXT"),
+    ("publish_commit_sha", "TEXT"),
+    ("publish_pushed_at", "TEXT"),
+    ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("publish_last_error", "TEXT"),
+]
+
+
 def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
     """Create operation_chains table (idempotent additive migration)."""
     conn.executescript(
@@ -410,6 +424,11 @@ def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
             steps_successful INTEGER DEFAULT 0,
             steps_failed INTEGER DEFAULT 0,
             outbox_file TEXT NULL,
+            publish_status TEXT NULL,
+            publish_commit_sha TEXT NULL,
+            publish_pushed_at TEXT NULL,
+            publish_retry_count INTEGER NOT NULL DEFAULT 0,
+            publish_last_error TEXT NULL,
             error TEXT NULL,
             updated_at TEXT NOT NULL
         );
@@ -422,6 +441,14 @@ def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
             ON operation_chains(created_at);
         """
     )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(operation_chains)")}
+    for column_name, column_type in _OPERATION_CHAINS_ADDITIVE_COLUMNS:
+        if column_name not in existing:
+            conn.execute(
+                f"ALTER TABLE operation_chains ADD COLUMN {column_name} {column_type}"
+            )
+
+
 def get_applicable_price(
     conn: sqlite3.Connection,
     provider: str,

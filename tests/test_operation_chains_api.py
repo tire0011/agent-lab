@@ -9,6 +9,20 @@ from fastapi.testclient import TestClient
 from api import app
 
 
+@pytest.fixture(autouse=True)
+def _reset_dependency_overrides():
+    """Ensure dependency_overrides set by one test never leak into another.
+
+    ``app`` is a module-level FastAPI singleton shared by every test file in
+    the suite, so leftover overrides (or a lingering absence of an override,
+    which lets a Depends() call fall through to the real, non-test service)
+    can silently change behavior for unrelated tests that run later in the
+    same pytest process.
+    """
+    yield
+    app.dependency_overrides.clear()
+
+
 @pytest.fixture
 def client():
     """Create test client."""
@@ -149,15 +163,18 @@ class TestOperationChainAPI:
         assert response.status_code == 401
 
     def test_operations_catalog_authorized(self, client, monkeypatch):
-        """Test GET /operations/catalog with API key."""
+        """Test GET /operations/catalog with API key uses the canonical
+        (underscore) operation names shared with the chain allowlist."""
         from api import get_operations_service
+        from modules.operations_registry import OperationSpec
+
         monkeypatch.setenv("AGENT_API_KEY", "test-key")
         mock_svc = Mock()
-        mock_svc.get_catalog_metadata = Mock(return_value={
-            "git_status": {"name": "git_status", "description": "Git status"},
-        })
+        mock_svc.catalog = Mock(return_value=[
+            OperationSpec("git_status", "Git status"),
+        ])
         app.dependency_overrides[get_operations_service] = lambda: mock_svc
-        
+
         response = client.get(
             "/operations/catalog",
             headers={"x-api-key": "test-key"}
@@ -165,3 +182,4 @@ class TestOperationChainAPI:
         assert response.status_code == 200
         data = response.json()
         assert "operations" in data
+        assert data["operations"][0]["operation"] == "git_status"

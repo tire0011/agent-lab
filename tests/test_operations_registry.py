@@ -93,8 +93,8 @@ class OperationsRegistryTests(unittest.TestCase):
     def test_catalog_lists_allowlisted_operations(self):
         catalog = self.registry.catalog()
         names = {item.name for item in catalog}
-        self.assertIn("git status", names)
-        self.assertIn("service logs", names)
+        self.assertIn("git_status", names)
+        self.assertIn("service_logs", names)
         self.assertNotIn("experiment adopt", names)
 
     def test_invalid_operation_string_is_rejected_without_execution(self):
@@ -106,14 +106,14 @@ class OperationsRegistryTests(unittest.TestCase):
             self.registry.execute("cat /etc/passwd")
 
     def test_git_operations_work_with_limit_validation(self):
-        log_result = self.registry.execute("git log", {"limit": 1})
+        log_result = self.registry.execute("git_log", {"limit": 1})
         self.assertTrue(log_result.success)
         self.assertEqual(len(log_result.output_lines), 1)
-        status_result = self.registry.execute("git status", {})
+        status_result = self.registry.execute("git_status", {})
         self.assertTrue(status_result.success)
         self.assertEqual(status_result.output_lines, [])
         with self.assertRaises(OperationValidationError):
-            self.registry.execute("git log", {"limit": 1000})
+            self.registry.execute("git_log", {"limit": 1000})
 
     def test_experiment_show_and_logs_are_sanitized(self):
         self.log_path.write_text(
@@ -126,11 +126,11 @@ class OperationsRegistryTests(unittest.TestCase):
             }) + "\n",
             encoding="utf-8",
         )
-        show = self.registry.execute("experiment show", {"experiment_id": self.experiment.id[:8]})
+        show = self.registry.execute("experiment_show", {"experiment_id": self.experiment.id[:8]})
         self.assertTrue(show.success)
         self.assertNotIn("/agent", json.dumps(show.output_lines))
         self.assertNotIn("secret", json.dumps(show.output_lines))
-        logs = self.registry.execute("experiment logs", {"experiment_id": self.experiment.id[:8], "limit": 5})
+        logs = self.registry.execute("experiment_logs", {"experiment_id": self.experiment.id[:8], "limit": 5})
         self.assertTrue(logs.success)
         serialized = json.dumps(logs.output_lines)
         self.assertNotIn("secret", serialized)
@@ -148,12 +148,12 @@ class OperationsRegistryTests(unittest.TestCase):
             meminfo_path=str(self.meminfo),
         )
         self.addCleanup(registry.close)
-        result = registry.execute("service logs", {"limit": 5})
+        result = registry.execute("service_logs", {"limit": 5})
         self.assertFalse(result.success)
         self.assertIn("Zeitlimit", result.error_summary)
 
     def test_inbox_refresh_uses_single_poll_and_reports_already_running(self):
-        result = self.registry.execute("inbox refresh", {})
+        result = self.registry.execute("inbox_refresh", {})
         self.assertTrue(result.success)
         self.assertIn("message.md", json.dumps(result.output_lines))
         lock_path = Path(self.tmp.name) / "mailbox.lock"
@@ -162,7 +162,7 @@ class OperationsRegistryTests(unittest.TestCase):
         lock = MailboxLock(lock_path)
         self.assertTrue(lock.acquire())
         try:
-            blocked = self.registry.execute("inbox refresh", {})
+            blocked = self.registry.execute("inbox_refresh", {})
         finally:
             lock.release()
         self.assertFalse(blocked.success)
@@ -176,11 +176,11 @@ class OperationsRegistryTests(unittest.TestCase):
         self.assertIn("MemTotal", "\n".join(memory.output_lines))
 
     def test_operations_are_audited_without_secret_logging(self):
-        self.registry.execute("git log", {"limit": 1})
+        self.registry.execute("git_log", {"limit": 1})
         row = self.registry._conn.execute(
             "SELECT operation, args_json, success, error_summary FROM operations_audit ORDER BY timestamp DESC LIMIT 1"
         ).fetchone()
-        self.assertEqual(row[0], "git log")
+        self.assertEqual(row[0], "git_log")
         self.assertEqual(json.loads(row[1]), {"limit": "1"})
         self.assertEqual(row[2], 1)
         self.assertIsNone(row[3])

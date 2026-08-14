@@ -123,7 +123,10 @@ class OperationsRegistry:
         params = dict(args or {})
         started = time.perf_counter()
         try:
-            handler = getattr(self, f"_op_{operation.replace(' ', '_')}")
+            # Canonical operation names use underscores (e.g. "git_status") and map
+            # 1:1 to "_op_<name>" handler methods; this is the single source of
+            # truth shared by the catalog, the API, and OperationChainService.
+            handler = getattr(self, f"_op_{operation}")
             result = handler(params)
         except OperationValidationError:
             raise
@@ -145,20 +148,20 @@ class OperationsRegistry:
         adoption_id = OperationArgSpec("adoption_id", "string", "Adoption-ID.", required=True)
         return {
             "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts."),
-            "experiment logs": OperationSpec("experiment logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50]),
-            "experiment show": OperationSpec("experiment show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id]),
-            "git log": OperationSpec("git log", "Kurze Git-Historie des Haupt-Repositories.", [limit10]),
-            "git status": OperationSpec("git status", "Git-Status des Haupt-Repositories."),
-            "git worktrees": OperationSpec("git worktrees", "Liste der registrierten Git-Worktrees."),
+            "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50]),
+            "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id]),
+            "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10]),
+            "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories."),
+            "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees."),
             "help": OperationSpec("help", "Liste aller erlaubten Operationen."),
-            "inbox refresh": OperationSpec("inbox refresh", "Genau einen kontrollierten Mailbox-Poll auslösen."),
+            "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen."),
             "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo."),
-            "service logs": OperationSpec("service logs", "journalctl-Auszug für den API-Service.", [limit50]),
-            "service status": OperationSpec("service status", "systemctl-Status des API-Service."),
-            "adoption show": OperationSpec("adoption show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id]),
-            "problems list": OperationSpec("problems list", "Liste der letzten Probleme."),
-            "inbox status": OperationSpec("inbox status", "Status der Mailbox-Inbox."),
-            "outbox status": OperationSpec("outbox status", "Neueste Dateien in der Mailbox-Outbox."),
+            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für den API-Service.", [limit50]),
+            "service_status": OperationSpec("service_status", "systemctl-Status des API-Service."),
+            "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id]),
+            "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme."),
+            "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox."),
+            "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox."),
         }
 
     def _audit(self, operation: str, args: dict[str, Any], result: OperationResult, *, caller: str) -> None:
@@ -239,19 +242,19 @@ class OperationsRegistry:
     def _op_git_status(self, args: dict[str, Any]) -> OperationResult:
         del args
         result = self._run_command(["git", "status", "--porcelain"], cwd=self.repo_root, timeout=10)
-        result.operation = "git status"
+        result.operation = "git_status"
         return result
 
     def _op_git_log(self, args: dict[str, Any]) -> OperationResult:
         limit = self._limit(args, default=10, maximum=100)
         result = self._run_command(["git", "log", "--oneline", "-n", str(limit)], cwd=self.repo_root, timeout=10)
-        result.operation = "git log"
+        result.operation = "git_log"
         return result
 
     def _op_git_worktrees(self, args: dict[str, Any]) -> OperationResult:
         del args
         result = self._run_command(["git", "worktree", "list"], cwd=self.repo_root, timeout=10)
-        result.operation = "git worktrees"
+        result.operation = "git_worktrees"
         return result
 
     def _op_experiment_show(self, args: dict[str, Any]) -> OperationResult:
@@ -266,7 +269,7 @@ class OperationsRegistry:
             f"changed_files: {', '.join(changed_file_names(experiment.git_status)) or '-'}",
             f"reason: {sanitized_reason(experiment.error) or '-'}",
         ]
-        return OperationResult("experiment show", True, lines, 0)
+        return OperationResult("experiment_show", True, lines, 0)
 
     def _op_experiment_logs(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)
@@ -278,18 +281,18 @@ class OperationsRegistry:
             )[:500]
             for entry in entries
         ]
-        return OperationResult("experiment logs", True, lines, 0)
+        return OperationResult("experiment_logs", True, lines, 0)
 
     def _op_service_status(self, args: dict[str, Any]) -> OperationResult:
         del args
         result = self._run_command(["systemctl", "status", self.service_name, "--no-pager", "-n", "0"], timeout=15)
-        result.operation = "service status"
+        result.operation = "service_status"
         return result
 
     def _op_service_logs(self, args: dict[str, Any]) -> OperationResult:
         limit = self._limit(args, default=50, maximum=500)
         result = self._run_command(["journalctl", "-u", self.service_name, "-n", str(limit), "--no-pager"], timeout=20)
-        result.operation = "service logs"
+        result.operation = "service_logs"
         return result
 
     def _op_inbox_refresh(self, args: dict[str, Any]) -> OperationResult:
@@ -297,7 +300,7 @@ class OperationsRegistry:
         self.mailbox_lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock = MailboxLock(self.mailbox_lock_path)
         if not lock.acquire():
-            return OperationResult("inbox refresh", False, ["Mailbox-Poll läuft bereits."], 0, error_summary="Mailbox-Poll läuft bereits.")
+            return OperationResult("inbox_refresh", False, ["Mailbox-Poll läuft bereits."], 0, error_summary="Mailbox-Poll läuft bereits.")
         started = time.perf_counter()
         try:
             processor = self.mailbox_processor_factory(repo_path=self.repo_root, db_path=self.db_path, dry_run=False)
@@ -306,7 +309,7 @@ class OperationsRegistry:
                 processor.retry_pending_git_commits()
                 if not processor.ensure_clean_worktree():
                     return OperationResult(
-                        "inbox refresh",
+                        "inbox_refresh",
                         False,
                         ["Working tree is dirty; refusing mailbox processing"],
                         int((time.perf_counter() - started) * 1000),
@@ -314,7 +317,7 @@ class OperationsRegistry:
                     )
                 if not processor.pull():
                     return OperationResult(
-                        "inbox refresh",
+                        "inbox_refresh",
                         False,
                         ["git pull --ff-only failed; refusing mailbox processing"],
                         int((time.perf_counter() - started) * 1000),
@@ -326,7 +329,7 @@ class OperationsRegistry:
         finally:
             lock.release()
         output = [redact(json.dumps(result, sort_keys=True))[:500] for result in results] or ["Keine Inbox-Nachrichten verarbeitet."]
-        return OperationResult("inbox refresh", True, output, int((time.perf_counter() - started) * 1000))
+        return OperationResult("inbox_refresh", True, output, int((time.perf_counter() - started) * 1000))
 
     def _op_disk(self, args: dict[str, Any]) -> OperationResult:
         del args
@@ -355,7 +358,7 @@ class OperationsRegistry:
         from data_sources import list_problems
         problems = list_problems()
         lines = [f"{p.id}: {p.summary}" for p in problems[:20]]
-        return OperationResult("problems list", True, lines, 0)
+        return OperationResult("problems_list", True, lines, 0)
 
     def _op_adoption_show(self, args: dict[str, Any]) -> OperationResult:
         adoption_id = args.get("adoption_id")
@@ -374,7 +377,7 @@ class OperationsRegistry:
                 f"target_branch: {adoption.target_branch}",
                 f"test_exit_code: {adoption.test_exit_code if adoption.test_exit_code is not None else '-'}",
             ]
-            return OperationResult("adoption show", True, lines, 0)
+            return OperationResult("adoption_show", True, lines, 0)
         except Exception as exc:
             raise OperationValidationError(f"adoption not found: {exc}")
 
@@ -385,7 +388,7 @@ class OperationsRegistry:
             pending = conn.execute(
                 "SELECT COUNT(*) FROM mailbox_messages WHERE status NOT IN ('done', 'done_pending_commit')"
             ).fetchone()[0]
-            return OperationResult("inbox status", True, [f"pending_count: {pending}"], 0)
+            return OperationResult("inbox_status", True, [f"pending_count: {pending}"], 0)
         finally:
             conn.close()
 
@@ -394,129 +397,7 @@ class OperationsRegistry:
         from pathlib import Path
         outbox_dir = Path("/agent/communication/outbox")
         if not outbox_dir.exists():
-            return OperationResult("outbox status", True, ["outbox_dir does not exist"], 0)
+            return OperationResult("outbox_status", True, ["outbox_dir does not exist"], 0)
         files = sorted(outbox_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
         lines = [f"{f.name}" for f in files]
-        return OperationResult("outbox status", True, lines, 0)
-
-    def get_catalog_metadata(self) -> dict[str, dict[str, Any]]:
-        """Return metadata for all operations (for use in chains)."""
-        return {
-            "disk": {
-                "name": "disk",
-                "description": "Datenträgerbelegung des Hosts.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 10,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-            "memory": {
-                "name": "memory",
-                "description": "Speicherbelegung aus /proc/meminfo.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 20,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-            "git_status": {
-                "name": "git_status",
-                "description": "Git-Status des Haupt-Repositories.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 100,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-            "git_log": {
-                "name": "git_log",
-                "description": "Kurze Git-Historie des Haupt-Repositories.",
-                "arguments": {"limit": {"type": "int", "min": 1, "max": 100, "default": 10}},
-                "read_only": True,
-                "max_output_lines": 100,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-            "git_worktrees": {
-                "name": "git_worktrees",
-                "description": "Liste der registrierten Git-Worktrees.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 50,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-            "experiment_show": {
-                "name": "experiment_show",
-                "description": "Sichere Kurzübersicht zu einem Experiment.",
-                "arguments": {"experiment_id": {"type": "str", "required": True}},
-                "read_only": True,
-                "max_output_lines": 50,
-                "max_line_chars": 500,
-                "timeout_seconds": 15,
-            },
-            "experiment_logs": {
-                "name": "experiment_logs",
-                "description": "Gekürzte JSONL-Logausgabe eines Experiments.",
-                "arguments": {"experiment_id": {"type": "str", "required": True}, "limit": {"type": "int", "min": 1, "max": 500, "default": 50}},
-                "read_only": True,
-                "max_output_lines": 500,
-                "max_line_chars": 500,
-                "timeout_seconds": 20,
-            },
-            "adoption_show": {
-                "name": "adoption_show",
-                "description": "Sichere Kurzübersicht zu einer Experiment-Adoption.",
-                "arguments": {"adoption_id": {"type": "str", "required": True}},
-                "read_only": True,
-                "max_output_lines": 50,
-                "max_line_chars": 500,
-                "timeout_seconds": 15,
-            },
-            "service_status": {
-                "name": "service_status",
-                "description": "systemctl-Status des API-Service.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 50,
-                "max_line_chars": 500,
-                "timeout_seconds": 15,
-            },
-            "service_logs": {
-                "name": "service_logs",
-                "description": "journalctl-Auszug für den API-Service.",
-                "arguments": {"limit": {"type": "int", "min": 1, "max": 500, "default": 50}},
-                "read_only": True,
-                "max_output_lines": 500,
-                "max_line_chars": 500,
-                "timeout_seconds": 20,
-            },
-            "problems_list": {
-                "name": "problems_list",
-                "description": "Liste der letzten bekannten Probleme.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 50,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-            "inbox_status": {
-                "name": "inbox_status",
-                "description": "Status der Mailbox-Inbox.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 10,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-            "outbox_status": {
-                "name": "outbox_status",
-                "description": "Neueste Dateien in der Mailbox-Outbox.",
-                "arguments": {},
-                "read_only": True,
-                "max_output_lines": 50,
-                "max_line_chars": 500,
-                "timeout_seconds": 10,
-            },
-        }
+        return OperationResult("outbox_status", True, lines, 0)
