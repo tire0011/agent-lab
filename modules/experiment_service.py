@@ -54,12 +54,18 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from modules.codex_worker import CodexResult, CodexWorker
+from modules.experiment_evaluation import (
+    ChangedFiles,
+    evaluate_implementation,
+    parse_git_status_short,
+    validate_plan as validate_plan_completeness,
+)
 from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
@@ -540,7 +546,17 @@ class ExperimentNotRunnableError(RuntimeError):
 
 @dataclass
 class ExperimentPlan:
-    """Structured feature plan as selected by the read-only selection phase."""
+    """Structured feature plan as selected by the read-only selection phase.
+
+    ``change_kind``, ``required_artifacts``, and ``acceptance_criteria``
+    were added for the deterministic quality evaluation in
+    ``modules.experiment_evaluation`` (see ``validate_plan``/
+    ``evaluate_implementation``). They all default to safe,
+    backward-compatible values so plans parsed from an older raw model
+    response (before these keys existed) keep working unchanged —
+    ``change_kind`` defaults to ``"implementation"`` (the strictest of the
+    four kinds), and the two list fields default to empty.
+    """
 
     title: str
     motivation: str
@@ -550,6 +566,9 @@ class ExperimentPlan:
     planned_tests: str
     risks: str
     estimated_scope: str
+    change_kind: str = "implementation"
+    required_artifacts: list[str] = field(default_factory=list)
+    acceptance_criteria: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -561,6 +580,9 @@ class ExperimentPlan:
             "planned_tests": self.planned_tests,
             "risks": self.risks,
             "estimated_scope": self.estimated_scope,
+            "change_kind": self.change_kind,
+            "required_artifacts": self.required_artifacts,
+            "acceptance_criteria": self.acceptance_criteria,
         }
 
 
@@ -568,8 +590,9 @@ class ExperimentPlan:
 # ``CodexWorker.run(output_schema=...)`` for both the selection phase and
 # the reformat retry. Codex's own ``--output-schema`` support constrains
 # the *shape* of the model's final response; the result is still fully
-# re-validated with parse_plan()/plan_violates_policy() below (no
-# semantic values are trusted or guessed just because the shape matched).
+# re-validated with parse_plan()/plan_violates_policy()/validate_plan()
+# below (no semantic values are trusted or guessed just because the shape
+# matched).
 PLAN_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -581,6 +604,12 @@ PLAN_JSON_SCHEMA: dict[str, Any] = {
         "planned_tests": {"type": "string"},
         "risks": {"type": "string"},
         "estimated_scope": {"type": "string"},
+        "change_kind": {
+            "type": "string",
+            "enum": ["implementation", "tests_only", "documentation", "analysis"],
+        },
+        "required_artifacts": {"type": "array", "items": {"type": "string"}},
+        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "title",
@@ -591,6 +620,9 @@ PLAN_JSON_SCHEMA: dict[str, Any] = {
         "planned_tests",
         "risks",
         "estimated_scope",
+        "change_kind",
+        "required_artifacts",
+        "acceptance_criteria",
     ],
     "additionalProperties": False,
 }
@@ -643,6 +675,7 @@ class Experiment:
     diff_text: str | None = None
     error: str | None = None
     policy_rule: str | None = None
+    quality_evaluation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -691,6 +724,7 @@ class Experiment:
             "diff_text": self.diff_text,
             "error": self.error,
             "policy_rule": self.policy_rule,
+            "quality_evaluation": self.quality_evaluation,
         }
 
 
@@ -744,6 +778,9 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         diff_text=row["diff_text"],
         error=row["error"],
         policy_rule=row["policy_rule"] if "policy_rule" in row.keys() else None,
+        quality_evaluation=(
+            _json_or_none(row["quality_evaluation_json"]) if "quality_evaluation_json" in row.keys() else None
+        ),
     )
 
 
@@ -760,6 +797,9 @@ _PLAN_FIELD_PATTERNS: dict[str, str] = {
     "planned_tests": r"(planned[_ ]tests|tests)",
     "risks": r"risks",
     "estimated_scope": r"estimated[_ ]scope",
+    "change_kind": r"change[_ ]kind",
+    "required_artifacts": r"required[_ ]artifacts",
+    "acceptance_criteria": r"acceptance[_ ]criteria",
 }
 
 
@@ -922,6 +962,25 @@ def parse_plan(raw_text: str | None) -> ExperimentPlan | None:
     if not affected_files or any(v is None for v in required.values()):
         return None
 
+    # New, optional-for-backward-compatibility fields: absent in any plan
+    # produced before this vocabulary existed, or in a raw model response
+    # that fell back to the "Field: value" text format above. Defaults are
+    # applied by ``ExperimentPlan`` itself; this only normalizes whatever
+    # was actually present.
+    change_kind_raw = _get_str("change_kind")
+    change_kind = change_kind_raw.strip().lower() if change_kind_raw else "implementation"
+
+    def _get_list(key: str) -> list[str]:
+        value = data.get(key)
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str) and value.strip():
+            return [p.strip() for p in re.split(r"[,\n]", value) if p.strip()]
+        return []
+
+    required_artifacts = _get_list("required_artifacts")
+    acceptance_criteria = _get_list("acceptance_criteria")
+
     return ExperimentPlan(
         title=required["title"],
         motivation=required["motivation"],
@@ -931,6 +990,9 @@ def parse_plan(raw_text: str | None) -> ExperimentPlan | None:
         planned_tests=required["planned_tests"],
         risks=required["risks"],
         estimated_scope=required["estimated_scope"],
+        change_kind=change_kind,
+        required_artifacts=required_artifacts,
+        acceptance_criteria=acceptance_criteria,
     )
 
 
@@ -1024,6 +1086,16 @@ _POLICY_RULE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("plan does not touch any concrete code or test file", "documentation_only"),
     ("plan touches too many files", "too_many_files"),
     ("plan references a path outside the repository", "path_outside_repo"),
+    ("plan declares an unknown change_kind", "invalid_change_kind"),
+    (
+        "plan declares change_kind='tests_only' but affected_files names non-test",
+        "tests_only_inconsistent",
+    ),
+    (
+        "plan declares change_kind='tests_only' but the original task did not explicitly",
+        "tests_only_not_justified",
+    ),
+    ("plan declares change_kind=", "insufficient_plan_artifacts"),
     ("research phase timed out", "research_timed_out"),
     ("plan phase timed out", "plan_timed_out"),
     ("policy replan failed", "policy_replan_failed"),
@@ -1122,13 +1194,26 @@ JSON object and NOTHING else: no prose before or after it, no markdown
 code fence, no explanation outside the JSON. The object must have exactly
 these keys: "title", "motivation", "affected_files" (list of repo-relative
 paths), "expected_changes", "success_criteria", "planned_tests", "risks",
-"estimated_scope". All values must be strings, except "affected_files"
+"estimated_scope", "change_kind", "required_artifacts",
+"acceptance_criteria". All values must be strings, except "affected_files"
 which must be a non-empty list of strings naming at least one existing or
 planned repository file — never an empty list.
 
+"change_kind" must be exactly one of: "implementation" (default for any
+ordinary feature/fix/refactoring change), "tests_only" (ONLY if the goal
+above explicitly and exclusively asks for a tests-only change with no
+production-code modification — never choose this for a refactoring or
+feature request), "documentation", or "analysis". "required_artifacts"
+must be a list of the concrete new or modified non-test file paths that
+must exist once the change is implemented (may be empty only for
+"analysis"). "acceptance_criteria" must be a non-empty list of short,
+measurable, checkable statements (e.g. "static/logs.js exists and is
+served", not vague statements like "code is improved").
+
 If no suitable small improvement exists in the research summary, respond
 with a JSON object where "title" is exactly "NONE" and briefly explain why
-in "motivation" (still exactly one JSON object and nothing else).
+in "motivation" (still exactly one JSON object and nothing else, with
+"change_kind" set to "analysis" and both list fields empty).
 """
 
 
@@ -1140,9 +1225,17 @@ def _build_plan_prompt(goal: str, research_summary: str) -> str:
 
 _REFORMAT_RETRY_PROMPT_TEMPLATE = """Reformat the previous plan as exactly one JSON object matching this schema. Do not select or modify the feature. Output JSON only.
 
-Schema keys (all string values, except "affected_files" which is a list of strings):
+Schema keys (all string values, except "affected_files",
+"required_artifacts", and "acceptance_criteria" which are lists of
+strings):
 "title", "motivation", "affected_files", "expected_changes",
-"success_criteria", "planned_tests", "risks", "estimated_scope".
+"success_criteria", "planned_tests", "risks", "estimated_scope",
+"change_kind" (one of "implementation", "tests_only", "documentation",
+"analysis"), "required_artifacts", "acceptance_criteria". If the previous
+plan did not specify "change_kind", "required_artifacts", or
+"acceptance_criteria", infer them conservatively from the previous plan's
+own content (do not invent a new feature) — use "implementation" as the
+default change_kind if genuinely unclear.
 
 Previous plan (reformat this content only, do not change its meaning or
 select a different feature):
@@ -1215,13 +1308,22 @@ JSON object and NOTHING else: no prose before or after it, no markdown
 code fence, no explanation outside the JSON. The object must have exactly
 these keys: "title", "motivation", "affected_files" (list of repo-relative
 paths), "expected_changes", "success_criteria", "planned_tests", "risks",
-"estimated_scope". All values must be strings, except "affected_files"
+"estimated_scope", "change_kind", "required_artifacts",
+"acceptance_criteria". All values must be strings, except "affected_files"
 which must be a non-empty list of strings naming at least one existing or
 planned repository file — never an empty list.
 
+"change_kind" must be exactly one of: "implementation", "tests_only" (ONLY
+if the goal explicitly and exclusively asks for a tests-only change),
+"documentation", or "analysis". "required_artifacts" must list the
+concrete new or modified non-test file paths that must exist once
+implemented. "acceptance_criteria" must be a non-empty list of short,
+measurable, checkable statements.
+
 If no suitable alternative improvement exists, respond with a JSON object
 where "title" is exactly "NONE" and briefly explain why in "motivation"
-(still exactly one JSON object and nothing else).
+(still exactly one JSON object and nothing else, with "change_kind" set
+to "analysis" and both list fields empty).
 """
 
 
@@ -1243,9 +1345,12 @@ implement anything beyond this plan.
 
 Title: {title}
 Motivation: {motivation}
+Change kind: {change_kind}
 Affected files: {affected_files}
+Required artifacts (must exist on disk when you are done): {required_artifacts}
 Expected changes: {expected_changes}
 Success criteria: {success_criteria}
+Acceptance criteria: {acceptance_criteria}
 Planned tests: {planned_tests}
 
 Allowed boundaries (must not be violated):
@@ -1256,7 +1361,10 @@ Allowed boundaries (must not be violated):
 - Do NOT run `git commit`, `git push`, or any merge.
 
 Instructions:
-1. Implement the change described above.
+1. Implement the change described above. If "Change kind" is
+   "implementation" or "documentation", you MUST actually create/modify
+   every file listed under "Required artifacts" — adding or editing tests
+   alone does not satisfy this plan, even if those tests already pass.
 2. Add or update tests so the success criteria are verifiable.
 3. Do not commit or push. Leave the working tree with your changes unstaged.
 """
@@ -1267,9 +1375,12 @@ def _build_implementation_prompt(plan: ExperimentPlan) -> str:
         _IMPLEMENTATION_PROMPT_TEMPLATE.format(
             title=plan.title,
             motivation=plan.motivation,
+            change_kind=plan.change_kind,
             affected_files=", ".join(plan.affected_files),
+            required_artifacts=", ".join(plan.required_artifacts) or "(none declared)",
             expected_changes=plan.expected_changes,
             success_criteria=plan.success_criteria,
+            acceptance_criteria=", ".join(plan.acceptance_criteria) or "(none declared)",
             planned_tests=plan.planned_tests,
         )
     )
@@ -1936,7 +2047,9 @@ class ExperimentService:
             elif plan.title.strip().upper() == "NONE":
                 rejection_reason = f"agent found no suitable improvement: {plan.motivation}"
             else:
-                rejection_reason = plan_violates_policy(plan, selection_result.final_message or "")
+                rejection_reason = plan_violates_policy(
+                    plan, selection_result.final_message or ""
+                ) or validate_plan_completeness(plan, experiment.goal)
 
             if rejection_reason is not None and plan is not None and plan.title.strip().upper() != "NONE":
                 # This is specifically a policy violation on an otherwise
@@ -1992,7 +2105,7 @@ class ExperimentService:
                     else:
                         new_rejection_reason = plan_violates_policy(
                             new_plan, policy_replan_result.final_message or ""
-                        )
+                        ) or validate_plan_completeness(new_plan, experiment.goal)
                         plan = new_plan
                         rejection_reason = new_rejection_reason
                 else:
@@ -2153,7 +2266,10 @@ class ExperimentService:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
         try:
-            status_proc = _run_git(["status", "--short"], cwd=worktree_path, elog=elog, phase="verifying")
+            status_proc = _run_git(
+                ["status", "--short", "--untracked-files=all"],
+                cwd=worktree_path, elog=elog, phase="verifying",
+            )
             with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
                 index_env = dict(os.environ)
                 index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
@@ -2288,6 +2404,7 @@ class ExperimentService:
 
         final_status = STATUS_SUCCEEDED
         error: str | None = None
+        quality_evaluation: dict[str, Any] | None = None
         if diff_check_issue:
             final_status = STATUS_NEEDS_REVIEW
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
@@ -2299,6 +2416,49 @@ class ExperimentService:
         else:
             elog.info("verifying", "tests_passed", "Verification tests passed")
 
+            # ---- Deterministic quality evaluation (no LLM call) --------
+            # Tests passing is necessary but never sufficient: this checks
+            # that the *actual* diff matches what the plan (and the
+            # original task) required — e.g. a plan for an implementation
+            # change that only touched test files must never become
+            # "succeeded" just because those tests happen to pass. A
+            # failure anywhere in this block (a bug in the evaluator
+            # itself, an unreadable plan, ...) must never be able to turn
+            # into a silent "succeeded" — it always downgrades to
+            # needs_review instead, with the worktree preserved for
+            # manual review.
+            try:
+                experiment_for_eval = self.get_experiment(experiment_id)
+                changed = parse_git_status_short(git_status)
+                eval_result = evaluate_implementation(
+                    experiment_for_eval.plan,
+                    experiment_for_eval.goal,
+                    changed,
+                    worktree_path,
+                )
+                quality_evaluation = eval_result.to_dict()
+                if eval_result.outcome != "pass":
+                    final_status = STATUS_NEEDS_REVIEW
+                    error = f"quality evaluation: {eval_result.reason}"
+                    elog.warning(
+                        "verifying", "quality_evaluation_failed",
+                        f"Deterministic quality evaluation flagged this experiment for review: {eval_result.reason}",
+                        evaluation_json=json.dumps(quality_evaluation),
+                    )
+                else:
+                    elog.info(
+                        "verifying", "quality_evaluation_passed",
+                        "Deterministic quality evaluation passed",
+                        evaluation_json=json.dumps(quality_evaluation),
+                    )
+            except Exception as exc:  # noqa: BLE001 - never let this promote to succeeded
+                final_status = STATUS_NEEDS_REVIEW
+                error = f"quality evaluation failed unexpectedly: {exc}"
+                elog.error(
+                    "verifying", "quality_evaluation_exception",
+                    "Exception while running deterministic quality evaluation", exc=exc,
+                )
+
         self._force_status(
             experiment_id, final_status,
             ended_at=_utcnow_iso(),
@@ -2309,6 +2469,7 @@ class ExperimentService:
             test_exit_code=test_exit_code,
             test_output=test_output_capped,
             error=error,
+            quality_evaluation_json=json.dumps(quality_evaluation) if quality_evaluation is not None else None,
         )
         return self.get_experiment(experiment_id)
 

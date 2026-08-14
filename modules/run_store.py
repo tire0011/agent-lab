@@ -166,7 +166,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             diff_stat TEXT NULL,
             diff_text TEXT NULL,
             error TEXT NULL,
-            policy_rule TEXT NULL
+            policy_rule TEXT NULL,
+            quality_evaluation_json TEXT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
@@ -236,6 +237,7 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("policy_replan_raw_message", "TEXT"),
     ("policy_replan_diagnostic_log", "TEXT"),
     ("policy_rule", "TEXT"),
+    ("quality_evaluation_json", "TEXT"),
 ]
 
 

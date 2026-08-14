@@ -222,6 +222,7 @@ class ExperimentDetail(BaseModel):
     diff_text: str | None = None
     error: str | None = None
     policy_rule: str | None = None
+    quality_evaluation: dict[str, Any] | None = None
 
 
 class ExperimentsResponse(BaseModel):

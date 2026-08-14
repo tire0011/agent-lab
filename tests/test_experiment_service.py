@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -152,6 +153,41 @@ def _init_git_repo(path: Path) -> None:
     subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "init"], check=True)
 
 
+def _write_affected_files_side_effect(message: str = "implemented"):
+    """A reusable ``implementation_worker.run`` side effect for tests.
+
+    Pretends to actually implement the selected plan by creating each file
+    listed in the "Affected files: ..." line of the implementation prompt
+    inside the (real, temporary) git worktree — so the run ends with a
+    genuine, non-empty, plan-matching diff. This is required by
+    ``modules.experiment_evaluation``'s deterministic quality gate: an
+    "implementation" plan that produces no non-test file changes (as a
+    bare ``MagicMock`` that never touches the filesystem would) is now
+    correctly downgraded to ``needs_review`` rather than ``succeeded``.
+    """
+
+    def _run(*args, **kwargs):
+        working_dir = kwargs.get("working_dir")
+        task_text = kwargs.get("task") or (args[0] if args else "")
+        match = re.search(r"Affected files:\s*(.+)", task_text)
+        if working_dir and match:
+            for rel_path in (p.strip() for p in match.group(1).split(",")):
+                if not rel_path:
+                    continue
+                target = Path(working_dir) / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    if "test" in target.name:
+                        target.write_text(
+                            "def test_docstring():\n    assert True\n"
+                        )
+                    else:
+                        target.write_text('"""Docstring."""\n')
+        return _make_result(final_message=message, sandbox="workspace-write")
+
+    return _run
+
+
 class ExperimentServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -177,9 +213,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
             return self.plan_worker
 
         self.implementation_worker = MagicMock()
-        self.implementation_worker.run.return_value = _make_result(
-            final_message="implemented", sandbox="workspace-write"
-        )
+        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
         self.worker_factory_calls: list[str] = []
 
         def factory(worktree_path: str):
@@ -786,6 +820,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertIn("kaboom", result.error)
 
     def test_implementation_timeout_yields_timed_out(self):
+        self.implementation_worker.run.side_effect = None
         self.implementation_worker.run.return_value = _make_result(
             timed_out=True, success=False, sandbox="workspace-write",
             error="Codex process timed out after 1200s",
@@ -799,6 +834,14 @@ class ExperimentServiceTestCase(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_missing_tests_dir_yields_needs_review(self):
+        # This scenario is about the test-runner being unable to find a
+        # tests/ dir at all — it must not be masked by the implementation
+        # side effect recreating tests/test_foo.py, so revert to a plain
+        # (no filesystem writes) mock for this test only.
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            final_message="implemented", sandbox="workspace-write"
+        )
         # Remove the tests/ dir the worktree would have inherited from HEAD.
         import shutil as _shutil
         _shutil.rmtree(self.repo_root / "tests")
@@ -1310,9 +1353,7 @@ class ReformatRetryTestCase(unittest.TestCase):
             return self.plan_worker
 
         self.implementation_worker = MagicMock()
-        self.implementation_worker.run.return_value = _make_result(
-            final_message="implemented", sandbox="workspace-write"
-        )
+        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
 
         def factory(worktree_path: str):
             return self.implementation_worker
@@ -1598,9 +1639,7 @@ class PolicyReplanTestCase(unittest.TestCase):
             return self.plan_worker
 
         self.implementation_worker = MagicMock()
-        self.implementation_worker.run.return_value = _make_result(
-            final_message="implemented", sandbox="workspace-write"
-        )
+        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
 
         def factory(worktree_path: str):
             return self.implementation_worker
@@ -1882,9 +1921,7 @@ class DiagnosticLogPipelineTestCase(unittest.TestCase):
             return self.plan_worker
 
         self.implementation_worker = MagicMock()
-        self.implementation_worker.run.return_value = _make_result(
-            final_message="implemented", sandbox="workspace-write"
-        )
+        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
 
         def factory(worktree_path: str):
             return self.implementation_worker
@@ -2116,9 +2153,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         self.plan_worker.run.return_value = _make_result()
 
         self.implementation_worker = MagicMock()
-        self.implementation_worker.run.return_value = _make_result(
-            final_message="implemented", sandbox="workspace-write"
-        )
+        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
 
         self.service = ExperimentService(
             selection_worker=self.selection_worker,
