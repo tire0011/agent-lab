@@ -246,6 +246,49 @@
           </div>
           <div id="operations-history" class="list-state" aria-live="polite">Noch keine Operationen.</div>
         </section>
+
+        <!-- ===== Chain Editor ===== -->
+        <section class="card" id="chain-editor-card">
+          <div class="card-heading">
+            <div>
+              <h2>Chain-Editor</h2>
+              <p class="muted">Bis zu 10 Schritte · Allowlist-Only</p>
+            </div>
+            <button id="chain-template-button" class="secondary" type="button">Vorlage: Nexus Gesamtstatus</button>
+          </div>
+
+          <div class="chain-editor-meta">
+            <label for="chain-stop-on-error">Bei Fehler stoppen</label>
+            <input id="chain-stop-on-error" type="checkbox">
+          </div>
+
+          <div id="chain-steps-list" class="chain-steps-list" aria-label="Chain-Schritte"></div>
+
+          <div class="chain-editor-actions">
+            <button id="chain-add-step-button" class="secondary" type="button">+ Schritt hinzufügen</button>
+            <span id="chain-step-count" class="muted">0 / 10 Schritte</span>
+          </div>
+
+          <div class="chain-run-row">
+            <button id="chain-run-button" type="button">Chain starten</button>
+            <span id="chain-run-status" class="muted" aria-live="polite"></span>
+          </div>
+        </section>
+
+        <!-- ===== Chain Results ===== -->
+        <section class="card" id="chain-result-card" hidden>
+          <div class="card-heading">
+            <div>
+              <h2>Chain-Ergebnis</h2>
+              <span id="chain-result-overall-status" class="indicator pending">–</span>
+            </div>
+            <div class="chain-result-meta-row">
+              <span id="chain-result-meta" class="muted"></span>
+              <button id="chain-result-copy-button" class="secondary" type="button">Kopieren</button>
+            </div>
+          </div>
+          <div id="chain-result-steps" class="chain-result-steps" aria-live="polite"></div>
+        </section>
       </section>
 
       <!-- ================= Chat ================= -->

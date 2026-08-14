@@ -49,6 +49,9 @@ def main(argv: list[str] | None = None) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     from modules.mailbox import MailboxLock, MailboxProcessor
+    from modules.experiment_service import ExperimentService
+    from modules.operation_chain_service import OperationChainService
+    from modules.operations_registry import OperationsRegistry
 
     lock = MailboxLock(lock_path)
     if not lock.acquire():
@@ -56,10 +59,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        experiment_service = ExperimentService(db_path=args.db_path)
+        operations_registry = OperationsRegistry(
+            experiment_service=experiment_service,
+            db_path=args.db_path,
+            repo_root=str(repo_path),
+        )
+        chain_service = OperationChainService(
+            db_path=args.db_path,
+            repo_root=str(repo_path),
+            outbox_dir=str(repo_path / "communication" / "outbox"),
+            operations_registry=operations_registry,
+        )
         processor = MailboxProcessor(
             repo_path=repo_path,
             db_path=args.db_path,
             dry_run=args.dry_run,
+            operation_chain_service=chain_service,
         )
         try:
             # 1. Retry any previously committed-but-not-pushed commits
@@ -95,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
 
         finally:
             processor.close()
+            chain_service.close()
+            operations_registry.close()
     finally:
         lock.release()
 

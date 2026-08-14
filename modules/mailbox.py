@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import logging
 import os
 import re
@@ -28,7 +29,7 @@ MAX_FILE_SIZE = 65536  # 64 KB
 MAX_RETRY = 3
 STATUS_DONE = "done"
 STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
-SUPPORTED_TYPES = {"idea", "task", "question", "context"}
+SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain"}
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
     re.compile(r"AZURE_[A-Z_]+\s*=\s*\S"),
@@ -545,11 +546,161 @@ def _process_context(
     return result_body, None
 
 
+def _parse_operation_chain_body(body: str) -> tuple[dict, str | None]:
+    """Parse and validate JSON body of an operation_chain message.
+
+    Returns (parsed_dict, error_reason).  error_reason is None on success.
+    """
+    stripped = body.strip()
+    if not stripped:
+        return {}, "Empty body: JSON is required"
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        return {}, f"Invalid JSON: {exc}"
+    if not isinstance(data, dict):
+        return {}, "Body must be a JSON object"
+    if "steps" not in data:
+        return {}, "Missing required field: steps"
+    if not isinstance(data["steps"], list):
+        return {}, "Field 'steps' must be a list"
+    if len(data["steps"]) == 0:
+        return {}, "Field 'steps' must not be empty"
+    if len(data["steps"]) > 10:
+        return {}, "Field 'steps' must have at most 10 entries"
+    for i, step in enumerate(data["steps"]):
+        if not isinstance(step, dict):
+            return {}, f"Step {i} must be a JSON object"
+        if "id" not in step:
+            return {}, f"Step {i} missing required field: id"
+        if "action" not in step:
+            return {}, f"Step {i} missing required field: action"
+        step_id = step["id"]
+        if not isinstance(step_id, str) or not step_id.strip():
+            return {}, f"Step {i} field 'id' must be a non-empty string"
+        step_action = step["action"]
+        if not isinstance(step_action, str) or not step_action.strip():
+            return {}, f"Step {i} field 'action' must be a non-empty string"
+    return data, None
+
+
+
+
+# Sentinel returned by _process_operation_chain to signal:
+# "accepted – no mailbox outbox file; service owns the result outbox file"
+_CHAIN_ACCEPTED = object()
+
+# Sentinel for validation/idempotency errors that need a problem outbox file
+class _ChainError:
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+def _process_operation_chain(
+    msg: MailboxMessage,
+    repo_path: Path,
+    conn: sqlite3.Connection,
+    db_msg_id: int,
+    operation_chain_service: Any = None,
+) -> Any:
+    """Parse, validate, and start an operation_chain message.
+
+    Returns:
+      _CHAIN_ACCEPTED  – chain queued; the service writes the sole outbox file.
+      _ChainError(...)  – validation/idempotency failed; caller writes a
+                          problem outbox file so the sender gets feedback.
+    """
+    import hashlib as _hashlib
+
+    # ── Parse body ──────────────────────────────────────────────────────────
+    data, parse_error = _parse_operation_chain_body(msg.body)
+    if parse_error:
+        logger.warning("operation_chain parse error for %s: %s", msg.file_path.name, parse_error)
+        return _ChainError(f"Operation chain rejected: {parse_error}")
+
+    # ── Extract / derive request_id ─────────────────────────────────────────
+    request_id: str | None = msg.meta.get("request_id", "").strip() or None
+    if request_id and not request_id.replace("-", "").replace("_", "").isalnum():
+        return _ChainError("Operation chain rejected: request_id must be alphanumeric with dashes/underscores")
+
+    content_hash = _hashlib.sha256(msg.body.strip().encode()).hexdigest()[:16]
+    if request_id is None:
+        request_id = f"inbox-{content_hash}"
+
+    # ── Idempotency check ────────────────────────────────────────────────────
+    existing_row = conn.execute(
+        "SELECT id, chain_request_id, content_hash FROM mailbox_messages WHERE chain_request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if existing_row:
+        existing_hash = existing_row[2] if len(existing_row) > 2 else None
+        if existing_hash == content_hash:
+            logger.info(
+                "operation_chain idempotent: request_id=%s already accepted", request_id
+            )
+            return _CHAIN_ACCEPTED  # already queued with identical content; no-op
+        else:
+            return _ChainError(
+                f"Conflict: request_id `{request_id}` already exists with different content."
+            )
+
+    # ── Record idempotency data before starting the chain ───────────────────
+    try:
+        conn.execute(
+            "UPDATE mailbox_messages SET chain_request_id = ?, content_hash = ? WHERE id = ?",
+            (request_id, content_hash, db_msg_id),
+        )
+        conn.commit()
+    except Exception:
+        logger.warning(
+            "_process_operation_chain: failed to persist idempotency data for msg %s", db_msg_id
+        )
+
+    if operation_chain_service is None:
+        return _ChainError("Operation chain service not available; chain not started.")
+
+    # ── Build and start the chain ────────────────────────────────────────────
+    try:
+        from models import OperationChainRequest, OperationChainStep
+        stop_on_error = bool(data.get("stop_on_error", False))
+        steps = [
+            OperationChainStep(
+                id=s["id"],
+                action=s["action"],
+                arguments=s.get("arguments", {}),
+            )
+            for s in data["steps"]
+        ]
+        chain_request = OperationChainRequest(
+            steps=steps,
+            stop_on_error=stop_on_error,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        return _ChainError(f"Operation chain rejected: invalid step definition – {exc}")
+
+    try:
+        result = operation_chain_service.start_chain(chain_request)
+    except Exception as exc:
+        logger.exception("_process_operation_chain: start_chain failed")
+        return _ChainError(f"Operation chain failed to start: {exc}")
+
+    if result.overall_status == "rejected":
+        return _ChainError(f"Operation chain rejected: {result.rejection_reason}")
+
+    logger.info(
+        "operation_chain queued: request_id=%s status=%s steps=%d",
+        request_id, result.overall_status, len(steps),
+    )
+    return _CHAIN_ACCEPTED
+
+
 _PROCESSORS = {
     "idea": _process_idea,
     "task": _process_task,
     "question": _process_question,
     "context": _process_context,
+    # operation_chain is handled separately (needs service injection)
 }
 
 
@@ -565,12 +716,14 @@ class MailboxProcessor:
         repo_path: Path,
         db_path: str,
         dry_run: bool = False,
+        operation_chain_service: Any = None,
     ) -> None:
         self.repo_path = repo_path
         self.inbox = repo_path / "communication" / "inbox"
         self.outbox = repo_path / "communication" / "outbox"
         self.db_path = db_path
         self.dry_run = dry_run
+        self.operation_chain_service = operation_chain_service
         self._conn: sqlite3.Connection | None = None
 
     @property
@@ -624,7 +777,10 @@ class MailboxProcessor:
             }
             if msg["status"] == STATUS_DONE and not msg["file_path"].exists():
                 continue
-            self._finalize_git_commit(msg)
+            if msg["msg_type"] == "operation_chain":
+                self._finalize_git_commit_inbox_only(msg)
+            else:
+                self._finalize_git_commit(msg)
 
     def process_inbox(self) -> list[dict[str, Any]]:
         """Process all pending inbox messages. Returns list of result dicts."""
@@ -741,8 +897,17 @@ class MailboxProcessor:
 
         # Process
         try:
-            processor = _PROCESSORS[msg.msg_type]
-            result_body, idea_id = processor(msg, self.repo_path, self.conn, db_msg_id)
+            if msg.msg_type == "operation_chain":
+                chain_outcome = _process_operation_chain(
+                    msg, self.repo_path, self.conn, db_msg_id,
+                    operation_chain_service=self.operation_chain_service,
+                )
+                return self._handle_chain_outcome(
+                    chain_outcome, file_path, rel, msg, db_msg_id
+                )
+            else:
+                processor = _PROCESSORS[msg.msg_type]
+                result_body, idea_id = processor(msg, self.repo_path, self.conn, db_msg_id)
         except Exception as exc:
             logger.exception("Error processing %s", file_path)
             self._record_failure(file_path, str(exc), {"id": db_msg_id})
@@ -822,6 +987,126 @@ class MailboxProcessor:
             f"mailbox: process {msg_type} from {created_by} [{Path(file_path).name}]"
         )
         if not git_add_and_commit(self.repo_path, files_to_commit, commit_msg):
+            return False
+
+        self.conn.execute(
+            "UPDATE mailbox_messages SET status=? WHERE id=?",
+            (STATUS_DONE, msg_id),
+        )
+        self.conn.commit()
+        git_push(self.repo_path)
+        return True
+
+    def _handle_chain_outcome(
+        self,
+        outcome: Any,
+        file_path: Path,
+        rel: str,
+        msg: "MailboxMessage",
+        db_msg_id: int,
+    ) -> dict[str, Any]:
+        """Handle the return value of _process_operation_chain.
+
+        _CHAIN_ACCEPTED  → no outbox file; commit only the inbox deletion.
+        _ChainError(...)  → write a problem outbox file; commit inbox + outbox.
+        """
+        processed_at = _now_iso()
+
+        if outcome is _CHAIN_ACCEPTED:
+            # Persist acceptance in DB (outbox_file stays NULL)
+            self.conn.execute(
+                """
+                UPDATE mailbox_messages
+                SET status=?, processed_at=?, last_error=NULL
+                WHERE id=?
+                """,
+                (STATUS_DONE_PENDING_COMMIT, processed_at, db_msg_id),
+            )
+            self.conn.commit()
+
+            committed = False
+            if not self.dry_run:
+                committed = self._finalize_git_commit_inbox_only(
+                    {
+                        "id": db_msg_id,
+                        "file_path": file_path,
+                        "msg_type": msg.msg_type,
+                        "created_by": msg.created_by,
+                    }
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE mailbox_messages SET status=? WHERE id=?",
+                    (STATUS_DONE, db_msg_id),
+                )
+                self.conn.commit()
+
+            return {
+                "file": rel,
+                "status": "done" if committed or self.dry_run else "skipped",
+                "type": msg.msg_type,
+            }
+
+        # _ChainError: write a problem outbox file so the sender gets feedback
+        assert isinstance(outcome, _ChainError), f"Unexpected chain outcome: {outcome!r}"
+        outbox_name = _outbox_filename(msg, processed_at)
+        outbox_path = self.outbox / outbox_name
+        outbox_content = _build_outbox_content(
+            msg, "rejected", processed_at, outcome.reason, None
+        )
+        if not self.dry_run:
+            _atomic_write(outbox_path, outbox_content)
+
+        self.conn.execute(
+            """
+            UPDATE mailbox_messages
+            SET status=?, processed_at=?, outbox_file=?, last_error=?
+            WHERE id=?
+            """,
+            (STATUS_DONE_PENDING_COMMIT, processed_at, outbox_name, outcome.reason, db_msg_id),
+        )
+        self.conn.commit()
+
+        committed = False
+        if not self.dry_run:
+            committed = self._finalize_git_commit(
+                {
+                    "id": db_msg_id,
+                    "file_path": file_path,
+                    "msg_type": msg.msg_type,
+                    "created_by": msg.created_by,
+                    "outbox_file": outbox_name,
+                    "status": STATUS_DONE_PENDING_COMMIT,
+                }
+            )
+        else:
+            self.conn.execute(
+                "UPDATE mailbox_messages SET status=? WHERE id=?",
+                (STATUS_DONE, db_msg_id),
+            )
+            self.conn.commit()
+
+        return {
+            "file": rel,
+            "status": "done" if committed or self.dry_run else "skipped",
+            "type": msg.msg_type,
+            "outbox": outbox_name,
+        }
+
+    def _finalize_git_commit_inbox_only(self, message_row: dict[str, Any]) -> bool:
+        """Commit only the inbox file deletion (no outbox file to add)."""
+        msg_id = int(message_row["id"])
+        file_path = Path(message_row["file_path"])
+        msg_type = str(message_row["msg_type"] or "unknown")
+        created_by = str(message_row["created_by"] or "unknown")
+
+        if file_path.exists():
+            file_path.unlink()
+
+        commit_msg = (
+            f"mailbox: process {msg_type} from {created_by} [{file_path.name}]"
+        )
+        if not git_add_and_commit(self.repo_path, [file_path], commit_msg):
             return False
 
         self.conn.execute(

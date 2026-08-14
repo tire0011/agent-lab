@@ -214,6 +214,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     )
     _migrate_experiments_columns(conn)
     _migrate_mailbox_messages_task_body(conn)
+    _migrate_mailbox_messages_chain_columns(conn)
     _migrate_mailbox_task_approvals(conn)
     _migrate_experiment_adoptions(conn)
     _migrate_operations_audit(conn)
@@ -258,6 +259,15 @@ def _migrate_mailbox_messages_task_body(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(mailbox_messages)")}
     if "task_body" not in existing:
         conn.execute("ALTER TABLE mailbox_messages ADD COLUMN task_body TEXT NULL")
+
+
+def _migrate_mailbox_messages_chain_columns(conn: sqlite3.Connection) -> None:
+    """Add chain_request_id and content_hash columns for operation_chain idempotency."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(mailbox_messages)")}
+    if "chain_request_id" not in existing:
+        conn.execute("ALTER TABLE mailbox_messages ADD COLUMN chain_request_id TEXT NULL")
+    if "content_hash" not in existing:
+        conn.execute("ALTER TABLE mailbox_messages ADD COLUMN content_hash TEXT NULL")
 
 
 def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:

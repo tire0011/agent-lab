@@ -107,8 +107,143 @@ button.secondary { border: 1px solid var(--border); background: var(--surface); 
   font-family: ui-monospace, monospace;
   font-size: .82rem;
 }
+/* Chain Editor */
+.chain-editor-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.chain-steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.chain-step-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--surface);
+}
+.chain-step-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.chain-step-header label { font-size: .8rem; color: var(--muted); }
+.chain-step-header input, .chain-step-header select {
+  flex: 1;
+  min-width: 80px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  color: var(--text);
+  font: inherit;
+  font-size: .85rem;
+}
+.chain-step-remove {
+  padding: 4px 10px;
+  font-size: .8rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.chain-step-remove:hover { color: var(--bad); border-color: var(--bad); }
+.chain-step-args {
+  font-size: .82rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.chain-step-args input {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--text);
+  font: inherit;
+  font-size: .82rem;
+  margin-top: 2px;
+  box-sizing: border-box;
+}
+.chain-step-move {
+  display: flex;
+  gap: 4px;
+}
+.chain-step-move button {
+  padding: 2px 8px;
+  font-size: .8rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+.chain-step-move button:hover { color: var(--text); }
+.chain-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.chain-run-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.chain-result-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.chain-result-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chain-result-step {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.chain-result-step-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.chain-result-step-header:hover { background: var(--surface); }
+.chain-result-step-title { font-weight: 500; font-size: .9rem; }
+.chain-result-step-meta { font-size: .8rem; color: var(--muted); }
+.chain-result-step-body {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  font-family: ui-monospace, monospace;
+  font-size: .8rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--message);
+}
+.chain-result-step[aria-expanded="false"] .chain-result-step-body { display: none; }
+.chain-result-step[aria-expanded="true"] .chain-result-step-body { display: block; }
+.step-status-success { color: var(--good); }
+.step-status-failed { color: var(--bad); }
+.step-status-skipped { color: var(--muted); }
+
 .adoption-box {
-  margin-top: 16px;
   padding-top: 12px;
   border-top: 1px solid var(--border);
 }
@@ -228,6 +363,9 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
   .logs-status { align-items: flex-start; flex-direction: column; gap: 4px; }
   .detail-list { grid-template-columns: 1fr; }
   .operations-form { grid-template-columns: 1fr; }
+  .chain-step-header { flex-direction: column; align-items: stretch; }
+  .chain-run-row { flex-direction: column; align-items: stretch; }
+  .chain-run-row button { width: 100%; }
   .detail-list dd { margin-bottom: 4px; }
   .api-key-form { flex-direction: column; }
   .api-key-form button, .api-key-form input { width: 100%; }
