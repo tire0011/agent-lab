@@ -63,6 +63,7 @@ from modules.codex_worker import CodexResult, CodexWorker
 from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
+from modules.verification_env import build_verification_test_env
 
 logger = logging.getLogger(__name__)
 
@@ -2233,6 +2234,15 @@ class ExperimentService:
             "Running verification test command",
             command=test_command, cwd=worktree_path,
         )
+        # Isolated, allowlisted environment for the test subprocess only:
+        # never the full parent (agent-api) environment, so a production
+        # AGENT_API_KEY or provider credential can never leak into the
+        # verification test run. Values themselves are never logged.
+        test_env = build_verification_test_env()
+        elog.debug(
+            "verifying", "test_env_isolated",
+            f"Verification test subprocess uses an isolated environment ({len(test_env)} allowlisted variables)",
+        )
         test_started = time.perf_counter()
         try:
             test_proc = subprocess.run(
@@ -2242,6 +2252,7 @@ class ExperimentService:
                 text=True,
                 timeout=300,
                 shell=False,
+                env=test_env,
             )
             test_exit_code = test_proc.returncode
             test_output = (test_proc.stdout or "") + (test_proc.stderr or "")

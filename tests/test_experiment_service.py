@@ -7,6 +7,7 @@ No real Codex process is invoked and no token quota is consumed.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -448,6 +449,44 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(len(test_calls), 1)
         _, kwargs = test_calls[0]
         self.assertEqual(kwargs["cwd"], result.worktree_path)
+
+    @patch("subprocess.run")
+    def test_test_command_uses_isolated_env_not_full_parent_env(self, mock_run):
+        """Regression test for the leaked-production-secret bug: the test
+        subprocess must receive the isolated verification environment
+        (AGENT_API_KEY=test-key), never a copy of the parent process
+        environment, even when the parent has a fake production key and
+        other secrets set."""
+        real_run = _ORIGINAL_SUBPROCESS_RUN
+
+        def fake_run(args, **kwargs):
+            if args and args[0] == "git":
+                return real_run(args, **kwargs)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="OK", stderr="")
+
+        mock_run.side_effect = fake_run
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_API_KEY": "fake-production-secret-should-not-leak",
+                "AZURE_OPENAI_API_KEY": "azure-secret-should-not-leak",
+            },
+        ):
+            experiment = self.service.create_experiment(goal="g")
+            self.service.run_experiment(experiment.id)
+
+        test_calls = [
+            c for c in mock_run.call_args_list
+            if c.args and c.args[0] and c.args[0][0] != "git"
+        ]
+        self.assertEqual(len(test_calls), 1)
+        _, kwargs = test_calls[0]
+        env = kwargs.get("env")
+        self.assertIsNotNone(env, "test subprocess must be given an explicit isolated env")
+        self.assertEqual(env["AGENT_API_KEY"], "test-key")
+        self.assertNotIn("AZURE_OPENAI_API_KEY", env)
+        self.assertNotIn("fake-production-secret-should-not-leak", env.values())
 
     def test_no_venv_copied_or_installed_into_worktree(self):
         experiment = self.service.create_experiment(goal="g")

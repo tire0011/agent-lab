@@ -96,6 +96,52 @@ def _bounded_text(text: str | None, max_chars: int) -> tuple[str | None, bool]:
     return cleaned[:max_chars] + "\u2026", True
 
 
+_TRUNCATION_MARKER_TEMPLATE = "...[TRUNCATED: {n} characters omitted]..."
+
+
+def _bounded_head_tail_text(text: str | None, max_chars: int) -> tuple[str | None, bool]:
+    """Redact then bound *text*, keeping both the beginning and the end.
+
+    Diagnostic process output (``stdout``/``stderr``) commonly has its most
+    useful content at *both* ends: e.g. a unittest run prints the command
+    and early setup near the start, but the final failure summary
+    (``FAILED (failures=1)``), failing test names, and traceback tail are
+    the very last lines. A head-only truncation (as ``_bounded_text`` does
+    for other fields) silently discards exactly that summary. This keeps a
+    head slice and a tail slice, joined by an explicit, human-readable
+    marker naming how many characters were omitted in between, and never
+    exceeds *max_chars* in total (the marker's own length is accounted for
+    up front, using the input length as a safe upper bound on how many
+    digits the omitted-count can have).
+    """
+    if text is None:
+        return None, False
+    cleaned = redaction.redact(str(text))
+    total_len = len(cleaned)
+    if total_len <= max_chars:
+        return cleaned, False
+
+    # Reserve enough room for the marker up front: the number of omitted
+    # characters can never exceed total_len, so sizing the reservation off
+    # total_len's own digit count guarantees the real marker (built from
+    # the *actual*, necessarily smaller, omitted count) never overflows it.
+    reserved = len(_TRUNCATION_MARKER_TEMPLATE.format(n=total_len))
+    available = max_chars - reserved
+    if available <= 0:
+        # max_chars is too small to fit both a head, a tail, and the
+        # marker meaningfully; fall back to the simple head-only scheme
+        # used elsewhere rather than producing something unreadable.
+        return cleaned[:max_chars] + "\u2026", True
+
+    head_len = available // 2
+    tail_len = available - head_len
+    omitted = total_len - head_len - tail_len
+    marker = _TRUNCATION_MARKER_TEMPLATE.format(n=omitted)
+    tail = cleaned[-tail_len:] if tail_len > 0 else ""
+    result = cleaned[:head_len] + marker + tail
+    return result, True
+
+
 def sanitize_command(command: list[str] | str | None) -> str | None:
     """Bounded, redacted, human-readable rendering of a command for logs.
 
@@ -276,11 +322,11 @@ class ExperimentLogger:
         if exit_code is not None:
             entry["exit_code"] = int(exit_code)
         if stdout is not None:
-            bounded_stdout, out_truncated = _bounded_text(stdout, MAX_STDOUT_CHARS)
+            bounded_stdout, out_truncated = _bounded_head_tail_text(stdout, MAX_STDOUT_CHARS)
             entry["stdout"] = bounded_stdout
             truncated = truncated or out_truncated
         if stderr is not None:
-            bounded_stderr, err_truncated = _bounded_text(stderr, MAX_STDERR_CHARS)
+            bounded_stderr, err_truncated = _bounded_head_tail_text(stderr, MAX_STDERR_CHARS)
             entry["stderr"] = bounded_stderr
             truncated = truncated or err_truncated
         if exception_type is not None:

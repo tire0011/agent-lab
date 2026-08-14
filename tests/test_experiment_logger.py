@@ -16,7 +16,10 @@ from pathlib import Path
 
 from modules.experiment_logger import (
     DEFAULT_LOG_DIR,
+    MAX_STDERR_CHARS,
+    MAX_STDOUT_CHARS,
     ExperimentLogger,
+    _bounded_head_tail_text,
     read_log_entries,
     sanitize_command,
 )
@@ -218,6 +221,84 @@ class ExperimentLoggerSizeLimitTests(unittest.TestCase):
         self.assertEqual(len(markers), 1)
         self.assertEqual(markers[0]["level"], "WARNING")
         self.assertLess(elog.path.stat().st_size, 2000)
+
+
+class HeadTailTruncationTests(unittest.TestCase):
+    """Problem 2 regression: stdout/stderr truncation must preserve both
+    the beginning *and* the end of long diagnostic process output, since
+    the final unittest failure summary and traceback tail appear at the
+    end, not the beginning."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmpdir.name)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_short_output_is_not_truncated(self):
+        text = "hello world"
+        result, truncated = _bounded_head_tail_text(text, 100)
+        self.assertEqual(result, text)
+        self.assertFalse(truncated)
+
+    def test_exact_boundary_is_not_truncated(self):
+        text = "x" * 100
+        result, truncated = _bounded_head_tail_text(text, 100)
+        self.assertEqual(result, text)
+        self.assertFalse(truncated)
+        self.assertLessEqual(len(result), 100)
+
+    def test_long_output_is_truncated_with_marker_and_stays_within_limit(self):
+        text = "A" * 5000
+        result, truncated = _bounded_head_tail_text(text, 200)
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(result), 200)
+        self.assertIn("TRUNCATED", result)
+
+    def test_head_is_preserved(self):
+        text = "START_MARKER_HEAD" + ("x" * 5000)
+        result, truncated = _bounded_head_tail_text(text, 300)
+        self.assertTrue(truncated)
+        self.assertTrue(result.startswith("START_MARKER_HEAD"))
+
+    def test_tail_preserves_unittest_failure_summary(self):
+        # Simulates a long unittest run whose final, most important lines
+        # (failure summary + traceback tail) are at the very end.
+        body = "test output line\n" * 500
+        tail = "\nFAILED (failures=1)\nAssertionError: boom at line 42\n"
+        text = body + tail
+        result, truncated = _bounded_head_tail_text(text, 1000)
+        self.assertTrue(truncated)
+        self.assertIn("FAILED (failures=1)", result)
+        self.assertIn("AssertionError: boom at line 42", result)
+        self.assertLessEqual(len(result), 1000)
+
+    def test_redaction_applied_to_full_text_before_splitting(self):
+        # A secret that would fall right at the boundary between head and
+        # tail (in the omitted middle) must still be redacted, proving
+        # redaction runs on the whole string first, not on the surviving
+        # slices only.
+        secret = "sk-testsecretkeyabcdefghijklmnopqrstuvwxyz1234567890"
+        text = ("a" * 2000) + f"AZURE_OPENAI_API_KEY={secret}" + ("b" * 2000)
+        result, truncated = _bounded_head_tail_text(text, 200)
+        self.assertTrue(truncated)
+        self.assertNotIn(secret, result)
+
+    def test_log_process_stdout_stderr_use_head_tail_truncation(self):
+        elog = ExperimentLogger("exp-headtail", log_dir=self.log_dir)
+        long_stdout = "start-of-stdout\n" + ("x" * (MAX_STDOUT_CHARS * 2))
+        long_stderr = "start-of-stderr\n" + ("y" * (MAX_STDERR_CHARS * 2)) + "\nFAILED (failures=2)"
+        elog.log_process(
+            "verifying", "tests_completed", "done",
+            command=["python", "-m", "unittest"], exit_code=1,
+            stdout=long_stdout, stderr=long_stderr,
+        )
+        entry = _read_lines(elog.path)[0]
+        self.assertTrue(entry["truncated"])
+        self.assertTrue(entry["stdout"].startswith("start-of-stdout"))
+        self.assertTrue(entry["stderr"].startswith("start-of-stderr"))
+        self.assertIn("FAILED (failures=2)", entry["stderr"])
+        self.assertLessEqual(len(entry["stdout"]), MAX_STDOUT_CHARS)
+        self.assertLessEqual(len(entry["stderr"]), MAX_STDERR_CHARS)
 
 
 class ExperimentLoggerConcurrencyTests(unittest.TestCase):
