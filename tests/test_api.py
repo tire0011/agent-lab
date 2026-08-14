@@ -90,6 +90,60 @@ class WebClientTests(ApiTestsBase):
         self.assertIn("javascript", response.headers["content-type"])
         self.assertIn("textContent", response.text)
 
+    def test_logs_status_contract(self):
+        html = self.client.get("/").text
+        self.assertIn('id="logs-visible-count"', html)
+        self.assertIn('id="logs-last-successful-refresh"', html)
+        self.assertIn("Sichtbar:", html)
+        self.assertIn("Zuletzt erfolgreich aktualisiert:", html)
+
+    def test_logs_refresh_uses_rendered_arrays_and_shared_load_function(self):
+        javascript = self.client.get("/static/app.js").text
+        self.assertIn("const visibleCount = renderedEntries.length;", javascript)
+        self.assertIn("renderExperimentLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
+        self.assertIn("renderLogsFromActivity(activity);\n      updateLogsSuccessStatus(activity);", javascript)
+        self.assertIn("renderLogsFromDiagnostics(experiments);\n    updateLogsSuccessStatus(experiments);", javascript)
+        self.assertIn('setInterval(loadLogs, 10000)', javascript)
+        self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
+
+    def test_logs_success_timestamp_is_not_updated_in_error_paths(self):
+        javascript = self.client.get("/static/app.js").text
+        load_logs = javascript.split("async function loadLogs()", 1)[1].split(
+            'logsElements.refreshButton.addEventListener("click", loadLogs)', 1
+        )[0]
+        self.assertEqual(load_logs.count("updateLogsSuccessStatus("), 3)
+        for error_path in load_logs.split("catch (error)")[1:]:
+            catch_body = error_path.split("}", 1)[0]
+            self.assertNotIn("updateLogsSuccessStatus", catch_body)
+
+    def test_logs_error_paths_reset_visible_count_but_not_timestamp(self):
+        javascript = self.client.get("/static/app.js").text
+        self.assertIn(
+            "function updateLogsErrorStatus() {\n"
+            "  logsElements.visibleCount.textContent = \"0\";\n"
+            "}",
+            javascript,
+        )
+        self.assertNotIn("lastSuccessfulRefresh", javascript.split(
+            "function updateLogsErrorStatus() {", 1
+        )[1].split("}", 1)[0])
+
+        load_logs = javascript.split("async function loadLogs()", 1)[1].split(
+            'logsElements.refreshButton.addEventListener("click", loadLogs)', 1
+        )[0]
+        self.assertEqual(load_logs.count("updateLogsErrorStatus()"), 3)
+        for error_path in load_logs.split("catch (error)")[1:]:
+            catch_body = error_path.split("}", 1)[0]
+            self.assertIn("updateLogsErrorStatus()", catch_body)
+            self.assertNotIn("lastSuccessfulRefresh", catch_body)
+
+    def test_logs_status_wraps_on_small_screens(self):
+        stylesheet = self.client.get("/static/styles.css").text
+        self.assertIn(".logs-status {", stylesheet)
+        self.assertIn("flex-wrap: wrap", stylesheet)
+        mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
+        self.assertIn(".logs-status { align-items: flex-start; flex-direction: column;", mobile_rules)
+
 
 class StatusEndpointTests(ApiTestsBase):
     def test_status_returns_expected_fields(self):

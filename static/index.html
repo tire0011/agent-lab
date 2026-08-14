@@ -193,6 +193,10 @@
             <input id="logs-mailbox-task-input" type="text" placeholder="z. B. 7ce03cf1…">
           </div>
           <p id="logs-auto-refresh-state" class="muted">Automatische Aktualisierung alle 10 Sekunden.</p>
+          <div class="logs-status" role="status" aria-live="polite">
+            <span>Sichtbar: <strong id="logs-visible-count">0</strong></span>
+            <span>Zuletzt erfolgreich aktualisiert: <time id="logs-last-successful-refresh">Noch nicht</time></span>
+          </div>
         </section>
 
         <section class="card">

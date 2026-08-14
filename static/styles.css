@@ -143,6 +143,11 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
   padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
   background: var(--surface); color: var(--text); font: inherit; width: 100%;
 }
+.logs-status {
+  display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--muted);
+  font-size: .85rem; overflow-wrap: anywhere;
+}
+.logs-status strong { color: var(--text); }
 
 .log-entry { padding: 10px 0; border-top: 1px solid var(--border); }
 .log-entry:first-child { padding-top: 0; border-top: 0; }
@@ -184,6 +189,7 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
   .card-actions { flex-direction: column; }
   .card-actions button { width: 100%; }
   .logs-filters { grid-template-columns: 1fr; }
+  .logs-status { align-items: flex-start; flex-direction: column; gap: 4px; }
   .detail-list { grid-template-columns: 1fr; }
   .detail-list dd { margin-bottom: 4px; }
   .api-key-form { flex-direction: column; }

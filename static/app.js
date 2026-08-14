@@ -629,6 +629,8 @@ const logsElements = {
   mailboxTaskInput: document.querySelector("#logs-mailbox-task-input"),
   content: document.querySelector("#logs-content"),
   count: document.querySelector("#logs-count"),
+  visibleCount: document.querySelector("#logs-visible-count"),
+  lastSuccessfulRefresh: document.querySelector("#logs-last-successful-refresh"),
   autoRefreshState: document.querySelector("#logs-auto-refresh-state"),
 };
 
@@ -643,6 +645,22 @@ function stopLogsAutoRefresh() {
   if (!logsAutoRefreshTimer) return;
   clearInterval(logsAutoRefreshTimer);
   logsAutoRefreshTimer = null;
+}
+
+function updateLogsErrorStatus() {
+  logsElements.visibleCount.textContent = "0";
+}
+
+function updateLogsSuccessStatus(renderedEntries) {
+  const visibleCount = renderedEntries.length;
+  logsElements.count.textContent = String(visibleCount);
+  logsElements.visibleCount.textContent = String(visibleCount);
+  const refreshedAt = new Date();
+  logsElements.lastSuccessfulRefresh.dateTime = refreshedAt.toISOString();
+  logsElements.lastSuccessfulRefresh.textContent = new Intl.DateTimeFormat("de-DE", {
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(refreshedAt);
 }
 
 async function loadLogsExperimentOptions() {
@@ -813,11 +831,13 @@ async function loadLogs() {
       const data = await requestJson(`/experiments/${encodeURIComponent(experimentId)}/logs?${params.toString()}`, {
         headers: authHeaders(),
       });
-      logsElements.count.textContent = String(data.count);
-      renderExperimentLogEntries(data.entries || []);
+      const entries = data.entries || [];
+      renderExperimentLogEntries(entries);
+      updateLogsSuccessStatus(entries);
       return;
     } catch (error) {
       logsElements.count.textContent = "!";
+      updateLogsErrorStatus();
       showError(logsElements.content, error.message);
       return;
     }
@@ -828,11 +848,13 @@ async function loadLogs() {
       const params = new URLSearchParams({ limit: "50" });
       if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
       const data = await requestJson(`/activity?${params.toString()}`, { headers: authHeaders() });
-      logsElements.count.textContent = String(data.count);
-      renderLogsFromActivity(data.activity);
+      const activity = data.activity || [];
+      renderLogsFromActivity(activity);
+      updateLogsSuccessStatus(activity);
       return;
     } catch (error) {
       logsElements.count.textContent = "!";
+      updateLogsErrorStatus();
       showError(logsElements.content, error.message);
       return;
     }
@@ -843,10 +865,11 @@ async function loadLogs() {
     let experiments = data.experiments || [];
     if (experimentId) experiments = experiments.filter((exp) => exp.id === experimentId);
     if (mailboxTaskId) experiments = experiments.filter((exp) => exp.mailbox_task_id === mailboxTaskId);
-    logsElements.count.textContent = String(experiments.length);
     renderLogsFromDiagnostics(experiments);
+    updateLogsSuccessStatus(experiments);
   } catch (error) {
     logsElements.count.textContent = "!";
+    updateLogsErrorStatus();
     showError(logsElements.content, error.message);
   }
 }
