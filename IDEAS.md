@@ -148,6 +148,7 @@ not a significance ranking.
 - Azure actual-cost reconciliation against estimated cost. `new`
 
 ### Mailbox submissions
+- Improve the Logs tab auto-refresh behavior so reading logs on desktop or iPhone is not interrupted every ten seconds.  Add an accessible Auto-refresh on/off control, preserve the user's scroll position and expanded log-entry state during refresh, and avoid replacing the rendered DOM when data is unchanged. When the user has scrolled away from the newest entries, do not jump the page; show a small "new log entries available" indicator that lets the user move to them explicitly. Manual refresh must remain available. Keep the behavior mobile-friendly and test success, failure, paused, unchanged-data, scroll-preservation, and new-entry cases. `new`
 - Evaluate whether a small local LLM can run continuously on the main VM as Nexus's low-cost decision layer: selecting the next action, classifying messages, choosing tools or larger models, and recognizing when human help is needed. Compare it against rule-based routing for decision quality, runtime, memory usage, energy/resource consumption, and avoided API cost. `new`
 
 
