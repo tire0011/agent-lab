@@ -196,6 +196,95 @@ class MailboxMessage:
 
 
 # ---------------------------------------------------------------------------
+# Read-only listing helpers for the web UI (Inbox/Outbox tab).
+#
+# These return raw, unsanitized data (front matter + body text) meant only
+# for internal consumption. Callers (api.py) are responsible for applying
+# an explicit field allowlist and redaction before exposing anything in an
+# HTTP response.
+# ---------------------------------------------------------------------------
+
+MAILBOX_MESSAGE_COLUMNS = (
+    "id", "file_path", "msg_type", "created_by", "status",
+    "received_at", "processed_at", "outbox_file",
+)
+
+
+def list_recent_db_messages(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
+    """Return the most recent ``mailbox_messages`` rows, newest first.
+
+    Read-only: creates the mailbox schema if missing (idempotent) but never
+    writes message rows. Values are raw database contents.
+    """
+    init_mailbox_db(conn)
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(MAILBOX_MESSAGE_COLUMNS)}
+        FROM mailbox_messages
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(zip(MAILBOX_MESSAGE_COLUMNS, row)) for row in rows]
+
+
+def read_inbox_preview(file_path: str | None, *, max_chars: int = 4000) -> str | None:
+    """Best-effort raw body text of a still-pending inbox file.
+
+    Returns ``None`` (not an error) once the file no longer exists, e.g.
+    because it was already processed, committed, and deleted -- this is the
+    normal end state for a handled message, not a failure.
+    """
+    if not file_path:
+        return None
+    try:
+        path = Path(file_path)
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > MAX_FILE_SIZE:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+        _, body = parse_front_matter(text)
+        return body[:max_chars]
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def list_outbox_files(outbox_dir: Path, limit: int = 20) -> list[dict[str, Any]]:
+    """Return recent outbox files as raw ``{filename, meta, body}`` dicts.
+
+    Newest first (outbox filenames are timestamp-prefixed, so lexicographic
+    order is chronological). Read-only; never writes or deletes files.
+    """
+    if not outbox_dir.is_dir():
+        return []
+    try:
+        candidates = sorted(
+            (
+                p for p in outbox_dir.iterdir()
+                if p.suffix == ".md" and not p.is_symlink() and p.is_file()
+            ),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+    except OSError:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for path in candidates[:limit]:
+        try:
+            if path.stat().st_size > MAX_FILE_SIZE:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            meta, body = parse_front_matter(text)
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        results.append({"filename": path.name, "meta": meta, "body": body})
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
 

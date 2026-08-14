@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 import chat as chat_module
 from data_sources import InvalidIdeaTextError, add_idea, list_ideas, list_problems
+from modules import mailbox as mailbox_module
 from modules.codex_task_service import (
     CodexTaskService,
     TaskNotFoundError,
@@ -42,6 +43,8 @@ from models import (
     Idea,
     IdeaCreateRequest,
     IdeasResponse,
+    MailboxMessageEntry,
+    MailboxMessagesResponse,
     MailboxTaskApproval,
     MailboxTaskApprovalsResponse,
     MailboxTaskRejectRequest,
@@ -152,6 +155,8 @@ app = FastAPI(lifespan=lifespan)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+_OUTBOX_DIR = Path(__file__).resolve().parent / "communication" / "outbox"
 
 API_KEY = os.environ["AGENT_API_KEY"]
 
@@ -381,6 +386,108 @@ def reject_mailbox_task(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return _approval_to_response(approval)
+
+
+# ---------------------------------------------------------------------------
+# Mailbox inbox/outbox listing (public, sanitized, read-only)
+#
+# Separate from the "Aufträge" task-approval bridge above: this surfaces the
+# general communication mailbox (idea/task/question/context messages and
+# their outbox responses) so the web UI can show what came in and what went
+# out, without ever exposing full prompts, file paths, or secrets.
+# ---------------------------------------------------------------------------
+
+_MAILBOX_MESSAGES_DEFAULT_LIMIT = 20
+_MAILBOX_MESSAGES_MAX_LIMIT = 100
+
+_MAILBOX_TYPE_LABELS_DE = {
+    "idea": "Idee",
+    "task": "Auftrag",
+    "question": "Frage",
+    "context": "Kontext",
+    "task_approval_result": "Freigabe-Ergebnis",
+}
+
+_SAFE_SENDER_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def _mailbox_type_label(msg_type: str | None) -> str:
+    if not msg_type:
+        return "Nachricht"
+    return _MAILBOX_TYPE_LABELS_DE.get(msg_type, msg_type.replace("_", " ").strip().capitalize() or "Nachricht")
+
+
+def _safe_mailbox_sender(raw: str | None) -> str | None:
+    """Only expose sender/creator identifiers matching a safe, narrow shape."""
+    if not raw:
+        return None
+    candidate = raw.strip()
+    return candidate if _SAFE_SENDER_RE.fullmatch(candidate) else None
+
+
+def _mailbox_preview(text: str | None) -> str | None:
+    if not text:
+        return None
+    # Drop markdown headings (e.g. "## Result") so the preview starts with
+    # actual content, then redact and bound it like every other diagnostic.
+    stripped = "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    ).strip()
+    return redaction.sanitized_reason(stripped, max_chars=220)
+
+
+def _inbox_entries(service: ExperimentService, limit: int) -> list[MailboxMessageEntry]:
+    rows = mailbox_module.list_recent_db_messages(service._conn, limit=limit)
+    entries = []
+    for row in rows:
+        preview = _mailbox_preview(mailbox_module.read_inbox_preview(row.get("file_path")))
+        entries.append(
+            MailboxMessageEntry(
+                id=f"msg-{row['id']}",
+                timestamp=row.get("received_at") or "",
+                type=row.get("msg_type") or "unknown",
+                status=row.get("status") or "unknown",
+                sender=_safe_mailbox_sender(row.get("created_by")),
+                title=_mailbox_type_label(row.get("msg_type")),
+                preview=preview,
+            )
+        )
+    return entries
+
+
+def _outbox_entries(limit: int) -> list[MailboxMessageEntry]:
+    files = mailbox_module.list_outbox_files(_OUTBOX_DIR, limit=limit)
+    entries = []
+    for item in files:
+        meta = item.get("meta") or {}
+        msg_type = meta.get("type")
+        entries.append(
+            MailboxMessageEntry(
+                id=item["filename"],
+                timestamp=meta.get("processed_at") or meta.get("created_at") or "",
+                type=msg_type or "unknown",
+                status=meta.get("status") or "unknown",
+                sender=_safe_mailbox_sender(meta.get("created_by") or meta.get("sender")),
+                title=_mailbox_type_label(msg_type),
+                preview=_mailbox_preview(item.get("body")),
+            )
+        )
+    return entries
+
+
+@app.get("/mailbox/messages", response_model=MailboxMessagesResponse)
+def list_mailbox_messages(
+    limit: int = Query(default=_MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=1, le=_MAILBOX_MESSAGES_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> MailboxMessagesResponse:
+    inbox = _inbox_entries(service, limit)
+    outbox = _outbox_entries(limit)
+    return MailboxMessagesResponse(
+        inbox_count=len(inbox),
+        outbox_count=len(outbox),
+        inbox=inbox,
+        outbox=outbox,
+    )
 
 
 # ---------------------------------------------------------------------------

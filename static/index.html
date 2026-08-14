@@ -13,105 +13,192 @@
       <div>
         <p class="eyebrow">agent-lab</p>
         <h1>Agent Lab</h1>
-        <p class="subtitle">Status, Aufgaben und Chat auf einen Blick</p>
       </div>
-      <button id="refresh-button" class="secondary" type="button">Aktualisieren</button>
     </header>
 
+    <section class="card api-key-card" aria-label="API-Key">
+      <div class="card-heading">
+        <h2>API-Key</h2>
+        <span id="api-key-status" class="indicator pending">Nicht verbunden</span>
+      </div>
+      <form id="api-key-form" class="api-key-form">
+        <label for="api-key-input" class="sr-only">API-Key</label>
+        <input id="api-key-input" type="password" placeholder="API-Key eingeben …" autocomplete="off">
+        <button id="api-key-connect" type="submit">Verbinden</button>
+        <button id="api-key-forget" type="button" class="secondary">Vergessen</button>
+      </form>
+      <p class="muted api-key-hint">Der Key wird nur für diese Sitzung im Browser gespeichert und ausschließlich als Header gesendet.</p>
+    </section>
+
+    <nav class="tabs" role="tablist" aria-label="Bereiche">
+      <button type="button" role="tab" class="tab-button active" data-tab="overview" aria-selected="true" aria-controls="tab-overview" id="tabbtn-overview">Übersicht</button>
+      <button type="button" role="tab" class="tab-button" data-tab="tasks" aria-selected="false" aria-controls="tab-tasks" id="tabbtn-tasks">Aufträge</button>
+      <button type="button" role="tab" class="tab-button" data-tab="mailbox" aria-selected="false" aria-controls="tab-mailbox" id="tabbtn-mailbox">Inbox / Outbox</button>
+      <button type="button" role="tab" class="tab-button" data-tab="logs" aria-selected="false" aria-controls="tab-logs" id="tabbtn-logs">Logs</button>
+      <button type="button" role="tab" class="tab-button" data-tab="chat" aria-selected="false" aria-controls="tab-chat" id="tabbtn-chat">Chat</button>
+    </nav>
+
     <main>
-      <section class="status-grid" aria-label="Systemstatus">
-        <article class="card status-card">
-          <div class="card-heading">
-            <h2>API</h2>
-            <span id="health-indicator" class="indicator pending">Lädt …</span>
-          </div>
-          <p id="health-detail" class="muted" aria-live="polite">Status wird abgerufen.</p>
-        </article>
+      <!-- ================= Übersicht ================= -->
+      <section id="tab-overview" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-overview">
+        <div class="tab-panel-heading">
+          <button id="refresh-button" class="secondary" type="button">Aktualisieren</button>
+        </div>
 
-        <article class="card status-card">
+        <section class="status-grid" aria-label="Systemstatus">
+          <article class="card status-card">
+            <div class="card-heading">
+              <h2>API</h2>
+              <span id="health-indicator" class="indicator pending">Lädt …</span>
+            </div>
+            <p id="health-detail" class="muted" aria-live="polite">Status wird abgerufen.</p>
+          </article>
+
+          <article class="card status-card">
+            <div class="card-heading">
+              <h2>Agent</h2>
+              <span id="agent-indicator" class="indicator pending">Lädt …</span>
+            </div>
+            <p id="agent-detail" class="muted" aria-live="polite">Status wird abgerufen.</p>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="card">
+            <div class="card-heading">
+              <h2>Aktuelle Probleme</h2>
+              <span id="problems-count" class="count">–</span>
+            </div>
+            <div id="problems-content" class="list-state" aria-live="polite">Wird geladen …</div>
+          </article>
+
+          <article class="card">
+            <div class="card-heading">
+              <h2>Ideen</h2>
+              <span id="ideas-count" class="count">–</span>
+            </div>
+            <div id="ideas-content" class="list-state" aria-live="polite">Wird geladen …</div>
+            <form id="idea-form" class="idea-form">
+              <label for="idea-input" class="sr-only">Neue Idee</label>
+              <input id="idea-input" type="text" maxlength="500" placeholder="Neue Idee …" required>
+              <button id="idea-submit" type="submit">Idee hinzufügen</button>
+              <span id="idea-state" class="muted" aria-live="polite"></span>
+            </form>
+          </article>
+        </section>
+
+        <section class="card" id="public-activity-section">
           <div class="card-heading">
-            <h2>Agent</h2>
-            <span id="agent-indicator" class="indicator pending">Lädt …</span>
+            <div>
+              <h2>Nexus Activity</h2>
+              <p class="muted">Public, sanitized · refreshes every 10 seconds</p>
+            </div>
+            <span id="public-activity-count" class="count">–</span>
           </div>
-          <p id="agent-detail" class="muted" aria-live="polite">Status wird abgerufen.</p>
-        </article>
+          <div id="public-activity-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </section>
+
+        <section class="card" id="diagnostics-section">
+          <div class="card-heading">
+            <div>
+              <h2>Diagnostics</h2>
+              <p class="muted">Public, sanitized · refreshes every 10 seconds</p>
+            </div>
+            <span id="diagnostics-count" class="count">–</span>
+          </div>
+          <div id="diagnostics-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </section>
       </section>
 
-      <section class="content-grid">
-        <article class="card">
+      <!-- ================= Aufträge ================= -->
+      <section id="tab-tasks" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-tasks" hidden>
+        <section class="card">
           <div class="card-heading">
-            <h2>Aktuelle Probleme</h2>
-            <span id="problems-count" class="count">–</span>
+            <h2>Mailbox-Aufträge</h2>
+            <span id="task-approvals-count" class="count">–</span>
           </div>
-          <div id="problems-content" class="list-state" aria-live="polite">Wird geladen …</div>
-        </article>
+          <div class="row-actions">
+            <button id="task-load-button" type="button" class="secondary">Aktualisieren</button>
+          </div>
+          <div id="task-approvals-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </section>
 
-        <article class="card">
+        <section class="card" id="task-detail-section" hidden>
           <div class="card-heading">
-            <h2>Ideen</h2>
-            <span id="ideas-count" class="count">–</span>
+            <h2>Experiment-Details</h2>
+            <button id="task-detail-close" type="button" class="secondary">Schließen</button>
           </div>
-          <div id="ideas-content" class="list-state" aria-live="polite">Wird geladen …</div>
-          <form id="idea-form" class="idea-form">
-            <label for="idea-input" class="sr-only">Neue Idee</label>
-            <input id="idea-input" type="text" maxlength="500" placeholder="Neue Idee …" required>
-            <label for="idea-api-key" class="sr-only">API-Key</label>
-            <input id="idea-api-key" type="password" placeholder="API-Key" autocomplete="off">
-            <button id="idea-submit" type="submit">Idee hinzufügen</button>
-            <span id="idea-state" class="muted" aria-live="polite"></span>
+          <div id="task-detail-content" class="list-state" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <!-- ================= Inbox / Outbox ================= -->
+      <section id="tab-mailbox" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-mailbox" hidden>
+        <div class="tab-panel-heading">
+          <button id="mailbox-refresh-button" class="secondary" type="button">Aktualisieren</button>
+        </div>
+
+        <section class="card">
+          <div class="card-heading">
+            <h2>Inbox</h2>
+            <span id="mailbox-inbox-count" class="count">–</span>
+          </div>
+          <div id="mailbox-inbox-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </section>
+
+        <section class="card">
+          <div class="card-heading">
+            <h2>Outbox</h2>
+            <span id="mailbox-outbox-count" class="count">–</span>
+          </div>
+          <div id="mailbox-outbox-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </section>
+      </section>
+
+      <!-- ================= Logs ================= -->
+      <section id="tab-logs" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-logs" hidden>
+        <section class="card">
+          <div class="card-heading">
+            <h2>Diagnose-Filter</h2>
+            <button id="logs-refresh-button" class="secondary" type="button">Aktualisieren</button>
+          </div>
+          <div class="logs-filters">
+            <label for="logs-experiment-select">Experiment</label>
+            <select id="logs-experiment-select">
+              <option value="">Alle Experimente</option>
+            </select>
+            <label for="logs-mailbox-task-input">Mailbox-Task-ID</label>
+            <input id="logs-mailbox-task-input" type="text" placeholder="z. B. 7ce03cf1…">
+          </div>
+          <p id="logs-auto-refresh-state" class="muted">Automatische Aktualisierung alle 10 Sekunden.</p>
+        </section>
+
+        <section class="card">
+          <div class="card-heading">
+            <h2>Log-Einträge</h2>
+            <span id="logs-count" class="count">–</span>
+          </div>
+          <div id="logs-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </section>
+      </section>
+
+      <!-- ================= Chat ================= -->
+      <section id="tab-chat" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-chat" hidden>
+        <section class="card chat-card">
+          <div class="card-heading">
+            <div>
+              <h2>Chat</h2>
+              <p class="muted">Fragen zu Status, Problemen und Ideen</p>
+            </div>
+            <span id="chat-state" class="muted" aria-live="polite"></span>
+          </div>
+          <div id="messages" class="messages" aria-live="polite" aria-label="Nachrichtenverlauf"></div>
+          <form id="chat-form" class="chat-form">
+            <label for="chat-input" class="sr-only">Nachricht</label>
+            <textarea id="chat-input" rows="2" maxlength="2000" placeholder="Nachricht eingeben …" required></textarea>
+            <button id="send-button" type="submit">Senden</button>
           </form>
-        </article>
-      </section>
-
-      <section class="card" id="public-activity-section">
-        <div class="card-heading">
-          <div>
-            <h2>Nexus Activity</h2>
-            <p class="muted">Public, sanitized · refreshes every 10 seconds</p>
-          </div>
-          <span id="public-activity-count" class="count">–</span>
-        </div>
-        <div id="public-activity-content" class="list-state" aria-live="polite">Wird geladen …</div>
-      </section>
-
-      <section class="card" id="diagnostics-section">
-        <div class="card-heading">
-          <div>
-            <h2>Diagnostics</h2>
-            <p class="muted">Public, sanitized · refreshes every 10 seconds</p>
-          </div>
-          <span id="diagnostics-count" class="count">–</span>
-        </div>
-        <div id="diagnostics-content" class="list-state" aria-live="polite">Wird geladen …</div>
-      </section>
-
-      <section class="card chat-card">
-        <div class="card-heading">
-          <div>
-            <h2>Chat</h2>
-            <p class="muted">Fragen zu Status, Problemen und Ideen</p>
-          </div>
-          <span id="chat-state" class="muted" aria-live="polite"></span>
-        </div>
-        <div id="messages" class="messages" aria-live="polite" aria-label="Nachrichtenverlauf"></div>
-        <form id="chat-form" class="chat-form">
-          <label for="chat-input" class="sr-only">Nachricht</label>
-          <textarea id="chat-input" rows="2" maxlength="2000" placeholder="Nachricht eingeben …" required></textarea>
-          <button id="send-button" type="submit">Senden</button>
-        </form>
-      </section>
-
-      <section class="card" id="task-approvals-section">
-        <div class="card-heading">
-          <h2>Task Approvals</h2>
-          <span id="task-approvals-count" class="count">–</span>
-        </div>
-        <div class="api-key-row" style="margin-bottom:12px;display:flex;gap:8px;">
-          <label for="task-api-key" class="sr-only">API-Key</label>
-          <input id="task-api-key" type="password" placeholder="API-Key" autocomplete="off" style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:8px;">
-          <button id="task-load-button" type="button" class="secondary">Laden</button>
-        </div>
-        <div id="task-approvals-content" class="list-state" aria-live="polite">API-Key eingeben und Laden klicken.</div>
+        </section>
       </section>
     </main>
   </body>

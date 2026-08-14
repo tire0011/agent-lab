@@ -353,3 +353,31 @@ class PublicDiagnosticsResponse(BaseModel):
     experiments: list[PublicDiagnosticExperiment] = Field(default_factory=list)
     problems: list[Problem] = Field(default_factory=list)
 
+
+# ---------------------------------------------------------------------------
+# Mailbox inbox/outbox listing (public, sanitized).
+#
+# Every field is drawn from an explicit allowlist assembled in api.py.
+# ``preview`` is always short and redacted; full prompts, task bodies,
+# absolute file paths, and unfiltered file/command output are never
+# included here (see the "Aufträge"/task-approval and "Logs" endpoints for
+# authenticated, more detailed views).
+# ---------------------------------------------------------------------------
+
+
+class MailboxMessageEntry(BaseModel):
+    id: str
+    timestamp: str
+    type: str
+    status: str
+    sender: str | None = None
+    title: str
+    preview: str | None = None
+
+
+class MailboxMessagesResponse(BaseModel):
+    inbox_count: int
+    outbox_count: int
+    inbox: list[MailboxMessageEntry] = Field(default_factory=list)
+    outbox: list[MailboxMessageEntry] = Field(default_factory=list)
+
