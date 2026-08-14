@@ -56,6 +56,7 @@ _CHAIN_OPERATION_ALLOWLIST = {
     "experiment_logs",
     "adoption_show",
     "service_status",
+    "mailbox_status",
     "service_logs",
     "disk",
     "memory",

@@ -488,6 +488,7 @@ class TestOperationChainServiceRealRegistryIntegration:
             "experiment_logs": {"experiment_id": experiment_id, "limit": 5},
             "adoption_show": {"adoption_id": adoption_id},
             "service_status": {},
+            "mailbox_status": {},
             "service_logs": {"limit": 5},
             "disk": {},
             "memory": {},

@@ -156,6 +156,7 @@ class OperationsRegistry:
             "help": OperationSpec("help", "Liste aller erlaubten Operationen."),
             "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen."),
             "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo."),
+            "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers."),
             "service_logs": OperationSpec("service_logs", "journalctl-Auszug für den API-Service.", [limit50]),
             "service_status": OperationSpec("service_status", "systemctl-Status des API-Service."),
             "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id]),
@@ -288,6 +289,41 @@ class OperationsRegistry:
         result = self._run_command(["systemctl", "status", self.service_name, "--no-pager", "-n", "0"], timeout=15)
         result.operation = "service_status"
         return result
+
+    def _op_mailbox_status(self, args: dict[str, Any]) -> OperationResult:
+        if args:
+            raise OperationValidationError("mailbox_status akzeptiert keine Argumente.")
+
+        started = time.perf_counter()
+        checks = []
+        for unit in ("nexus-mailbox.service", "nexus-mailbox.timer"):
+            check = self._run_command(
+                ["systemctl", "status", unit, "--no-pager", "-n", "0"],
+                timeout=15,
+            )
+            checks.append((unit, check))
+
+        output_lines: list[str] = []
+        failure_details: list[str] = []
+        for unit, check in checks:
+            output_lines.append(f"{unit}:")
+            # Reserve room for both unit labels and exit-code lines while
+            # keeping the combined response within the 200-line bound.
+            output_lines.extend(bounded_lines("\n".join(check.output_lines), max_lines=96))
+            output_lines.append(f"exit_code: {check.exit_code if check.exit_code is not None else '-'}")
+            if not check.success:
+                reason = sanitized_reason(check.error_summary) or "Statusprüfung fehlgeschlagen."
+                failure_details.append(f"{unit}: {reason}")
+
+        failed_checks = [check for _, check in checks if not check.success]
+        return OperationResult(
+            operation="mailbox_status",
+            success=not failed_checks,
+            output_lines=bounded_lines("\n".join(output_lines), max_lines=200),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            exit_code=failed_checks[0].exit_code if failed_checks else 0,
+            error_summary=sanitized_reason("; ".join(failure_details)) if failure_details else None,
+        )
 
     def _op_service_logs(self, args: dict[str, Any]) -> OperationResult:
         limit = self._limit(args, default=50, maximum=500)

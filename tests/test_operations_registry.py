@@ -95,7 +95,75 @@ class OperationsRegistryTests(unittest.TestCase):
         names = {item.name for item in catalog}
         self.assertIn("git_status", names)
         self.assertIn("service_logs", names)
+        self.assertIn("mailbox_status", names)
         self.assertNotIn("experiment adopt", names)
+
+    def test_mailbox_status_uses_fixed_units_and_redacts_bounded_output(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="\n".join(["token=secret /agent/private"] + [f"line {i}" for i in range(250)]),
+                stderr="password=hunter2 /var/lib/private",
+            )
+
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-mailbox-status.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("mailbox_status", {})
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            [call[0] for call in calls],
+            [
+                ["systemctl", "status", "nexus-mailbox.service", "--no-pager", "-n", "0"],
+                ["systemctl", "status", "nexus-mailbox.timer", "--no-pager", "-n", "0"],
+            ],
+        )
+        self.assertTrue(all(call[1]["shell"] is False for call in calls))
+        serialized = json.dumps(result.output_lines)
+        self.assertLessEqual(len(result.output_lines), 200)
+        self.assertIn("nexus-mailbox.service", serialized)
+        self.assertIn("nexus-mailbox.timer", serialized)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("hunter2", serialized)
+        self.assertNotIn("/agent", serialized)
+
+    def test_mailbox_status_rejects_arguments_and_safely_reports_nonzero_exit(self):
+        runner = MagicMock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=3, stdout="token=secret", stderr="password=hunter2 /var/lib/private"
+        ))
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-mailbox-failure.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        with self.assertRaises(OperationValidationError):
+            registry.execute("mailbox_status", {"unit": "ssh.service"})
+        runner.assert_not_called()
+
+        result = registry.execute("mailbox_status", {})
+        self.assertFalse(result.success)
+        self.assertEqual(result.exit_code, 3)
+        serialized = json.dumps(result.to_dict())
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("hunter2", serialized)
+        self.assertNotIn("/var/lib", serialized)
+        self.assertIn("nexus-mailbox.service", serialized)
+        self.assertIn("nexus-mailbox.timer", serialized)
 
     def test_invalid_operation_string_is_rejected_without_execution(self):
         with self.assertRaises(OperationValidationError):
