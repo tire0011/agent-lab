@@ -2,6 +2,7 @@ import json
 import os
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock
 
@@ -11,7 +12,12 @@ from fastapi.testclient import TestClient
 
 import data_sources
 import api
-from api import get_codex_service, get_mailbox_task_service
+from api import (
+    get_codex_service,
+    get_experiment_adoption_service,
+    get_mailbox_task_service,
+    get_operations_service,
+)
 
 
 def _mock_codex_service():
@@ -29,12 +35,36 @@ def _mock_mailbox_task_service():
     return svc
 
 
+def _mock_adoption_service():
+    svc = MagicMock()
+    svc.recover_after_restart.return_value = []
+    svc.get.return_value = MagicMock(to_dict=lambda: {
+        "id": None,
+        "experiment_id": "exp-1",
+        "status": "not_started",
+        "target_branch": "main",
+        "expected_files": [],
+        "actual_files": [],
+        "test_output_lines": [],
+        "local_sync_pending": False,
+    })
+    return svc
+
+
+def _mock_operations_service():
+    svc = MagicMock()
+    svc.catalog.return_value = []
+    return svc
+
+
 class ApiTestsBase(unittest.TestCase):
     def setUp(self) -> None:
         # Override heavy singletons so tests never touch the production DB
         # or spawn background workers.
         api.app.dependency_overrides[get_codex_service] = _mock_codex_service
         api.app.dependency_overrides[get_mailbox_task_service] = _mock_mailbox_task_service
+        api.app.dependency_overrides[get_experiment_adoption_service] = _mock_adoption_service
+        api.app.dependency_overrides[get_operations_service] = _mock_operations_service
 
         self.client = TestClient(api.app)
         self.temp_dir = TemporaryDirectory()
@@ -396,6 +426,124 @@ class ConsistencyTests(ApiTestsBase):
 
         self.assertEqual(ideas_response["count"], 1)
         self.assertIn(ideas_response["ideas"][0]["text"], chat_response["reply"])
+
+
+class AdoptionAndOperationsEndpointTests(ApiTestsBase):
+    HEADERS = {"x-api-key": "test-key"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        from modules.experiment_service import ExperimentNotFoundError
+
+        self.experiment = MagicMock()
+        self.experiment.id = "3ef5b935abcd1234"
+        self.experiment.to_dict.return_value = {
+            "id": self.experiment.id,
+            "goal": "Goal",
+            "status": "succeeded",
+            "created_at": "2026-08-14T12:00:00Z",
+            "quality_evaluation": {"outcome": "pass"},
+        }
+        self.experiment_service = MagicMock()
+        self.experiment_service.resolve_experiment.return_value = self.experiment
+        api.app.dependency_overrides[api.get_experiment_service] = lambda: self.experiment_service
+
+        self.adoption_state = {
+            "id": "row1",
+            "experiment_id": self.experiment.id,
+            "status": "queued",
+            "target_branch": "main",
+            "expected_files": ["app.py"],
+            "actual_files": ["app.py"],
+            "test_output_lines": [],
+            "local_sync_pending": False,
+        }
+        self.adoption_service = MagicMock()
+        self.adoption_service.get.return_value = SimpleNamespace(to_dict=lambda: dict(self.adoption_state), status="queued")
+        self.adoption_service.start_adoption.return_value = SimpleNamespace(to_dict=lambda: dict(self.adoption_state), status="queued")
+        api.app.dependency_overrides[api.get_experiment_adoption_service] = lambda: self.adoption_service
+
+        self.operations_service = MagicMock()
+        self.operations_service.catalog.return_value = [
+            SimpleNamespace(to_dict=lambda: {
+                "operation": "git log",
+                "description": "History",
+                "arguments": [{"name": "limit", "type": "integer", "description": "Max", "required": False, "default": 10, "minimum": 1, "maximum": 100}],
+            })
+        ]
+        self.operations_service.execute.return_value = SimpleNamespace(to_dict=lambda: {
+            "operation": "git log",
+            "success": True,
+            "output_lines": ["abc init"],
+            "duration_ms": 5,
+            "exit_code": 0,
+            "error_summary": None,
+        })
+        api.app.dependency_overrides[api.get_operations_service] = lambda: self.operations_service
+
+    def test_post_adopt_requires_api_key(self):
+        response = self.client.post(f"/experiments/{self.experiment.id}/adopt")
+        self.assertEqual(response.status_code, 401)
+
+    def test_post_adopt_resolves_prefix_and_returns_202(self):
+        response = self.client.post(f"/experiments/{self.experiment.id[:8]}/adopt", headers=self.HEADERS)
+        self.assertEqual(response.status_code, 202)
+        self.experiment_service.resolve_experiment.assert_called_with(self.experiment.id[:8])
+        self.adoption_service.start_adoption.assert_called_with(self.experiment.id)
+        self.assertEqual(response.json()["status"], "queued")
+
+    def test_post_adopt_maps_conflicts_to_409(self):
+        from modules.experiment_adoption_service import ExperimentAdoptionError
+
+        self.adoption_service.start_adoption.side_effect = ExperimentAdoptionError("conflict")
+        response = self.client.post(f"/experiments/{self.experiment.id}/adopt", headers=self.HEADERS)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "conflict")
+
+    def test_get_adoption_returns_default_or_existing_state(self):
+        self.adoption_service.get.return_value = SimpleNamespace(to_dict=lambda: {
+            "id": None,
+            "experiment_id": self.experiment.id,
+            "status": "not_started",
+            "target_branch": "main",
+            "expected_files": [],
+            "actual_files": [],
+            "test_output_lines": [],
+            "local_sync_pending": False,
+        })
+        response = self.client.get(f"/experiments/{self.experiment.id[:8]}/adoption", headers=self.HEADERS)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "not_started")
+
+    def test_get_experiment_embeds_adoption_when_present(self):
+        response = self.client.get(f"/experiments/{self.experiment.id}", headers=self.HEADERS)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["adoption"]["status"], "queued")
+
+    def test_operations_catalog_and_execute_require_allowlisted_models(self):
+        catalog = self.client.get("/operations/catalog", headers=self.HEADERS)
+        self.assertEqual(catalog.status_code, 200)
+        self.assertEqual(catalog.json()["count"], 1)
+        execute = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git log", "args": {"limit": 5}})
+        self.assertEqual(execute.status_code, 200)
+        self.operations_service.execute.assert_called_with("git log", {"limit": 5})
+        self.assertEqual(execute.json()["output_lines"], ["abc init"])
+
+    def test_operations_execute_maps_validation_errors_to_400(self):
+        from modules.operations_registry import OperationValidationError
+
+        self.operations_service.execute.side_effect = OperationValidationError("bad op")
+        response = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git log", "args": {}})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "bad op")
+
+    def test_web_assets_contain_operations_tab_and_no_innerhtml(self):
+        html = self.client.get("/").text
+        js = self.client.get("/static/app.js").text
+        self.assertIn('data-tab="operations"', html)
+        self.assertIn('id="tab-operations"', html)
+        self.assertIn("loadOperationsCatalog", js)
+        self.assertNotIn("innerHTML", js)
 
 
 if __name__ == "__main__":

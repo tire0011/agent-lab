@@ -8,6 +8,8 @@ const API_KEY_STORAGE_KEY = "agentLabApiKey";
 
 const state = {
   apiKey: null,
+  operationsCatalog: [],
+  operationsHistory: [],
 };
 
 function authHeaders() {
@@ -55,7 +57,7 @@ function showError(container, message) {
 /**
  * Render a list of items as mobile-friendly "cards": a title line plus an
  * optional list of meta lines. Every value is set via textContent, never
- * innerHTML, so nothing from the API can inject markup.
+ * HTML injection APIs, so nothing from the API can inject markup.
  */
 function renderCardList(container, items, emptyMessage, buildCard) {
   container.replaceChildren();
@@ -114,6 +116,7 @@ function activateTab(name) {
   }
   if (name === "tasks") loadTaskApprovals();
   if (name === "mailbox") loadMailboxMessages();
+  if (name === "operations") loadOperationsCatalog();
   if (name === "logs") {
     loadLogsExperimentOptions();
     loadLogs();
@@ -146,6 +149,7 @@ function onApiKeyChanged() {
   // Re-load anything that behaves differently with/without a key.
   refreshIdeas();
   if (!document.querySelector("#tab-tasks").hidden) loadTaskApprovals();
+  if (!document.querySelector("#tab-operations").hidden) loadOperationsCatalog();
   if (!document.querySelector("#tab-logs").hidden) loadLogs();
 }
 
@@ -417,6 +421,91 @@ const taskElements = {
   detailClose: document.querySelector("#task-detail-close"),
 };
 
+const taskState = {
+  currentExperimentId: null,
+  adoptionTimer: null,
+  adoptionUi: null,
+};
+
+function stopAdoptionPolling() {
+  if (!taskState.adoptionTimer) return;
+  clearInterval(taskState.adoptionTimer);
+  taskState.adoptionTimer = null;
+}
+
+function startAdoptionPolling(experimentId) {
+  stopAdoptionPolling();
+  taskState.adoptionTimer = setInterval(async () => {
+    if (taskState.currentExperimentId !== experimentId || !state.apiKey) {
+      stopAdoptionPolling();
+      return;
+    }
+    try {
+      const adoption = await requestJson(`/experiments/${encodeURIComponent(experimentId)}/adoption`, { headers: authHeaders() });
+      updateAdoptionUi(adoption);
+      if (["adopted", "needs_review", "failed", "interrupted"].includes(adoption.status)) {
+        stopAdoptionPolling();
+      }
+    } catch {
+      stopAdoptionPolling();
+    }
+  }, 5000);
+}
+
+function adoptionSummary(adoption) {
+  if (!adoption) return "Noch nicht gestartet.";
+  const parts = [`Status: ${adoption.status || "not_started"}`];
+  if (adoption.integrated_commit_sha) parts.push(`Integrations-Commit: ${adoption.integrated_commit_sha.slice(0, 8)}`);
+  if (adoption.experiment_commit_sha) parts.push(`Experiment-Commit: ${adoption.experiment_commit_sha.slice(0, 8)}`);
+  if (adoption.test_exit_code !== null && adoption.test_exit_code !== undefined) parts.push(`Tests: Exit-Code ${adoption.test_exit_code}`);
+  return parts.join(" · ");
+}
+
+function updateAdoptionUi(adoption) {
+  const ui = taskState.adoptionUi;
+  if (!ui) return;
+  const status = adoption && adoption.status ? adoption.status : "not_started";
+  ui.status.textContent = adoptionSummary(adoption);
+  ui.reason.textContent = adoption && adoption.reason ? adoption.reason : "";
+  ui.files.textContent = adoption && adoption.actual_files && adoption.actual_files.length
+    ? `Dateien: ${adoption.actual_files.join(", ")}`
+    : ui.defaultFiles;
+  ui.localSync.textContent = adoption && adoption.local_sync_pending
+    ? "Lokale Synchronisierung ausstehend."
+    : "";
+  ui.button.disabled = ["queued", "adopting"].includes(status);
+  if (status === "adopted") ui.button.textContent = "Übernommen";
+  else if (["queued", "adopting"].includes(status)) ui.button.textContent = "Übernahme läuft …";
+  else ui.button.textContent = "Experiment übernehmen";
+}
+
+async function triggerAdoption(experiment) {
+  const files = (experiment.quality_evaluation && experiment.quality_evaluation.changed_files) || [];
+  const targetBranch = (experiment.adoption && experiment.adoption.target_branch) || "main";
+  const confirmed = window.confirm(
+    `Experiment ${experiment.id}
+Zielbranch: ${targetBranch}
+Dateien: ${files.join(", ") || "–"}
+
+Jetzt übernehmen?`
+  );
+  if (!confirmed) return;
+  taskState.adoptionUi.button.disabled = true;
+  taskState.adoptionUi.button.textContent = "Übernahme läuft …";
+  try {
+    const adoption = await requestJson(`/experiments/${encodeURIComponent(experiment.id)}/adopt`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+    updateAdoptionUi(adoption);
+    startAdoptionPolling(experiment.id);
+  } catch (error) {
+    taskState.adoptionUi.button.disabled = false;
+    taskState.adoptionUi.button.textContent = "Experiment übernehmen";
+    window.alert(error.message);
+  }
+}
+
 async function loadTaskApprovals() {
   if (!state.apiKey) {
     taskElements.content.textContent = "Bitte oben den API-Key eingeben, um Aufträge zu sehen.";
@@ -534,6 +623,8 @@ async function renderTaskApprovals(tasks) {
 }
 
 async function showExperimentDetail(experimentId) {
+  stopAdoptionPolling();
+  taskState.currentExperimentId = experimentId;
   taskElements.detailSection.hidden = false;
   taskElements.detailContent.textContent = "Wird geladen …";
   const exp = await fetchExperimentSummary(experimentId);
@@ -550,9 +641,7 @@ async function showExperimentDetail(experimentId) {
     ["Geänderte Dateien", (exp.changed_files || []).join(", ") || "–"],
   ];
   if (exp.policy_rule) lines.push(["Regel", exp.policy_rule]);
-  if (exp.failure_reason || exp.rejection_reason) {
-    lines.push(["Hinweis", exp.failure_reason || exp.rejection_reason]);
-  }
+  if (exp.failure_reason || exp.rejection_reason) lines.push(["Hinweis", exp.failure_reason || exp.rejection_reason]);
   if (exp.test_command) {
     const cmd = Array.isArray(exp.test_command) ? exp.test_command.join(" ") : exp.test_command;
     lines.push(["Testbefehl", cmd]);
@@ -567,10 +656,47 @@ async function showExperimentDetail(experimentId) {
     dl.append(dt, dd);
   }
   taskElements.detailContent.append(dl);
+
+  const canAdopt = Boolean(
+    state.apiKey && exp.status === "succeeded" && exp.quality_evaluation && exp.quality_evaluation.outcome === "pass"
+  );
+  if (canAdopt) {
+    const box = document.createElement("section");
+    box.className = "adoption-box";
+    const title = document.createElement("h3");
+    title.textContent = "Übernahme";
+    const status = document.createElement("p");
+    const files = document.createElement("p");
+    const reason = document.createElement("p");
+    reason.className = "muted";
+    const localSync = document.createElement("p");
+    localSync.className = "muted";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Experiment übernehmen";
+    button.addEventListener("click", () => triggerAdoption(exp));
+    box.append(title, status, files, reason, localSync, button);
+    taskElements.detailContent.append(box);
+    taskState.adoptionUi = {
+      status,
+      files,
+      reason,
+      localSync,
+      button,
+      defaultFiles: `Dateien: ${((exp.quality_evaluation && exp.quality_evaluation.changed_files) || exp.changed_files || []).join(", ") || "–"}`,
+    };
+    updateAdoptionUi(exp.adoption || { status: "not_started", actual_files: (exp.changed_files || []), target_branch: "main" });
+    if (exp.adoption && ["queued", "adopting"].includes(exp.adoption.status)) startAdoptionPolling(exp.id);
+  } else {
+    taskState.adoptionUi = null;
+  }
 }
 
 taskElements.loadButton.addEventListener("click", loadTaskApprovals);
 taskElements.detailClose.addEventListener("click", () => {
+  stopAdoptionPolling();
+  taskState.currentExperimentId = null;
+  taskState.adoptionUi = null;
   taskElements.detailSection.hidden = true;
   taskElements.detailContent.replaceChildren();
 });
@@ -616,6 +742,104 @@ async function loadMailboxMessages() {
 }
 
 mailboxElements.refreshButton.addEventListener("click", loadMailboxMessages);
+
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+const operationsElements = {
+  refreshButton: document.querySelector("#operations-refresh-button"),
+  form: document.querySelector("#operations-form"),
+  select: document.querySelector("#operations-operation-select"),
+  experimentId: document.querySelector("#operations-experiment-id"),
+  limit: document.querySelector("#operations-limit"),
+  help: document.querySelector("#operations-help"),
+  output: document.querySelector("#operations-output"),
+  status: document.querySelector("#operations-status"),
+  history: document.querySelector("#operations-history"),
+};
+
+function renderOperationsHistory() {
+  renderCardList(operationsElements.history, state.operationsHistory, "Noch keine Operationen.", (li, item) => {
+    addTitle(li, item.operation);
+    addMetaLine(li, `${item.success ? "OK" : "Fehler"} · ${item.duration_ms} ms`);
+    if (item.summary) addMetaLine(li, item.summary);
+  });
+}
+
+function updateOperationsHelp() {
+  const selected = state.operationsCatalog.find((entry) => entry.operation === operationsElements.select.value);
+  if (!selected) {
+    operationsElements.help.textContent = "Keine Operation ausgewählt.";
+    return;
+  }
+  const args = (selected.arguments || []).map((arg) => `${arg.name}${arg.required ? "*" : ""}: ${arg.description}`).join(" · ");
+  operationsElements.help.textContent = `${selected.description}${args ? ` · ${args}` : ""}`;
+}
+
+async function loadOperationsCatalog() {
+  if (!state.apiKey) {
+    operationsElements.help.textContent = "Bitte oben den API-Key eingeben, um Operations zu verwenden.";
+    operationsElements.select.replaceChildren();
+    return;
+  }
+  operationsElements.help.textContent = "Katalog wird geladen …";
+  try {
+    const data = await requestJson("/operations/catalog", { headers: authHeaders() });
+    state.operationsCatalog = data.operations || [];
+    const previous = operationsElements.select.value;
+    operationsElements.select.replaceChildren();
+    for (const entry of state.operationsCatalog) {
+      const option = document.createElement("option");
+      option.value = entry.operation;
+      option.textContent = entry.operation;
+      operationsElements.select.append(option);
+    }
+    if (state.operationsCatalog.some((entry) => entry.operation === previous)) {
+      operationsElements.select.value = previous;
+    }
+    updateOperationsHelp();
+  } catch (error) {
+    operationsElements.select.replaceChildren();
+    operationsElements.help.textContent = error.message;
+  }
+}
+
+operationsElements.select.addEventListener("change", updateOperationsHelp);
+operationsElements.refreshButton.addEventListener("click", loadOperationsCatalog);
+operationsElements.form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const operation = operationsElements.select.value;
+  if (!operation) return;
+  const args = {};
+  const experimentId = operationsElements.experimentId.value.trim();
+  const limit = operationsElements.limit.value.trim();
+  if (experimentId) args.experiment_id = experimentId;
+  if (limit) args.limit = Number(limit);
+  operationsElements.status.textContent = "Läuft …";
+  operationsElements.output.textContent = "Wird ausgeführt …";
+  try {
+    const result = await requestJson("/operations/execute", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ operation, args }),
+    });
+    operationsElements.status.textContent = result.success ? "Fertig" : "Fehler";
+    operationsElements.output.textContent = (result.output_lines || []).join("
+") || (result.error_summary || "Keine Ausgabe.");
+    state.operationsHistory.unshift({
+      operation: result.operation,
+      success: result.success,
+      duration_ms: result.duration_ms,
+      summary: result.error_summary || ((result.output_lines || [])[0] || ""),
+    });
+    state.operationsHistory = state.operationsHistory.slice(0, 10);
+    renderOperationsHistory();
+  } catch (error) {
+    operationsElements.status.textContent = "Fehler";
+    operationsElements.output.textContent = error.message;
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Logs

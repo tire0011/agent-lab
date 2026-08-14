@@ -157,6 +157,68 @@ class MailboxTaskRejectRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+
+
+class ExperimentAdoptionStatus(BaseModel):
+    id: str | None = None
+    experiment_id: str
+    status: str
+    started_at: str | None = None
+    ended_at: str | None = None
+    experiment_commit_sha: str | None = None
+    integrated_commit_sha: str | None = None
+    target_branch: str = "main"
+    expected_files: list[str] = Field(default_factory=list)
+    actual_files: list[str] = Field(default_factory=list)
+    test_exit_code: int | None = None
+    test_output_lines: list[str] = Field(default_factory=list)
+    reason: str | None = None
+    local_sync_pending: bool = False
+    diagnostic_worktree_path: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class OperationsExecuteArgs(BaseModel):
+    experiment_id: str | None = None
+    limit: int | None = None
+
+
+class OperationsExecuteRequest(BaseModel):
+    operation: str = Field(min_length=1, max_length=80)
+    args: OperationsExecuteArgs = Field(default_factory=OperationsExecuteArgs)
+
+
+class OperationArgumentDefinition(BaseModel):
+    name: str
+    type: str
+    description: str
+    required: bool = False
+    default: int | str | None = None
+    minimum: int | None = None
+    maximum: int | None = None
+
+
+class OperationCatalogEntry(BaseModel):
+    operation: str
+    description: str
+    arguments: list[OperationArgumentDefinition] = Field(default_factory=list)
+
+
+class OperationsCatalogResponse(BaseModel):
+    count: int
+    operations: list[OperationCatalogEntry] = Field(default_factory=list)
+
+
+class OperationsExecuteResponse(BaseModel):
+    operation: str
+    success: bool
+    output_lines: list[str] = Field(default_factory=list)
+    duration_ms: int
+    exit_code: int | None = None
+    error_summary: str | None = None
+
+
 class ExperimentSummary(BaseModel):
     """Compact experiment listing shape (omits large text/JSON fields)."""
 
@@ -223,6 +285,7 @@ class ExperimentDetail(BaseModel):
     error: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
+    adoption: ExperimentAdoptionStatus | None = None
 
 
 class ExperimentsResponse(BaseModel):

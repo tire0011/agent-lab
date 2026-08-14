@@ -35,6 +35,7 @@
       <button type="button" role="tab" class="tab-button" data-tab="tasks" aria-selected="false" aria-controls="tab-tasks" id="tabbtn-tasks">Aufträge</button>
       <button type="button" role="tab" class="tab-button" data-tab="mailbox" aria-selected="false" aria-controls="tab-mailbox" id="tabbtn-mailbox">Inbox / Outbox</button>
       <button type="button" role="tab" class="tab-button" data-tab="logs" aria-selected="false" aria-controls="tab-logs" id="tabbtn-logs">Logs</button>
+      <button type="button" role="tab" class="tab-button" data-tab="operations" aria-selected="false" aria-controls="tab-operations" id="tabbtn-operations">Operations</button>
       <button type="button" role="tab" class="tab-button" data-tab="chat" aria-selected="false" aria-controls="tab-chat" id="tabbtn-chat">Chat</button>
     </nav>
 
@@ -205,6 +206,45 @@
             <span id="logs-count" class="count">–</span>
           </div>
           <div id="logs-content" class="list-state" aria-live="polite">Wird geladen …</div>
+        </section>
+      </section>
+
+
+      <!-- ================= Operations ================= -->
+      <section id="tab-operations" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-operations" hidden>
+        <section class="card">
+          <div class="card-heading">
+            <div>
+              <h2>Operations</h2>
+              <p class="muted">Strikte Allowlist ohne freie Shell.</p>
+            </div>
+            <button id="operations-refresh-button" class="secondary" type="button">Katalog laden</button>
+          </div>
+          <form id="operations-form" class="operations-form">
+            <label for="operations-operation-select">Operation</label>
+            <select id="operations-operation-select"></select>
+            <label for="operations-experiment-id">Experiment-ID (optional)</label>
+            <input id="operations-experiment-id" type="text" placeholder="z. B. 3ef5b935">
+            <label for="operations-limit">Limit (optional)</label>
+            <input id="operations-limit" type="number" min="1" max="500" inputmode="numeric" placeholder="z. B. 20">
+            <button id="operations-run-button" type="submit">Ausführen</button>
+          </form>
+          <div id="operations-help" class="muted" aria-live="polite">Katalog wird nach Authentifizierung geladen.</div>
+        </section>
+
+        <section class="card">
+          <div class="card-heading">
+            <h2>Ausgabe</h2>
+            <span id="operations-status" class="muted" aria-live="polite"></span>
+          </div>
+          <pre id="operations-output" class="operations-output">Noch keine Operation ausgeführt.</pre>
+        </section>
+
+        <section class="card">
+          <div class="card-heading">
+            <h2>Verlauf</h2>
+          </div>
+          <div id="operations-history" class="list-state" aria-live="polite">Noch keine Operationen.</div>
         </section>
       </section>
 

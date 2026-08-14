@@ -80,6 +80,42 @@ button.secondary { border: 1px solid var(--border); background: var(--surface); 
 .detail-list dd { margin: 0; overflow-wrap: anywhere; }
 
 .chat-card { margin-top: 0; }
+
+.operations-form {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 10px;
+  align-items: center;
+}
+.operations-form input,
+.operations-form select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+.operations-output {
+  margin: 0;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--message);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+  font-size: .82rem;
+}
+.adoption-box {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.adoption-box h3 {
+  margin: 0 0 10px;
+  font-size: .98rem;
+}
 .messages { min-height: 150px; max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--background); }
 .message { max-width: 82%; padding: 10px 12px; border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message.user { align-self: flex-end; background: var(--accent); color: white; }
@@ -191,6 +227,7 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
   .logs-filters { grid-template-columns: 1fr; }
   .logs-status { align-items: flex-start; flex-direction: column; gap: 4px; }
   .detail-list { grid-template-columns: 1fr; }
+  .operations-form { grid-template-columns: 1fr; }
   .detail-list dd { margin-bottom: 4px; }
   .api-key-form { flex-direction: column; }
   .api-key-form button, .api-key-form input { width: 100%; }

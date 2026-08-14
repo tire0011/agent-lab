@@ -26,7 +26,9 @@ from modules.mailbox_task_service import (
     MailboxTaskService,
     MailboxTaskWorker,
 )
+from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
+from modules.operations_registry import OperationValidationError, OperationsRegistry
 from modules import redaction
 from modules.run_store import calculate_estimated_cost, get_applicable_price
 from models import (
@@ -37,6 +39,7 @@ from models import (
     CodexTaskListResponse,
     CodexTaskResponse,
     CodexTaskSummary,
+    ExperimentAdoptionStatus,
     ExperimentDetail,
     ExperimentLogEntry,
     ExperimentLogsResponse,
@@ -47,6 +50,10 @@ from models import (
     IdeasResponse,
     MailboxMessageEntry,
     MailboxMessagesResponse,
+    OperationCatalogEntry,
+    OperationsCatalogResponse,
+    OperationsExecuteRequest,
+    OperationsExecuteResponse,
     MailboxTaskApproval,
     MailboxTaskApprovalsResponse,
     MailboxTaskRejectRequest,
@@ -115,6 +122,18 @@ def get_mailbox_task_service() -> MailboxTaskService:
     return MailboxTaskService(experiment_service=_resolve_experiment_service())
 
 
+@lru_cache(maxsize=1)
+def get_experiment_adoption_service() -> ExperimentAdoptionService:
+    """Singleton adoption service for the process."""
+    return ExperimentAdoptionService(experiment_service=_resolve_experiment_service())
+
+
+@lru_cache(maxsize=1)
+def get_operations_service() -> OperationsRegistry:
+    """Singleton safe operations registry for the process."""
+    return OperationsRegistry(experiment_service=_resolve_experiment_service())
+
+
 def _resolve_experiment_service() -> ExperimentService:
     override = app.dependency_overrides.get(get_experiment_service)
     if override is not None:
@@ -142,6 +161,13 @@ def _resolve_mailbox_task_service() -> MailboxTaskService:
     return get_mailbox_task_service()
 
 
+def _resolve_experiment_adoption_service() -> ExperimentAdoptionService:
+    override = app.dependency_overrides.get(get_experiment_adoption_service)
+    if override is not None:
+        return override()
+    return get_experiment_adoption_service()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
@@ -149,6 +175,7 @@ async def lifespan(app: FastAPI):
     _resolve_codex_service().mark_interrupted_tasks_failed()
     mts = _resolve_mailbox_task_service()
     mts.recover_after_restart()
+    _resolve_experiment_adoption_service().recover_after_restart()
     worker = MailboxTaskWorker(mts)
     worker.start()
     yield
@@ -526,7 +553,12 @@ def get_experiment(
         experiment = service.resolve_experiment(experiment_id)
     except ExperimentNotFoundError:
         raise HTTPException(status_code=404, detail="experiment not found")
-    return ExperimentDetail(**experiment.to_dict())
+    adoption_service = _resolve_experiment_adoption_service()
+    adoption = adoption_service.get(experiment.id)
+    payload = experiment.to_dict()
+    if adoption.status != "not_started":
+        payload["adoption"] = adoption.to_dict()
+    return ExperimentDetail(**payload)
 
 
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
@@ -568,6 +600,68 @@ def get_experiment_logs(
 
     entries = [ExperimentLogEntry(**entry) for entry in raw_entries]
     return ExperimentLogsResponse(count=len(entries), experiment_id=experiment.id, entries=entries)
+
+
+@app.post("/experiments/{experiment_id}/adopt", response_model=ExperimentAdoptionStatus, status_code=202)
+def adopt_experiment(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+    adoption_service: ExperimentAdoptionService = Depends(get_experiment_adoption_service),
+) -> ExperimentAdoptionStatus:
+    authorize(x_api_key)
+    try:
+        experiment = service.resolve_experiment(experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    try:
+        adoption = adoption_service.start_adoption(experiment.id)
+    except ExperimentAdoptionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    return ExperimentAdoptionStatus(**adoption.to_dict())
+
+
+@app.get("/experiments/{experiment_id}/adoption", response_model=ExperimentAdoptionStatus)
+def get_experiment_adoption(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+    adoption_service: ExperimentAdoptionService = Depends(get_experiment_adoption_service),
+) -> ExperimentAdoptionStatus:
+    authorize(x_api_key)
+    try:
+        experiment = service.resolve_experiment(experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    # Chosen contract: never 404 just because adoption was not started yet.
+    return ExperimentAdoptionStatus(**adoption_service.get(experiment.id).to_dict())
+
+
+@app.get("/operations/catalog", response_model=OperationsCatalogResponse)
+def get_operations_catalog(
+    x_api_key: str | None = Header(default=None),
+    operations_service: OperationsRegistry = Depends(get_operations_service),
+) -> OperationsCatalogResponse:
+    authorize(x_api_key)
+    operations = [OperationCatalogEntry(**entry.to_dict()) for entry in operations_service.catalog()]
+    return OperationsCatalogResponse(count=len(operations), operations=operations)
+
+
+@app.post("/operations/execute", response_model=OperationsExecuteResponse)
+def execute_operation(
+    request: OperationsExecuteRequest,
+    x_api_key: str | None = Header(default=None),
+    operations_service: OperationsRegistry = Depends(get_operations_service),
+) -> OperationsExecuteResponse:
+    authorize(x_api_key)
+    try:
+        result = operations_service.execute(
+            request.operation,
+            request.args.model_dump(exclude_none=True),
+        )
+    except OperationValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return OperationsExecuteResponse(**result.to_dict())
 
 
 _PUBLIC_PHASES = {

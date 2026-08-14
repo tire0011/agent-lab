@@ -215,6 +215,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_experiments_columns(conn)
     _migrate_mailbox_messages_task_body(conn)
     _migrate_mailbox_task_approvals(conn)
+    _migrate_experiment_adoptions(conn)
+    _migrate_operations_audit(conn)
     conn.commit()
     return conn
 
@@ -324,6 +326,62 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             (approval_id, msg_id, task_body, created_by or "", file_path or "",
              received_at or now, now, now),
         )
+
+
+def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
+    """Create experiment_adoptions table (idempotent additive migration)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS experiment_adoptions (
+            id TEXT PRIMARY KEY,
+            experiment_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NULL,
+            ended_at TEXT NULL,
+            experiment_commit_sha TEXT NULL,
+            integrated_commit_sha TEXT NULL,
+            target_branch TEXT NOT NULL DEFAULT 'main',
+            expected_files_json TEXT NULL,
+            actual_files_json TEXT NULL,
+            test_exit_code INTEGER NULL,
+            test_output TEXT NULL,
+            reason TEXT NULL,
+            local_sync_pending INTEGER NOT NULL DEFAULT 0,
+            diagnostic_worktree_path TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(experiment_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_experiment_adoptions_status
+            ON experiment_adoptions(status);
+        CREATE INDEX IF NOT EXISTS idx_experiment_adoptions_experiment_id
+            ON experiment_adoptions(experiment_id);
+        """
+    )
+
+
+def _migrate_operations_audit(conn: sqlite3.Connection) -> None:
+    """Create operations_audit table (idempotent additive migration)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS operations_audit (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            args_json TEXT NULL,
+            success INTEGER NOT NULL CHECK (success IN (0, 1)),
+            duration_ms INTEGER NOT NULL,
+            error_summary TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_operations_audit_timestamp
+            ON operations_audit(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_operations_audit_operation
+            ON operations_audit(operation);
+        """
+    )
+
 
 
 def get_applicable_price(
