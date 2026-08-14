@@ -153,6 +153,10 @@ class MailboxTaskService:
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
+        logger.info(
+            "mailbox_task: received task approval=%s from sender=%s (pending_approval)",
+            approval_id[:8], sender,
+        )
         return _row_to_approval(row)
 
     def get(self, approval_id: str) -> MailboxTaskApproval:
@@ -208,6 +212,7 @@ class MailboxTaskService:
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
+        logger.info("mailbox_task: approval=%s approved", approval_id[:8])
         return _row_to_approval(row)
 
     def reject(self, approval_id: str, reason: str) -> MailboxTaskApproval:
@@ -237,6 +242,7 @@ class MailboxTaskService:
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
+        logger.info("mailbox_task: approval=%s rejected reason=%s", approval_id[:8], reason)
         return _row_to_approval(row)
 
     # ------------------------------------------------------------------
@@ -272,7 +278,25 @@ class MailboxTaskService:
             # Raced; abort the experiment (it's still queued and harmless, but mark it)
             logger.warning("mailbox_task: lost race for approval %s, experiment %s orphaned",
                            approval.id, experiment.id)
+            try:
+                elog = self.experiment_service.get_experiment_logger(experiment.id, mailbox_task_id=approval.id)
+                elog.warning(
+                    "mailbox", "mailbox_task_submit_race_lost",
+                    f"lost race for approval {approval.id[:8]}, experiment orphaned",
+                )
+            except Exception:
+                logger.exception("mailbox_task: failed to log race-lost for approval %s", approval.id)
             return
+
+        try:
+            elog = self.experiment_service.get_experiment_logger(experiment.id, mailbox_task_id=approval.id)
+            elog.info(
+                "mailbox", "mailbox_task_submitted",
+                f"mailbox task approval {approval.id[:8]} submitted as experiment",
+            )
+        except Exception:
+            logger.exception("mailbox_task: failed to log submission for approval %s", approval.id)
+        logger.info("mailbox_task: approval=%s submitted as experiment=%s", approval.id[:8], experiment.id[:8])
 
         # Run experiment in a daemon thread
         def _run():
@@ -314,6 +338,10 @@ class MailboxTaskService:
                             (_STATUS_RUNNING, now, approval.id),
                         )
                         self._conn.commit()
+                    self._log_mailbox_event(
+                        approval, "mailbox", "mailbox_task_running",
+                        f"mailbox task approval {approval.id[:8]} now running (experiment status={exp.status})",
+                    )
             elif exp.status == "succeeded":
                 self._transition_terminal(approval, _STATUS_SUCCEEDED, exp)
             elif exp.status in ("failed", "timed_out"):
@@ -328,6 +356,20 @@ class MailboxTaskService:
                         (_STATUS_RUNNING, now, approval.id),
                     )
                     self._conn.commit()
+                self._log_mailbox_event(
+                    approval, "mailbox", "mailbox_task_running",
+                    f"mailbox task approval {approval.id[:8]} now running (experiment status={exp.status})",
+                )
+
+    def _log_mailbox_event(self, approval: MailboxTaskApproval, phase: str, event: str, message: str, level: str = "info") -> None:
+        """Best-effort mailbox event log into the experiment's JSONL log (never raises)."""
+        if self.experiment_service is None or not approval.experiment_id:
+            return
+        try:
+            elog = self.experiment_service.get_experiment_logger(approval.experiment_id, mailbox_task_id=approval.id)
+            getattr(elog, level)(phase, event, message)
+        except Exception:
+            logger.exception("mailbox_task: failed to log event %s for approval %s", event, approval.id)
 
     def _transition_terminal(self, approval: MailboxTaskApproval, new_status: str, exp) -> None:
         now = _now_iso()
@@ -347,6 +389,12 @@ class MailboxTaskService:
                  approval.id),
             )
             self._conn.commit()
+
+        self._log_mailbox_event(
+            approval, "mailbox", "mailbox_task_terminal",
+            f"mailbox task approval {approval.id[:8]} reached terminal status={new_status}; {result_summary}",
+            level="warning" if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW) else "info",
+        )
 
         if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW):
             self._write_problem(approval, new_status, result_summary, exp)
@@ -385,9 +433,18 @@ class MailboxTaskService:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(content, encoding="utf-8")
             tmp.rename(path)
+            self._log_mailbox_event(
+                approval, "mailbox", "outbox_written",
+                f"outbox file {filename} written for approval {approval.id[:8]} (status={status})",
+            )
             return filename
         except Exception:
             logger.exception("mailbox_task: failed to write outbox for approval %s", approval.id)
+            self._log_mailbox_event(
+                approval, "mailbox", "outbox_write_failed",
+                f"failed to write outbox for approval {approval.id[:8]}",
+                level="error",
+            )
             return None
 
     def _write_problem(self, approval: MailboxTaskApproval, status: str, summary: str, exp) -> None:
@@ -404,8 +461,18 @@ class MailboxTaskService:
                 "response": f"ERROR: task approval {approval.id[:8]} ended with status={status}; {summary}",
             }
             filename.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self._log_mailbox_event(
+                approval, "mailbox", "problem_file_written",
+                f"problem file written for approval {approval.id[:8]} (status={status})",
+                level="warning",
+            )
         except Exception:
             logger.exception("mailbox_task: failed to write problem for approval %s", approval.id)
+            self._log_mailbox_event(
+                approval, "mailbox", "problem_write_failed",
+                f"failed to write problem file for approval {approval.id[:8]}",
+                level="error",
+            )
 
     def recover_after_restart(self) -> None:
         """On startup: advance state machine for non-terminal approvals."""

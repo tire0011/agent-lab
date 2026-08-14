@@ -19,11 +19,20 @@ import re
 _SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)(\s*[:=]\s*|\s+)\S+"
 )
+# Two additional secret shapes that the generic keyword-based pattern above
+# does not fully cover on its own: an HTTP "Bearer <token>" credential (the
+# keyword pattern only consumes the single word "Bearer", leaving the actual
+# token exposed) and bare OpenAI-style "sk-..." API keys that can appear
+# without a preceding keyword at all (e.g. copy-pasted into a prompt).
+_BEARER_PATTERN = re.compile(r"(?i)bearer\s+\S+")
+_SK_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9]{10,}")
 _PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
 
 
 def redact(text: str) -> str:
     """Scrub secret-shaped substrings and absolute filesystem paths."""
+    text = _BEARER_PATTERN.sub("[REDACTED]", text)
+    text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
     text = _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
     text = _PATH_PATTERN.sub("[PATH]", text)
     return text

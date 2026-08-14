@@ -381,3 +381,36 @@ class MailboxMessagesResponse(BaseModel):
     inbox: list[MailboxMessageEntry] = Field(default_factory=list)
     outbox: list[MailboxMessageEntry] = Field(default_factory=list)
 
+
+class ExperimentLogEntry(BaseModel):
+    """One structured, defensively re-sanitized line from an experiment's
+    JSONL log (``state/experiment-logs/<experiment_id>.jsonl``). Explicit
+    allowlist only - never a generic serialization of the raw log dict, so
+    an unexpected/legacy field written by an older logger version cannot
+    leak into the API response."""
+
+    timestamp: str
+    level: str
+    logger: str
+    message: str | None = None
+    experiment_id: str
+    mailbox_task_id: str | None = None
+    phase: str
+    event: str
+    duration_ms: int | None = None
+    command: str | None = None
+    cwd: str | None = None
+    exit_code: int | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    exception_type: str | None = None
+    exception_message: str | None = None
+    stacktrace: str | None = None
+    truncated: bool | None = None
+
+
+class ExperimentLogsResponse(BaseModel):
+    count: int
+    experiment_id: str
+    entries: list[ExperimentLogEntry] = Field(default_factory=list)
+

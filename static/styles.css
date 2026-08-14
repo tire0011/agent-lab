@@ -144,6 +144,35 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
   background: var(--surface); color: var(--text); font: inherit; width: 100%;
 }
 
+.log-entry { padding: 10px 0; border-top: 1px solid var(--border); }
+.log-entry:first-child { padding-top: 0; border-top: 0; }
+.log-entry-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  cursor: pointer; background: none; border: none; padding: 0; width: 100%;
+  text-align: left; font: inherit; color: inherit;
+}
+.log-level {
+  flex: none; border-radius: 999px; padding: 2px 9px; font-size: .72rem;
+  font-weight: 700; letter-spacing: .02em; text-transform: uppercase;
+}
+.log-level-debug { color: #4b5768; background: #e7ebf0; }
+.log-level-info { color: var(--good); background: var(--good-bg); }
+.log-level-warning { color: var(--pending); background: var(--pending-bg); }
+.log-level-error { color: var(--bad); background: var(--bad-bg); }
+.log-entry-time { color: var(--muted); font-size: .78rem; white-space: nowrap; }
+.log-entry-phase { color: var(--accent); font-size: .8rem; font-weight: 600; }
+.log-entry-message { flex: 1 1 100%; overflow-wrap: anywhere; font-size: .92rem; }
+.log-entry-toggle { margin-left: auto; color: var(--muted); font-size: .8rem; flex: none; }
+.log-entry-details {
+  margin-top: 8px; padding: 10px 12px; border-radius: 10px; background: var(--message);
+  font-size: .82rem;
+}
+.log-entry-details dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 4px 10px; }
+.log-entry-details dt { color: var(--muted); }
+.log-entry-details dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-family: ui-monospace, monospace; }
+.log-entry-details[hidden] { display: none; }
+.log-entry-truncated { color: var(--pending); font-size: .75rem; margin-top: 4px; }
+
 @media (max-width: 640px) {
   .page-header, .api-key-card, .tabs, main { width: min(100% - 24px, 1040px); }
   .page-header { align-items: flex-end; padding-top: 16px; }
@@ -159,6 +188,8 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
   .detail-list dd { margin-bottom: 4px; }
   .api-key-form { flex-direction: column; }
   .api-key-form button, .api-key-form input { width: 100%; }
+  .log-entry-details dl { grid-template-columns: 1fr; }
+  .log-entry-details dt { margin-top: 6px; }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -178,4 +209,5 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
     --pending-bg: #3e3619;
     --message: #26313e;
   }
+  .log-level-debug { color: #c4cbd4; background: #2b323c; }
 }

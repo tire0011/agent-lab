@@ -52,6 +52,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -59,6 +60,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.codex_worker import CodexResult, CodexWorker
+from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
 
@@ -71,6 +73,12 @@ logger = logging.getLogger(__name__)
 _WARNING_STATUSES = frozenset(
     {"rejected", "failed", "timed_out", "needs_review"}
 )
+
+# Subset of the above that represents an actual failure (as opposed to a
+# policy rejection or a review handoff) — logged at ERROR in the
+# structured per-experiment JSONL log (journald keeps the coarser
+# WARNING/INFO split above for backward compatibility).
+_ERROR_STATUSES = frozenset({"failed", "timed_out"})
 
 # ---------------------------------------------------------------------------
 # Status constants — small deterministic state machine.
@@ -1276,16 +1284,38 @@ def _run_git(
     cwd: str,
     timeout: int = 60,
     env: dict[str, str] | None = None,
+    elog: ExperimentLogger | None = None,
+    phase: str = "verification",
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        shell=False,
-        env=env,
-    )
+    command = ["git", *args]
+    started = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        if elog is not None:
+            elog.log_process(
+                phase, "git_command_timeout", f"git {' '.join(args)} timed out",
+                command=command, cwd=cwd,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                timed_out=True, level="ERROR",
+            )
+        raise
+    if elog is not None:
+        elog.log_process(
+            phase, "git_command", f"git {' '.join(args)}",
+            command=command, cwd=cwd,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            exit_code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr,
+        )
+    return proc
 
 
 class ExperimentService:
@@ -1310,6 +1340,7 @@ class ExperimentService:
         max_raw_message_bytes: int = _DEFAULT_MAX_RAW_MESSAGE_BYTES,
         max_diagnostic_log_bytes: int = _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES,
         test_python_executable: str = _DEFAULT_TEST_PYTHON_EXECUTABLE,
+        experiment_log_dir: str | None = None,
     ) -> None:
         """
         Parameters
@@ -1351,6 +1382,11 @@ class ExperimentService:
             *working directory*, never as the source of the interpreter
             or its installed packages. No package is installed and no
             ``.venv`` is copied into the worktree.
+        experiment_log_dir:
+            Directory holding one durable, append-only JSONL log per
+            experiment (``<experiment_log_dir>/<experiment_id>.jsonl``),
+            written via ``modules.experiment_logger.ExperimentLogger``.
+            Defaults to ``<repo_root>/state/experiment-logs``.
         """
         self.selection_worker = selection_worker if selection_worker is not None else CodexWorker(
             allowed_roots=(repo_root,)
@@ -1369,6 +1405,14 @@ class ExperimentService:
         self.max_raw_message_bytes = max_raw_message_bytes
         self.max_diagnostic_log_bytes = max_diagnostic_log_bytes
         self.test_python_executable = test_python_executable
+        # Deliberately *not* derived from ``repo_root``: tests (and some
+        # deployments) point ``repo_root`` at a throwaway git checkout whose
+        # cleanliness is asserted directly, so the log directory must never
+        # live inside it (matching ``modules.run_log``'s plain
+        # ``state/runs`` default, which is likewise independent of any
+        # injected repo path). In production this resolves relative to the
+        # service's working directory (``/agent``).
+        self.experiment_log_dir = experiment_log_dir or DEFAULT_LOG_DIR
 
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
@@ -1415,6 +1459,11 @@ class ExperimentService:
 
         self._implementation_timeout_seconds = timeout_seconds
         logger.info("experiment %s created (status=%s)", experiment_id, STATUS_QUEUED)
+        self.get_experiment_logger(experiment_id).info(
+            STATUS_QUEUED, "experiment_created",
+            f"Experiment created: {goal.strip()}",
+            timeout_seconds=timeout_seconds,
+        )
         return self.get_experiment(experiment_id)
 
     # ------------------------------------------------------------------
@@ -1506,6 +1555,29 @@ class ExperimentService:
             ).fetchone()
         return str(row[0]) if row else None
 
+    def get_experiment_logger(
+        self, experiment_id: str, mailbox_task_id: str | None = None
+    ) -> ExperimentLogger:
+        """Build the (cheap, stateless) structured JSONL logger for one experiment.
+
+        Every caller anywhere in the pipeline — this service, the mailbox
+        approval bridge, or a test — goes through this single factory so
+        every log entry for a given experiment lands in exactly one file
+        (``<experiment_log_dir>/<experiment_id>.jsonl``), regardless of
+        which thread is writing.
+        """
+        if mailbox_task_id is None:
+            mailbox_task_id = self.mailbox_task_id_for_experiment(experiment_id)
+        return ExperimentLogger(
+            experiment_id,
+            mailbox_task_id=mailbox_task_id,
+            log_dir=self.experiment_log_dir,
+        )
+
+    def experiment_log_path(self, experiment_id: str) -> Path:
+        """Path to an experiment's JSONL log file (may not exist yet)."""
+        return Path(self.experiment_log_dir) / f"{experiment_id}.jsonl"
+
     # ------------------------------------------------------------------
     # Internal: status transition helper
     # ------------------------------------------------------------------
@@ -1552,6 +1624,20 @@ class ExperimentService:
                 to_status,
                 f" (policy_rule={fields['policy_rule']})" if fields.get("policy_rule") else "",
             )
+            elog = self.get_experiment_logger(experiment_id)
+            elog_method = (
+                elog.error if to_status in _ERROR_STATUSES
+                else elog.warning if to_status in _WARNING_STATUSES
+                else elog.info
+            )
+            elog_method(
+                to_status, "status_changed",
+                f"Experiment transitioned {from_status} -> {to_status}",
+                from_status=from_status,
+                to_status=to_status,
+                policy_rule=fields.get("policy_rule"),
+                reason=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
+            )
         return moved
 
     def _force_status(self, experiment_id: str, status: str, **fields: Any) -> None:
@@ -1585,6 +1671,19 @@ class ExperimentService:
             status,
             f" (policy_rule={fields['policy_rule']})" if fields.get("policy_rule") else "",
         )
+        elog = self.get_experiment_logger(experiment_id)
+        elog_method = (
+            elog.error if status in _ERROR_STATUSES
+            else elog.warning if status in _WARNING_STATUSES
+            else elog.info
+        )
+        elog_method(
+            status, "status_forced",
+            f"Experiment status forced to {status}",
+            to_status=status,
+            policy_rule=fields.get("policy_rule"),
+            reason=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
+        )
 
     # ------------------------------------------------------------------
     # run_experiment — the whole pipeline, single entry point
@@ -1592,12 +1691,19 @@ class ExperimentService:
 
     def run_experiment(self, experiment_id: str) -> Experiment:
         experiment = self.get_experiment(experiment_id)  # raises if missing
+        elog = self.get_experiment_logger(experiment_id)
 
         if experiment.status != STATUS_QUEUED:
+            elog.warning(
+                experiment.status, "run_experiment_rejected",
+                f"run_experiment called but experiment is not queued (status={experiment.status})",
+            )
             raise ExperimentNotRunnableError(
                 f"experiment {experiment_id!r} cannot be started from status "
                 f"{experiment.status!r} (only {STATUS_QUEUED!r} experiments can run)"
             )
+
+        elog.info(STATUS_QUEUED, "run_experiment_started", "Experiment pipeline starting")
 
         moved = self._transition(
             experiment_id, STATUS_QUEUED, STATUS_SELECTING,
@@ -1606,6 +1712,10 @@ class ExperimentService:
         if not moved:
             # Raced with another start attempt; refuse rather than double-run.
             current = self.get_experiment(experiment_id)
+            elog.warning(
+                current.status, "run_experiment_race_lost",
+                f"run_experiment lost a race; experiment already status={current.status}",
+            )
             raise ExperimentNotRunnableError(
                 f"experiment {experiment_id!r} cannot be started from status "
                 f"{current.status!r} (only {STATUS_QUEUED!r} experiments can run)"
@@ -1614,6 +1724,11 @@ class ExperimentService:
         try:
             return self._run_pipeline(experiment_id)
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
+            elog.error(
+                "pipeline", "unhandled_exception",
+                "Unhandled exception in experiment pipeline; forcing status=failed",
+                exc=exc,
+            )
             self._force_status(
                 experiment_id,
                 STATUS_FAILED,
@@ -1624,8 +1739,10 @@ class ExperimentService:
 
     def _run_pipeline(self, experiment_id: str) -> Experiment:
         experiment = self.get_experiment(experiment_id)
+        elog = self.get_experiment_logger(experiment_id)
 
         # ---- Phase 1: research (read-only, free-form, tools allowed) -----
+        elog.info("research", "research_started", "Starting research phase (read-only)")
         research_started_at = _utcnow_iso()
         research_prompt = _build_research_prompt(experiment.goal)
         research_task_id = uuid.uuid4().hex
@@ -1634,6 +1751,8 @@ class ExperimentService:
             working_dir=self.repo_root,
             sandbox="read-only",
             timeout_seconds=_DEFAULT_RESEARCH_TIMEOUT_SECONDS,
+            experiment_logger=elog,
+            phase="research",
         )
 
         research_fields = dict(
@@ -1671,6 +1790,11 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         research_summary = research_result.final_message or ""
+        elog.info(
+            "research", "research_completed",
+            "Research phase completed successfully",
+            duration_ms=research_result.runtime_ms,
+        )
 
         # ---- Phase 2: plan (no tools, schema-constrained, isolated) -------
         # The plan-phase worker is scoped to a fresh, empty scratch
@@ -1678,11 +1802,13 @@ class ExperimentService:
         # a shell command, there is no repository content there to
         # research further. The directory is removed again once the plan
         # phase (including its one reformat retry) has finished.
+        elog.debug("selection", "scratch_dir_created", "Creating isolated scratch directory for plan phase")
         Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
         scratch_dir = tempfile.mkdtemp(prefix=f"plan-{experiment_id}-", dir=self.worktrees_root)
         try:
             plan_worker = self.plan_worker_factory(scratch_dir)
 
+            elog.info("selection", "selection_started", "Starting plan selection phase (isolated, tool-less)")
             plan_prompt = _build_plan_prompt(experiment.goal, research_summary)
             selection_task_id = uuid.uuid4().hex
             selection_result: CodexResult = plan_worker.run(
@@ -1692,6 +1818,8 @@ class ExperimentService:
                 timeout_seconds=_DEFAULT_PLAN_TIMEOUT_SECONDS,
                 output_schema=PLAN_JSON_SCHEMA,
                 skip_git_repo_check=True,
+                experiment_logger=elog,
+                phase="selection",
             )
 
             if selection_result.timed_out:
@@ -1733,6 +1861,8 @@ class ExperimentService:
                 return self.get_experiment(experiment_id)
 
             plan = parse_plan(selection_result.final_message)
+            if plan is not None:
+                elog.debug("selection", "plan_parsed", f"Plan parsed successfully: {plan.title}")
             reformat_task_id: str | None = None
             reformat_runtime_ms: int | None = None
             reformat_usage: dict[str, Any] | None = None
@@ -1746,6 +1876,10 @@ class ExperimentService:
             # isolated plan_worker/scratch_dir — it never regains repo
             # access either.
             if plan is None:
+                elog.warning(
+                    "selection", "plan_reformat_retry",
+                    "Plan output could not be parsed; issuing one read-only reformat retry",
+                )
                 reformat_task_id = uuid.uuid4().hex
                 reformat_prompt = _build_reformat_retry_prompt(selection_result.final_message or "")
                 reformat_result: CodexResult = plan_worker.run(
@@ -1755,6 +1889,8 @@ class ExperimentService:
                     timeout_seconds=_REFORMAT_RETRY_TIMEOUT_SECONDS,
                     output_schema=PLAN_JSON_SCHEMA,
                     skip_git_repo_check=True,
+                    experiment_logger=elog,
+                    phase="selection_reformat_retry",
                 )
                 reformat_runtime_ms = reformat_result.runtime_ms
                 reformat_usage = reformat_result.usage
@@ -1804,6 +1940,11 @@ class ExperimentService:
             if rejection_reason is not None and plan is not None and plan.title.strip().upper() != "NONE":
                 # This is specifically a policy violation on an otherwise
                 # valid plan (never a parse failure, never a "NONE" plan).
+                elog.warning(
+                    "selection", "policy_replan_retry",
+                    f"Plan rejected by policy ({rejection_reason}); issuing one policy replan attempt",
+                    policy_rule=_policy_rule_for_reason(rejection_reason),
+                )
                 policy_replan_task_id = uuid.uuid4().hex
                 policy_replan_prompt = _build_policy_replan_prompt(
                     goal=experiment.goal,
@@ -1818,6 +1959,8 @@ class ExperimentService:
                     timeout_seconds=_DEFAULT_PLAN_TIMEOUT_SECONDS,
                     output_schema=PLAN_JSON_SCHEMA,
                     skip_git_repo_check=True,
+                    experiment_logger=elog,
+                    phase="selection_policy_replan",
                 )
                 policy_replan_runtime_ms = policy_replan_result.runtime_ms
                 policy_replan_usage = policy_replan_result.usage
@@ -1907,12 +2050,15 @@ class ExperimentService:
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
 
+        elog.debug("implementation", "worktree_check", f"Creating isolated git worktree at branch {branch_name}")
         try:
             Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
             create_proc = _run_git(
                 ["worktree", "add", "-b", branch_name, worktree_path, "HEAD"],
                 cwd=self.repo_root,
                 timeout=60,
+                elog=elog,
+                phase="implementation",
             )
             if create_proc.returncode != 0:
                 self._force_status(
@@ -1925,6 +2071,10 @@ class ExperimentService:
                 )
                 return self.get_experiment(experiment_id)
         except (OSError, subprocess.SubprocessError) as exc:
+            elog.error(
+                "implementation", "worktree_creation_exception",
+                "Exception while creating git worktree", exc=exc,
+            )
             self._force_status(
                 experiment_id, STATUS_FAILED,
                 ended_at=_utcnow_iso(),
@@ -1933,6 +2083,7 @@ class ExperimentService:
             )
             return self.get_experiment(experiment_id)
 
+        elog.info("implementation", "worktree_created", f"Git worktree created at {branch_name}")
         self._force_status(
             experiment_id, STATUS_IMPLEMENTING,
             worktree_path=worktree_path,
@@ -1940,6 +2091,7 @@ class ExperimentService:
         )
 
         # ---- Phase 3: implementation (workspace-write, worktree only) -----
+        elog.info("implementation", "implementation_started", "Starting implementation phase (workspace-write, worktree only)")
         implementation_prompt = _build_implementation_prompt(plan)
         implementation_task_id = uuid.uuid4().hex
         worker = self.worker_factory(worktree_path)
@@ -1953,6 +2105,8 @@ class ExperimentService:
             working_dir=worktree_path,
             sandbox="workspace-write",
             timeout_seconds=implementation_timeout,
+            experiment_logger=elog,
+            phase="implementation",
         )
 
         if implementation_result.timed_out:
@@ -1991,18 +2145,21 @@ class ExperimentService:
         )
 
         # ---- Phase 4: verification -----------------------------------------
-        return self._verify(experiment_id, worktree_path)
+        elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
+        return self._verify(experiment_id, worktree_path, elog)
 
-    def _verify(self, experiment_id: str, worktree_path: str) -> Experiment:
+    def _verify(self, experiment_id: str, worktree_path: str, elog: ExperimentLogger | None = None) -> Experiment:
+        if elog is None:
+            elog = self.get_experiment_logger(experiment_id)
         try:
-            status_proc = _run_git(["status", "--short"], cwd=worktree_path)
+            status_proc = _run_git(["status", "--short"], cwd=worktree_path, elog=elog, phase="verifying")
             with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
                 index_env = dict(os.environ)
                 index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
                 read_tree_proc = _run_git(
-                    ["read-tree", "HEAD"], cwd=worktree_path, env=index_env
+                    ["read-tree", "HEAD"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying"
                 )
-                add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env)
+                add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying")
                 if read_tree_proc.returncode != 0 or add_proc.returncode != 0:
                     failed_proc = read_tree_proc if read_tree_proc.returncode != 0 else add_proc
                     raise subprocess.CalledProcessError(
@@ -2015,16 +2172,23 @@ class ExperimentService:
                     ["diff", "--cached", "--stat", "HEAD"],
                     cwd=worktree_path,
                     env=index_env,
+                    elog=elog, phase="verifying",
                 )
                 diff_proc = _run_git(
-                    ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env
+                    ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env,
+                    elog=elog, phase="verifying",
                 )
                 check_proc = _run_git(
                     ["diff", "--cached", "--check", "HEAD"],
                     cwd=worktree_path,
                     env=index_env,
+                    elog=elog, phase="verifying",
                 )
         except (OSError, subprocess.SubprocessError) as exc:
+            elog.error(
+                "verifying", "verification_git_exception",
+                "Exception while running verification git commands", exc=exc,
+            )
             self._force_status(
                 experiment_id, STATUS_NEEDS_REVIEW,
                 ended_at=_utcnow_iso(),
@@ -2036,6 +2200,10 @@ class ExperimentService:
         diff_stat = stat_proc.stdout
         diff_text = _truncate_text(diff_proc.stdout, self.max_diff_bytes, label="diff")
         diff_check_issue = check_proc.stdout.strip() or (check_proc.returncode != 0 and check_proc.stderr.strip())
+        if git_status.strip():
+            elog.debug("verifying", "git_status_checked", "Worktree has uncommitted changes as expected")
+        else:
+            elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
         test_command_template = _ALLOWED_TEST_COMMANDS.get(test_command_key)
@@ -2046,6 +2214,10 @@ class ExperimentService:
         )
 
         if test_command is None or not (Path(worktree_path) / "tests").is_dir():
+            elog.warning(
+                "verifying", "no_test_command",
+                "No safe allowlisted test command could be determined for this worktree",
+            )
             self._force_status(
                 experiment_id, STATUS_NEEDS_REVIEW,
                 ended_at=_utcnow_iso(),
@@ -2056,6 +2228,12 @@ class ExperimentService:
             )
             return self.get_experiment(experiment_id)
 
+        elog.info(
+            "verifying", "tests_started",
+            "Running verification test command",
+            command=test_command, cwd=worktree_path,
+        )
+        test_started = time.perf_counter()
         try:
             test_proc = subprocess.run(
                 test_command,
@@ -2067,14 +2245,33 @@ class ExperimentService:
             )
             test_exit_code = test_proc.returncode
             test_output = (test_proc.stdout or "") + (test_proc.stderr or "")
+            elog.log_process(
+                "verifying", "tests_completed",
+                f"Test command finished with exit code {test_exit_code}",
+                command=test_command, cwd=worktree_path,
+                duration_ms=int((time.perf_counter() - test_started) * 1000),
+                exit_code=test_exit_code, stdout=test_proc.stdout, stderr=test_proc.stderr,
+            )
         except subprocess.TimeoutExpired as exc:
             test_exit_code = None
             test_output = (
                 (exc.stdout or "") if isinstance(exc.stdout, str) else ""
             ) + "\n[test command timed out]"
+            elog.log_process(
+                "verifying", "tests_timeout",
+                "Test command timed out",
+                command=test_command, cwd=worktree_path,
+                duration_ms=int((time.perf_counter() - test_started) * 1000),
+                timed_out=True, level="ERROR",
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             test_exit_code = None
             test_output = f"failed to run test command: {exc}"
+            elog.error(
+                "verifying", "tests_exception",
+                "Exception while running test command", exc=exc,
+                command=sanitize_command(test_command), cwd=worktree_path,
+            )
 
         test_output_capped = _truncate_text(test_output, self.max_test_output_bytes, label="test output")
 
@@ -2083,9 +2280,13 @@ class ExperimentService:
         if diff_check_issue:
             final_status = STATUS_NEEDS_REVIEW
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
+            elog.warning("verifying", "diff_check_issue", f"git diff --check reported issues: {diff_check_issue}")
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"
+            elog.error("verifying", "tests_failed", error, exit_code=test_exit_code)
+        else:
+            elog.info("verifying", "tests_passed", "Verification tests passed")
 
         self._force_status(
             experiment_id, final_status,
@@ -2111,12 +2312,16 @@ class ExperimentService:
         kept after an experiment finishes so a human can inspect it. Safe to
         call multiple times.
         """
+        elog = self.get_experiment_logger(experiment_id)
         experiment = self.get_experiment(experiment_id)
+        elog.info("cleanup", "worktree_cleanup_started", "Cleaning up experiment worktree and branch")
         if experiment.worktree_path:
             _run_git(
                 ["worktree", "remove", "--force", experiment.worktree_path],
                 cwd=self.repo_root,
+                elog=elog, phase="cleanup",
             )
             shutil.rmtree(experiment.worktree_path, ignore_errors=True)
         if experiment.branch_name:
-            _run_git(["branch", "-D", experiment.branch_name], cwd=self.repo_root)
+            _run_git(["branch", "-D", experiment.branch_name], cwd=self.repo_root, elog=elog, phase="cleanup")
+        elog.info("cleanup", "worktree_cleanup_done", "Experiment worktree and branch cleanup finished")

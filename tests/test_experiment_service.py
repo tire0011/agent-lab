@@ -2050,5 +2050,158 @@ class PlaceholderPlanPolicyTestCase(unittest.TestCase):
         self.assertIsNotNone(plan_violates_policy(plan, json.dumps(plan.to_dict())))
 
 
+class ExperimentLoggingIntegrationTests(unittest.TestCase):
+    """End-to-end checks that the structured JSONL log written for one
+    experiment actually tells the complete story of that run: success,
+    test failure, an unhandled exception, a timeout, and a plan-reformat
+    retry - and that a logging failure never changes the experiment's
+    resulting status.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo_root = Path(self.tmp.name) / "repo"
+        self.repo_root.mkdir()
+        _init_git_repo(self.repo_root)
+
+        self.worktrees_root = Path(self.tmp.name) / "worktrees"
+        self.db_path = str(Path(self.tmp.name) / "agent.db")
+        self.log_dir = Path(self.tmp.name) / "experiment-logs"
+
+        self.selection_worker = MagicMock()
+        self.selection_worker.run.return_value = _make_result(
+            final_message="Research summary: looked at IDEAS.md and repo layout."
+        )
+        self.plan_worker = MagicMock()
+        self.plan_worker.run.return_value = _make_result()
+
+        self.implementation_worker = MagicMock()
+        self.implementation_worker.run.return_value = _make_result(
+            final_message="implemented", sandbox="workspace-write"
+        )
+
+        self.service = ExperimentService(
+            selection_worker=self.selection_worker,
+            plan_worker_factory=lambda scratch_dir: self.plan_worker,
+            worker_factory=lambda worktree_path: self.implementation_worker,
+            db_path=self.db_path,
+            repo_root=str(self.repo_root),
+            worktrees_root=str(self.worktrees_root),
+            experiment_log_dir=str(self.log_dir),
+        )
+        self.addCleanup(self.service.close)
+
+    def _read_log(self, experiment_id: str) -> list[dict]:
+        path = self.service.experiment_log_path(experiment_id)
+        with open(path, "r", encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_successful_run_is_fully_understandable_from_log_alone(self):
+        experiment = self.service.create_experiment(goal="Add a small docstring test.")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+
+        entries = self._read_log(experiment.id)
+        events = [e["event"] for e in entries]
+        # The whole pipeline - creation, every phase start, worktree
+        # creation, and final success - must be traceable from this one
+        # file, in order.
+        for expected in (
+            "experiment_created", "run_experiment_started", "research_started",
+            "research_completed", "selection_started", "worktree_created",
+            "implementation_started", "tests_passed",
+        ):
+            self.assertIn(expected, events, f"missing {expected!r} in {events!r}")
+        self.assertLess(events.index("research_started"), events.index("selection_started"))
+        self.assertLess(events.index("selection_started"), events.index("implementation_started"))
+        self.assertLess(events.index("implementation_started"), events.index("tests_passed"))
+        for entry in entries:
+            self.assertEqual(entry["experiment_id"], experiment.id)
+
+    def test_test_failure_is_logged_as_error_with_context(self):
+        (self.repo_root / "tests" / "test_placeholder.py").write_text(
+            "import unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_fail(self):\n"
+            "        self.assertTrue(False)\n"
+        )
+        subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.repo_root), "commit", "-q", "-m", "failing test"], check=True)
+
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_FAILED)
+
+        entries = self._read_log(experiment.id)
+        failed = [e for e in entries if e["event"] == "tests_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["level"], "ERROR")
+        self.assertEqual(failed[0]["phase"], "verifying")
+        self.assertIn("exit_code", failed[0])
+        status_change = [e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_FAILED]
+        self.assertTrue(status_change, "expected a status_forced -> failed entry")
+
+    def test_unhandled_exception_is_logged_with_stacktrace(self):
+        self.selection_worker.run.side_effect = RuntimeError("research boom")
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_FAILED)
+
+        entries = self._read_log(experiment.id)
+        exceptions = [e for e in entries if e["event"] == "unhandled_exception"]
+        self.assertEqual(len(exceptions), 1)
+        self.assertEqual(exceptions[0]["level"], "ERROR")
+        self.assertEqual(exceptions[0]["exception_type"], "RuntimeError")
+        self.assertIn("research boom", exceptions[0]["exception_message"])
+        self.assertIn("Traceback", exceptions[0]["stacktrace"])
+
+    def test_timeout_is_logged_distinctly_from_a_hard_failure(self):
+        self.plan_worker.run.return_value = _make_result(
+            timed_out=True, success=False, error="Codex process timed out after 90s"
+        )
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_TIMED_OUT)
+
+        entries = self._read_log(experiment.id)
+        status_events = [e for e in entries if e["event"] == "status_forced"]
+        self.assertTrue(any(e.get("to_status") == STATUS_TIMED_OUT for e in status_events))
+
+    def test_reformat_retry_is_logged_as_warning(self):
+        self.plan_worker.run.side_effect = [
+            _make_result(final_message="not valid json at all"),
+            _make_result(final_message=VALID_PLAN_JSON),
+        ]
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+
+        entries = self._read_log(experiment.id)
+        retries = [e for e in entries if e["event"] == "plan_reformat_retry"]
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0]["level"], "WARNING")
+        self.assertEqual(retries[0]["phase"], "selection")
+
+    def test_logging_failure_never_changes_experiment_status(self):
+        """A broken logger (disk full, permission error, ...) must never
+        affect the actual pipeline outcome - only best-effort logging is
+        skipped."""
+        experiment = self.service.create_experiment(goal="g")
+
+        with patch(
+            "modules.experiment_logger.ExperimentLogger._append",
+            side_effect=OSError("simulated disk failure"),
+        ):
+            result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        # The experiment record itself (in the real DB, not the log) must
+        # still reflect the correct successful outcome despite every log
+        # write having failed.
+        reloaded = self.service.get_experiment(experiment.id)
+        self.assertEqual(reloaded.status, STATUS_SUCCEEDED)
+
+
 if __name__ == "__main__":
     unittest.main()

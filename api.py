@@ -38,6 +38,8 @@ from models import (
     CodexTaskResponse,
     CodexTaskSummary,
     ExperimentDetail,
+    ExperimentLogEntry,
+    ExperimentLogsResponse,
     ExperimentsResponse,
     HealthResponse,
     Idea,
@@ -59,6 +61,7 @@ from models import (
     PublicExperimentSummary,
     StatusResponse,
 )
+from modules import experiment_logger as experiment_logger_module
 
 _PROCESS_START_TIME = time.time()
 
@@ -524,6 +527,47 @@ def get_experiment(
     except ExperimentNotFoundError:
         raise HTTPException(status_code=404, detail="experiment not found")
     return ExperimentDetail(**experiment.to_dict())
+
+
+_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
+
+
+@app.get("/experiments/{experiment_id}/logs", response_model=ExperimentLogsResponse)
+def get_experiment_logs(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    level: str | None = Query(default=None),
+    phase: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ExperimentLogsResponse:
+    """Single, chronological, structured view of one experiment's complete
+    task/experiment run - mailbox approval through research, selection,
+    implementation, verification, and cleanup - reusing the same durable
+    JSONL log written by ``modules.experiment_logger``.
+    """
+    authorize(x_api_key)
+    try:
+        experiment = service.resolve_experiment(experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+
+    if level is not None and level.upper() not in _LOG_LEVELS:
+        raise HTTPException(status_code=400, detail="invalid level filter")
+
+    log_path = service.experiment_log_path(experiment.id)
+    try:
+        raw_entries = experiment_logger_module.read_log_entries(
+            log_path, level=level, phase=phase, limit=limit,
+        )
+    except Exception:
+        # Reading/parsing the log must never surface as a 500 to the
+        # operator - an unreadable log is reported as "no entries yet",
+        # same as a missing file.
+        raw_entries = []
+
+    entries = [ExperimentLogEntry(**entry) for entry in raw_entries]
+    return ExperimentLogsResponse(count=len(entries), experiment_id=experiment.id, entries=entries)
 
 
 _PUBLIC_PHASES = {

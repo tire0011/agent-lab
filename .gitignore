@@ -7,3 +7,4 @@ state/runs/*.json
 state/mailbox.lock
 state/*.db
 state/*.db-*
+state/experiment-logs/*.jsonl

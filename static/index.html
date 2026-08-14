@@ -167,6 +167,28 @@
             <select id="logs-experiment-select">
               <option value="">Alle Experimente</option>
             </select>
+            <label for="logs-level-select">Level</label>
+            <select id="logs-level-select">
+              <option value="">Alle Level</option>
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO">INFO</option>
+              <option value="WARNING">WARNING</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+            <label for="logs-phase-select">Phase</label>
+            <select id="logs-phase-select">
+              <option value="">Alle Phasen</option>
+              <option value="mailbox">mailbox</option>
+              <option value="queued">queued</option>
+              <option value="research">research</option>
+              <option value="selection">selection</option>
+              <option value="selection_reformat_retry">selection_reformat_retry</option>
+              <option value="selection_policy_replan">selection_policy_replan</option>
+              <option value="implementation">implementation</option>
+              <option value="verifying">verifying</option>
+              <option value="cleanup">cleanup</option>
+              <option value="pipeline">pipeline</option>
+            </select>
             <label for="logs-mailbox-task-input">Mailbox-Task-ID</label>
             <input id="logs-mailbox-task-input" type="text" placeholder="z. B. 7ce03cf1…">
           </div>

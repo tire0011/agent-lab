@@ -181,6 +181,8 @@ class CodexWorker:
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
         output_schema: dict | None = None,
         skip_git_repo_check: bool = False,
+        experiment_logger: Any | None = None,
+        phase: str = "codex",
     ) -> CodexResult:
         """Execute *task* non-interactively via ``codex exec``.
 
@@ -215,12 +217,26 @@ class CodexWorker:
             possible). Defaults to ``False`` (preserves prior behavior for
             all existing callers, all of which operate inside the real
             repository or a git worktree).
+        experiment_logger:
+            Optional ``modules.experiment_logger.ExperimentLogger`` (duck
+            typed here to avoid a hard import) used to record this call's
+            start/outcome into the owning experiment's structured JSONL
+            log. Defaults to ``None`` (no experiment-log entries; standalone
+            callers such as the public ``/codex/tasks`` API are unaffected).
+        phase:
+            Label used in log entries when *experiment_logger* is given
+            (e.g. ``"research"``, ``"selection"``, ``"implementation"``).
         """
         timestamp = datetime.now(timezone.utc).isoformat()
 
         try:
             self._validate(task, working_dir, sandbox)
         except WorkerConfigError as exc:
+            if experiment_logger is not None:
+                experiment_logger.error(
+                    phase, "codex_call_invalid_config",
+                    f"Codex call rejected before starting: {exc}",
+                )
             return CodexResult(
                 success=False,
                 exit_code=None,
@@ -247,6 +263,15 @@ class CodexWorker:
                     json.dump(output_schema, f)
 
             cmd = self._build_command(task, working_dir, sandbox, schema_path, skip_git_repo_check)
+
+            if experiment_logger is not None:
+                experiment_logger.debug(
+                    phase, "codex_call_start",
+                    f"Starting Codex call (sandbox={sandbox}, timeout={timeout_seconds}s)",
+                    command=cmd, cwd=working_dir, sandbox=sandbox,
+                    timeout_seconds=timeout_seconds,
+                )
+
             result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox)
         finally:
             if schema_path is not None:
@@ -255,8 +280,50 @@ class CodexWorker:
                 except OSError:
                     pass
 
+        if experiment_logger is not None:
+            self._log_result(experiment_logger, phase, cmd, working_dir, result)
+
         self._audit(result, timestamp)
         return result
+
+    @staticmethod
+    def _log_result(
+        experiment_logger: Any,
+        phase: str,
+        cmd: list[str],
+        working_dir: str,
+        result: "CodexResult",
+    ) -> None:
+        if result.timed_out:
+            experiment_logger.log_process(
+                phase, "codex_call_timeout",
+                f"Codex call timed out after {result.runtime_ms}ms",
+                command=cmd, cwd=working_dir, duration_ms=result.runtime_ms,
+                exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr,
+                timed_out=True, level="ERROR",
+            )
+        elif result.error:
+            experiment_logger.log_process(
+                phase, "codex_call_failed",
+                f"Codex call failed: {result.error}",
+                command=cmd, cwd=working_dir, duration_ms=result.runtime_ms,
+                exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr,
+                level="ERROR",
+            )
+        else:
+            experiment_logger.log_process(
+                phase, "codex_call_completed",
+                f"Codex call completed (success={result.success})",
+                command=cmd, cwd=working_dir, duration_ms=result.runtime_ms,
+                exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr,
+                level="INFO" if result.success else "WARNING",
+            )
+            if result.success:
+                experiment_logger.debug(
+                    phase, "codex_response_validated",
+                    "Codex response received and parsed as JSONL event stream",
+                    thread_id=result.thread_id or "",
+                )
 
     # ------------------------------------------------------------------
     # Validation
