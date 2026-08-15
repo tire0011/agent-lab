@@ -32,12 +32,14 @@ For `agent.py`:
 For API auth in `api.py`:
 
 - `AGENT_API_KEY`
+- `AGENT_GITHUB_WEBHOOK_SECRET` (only required when using `POST /mailbox/webhook/github`)
 
 ## Service behavior
 
 - Public health endpoint: `GET /health`
 - Protected endpoint example: `GET /secure-health` requires `x-api-key` header
 - Task approval endpoints: `GET /mailbox/tasks`, `POST /mailbox/tasks/{id}/approve|reject` — require `x-api-key`
+- GitHub mailbox webhook: `POST /mailbox/webhook/github` — authenticated via `X-Hub-Signature-256`
 - `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for approved tasks to submit
 
 ## Operational checks
