@@ -1055,7 +1055,7 @@ class TestPushErrorRedaction(unittest.TestCase):
             fmt = log_call.args[0] % log_call.args[1:]
             with self.subTest(fragment=fragment):
                 self._check_no_secret(fmt, fragment, "git_push debug log")
-                self.assertIn("[RE", fmt, "Redacted/Remote placeholder absent from debug log")
+                self.assertIn("[REMOTE]", fmt, "REMOTE placeholder absent from debug log")
 
 
 if __name__ == "__main__":
