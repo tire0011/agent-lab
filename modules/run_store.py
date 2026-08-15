@@ -270,6 +270,15 @@ def _migrate_mailbox_messages_chain_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE mailbox_messages ADD COLUMN content_hash TEXT NULL")
 
 
+_MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS = [
+    ("publish_status", "TEXT"),
+    ("publish_commit_sha", "TEXT"),
+    ("publish_pushed_at", "TEXT"),
+    ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("publish_last_error", "TEXT"),
+]
+
+
 def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
     """Create mailbox_task_approvals table and backfill from existing task messages."""
     conn.executescript(
@@ -287,6 +296,11 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             rejection_reason TEXT NULL,
             experiment_id TEXT NULL,
             outbox_file TEXT NULL,
+            publish_status TEXT NULL,
+            publish_commit_sha TEXT NULL,
+            publish_pushed_at TEXT NULL,
+            publish_retry_count INTEGER NOT NULL DEFAULT 0,
+            publish_last_error TEXT NULL,
             result_summary TEXT NULL,
             error TEXT NULL,
             created_at TEXT NOT NULL,
@@ -298,6 +312,14 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_mta_experiment_id ON mailbox_task_approvals(experiment_id);
         """
     )
+    # Additive migration: add publish columns to pre-existing tables that were
+    # created before these columns were introduced.
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(mailbox_task_approvals)")}
+    for column_name, column_type in _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS:
+        if column_name not in existing:
+            conn.execute(
+                f"ALTER TABLE mailbox_task_approvals ADD COLUMN {column_name} {column_type}"
+            )
 
     # Backfill: create pending_approval records for any task messages that
     # don't already have one.

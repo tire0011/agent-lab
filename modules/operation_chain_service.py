@@ -25,6 +25,7 @@ from models import (
     OperationChainStep,
     OperationChainStepResult,
 )
+from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN
 from modules.redaction import bounded_lines, redact
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
@@ -494,13 +495,42 @@ status: {result.overall_status}
 
         content = front_matter + body
         try:
+            # Compute relative path for the publisher.  If the outbox directory
+            # is not under repo_root (e.g. in tests with a temp outbox dir) we
+            # still write the file but skip the publish-lifecycle DB tracking.
+            try:
+                rel_path: str | None = str(filepath.relative_to(self.repo_root))
+            except ValueError:
+                rel_path = None
+
+            if rel_path is not None:
+                # Persist publish intent before the atomic write so that a crash
+                # between write and the second DB update is recoverable.
+                with self._lock:
+                    self._conn.execute(
+                        "UPDATE operation_chains SET outbox_file = ?, publish_status = ?, updated_at = ? WHERE request_id = ?",
+                        (rel_path, PUBLISH_PENDING_WRITE, _now_iso(), result.request_id),
+                    )
+                    self._conn.commit()
+
             _atomic_write(filepath, content)
-            with self._lock:
-                self._conn.execute(
-                    "UPDATE operation_chains SET outbox_file = ?, publish_status = ?, updated_at = ? WHERE request_id = ?",
-                    (str(filepath.relative_to(self.repo_root)), "pending", _now_iso(), result.request_id),
-                )
-                self._conn.commit()
+
+            if rel_path is not None:
+                # Advance to written so the publisher knows the file exists on disk.
+                with self._lock:
+                    self._conn.execute(
+                        "UPDATE operation_chains SET publish_status = ?, updated_at = ? WHERE request_id = ?",
+                        (PUBLISH_WRITTEN, _now_iso(), result.request_id),
+                    )
+                    self._conn.commit()
+            else:
+                # Fallback: store absolute path so callers can still locate the file.
+                with self._lock:
+                    self._conn.execute(
+                        "UPDATE operation_chains SET outbox_file = ?, updated_at = ? WHERE request_id = ?",
+                        (str(filepath), _now_iso(), result.request_id),
+                    )
+                    self._conn.commit()
         except Exception as exc:
             logger.error(f"Failed to write outbox file {filepath}: {exc}")
 

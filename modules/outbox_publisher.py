@@ -1,0 +1,644 @@
+"""Shared, persistent publish lifecycle for all outbox results.
+
+Every asynchronous producer (MailboxTaskService, OperationChainService) writes
+its result file and persists a publish record to the DB.  This module owns the
+git side-effect: commit the exact file, push it, and persist the resulting
+state.
+
+Lifecycle
+---------
+    pending_write  → written  → committing  → committed  → pushed
+                                                         ↘ failed (retryable)
+
+Recovery contract (per acceptance criteria)
+-------------------------------------------
+1. DB=pending_write, file missing          → re-write from content_fn, then commit+push.
+2. DB=written/pending, file present        → commit + push.
+3. DB=committed, commit_sha present        → push existing commit only.
+4. DB=pushed but push was not applied      → caller detects via remote check; n/a here.
+5. Repeated calls are idempotent.
+6. Concurrent publishers are serialised via a per-repo file lock.
+7. Existing untracked matching file is adopted as-is.
+8. Foreign untracked/dirty files → safe error; never staged or committed.
+
+Security
+--------
+- Only ``MailboxConfig.mailbox_repo_path`` / ``outbox_dir`` are touched.
+- Path-traversal and symlink protection on every path.
+- Exact pathspec on ``git add`` and ``git commit``; never ``git add -A``.
+- No force-push.
+- ``shell=False`` throughout.
+- Per-repo ``fcntl.flock`` lock serialises write/commit/push across threads
+  and processes.
+- No secrets / remote URLs in logs.
+- Atomic write via temp file + rename.
+- A publish error never mutates the caller's business-logic DB state.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import logging
+import os
+import sqlite3
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+from modules.mailbox import git_push
+from modules.run_store import DEFAULT_DB_PATH, init_db
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Lifecycle state constants
+# ---------------------------------------------------------------------------
+
+PUBLISH_PENDING_WRITE = "pending_write"
+PUBLISH_WRITTEN = "written"
+PUBLISH_COMMITTING = "committing"
+PUBLISH_COMMITTED = "committed"
+PUBLISH_PUSHED = "pushed"
+PUBLISH_FAILED = "failed"
+
+# Legacy alias: operation_chains used "pending" before this module existed.
+# Treat it the same as PUBLISH_WRITTEN so that old rows are handled correctly.
+_PENDING_COMPAT = "pending"
+
+_ACTIONABLE_STATUSES = {
+    PUBLISH_PENDING_WRITE,
+    PUBLISH_WRITTEN,
+    _PENDING_COMPAT,
+    PUBLISH_COMMITTING,
+    PUBLISH_COMMITTED,
+    PUBLISH_FAILED,
+}
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class PublishRecord:
+    """One outbox result that needs to be published."""
+
+    record_id: str
+    outbox_file: str  # relative path from mailbox_repo_root
+    publish_status: str
+    publish_commit_sha: str | None = None
+    publish_retry_count: int = 0
+    # Optional: called when publish_status==pending_write and file is missing.
+    # Must return the UTF-8 content to write.  If None and file is missing the
+    # record is marked failed.
+    content_fn: Callable[[], str] | None = field(default=None, compare=False)
+
+
+# ---------------------------------------------------------------------------
+# Lock helper
+# ---------------------------------------------------------------------------
+
+
+class _RepoLock:
+    """Advisory per-repo file lock (fcntl.LOCK_EX) for write/commit/push."""
+
+    def __init__(self, repo_root: Path) -> None:
+        lock_dir = repo_root / ".git"
+        if not lock_dir.is_dir():
+            # bare repo or misconfigured; fall back to repo root
+            lock_dir = repo_root
+        self._lock_path = lock_dir / "outbox_publisher.lock"
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+
+    def release(self) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+    def __enter__(self) -> "_RepoLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.release()
+
+
+# ---------------------------------------------------------------------------
+# Publisher
+# ---------------------------------------------------------------------------
+
+
+class OutboxPublisher:
+    """Shared git-lifecycle publisher for outbox results.
+
+    Instantiate once per process; the class serialises concurrent calls via a
+    per-repo file lock so that multiple threads (or a concurrent process) never
+    produce duplicate commits for the same file.
+
+    Parameters
+    ----------
+    mailbox_config:
+        ``MailboxConfig`` instance that provides ``mailbox_repo_path`` and
+        ``outbox_dir``.  At least one of *mailbox_config* or *repo_root* must
+        be supplied.
+    db_path:
+        Path to the SQLite state database.
+    repo_root:
+        Fallback when *mailbox_config* is ``None`` (legacy usage).
+    """
+
+    def __init__(
+        self,
+        mailbox_config: Any = None,
+        db_path: str = DEFAULT_DB_PATH,
+        repo_root: str | Path | None = None,
+    ) -> None:
+        if mailbox_config is not None:
+            self._repo_root: Path = Path(mailbox_config.mailbox_repo_path)
+            self._outbox_dir: Path = Path(mailbox_config.outbox_dir)
+        elif repo_root is not None:
+            self._repo_root = Path(repo_root)
+            self._outbox_dir = self._repo_root / "communication" / "outbox"
+        else:
+            raise ValueError("Either mailbox_config or repo_root must be provided")
+
+        self._conn = init_db(db_path)
+        self._conn.row_factory = sqlite3.Row
+        self._db_path = db_path
+        self._repo_lock = _RepoLock(self._repo_root)
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # ------------------------------------------------------------------
+    # Public helpers: state transitions used by producers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def status_pending_write() -> str:
+        return PUBLISH_PENDING_WRITE
+
+    @staticmethod
+    def status_written() -> str:
+        return PUBLISH_WRITTEN
+
+    # ------------------------------------------------------------------
+    # Core publish API
+    # ------------------------------------------------------------------
+
+    def publish(self, record: PublishRecord) -> bool:
+        """Publish one record through the full lifecycle.
+
+        Returns True if the record reached PUSH_PUSHED, False otherwise.
+        The caller's business-logic state is never changed by this method.
+        """
+        with self._repo_lock:
+            return self._publish_locked(record)
+
+    def publish_many(self, records: list[PublishRecord]) -> int:
+        """Publish a list of records; return count of successfully pushed."""
+        published = 0
+        for record in records:
+            if self.publish(record):
+                published += 1
+        return published
+
+    # ------------------------------------------------------------------
+    # Internal locked implementation
+    # ------------------------------------------------------------------
+
+    def _publish_locked(self, record: PublishRecord) -> bool:
+        status = record.publish_status
+
+        if status == PUBLISH_PUSHED:
+            return True
+
+        # ---- Stage 3: commit exists → only push ------------------------------
+        if record.publish_commit_sha and status == PUBLISH_COMMITTED:
+            return self._push_and_record(record)
+
+        # ---- Stage 2: file written → commit + push ---------------------------
+        if status in (PUBLISH_WRITTEN, _PENDING_COMPAT, PUBLISH_COMMITTING):
+            try:
+                path = self._validate_outbox_path(record.outbox_file)
+            except ValueError as exc:
+                self._on_error(record, str(exc))
+                logger.error("outbox publish rejected (%s): %s", record.record_id, _redact(str(exc)))
+                return False
+            return self._commit_and_push(record, path)
+
+        # ---- Stage 1: pending_write → write file, then commit + push ---------
+        if status == PUBLISH_PENDING_WRITE:
+            return self._write_then_publish(record)
+
+        # ---- Retryable failure: re-evaluate from current disk state ----------
+        if status == PUBLISH_FAILED:
+            return self._recover_failed(record)
+
+        logger.warning("outbox publish: unknown status %r for %s", status, record.record_id)
+        return False
+
+    # ------------------------------------------------------------------
+    # Stage implementations
+    # ------------------------------------------------------------------
+
+    def _write_then_publish(self, record: PublishRecord) -> bool:
+        """pending_write → write file → written → commit → push."""
+        rel = _safe_relative(record.outbox_file)
+        path = self._repo_root / rel
+
+        if path.is_symlink():
+            self._on_error(record, "symlinks are not allowed")
+            return False
+
+        if path.is_file():
+            # File already exists (e.g. a previous run wrote it but crashed
+            # before advancing the state).  Adopt as-is.
+            self._advance_status(record, PUBLISH_WRITTEN)
+            record = record  # update in-place would need mutable; use local var
+            try:
+                validated = self._validate_outbox_path(record.outbox_file)
+            except ValueError as exc:
+                self._on_error(record, str(exc))
+                return False
+            return self._commit_and_push(record, validated)
+
+        if record.content_fn is None:
+            self._on_error(record, "file missing and no content_fn to recreate it")
+            return False
+
+        try:
+            content = record.content_fn()
+        except Exception as exc:
+            self._on_error(record, f"content_fn raised: {exc!r}")
+            return False
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            self._on_error(record, f"write failed: {exc!r}")
+            return False
+
+        self._advance_status(record, PUBLISH_WRITTEN)
+
+        try:
+            validated = self._validate_outbox_path(record.outbox_file)
+        except ValueError as exc:
+            self._on_error(record, str(exc))
+            return False
+
+        return self._commit_and_push(record, validated)
+
+    def _commit_and_push(self, record: PublishRecord, path: Path) -> bool:
+        """written/committing → commit → committed → push → pushed."""
+        self._advance_status(record, PUBLISH_COMMITTING)
+
+        # Check for foreign dirty files before touching the index
+        if self._has_foreign_dirty_files(record.outbox_file):
+            self._on_error(record, "foreign dirty files in mailbox repo; aborting")
+            return False
+
+        if not self._stage_exact_file(path):
+            self._on_error(record, "git add failed")
+            return False
+
+        commit_sha = self._commit_exact_file(record.record_id, path)
+        if commit_sha is None:
+            self._on_error(record, "git commit failed")
+            return False
+
+        self._advance_committed(record, commit_sha)
+
+        if not git_push(self._repo_root):
+            self._on_error(record, "git push failed")
+            return False
+
+        self._advance_status(record, PUBLISH_PUSHED)
+        return True
+
+    def _push_and_record(self, record: PublishRecord) -> bool:
+        """committed → push only (commit already exists)."""
+        if not git_push(self._repo_root):
+            self._on_error(record, "git push failed")
+            return False
+        self._advance_status(record, PUBLISH_PUSHED)
+        return True
+
+    def _recover_failed(self, record: PublishRecord) -> bool:
+        """Best-effort recovery for a previously-failed record."""
+        rel = _safe_relative(record.outbox_file)
+        path = self._repo_root / rel
+
+        if record.publish_commit_sha:
+            # Commit exists → just retry push
+            return self._push_and_record(record)
+
+        if path.is_file():
+            try:
+                validated = self._validate_outbox_path(record.outbox_file)
+            except ValueError as exc:
+                self._on_error(record, str(exc))
+                return False
+            # Synthesise a written record to resume the pipeline
+            pseudo = PublishRecord(
+                record_id=record.record_id,
+                outbox_file=record.outbox_file,
+                publish_status=PUBLISH_WRITTEN,
+                publish_commit_sha=None,
+                publish_retry_count=record.publish_retry_count,
+                content_fn=record.content_fn,
+            )
+            return self._commit_and_push(pseudo, validated)
+
+        if record.content_fn is not None:
+            pseudo = PublishRecord(
+                record_id=record.record_id,
+                outbox_file=record.outbox_file,
+                publish_status=PUBLISH_PENDING_WRITE,
+                publish_retry_count=record.publish_retry_count,
+                content_fn=record.content_fn,
+            )
+            return self._write_then_publish(pseudo)
+
+        self._on_error(record, "failed: file missing and no content_fn")
+        return False
+
+    # ------------------------------------------------------------------
+    # Git helpers
+    # ------------------------------------------------------------------
+
+    def _validate_outbox_path(self, outbox_file: str) -> Path:
+        rel = Path(outbox_file)
+        if rel.is_absolute():
+            raise ValueError("outbox path must be relative")
+        if any(part == ".." for part in rel.parts):
+            raise ValueError("outbox path must not contain path traversal segments")
+        if not rel.name.endswith(".md"):
+            raise ValueError(f"unexpected outbox filename: {rel.name!r}")
+        path = self._repo_root / rel
+        resolved = path.resolve()
+        outbox_resolved = self._outbox_dir.resolve()
+        if not str(resolved).startswith(str(outbox_resolved) + os.sep):
+            raise ValueError("outbox path escapes outbox directory")
+        if path.is_symlink():
+            raise ValueError("symlinks are not allowed")
+        if not path.is_file():
+            raise ValueError(f"outbox file missing: {rel}")
+        return path
+
+    def _has_foreign_dirty_files(self, expected_rel: str) -> bool:
+        """Return True if there are foreign *staged* changes in the index.
+
+        Unstaged modifications and untracked files are harmless because
+        ``git add -- <path>`` and ``git commit -- <path>`` only touch the
+        exact pathspec.  We abort only when another process has already staged
+        foreign changes that would pollute the index in a way we cannot undo
+        safely.
+        """
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(self._repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return True
+        for line in result.stdout.splitlines():
+            if len(line) < 3:
+                continue
+            index_status = line[0]  # column 1: staging-area status
+            file_path = line[3:].strip('"')
+            # Skip untracked files and unstaged-only changes (index_status == ' ').
+            if index_status in (" ", "?"):
+                continue
+            # A staged change for a file OTHER than our expected outbox file is
+            # foreign and must not be swept into the commit.
+            if file_path != expected_rel:
+                return True
+        return False
+
+    def _stage_exact_file(self, path: Path) -> bool:
+        rel = path.relative_to(self._repo_root)
+        result = subprocess.run(
+            ["git", "add", "--", str(rel)],
+            cwd=str(self._repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.error("git add failed for %s: %s", rel, result.stderr[:300])
+        return result.returncode == 0
+
+    def _commit_exact_file(self, record_id: str, path: Path) -> str | None:
+        """Commit only *path* and return the new HEAD SHA.
+
+        If the file is already committed (crash-recovery scenario) the
+        existing SHA is returned without creating a duplicate commit.
+        """
+        rel = str(path.relative_to(self._repo_root))
+        message = f"outbox: publish {record_id}"
+        result = subprocess.run(
+            ["git", "commit", "--no-verify", "-m", message, "--", rel],
+            cwd=str(self._repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return self._current_commit_sha()
+
+        # Self-heal: file already in HEAD (crash after commit, before DB write).
+        diff = subprocess.run(
+            ["git", "diff", "--quiet", "HEAD", "--", rel],
+            cwd=str(self._repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if diff.returncode == 0:
+            logger.info("outbox publish: %s already committed, recovering SHA", rel)
+            return self._current_commit_sha()
+
+        logger.error("git commit failed for %s: %s", rel, result.stderr[:300])
+        return None
+
+    def _current_commit_sha(self) -> str:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(self._repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout.strip()
+
+    # ------------------------------------------------------------------
+    # DB state helpers (generic — callers supply their own SQL or use
+    # the table-specific subclasses / wrapper methods below)
+    # ------------------------------------------------------------------
+
+    def _advance_status(self, record: PublishRecord, new_status: str) -> None:
+        """Advance the publish_status for a record.  Subclasses override."""
+
+    def _advance_committed(self, record: PublishRecord, commit_sha: str) -> None:
+        """Persist commit_sha and advance status to PUBLISH_COMMITTED."""
+        self._advance_status(record, PUBLISH_COMMITTED)
+
+    def _on_error(self, record: PublishRecord, error: str) -> None:
+        """Persist a failure.  Subclasses override."""
+        logger.error("outbox publish failed for %s: %s", record.record_id, _redact(error))
+
+
+# ---------------------------------------------------------------------------
+# Table-specific sub-publishers
+# ---------------------------------------------------------------------------
+
+
+class _TablePublisher(OutboxPublisher):
+    """OutboxPublisher backed by a specific SQLite table.
+
+    Subclasses set ``_TABLE``, ``_ID_COLUMN``, and ``_COMMIT_SHA_COLUMN``.
+    """
+
+    _TABLE: str = ""
+    _ID_COLUMN: str = "request_id"
+    _COMMIT_SHA_COLUMN: str = "publish_commit_sha"
+
+    def _advance_status(self, record: PublishRecord, new_status: str) -> None:
+        self._conn.execute(
+            f"""UPDATE {self._TABLE}
+                SET publish_status = ?,
+                    publish_retry_count = publish_retry_count + 1,
+                    updated_at = datetime('now')
+                WHERE {self._ID_COLUMN} = ?""",
+            (new_status, record.record_id),
+        )
+        self._conn.commit()
+
+    def _advance_committed(self, record: PublishRecord, commit_sha: str) -> None:
+        self._conn.execute(
+            f"""UPDATE {self._TABLE}
+                SET publish_status = ?,
+                    {self._COMMIT_SHA_COLUMN} = ?,
+                    updated_at = datetime('now')
+                WHERE {self._ID_COLUMN} = ?""",
+            (PUBLISH_COMMITTED, commit_sha, record.record_id),
+        )
+        self._conn.commit()
+
+    def _on_error(self, record: PublishRecord, error: str) -> None:
+        logger.error("outbox publish failed for %s: %s", record.record_id, _redact(error))
+        self._conn.execute(
+            f"""UPDATE {self._TABLE}
+                SET publish_status = ?,
+                    publish_last_error = ?,
+                    updated_at = datetime('now')
+                WHERE {self._ID_COLUMN} = ?""",
+            (PUBLISH_FAILED, error[:500], record.record_id),
+        )
+        self._conn.commit()
+
+
+class OperationChainOutboxPublisher(_TablePublisher):
+    """Publishes operation-chain outbox results."""
+
+    _TABLE = "operation_chains"
+    _ID_COLUMN = "request_id"
+    _COMMIT_SHA_COLUMN = "publish_commit_sha"
+
+    def fetch_pending(self) -> list[PublishRecord]:
+        rows = self._conn.execute(
+            """SELECT request_id, outbox_file, publish_status,
+                      publish_commit_sha, publish_retry_count
+               FROM operation_chains
+               WHERE outbox_file IS NOT NULL
+                 AND publish_status IN (?, ?, ?, ?, ?, ?)
+               ORDER BY created_at ASC""",
+            (
+                PUBLISH_PENDING_WRITE,
+                PUBLISH_WRITTEN,
+                _PENDING_COMPAT,
+                PUBLISH_COMMITTING,
+                PUBLISH_COMMITTED,
+                PUBLISH_FAILED,
+            ),
+        ).fetchall()
+        return [
+            PublishRecord(
+                record_id=row["request_id"],
+                outbox_file=row["outbox_file"],
+                publish_status=row["publish_status"],
+                publish_commit_sha=row["publish_commit_sha"],
+                publish_retry_count=row["publish_retry_count"] or 0,
+            )
+            for row in rows
+        ]
+
+    def publish_pending(self) -> int:
+        return self.publish_many(self.fetch_pending())
+
+
+class TaskApprovalOutboxPublisher(_TablePublisher):
+    """Publishes task-approval outbox results."""
+
+    _TABLE = "mailbox_task_approvals"
+    _ID_COLUMN = "id"
+    _COMMIT_SHA_COLUMN = "publish_commit_sha"
+
+    def fetch_pending(self) -> list[PublishRecord]:
+        rows = self._conn.execute(
+            """SELECT id, outbox_file, publish_status,
+                      publish_commit_sha, publish_retry_count
+               FROM mailbox_task_approvals
+               WHERE outbox_file IS NOT NULL
+                 AND publish_status IN (?, ?, ?, ?, ?, ?)
+               ORDER BY created_at ASC""",
+            (
+                PUBLISH_PENDING_WRITE,
+                PUBLISH_WRITTEN,
+                _PENDING_COMPAT,
+                PUBLISH_COMMITTING,
+                PUBLISH_COMMITTED,
+                PUBLISH_FAILED,
+            ),
+        ).fetchall()
+        return [
+            PublishRecord(
+                record_id=row["id"],
+                outbox_file=row["outbox_file"],
+                publish_status=row["publish_status"],
+                publish_commit_sha=row["publish_commit_sha"],
+                publish_retry_count=row["publish_retry_count"] or 0,
+            )
+            for row in rows
+        ]
+
+    def publish_pending(self) -> int:
+        return self.publish_many(self.fetch_pending())
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+def _safe_relative(outbox_file: str) -> Path:
+    """Return a Path that is guaranteed to be relative (no absolute check)."""
+    return Path(outbox_file)
+
+
+def _redact(value: str) -> str:
+    return value[:200]

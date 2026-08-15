@@ -74,7 +74,7 @@ def _insert_chain_row(
 
 
 def _remote_head_content(remote: Path, rel_path: str) -> str:
-    result = _run_git(["show", f"HEAD:{rel_path}"], remote)
+    result = _run_git(["--git-dir", str(remote), "show", f"HEAD:{rel_path}"], remote.parent)
     return result.stdout
 
 
