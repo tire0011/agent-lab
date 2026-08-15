@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from modules.run_store import init_db, DEFAULT_DB_PATH
+from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 
 if TYPE_CHECKING:
     from modules.experiment_service import ExperimentService
@@ -67,6 +68,7 @@ class MailboxTaskApproval:
         "id", "mailbox_msg_id", "task_body", "sender", "file_path",
         "received_at", "status", "approved_at", "rejected_at",
         "rejection_reason", "experiment_id", "outbox_file",
+        "publish_status", "publish_commit_sha",
         "result_summary", "error", "created_at", "updated_at",
     )
 
@@ -83,10 +85,11 @@ def _row_to_approval(row: sqlite3.Row | tuple) -> MailboxTaskApproval:
         "id", "mailbox_msg_id", "task_body", "sender", "file_path",
         "received_at", "status", "approved_at", "rejected_at",
         "rejection_reason", "experiment_id", "outbox_file",
+        "publish_status", "publish_commit_sha",
         "result_summary", "error", "created_at", "updated_at",
     )
     if isinstance(row, sqlite3.Row):
-        return MailboxTaskApproval(**{k: row[k] for k in keys})
+        return MailboxTaskApproval(**{k: row[k] for k in keys if k in row.keys()})
     return MailboxTaskApproval(**dict(zip(keys, row)))
 
 
@@ -110,10 +113,13 @@ class MailboxTaskService:
         if mailbox_config is not None:
             self.outbox_dir = mailbox_config.outbox_dir
             self.repo_path = mailbox_config.code_repo_path
+            self.mailbox_repo_path = Path(mailbox_config.mailbox_repo_path)
         else:
             self.outbox_dir = Path(outbox_dir)
             self.repo_path = Path(repo_path)
+            self.mailbox_repo_path = self.repo_path
         self._lock = threading.Lock()
+        self._repo_lock = RepoLock(self.mailbox_repo_path)
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -379,17 +385,19 @@ class MailboxTaskService:
     def _transition_terminal(self, approval: MailboxTaskApproval, new_status: str, exp) -> None:
         now = _now_iso()
         result_summary = self._make_result_summary(exp)
-        outbox_file = self._write_outbox(approval, new_status, exp, result_summary)
+        # _write_outbox sets outbox_file and publish_status in the DB itself
+        # so that the publish lifecycle (pending_write → written) is persisted
+        # before the business-status transition.
+        self._write_outbox(approval, new_status, exp, result_summary)
 
         with self._lock:
             self._conn.execute(
                 """UPDATE mailbox_task_approvals
-                   SET status=?, result_summary=?, error=?, outbox_file=?, updated_at=?
+                   SET status=?, result_summary=?, error=?, updated_at=?
                    WHERE id=?""",
                 (new_status,
                  result_summary,
                  _safe_error(exp.error) if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW) else None,
-                 outbox_file,
                  now,
                  approval.id),
             )
@@ -413,6 +421,23 @@ class MailboxTaskService:
         return "; ".join(parts)
 
     def _write_outbox(self, approval: MailboxTaskApproval, status: str, exp, summary: str) -> str | None:
+        """Write the outbox result file using the persistent publish lifecycle.
+
+        Persists ``outbox_content`` + ``publish_status=pending_write`` (+ ``outbox_file``)
+        before the atomic write so that ``TaskApprovalOutboxPublisher`` can
+        reconstruct the file from the DB if the process crashes after the DB
+        write but before the file write completes.  Advances to
+        ``publish_status=written`` on success.  The actual git commit/push is
+        handled by ``TaskApprovalOutboxPublisher.publish_pending()``.
+
+        The entire write (DB intent → file write → DB confirmation) is wrapped
+        in the per-repo ``RepoLock`` so that the publisher's own lock and the
+        write path share the same ``fcntl.flock`` serialisation, also across
+        processes.
+
+        Returns the relative outbox path (from mailbox_repo_root) on success,
+        or None on failure.
+        """
         try:
             self.outbox_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -435,14 +460,40 @@ class MailboxTaskService:
                 f"**Summary:** {summary}\n"
             )
             path = self.outbox_dir / filename
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.rename(path)
+            # Store relative path from mailbox repo root for the publisher.
+            rel_path = str(path.relative_to(self.mailbox_repo_path))
+
+            with self._repo_lock:
+                # Persist publish intent + full content before the file write so
+                # that a crash between write and DB update is recoverable.
+                with self._lock:
+                    self._conn.execute(
+                        """UPDATE mailbox_task_approvals
+                           SET outbox_file=?, outbox_content=?, publish_status=?, updated_at=?
+                           WHERE id=?""",
+                        (rel_path, content, PUBLISH_PENDING_WRITE, _now_iso(), approval.id),
+                    )
+                    self._conn.commit()
+
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(content, encoding="utf-8")
+                tmp.replace(path)  # atomic rename
+
+                # Advance to written so the publisher knows the file exists.
+                with self._lock:
+                    self._conn.execute(
+                        """UPDATE mailbox_task_approvals
+                           SET publish_status=?, updated_at=?
+                           WHERE id=?""",
+                        (PUBLISH_WRITTEN, _now_iso(), approval.id),
+                    )
+                    self._conn.commit()
+
             self._log_mailbox_event(
                 approval, "mailbox", "outbox_written",
                 f"outbox file {filename} written for approval {approval.id[:8]} (status={status})",
             )
-            return filename
+            return rel_path
         except Exception:
             logger.exception("mailbox_task: failed to write outbox for approval %s", approval.id)
             self._log_mailbox_event(

@@ -546,5 +546,112 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         self.assertNotIn("innerHTML", js)
 
 
+class TestStartupOutboxRecovery(unittest.TestCase):
+    """API lifespan must call publish_pending() for both outbox publishers."""
+
+    def _run_lifespan(self, chain_pub_mock, approval_pub_mock):
+        """Start and stop the ASGI lifespan while service mocks are active."""
+        from unittest.mock import MagicMock, patch
+
+        mts = _mock_mailbox_task_service()
+        ocs = MagicMock()
+        ocs.recover_after_restart.return_value = None
+
+        with (
+            patch.object(api, "OperationChainOutboxPublisher", chain_pub_mock),
+            patch.object(api, "TaskApprovalOutboxPublisher", approval_pub_mock),
+            patch("api.MailboxConfig") as mc_cls,
+            patch("api.MailboxTaskWorker") as worker_cls,
+            patch("api._resolve_mailbox_task_service", return_value=mts),
+            patch("api._resolve_codex_service", return_value=MagicMock()),
+            patch("api._resolve_experiment_adoption_service", return_value=MagicMock()),
+            patch("api._resolve_operation_chain_service", return_value=ocs),
+        ):
+            mc_cls.from_env.return_value = MagicMock()
+            worker_cls.return_value.start.return_value = None
+            with TestClient(api.app, raise_server_exceptions=True):
+                pass  # triggers lifespan start and stop
+
+    def test_both_publishers_publish_pending_called_at_startup(self):
+        """Both OperationChainOutboxPublisher and TaskApprovalOutboxPublisher
+        must have publish_pending() called during API startup."""
+        from unittest.mock import MagicMock, call
+
+        chain_instance = MagicMock()
+        approval_instance = MagicMock()
+
+        chain_cls = MagicMock(return_value=chain_instance)
+        approval_cls = MagicMock(return_value=approval_instance)
+
+        self._run_lifespan(chain_cls, approval_cls)
+
+        chain_instance.publish_pending.assert_called_once()
+        approval_instance.publish_pending.assert_called_once()
+
+    def test_both_publishers_closed_after_startup(self):
+        """Publishers must be closed (connection released) after startup recovery."""
+        from unittest.mock import MagicMock
+
+        chain_instance = MagicMock()
+        approval_instance = MagicMock()
+
+        chain_cls = MagicMock(return_value=chain_instance)
+        approval_cls = MagicMock(return_value=approval_instance)
+
+        self._run_lifespan(chain_cls, approval_cls)
+
+        chain_instance.close.assert_called_once()
+        approval_instance.close.assert_called_once()
+
+    def test_startup_continues_when_publisher_raises(self):
+        """A publish_pending() exception must not abort the startup sequence."""
+        from unittest.mock import MagicMock
+
+        chain_instance = MagicMock()
+        chain_instance.publish_pending.side_effect = RuntimeError("push failed")
+        approval_instance = MagicMock()
+
+        chain_cls = MagicMock(return_value=chain_instance)
+        approval_cls = MagicMock(return_value=approval_instance)
+
+        # Must not raise — startup continues best-effort
+        self._run_lifespan(chain_cls, approval_cls)
+
+        # Second publisher must still be attempted even if first raised
+        approval_instance.publish_pending.assert_called_once()
+
+    def test_startup_continues_when_constructor_raises(self):
+        """A constructor exception must not abort the startup sequence or raise."""
+        from unittest.mock import MagicMock
+
+        # First publisher constructor raises; second must still be attempted.
+        chain_cls = MagicMock(side_effect=RuntimeError("db unavailable"))
+        approval_instance = MagicMock()
+        approval_cls = MagicMock(return_value=approval_instance)
+
+        self._run_lifespan(chain_cls, approval_cls)
+
+        approval_instance.publish_pending.assert_called_once()
+
+    def test_startup_continues_when_close_raises(self):
+        """A close() exception must not abort the startup sequence or raise."""
+        from unittest.mock import MagicMock
+
+        chain_instance = MagicMock()
+        chain_instance.close.side_effect = RuntimeError("close failed")
+        approval_instance = MagicMock()
+
+        chain_cls = MagicMock(return_value=chain_instance)
+        approval_cls = MagicMock(return_value=approval_instance)
+
+        self._run_lifespan(chain_cls, approval_cls)
+
+        # Both publishers must still have publish_pending() attempted
+        chain_instance.publish_pending.assert_called_once()
+        approval_instance.publish_pending.assert_called_once()
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
