@@ -33,6 +33,8 @@ def run_mailbox_poll_once(
     if not lock.acquire():
         return MailboxPollRunResult(status="busy")
 
+    result = MailboxPollRunResult(status="error", error="unknown mailbox processing failure")
+    cleanup_failures: list[str] = []
     processor = None
     chain_service = None
     publisher = None
@@ -71,23 +73,46 @@ def run_mailbox_poll_once(
             processor.retry_unpushed_commits()
             processor.retry_pending_git_commits()
             if not processor.ensure_clean_worktree():
-                return MailboxPollRunResult(status="dirty_worktree")
-            if not processor.pull():
-                return MailboxPollRunResult(status="pull_failed")
-
-        results = processor.process_inbox()
-        return MailboxPollRunResult(status="processed", results=results)
+                result = MailboxPollRunResult(status="dirty_worktree")
+            elif not processor.pull():
+                result = MailboxPollRunResult(status="pull_failed")
+            else:
+                results = processor.process_inbox()
+                result = MailboxPollRunResult(status="processed", results=results)
+        else:
+            results = processor.process_inbox()
+            result = MailboxPollRunResult(status="processed", results=results)
     except Exception as exc:
-        return MailboxPollRunResult(status="error", error=str(exc))
+        result = MailboxPollRunResult(status="error", error=str(exc))
     finally:
-        if processor is not None:
-            processor.close()
-        if chain_service is not None:
-            chain_service.close()
-        if publisher is not None:
-            publisher.close()
-        if task_publisher is not None:
-            task_publisher.close()
-        if operations_registry is not None:
-            operations_registry.close()
-        lock.release()
+        try:
+            for label, resource in (
+                ("processor", processor),
+                ("operation_chain_service", chain_service),
+                ("operation_chain_publisher", publisher),
+                ("task_approval_outbox_publisher", task_publisher),
+                ("operations_registry", operations_registry),
+            ):
+                if resource is None:
+                    continue
+                try:
+                    resource.close()
+                except Exception:
+                    cleanup_failures.append(label)
+        finally:
+            try:
+                lock.release()
+            except Exception:
+                cleanup_failures.append("mailbox_lock")
+
+    if cleanup_failures:
+        details = ", ".join(cleanup_failures)
+        if result.status == "error":
+            base = result.error or "unknown mailbox processing failure"
+            result.error = f"{base}; cleanup_failed={details}"
+            return result
+        return MailboxPollRunResult(
+            status="error",
+            error=f"mailbox processing cleanup_failed={details}",
+        )
+    return result

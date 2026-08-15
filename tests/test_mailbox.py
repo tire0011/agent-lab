@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import mailbox_processor
 from modules.mailbox import (
@@ -24,6 +25,7 @@ from modules.mailbox import (
     parse_front_matter,
 )
 from modules.run_store import init_db
+from modules.mailbox_poll_runner import MailboxPollRunResult
 
 
 def _make_repo(tmp: Path) -> Path:
@@ -602,6 +604,32 @@ class TestMailboxProcessorCliGuards(unittest.TestCase):
                 ]
             )
             self.assertEqual(rc, 1)
+
+    def test_error_logging_uses_sanitized_reason(self):
+        raw_error = (
+            "token=abc123 git@github.com:tire0011/agent-lab "
+            "path=/var/lib/nexus/mailbox.lock"
+        )
+        with patch(
+            "mailbox_processor.run_mailbox_poll_once",
+            return_value=MailboxPollRunResult(status="error", error=raw_error),
+        ):
+            with self.assertLogs("mailbox_processor", level="ERROR") as logs:
+                rc = mailbox_processor.main(
+                    [
+                        "--repo-path",
+                        "/agent",
+                        "--db-path",
+                        "/tmp/test-agent.db",
+                        "--lock-path",
+                        "/tmp/test-mailbox.lock",
+                    ]
+                )
+        self.assertEqual(rc, 1)
+        serialized = "\n".join(logs.output)
+        self.assertNotIn("abc123", serialized)
+        self.assertNotIn("git@github.com:tire0011/agent-lab", serialized)
+        self.assertNotIn("/var/lib/nexus/mailbox.lock", serialized)
 
 
 class TestLock(unittest.TestCase):

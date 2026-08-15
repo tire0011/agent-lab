@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from modules.mailbox_poll_runner import run_mailbox_poll_once
+from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH
 
 logging.basicConfig(
@@ -131,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("git pull --ff-only failed; refusing mailbox processing")
         return 1
     if result.status == "error":
-        logger.error("Mailbox processing failed: %s", result.error or "unknown")
+        logger.error("Mailbox processing failed: %s", sanitized_reason(result.error) or "unknown")
         return 1
 
     for r in result.results:
