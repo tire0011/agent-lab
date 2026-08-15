@@ -207,6 +207,7 @@ class MailboxGithubWebhookTests(ApiTestsBase):
         self.assertNotIn(bad_signature, serialized)
         self.assertNotIn(payload_text, serialized)
 
+
 class WebClientTests(ApiTestsBase):
     def test_index_returns_html(self):
         response = self.client.get("/")

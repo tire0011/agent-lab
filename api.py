@@ -264,13 +264,13 @@ _MAILBOX_LOCK_DEFAULT = "/var/lib/nexus/mailbox.lock"
 
 
 def _mailbox_lock_path_from_env() -> Path:
-    lock_path = Path(os.environ.get("AGENT_MAILBOX_LOCK_PATH", _MAILBOX_LOCK_DEFAULT))
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    return lock_path
+    return Path(os.environ.get("AGENT_MAILBOX_LOCK_PATH", _MAILBOX_LOCK_DEFAULT))
 
 
 def _run_mailbox_poll_once_for_webhook() -> None:
-    lock = mailbox_module.MailboxLock(_mailbox_lock_path_from_env())
+    lock_path = _mailbox_lock_path_from_env()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = mailbox_module.MailboxLock(lock_path)
     if not lock.acquire():
         _logger.warning("mailbox_webhook busy")
         return
@@ -337,10 +337,11 @@ def _run_mailbox_poll_once_for_webhook() -> None:
 
 
 def _start_mailbox_webhook_poll() -> None:
+    thread_name = f"mailbox-webhook-poll-{time.time_ns()}"
     threading.Thread(
         target=_run_mailbox_poll_once_for_webhook,
         daemon=True,
-        name="mailbox-webhook-poll",
+        name=thread_name,
     ).start()
 
 
@@ -576,7 +577,7 @@ async def mailbox_github_webhook(
     request: Request,
     x_hub_signature_256: str | None = Header(default=None),
     x_github_event: str | None = Header(default=None),
-) -> dict[str, str]:
+) -> JSONResponse:
     secret = os.environ.get(GITHUB_WEBHOOK_SECRET_ENV)
     if not secret:
         _logger.error("mailbox_webhook failed reason=missing_secret")
@@ -599,15 +600,15 @@ async def mailbox_github_webhook(
 
     if is_ping_event(x_github_event):
         _logger.info("mailbox_webhook ignored reason=ping")
-        return {"status": "pong"}
+        return JSONResponse(status_code=200, content={"status": "pong"})
 
     if (x_github_event or "").strip().lower() != "push":
         _logger.info("mailbox_webhook ignored reason=event")
-        return {"status": "ignored"}
+        return JSONResponse(status_code=200, content={"status": "ignored"})
 
     if not isinstance(payload, dict) or not has_inbox_changes(payload):
         _logger.info("mailbox_webhook ignored reason=no_inbox_changes")
-        return {"status": "ignored"}
+        return JSONResponse(status_code=200, content={"status": "ignored"})
 
     _start_mailbox_webhook_poll()
     _logger.info("mailbox_webhook accepted reason=inbox_change")
