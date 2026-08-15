@@ -18,6 +18,39 @@ logging.basicConfig(
 logger = logging.getLogger("mailbox_processor")
 
 
+def _resolve_repo_paths(
+    code_repo_path_arg: str | None,
+    mailbox_repo_path_arg: str | None,
+    repo_path_arg: str | None,
+) -> tuple[Path, Path]:
+    """Resolve code and mailbox repository paths from CLI arguments and env vars.
+
+    Priority: explicit flags > ``--repo-path`` alias > environment variables >
+    ``/agent`` default.  Raises :exc:`ValueError` if ``--repo-path`` is
+    combined with ``--code-repo-path`` or ``--mailbox-repo-path``.
+
+    Returns ``(code_repo_path, mailbox_repo_path)``.
+    """
+    explicit_alias = repo_path_arg is not None
+    explicit_code = code_repo_path_arg is not None
+    explicit_mailbox = mailbox_repo_path_arg is not None
+
+    if explicit_alias and (explicit_code or explicit_mailbox):
+        raise ValueError(
+            "--repo-path cannot be combined with --code-repo-path or "
+            "--mailbox-repo-path; use the explicit flags instead."
+        )
+
+    if explicit_alias:
+        p = Path(repo_path_arg)
+        return p, p
+
+    return (
+        Path(code_repo_path_arg or os.environ.get("AGENT_CODE_REPO_PATH", "/agent")),
+        Path(mailbox_repo_path_arg or os.environ.get("AGENT_MAILBOX_REPO_PATH", "/agent")),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -26,9 +59,30 @@ def main(argv: list[str] | None = None) -> int:
         help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})",
     )
     parser.add_argument(
+        "--code-repo-path",
+        default=None,
+        help=(
+            "Path to the code repository root "
+            "(default: AGENT_CODE_REPO_PATH env var, or /agent). "
+            "Artifacts like IDEAS.md and state/runs live here."
+        ),
+    )
+    parser.add_argument(
+        "--mailbox-repo-path",
+        default=None,
+        help=(
+            "Path to the mailbox repository root "
+            "(default: AGENT_MAILBOX_REPO_PATH env var, or /agent). "
+            "Git operations for inbox/outbox messages run here."
+        ),
+    )
+    parser.add_argument(
         "--repo-path",
-        default="/agent",
-        help="Path to the git repository root (default: /agent)",
+        default=None,
+        help=(
+            "Backward-compatible alias: sets both --code-repo-path and "
+            "--mailbox-repo-path when neither is specified explicitly."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -42,17 +96,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    repo_path = Path(args.repo_path)
+    # Resolve repo paths via the module-level helper so that the same logic
+    # is reachable from tests without starting the full processor.
+    try:
+        code_repo_path, mailbox_repo_path = _resolve_repo_paths(
+            args.code_repo_path, args.mailbox_repo_path, args.repo_path
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     lock_path = Path(
         args.lock_path or os.environ.get("AGENT_MAILBOX_LOCK_PATH", "/var/lib/nexus/mailbox.lock")
     )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     from modules.mailbox import MailboxLock, MailboxProcessor
+    from modules.mailbox_config import MailboxConfig
     from modules.experiment_service import ExperimentService
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
+
+    mailbox_config = MailboxConfig.from_paths(code_repo_path, mailbox_repo_path)
 
     lock = MailboxLock(lock_path)
     if not lock.acquire():
@@ -64,21 +129,24 @@ def main(argv: list[str] | None = None) -> int:
         operations_registry = OperationsRegistry(
             experiment_service=experiment_service,
             db_path=args.db_path,
-            repo_root=str(repo_path),
+            repo_root=str(code_repo_path),
         )
         chain_service = OperationChainService(
             db_path=args.db_path,
-            repo_root=str(repo_path),
-            outbox_dir=str(repo_path / "communication" / "outbox"),
+            mailbox_config=mailbox_config,
             operations_registry=operations_registry,
         )
         processor = MailboxProcessor(
-            repo_path=repo_path,
+            repo_path=mailbox_repo_path,
             db_path=args.db_path,
             dry_run=args.dry_run,
             operation_chain_service=chain_service,
+            mailbox_config=mailbox_config,
         )
-        publisher = OperationChainPublisher(db_path=args.db_path, repo_root=str(repo_path))
+        publisher = OperationChainPublisher(
+            db_path=args.db_path,
+            mailbox_config=mailbox_config,
+        )
         try:
             # 1. Retry any previously committed-but-not-pushed commits
             if not args.dry_run:

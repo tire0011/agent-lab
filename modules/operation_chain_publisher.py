@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from modules.mailbox import git_push
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -33,10 +34,18 @@ class PublishCandidate:
 
 
 class OperationChainPublisher:
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, repo_root: str = "/agent") -> None:
-        self.db_path = db_path
-        self.repo_root = Path(repo_root)
-        self.outbox_dir = self.repo_root / "communication" / "outbox"
+    def __init__(
+        self,
+        db_path: str = DEFAULT_DB_PATH,
+        repo_root: str = "/agent",
+        mailbox_config: Any = None,
+    ) -> None:
+        if mailbox_config is not None:
+            self.repo_root = mailbox_config.mailbox_repo_path
+            self.outbox_dir = mailbox_config.outbox_dir
+        else:
+            self.repo_root = Path(repo_root)
+            self.outbox_dir = self.repo_root / "communication" / "outbox"
         self._conn = init_db(db_path)
         self._conn.row_factory = sqlite3.Row
 
@@ -101,17 +110,14 @@ class OperationChainPublisher:
         rel = Path(outbox_file)
         if rel.is_absolute():
             raise ValueError("outbox path must be relative")
-        parts = rel.parts
-        if len(parts) < 3 or parts[0] != "communication" or parts[1] != "outbox":
-            raise ValueError("outbox path must stay within communication/outbox")
-        if any(part == ".." for part in parts):
+        if any(part == ".." for part in rel.parts):
             raise ValueError("outbox path must not contain path traversal segments")
-        if rel.name != Path(outbox_file).name or not rel.name.endswith(".md"):
+        if not rel.name.endswith(".md"):
             raise ValueError("unexpected outbox filename")
         path = self.repo_root / rel
         resolved = path.resolve()
         if not str(resolved).startswith(str(self.outbox_dir.resolve()) + os.sep):
-            raise ValueError("outbox path escapes communication/outbox")
+            raise ValueError("outbox path escapes outbox directory")
         if path.is_symlink():
             raise ValueError("symlinks are not allowed")
         if not path.is_file():
