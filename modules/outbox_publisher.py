@@ -197,7 +197,7 @@ class OutboxPublisher:
     def publish(self, record: PublishRecord) -> bool:
         """Publish one record through the full lifecycle.
 
-        Returns True if the record reached PUSH_PUSHED, False otherwise.
+        Returns True if the record reached PUBLISH_PUSHED, False otherwise.
         The caller's business-logic state is never changed by this method.
         """
         with self._repo_lock:
@@ -263,7 +263,6 @@ class OutboxPublisher:
             # File already exists (e.g. a previous run wrote it but crashed
             # before advancing the state).  Adopt as-is.
             self._advance_status(record, PUBLISH_WRITTEN)
-            record = record  # update in-place would need mutable; use local var
             try:
                 validated = self._validate_outbox_path(record.outbox_file)
             except ValueError as exc:
@@ -521,7 +520,6 @@ class _TablePublisher(OutboxPublisher):
         self._conn.execute(
             f"""UPDATE {self._TABLE}
                 SET publish_status = ?,
-                    publish_retry_count = publish_retry_count + 1,
                     updated_at = datetime('now')
                 WHERE {self._ID_COLUMN} = ?""",
             (new_status, record.record_id),
@@ -545,6 +543,7 @@ class _TablePublisher(OutboxPublisher):
             f"""UPDATE {self._TABLE}
                 SET publish_status = ?,
                     publish_last_error = ?,
+                    publish_retry_count = publish_retry_count + 1,
                     updated_at = datetime('now')
                 WHERE {self._ID_COLUMN} = ?""",
             (PUBLISH_FAILED, error[:500], record.record_id),
