@@ -33,12 +33,15 @@ class _FakeMailboxLock:
 
 
 class _FakeExperimentService:
+    raise_on_close = False
+
     def __init__(self, **_kwargs):
         pass
 
     def close(self) -> None:
         _CloseTracking.close_calls.append("experiment_service")
-        raise RuntimeError("experiment service close failure")
+        if type(self).raise_on_close:
+            raise RuntimeError("experiment service close failure")
 
 
 class _FakeOperationsRegistry:
@@ -107,8 +110,10 @@ class MailboxPollRunnerCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
         _CloseTracking.close_calls = []
         _FakeMailboxLock.release_calls = 0
+        _FakeExperimentService.raise_on_close = False
 
     def test_close_failures_do_not_block_other_cleanup_or_lock_release(self) -> None:
+        _FakeExperimentService.raise_on_close = True
         cfg = MailboxConfig.from_paths(Path("/code"), Path("/mailbox"))
         with tempfile.TemporaryDirectory() as tmp:
             lock_path = Path(tmp) / "mailbox.lock"
