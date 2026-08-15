@@ -40,6 +40,7 @@ def run_mailbox_poll_once(
     publisher = None
     task_publisher = None
     operations_registry = None
+    experiment_service = None
     try:
         experiment_service = ExperimentService(db_path=db_path)
         operations_registry = OperationsRegistry(
@@ -92,6 +93,7 @@ def run_mailbox_poll_once(
                 ("operation_chain_publisher", publisher),
                 ("task_approval_outbox_publisher", task_publisher),
                 ("operations_registry", operations_registry),
+                ("experiment_service", experiment_service),
             ):
                 if resource is None:
                     continue

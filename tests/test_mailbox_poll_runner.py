@@ -36,6 +36,10 @@ class _FakeExperimentService:
     def __init__(self, **_kwargs):
         pass
 
+    def close(self) -> None:
+        _CloseTracking.close_calls.append("experiment_service")
+        raise RuntimeError("experiment service close failure")
+
 
 class _FakeOperationsRegistry:
     def __init__(self, **_kwargs):
@@ -142,6 +146,7 @@ class MailboxPollRunnerCleanupTests(unittest.TestCase):
 
         self.assertEqual(result.status, "error")
         self.assertIn("cleanup_failed=processor", result.error or "")
+        self.assertIn("experiment_service", result.error or "")
         self.assertEqual(
             _CloseTracking.close_calls,
             [
@@ -150,6 +155,7 @@ class MailboxPollRunnerCleanupTests(unittest.TestCase):
                 "operation_chain_publisher",
                 "task_approval_outbox_publisher",
                 "operations_registry",
+                "experiment_service",
             ],
         )
         self.assertEqual(_FakeMailboxLock.release_calls, 1)
