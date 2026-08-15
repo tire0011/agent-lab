@@ -620,6 +620,38 @@ class TestStartupOutboxRecovery(unittest.TestCase):
         # Second publisher must still be attempted even if first raised
         approval_instance.publish_pending.assert_called_once()
 
+    def test_startup_continues_when_constructor_raises(self):
+        """A constructor exception must not abort the startup sequence or raise."""
+        from unittest.mock import MagicMock
+
+        # First publisher constructor raises; second must still be attempted.
+        chain_cls = MagicMock(side_effect=RuntimeError("db unavailable"))
+        approval_instance = MagicMock()
+        approval_cls = MagicMock(return_value=approval_instance)
+
+        self._run_lifespan(chain_cls, approval_cls)
+
+        approval_instance.publish_pending.assert_called_once()
+
+    def test_startup_continues_when_close_raises(self):
+        """A close() exception must not abort the startup sequence or raise."""
+        from unittest.mock import MagicMock
+
+        chain_instance = MagicMock()
+        chain_instance.close.side_effect = RuntimeError("close failed")
+        approval_instance = MagicMock()
+
+        chain_cls = MagicMock(return_value=chain_instance)
+        approval_cls = MagicMock(return_value=approval_instance)
+
+        self._run_lifespan(chain_cls, approval_cls)
+
+        # Both publishers must still have publish_pending() attempted
+        chain_instance.publish_pending.assert_called_once()
+        approval_instance.publish_pending.assert_called_once()
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,11 +26,14 @@ _SECRET_PATTERN = re.compile(
 # without a preceding keyword at all (e.g. copy-pasted into a prompt).
 _BEARER_PATTERN = re.compile(r"(?i)bearer\s+\S+")
 _SK_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9]{10,}")
+# HTTPS remote URLs that embed credentials, e.g. ******github.com/...
+_URL_CRED_PATTERN = re.compile(r"https?://[^@\s]*:[^@\s]*@\S*")
 _PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
 
 
 def redact(text: str) -> str:
     """Scrub secret-shaped substrings and absolute filesystem paths."""
+    text = _URL_CRED_PATTERN.sub("[REDACTED]", text)
     text = _BEARER_PATTERN.sub("[REDACTED]", text)
     text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
     text = _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)

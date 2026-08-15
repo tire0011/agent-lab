@@ -74,6 +74,7 @@ from models import (
     StatusResponse,
 )
 from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
+from modules.redaction import sanitized_reason as _sanitized_reason
 from modules import experiment_logger as experiment_logger_module
 
 _PROCESS_START_TIME = time.time()
@@ -213,18 +214,33 @@ async def lifespan(app: FastAPI):
 
     # Best-effort outbox recovery: publish any un-pushed outbox records from
     # a previous crash.  Both publishers share the same MailboxConfig / DB.
+    # Each publisher is fully wrapped so that a constructor *or* close failure
+    # never skips the next publisher and never aborts the API startup.
+    # exc_info is intentionally omitted: raw tracebacks can expose paths /
+    # tokens; the redacted message is sufficient for diagnosis.
     _mc = MailboxConfig.from_env()
     for _pub_cls in (OperationChainOutboxPublisher, TaskApprovalOutboxPublisher):
-        _pub = _pub_cls(mailbox_config=_mc)
         _cls_name = getattr(_pub_cls, "__name__", repr(_pub_cls))
+        _pub = None
         try:
+            _pub = _pub_cls(mailbox_config=_mc)
             _pub.publish_pending()
-        except Exception:
+        except Exception as _exc:
             _logger.warning(
-                "Startup outbox recovery failed for %s", _cls_name, exc_info=True
+                "Startup outbox recovery failed for %s: %s",
+                _cls_name,
+                _sanitized_reason(str(_exc)),
             )
         finally:
-            _pub.close()
+            if _pub is not None:
+                try:
+                    _pub.close()
+                except Exception as _close_exc:
+                    _logger.warning(
+                        "Startup outbox close failed for %s: %s",
+                        _cls_name,
+                        _sanitized_reason(str(_close_exc)),
+                    )
 
     worker = MailboxTaskWorker(mts)
     worker.start()

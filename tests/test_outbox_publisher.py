@@ -868,6 +868,11 @@ class TestPushErrorRedaction(unittest.TestCase):
             "fatal: remote: token=ghp_abcXYZ123456789abcdef access denied",
             "ghp_abcXYZ123456789abcdef",
         ),
+        # HTTPS URL with embedded credential (e.g. x-access-token:ghs_...)
+        (
+            "fatal: repository 'https://x-access-token:ghs_SomeSecret12345@github.com/org/repo.git/' not found",
+            "ghs_SomeSecret12345",
+        ),
         # OpenAI-style sk- key
         (
             "push rejected: sk-abcdefghijklmnopqrstuvwxyz1234 is invalid",
