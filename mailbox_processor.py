@@ -18,6 +18,39 @@ logging.basicConfig(
 logger = logging.getLogger("mailbox_processor")
 
 
+def _resolve_repo_paths(
+    code_repo_path_arg: str | None,
+    mailbox_repo_path_arg: str | None,
+    repo_path_arg: str | None,
+) -> tuple[Path, Path]:
+    """Resolve code and mailbox repository paths from CLI arguments and env vars.
+
+    Priority: explicit flags > ``--repo-path`` alias > environment variables >
+    ``/agent`` default.  Raises :exc:`ValueError` if ``--repo-path`` is
+    combined with ``--code-repo-path`` or ``--mailbox-repo-path``.
+
+    Returns ``(code_repo_path, mailbox_repo_path)``.
+    """
+    explicit_alias = repo_path_arg is not None
+    explicit_code = code_repo_path_arg is not None
+    explicit_mailbox = mailbox_repo_path_arg is not None
+
+    if explicit_alias and (explicit_code or explicit_mailbox):
+        raise ValueError(
+            "--repo-path cannot be combined with --code-repo-path or "
+            "--mailbox-repo-path; use the explicit flags instead."
+        )
+
+    if explicit_alias:
+        p = Path(repo_path_arg)
+        return p, p
+
+    return (
+        Path(code_repo_path_arg or os.environ.get("AGENT_CODE_REPO_PATH", "/agent")),
+        Path(mailbox_repo_path_arg or os.environ.get("AGENT_MAILBOX_REPO_PATH", "/agent")),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -63,28 +96,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Resolve repo paths, giving explicit flags priority over --repo-path
-    # and env vars.
-    explicit_code = args.code_repo_path is not None
-    explicit_mailbox = args.mailbox_repo_path is not None
-    explicit_alias = args.repo_path is not None
-
-    if explicit_alias and (explicit_code or explicit_mailbox):
-        parser.error(
-            "--repo-path cannot be combined with --code-repo-path or "
-            "--mailbox-repo-path; use the explicit flags instead."
+    # Resolve repo paths via the module-level helper so that the same logic
+    # is reachable from tests without starting the full processor.
+    try:
+        code_repo_path, mailbox_repo_path = _resolve_repo_paths(
+            args.code_repo_path, args.mailbox_repo_path, args.repo_path
         )
-
-    if explicit_alias:
-        code_repo_path = Path(args.repo_path)
-        mailbox_repo_path = Path(args.repo_path)
-    else:
-        code_repo_path = Path(
-            args.code_repo_path or os.environ.get("AGENT_CODE_REPO_PATH", "/agent")
-        )
-        mailbox_repo_path = Path(
-            args.mailbox_repo_path or os.environ.get("AGENT_MAILBOX_REPO_PATH", "/agent")
-        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     lock_path = Path(
         args.lock_path or os.environ.get("AGENT_MAILBOX_LOCK_PATH", "/var/lib/nexus/mailbox.lock")
