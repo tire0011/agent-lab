@@ -186,6 +186,30 @@ This is an important transition toward more capable autonomous workflows, but it
 
 The resulting `needs_review` state is useful rather than a failure of the architecture: the system correctly avoided forcing an unsafe merge when the base branch had moved.
 
+### 13. 2026-08-15: code/mailbox repository split
+
+The earlier communication-repository idea was implemented. Nexus can now use separate repositories for source code and mailbox traffic through `MailboxConfig`, while retaining the legacy single-repository layout for compatibility.
+
+The deployed VM uses `/agent` as the code repository and `/var/lib/nexus/mailbox-repo` as the mailbox repository. In separate-repository mode, inbox/outbox live directly below the mailbox root instead of under `communication/`.
+
+The cutover included path-resolution and cross-repository regression tests, including an end-to-end two-repository mailbox test. This removes routine inbox/outbox commits from the source repository and directly addresses the earlier non-fast-forward/contention problem.
+
+The durable lesson is that **communication state and source-integration state have different write patterns and should be isolated when their Git histories interfere**.
+
+### 14. 2026-08-15: crash-safe outbox publication
+
+Task-approval results and operation-chain results now share a common persistent `OutboxPublisher` lifecycle rather than maintaining separate Git publication logic.
+
+Publication progress is persisted through states such as:
+
+`pending_write -> written -> committing -> committed -> pushed`
+
+The result content and publish intent are stored before the atomic file write, publication is serialized with a repository lock, and pending publication is retried during processor/API recovery. A recorded commit SHA is reused for push retry instead of creating duplicate commits.
+
+This makes result delivery resilient to crashes between database update, file write, commit, and push. Push failures are also handled with stricter URL/credential redaction so Git diagnostics do not leak remote credentials.
+
+A key lesson is that **asynchronous agent communication needs an idempotent, recoverable publication protocol; writing an outbox file is not equivalent to reliably delivering it**.
+
 ## What Nexus currently learns
 
 Nexus already accumulates several kinds of machine-readable or repository-visible information:
@@ -242,7 +266,8 @@ At the current stage the project contains several cooperating layers:
 - Git/worktree-based isolation and adoption,
 - SQLite state,
 - ideas and decision documents,
-- Git-backed human/agent mailbox,
+- separate Git-backed mailbox repository for human/agent communication,
+- persistent recoverable outbox publication,
 - API and browser UI,
 - public and authenticated diagnostics,
 - tests and policy boundaries.
@@ -253,18 +278,20 @@ The system is still intentionally small enough to understand.
 
 1. **Autonomy requires observability.** A result without enough evidence to understand the path to it is difficult to improve.
 2. **Self-modification needs evaluation and rollback.** Generating code is easier than deciding whether it should be adopted.
-3. **Git is useful state, but not every kind of state belongs in the same repository.** High-frequency communication can conflict with source integration.
-4. **Cheap reasoning matters.** Continuous autonomy will probably need a hierarchy of models, including small/local models for simple decisions and expensive models only when justified.
-5. **Context itself is a resource.** More memory is not automatically better; project memory should be retrieved or summarized and measured.
-6. **Failures are research data.** Selection failures, CLI incompatibilities, merge conflicts, timeouts, and rejected experiments are useful inputs to the next iteration.
-7. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
+3. **Git is useful state, but not every kind of state belongs in the same repository.** The separate mailbox repository validated this by removing communication commits from the source history.
+4. **Agent-to-agent/human communication needs delivery semantics.** Persisted publication state, locking, retry, and recovery are necessary to make Git-backed messaging reliable across crashes.
+5. **Cheap reasoning matters.** Continuous autonomy will probably need a hierarchy of models, including small/local models for simple decisions and expensive models only when justified.
+6. **Context itself is a resource.** More memory is not automatically better; project memory should be retrieved or summarized and measured.
+7. **Failures are research data.** Selection failures, CLI incompatibilities, merge conflicts, timeouts, and rejected experiments are useful inputs to the next iteration.
+8. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
 
 ## Open research directions
 
 Current directions worth investigating include:
 
 - project memory and retrieval from this history,
-- separating the communication repository from the source repository,
+- event-driven mailbox wake-up (for example via GitHub-triggered notification) so Nexus can react immediately to new inbox commits while retaining the timer as fallback,
+- reducing LLM token consumption caused by verbose tool/test output by returning compact success summaries and failure-focused evidence,
 - using a small local LLM for frequent action selection and reflection,
 - model routing by task difficulty and expected value,
 - stronger automatic evaluation of proposed changes,
@@ -279,11 +306,12 @@ Current directions worth investigating include:
 
 ## Current next-step candidates
 
-The immediate work should remain small. The strongest candidates are:
+The immediate work should remain small. Strong candidates now include:
 
 1. **Project-memory experiment:** expose this history to Nexus through a minimal retrieval/context mechanism and measure whether its next idea selections improve.
-2. **Communication-repository experiment:** move or prototype inbox/outbox in a separate Git repository to eliminate source-branch contention.
-3. **Cheap local decision model:** test whether a small model running on existing hardware can handle frequent low-risk decisions cheaply enough to reduce API use.
+2. **Event-driven mailbox experiment:** compare a GitHub-triggered wake-up against the current one-minute polling path for latency, reliability, complexity, and operational cost while preserving polling as a fallback.
+3. **Token-efficient tool-output experiment:** measure whether compact test/tool output reduces total LLM context and cost without hiding evidence needed to diagnose failures.
+4. **Cheap local decision model:** test whether a small model running on existing hardware can handle frequent low-risk decisions cheaply enough to reduce API use.
 
 The next choice should be based on expected learning value, implementation effort, risk, and measurable benefit rather than on architectural completeness.
 
