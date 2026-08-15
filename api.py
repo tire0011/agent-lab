@@ -25,6 +25,7 @@ from modules.codex_task_service import (
 )
 from modules.mailbox_config import MailboxConfig
 from modules.mailbox_github_webhook import has_inbox_changes, is_ping_event, verify_signature
+from modules.mailbox_poll_runner import run_mailbox_poll_once
 from modules.mailbox_task_service import (
     ApprovalNotFoundError,
     ApprovalStateError,
@@ -34,7 +35,6 @@ from modules.mailbox_task_service import (
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
 from modules.operations_registry import OperationValidationError, OperationsRegistry
-from modules.operation_chain_publisher import OperationChainPublisher
 from modules.operation_chain_service import OperationChainService
 from modules import redaction
 from modules.run_store import DEFAULT_DB_PATH, calculate_estimated_cost, get_applicable_price
@@ -268,72 +268,27 @@ def _mailbox_lock_path_from_env() -> Path:
 
 
 def _run_mailbox_poll_once_for_webhook() -> None:
-    lock_path = _mailbox_lock_path_from_env()
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = mailbox_module.MailboxLock(lock_path)
-    if not lock.acquire():
+    result = run_mailbox_poll_once(
+        db_path=DEFAULT_DB_PATH,
+        mailbox_config=MailboxConfig.from_env(),
+        lock_path=_mailbox_lock_path_from_env(),
+        dry_run=False,
+    )
+    if result.status == "busy":
         _logger.warning("mailbox_webhook busy")
         return
-
-    processor = None
-    chain_service = None
-    publisher = None
-    task_publisher = None
-    operations_registry = None
-    try:
-        mailbox_config = MailboxConfig.from_env()
-        experiment_service = ExperimentService(db_path=DEFAULT_DB_PATH)
-        operations_registry = OperationsRegistry(
-            experiment_service=experiment_service,
-            db_path=DEFAULT_DB_PATH,
-            repo_root=str(mailbox_config.code_repo_path),
-        )
-        chain_service = OperationChainService(
-            db_path=DEFAULT_DB_PATH,
-            mailbox_config=mailbox_config,
-            operations_registry=operations_registry,
-        )
-        processor = mailbox_module.MailboxProcessor(
-            repo_path=mailbox_config.mailbox_repo_path,
-            db_path=DEFAULT_DB_PATH,
-            dry_run=False,
-            operation_chain_service=chain_service,
-            mailbox_config=mailbox_config,
-        )
-        publisher = OperationChainPublisher(
-            db_path=DEFAULT_DB_PATH,
-            mailbox_config=mailbox_config,
-        )
-        task_publisher = TaskApprovalOutboxPublisher(
-            db_path=DEFAULT_DB_PATH,
-            mailbox_config=mailbox_config,
-        )
-        publisher.publish_pending()
-        task_publisher.publish_pending()
-        processor.retry_unpushed_commits()
-        processor.retry_pending_git_commits()
-        if not processor.ensure_clean_worktree():
-            _logger.error("mailbox_webhook failed reason=dirty_worktree")
-            return
-        if not processor.pull():
-            _logger.error("mailbox_webhook failed reason=pull_failed")
-            return
-        processor.process_inbox()
+    if result.status == "processed":
         _logger.info("mailbox_webhook accepted")
-    except Exception as exc:
-        _logger.error("mailbox_webhook failed reason=%s", _sanitized_reason(str(exc)) or "unknown")
-    finally:
-        if processor is not None:
-            processor.close()
-        if chain_service is not None:
-            chain_service.close()
-        if publisher is not None:
-            publisher.close()
-        if task_publisher is not None:
-            task_publisher.close()
-        if operations_registry is not None:
-            operations_registry.close()
-        lock.release()
+        return
+    if result.status == "dirty_worktree":
+        _logger.error("mailbox_webhook failed reason=dirty_worktree")
+        return
+    if result.status == "pull_failed":
+        _logger.error("mailbox_webhook failed reason=pull_failed")
+        return
+    if result.status == "error":
+        _logger.error("mailbox_webhook failed reason=%s", _sanitized_reason(result.error) or "unknown")
+        return
 
 
 def _start_mailbox_webhook_poll() -> None:

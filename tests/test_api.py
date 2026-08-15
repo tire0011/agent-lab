@@ -20,6 +20,7 @@ from api import (
     get_mailbox_task_service,
     get_operations_service,
 )
+from modules.mailbox_poll_runner import MailboxPollRunResult
 
 
 def _mock_codex_service():
@@ -180,16 +181,12 @@ class MailboxGithubWebhookTests(ApiTestsBase):
         start_poll.assert_not_called()
 
     def test_busy_poll_does_not_start_processing_twice(self):
-        lock_path = Path(self.temp_dir.name) / "mailbox.lock"
-        with patch.dict(os.environ, {"AGENT_MAILBOX_LOCK_PATH": str(lock_path)}, clear=False):
-            lock = api.mailbox_module.MailboxLock(lock_path)
-            self.assertTrue(lock.acquire())
-            try:
-                with patch("api.mailbox_module.MailboxProcessor") as processor_cls:
-                    api._run_mailbox_poll_once_for_webhook()
-            finally:
-                lock.release()
-        processor_cls.assert_not_called()
+        with patch(
+            "api.run_mailbox_poll_once",
+            return_value=MailboxPollRunResult(status="busy"),
+        ) as shared_runner:
+            api._run_mailbox_poll_once_for_webhook()
+        shared_runner.assert_called_once()
 
     def test_rejection_logs_never_include_secret_or_payload_content(self):
         secret = "top-secret"
