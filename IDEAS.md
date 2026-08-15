@@ -160,6 +160,13 @@ not a significance ranking.
 - Improve the Logs tab auto-refresh behavior so reading logs on desktop or iPhone is not interrupted every ten seconds.  Add an accessible Auto-refresh on/off control, preserve the user's scroll position and expanded log-entry state during refresh, and avoid replacing the rendered DOM when data is unchanged. When the user has scrolled away from the newest entries, do not jump the page; show a small "new log entries available" indicator that lets the user move to them explicitly. Manual refresh must remain available. Keep the behavior mobile-friendly and test success, failure, paused, unchanged-data, scroll-preservation, and new-entry cases. `new`
 - Evaluate whether a small local LLM can run continuously on the main VM as Nexus's low-cost decision layer: selecting the next action, classifying messages, choosing tools or larger models, and recognizing when human help is needed. Compare it against rule-based routing for decision quality, runtime, memory usage, energy/resource consumption, and avoided API cost. `new`
 
+### Inbox
+
+- Make Git-backed inbox communication event-driven: when inbox/ changes, GitHub should trigger Nexus via a signed webhook or a path-filtered GitHub Action instead of relying only on polling. Nexus should translate the external notification into a bounded internal event such as inbox_changed, verify authenticity, and avoid executing arbitrary webhook content directly. Later, evaluate a fire-and-forget workflow such as Nexus -> GitHub Cloud Agent -> PR/result -> GitHub event -> Nexus evaluation `new`
+- Testausgaben tokenoptimiert reduzieren Der Test-Runner soll standardmäßig möglichst kompakte Ausgaben erzeugen. Bei erfolgreichen Tests reichen Status, Anzahl der Tests und Laufzeit. Bei Fehlern sollen nur relevante Fehlermeldungen und Stacktraces erhalten bleiben. Ziel ist, gespeicherte und später an LLMs übergebene Testausgaben deutlich zu verkleinern, ohne Diagnoseinformationen zu verlieren. Messbar: Output-Größe/Tokens vor und nach der Änderung vergleichen. `new`
+- Tool-Ausgaben als Teil des Token-Budgets behandeln Alle Tools von Nexus sollten berücksichtigen, dass ihre Ausgaben später in einen LLM-Context gelangen können. Lange Logs, Git-Ausgaben, Testresultate, API-Antworten usw. sollen deshalb möglichst gefiltert, zusammengefasst oder begrenzt werden. Vollständige Rohdaten können bei Bedarf separat gespeichert und gezielt abgerufen werden. Grundprinzip: Nicht möglichst viele Daten an das LLM geben, sondern möglichst viel relevante Information pro Toke `new`
+- Ideen eingabefeld auf der Website ist zu klein `new`
+
 
 ## Open unknowns
 
