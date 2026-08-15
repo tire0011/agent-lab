@@ -1,6 +1,8 @@
+import json
 import os
 import re
 import logging
+import threading
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -9,8 +11,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import chat as chat_module
@@ -22,6 +24,8 @@ from modules.codex_task_service import (
     TaskNotRunnableError,
 )
 from modules.mailbox_config import MailboxConfig
+from modules.mailbox_github_webhook import has_inbox_changes, is_ping_event, verify_signature
+from modules.mailbox_poll_runner import run_mailbox_poll_once
 from modules.mailbox_task_service import (
     ApprovalNotFoundError,
     ApprovalStateError,
@@ -33,7 +37,7 @@ from modules.experiment_service import ExperimentNotFoundError, ExperimentServic
 from modules.operations_registry import OperationValidationError, OperationsRegistry
 from modules.operation_chain_service import OperationChainService
 from modules import redaction
-from modules.run_store import calculate_estimated_cost, get_applicable_price
+from modules.run_store import DEFAULT_DB_PATH, calculate_estimated_cost, get_applicable_price
 from models import (
     DiagnosticActivityResponse,
     ChatRequest,
@@ -255,6 +259,45 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 _OUTBOX_DIR = MailboxConfig.from_env().outbox_dir
 
 API_KEY = os.environ["AGENT_API_KEY"]
+GITHUB_WEBHOOK_SECRET_ENV = "AGENT_GITHUB_WEBHOOK_SECRET"
+_MAILBOX_LOCK_DEFAULT = "/var/lib/nexus/mailbox.lock"
+
+
+def _mailbox_lock_path_from_env() -> Path:
+    return Path(os.environ.get("AGENT_MAILBOX_LOCK_PATH", _MAILBOX_LOCK_DEFAULT))
+
+
+def _run_mailbox_poll_once_for_webhook() -> None:
+    result = run_mailbox_poll_once(
+        db_path=DEFAULT_DB_PATH,
+        mailbox_config=MailboxConfig.from_env(),
+        lock_path=_mailbox_lock_path_from_env(),
+        dry_run=False,
+    )
+    if result.status == "busy":
+        _logger.warning("mailbox_webhook busy")
+        return
+    if result.status == "processed":
+        _logger.info("mailbox_webhook accepted")
+        return
+    if result.status == "dirty_worktree":
+        _logger.error("mailbox_webhook failed reason=dirty_worktree")
+        return
+    if result.status == "pull_failed":
+        _logger.error("mailbox_webhook failed reason=pull_failed")
+        return
+    if result.status == "error":
+        _logger.error("mailbox_webhook failed reason=%s", _sanitized_reason(result.error) or "unknown")
+        return
+
+
+def _start_mailbox_webhook_poll() -> None:
+    thread_name = f"mailbox-webhook-poll-{time.time_ns()}"
+    threading.Thread(
+        target=_run_mailbox_poll_once_for_webhook,
+        daemon=True,
+        name=thread_name,
+    ).start()
 
 
 @app.get("/", include_in_schema=False)
@@ -482,6 +525,49 @@ def reject_mailbox_task(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return _approval_to_response(approval)
+
+
+@app.post("/mailbox/webhook/github")
+async def mailbox_github_webhook(
+    request: Request,
+    x_hub_signature_256: str | None = Header(default=None),
+    x_github_event: str | None = Header(default=None),
+) -> JSONResponse:
+    secret = os.environ.get(GITHUB_WEBHOOK_SECRET_ENV)
+    if not secret:
+        _logger.error("mailbox_webhook failed reason=missing_secret")
+        raise HTTPException(status_code=503, detail="webhook not configured")
+
+    raw_body = await request.body()
+    if not verify_signature(
+        secret=secret,
+        raw_body=raw_body,
+        signature_header=x_hub_signature_256,
+    ):
+        _logger.warning("mailbox_webhook rejected reason=invalid_signature")
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _logger.warning("mailbox_webhook rejected reason=invalid_json")
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    if is_ping_event(x_github_event):
+        _logger.info("mailbox_webhook ignored reason=ping")
+        return JSONResponse(status_code=200, content={"status": "pong"})
+
+    if (x_github_event or "").strip().lower() != "push":
+        _logger.info("mailbox_webhook ignored reason=event")
+        return JSONResponse(status_code=200, content={"status": "ignored"})
+
+    if not isinstance(payload, dict) or not has_inbox_changes(payload):
+        _logger.info("mailbox_webhook ignored reason=no_inbox_changes")
+        return JSONResponse(status_code=200, content={"status": "ignored"})
+
+    _start_mailbox_webhook_poll()
+    _logger.info("mailbox_webhook accepted reason=inbox_change")
+    return JSONResponse(status_code=202, content={"status": "accepted"})
 
 
 # ---------------------------------------------------------------------------
@@ -1112,4 +1198,3 @@ def get_public_diagnostics(
         experiments=diagnostic_experiments,
         problems=list_problems(),
     )
-

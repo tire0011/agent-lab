@@ -1,10 +1,12 @@
+import hashlib
+import hmac
 import json
 import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
@@ -18,6 +20,7 @@ from api import (
     get_mailbox_task_service,
     get_operations_service,
 )
+from modules.mailbox_poll_runner import MailboxPollRunResult
 
 
 def _mock_codex_service():
@@ -100,6 +103,106 @@ class HealthEndpointTests(ApiTestsBase):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
+
+
+class MailboxGithubWebhookTests(ApiTestsBase):
+    WEBHOOK_PATH = "/mailbox/webhook/github"
+
+    def _signed_headers(self, body: bytes, *, secret: str, event: str = "push") -> dict[str, str]:
+        digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        return {
+            "x-github-event": event,
+            "x-hub-signature-256": f"sha256={digest}",
+            "content-type": "application/json",
+        }
+
+    def test_push_with_inbox_addition_returns_202_and_triggers_once(self):
+        payload = {"commits": [{"added": ["inbox/new-task.md"], "modified": [], "removed": []}]}
+        body = json.dumps(payload).encode("utf-8")
+        with patch.dict(os.environ, {api.GITHUB_WEBHOOK_SECRET_ENV: "webhook-secret"}, clear=False):
+            with patch("api._start_mailbox_webhook_poll") as start_poll:
+                response = self.client.post(self.WEBHOOK_PATH, data=body, headers=self._signed_headers(body, secret="webhook-secret"))
+        self.assertEqual(response.status_code, 202)
+        start_poll.assert_called_once()
+
+    def test_wrong_or_missing_signature_is_rejected_without_trigger(self):
+        payload = {"commits": [{"added": ["inbox/new-task.md"]}]}
+        body = json.dumps(payload).encode("utf-8")
+        with patch.dict(os.environ, {api.GITHUB_WEBHOOK_SECRET_ENV: "webhook-secret"}, clear=False):
+            with patch("api._start_mailbox_webhook_poll") as start_poll:
+                wrong_sig = {"x-github-event": "push", "x-hub-signature-256": "sha256=deadbeef", "content-type": "application/json"}
+                wrong = self.client.post(self.WEBHOOK_PATH, data=body, headers=wrong_sig)
+                missing = self.client.post(self.WEBHOOK_PATH, data=body, headers={"x-github-event": "push", "content-type": "application/json"})
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(missing.status_code, 401)
+        start_poll.assert_not_called()
+
+    def test_missing_webhook_secret_is_rejected_without_trigger(self):
+        payload = {"commits": [{"added": ["inbox/new-task.md"]}]}
+        body = json.dumps(payload).encode("utf-8")
+        with patch.dict(os.environ, {api.GITHUB_WEBHOOK_SECRET_ENV: ""}, clear=False):
+            with patch("api._start_mailbox_webhook_poll") as start_poll:
+                response = self.client.post(self.WEBHOOK_PATH, data=body, headers={"x-github-event": "push"})
+        self.assertEqual(response.status_code, 503)
+        start_poll.assert_not_called()
+
+    def test_invalid_json_is_rejected_without_trigger(self):
+        body = b"{not-json"
+        with patch.dict(os.environ, {api.GITHUB_WEBHOOK_SECRET_ENV: "webhook-secret"}, clear=False):
+            with patch("api._start_mailbox_webhook_poll") as start_poll:
+                response = self.client.post(
+                    self.WEBHOOK_PATH,
+                    data=body,
+                    headers=self._signed_headers(body, secret="webhook-secret"),
+                )
+        self.assertEqual(response.status_code, 400)
+        start_poll.assert_not_called()
+
+    def test_ping_event_is_successful_without_trigger(self):
+        body = json.dumps({"zen": "hi"}).encode("utf-8")
+        with patch.dict(os.environ, {api.GITHUB_WEBHOOK_SECRET_ENV: "webhook-secret"}, clear=False):
+            with patch("api._start_mailbox_webhook_poll") as start_poll:
+                response = self.client.post(self.WEBHOOK_PATH, data=body, headers=self._signed_headers(body, secret="webhook-secret", event="ping"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "pong")
+        start_poll.assert_not_called()
+
+    def test_push_without_inbox_added_or_modified_is_ignored(self):
+        outbox_payload = {"commits": [{"added": ["outbox/result.md"], "modified": [], "removed": []}]}
+        archive_payload = {"commits": [{"added": [], "modified": ["archive/old.md"], "removed": []}]}
+        inbox_delete_payload = {"commits": [{"added": [], "modified": [], "removed": ["inbox/deleted.md"]}]}
+        with patch.dict(os.environ, {api.GITHUB_WEBHOOK_SECRET_ENV: "webhook-secret"}, clear=False):
+            with patch("api._start_mailbox_webhook_poll") as start_poll:
+                for payload in (outbox_payload, archive_payload, inbox_delete_payload):
+                    body = json.dumps(payload).encode("utf-8")
+                    response = self.client.post(self.WEBHOOK_PATH, data=body, headers=self._signed_headers(body, secret="webhook-secret"))
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["status"], "ignored")
+        start_poll.assert_not_called()
+
+    def test_busy_poll_does_not_start_processing_twice(self):
+        with patch(
+            "api.run_mailbox_poll_once",
+            return_value=MailboxPollRunResult(status="busy"),
+        ) as shared_runner:
+            api._run_mailbox_poll_once_for_webhook()
+        shared_runner.assert_called_once()
+
+    def test_rejection_logs_never_include_secret_or_payload_content(self):
+        secret = "top-secret"
+        payload_text = "inbox payload should not appear in logs"
+        payload = {"commits": [{"added": ["inbox/new.md"]}], "body": payload_text}
+        body = json.dumps(payload).encode("utf-8")
+        bad_signature = "sha256=leaked-signature-value"
+        headers = {"x-github-event": "push", "x-hub-signature-256": bad_signature, "content-type": "application/json"}
+        with patch.dict(os.environ, {api.GITHUB_WEBHOOK_SECRET_ENV: secret}, clear=False):
+            with self.assertLogs("api", level="WARNING") as logs:
+                response = self.client.post(self.WEBHOOK_PATH, data=body, headers=headers)
+        self.assertEqual(response.status_code, 401)
+        serialized = "\n".join(logs.output)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(bad_signature, serialized)
+        self.assertNotIn(payload_text, serialized)
 
 
 class WebClientTests(ApiTestsBase):

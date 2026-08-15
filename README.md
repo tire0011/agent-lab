@@ -106,6 +106,7 @@ CLI runner):
 
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
+- Optional for GitHub mailbox webhook: `AGENT_GITHUB_WEBHOOK_SECRET=<value>`
 - Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests`
 
 ## Adding ideas
@@ -176,6 +177,7 @@ All endpoints require the `x-api-key` header.
 - `GET /mailbox/tasks/{id}` — fetch one approval.
 - `POST /mailbox/tasks/{id}/approve` — approve; triggers `ExperimentService` in background.
 - `POST /mailbox/tasks/{id}/reject` — reject (`{"reason": "..."}`).
+- `POST /mailbox/webhook/github` — GitHub webhook trigger (`X-Hub-Signature-256`, HMAC-SHA256).
 
 State machine: `pending_approval → approved → submitted → running → succeeded / failed / needs_review`.
 A background `MailboxTaskWorker` daemon (10 s poll interval) calls
