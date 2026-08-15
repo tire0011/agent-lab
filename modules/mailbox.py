@@ -1013,7 +1013,7 @@ class MailboxProcessor:
                     logger.warning(
                         "Failed to commit IDEAS.md to code repo for mailbox row %s", msg_id
                     )
-
+                    return False
         self.conn.execute(
             "UPDATE mailbox_messages SET status=? WHERE id=?",
             (STATUS_DONE, msg_id),
