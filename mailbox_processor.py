@@ -98,12 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
 
-    mailbox_config = MailboxConfig(
-        code_repo_path=code_repo_path,
-        mailbox_repo_path=mailbox_repo_path,
-        inbox_dir=mailbox_repo_path / "communication" / "inbox",
-        outbox_dir=mailbox_repo_path / "communication" / "outbox",
-    )
+    mailbox_config = MailboxConfig.from_paths(code_repo_path, mailbox_repo_path)
 
     lock = MailboxLock(lock_path)
     if not lock.acquire():

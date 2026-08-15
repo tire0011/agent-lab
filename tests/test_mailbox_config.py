@@ -90,9 +90,9 @@ class TestMailboxConfigDefaults(unittest.TestCase):
             cfg = MailboxConfig.from_env()
             self.assertEqual(cfg.code_repo_path, Path("/code"))
             self.assertEqual(cfg.mailbox_repo_path, Path("/mailbox"))
-            # Default layout under mailbox repo
-            self.assertEqual(cfg.inbox_dir, Path("/mailbox/communication/inbox"))
-            self.assertEqual(cfg.outbox_dir, Path("/mailbox/communication/outbox"))
+            # Separate-repo external layout: inbox/outbox directly at mailbox root
+            self.assertEqual(cfg.inbox_dir, Path("/mailbox/inbox"))
+            self.assertEqual(cfg.outbox_dir, Path("/mailbox/outbox"))
         finally:
             for k, v in old.items():
                 if v is not None:
@@ -573,6 +573,202 @@ class TestLegacySingleRepoMode(unittest.TestCase):
             self.assertEqual(svc.outbox_dir, tmp / "communication" / "outbox")
         finally:
             svc.close()
+
+
+# ---------------------------------------------------------------------------
+# 11. Regression tests: env vars, CLI, two-repo end-to-end, cross-repo
+#     isolation
+# ---------------------------------------------------------------------------
+
+_MESSAGE_TMPL = """\
+---
+type: question
+created_by: test-agent
+---
+
+What is 2+2?
+"""
+
+
+def _make_external_mailbox_repo(path: Path) -> None:
+    """Create a mailbox repo with direct inbox/ outbox/ layout."""
+    path.mkdir(parents=True, exist_ok=True)
+    _run_git(["init"], path)
+    _run_git(["config", "user.email", "test@test.com"], path)
+    _run_git(["config", "user.name", "Test"], path)
+    (path / "inbox").mkdir()
+    (path / "outbox").mkdir()
+    (path / "inbox" / ".gitkeep").write_text("")
+    (path / "outbox" / ".gitkeep").write_text("")
+    _run_git(["add", "-A"], path)
+    _run_git(["commit", "-m", "init mailbox"], path)
+
+
+class TestEnvVarDirectExternalPaths(unittest.TestCase):
+    """from_env() with separate env vars produces direct inbox/outbox paths."""
+
+    def _set_env(self, code: str, mailbox: str):
+        self._old = {k: os.environ.pop(k, None)
+                     for k in ("AGENT_CODE_REPO_PATH", "AGENT_MAILBOX_REPO_PATH")}
+        os.environ["AGENT_CODE_REPO_PATH"] = code
+        os.environ["AGENT_MAILBOX_REPO_PATH"] = mailbox
+
+    def _restore_env(self):
+        for k, v in self._old.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+    def test_separate_repos_produce_direct_external_paths(self):
+        """AGENT_MAILBOX_REPO_PATH=/var/lib/nexus/mailbox-repo gives direct inbox/outbox."""
+        self._set_env("/agent", "/var/lib/nexus/mailbox-repo")
+        try:
+            cfg = MailboxConfig.from_env()
+            self.assertEqual(cfg.inbox_dir, Path("/var/lib/nexus/mailbox-repo/inbox"))
+            self.assertEqual(cfg.outbox_dir, Path("/var/lib/nexus/mailbox-repo/outbox"))
+            self.assertTrue(cfg.repos_are_separate)
+        finally:
+            self._restore_env()
+
+    def test_same_env_paths_produce_legacy_layout(self):
+        """When both env vars point to the same path, the legacy layout is used."""
+        self._set_env("/agent", "/agent")
+        try:
+            cfg = MailboxConfig.from_env()
+            self.assertEqual(cfg.inbox_dir, Path("/agent/communication/inbox"))
+            self.assertEqual(cfg.outbox_dir, Path("/agent/communication/outbox"))
+            self.assertFalse(cfg.repos_are_separate)
+        finally:
+            self._restore_env()
+
+    def test_from_paths_separate_gives_external_layout(self):
+        cfg = MailboxConfig.from_paths(Path("/code"), Path("/mailbox"))
+        self.assertEqual(cfg.inbox_dir, Path("/mailbox/inbox"))
+        self.assertEqual(cfg.outbox_dir, Path("/mailbox/outbox"))
+        self.assertTrue(cfg.repos_are_separate)
+
+    def test_from_paths_same_gives_legacy_layout(self):
+        cfg = MailboxConfig.from_paths(Path("/agent"), Path("/agent"))
+        self.assertEqual(cfg.inbox_dir, Path("/agent/communication/inbox"))
+        self.assertEqual(cfg.outbox_dir, Path("/agent/communication/outbox"))
+        self.assertFalse(cfg.repos_are_separate)
+
+
+class TestCLIPathResolution(unittest.TestCase):
+    """CLI path resolution via mailbox_processor.main() uses from_paths() logic."""
+
+    def test_explicit_separate_flags_produce_direct_external_paths(self):
+        """--code-repo-path + --mailbox-repo-path produces external layout paths."""
+        # We cannot run the full processor without a real repo, but we CAN
+        # inspect how from_paths() would resolve the paths, mirroring what
+        # mailbox_processor.main() will do via from_paths().
+        cfg = MailboxConfig.from_paths(Path("/agent"), Path("/var/lib/nexus/mailbox-repo"))
+        self.assertEqual(cfg.inbox_dir, Path("/var/lib/nexus/mailbox-repo/inbox"))
+        self.assertEqual(cfg.outbox_dir, Path("/var/lib/nexus/mailbox-repo/outbox"))
+
+    def test_repo_path_alias_produces_legacy_layout(self):
+        """--repo-path (alias) sets both paths to the same value → legacy layout."""
+        cfg = MailboxConfig.from_paths(Path("/agent"), Path("/agent"))
+        self.assertEqual(cfg.inbox_dir, Path("/agent/communication/inbox"))
+        self.assertEqual(cfg.outbox_dir, Path("/agent/communication/outbox"))
+
+    def test_explicit_conflict_rejected(self):
+        """--repo-path combined with --code-repo-path is rejected by the CLI."""
+        import mailbox_processor
+        with self.assertRaises(SystemExit) as ctx:
+            mailbox_processor.main(
+                ["--repo-path", "/x", "--code-repo-path", "/y", "--db-path", "/tmp/x.db"]
+            )
+        self.assertNotEqual(ctx.exception.code, 0)
+
+
+class TestTwoRepoEndToEndCommit(unittest.TestCase):
+    """Process and commit a message in two separate temp repos; prove no
+    cross-repo writes occur.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.code_repo = self.tmp / "code"
+        self.mailbox_repo = self.tmp / "mailbox"
+        _make_git_repo(self.code_repo)
+        _make_ideas_md(self.code_repo)
+        _make_external_mailbox_repo(self.mailbox_repo)
+        self.db_path = str(self.tmp / "test.db")
+        init_db(self.db_path)
+
+    def _list_committed_files(self, repo: Path) -> set[str]:
+        """Return relative paths of all files tracked in HEAD."""
+        result = _run_git(["ls-tree", "-r", "--name-only", "HEAD"], repo)
+        return set(result.stdout.strip().splitlines())
+
+    def test_commit_allowlist_accepts_direct_inbox_outbox(self):
+        """git_add_and_commit accepts inbox/<file> and outbox/<file>."""
+        from modules.mailbox import git_add_and_commit
+
+        inbox_file = self.mailbox_repo / "inbox" / "msg.md"
+        inbox_file.write_text(_MESSAGE_TMPL)
+
+        cfg = MailboxConfig.from_paths(self.code_repo, self.mailbox_repo)
+        extra = frozenset(
+            str(d.relative_to(self.mailbox_repo))
+            for d in (cfg.inbox_dir, cfg.outbox_dir)
+        )
+        # Should NOT raise PermissionError
+        result = git_add_and_commit(
+            self.mailbox_repo, [inbox_file], "test: direct inbox commit", extra
+        )
+        self.assertTrue(result)
+        committed = self._list_committed_files(self.mailbox_repo)
+        self.assertIn("inbox/msg.md", committed)
+
+    def test_commit_allowlist_rejects_arbitrary_paths(self):
+        """git_add_and_commit rejects paths outside inbox/outbox."""
+        from modules.mailbox import ALLOWED_WRITE_PATHS, git_add_and_commit
+
+        # Use a filename that is demonstrably absent from both the static
+        # allowlist and the extra prefixes, so the assertion cannot be
+        # vacuously satisfied by an unexpected allowlist entry.
+        rogue_name = "rogue_not_in_allowlist.txt"
+        self.assertNotIn(rogue_name, ALLOWED_WRITE_PATHS)
+        rogue = self.mailbox_repo / rogue_name
+        rogue.write_text("very secret")
+        with self.assertRaises(PermissionError):
+            git_add_and_commit(
+                self.mailbox_repo, [rogue], "should fail", frozenset({"inbox", "outbox"})
+            )
+
+    def test_no_mailbox_file_written_to_code_repo(self):
+        """After processing, no inbox/outbox file exists in the code repo."""
+        # Simulate what MailboxProcessor.process_inbox would do:
+        # write a message to mailbox_repo/inbox and commit it there.
+        from modules.mailbox import git_add_and_commit
+
+        inbox_msg = self.mailbox_repo / "inbox" / "test-msg.md"
+        inbox_msg.write_text(_MESSAGE_TMPL)
+
+        cfg = MailboxConfig.from_paths(self.code_repo, self.mailbox_repo)
+        extra = frozenset(
+            str(d.relative_to(self.mailbox_repo))
+            for d in (cfg.inbox_dir, cfg.outbox_dir)
+        )
+        git_add_and_commit(self.mailbox_repo, [inbox_msg], "mailbox: commit msg", extra)
+
+        # Code repo must not contain any inbox/outbox files
+        code_files = self._list_committed_files(self.code_repo)
+        mailbox_files = self._list_committed_files(self.mailbox_repo)
+        for f in code_files:
+            self.assertNotIn("inbox", f.split("/"), msg=f"inbox file in code repo: {f}")
+            self.assertNotIn("outbox", f.split("/"), msg=f"outbox file in code repo: {f}")
+        self.assertIn("inbox/test-msg.md", mailbox_files)
+
+    def test_legacy_defaults_unchanged(self):
+        """MailboxConfig.from_paths with same path → legacy communication/* layout."""
+        cfg = MailboxConfig.from_paths(self.code_repo, self.code_repo)
+        self.assertEqual(cfg.inbox_dir, self.code_repo / "communication" / "inbox")
+        self.assertEqual(cfg.outbox_dir, self.code_repo / "communication" / "outbox")
+        self.assertFalse(cfg.repos_are_separate)
 
 
 if __name__ == "__main__":

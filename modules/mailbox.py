@@ -328,13 +328,33 @@ def git_pull_ff_only(repo_path: Path) -> bool:
     return True
 
 
-def git_add_and_commit(repo_path: Path, files: list[Path], message: str) -> bool:
-    """Stage only allowed files and commit. Return True on success."""
+def git_add_and_commit(
+    repo_path: Path,
+    files: list[Path],
+    message: str,
+    extra_allowed_prefixes: frozenset[str] | None = None,
+) -> bool:
+    """Stage only allowed files and commit. Return True on success.
+
+    *extra_allowed_prefixes* may extend the module-level ``ALLOWED_WRITE_PATHS``
+    allowlist to accommodate the external-repo layout (where inbox/outbox sit
+    directly at the repository root rather than under ``communication/``).  Each
+    entry is matched against the top-level path component of the relative file
+    path; no shell globbing or traversal is permitted.
+    """
+    effective_allowed = ALLOWED_WRITE_PATHS | (extra_allowed_prefixes or frozenset())
     for f in files:
         rel = f.relative_to(repo_path)
         parts = str(rel).split("/")
-        top = parts[0] if len(parts) == 1 else "/".join(parts[:2])
-        if top not in ALLOWED_WRITE_PATHS and str(rel) not in ALLOWED_WRITE_PATHS:
+        # Match single-component prefix (e.g. "inbox") OR two-component prefix
+        # (e.g. "communication/inbox") OR the exact relative path (e.g. "IDEAS.md").
+        # For root-level files (len(parts)==1) top2 equals top1; that is
+        # intentional — the exact-path check further below covers those.
+        top1 = parts[0]
+        top2 = "/".join(parts[:2]) if len(parts) >= 2 else top1
+        if (top1 not in effective_allowed
+                and top2 not in effective_allowed
+                and str(rel) not in effective_allowed):
             raise PermissionError(f"Not allowed to commit: {rel}")
         if f.exists():
             _git(["add", "--", str(rel)], repo_path)
@@ -732,6 +752,13 @@ class MailboxProcessor:
             self.repo_path = repo_path
             self.inbox = repo_path / "communication" / "inbox"
             self.outbox = repo_path / "communication" / "outbox"
+        # Compute per-instance commit allowlist from configured inbox/outbox paths
+        # so that external repos (direct inbox/ outbox/ layout) are handled
+        # without weakening the global ALLOWED_WRITE_PATHS constant.
+        self._mailbox_commit_prefixes: frozenset[str] = frozenset(
+            str(d.relative_to(self._mailbox_repo_path))
+            for d in (self.inbox, self.outbox)
+        )
         self.db_path = db_path
         self.dry_run = dry_run
         self.operation_chain_service = operation_chain_service
@@ -1002,10 +1029,12 @@ class MailboxProcessor:
         if self._mailbox_repo_path == self._code_repo_path:
             if msg_type == "idea":
                 mailbox_files.append(self._code_repo_path / "IDEAS.md")
-            if not git_add_and_commit(self._mailbox_repo_path, mailbox_files, commit_msg):
+            if not git_add_and_commit(self._mailbox_repo_path, mailbox_files, commit_msg,
+                                      self._mailbox_commit_prefixes):
                 return False
         else:
-            if not git_add_and_commit(self._mailbox_repo_path, mailbox_files, commit_msg):
+            if not git_add_and_commit(self._mailbox_repo_path, mailbox_files, commit_msg,
+                                      self._mailbox_commit_prefixes):
                 return False
             if msg_type == "idea":
                 ideas_path = self._code_repo_path / "IDEAS.md"
@@ -1131,7 +1160,8 @@ class MailboxProcessor:
         commit_msg = (
             f"mailbox: process {msg_type} from {created_by} [{file_path.name}]"
         )
-        if not git_add_and_commit(self._mailbox_repo_path, [file_path], commit_msg):
+        if not git_add_and_commit(self._mailbox_repo_path, [file_path], commit_msg,
+                                  self._mailbox_commit_prefixes):
             return False
 
         self.conn.execute(

@@ -8,9 +8,18 @@ Environment variables:
     AGENT_CODE_REPO_PATH    – root of the code checkout (default: /agent)
     AGENT_MAILBOX_REPO_PATH – root of the mailbox checkout (default: /agent)
 
-When both variables are unset, the defaults reproduce the legacy layout:
-    inbox  → /agent/communication/inbox
-    outbox → /agent/communication/outbox
+Path resolution rules
+---------------------
+* **Single-repo (legacy) layout** — both paths point to the same directory:
+    inbox  → ``<repo>/communication/inbox``
+    outbox → ``<repo>/communication/outbox``
+
+* **Separate-repo (external) layout** — paths differ:
+    inbox  → ``<mailbox_repo>/inbox``
+    outbox → ``<mailbox_repo>/outbox``
+
+The external mailbox repository is expected to contain ``inbox/``, ``outbox/``,
+and ``archive/`` at its root, not nested under ``communication/``.
 """
 
 from __future__ import annotations
@@ -45,21 +54,43 @@ class MailboxConfig:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_env(cls) -> "MailboxConfig":
-        """Build from environment variables.
+    def from_paths(cls, code_path: Path, mailbox_path: Path) -> "MailboxConfig":
+        """Build from explicit Path objects, applying the layout selection rule.
 
-        Reproduces the legacy single-repo layout when neither variable is set:
-            inbox  → ``mailbox_repo_path / communication / inbox``
-            outbox → ``mailbox_repo_path / communication / outbox``
+        When *code_path* and *mailbox_path* resolve to the same directory the
+        legacy layout is used (``communication/inbox``, ``communication/outbox``).
+        When they differ, the external layout is used (``inbox``, ``outbox`` at
+        the root of the mailbox repository).
+        """
+        separate = code_path.resolve() != mailbox_path.resolve()
+        if separate:
+            inbox_dir = mailbox_path / "inbox"
+            outbox_dir = mailbox_path / "outbox"
+        else:
+            inbox_dir = mailbox_path / "communication" / "inbox"
+            outbox_dir = mailbox_path / "communication" / "outbox"
+        return cls(
+            code_repo_path=code_path,
+            mailbox_repo_path=mailbox_path,
+            inbox_dir=inbox_dir,
+            outbox_dir=outbox_dir,
+        )
+
+    @classmethod
+    def from_env(cls) -> "MailboxConfig":
+        """Build from environment variables, applying the layout selection rule.
+
+        Single-repo (legacy) layout when both variables are unset or equal:
+            inbox  → ``/agent/communication/inbox``
+            outbox → ``/agent/communication/outbox``
+
+        Separate-repo (external) layout when the variables differ:
+            inbox  → ``<AGENT_MAILBOX_REPO_PATH>/inbox``
+            outbox → ``<AGENT_MAILBOX_REPO_PATH>/outbox``
         """
         code = Path(os.environ.get("AGENT_CODE_REPO_PATH", _DEFAULT_REPO))
         mailbox = Path(os.environ.get("AGENT_MAILBOX_REPO_PATH", _DEFAULT_REPO))
-        return cls(
-            code_repo_path=code,
-            mailbox_repo_path=mailbox,
-            inbox_dir=mailbox / "communication" / "inbox",
-            outbox_dir=mailbox / "communication" / "outbox",
-        )
+        return cls.from_paths(code, mailbox)
 
     @classmethod
     def legacy(cls, repo_path: Path) -> "MailboxConfig":
