@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from modules.redaction import redact as _redact
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -376,7 +378,7 @@ def git_push(repo_path: Path) -> bool:
     """Push to the tracked remote branch (no --force). Return True on success."""
     result = _git(["push"], repo_path, check=False)
     if result.returncode != 0:
-        logger.warning("git push failed: %s", result.stderr.strip())
+        logger.warning("git push failed: %s", _redact(result.stderr.strip())[:500])
         return False
     return True
 

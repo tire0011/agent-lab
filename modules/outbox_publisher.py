@@ -613,7 +613,7 @@ class _TablePublisher(OutboxPublisher):
                     publish_retry_count = publish_retry_count + 1,
                     updated_at = datetime('now')
                 WHERE {self._ID_COLUMN} = ?""",
-            (PUBLISH_FAILED, error[:500], record.record_id),
+            (PUBLISH_FAILED, _redact(error)[:500], record.record_id),
         )
         self._conn.commit()
 

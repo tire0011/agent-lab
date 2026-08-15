@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -72,9 +73,11 @@ from models import (
     PublicExperimentSummary,
     StatusResponse,
 )
+from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
 from modules import experiment_logger as experiment_logger_module
 
 _PROCESS_START_TIME = time.time()
+_logger = logging.getLogger(__name__)
 
 
 
@@ -207,6 +210,22 @@ async def lifespan(app: FastAPI):
     mts.recover_after_restart()
     _resolve_experiment_adoption_service().recover_after_restart()
     _resolve_operation_chain_service().recover_after_restart()
+
+    # Best-effort outbox recovery: publish any un-pushed outbox records from
+    # a previous crash.  Both publishers share the same MailboxConfig / DB.
+    _mc = MailboxConfig.from_env()
+    for _pub_cls in (OperationChainOutboxPublisher, TaskApprovalOutboxPublisher):
+        _pub = _pub_cls(mailbox_config=_mc)
+        _cls_name = getattr(_pub_cls, "__name__", repr(_pub_cls))
+        try:
+            _pub.publish_pending()
+        except Exception:
+            _logger.warning(
+                "Startup outbox recovery failed for %s", _cls_name, exc_info=True
+            )
+        finally:
+            _pub.close()
+
     worker = MailboxTaskWorker(mts)
     worker.start()
     yield

@@ -853,5 +853,148 @@ class TestGitDiffCheckClean(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+# ============================================================================
+# Push-error redaction  (AC #14)
+# ============================================================================
+
+
+class TestPushErrorRedaction(unittest.TestCase):
+    """push_last_error and log messages must never contain raw credentials."""
+
+    # Each tuple: (error_text, secret_fragment_that_must_not_survive_redaction)
+    _CASES = [
+        # keyword=value token
+        (
+            "fatal: remote: token=ghp_abcXYZ123456789abcdef access denied",
+            "ghp_abcXYZ123456789abcdef",
+        ),
+        # OpenAI-style sk- key
+        (
+            "push rejected: sk-abcdefghijklmnopqrstuvwxyz1234 is invalid",
+            "sk-abcdefghijklmnopqrstuvwxyz1234",
+        ),
+        # OAuth bearer token (older git that does not mask the value)
+        (
+            "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz12 push rejected",
+            "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz12",
+        ),
+    ]
+
+    def setUp(self):
+        self.ctx = tempfile.TemporaryDirectory()
+        tmp = Path(self.ctx.name)
+        self.repo, _ = _make_repo_with_remote(tmp)
+        self.db = str(tmp / "state.db")
+        self.cfg = _legacy_config(self.repo)
+
+    def tearDown(self):
+        self.ctx.cleanup()
+
+    # ---- helpers --------------------------------------------------------
+
+    def _make_chain_pub(self) -> OperationChainOutboxPublisher:
+        return OperationChainOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
+
+    def _make_dummy_record(self, record_id: str, outbox_rel: str) -> "PublishRecord":
+        return PublishRecord(
+            record_id=record_id,
+            outbox_file=outbox_rel,
+            publish_status=PUBLISH_WRITTEN,
+            publish_commit_sha=None,
+            publish_retry_count=0,
+            content_fn=None,
+        )
+
+    def _check_no_secret(self, text: str | None, secret_fragment: str, label: str) -> None:
+        if text is None:
+            return
+        self.assertNotIn(
+            secret_fragment,
+            text,
+            f"{label} must not contain raw secret fragment '{secret_fragment}'",
+        )
+
+    # ---- DB persistence tests -------------------------------------------
+
+    def test_on_error_redacts_credential_in_db(self):
+        """publish_last_error must not contain raw credentials for any error shape."""
+        import logging as _logging
+        from unittest.mock import patch
+
+        for i, (error_text, secret) in enumerate(self._CASES):
+            record_id = f"r-cred-{i}"
+            outbox_rel = f"communication/outbox/cred{i}.md"
+            _insert_chain(self.db, record_id, outbox_rel, publish_status=PUBLISH_WRITTEN)
+
+            pub = self._make_chain_pub()
+            try:
+                record = self._make_dummy_record(record_id, outbox_rel)
+                # Silence the logger.error() call so test output stays clean
+                with patch.object(
+                    _logging.getLogger("modules.outbox_publisher"), "error"
+                ):
+                    pub._on_error(record, error_text)
+            finally:
+                pub.close()
+
+            row = _get_chain(self.db, record_id)
+            stored = row.get("publish_last_error", "") or ""
+            with self.subTest(case=i, secret=secret):
+                self._check_no_secret(stored, secret, "DB publish_last_error")
+                self.assertIn("[REDACTED]", stored, "Redacted placeholder absent from DB")
+
+    # ---- Log message tests ----------------------------------------------
+
+    def test_on_error_redacts_credential_in_log(self):
+        """logger.error() must not emit raw credentials for any push error shape."""
+        import logging as _logging
+        from unittest.mock import patch
+
+        for i, (error_text, secret) in enumerate(self._CASES):
+            record_id = f"r-log-{i}"
+            outbox_rel = f"communication/outbox/log{i}.md"
+            _insert_chain(self.db, record_id, outbox_rel, publish_status=PUBLISH_WRITTEN)
+
+            pub = self._make_chain_pub()
+            try:
+                record = self._make_dummy_record(record_id, outbox_rel)
+                with patch.object(
+                    _logging.getLogger("modules.outbox_publisher"), "error"
+                ) as mock_log:
+                    pub._on_error(record, error_text)
+                    self.assertTrue(mock_log.called)
+                    log_call = mock_log.call_args
+                    fmt = log_call.args[0] % log_call.args[1:]
+                    with self.subTest(case=i, secret=secret):
+                        self._check_no_secret(fmt, secret, "log message")
+                        self.assertIn("[REDACTED]", fmt, "Redacted placeholder absent from log")
+            finally:
+                pub.close()
+
+    def test_git_push_log_redacts_credential_stderr(self):
+        """mailbox.git_push() must redact credential-containing stderr before logging."""
+        import logging as _logging
+        from unittest.mock import patch, MagicMock
+
+        from modules import mailbox as _mailbox
+
+        for error_text, secret in self._CASES:
+            fake_result = MagicMock()
+            fake_result.returncode = 1
+            fake_result.stderr = error_text
+
+            with patch.object(
+                _logging.getLogger("modules.mailbox"), "warning"
+            ) as mock_warn, patch("modules.mailbox._git", return_value=fake_result):
+                _mailbox.git_push(self.repo)
+
+            self.assertTrue(mock_warn.called)
+            log_call = mock_warn.call_args
+            fmt = log_call.args[0] % log_call.args[1:]
+            with self.subTest(secret=secret):
+                self._check_no_secret(fmt, secret, "git_push log")
+                self.assertIn("[REDACTED]", fmt, "Redacted placeholder absent from git_push log")
+
+
 if __name__ == "__main__":
     unittest.main()
