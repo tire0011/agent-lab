@@ -420,8 +420,9 @@ class OutboxPublisher:
             resolved_parent = path.parent.resolve()
         except OSError:
             resolved_parent = path.parent
-        rel_str = str(resolved_parent)
-        if not (rel_str == str(outbox_resolved) or rel_str.startswith(str(outbox_resolved) + os.sep)):
+        # Use is_relative_to to avoid false positives from string-prefix matching
+        # (e.g. /outbox_extra vs /outbox).
+        if resolved_parent != outbox_resolved and not resolved_parent.is_relative_to(outbox_resolved):
             raise ValueError("outbox path escapes outbox directory")
         if path.is_symlink():
             raise ValueError("symlinks are not allowed")
@@ -643,7 +644,7 @@ class OperationChainOutboxPublisher(_TablePublisher):
         ).fetchall()
         records = []
         for row in rows:
-            stored_content: str | None = row["outbox_content"] if "outbox_content" in row.keys() else None
+            stored_content: str | None = row["outbox_content"]
             content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
             records.append(PublishRecord(
                 record_id=row["request_id"],
@@ -685,7 +686,7 @@ class TaskApprovalOutboxPublisher(_TablePublisher):
         ).fetchall()
         records = []
         for row in rows:
-            stored_content: str | None = row["outbox_content"] if "outbox_content" in row.keys() else None
+            stored_content: str | None = row["outbox_content"]
             content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
             records.append(PublishRecord(
                 record_id=row["id"],
