@@ -99,10 +99,15 @@ class OperationChainService:
         repo_root: str = _DEFAULT_REPO_ROOT,
         outbox_dir: str = _DEFAULT_OUTBOX_DIR,
         operations_registry: OperationsRegistry | None = None,
+        mailbox_config: Any = None,
     ) -> None:
+        if mailbox_config is not None:
+            self.repo_root = mailbox_config.mailbox_repo_path
+            self.outbox_dir = mailbox_config.outbox_dir
+        else:
+            self.repo_root = Path(repo_root)
+            self.outbox_dir = Path(outbox_dir)
         self.db_path = db_path
-        self.repo_root = Path(repo_root)
-        self.outbox_dir = Path(outbox_dir)
         self.operations_registry = operations_registry
         # RLock (not Lock): several code paths call locked helper methods while
         # already holding the lock (e.g. the exception handler in

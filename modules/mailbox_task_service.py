@@ -24,7 +24,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from modules.run_store import init_db, DEFAULT_DB_PATH
 
@@ -103,11 +103,16 @@ class MailboxTaskService:
         experiment_service: "ExperimentService | None" = None,
         outbox_dir: str = "/agent/communication/outbox",
         repo_path: str = "/agent",
+        mailbox_config: "Any | None" = None,
     ) -> None:
         self.db_path = db_path
         self.experiment_service = experiment_service
-        self.outbox_dir = Path(outbox_dir)
-        self.repo_path = Path(repo_path)
+        if mailbox_config is not None:
+            self.outbox_dir = mailbox_config.outbox_dir
+            self.repo_path = mailbox_config.code_repo_path
+        else:
+            self.outbox_dir = Path(outbox_dir)
+            self.repo_path = Path(repo_path)
         self._lock = threading.Lock()
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row

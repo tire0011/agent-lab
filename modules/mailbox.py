@@ -717,10 +717,21 @@ class MailboxProcessor:
         db_path: str,
         dry_run: bool = False,
         operation_chain_service: Any = None,
+        mailbox_config: Any = None,
     ) -> None:
-        self.repo_path = repo_path
-        self.inbox = repo_path / "communication" / "inbox"
-        self.outbox = repo_path / "communication" / "outbox"
+        if mailbox_config is not None:
+            self._mailbox_repo_path: Path = mailbox_config.mailbox_repo_path
+            self._code_repo_path: Path = mailbox_config.code_repo_path
+            self.inbox = mailbox_config.inbox_dir
+            self.outbox = mailbox_config.outbox_dir
+            # Keep self.repo_path pointing at the mailbox repo for compat.
+            self.repo_path = mailbox_config.mailbox_repo_path
+        else:
+            self._mailbox_repo_path = repo_path
+            self._code_repo_path = repo_path
+            self.repo_path = repo_path
+            self.inbox = repo_path / "communication" / "inbox"
+            self.outbox = repo_path / "communication" / "outbox"
         self.db_path = db_path
         self.dry_run = dry_run
         self.operation_chain_service = operation_chain_service
@@ -745,16 +756,16 @@ class MailboxProcessor:
 
     def retry_unpushed_commits(self) -> None:
         """Attempt to push if there are local commits not yet on remote."""
-        result = _git(["log", "@{u}..", "--oneline"], self.repo_path, check=False)
+        result = _git(["log", "@{u}..", "--oneline"], self._mailbox_repo_path, check=False)
         if result.returncode == 0 and result.stdout.strip():
             logger.info("Retrying push of unpushed commits")
-            git_push(self.repo_path)
+            git_push(self._mailbox_repo_path)
 
     def pull(self) -> bool:
-        return git_pull_ff_only(self.repo_path)
+        return git_pull_ff_only(self._mailbox_repo_path)
 
     def ensure_clean_worktree(self) -> bool:
-        return git_is_clean(self.repo_path)
+        return git_is_clean(self._mailbox_repo_path)
 
     def retry_pending_git_commits(self) -> None:
         rows = self.conn.execute(
@@ -840,7 +851,7 @@ class MailboxProcessor:
         return True
 
     def _process_file(self, file_path: Path) -> dict[str, Any]:
-        rel = str(file_path.relative_to(self.repo_path))
+        rel = str(file_path.relative_to(self._mailbox_repo_path))
 
         existing = self._get_existing_record(file_path)
         if existing:
@@ -873,7 +884,7 @@ class MailboxProcessor:
             self._record_failure(file_path, str(exc), existing)
             return {"file": rel, "status": "failed", "error": str(exc)}
 
-        commit_sha = git_current_commit(self.repo_path)
+        commit_sha = git_current_commit(self._mailbox_repo_path)
         now = _now_iso()
 
         # Upsert DB record as processing
@@ -899,7 +910,7 @@ class MailboxProcessor:
         try:
             if msg.msg_type == "operation_chain":
                 chain_outcome = _process_operation_chain(
-                    msg, self.repo_path, self.conn, db_msg_id,
+                    msg, self._code_repo_path, self.conn, db_msg_id,
                     operation_chain_service=self.operation_chain_service,
                 )
                 return self._handle_chain_outcome(
@@ -907,7 +918,7 @@ class MailboxProcessor:
                 )
             else:
                 processor = _PROCESSORS[msg.msg_type]
-                result_body, idea_id = processor(msg, self.repo_path, self.conn, db_msg_id)
+                result_body, idea_id = processor(msg, self._code_repo_path, self.conn, db_msg_id)
         except Exception as exc:
             logger.exception("Error processing %s", file_path)
             self._record_failure(file_path, str(exc), {"id": db_msg_id})
@@ -980,21 +991,35 @@ class MailboxProcessor:
         if file_path.exists():
             file_path.unlink()
 
-        files_to_commit: list[Path] = [file_path, outbox_path]
-        if msg_type == "idea":
-            files_to_commit.append(self.repo_path / "IDEAS.md")
         commit_msg = (
             f"mailbox: process {msg_type} from {created_by} [{Path(file_path).name}]"
         )
-        if not git_add_and_commit(self.repo_path, files_to_commit, commit_msg):
-            return False
+
+        # When code and mailbox repos are the same, commit everything together
+        # (backward-compatible legacy behaviour).  When they are separate,
+        # commit inbox/outbox to the mailbox repo and IDEAS.md to the code repo.
+        mailbox_files: list[Path] = [file_path, outbox_path]
+        if self._mailbox_repo_path == self._code_repo_path:
+            if msg_type == "idea":
+                mailbox_files.append(self._code_repo_path / "IDEAS.md")
+            if not git_add_and_commit(self._mailbox_repo_path, mailbox_files, commit_msg):
+                return False
+        else:
+            if not git_add_and_commit(self._mailbox_repo_path, mailbox_files, commit_msg):
+                return False
+            if msg_type == "idea":
+                ideas_path = self._code_repo_path / "IDEAS.md"
+                if not git_add_and_commit(self._code_repo_path, [ideas_path], commit_msg):
+                    logger.warning(
+                        "Failed to commit IDEAS.md to code repo for mailbox row %s", msg_id
+                    )
 
         self.conn.execute(
             "UPDATE mailbox_messages SET status=? WHERE id=?",
             (STATUS_DONE, msg_id),
         )
         self.conn.commit()
-        git_push(self.repo_path)
+        git_push(self._mailbox_repo_path)
         return True
 
     def _handle_chain_outcome(
@@ -1106,7 +1131,7 @@ class MailboxProcessor:
         commit_msg = (
             f"mailbox: process {msg_type} from {created_by} [{file_path.name}]"
         )
-        if not git_add_and_commit(self.repo_path, [file_path], commit_msg):
+        if not git_add_and_commit(self._mailbox_repo_path, [file_path], commit_msg):
             return False
 
         self.conn.execute(
@@ -1114,7 +1139,7 @@ class MailboxProcessor:
             (STATUS_DONE, msg_id),
         )
         self.conn.commit()
-        git_push(self.repo_path)
+        git_push(self._mailbox_repo_path)
         return True
 
     def _record_failure(

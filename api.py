@@ -20,6 +20,7 @@ from modules.codex_task_service import (
     TaskNotFoundError,
     TaskNotRunnableError,
 )
+from modules.mailbox_config import MailboxConfig
 from modules.mailbox_task_service import (
     ApprovalNotFoundError,
     ApprovalStateError,
@@ -122,7 +123,10 @@ def get_mailbox_task_service() -> MailboxTaskService:
 
     Overridable in tests via ``app.dependency_overrides[get_mailbox_task_service]``.
     """
-    return MailboxTaskService(experiment_service=_resolve_experiment_service())
+    return MailboxTaskService(
+        experiment_service=_resolve_experiment_service(),
+        mailbox_config=MailboxConfig.from_env(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -142,6 +146,7 @@ def get_operation_chain_service() -> OperationChainService:
     """Singleton operation chain service for the process."""
     return OperationChainService(
         operations_registry=_resolve_operations_service(),
+        mailbox_config=MailboxConfig.from_env(),
     )
 
 
@@ -212,7 +217,7 @@ app = FastAPI(lifespan=lifespan)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-_OUTBOX_DIR = Path(__file__).resolve().parent / "communication" / "outbox"
+_OUTBOX_DIR = MailboxConfig.from_env().outbox_dir
 
 API_KEY = os.environ["AGENT_API_KEY"]
 
