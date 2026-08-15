@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.mailbox import git_push
+from modules.redaction import redact as _redact_full
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ class PublishRecord:
 # ---------------------------------------------------------------------------
 
 
-class _RepoLock:
+class RepoLock:
     """Advisory per-repo file lock (fcntl.LOCK_EX) for write/commit/push."""
 
     def __init__(self, repo_root: Path) -> None:
@@ -123,7 +124,7 @@ class _RepoLock:
             os.close(self._fd)
             self._fd = None
 
-    def __enter__(self) -> "_RepoLock":
+    def __enter__(self) -> "RepoLock":
         self.acquire()
         return self
 
@@ -173,7 +174,7 @@ class OutboxPublisher:
         self._conn = init_db(db_path)
         self._conn.row_factory = sqlite3.Row
         self._db_path = db_path
-        self._repo_lock = _RepoLock(self._repo_root)
+        self._repo_lock = RepoLock(self._repo_root)
 
     def close(self) -> None:
         self._conn.close()
@@ -252,8 +253,15 @@ class OutboxPublisher:
 
     def _write_then_publish(self, record: PublishRecord) -> bool:
         """pending_write → write file → written → commit → push."""
-        rel = _safe_relative(record.outbox_file)
-        path = self._repo_root / rel
+        # Validate before any filesystem access.
+        try:
+            validated = self._validate_outbox_path_for_write(record.outbox_file)
+        except ValueError as exc:
+            self._on_error(record, str(exc))
+            logger.error("outbox publish rejected (%s): %s", record.record_id, _redact(str(exc)))
+            return False
+
+        path = validated
 
         if path.is_symlink():
             self._on_error(record, "symlinks are not allowed")
@@ -264,11 +272,11 @@ class OutboxPublisher:
             # before advancing the state).  Adopt as-is.
             self._advance_status(record, PUBLISH_WRITTEN)
             try:
-                validated = self._validate_outbox_path(record.outbox_file)
+                self._validate_outbox_path(record.outbox_file)
             except ValueError as exc:
                 self._on_error(record, str(exc))
                 return False
-            return self._commit_and_push(record, validated)
+            return self._commit_and_push(record, path)
 
         if record.content_fn is None:
             self._on_error(record, "file missing and no content_fn to recreate it")
@@ -292,12 +300,12 @@ class OutboxPublisher:
         self._advance_status(record, PUBLISH_WRITTEN)
 
         try:
-            validated = self._validate_outbox_path(record.outbox_file)
+            self._validate_outbox_path(record.outbox_file)
         except ValueError as exc:
             self._on_error(record, str(exc))
             return False
 
-        return self._commit_and_push(record, validated)
+        return self._commit_and_push(record, path)
 
     def _commit_and_push(self, record: PublishRecord, path: Path) -> bool:
         """written/committing → commit → committed → push → pushed."""
@@ -327,7 +335,20 @@ class OutboxPublisher:
         return True
 
     def _push_and_record(self, record: PublishRecord) -> bool:
-        """committed → push only (commit already exists)."""
+        """committed → push only (commit already exists).
+
+        If the commit is already on the remote (push succeeded but DB update
+        crashed), we detect this via ``git branch -r --contains <sha>`` and
+        mark the record as pushed without a duplicate push.
+        """
+        sha = record.publish_commit_sha
+        if sha and self._commit_already_on_remote(sha):
+            logger.info(
+                "outbox publish: commit %s already on remote for %s; marking pushed",
+                sha[:12], record.record_id,
+            )
+            self._advance_status(record, PUBLISH_PUSHED)
+            return True
         if not git_push(self._repo_root):
             self._on_error(record, "git push failed")
             return False
@@ -376,6 +397,35 @@ class OutboxPublisher:
     # ------------------------------------------------------------------
     # Git helpers
     # ------------------------------------------------------------------
+
+    def _validate_outbox_path_for_write(self, outbox_file: str) -> Path:
+        """Validate path structure and containment *before* the file exists.
+
+        Unlike ``_validate_outbox_path`` this does not require the file to be
+        present on disk, making it safe to call at the start of
+        ``_write_then_publish`` before any directory/file is created.
+        """
+        rel = Path(outbox_file)
+        if rel.is_absolute():
+            raise ValueError("outbox path must be relative")
+        if any(part == ".." for part in rel.parts):
+            raise ValueError("outbox path must not contain path traversal segments")
+        if not rel.name.endswith(".md"):
+            raise ValueError(f"unexpected outbox filename: {rel.name!r}")
+        path = self._repo_root / rel
+        # Resolve parent dir (which must already exist or be creatable inside
+        # outbox) to check containment without requiring the file itself.
+        outbox_resolved = self._outbox_dir.resolve()
+        try:
+            resolved_parent = path.parent.resolve()
+        except OSError:
+            resolved_parent = path.parent
+        rel_str = str(resolved_parent)
+        if not (rel_str == str(outbox_resolved) or rel_str.startswith(str(outbox_resolved) + os.sep)):
+            raise ValueError("outbox path escapes outbox directory")
+        if path.is_symlink():
+            raise ValueError("symlinks are not allowed")
+        return path
 
     def _validate_outbox_path(self, outbox_file: str) -> Path:
         rel = Path(outbox_file)
@@ -484,6 +534,22 @@ class OutboxPublisher:
         )
         return result.stdout.strip()
 
+    def _commit_already_on_remote(self, sha: str) -> bool:
+        """Return True if *sha* is reachable from any remote-tracking branch.
+
+        This detects the "push succeeded, DB update crashed" scenario:
+        ``git push`` applied the commit but the process died before advancing
+        ``publish_status`` to ``pushed``.
+        """
+        result = subprocess.run(
+            ["git", "branch", "-r", "--contains", sha],
+            cwd=str(self._repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+
     # ------------------------------------------------------------------
     # DB state helpers (generic — callers supply their own SQL or use
     # the table-specific subclasses / wrapper methods below)
@@ -561,7 +627,7 @@ class OperationChainOutboxPublisher(_TablePublisher):
     def fetch_pending(self) -> list[PublishRecord]:
         rows = self._conn.execute(
             """SELECT request_id, outbox_file, publish_status,
-                      publish_commit_sha, publish_retry_count
+                      publish_commit_sha, publish_retry_count, outbox_content
                FROM operation_chains
                WHERE outbox_file IS NOT NULL
                  AND publish_status IN (?, ?, ?, ?, ?, ?)
@@ -575,16 +641,19 @@ class OperationChainOutboxPublisher(_TablePublisher):
                 PUBLISH_FAILED,
             ),
         ).fetchall()
-        return [
-            PublishRecord(
+        records = []
+        for row in rows:
+            stored_content: str | None = row["outbox_content"] if "outbox_content" in row.keys() else None
+            content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
+            records.append(PublishRecord(
                 record_id=row["request_id"],
                 outbox_file=row["outbox_file"],
                 publish_status=row["publish_status"],
                 publish_commit_sha=row["publish_commit_sha"],
                 publish_retry_count=row["publish_retry_count"] or 0,
-            )
-            for row in rows
-        ]
+                content_fn=content_fn,
+            ))
+        return records
 
     def publish_pending(self) -> int:
         return self.publish_many(self.fetch_pending())
@@ -600,7 +669,7 @@ class TaskApprovalOutboxPublisher(_TablePublisher):
     def fetch_pending(self) -> list[PublishRecord]:
         rows = self._conn.execute(
             """SELECT id, outbox_file, publish_status,
-                      publish_commit_sha, publish_retry_count
+                      publish_commit_sha, publish_retry_count, outbox_content
                FROM mailbox_task_approvals
                WHERE outbox_file IS NOT NULL
                  AND publish_status IN (?, ?, ?, ?, ?, ?)
@@ -614,16 +683,19 @@ class TaskApprovalOutboxPublisher(_TablePublisher):
                 PUBLISH_FAILED,
             ),
         ).fetchall()
-        return [
-            PublishRecord(
+        records = []
+        for row in rows:
+            stored_content: str | None = row["outbox_content"] if "outbox_content" in row.keys() else None
+            content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
+            records.append(PublishRecord(
                 record_id=row["id"],
                 outbox_file=row["outbox_file"],
                 publish_status=row["publish_status"],
                 publish_commit_sha=row["publish_commit_sha"],
                 publish_retry_count=row["publish_retry_count"] or 0,
-            )
-            for row in rows
-        ]
+                content_fn=content_fn,
+            ))
+        return records
 
     def publish_pending(self) -> int:
         return self.publish_many(self.fetch_pending())
@@ -640,4 +712,5 @@ def _safe_relative(outbox_file: str) -> Path:
 
 
 def _redact(value: str) -> str:
-    return value[:200]
+    """Scrub secrets/paths using the shared redaction module, then bound length."""
+    return _redact_full(value)[:500]

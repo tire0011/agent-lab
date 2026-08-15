@@ -276,6 +276,7 @@ _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS = [
     ("publish_pushed_at", "TEXT"),
     ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("publish_last_error", "TEXT"),
+    ("outbox_content", "TEXT"),
 ]
 
 
@@ -296,6 +297,7 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             rejection_reason TEXT NULL,
             experiment_id TEXT NULL,
             outbox_file TEXT NULL,
+            outbox_content TEXT NULL,
             publish_status TEXT NULL,
             publish_commit_sha TEXT NULL,
             publish_pushed_at TEXT NULL,
@@ -427,6 +429,7 @@ _OPERATION_CHAINS_ADDITIVE_COLUMNS = [
     ("publish_pushed_at", "TEXT"),
     ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("publish_last_error", "TEXT"),
+    ("outbox_content", "TEXT"),
 ]
 
 
@@ -446,6 +449,7 @@ def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
             steps_successful INTEGER DEFAULT 0,
             steps_failed INTEGER DEFAULT 0,
             outbox_file TEXT NULL,
+            outbox_content TEXT NULL,
             publish_status TEXT NULL,
             publish_commit_sha TEXT NULL,
             publish_pushed_at TEXT NULL,

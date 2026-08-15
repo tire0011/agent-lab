@@ -25,7 +25,7 @@ from models import (
     OperationChainStep,
     OperationChainStepResult,
 )
-from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN
+from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 from modules.redaction import bounded_lines, redact
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
@@ -119,6 +119,7 @@ class OperationChainService:
         # is opened with check_same_thread=False and is not safe for
         # unsynchronized concurrent use).
         self._lock = threading.RLock()
+        self._repo_lock = RepoLock(self.repo_root)
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -503,34 +504,36 @@ status: {result.overall_status}
             except ValueError:
                 rel_path = None
 
-            if rel_path is not None:
-                # Persist publish intent before the atomic write so that a crash
-                # between write and the second DB update is recoverable.
-                with self._lock:
-                    self._conn.execute(
-                        "UPDATE operation_chains SET outbox_file = ?, publish_status = ?, updated_at = ? WHERE request_id = ?",
-                        (rel_path, PUBLISH_PENDING_WRITE, _now_iso(), result.request_id),
-                    )
-                    self._conn.commit()
+            with self._repo_lock:
+                if rel_path is not None:
+                    # Persist publish intent + full content before the atomic write
+                    # so that a crash between write and the second DB update is
+                    # recoverable via OperationChainOutboxPublisher.content_fn.
+                    with self._lock:
+                        self._conn.execute(
+                            "UPDATE operation_chains SET outbox_file = ?, outbox_content = ?, publish_status = ?, updated_at = ? WHERE request_id = ?",
+                            (rel_path, content, PUBLISH_PENDING_WRITE, _now_iso(), result.request_id),
+                        )
+                        self._conn.commit()
 
-            _atomic_write(filepath, content)
+                _atomic_write(filepath, content)
 
-            if rel_path is not None:
-                # Advance to written so the publisher knows the file exists on disk.
-                with self._lock:
-                    self._conn.execute(
-                        "UPDATE operation_chains SET publish_status = ?, updated_at = ? WHERE request_id = ?",
-                        (PUBLISH_WRITTEN, _now_iso(), result.request_id),
-                    )
-                    self._conn.commit()
-            else:
-                # Fallback: store absolute path so callers can still locate the file.
-                with self._lock:
-                    self._conn.execute(
-                        "UPDATE operation_chains SET outbox_file = ?, updated_at = ? WHERE request_id = ?",
-                        (str(filepath), _now_iso(), result.request_id),
-                    )
-                    self._conn.commit()
+                if rel_path is not None:
+                    # Advance to written so the publisher knows the file exists on disk.
+                    with self._lock:
+                        self._conn.execute(
+                            "UPDATE operation_chains SET publish_status = ?, updated_at = ? WHERE request_id = ?",
+                            (PUBLISH_WRITTEN, _now_iso(), result.request_id),
+                        )
+                        self._conn.commit()
+                else:
+                    # Fallback: store absolute path so callers can still locate the file.
+                    with self._lock:
+                        self._conn.execute(
+                            "UPDATE operation_chains SET outbox_file = ?, updated_at = ? WHERE request_id = ?",
+                            (str(filepath), _now_iso(), result.request_id),
+                        )
+                        self._conn.commit()
         except Exception as exc:
             logger.error(f"Failed to write outbox file {filepath}: {exc}")
 

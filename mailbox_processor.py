@@ -116,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
+    from modules.outbox_publisher import TaskApprovalOutboxPublisher
 
     mailbox_config = MailboxConfig.from_paths(code_repo_path, mailbox_repo_path)
 
@@ -147,10 +148,15 @@ def main(argv: list[str] | None = None) -> int:
             db_path=args.db_path,
             mailbox_config=mailbox_config,
         )
+        task_publisher = TaskApprovalOutboxPublisher(
+            db_path=args.db_path,
+            mailbox_config=mailbox_config,
+        )
         try:
             # 1. Retry any previously committed-but-not-pushed commits
             if not args.dry_run:
                 publisher.publish_pending()
+                task_publisher.publish_pending()
                 processor.retry_unpushed_commits()
                 processor.retry_pending_git_commits()
                 if not processor.ensure_clean_worktree():
@@ -184,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
             processor.close()
             chain_service.close()
             publisher.close()
+            task_publisher.close()
             operations_registry.close()
     finally:
         lock.release()
