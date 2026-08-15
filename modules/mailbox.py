@@ -378,7 +378,10 @@ def git_push(repo_path: Path) -> bool:
     """Push to the tracked remote branch (no --force). Return True on success."""
     result = _git(["push"], repo_path, check=False)
     if result.returncode != 0:
-        logger.warning("git push failed: %s", _redact(result.stderr.strip())[:500])
+        # Never log raw stderr: git errors can contain remote URLs and credentials.
+        # Log only a generic warning; the sanitised detail goes to DEBUG for diagnosis.
+        logger.warning("git push failed (exit %d)", result.returncode)
+        logger.debug("git push stderr (redacted): %s", _redact(result.stderr.strip())[:500])
         return False
     return True
 

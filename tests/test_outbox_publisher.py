@@ -976,14 +976,30 @@ class TestPushErrorRedaction(unittest.TestCase):
             finally:
                 pub.close()
 
-    def test_git_push_log_redacts_credential_stderr(self):
-        """mailbox.git_push() must redact credential-containing stderr before logging."""
+    def test_git_push_log_warning_is_generic(self):
+        """git_push() WARNING must be a generic message – no raw stderr, no secrets, no URLs."""
         import logging as _logging
         from unittest.mock import patch, MagicMock
 
         from modules import mailbox as _mailbox
 
-        for error_text, secret in self._CASES:
+        # Include both credential cases and plain remote-URL cases.
+        all_cases = self._CASES + [
+            (
+                "remote: https://github.com/org/private-repo.git access denied",
+                "https://github.com/org/private-repo.git",
+            ),
+            (
+                "fatal: unable to access 'ssh://git@github.com/org/private.git': could not resolve host",
+                "ssh://git@github.com/org/private.git",
+            ),
+            (
+                "ERROR: Repository not found: git@github.com:org/private-repo.git",
+                "git@github.com:org/private-repo.git",
+            ),
+        ]
+
+        for error_text, fragment in all_cases:
             fake_result = MagicMock()
             fake_result.returncode = 1
             fake_result.stderr = error_text
@@ -993,12 +1009,53 @@ class TestPushErrorRedaction(unittest.TestCase):
             ) as mock_warn, patch("modules.mailbox._git", return_value=fake_result):
                 _mailbox.git_push(self.repo)
 
-            self.assertTrue(mock_warn.called)
+            self.assertTrue(mock_warn.called, "git_push should call logger.warning on failure")
             log_call = mock_warn.call_args
             fmt = log_call.args[0] % log_call.args[1:]
-            with self.subTest(secret=secret):
-                self._check_no_secret(fmt, secret, "git_push log")
-                self.assertIn("[REDACTED]", fmt, "Redacted placeholder absent from git_push log")
+            with self.subTest(fragment=fragment):
+                # WARNING must not contain any raw stderr fragment at all.
+                self._check_no_secret(fmt, fragment, "git_push warning log")
+                # The warning should contain the exit code but nothing from stderr.
+                self.assertIn("exit", fmt, "WARNING should mention exit code")
+
+    def test_git_push_debug_log_redacts_remote_urls(self):
+        """git_push() DEBUG log must replace all remote URL forms with [REMOTE]."""
+        import logging as _logging
+        from unittest.mock import patch, MagicMock
+
+        from modules import mailbox as _mailbox
+
+        remote_url_cases = [
+            (
+                "remote: https://github.com/org/private-repo.git not found",
+                "https://github.com/org/private-repo.git",
+            ),
+            (
+                "fatal: ssh://git@github.com/org/private.git permission denied",
+                "ssh://git@github.com/org/private.git",
+            ),
+            (
+                "ERROR: git@github.com:org/repo.git: access denied",
+                "git@github.com:org/repo.git",
+            ),
+        ]
+
+        for error_text, fragment in remote_url_cases:
+            fake_result = MagicMock()
+            fake_result.returncode = 1
+            fake_result.stderr = error_text
+
+            with patch.object(
+                _logging.getLogger("modules.mailbox"), "debug"
+            ) as mock_debug, patch("modules.mailbox._git", return_value=fake_result):
+                _mailbox.git_push(self.repo)
+
+            self.assertTrue(mock_debug.called, "git_push should call logger.debug with redacted detail")
+            log_call = mock_debug.call_args
+            fmt = log_call.args[0] % log_call.args[1:]
+            with self.subTest(fragment=fragment):
+                self._check_no_secret(fmt, fragment, "git_push debug log")
+                self.assertIn("[RE", fmt, "Redacted/Remote placeholder absent from debug log")
 
 
 if __name__ == "__main__":

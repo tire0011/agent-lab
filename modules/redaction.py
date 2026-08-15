@@ -26,14 +26,24 @@ _SECRET_PATTERN = re.compile(
 # without a preceding keyword at all (e.g. copy-pasted into a prompt).
 _BEARER_PATTERN = re.compile(r"(?i)bearer\s+\S+")
 _SK_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9]{10,}")
-# HTTPS remote URLs that embed credentials, e.g. ******github.com/...
+# HTTPS remote URLs with embedded credentials, e.g. ******github.com/...
 _URL_CRED_PATTERN = re.compile(r"https?://[^@\s]*:[^@\s]*@\S*")
+# Any remote URL that could reveal repository identity (plain HTTPS, SSH, SCP-style git@)
+_REMOTE_URL_PATTERN = re.compile(
+    r"(?:"
+    r"https?://\S+"          # plain HTTPS remote
+    r"|ssh://\S+"            # ssh:// remote
+    r"|git://\S+"            # git:// remote
+    r"|git@[^\s:]+:[^\s]+"   # SCP-style git@host:org/repo
+    r")"
+)
 _PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
 
 
 def redact(text: str) -> str:
     """Scrub secret-shaped substrings and absolute filesystem paths."""
     text = _URL_CRED_PATTERN.sub("[REDACTED]", text)
+    text = _REMOTE_URL_PATTERN.sub("[REMOTE]", text)
     text = _BEARER_PATTERN.sub("[REDACTED]", text)
     text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
     text = _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
