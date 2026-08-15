@@ -109,10 +109,14 @@ def run_mailbox_poll_once(
         details = ", ".join(cleanup_failures)
         if result.status == "error":
             base = result.error or "unknown mailbox processing failure"
-            result.error = f"{base}; cleanup_failed={details}"
-            return result
+            return MailboxPollRunResult(
+                status="error",
+                results=result.results,
+                error=f"{base}; cleanup_failed={details}",
+            )
         return MailboxPollRunResult(
             status="error",
+            results=result.results,
             error=f"mailbox processing cleanup_failed={details}",
         )
     return result
