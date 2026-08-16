@@ -15,7 +15,7 @@ from typing import Any, Callable
 import mailbox_processor
 from modules import experiment_logger as experiment_logger_module
 from modules.mailbox import MailboxLock, MailboxProcessor
-from modules.redaction import bounded_lines, changed_file_names, redact, sanitized_reason, test_command_name
+from modules.redaction import bounded_lines, changed_file_names, redact, sanitized_reason, test_command_name, test_failure_tail as _test_failure_tail
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger(__name__)
@@ -270,6 +270,11 @@ class OperationsRegistry:
             f"changed_files: {', '.join(changed_file_names(experiment.git_status)) or '-'}",
             f"reason: {sanitized_reason(experiment.error) or '-'}",
         ]
+        if experiment.test_exit_code not in (None, 0):
+            tail = _test_failure_tail(experiment.test_output)
+            if tail:
+                lines.append("test_failure_tail:")
+                lines.extend(f"  {line}" for line in tail)
         return OperationResult("experiment_show", True, lines, 0)
 
     def _op_experiment_logs(self, args: dict[str, Any]) -> OperationResult:

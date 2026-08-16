@@ -708,6 +708,8 @@ def get_experiment(
     adoption_service = _resolve_experiment_adoption_service()
     adoption = adoption_service.get(experiment.id)
     payload = experiment.to_dict()
+    if experiment.test_exit_code not in (None, 0):
+        payload["test_failure_tail"] = redaction.test_failure_tail(experiment.test_output)
     if adoption.status != "not_started":
         payload["adoption"] = adoption.to_dict()
     return ExperimentDetail(**payload)
@@ -1131,6 +1133,7 @@ def _diagnostic_experiment(service: ExperimentService, experiment) -> PublicDiag
         test_exit_code=experiment.test_exit_code,
         failure_summary=_failure_reason(experiment),
         changed_files=_changed_file_names(experiment.git_status),
+        test_failure_tail=redaction.test_failure_tail(experiment.test_output) if experiment.test_exit_code not in (None, 0) else [],
         diagnostic_messages=diagnostic_messages[:20],
         usage=usage,
         estimated_cost=_estimated_cost(usage),

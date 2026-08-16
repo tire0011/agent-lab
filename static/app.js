@@ -711,6 +711,18 @@ async function showExperimentDetail(experimentId) {
   }
   taskElements.detailContent.append(dl);
 
+  if (exp.test_failure_tail && exp.test_failure_tail.length) {
+    const section = document.createElement("section");
+    section.className = "test-failure-section";
+    const heading = document.createElement("h3");
+    heading.textContent = "Testfehler";
+    const pre = document.createElement("pre");
+    pre.className = "test-failure-output";
+    pre.textContent = exp.test_failure_tail.join("\n");
+    section.append(heading, pre);
+    taskElements.detailContent.append(section);
+  }
+
   const canAdopt = Boolean(
     state.apiKey && exp.status === "succeeded" && exp.quality_evaluation && exp.quality_evaluation.outcome === "pass"
   );
