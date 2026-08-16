@@ -2511,6 +2511,8 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         self.implementation_worker.run.side_effect = tests_only_impl
         experiment = self.service.create_experiment(goal="Add tests only.")
         result = self.service.run_experiment(experiment.id)
+        # With an explicit tests-only goal, a test-only diff should pass the
+        # quality gate and succeed.
         self.assertEqual(result.status, STATUS_SUCCEEDED)
 
     def test_quality_gate_requires_non_test_file_change(self):
