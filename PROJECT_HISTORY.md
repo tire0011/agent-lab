@@ -210,6 +210,28 @@ This makes result delivery resilient to crashes between database update, file wr
 
 A key lesson is that **asynchronous agent communication needs an idempotent, recoverable publication protocol; writing an outbox file is not equivalent to reliably delivering it**.
 
+### 15. 2026-08-16: single-call experiment pipeline
+
+The Codex experiment pipeline was simplified from roughly **3-5 LLM calls per approved experiment to one implementation call**. The earlier research, selection/plan, reformat retry, and policy-replan calls were removed from the normal path; Codex now receives the raw goal and is asked to investigate, plan, implement, and add tests in one call.
+
+Safety checks were moved to the raw goal before the Codex call, while the existing implementation quality gate and verification remain after the change. Legacy database fields and state transitions were retained where useful for compatibility.
+
+This materially changes the project's cost model: orchestration complexity and prompt/token overhead are reduced before trying cheaper models. The trade-off is now explicit and measurable: **does a cheaper single-call pipeline preserve enough implementation quality compared with the former multi-stage reasoning pipeline?**
+
+A follow-up regression exposed an evaluation edge case: explicit tests-only goals were incorrectly treated as ordinary implementation work when no plan object existed. Goal-based tests-only classification was added so legitimate test-only experiments can succeed while ordinary implementation goals with only test-file changes still go to `needs_review`. A later stale regression expectation was also corrected to preserve this boundary.
+
+### 16. 2026-08-16: token-efficient verification with bounded failure evidence
+
+Default `unittest` verification now runs in quiet mode (`-q`). Successful runs retain the final `Ran ...` / `OK` summary without progress-dot noise, while failed runs retain traceback information and the final failure summary. Explicit custom test commands are not rewritten.
+
+To avoid trading token efficiency for diagnosability, failed experiments gained a bounded, redacted failure tail. The implementation limits evidence to the final 30 lines, at most 500 characters per line and 4,000 characters total, with existing secret/path redaction applied. The failure tail is available through authenticated experiment detail, operation output, and the web UI; an initial public-diagnostics exposure was deliberately removed in follow-up hardening.
+
+The feature was backed by 22 focused regression tests covering truncation, redaction, API/operation/UI behavior, successful-run omission, and safe DOM rendering.
+
+The durable lesson is that **tool output should be shaped for the consumer**: normal success paths should be compact, while failures should surface the smallest bounded evidence needed for diagnosis. This is now an implemented optimization rather than only a research idea.
+
+A related usability improvement exposes the full experiment ID with a copy action in the detail UI, reducing ambiguity when diagnosing failures or building operation chains remotely.
+
 ## What Nexus currently learns
 
 Nexus already accumulates several kinds of machine-readable or repository-visible information:
@@ -261,8 +283,8 @@ At the current stage the project contains several cooperating layers:
 - persistent Azure VM,
 - baseline and MCP-oriented agent code,
 - LLM/provider access,
-- Codex execution,
-- experiment orchestration,
+- single-call Codex experiment execution,
+- experiment orchestration and quality gating,
 - Git/worktree-based isolation and adoption,
 - SQLite state,
 - ideas and decision documents,
@@ -270,6 +292,7 @@ At the current stage the project contains several cooperating layers:
 - persistent recoverable outbox publication,
 - API and browser UI,
 - public and authenticated diagnostics,
+- token-efficient verification with bounded failure evidence,
 - tests and policy boundaries.
 
 The system is still intentionally small enough to understand.
@@ -282,8 +305,10 @@ The system is still intentionally small enough to understand.
 4. **Agent-to-agent/human communication needs delivery semantics.** Persisted publication state, locking, retry, and recovery are necessary to make Git-backed messaging reliable across crashes.
 5. **Cheap reasoning matters.** Continuous autonomy will probably need a hierarchy of models, including small/local models for simple decisions and expensive models only when justified.
 6. **Context itself is a resource.** More memory is not automatically better; project memory should be retrieved or summarized and measured.
-7. **Failures are research data.** Selection failures, CLI incompatibilities, merge conflicts, timeouts, and rejected experiments are useful inputs to the next iteration.
-8. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
+7. **Failures are research data.** Selection failures, CLI incompatibilities, merge conflicts, timeouts, rejected experiments, and stale regression assumptions are useful inputs to the next iteration.
+8. **Optimize orchestration before buying more model capacity.** Collapsing 3-5 LLM calls to one and reducing routine tool output can lower cost without changing providers; quality must then be measured explicitly.
+9. **Compact output and useful diagnostics are compatible.** Quiet success output plus bounded/redacted failure evidence gives a better signal-to-token ratio than verbose logs everywhere.
+10. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
 
 ## Open research directions
 
@@ -291,7 +316,7 @@ Current directions worth investigating include:
 
 - project memory and retrieval from this history,
 - event-driven mailbox wake-up (for example via GitHub-triggered notification) so Nexus can react immediately to new inbox commits while retaining the timer as fallback,
-- reducing LLM token consumption caused by verbose tool/test output by returning compact success summaries and failure-focused evidence,
+- measuring the real token/cost reduction and implementation-quality impact of the single-call pipeline and quiet verification output,
 - using a small local LLM for frequent action selection and reflection,
 - model routing by task difficulty and expected value,
 - stronger automatic evaluation of proposed changes,
@@ -309,8 +334,8 @@ Current directions worth investigating include:
 The immediate work should remain small. Strong candidates now include:
 
 1. **Project-memory experiment:** expose this history to Nexus through a minimal retrieval/context mechanism and measure whether its next idea selections improve.
-2. **Event-driven mailbox experiment:** compare a GitHub-triggered wake-up against the current one-minute polling path for latency, reliability, complexity, and operational cost while preserving polling as a fallback.
-3. **Token-efficient tool-output experiment:** measure whether compact test/tool output reduces total LLM context and cost without hiding evidence needed to diagnose failures.
+2. **Single-call before/after measurement:** compare quality, total tokens, runtime, and estimated cost against representative historical multi-stage experiments to verify that the simplification is a real improvement rather than only fewer calls.
+3. **Event-driven mailbox experiment:** compare a GitHub-triggered wake-up against the current one-minute polling path for latency, reliability, complexity, and operational cost while preserving polling as a fallback.
 4. **Cheap local decision model:** test whether a small model running on existing hardware can handle frequent low-risk decisions cheaply enough to reduce API use.
 
 The next choice should be based on expected learning value, implementation effort, risk, and measurable benefit rather than on architectural completeness.
