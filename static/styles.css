@@ -78,6 +78,9 @@ button.secondary { border: 1px solid var(--border); background: var(--surface); 
 .detail-list { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
 .detail-list dt { color: var(--muted); font-weight: 600; }
 .detail-list dd { margin: 0; overflow-wrap: anywhere; }
+.selectable-id { font-family: ui-monospace, monospace; }
+.inline-copy-button { min-height: 28px; margin-left: 8px; padding: 4px 10px; font-size: .78rem; font-weight: 600; vertical-align: middle; }
+.inline-copy-status { margin-left: 8px; color: var(--muted); font-size: .8rem; }
 
 .chat-card { margin-top: 0; }
 
