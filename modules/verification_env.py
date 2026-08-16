@@ -24,7 +24,10 @@ need none of those, and must never see them.
 from __future__ import annotations
 
 import os
-from typing import Mapping
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator, Mapping
 
 # Runtime plumbing only: just enough for Python/unittest to start, locate
 # the interpreter and any already-installed packages, and use a
@@ -60,3 +63,21 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     env = {key: source[key] for key in SAFE_RUNTIME_PASSTHROUGH if key in source}
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
     return env
+
+
+@contextmanager
+def verification_test_env(
+    base_env: Mapping[str, str] | None = None,
+) -> Iterator[dict[str, str]]:
+    """Yield an isolated verification environment with a temporary database.
+
+    The environment retains the same allowlist and fixed test API key as
+    :func:`build_verification_test_env`. Each context gets its own temporary
+    directory and an explicit ``AGENT_DB_PATH`` within it. The temporary
+    directory is removed when the context exits, including when its body
+    raises an exception.
+    """
+    env = build_verification_test_env(base_env)
+    with tempfile.TemporaryDirectory(prefix="nexus-verification-") as temp_dir:
+        env["AGENT_DB_PATH"] = str(Path(temp_dir) / "agent.db")
+        yield env

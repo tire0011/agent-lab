@@ -8,12 +8,14 @@ which expects ``AGENT_API_KEY=test-key``.
 
 from __future__ import annotations
 
+from pathlib import Path
 import unittest
 
 from modules.verification_env import (
     SAFE_RUNTIME_PASSTHROUGH,
     VERIFICATION_TEST_API_KEY,
     build_verification_test_env,
+    verification_test_env,
 )
 
 # Representative secret-shaped environment variables that must never reach
@@ -122,6 +124,58 @@ class VerificationEnvSafeRuntimeTests(unittest.TestCase):
         parent_env["PATH"] = "/usr/bin"
         built = build_verification_test_env(parent_env)
         self.assertEqual(set(built.keys()), {"PATH", "AGENT_API_KEY"})
+
+
+class VerificationTestEnvContextTests(unittest.TestCase):
+    def test_sets_database_path_and_preserves_environment_rules(self):
+        parent_env = {
+            "PATH": "/usr/bin",
+            "HOME": "/home/nexus",
+            "AGENT_API_KEY": "production-secret",
+            "AGENT_DB_PATH": "/production/agent.db",
+            "OPENAI_API_KEY": "provider-secret",
+        }
+
+        with verification_test_env(parent_env) as env:
+            db_path = Path(env["AGENT_DB_PATH"])
+            self.assertTrue(db_path.parent.is_dir())
+            self.assertEqual(db_path.name, "agent.db")
+            self.assertEqual(env["AGENT_API_KEY"], VERIFICATION_TEST_API_KEY)
+            self.assertEqual(env["PATH"], "/usr/bin")
+            self.assertEqual(env["HOME"], "/home/nexus")
+            self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertNotEqual(env["AGENT_DB_PATH"], "/production/agent.db")
+            self.assertEqual(
+                set(env),
+                {"PATH", "HOME", "AGENT_API_KEY", "AGENT_DB_PATH"},
+            )
+
+    def test_separate_contexts_use_different_database_paths(self):
+        with verification_test_env({}) as first_env:
+            first_path = Path(first_env["AGENT_DB_PATH"])
+        with verification_test_env({}) as second_env:
+            second_path = Path(second_env["AGENT_DB_PATH"])
+
+        self.assertNotEqual(first_path, second_path)
+        self.assertNotEqual(first_path.parent, second_path.parent)
+
+    def test_removes_temporary_directory_after_normal_exit(self):
+        with verification_test_env({}) as env:
+            temp_dir = Path(env["AGENT_DB_PATH"]).parent
+            self.assertTrue(temp_dir.is_dir())
+
+        self.assertFalse(temp_dir.exists())
+
+    def test_removes_temporary_directory_after_exception(self):
+        temp_dir = None
+        with self.assertRaisesRegex(RuntimeError, "expected failure"):
+            with verification_test_env({}) as env:
+                temp_dir = Path(env["AGENT_DB_PATH"]).parent
+                self.assertTrue(temp_dir.is_dir())
+                raise RuntimeError("expected failure")
+
+        self.assertIsNotNone(temp_dir)
+        self.assertFalse(temp_dir.exists())
 
 
 if __name__ == "__main__":
