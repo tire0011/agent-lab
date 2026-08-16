@@ -99,6 +99,43 @@ class ActivityApiTests(unittest.TestCase):
         self.assertNotIn(SECRET, json.dumps(body))
         self.service.resolve_public_experiment.assert_called_once_with("3ef5b935")
 
+    def test_public_experiment_sums_stored_usage_with_exact_allowlist(self):
+        self.exp.research_usage = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "raw_prompt": SECRET,
+        }
+        self.exp.selection_usage = {
+            "input_tokens": 20,
+            "cached_input_tokens": 7,
+            "total_tokens": 30,
+        }
+        self.exp.reformat_retry_usage = {"output_tokens": 3}
+        self.exp.policy_replan_usage = {"input_tokens": "not-numeric"}
+        self.exp.implementation_usage = None
+
+        response = self.client.get(f"/experiments/{self.exp.id}/public")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(set(body), {
+            "id", "mailbox_task_id", "phase", "status", "created_at", "ended_at",
+            "failure_reason", "test_exit_code", "changed_files", "test_summary", "usage",
+        })
+        self.assertEqual(body["usage"], {
+            "input_tokens": 30,
+            "cached_input_tokens": 7,
+            "output_tokens": 8,
+            "total_tokens": 45,
+        })
+        self.assertNotIn("raw_prompt", json.dumps(body))
+
+        self.exp.research_usage.pop("cached_input_tokens", None)
+        self.exp.selection_usage.pop("cached_input_tokens", None)
+        response = self.client.get(f"/experiments/{self.exp.id}/public")
+        self.assertIsNone(response.json()["usage"]["cached_input_tokens"])
+
     def test_authenticated_activity_has_filters_and_bounded_sanitized_output(self):
         self.exp.test_output = "\n".join([f"line {i}" for i in range(105)] + [f"token={SECRET} /agent/x.py"])
         response = self.client.get(

@@ -343,6 +343,13 @@ class PublicActivityResponse(BaseModel):
     activity: list[PublicActivityEntry]
 
 
+class PublicExperimentUsage(BaseModel):
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+
+
 class PublicExperimentSummary(BaseModel):
     id: str
     mailbox_task_id: str | None = None
@@ -354,6 +361,7 @@ class PublicExperimentSummary(BaseModel):
     test_exit_code: int | None = None
     changed_files: list[str] = Field(default_factory=list)
     test_summary: str | None = None
+    usage: PublicExperimentUsage | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -525,4 +533,3 @@ class OperationChainResult(BaseModel):
     steps_failed: int
     steps: list[OperationChainStepResult] = Field(default_factory=list)
     rejection_reason: str | None = None
-

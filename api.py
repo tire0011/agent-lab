@@ -860,6 +860,25 @@ def _mailbox_task_id(service: ExperimentService, experiment_id: str) -> str | No
     return lookup(experiment_id) if lookup else None
 
 
+def _public_experiment_usage(experiment) -> dict[str, int | None] | None:
+    fields = ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens")
+    totals: dict[str, int | None] = {field: None for field in fields}
+    for usage in (
+        experiment.research_usage,
+        experiment.selection_usage,
+        experiment.reformat_retry_usage,
+        experiment.policy_replan_usage,
+        experiment.implementation_usage,
+    ):
+        if not isinstance(usage, dict):
+            continue
+        for field in fields:
+            value = usage.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[field] = (totals[field] or 0) + int(value)
+    return totals if any(value is not None for value in totals.values()) else None
+
+
 def _public_experiment(experiment, mailbox_task_id: str | None) -> PublicExperimentSummary:
     # Strict allowlist: never derive this response from to_dict/model_dump.
     return PublicExperimentSummary(
@@ -873,6 +892,7 @@ def _public_experiment(experiment, mailbox_task_id: str | None) -> PublicExperim
         test_exit_code=experiment.test_exit_code,
         changed_files=_changed_file_names(experiment.git_status),
         test_summary=_test_summary(experiment),
+        usage=_public_experiment_usage(experiment),
     )
 
 
