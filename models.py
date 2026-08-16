@@ -402,7 +402,6 @@ class PublicDiagnosticExperiment(BaseModel):
     test_command: str | None = None
     test_exit_code: int | None = None
     failure_summary: str | None = None
-    test_failure_tail: list[str] = Field(default_factory=list)
     changed_files: list[str] = Field(default_factory=list)
     diagnostic_messages: list[str] = Field(default_factory=list)
     usage: dict[str, int] | None = None

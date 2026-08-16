@@ -7,7 +7,6 @@ Covers:
 - ``experiment_show`` operation contains the bounded diagnostic tail.
 - Successful / no-output experiments do not produce a failure block.
 - Authenticated ``GET /experiments/{id}`` exposes ``test_failure_tail``.
-- Public diagnostics ``GET /diagnostics/public`` exposes ``test_failure_tail``.
 - UI ``showExperimentDetail`` uses ``textContent`` only (no innerHTML).
 """
 
@@ -81,6 +80,17 @@ class TestFailureTailRedactionUnit(unittest.TestCase):
         tail = redaction.test_failure_tail(output)
         self.assertTrue(any("FINAL AssertionError" in line for line in tail))
         self.assertFalse(any("early line 0" in line for line in tail))
+
+    def test_long_lines_end_marker_always_present(self):
+        """With 30 lines each near 500 chars, the last line's marker must survive."""
+        long_lines = [("X" * 490 + f" line{i:02d}") for i in range(29)]
+        long_lines.append("END_MARKER_UNIQUE_LAST_LINE")
+        output = "\n".join(long_lines)
+        tail = redaction.test_failure_tail(output)
+        self.assertTrue(
+            any("END_MARKER_UNIQUE_LAST_LINE" in line for line in tail),
+            f"End marker not found; tail={tail}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -159,69 +169,6 @@ class ExperimentDetailTailApiTests(unittest.TestCase):
         # The test_failure_tail field itself must not contain the raw secret
         tail = response.json().get("test_failure_tail", [])
         self.assertNotIn(SECRET, json.dumps(tail))
-
-
-# ---------------------------------------------------------------------------
-# API: public diagnostics exposes test_failure_tail only when tests fail
-# ---------------------------------------------------------------------------
-
-class DiagnosticsPublicTailTests(unittest.TestCase):
-    def setUp(self):
-        self.traceback = (
-            "Traceback:\n"
-            "  self.assertEqual(a, b)\n"
-            f"AssertionError: mismatch  token={SECRET}\n"
-        )
-        self.failed_exp = experiment(
-            id="deadbeefcafe0001",
-            status="failed",
-            test_exit_code=1,
-            test_output=self.traceback,
-        )
-        self.success_exp = experiment(
-            id="deadbeefcafe0002",
-            status="succeeded",
-            test_exit_code=0,
-            test_output="OK",
-        )
-        service = MagicMock()
-        service.list_experiments.return_value = [self.failed_exp, self.success_exp]
-        service.mailbox_task_id_for_experiment.return_value = None
-        service.list_activity.return_value = []
-
-        mailbox = MagicMock()
-        mailbox.recover_after_restart.return_value = None
-        mailbox.list_pending.return_value = []
-        mailbox.list_recent.return_value = []
-
-        api.app.dependency_overrides[api.get_experiment_service] = lambda: service
-        api.app.dependency_overrides[api.get_codex_service] = lambda: MagicMock()
-        api.app.dependency_overrides[api.get_mailbox_task_service] = lambda: mailbox
-        self.client = TestClient(api.app)
-        self.addCleanup(api.app.dependency_overrides.clear)
-
-    def test_failed_experiment_has_test_failure_tail(self):
-        response = self.client.get("/diagnostics/public")
-        self.assertEqual(response.status_code, 200)
-        exps = response.json()["experiments"]
-        failed = next(e for e in exps if e["id"] == self.failed_exp.id)
-        tail = failed.get("test_failure_tail", [])
-        self.assertIsInstance(tail, list)
-        self.assertGreater(len(tail), 0)
-        self.assertTrue(any("AssertionError" in line for line in tail))
-
-    def test_failed_tail_secrets_redacted(self):
-        response = self.client.get("/diagnostics/public")
-        exps = response.json()["experiments"]
-        failed = next(e for e in exps if e["id"] == self.failed_exp.id)
-        serialized = json.dumps(failed.get("test_failure_tail", []))
-        self.assertNotIn(SECRET, serialized)
-
-    def test_successful_experiment_has_no_tail(self):
-        response = self.client.get("/diagnostics/public")
-        exps = response.json()["experiments"]
-        succeeded = next(e for e in exps if e["id"] == self.success_exp.id)
-        self.assertEqual(succeeded.get("test_failure_tail", []), [])
 
 
 # ---------------------------------------------------------------------------

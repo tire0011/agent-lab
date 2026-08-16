@@ -64,15 +64,10 @@ class DiagnosticsPublicApiTests(unittest.TestCase):
         # goal prompt, or env-var names.
         forbidden = (
             SECRET, "/agent", "user input prompt",
-            "AGENT_API_KEY",
+            "AGENT_API_KEY", "AssertionError", "API_KEY",
         )
         for token in forbidden:
             self.assertNotIn(token, serialized)
-        # AssertionError lines and redacted key names (API_KEY=[REDACTED]) may
-        # now appear in test_failure_tail — that is intentional per the
-        # bounded-diagnostic-tail feature.  Verify the raw secret value is
-        # absent but its redacted form is present.
-        self.assertIn("[REDACTED]", serialized)
         self.assertIn("service", body)
         self.assertIn("mailbox", body)
         self.assertIn("experiments", body)
