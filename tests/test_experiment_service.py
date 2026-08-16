@@ -2174,6 +2174,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
             repo_root=str(self.repo_root),
             worktrees_root=str(self.worktrees_root),
             experiment_log_dir=str(self.log_dir),
+            test_python_executable=sys.executable,
         )
         self.addCleanup(self.service.close)
 
@@ -2268,7 +2269,6 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         self.assertEqual(retries[0]["level"], "WARNING")
         self.assertEqual(retries[0]["phase"], "selection")
 
-    @unittest.skip("pre-existing: relies on /agent/.venv/bin/python which may not exist in CI")
     def test_logging_failure_never_changes_experiment_status(self):
         """A broken logger (disk full, permission error, ...) must never
         affect the actual pipeline outcome - only best-effort logging is
