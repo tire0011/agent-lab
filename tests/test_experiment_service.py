@@ -2497,8 +2497,9 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
     # Quality gate (plan=None) still catches tests-only diffs
     # ------------------------------------------------------------------
 
-    def test_quality_gate_requires_non_test_file_change(self):
-        # An implementation that only touches test files must be flagged.
+    def test_explicit_tests_only_goal_allows_test_only_diff(self):
+        self.service.test_python_executable = sys.executable
+
         def tests_only_impl(*args, **kwargs):
             working_dir = kwargs.get("working_dir")
             if working_dir:
@@ -2510,8 +2511,28 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         self.implementation_worker.run.side_effect = tests_only_impl
         experiment = self.service.create_experiment(goal="Add tests only.")
         result = self.service.run_experiment(experiment.id)
-        # With no non-test changes and a goal that doesn't explicitly request
-        # tests-only, the quality gate should flag this for review.
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+
+    def test_quality_gate_requires_non_test_file_change(self):
+        # An implementation that only touches test files must be flagged.
+        self.service.test_python_executable = sys.executable
+
+        def tests_only_impl(*args, **kwargs):
+            working_dir = kwargs.get("working_dir")
+            if working_dir:
+                target = Path(working_dir) / "tests" / "test_new.py"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("def test_pass(): assert True\n")
+            return _make_result(final_message="done", sandbox="workspace-write")
+
+        self.implementation_worker.run.side_effect = tests_only_impl
+        experiment = self.service.create_experiment(
+            goal="Add application behavior with regression tests."
+        )
+        result = self.service.run_experiment(experiment.id)
+        # With no non-test changes and a goal that requests implementation
+        # work rather than tests-only, the quality gate should flag this for
+        # review.
         self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
 
     # ------------------------------------------------------------------
