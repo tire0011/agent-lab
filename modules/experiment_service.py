@@ -179,6 +179,13 @@ _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
 # handled by the action-based _SECRET_ACTION_REGEXES check below, since a
 # bare mention (e.g. "without secrets", "tests the redaction logic for
 # tokens") is a common, safe statement that must not reject a plan.
+#
+# NOTE: "commit", "push", and "merge" are kept here for the plan-level check
+# (plan_violates_policy) where the haystack is LLM-generated plan JSON and
+# any occurrence unambiguously means a planned git operation.  For the
+# goal-level check (_check_goal_policy) these three verbs are handled by the
+# word-boundary and negation-aware _GIT_ACTION_REGEXES instead — see the
+# _GIT_ACTION_KEYWORDS frozenset below.
 _REJECT_KEYWORDS: tuple[str, ...] = (
     "commit", "push", "merge",
     "pip install", "npm install", "apt install", "apt-get install",
@@ -192,6 +199,10 @@ _REJECT_KEYWORDS: tuple[str, ...] = (
     "enable billing", "paid tier", "spend money",
     "increase budget", "increase the budget", "credit card",
 )
+
+# The three git-action keywords that are treated specially in
+# _check_goal_policy (word/context-aware instead of plain substring).
+_GIT_ACTION_KEYWORDS: frozenset[str] = frozenset({"commit", "push", "merge"})
 
 # Action-based infrastructure/deployment check. Bare mentions of terms
 # such as "VM", "Azure", "deploy", or "infrastructure" must NOT alone
@@ -249,6 +260,49 @@ _INFRA_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
     re.compile(
         rf"\b(?:{_INFRA_NOUN_ALT})\b(?:\s+\S+){{0,{_INFRA_ACTION_MAX_FILLER_WORDS}}}\s+"
         rf"\b(?:{_INFRA_VERB_ALT})\b",
+        re.IGNORECASE,
+    ),
+)
+
+# Git-action detection for the goal-level policy check (_check_goal_policy).
+# The plan-level check (plan_violates_policy) keeps the simple substring
+# matches in _REJECT_KEYWORDS because the haystack there is LLM-generated
+# plan JSON and any occurrence of "commit" / "push" / "merge" is
+# unambiguously a planned git operation.
+#
+# Raw user goals are different: they routinely contain safe incidental
+# mentions that would be false-positively flagged by substring matching:
+#   "do not commit or push"           (safety constraint / negation)
+#   "improve merge-conflict handling" (incidental compound noun)
+#   "handle commit message parsing"   (domain noun, not a git command)
+#   "push-notification support"       (unrelated product domain)
+#
+# The word-boundary and negation-aware checks below are therefore used
+# instead for raw goal text:
+#   (a) Explicit git sub-command: "git commit / push / merge"  → always
+#       an imperative git action; reject unless a negation precedes it.
+#   (b) Git verb + git-object proximity: "commit the changes",
+#       "push the branch", "merge the PR"  → reject unless negated.
+#
+# Both patterns reuse _infra_action_match_is_false_positive so that
+# explicit negations ("do not commit", "without pushing", "won't merge")
+# and clause-level negations ("never ..., commit ...") are accepted.
+_GIT_OBJECT_NOUNS: tuple[str, ...] = (
+    "change", "changes", "code", "branch", "branches",
+    "result", "results", "implementation", "work",
+    "pr", "prs", "pull request", "pull requests",
+    "it", "them", "this", "that", "everything", "all",
+)
+_GIT_ACTION_MAX_FILLER = 4
+_GIT_NOUN_ALT = "|".join(re.escape(n) for n in _GIT_OBJECT_NOUNS)
+_GIT_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
+    # (a) Explicit git sub-command: "git commit", "git push", "git merge"
+    re.compile(r"\bgit\s+(?:commit|push|merge)\b", re.IGNORECASE),
+    # (b) Git verb within a few words of a recognisable git-object noun:
+    #     "commit the changes", "push the branch", "merge the PR"
+    re.compile(
+        rf"\b(?:commit|push|merge)\b(?:\s+\S+){{0,{_GIT_ACTION_MAX_FILLER}}}\s+"
+        rf"\b(?:{_GIT_NOUN_ALT})\b",
         re.IGNORECASE,
     ),
 )
@@ -1075,11 +1129,29 @@ def _check_goal_policy(goal: str) -> str | None:
     This is the pre-implementation security check for the single-call
     pipeline (no LLM-generated plan to scan).  Returns a human-readable
     rejection reason or ``None`` if the goal is acceptable.
+
+    Unlike the plan-level check (plan_violates_policy), the git-action
+    keywords "commit", "push", and "merge" are handled by the word-boundary
+    and negation-aware _GIT_ACTION_REGEXES rather than the plain substring
+    scan.  This avoids false-positive rejections of safe goals such as
+    "do not commit or push", "improve merge-conflict handling", or
+    "handle commit message parsing".
     """
     haystack = (goal or "").lower()
+    # Plain substring check — skip git-action keywords; they are checked
+    # with word-boundary and context awareness below.
     for keyword in _REJECT_KEYWORDS:
+        if keyword in _GIT_ACTION_KEYWORDS:
+            continue
         if keyword in haystack:
             return f"goal mentions disallowed keyword: {keyword!r}"
+    # Word-boundary + negation-aware git-action check.
+    for regex in _GIT_ACTION_REGEXES:
+        for match in regex.finditer(haystack):
+            preceding = haystack[max(0, match.start() - 200):match.start()]
+            if _infra_action_match_is_false_positive(match.group(0), preceding):
+                continue
+            return f"goal requests a disallowed git action: {match.group(0)!r}"
     for regex in _INFRA_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
@@ -1116,6 +1188,7 @@ _POLICY_RULE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("agent found no suitable alternative improvement", "no_suitable_improvement"),
     ("plan mentions disallowed keyword", "disallowed_keyword"),
     ("goal mentions disallowed keyword", "disallowed_keyword"),
+    ("goal requests a disallowed git action", "disallowed_keyword"),
     ("plan describes an actual infrastructure/deployment action", "infra_action"),
     ("goal describes an actual infrastructure/deployment action", "infra_action"),
     ("plan describes an actual secret/credential action", "secret_action"),

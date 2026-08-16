@@ -2513,6 +2513,86 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         # "no secrets" / "without logging tokens" must not block.
         self.assertIsNone(_check_goal_policy("Ensure no secrets are logged in the output."))
 
+    # ------------------------------------------------------------------
+    # Git-action detection: word/action-aware + negation-aware
+    # ------------------------------------------------------------------
+
+    # Imperative git actions that MUST be blocked ---
+
+    def test_git_commit_command_is_blocked(self):
+        # Explicit "git commit" sub-command is always a requested git action.
+        self.assertIsNotNone(_check_goal_policy("implement it and then run git commit"))
+
+    def test_git_push_command_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("after tests pass, run git push"))
+
+    def test_git_merge_command_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("run git merge to integrate changes"))
+
+    def test_commit_changes_is_blocked(self):
+        # Verb + object proximity: "commit the changes" is a git action.
+        self.assertIsNotNone(_check_goal_policy("commit the changes to the repo"))
+
+    def test_push_branch_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("push the branch to origin"))
+
+    def test_merge_pull_request_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("merge the pull request after review"))
+
+    def test_commit_result_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("implement and commit the result"))
+
+    def test_push_code_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("push the code when done"))
+
+    def test_merge_pr_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("merge the pr and mark complete"))
+
+    def test_git_action_rule_classified_as_disallowed_keyword(self):
+        # The policy_rule for a git-action rejection must be disallowed_keyword.
+        experiment = self.service.create_experiment(
+            goal="push the branch after the implementation is done"
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.assertEqual(result.policy_rule, "disallowed_keyword")
+
+    # Negated or incidental mentions that MUST be allowed ---
+
+    def test_do_not_commit_or_push_is_allowed(self):
+        # Explicit safety constraint — must never be rejected.
+        self.assertIsNone(_check_goal_policy("do not commit or push"))
+
+    def test_negated_commit_push_in_goal_is_allowed(self):
+        self.assertIsNone(
+            _check_goal_policy(
+                "Implement feature X. Do not commit, push, or merge anything."
+            )
+        )
+
+    def test_wont_merge_constraint_is_allowed(self):
+        self.assertIsNone(_check_goal_policy("ensure the service won't merge branches automatically"))
+
+    def test_merge_conflict_handling_is_allowed(self):
+        # Incidental noun phrase — "merge" is part of "merge-conflict", not a git command.
+        self.assertIsNone(_check_goal_policy("improve merge-conflict handling in the parser"))
+
+    def test_commit_message_noun_is_allowed(self):
+        # "commit message" is a domain noun, not a git operation request.
+        self.assertIsNone(_check_goal_policy("handle commit message parsing edge cases"))
+
+    def test_push_notification_is_allowed(self):
+        # Unrelated product domain — must not be rejected.
+        self.assertIsNone(_check_goal_policy("add push notification support to the mobile app"))
+
+    def test_committed_adjective_is_allowed(self):
+        # "committed" is an adjective here, not the bare verb "commit".
+        self.assertIsNone(_check_goal_policy("ensure all committed changes are visible in the UI"))
+
+    def test_without_committing_is_allowed(self):
+        # Negated/gerund form — the constraint itself must not be rejected.
+        self.assertIsNone(_check_goal_policy("write tests without committing anything"))
+
 
 if __name__ == "__main__":
     unittest.main()
