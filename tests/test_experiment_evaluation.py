@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -146,6 +147,7 @@ class Eb57900RegressionTestCase(unittest.TestCase):
             db_path=str(Path(tmp.name) / "agent.db"),
             repo_root=str(repo_root),
             worktrees_root=str(Path(tmp.name) / "worktrees"),
+            test_python_executable=sys.executable,
         )
         self.addCleanup(service.close)
 
@@ -350,6 +352,47 @@ class EvaluateImplementationTestCase(unittest.TestCase):
         )
         self.assertEqual(result.outcome, "needs_review")
 
+    def test_no_plan_explicit_tests_only_goal_with_only_test_files_passes(self):
+        """Single-call pipeline: plan=None + explicit tests-only goal => pass."""
+        changed = ChangedFiles(
+            tracked_modified=[], untracked_new=["tests/test_foo.py"]
+        )
+        result = evaluate_implementation(
+            None,
+            "Only add tests for foo(); do not change production code.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "pass")
+
+    def test_no_plan_ordinary_goal_with_only_test_files_is_needs_review(self):
+        """Single-call pipeline: plan=None + ordinary goal => needs_review when only tests changed."""
+        changed = ChangedFiles(
+            tracked_modified=["tests/test_api.py"], untracked_new=[]
+        )
+        result = evaluate_implementation(
+            None,
+            "Extract the logs tab into static/logs.js.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "needs_review")
+
+    def test_no_plan_goal_naming_non_test_artifact_is_not_tests_only(self):
+        """Single-call pipeline: plan=None, goal names a non-test path => must not be tests_only."""
+        changed = ChangedFiles(
+            tracked_modified=[], untracked_new=["tests/test_foo.py"]
+        )
+        result = evaluate_implementation(
+            None,
+            "Refactor static/logs.js and add tests.",
+            changed,
+            worktree_path=None,
+        )
+        # goal names a non-test artifact so change_kind stays implementation,
+        # and only test files changed -> needs_review
+        self.assertEqual(result.outcome, "needs_review")
+
 
 class PlanLikeCompatibilityTestCase(unittest.TestCase):
     def test_experiment_plan_dataclass_round_trips(self):
@@ -416,6 +459,7 @@ def _service(repo_root: Path, tmp_name: str, selection_worker, plan_worker, impl
         db_path=str(Path(tmp_name) / "agent.db"),
         repo_root=str(repo_root),
         worktrees_root=str(Path(tmp_name) / "worktrees"),
+        test_python_executable=sys.executable,
     )
 
 
@@ -449,8 +493,9 @@ class PipelineIntegrationTestCase(unittest.TestCase):
         self.assertEqual(result.quality_evaluation["outcome"], "pass")
 
     def test_legitimate_tests_only_task_succeeds(self):
-        plan_worker = MagicMock()
-        plan_worker.run.return_value = _make_result(final_message=TESTS_ONLY_PLAN_JSON)
+        # The single-call pipeline never invokes the plan worker, so
+        # experiment.plan stays None.  The evaluator must derive the
+        # tests_only classification solely from the goal text.
         implementation_worker = MagicMock()
 
         def _write_test_only(*args, **kwargs):
@@ -463,7 +508,7 @@ class PipelineIntegrationTestCase(unittest.TestCase):
         implementation_worker.run.side_effect = _write_test_only
 
         service = _service(
-            self.repo_root, self.tmp.name, self.selection_worker, plan_worker, implementation_worker
+            self.repo_root, self.tmp.name, self.selection_worker, MagicMock(), implementation_worker
         )
         self.addCleanup(service.close)
         experiment = service.create_experiment(

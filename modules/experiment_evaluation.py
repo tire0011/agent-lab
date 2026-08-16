@@ -418,6 +418,11 @@ def evaluate_implementation(
     exception raised here as ``needs_review`` (never as ``succeeded``).
     """
     p = PlanLike.from_any(plan)
+    # When no structured plan exists (single-call pipeline) and the original
+    # goal is exclusively tests-only, promote change_kind accordingly so the
+    # evaluator does not incorrectly require non-test file evidence.
+    if plan is None and p.change_kind == DEFAULT_CHANGE_KIND and goal_is_explicit_tests_only(goal):
+        p.change_kind = "tests_only"
     all_changed = changed.all_paths()
     test_changed, non_test_changed = split_test_and_non_test(all_changed)
 
