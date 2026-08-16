@@ -532,6 +532,35 @@ async function fetchExperimentSummary(experimentId) {
   }
 }
 
+async function copyTextToClipboard(value) {
+  if (!value) return false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fallback below.
+    }
+  }
+  const textArea = document.createElement("textarea");
+  textArea.value = value;
+  textArea.setAttribute("readonly", "");
+  textArea.style.position = "fixed";
+  textArea.style.opacity = "0";
+  textArea.style.left = "-9999px";
+  document.body.append(textArea);
+  textArea.select();
+  textArea.setSelectionRange(0, textArea.value.length);
+  try {
+    // Legacy fallback when Clipboard API is unavailable.
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    textArea.remove();
+  }
+}
+
 async function renderTaskApprovals(tasks) {
   if (!tasks.length) {
     taskElements.content.textContent = "Keine Mailbox-Aufträge vorhanden.";
@@ -633,7 +662,9 @@ async function showExperimentDetail(experimentId) {
     return;
   }
   taskElements.detailContent.replaceChildren();
+  const fullExperimentId = exp.id || "";
   const lines = [
+    ["Experiment-ID", fullExperimentId || "–"],
     ["Phase", exp.phase || exp.status],
     ["Erstellt", exp.created_at],
     ["Beendet", exp.ended_at || "–"],
@@ -652,7 +683,30 @@ async function showExperimentDetail(experimentId) {
     const dt = document.createElement("dt");
     dt.textContent = label;
     const dd = document.createElement("dd");
-    dd.textContent = value;
+    if (label === "Experiment-ID") {
+      const valueSpan = document.createElement("span");
+      valueSpan.textContent = value;
+      valueSpan.className = "selectable-id";
+      dd.append(valueSpan);
+      if (fullExperimentId) {
+        const copyButton = document.createElement("button");
+        copyButton.type = "button";
+        copyButton.className = "secondary inline-copy-button";
+        copyButton.textContent = "Kopieren";
+        const status = document.createElement("span");
+        status.className = "inline-copy-status";
+        copyButton.addEventListener("click", async () => {
+          const copied = await copyTextToClipboard(fullExperimentId);
+          status.textContent = copied ? "Kopiert." : "Kopieren fehlgeschlagen.";
+          setTimeout(() => {
+            status.textContent = "";
+          }, 1600);
+        });
+        dd.append(copyButton, status);
+      }
+    } else {
+      dd.textContent = value;
+    }
     dl.append(dt, dd);
   }
   taskElements.detailContent.append(dl);

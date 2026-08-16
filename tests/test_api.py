@@ -223,6 +223,31 @@ class WebClientTests(ApiTestsBase):
         self.assertIn("javascript", response.headers["content-type"])
         self.assertIn("textContent", response.text)
 
+    def test_experiment_detail_shows_full_id_and_copy_control(self):
+        javascript = self.client.get("/static/app.js").text
+        detail_block = javascript.split("async function showExperimentDetail(experimentId)", 1)[1].split(
+            "taskElements.loadButton.addEventListener", 1
+        )[0]
+        self.assertIn('["Experiment-ID", fullExperimentId || "–"]', detail_block)
+        self.assertIn('copyButton.textContent = "Kopieren"', detail_block)
+        self.assertIn("copyTextToClipboard(fullExperimentId)", detail_block)
+        self.assertNotIn("fullExperimentId.slice(0, 8)", detail_block)
+
+    def test_public_experiment_detail_fetch_path_is_preserved(self):
+        javascript = self.client.get("/static/app.js").text
+        fetch_block = javascript.split("async function fetchExperimentSummary(experimentId)", 1)[1].split(
+            "async function copyTextToClipboard", 1
+        )[0]
+        self.assertIn(
+            "const path = state.apiKey ? `/experiments/${experimentId}` : `/experiments/${experimentId}/public`;",
+            fetch_block,
+        )
+
+    def test_experiment_detail_mobile_layout_rule_is_preserved(self):
+        stylesheet = self.client.get("/static/styles.css").text
+        mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
+        self.assertIn(".detail-list { grid-template-columns: 1fr; }", mobile_rules)
+
     def test_logs_status_contract(self):
         html = self.client.get("/").text
         self.assertIn('id="logs-visible-count"', html)
@@ -276,6 +301,39 @@ class WebClientTests(ApiTestsBase):
         self.assertIn("flex-wrap: wrap", stylesheet)
         mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
         self.assertIn(".logs-status { align-items: flex-start; flex-direction: column;", mobile_rules)
+
+
+class MailboxTaskDetailEndpointTests(ApiTestsBase):
+    def test_mailbox_task_detail_exposes_full_experiment_id(self):
+        full_experiment_id = "exp-20260816-abcdef0123456789fedcba9876543210"
+        approval = SimpleNamespace(
+            to_dict=lambda: {
+                "id": "approval-1",
+                "mailbox_msg_id": 42,
+                "task_body": "Investigate failure",
+                "sender": "nexus",
+                "file_path": "communication/inbox/task.md",
+                "received_at": "2026-08-16T00:00:00Z",
+                "status": "failed",
+                "approved_at": None,
+                "rejected_at": None,
+                "rejection_reason": None,
+                "experiment_id": full_experiment_id,
+                "outbox_file": None,
+                "result_summary": None,
+                "error": None,
+                "created_at": "2026-08-16T00:00:00Z",
+                "updated_at": "2026-08-16T00:05:00Z",
+            }
+        )
+        service = MagicMock()
+        service.get.return_value = approval
+        api.app.dependency_overrides[get_mailbox_task_service] = lambda: service
+
+        response = self.client.get("/mailbox/tasks/approval-1", headers={"x-api-key": "test-key"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["experiment_id"], full_experiment_id)
+        self.assertGreater(len(response.json()["experiment_id"]), 8)
 
 
 class StatusEndpointTests(ApiTestsBase):
