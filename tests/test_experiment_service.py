@@ -32,11 +32,13 @@ from modules.experiment_service import (
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
     ExperimentService,
-    _build_plan_prompt,
+    _build_direct_implementation_prompt,
     _build_implementation_prompt,
+    _build_plan_prompt,
     _build_policy_replan_prompt,
     _build_reformat_retry_prompt,
     _build_research_prompt,
+    _check_goal_policy,
     _extract_diagnostic_log,
     extract_single_json_object,
     parse_plan,
@@ -183,6 +185,13 @@ def _write_affected_files_side_effect(message: str = "implemented"):
                         )
                     else:
                         target.write_text('"""Docstring."""\n')
+        elif working_dir:
+            # New single-call pipeline: no "Affected files:" in prompt.
+            # Create a minimal non-test file so the quality gate sees at
+            # least one production-code change.
+            target = Path(working_dir) / "stub.py"
+            if not target.exists():
+                target.write_text('"""Stub implementation created by experiment."""\n')
         return _make_result(final_message=message, sandbox="workspace-write")
 
     return _run
@@ -255,6 +264,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
     # Selection phase behavior
     # ------------------------------------------------------------------
 
+    @unittest.skip("research phase removed")
     def test_research_phase_runs_read_only_in_repo_root(self):
         experiment = self.service.create_experiment(goal="g")
         self.service.run_experiment(experiment.id)
@@ -266,6 +276,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertLessEqual(kwargs["timeout_seconds"], 120)
         self.assertNotIn("output_schema", kwargs)
 
+    @unittest.skip("plan phase removed")
     def test_plan_phase_uses_schema_but_isolated_scratch_dir(self):
         experiment = self.service.create_experiment(goal="g")
         self.service.run_experiment(experiment.id)
@@ -282,6 +293,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         # exec must be told to skip its trusted-git-repo check there.
         self.assertTrue(kwargs.get("skip_git_repo_check"))
 
+    @unittest.skip("plan phase removed")
     def test_plan_phase_receives_research_summary(self):
         self.selection_worker.run.return_value = _make_result(
             final_message="RESEARCH_MARKER: found interesting file X."
@@ -292,6 +304,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         _, kwargs = self.plan_worker.run.call_args
         self.assertIn("RESEARCH_MARKER: found interesting file X.", kwargs["task"])
 
+    @unittest.skip("research/plan phases removed")
     def test_research_runs_before_plan(self):
         call_order: list[str] = []
         self.selection_worker.run.side_effect = lambda **kw: (
@@ -304,6 +317,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.service.run_experiment(experiment.id)
         self.assertEqual(call_order, ["research", "plan"])
 
+    @unittest.skip("research phase removed")
     def test_research_phase_diagnostic_log_may_contain_tool_events(self):
         self.selection_worker.run.return_value = _make_result(
             final_message="Investigated the repo.",
@@ -325,6 +339,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertIsNotNone(result.research_diagnostic_log)
         self.assertIn("command_execution", result.research_diagnostic_log)
 
+    @unittest.skip("research phase removed")
     def test_research_raw_summary_is_size_limited(self):
         long_text = "y" * 20000
         self.selection_worker.run.return_value = _make_result(final_message=long_text)
@@ -335,6 +350,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         )
         self.assertIn("truncated", result.research_raw_summary)
 
+    @unittest.skip("research phase removed")
     def test_research_raw_summary_secrets_are_redacted(self):
         leaky_message = "Found config with AZURE_OPENAI_API_KEY=sk-verysecretvalue1234"
         self.selection_worker.run.return_value = _make_result(final_message=leaky_message)
@@ -343,6 +359,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertNotIn("sk-verysecretvalue1234", result.research_raw_summary or "")
         self.assertIn("[REDACTED]", result.research_raw_summary or "")
 
+    @unittest.skip("research phase removed")
     def test_research_diagnostic_log_excludes_reasoning_and_full_command_output(self):
         self.selection_worker.run.return_value = _make_result(
             final_message="Investigated the repo.",
@@ -370,6 +387,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertNotIn("full file contents that must not be persisted", result.research_diagnostic_log or "")
         self.assertIn("command_execution", result.research_diagnostic_log or "")
 
+    @unittest.skip("research/plan phases removed")
     def test_research_placeholder_text_not_parsed_as_plan(self):
         # The research phase may itself emit prose that superficially
         # mentions JSON-like content; it must never be fed into
@@ -424,11 +442,12 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertNotIn("experiment/", branch.stdout)
 
     def test_worker_called_exactly_once_each_phase(self):
+        # Single-call pipeline: only the implementation worker is invoked.
         experiment = self.service.create_experiment(goal="g")
         self.service.run_experiment(experiment.id)
-        self.assertEqual(self.selection_worker.run.call_count, 1)
-        self.assertEqual(self.plan_worker.run.call_count, 1)
-        self.assertEqual(self.implementation_worker.run.call_count, 1)
+        self.selection_worker.run.assert_not_called()
+        self.plan_worker.run.assert_not_called()
+        self.implementation_worker.run.assert_called_once()
 
     def test_succeeded_when_tests_pass(self):
         experiment = self.service.create_experiment(goal="g")
@@ -573,18 +592,20 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertIn(untracked_path, serialized["diff_stat"])
         self.assertIn("+new untracked contents", serialized["diff_text"])
 
-    def test_usage_of_both_phases_persisted(self):
+    def test_usage_of_implementation_phase_persisted(self):
+        # Single-call pipeline: only implementation usage is recorded.
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.selection_usage, {"input_tokens": 100, "output_tokens": 20})
         self.assertEqual(result.implementation_usage, {"input_tokens": 100, "output_tokens": 20})
-        self.assertIsNotNone(result.selection_runtime_ms)
         self.assertIsNotNone(result.implementation_runtime_ms)
+        self.assertIsNone(result.selection_usage)
+        self.assertIsNone(result.research_usage)
 
     # ------------------------------------------------------------------
     # Rejection handling
     # ------------------------------------------------------------------
 
+    @unittest.skip("plan phase removed")
     def test_none_plan_is_rejected(self):
         self.plan_worker.run.return_value = _make_result(
             final_message=json.dumps({"title": "NONE", "motivation": "nothing small enough"})
@@ -595,6 +616,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(result.policy_rule, "unparseable_plan")
         self.implementation_worker.run.assert_not_called()
 
+    @unittest.skip("plan phase removed")
     def test_unparseable_plan_is_rejected(self):
         self.plan_worker.run.return_value = _make_result(final_message="not structured at all")
         experiment = self.service.create_experiment(goal="g")
@@ -604,19 +626,15 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.implementation_worker.run.assert_not_called()
 
     def test_policy_violation_persists_matched_policy_rule(self):
-        rejected_plan = json.loads(VALID_PLAN_JSON)
-        rejected_plan["expected_changes"] = "run git commit and git push after the change"
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(rejected_plan))
-        experiment = self.service.create_experiment(goal="g")
+        # Goal policy check: commit keyword → rejected with disallowed_keyword rule.
+        experiment = self.service.create_experiment(
+            goal="Implement the feature then run git commit and push."
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
         self.assertEqual(result.policy_rule, "disallowed_keyword")
         self.assertIsNotNone(result.error)
         self.implementation_worker.run.assert_not_called()
-
-    # ------------------------------------------------------------------
-    # Prefix resolution (resolve_experiment / resolve_public_experiment)
-    # ------------------------------------------------------------------
 
     def test_resolve_experiment_accepts_unambiguous_prefix(self):
         experiment = self.service.create_experiment(goal="g")
@@ -642,71 +660,64 @@ class ExperimentServiceTestCase(unittest.TestCase):
         with self.assertRaises(ExperimentNotFoundError):
             self.service.resolve_experiment(shared_prefix)
 
-    def test_plan_mentioning_commit_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["expected_changes"] = "Implement then git commit and push the change."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_plan_mentioning_package_install_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["expected_changes"] = "Run pip install requests then use it."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_plan_with_harmless_vm_mention_is_not_rejected(self):
-        # A bare, passing mention of "VM"/"Azure" (e.g. documenting the
-        # currently configured VM size) must not be blocked on its own —
-        # only an actual planned infra action should reject a plan.
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["motivation"] = (
-            "README.md still says the VM runs on Azure as Standard_B1s, "
-            "while IDEAS.md records that it was already resized to "
-            "Standard_B2s. Fix the outdated VM size mentioned in the docs."
+    def test_goal_mentioning_commit_is_rejected(self):
+        # Security check on goal text: "commit" triggers the denylist.
+        experiment = self.service.create_experiment(
+            goal="Implement the feature then run git commit and push."
         )
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_not_called()
+
+    def test_goal_mentioning_package_install_is_rejected(self):
+        # Security check on goal text: "pip install" triggers the denylist.
+        experiment = self.service.create_experiment(
+            goal="Run pip install requests then use it in the code."
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_not_called()
+
+    def test_goal_with_harmless_vm_mention_is_not_rejected(self):
+        # A bare VM mention without a paired action verb must not block the goal.
+        experiment = self.service.create_experiment(
+            goal=(
+                "Fix a typo in README.md. The current VM is Standard_B1s "
+                "per OPERATIONS.md. No infrastructure action is needed."
+            )
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertNotEqual(result.status, STATUS_REJECTED)
 
-    def test_plan_creating_vm_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["expected_changes"] = "Create a new Azure VM for the worker pool."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
+    def test_goal_creating_vm_is_rejected(self):
+        experiment = self.service.create_experiment(
+            goal="Create a new Azure VM for the worker pool."
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
         self.implementation_worker.run.assert_not_called()
 
-    def test_plan_deleting_vm_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["expected_changes"] = "Delete the unused VM once traffic drains."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
+    def test_goal_deleting_vm_is_rejected(self):
+        experiment = self.service.create_experiment(
+            goal="Delete the Azure VM that is no longer needed."
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
         self.implementation_worker.run.assert_not_called()
 
-    def test_plan_deploying_to_production_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["expected_changes"] = "Deploy the updated service to the production environment."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
+    def test_goal_deploying_to_production_is_rejected(self):
+        experiment = self.service.create_experiment(
+            goal="Deploy the application to the production environment."
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
         self.implementation_worker.run.assert_not_called()
 
-    def test_plan_with_cost_action_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["risks"] = "Requires purchasing additional compute credits first."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
+    def test_goal_with_cost_action_is_rejected(self):
+        # "enable billing" is in the hard keyword denylist.
+        experiment = self.service.create_experiment(
+            goal="Enable billing to provision new paid resources."
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
         self.implementation_worker.run.assert_not_called()
@@ -721,26 +732,22 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertNotEqual(result.status, STATUS_REJECTED)
 
     def test_bare_secret_mention_with_negation_is_accepted(self):
-        # Regression: this used to be rejected by a context-less bare
-        # "api_key" keyword hit. A safe, negated mention like "does not
-        # touch any api_key values" must now be accepted; only an actual
-        # secret/credential *action* (see PolicyActionSecretTestCase)
-        # rejects a plan.
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["risks"] = "None, does not touch any api_key values."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
+        # Negated mentions in the goal should not trigger the secret-action check.
+        experiment = self.service.create_experiment(
+            goal="Improve redaction logic to ensure secrets are not logged."
+        )
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.assertNotEqual(result.status, STATUS_REJECTED)
 
-    def test_plan_reading_secret_from_env_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["expected_changes"] = "Reads the api key from an environment variable to call the service."
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
+    def test_goal_reading_secret_from_env_is_rejected(self):
+        experiment = self.service.create_experiment(
+            goal="Read the API key from the environment and use it in requests."
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_not_called()
 
+    @unittest.skip("plan-specific check removed")
     def test_plan_touching_too_many_files_is_rejected(self):
         plan = json.loads(VALID_PLAN_JSON)
         plan["affected_files"] = [f"modules/f{i}.py" for i in range(6)]
@@ -751,24 +758,22 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.implementation_worker.run.assert_not_called()
 
     def test_rejected_experiment_never_creates_worktree(self):
-        self.plan_worker.run.return_value = _make_result(final_message="garbage")
-        experiment = self.service.create_experiment(goal="g")
+        # Goal policy rejection must happen before any worktree is created.
+        experiment = self.service.create_experiment(
+            goal="Run git commit and push after implementing the change."
+        )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
         self.assertIsNone(result.worktree_path)
         self.assertFalse(self.worktrees_root.exists() and any(self.worktrees_root.iterdir()))
-
-    # ------------------------------------------------------------------
-    # Start-once semantics
-    # ------------------------------------------------------------------
 
     def test_second_start_is_rejected(self):
         experiment = self.service.create_experiment(goal="g")
         self.service.run_experiment(experiment.id)
         with self.assertRaises(ExperimentNotRunnableError):
             self.service.run_experiment(experiment.id)
-        # Worker still only called once per phase despite the second attempt.
-        self.assertEqual(self.selection_worker.run.call_count, 1)
+        # Implementation worker still only called once despite second attempt.
+        self.assertEqual(self.implementation_worker.run.call_count, 1)
 
     def test_run_unknown_experiment_raises(self):
         with self.assertRaises(ExperimentNotFoundError):
@@ -778,6 +783,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
     # Timeout / exception handling never leaves an active status
     # ------------------------------------------------------------------
 
+    @unittest.skip("research phase removed")
     def test_research_timeout_yields_timed_out_not_active(self):
         self.selection_worker.run.return_value = _make_result(
             timed_out=True, success=False, error="Codex process timed out after 120s"
@@ -788,6 +794,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.plan_worker.run.assert_not_called()
         self.implementation_worker.run.assert_not_called()
 
+    @unittest.skip("research phase removed")
     def test_research_exception_yields_failed_not_active(self):
         self.selection_worker.run.side_effect = RuntimeError("boom")
         experiment = self.service.create_experiment(goal="g")
@@ -796,6 +803,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertIn("boom", result.error)
         self.plan_worker.run.assert_not_called()
 
+    @unittest.skip("plan phase removed")
     def test_plan_timeout_yields_timed_out_not_active(self):
         self.plan_worker.run.return_value = _make_result(
             timed_out=True, success=False, error="Codex process timed out after 90s"
@@ -805,6 +813,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(result.status, STATUS_TIMED_OUT)
         self.implementation_worker.run.assert_not_called()
 
+    @unittest.skip("plan phase removed")
     def test_plan_exception_yields_failed_not_active(self):
         self.plan_worker.run.side_effect = RuntimeError("plan-boom")
         experiment = self.service.create_experiment(goal="g")
@@ -1328,6 +1337,7 @@ class PolicyActionSecretTestCase(unittest.TestCase):
         self.assertIsNone(plan_violates_policy(plan, json.dumps(data)))
 
 
+@unittest.skip("reformat-retry phase removed")
 class ReformatRetryTestCase(unittest.TestCase):
     """Covers the exactly-one-shot read-only reformat retry."""
 
@@ -1614,6 +1624,7 @@ class ReformatRetryTestCase(unittest.TestCase):
         self.assertIn("truncated", result.selection_raw_message)
 
 
+@unittest.skip("policy-replan phase removed")
 class PolicyReplanTestCase(unittest.TestCase):
     """Covers the exactly-one-shot policy replan (distinct from the parser
     reformat retry above): triggered when a syntactically valid,
@@ -1942,6 +1953,7 @@ class DiagnosticLogPipelineTestCase(unittest.TestCase):
             "item": {"id": "i0", "type": "agent_message", "text": message},
         })
 
+    @unittest.skip("selection phase removed")
     def test_selection_diagnostic_log_stored_on_rejection(self):
         self.plan_worker.run.return_value = _make_result(
             final_message=self.UNPARSEABLE_TEXT,
@@ -1954,6 +1966,7 @@ class DiagnosticLogPipelineTestCase(unittest.TestCase):
         self.assertIsNotNone(result.selection_diagnostic_log)
         self.assertIn(self.UNPARSEABLE_TEXT, result.selection_diagnostic_log)
 
+    @unittest.skip("reformat-retry phase removed")
     def test_reformat_diagnostic_log_stored_separately(self):
         self.plan_worker.run.side_effect = [
             _make_result(final_message=self.UNPARSEABLE_TEXT, stdout=self._stdout_for(self.UNPARSEABLE_TEXT)),
@@ -1982,21 +1995,18 @@ class NexusIdentityPromptTestCase(unittest.TestCase):
     def test_all_llm_prompts_identify_nexus(self):
         plan = parse_plan(VALID_PLAN_JSON)
         prompts = [
-            _build_research_prompt("goal"),
-            _build_plan_prompt("goal", "research"),
-            _build_reformat_retry_prompt(VALID_PLAN_JSON),
-            _build_policy_replan_prompt(
-                "goal", "research", VALID_PLAN_JSON, "reason"
-            ),
+            _build_direct_implementation_prompt("some goal"),
             _build_implementation_prompt(plan),
         ]
+        # Old prompts still exist as helpers but are no longer called in the
+        # live pipeline; verify the new direct-implementation prompt and the
+        # existing plan-based prompt both carry the Nexus identity header.
         for prompt in prompts:
             with self.subTest(prompt=prompt[:80]):
                 self.assertTrue(prompt.startswith("You are operating"))
                 self.assertIn("worker for Nexus", prompt)
                 self.assertIn('not as "the user"', prompt)
                 self.assertIn("not independently Nexus", prompt)
-
 
 class ResearchPromptRequirementsTestCase(unittest.TestCase):
     """The research prompt must instruct Codex to investigate read-only and
@@ -2014,6 +2024,7 @@ class ResearchPromptRequirementsTestCase(unittest.TestCase):
         self.assertIn("prose, not JSON", prompt)
 
 
+@unittest.skip("plan phase removed")
 class PlanPromptRequirementsTestCase(unittest.TestCase):
     """The plan prompt must instruct Codex it has no tools, embed the
     research summary, forbid placeholder/intention-only answers, and
@@ -2163,6 +2174,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
             repo_root=str(self.repo_root),
             worktrees_root=str(self.worktrees_root),
             experiment_log_dir=str(self.log_dir),
+            test_python_executable=sys.executable,
         )
         self.addCleanup(self.service.close)
 
@@ -2178,17 +2190,14 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
         entries = self._read_log(experiment.id)
         events = [e["event"] for e in entries]
-        # The whole pipeline - creation, every phase start, worktree
-        # creation, and final success - must be traceable from this one
-        # file, in order.
+        # The whole pipeline - creation, implementation, worktree creation,
+        # and final success - must be traceable from this one file, in order.
         for expected in (
-            "experiment_created", "run_experiment_started", "research_started",
-            "research_completed", "selection_started", "worktree_created",
+            "experiment_created", "run_experiment_started", "worktree_created",
             "implementation_started", "tests_passed",
         ):
             self.assertIn(expected, events, f"missing {expected!r} in {events!r}")
-        self.assertLess(events.index("research_started"), events.index("selection_started"))
-        self.assertLess(events.index("selection_started"), events.index("implementation_started"))
+        self.assertLess(events.index("worktree_created"), events.index("implementation_started"))
         self.assertLess(events.index("implementation_started"), events.index("tests_passed"))
         for entry in entries:
             self.assertEqual(entry["experiment_id"], experiment.id)
@@ -2217,7 +2226,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         self.assertTrue(status_change, "expected a status_forced -> failed entry")
 
     def test_unhandled_exception_is_logged_with_stacktrace(self):
-        self.selection_worker.run.side_effect = RuntimeError("research boom")
+        self.implementation_worker.run.side_effect = RuntimeError("impl boom")
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_FAILED)
@@ -2227,12 +2236,14 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         self.assertEqual(len(exceptions), 1)
         self.assertEqual(exceptions[0]["level"], "ERROR")
         self.assertEqual(exceptions[0]["exception_type"], "RuntimeError")
-        self.assertIn("research boom", exceptions[0]["exception_message"])
+        self.assertIn("impl boom", exceptions[0]["exception_message"])
         self.assertIn("Traceback", exceptions[0]["stacktrace"])
 
     def test_timeout_is_logged_distinctly_from_a_hard_failure(self):
-        self.plan_worker.run.return_value = _make_result(
-            timed_out=True, success=False, error="Codex process timed out after 90s"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            timed_out=True, success=False, sandbox="workspace-write",
+            error="Codex process timed out after 1200s",
         )
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
@@ -2242,6 +2253,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         status_events = [e for e in entries if e["event"] == "status_forced"]
         self.assertTrue(any(e.get("to_status") == STATUS_TIMED_OUT for e in status_events))
 
+    @unittest.skip("reformat-retry phase removed")
     def test_reformat_retry_is_logged_as_warning(self):
         self.plan_worker.run.side_effect = [
             _make_result(final_message="not valid json at all"),
@@ -2275,6 +2287,311 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         # write having failed.
         reloaded = self.service.get_experiment(experiment.id)
         self.assertEqual(reloaded.status, STATUS_SUCCEEDED)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the single-LLM-call pipeline
+# ---------------------------------------------------------------------------
+
+
+class SingleCallPipelineRegressionTests(unittest.TestCase):
+    """Focused regression tests for the single-call Codex pipeline.
+
+    These tests verify that:
+    - only one Codex call is made per experiment (implementation only),
+    - the safety check runs on the raw goal before any LLM call,
+    - the quality gate still works without an LLM-generated plan,
+    - DB fields for removed phases remain null (backward-compatible),
+    - usage summary contains only the implementation call.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo_root = Path(self.tmp.name) / "repo"
+        self.repo_root.mkdir()
+        _init_git_repo(self.repo_root)
+        self.worktrees_root = Path(self.tmp.name) / "worktrees"
+        self.db_path = str(Path(self.tmp.name) / "agent.db")
+
+        self.implementation_worker = MagicMock()
+        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
+
+        self.service = ExperimentService(
+            worker_factory=lambda wt: self.implementation_worker,
+            db_path=self.db_path,
+            repo_root=str(self.repo_root),
+            worktrees_root=str(self.worktrees_root),
+        )
+        self.addCleanup(self.service.close)
+
+    # ------------------------------------------------------------------
+    # Single LLM call
+    # ------------------------------------------------------------------
+
+    def test_only_implementation_worker_is_called(self):
+        experiment = self.service.create_experiment(goal="Add a small helper.")
+        self.service.run_experiment(experiment.id)
+        # The implementation worker must be called exactly once and no other
+        # LLM call should be made (no selection_worker, no plan_worker).
+        self.implementation_worker.run.assert_called_once()
+
+    def test_implementation_prompt_contains_goal(self):
+        goal = "Add a UNIQUE_GOAL_MARKER helper function."
+        experiment = self.service.create_experiment(goal=goal)
+        self.service.run_experiment(experiment.id)
+        _, kwargs = self.implementation_worker.run.call_args
+        self.assertIn("UNIQUE_GOAL_MARKER", kwargs.get("task", ""))
+
+    def test_implementation_uses_workspace_write_sandbox(self):
+        experiment = self.service.create_experiment(goal="Some task.")
+        self.service.run_experiment(experiment.id)
+        _, kwargs = self.implementation_worker.run.call_args
+        self.assertEqual(kwargs["sandbox"], "workspace-write")
+
+    def test_implementation_worker_scoped_to_worktree(self):
+        experiment = self.service.create_experiment(goal="Some task.")
+        result = self.service.run_experiment(experiment.id)
+        _, kwargs = self.implementation_worker.run.call_args
+        self.assertEqual(kwargs["working_dir"], result.worktree_path)
+
+    # ------------------------------------------------------------------
+    # Goal security check runs before any LLM call
+    # ------------------------------------------------------------------
+
+    def test_goal_with_commit_keyword_rejected_without_llm_call(self):
+        experiment = self.service.create_experiment(
+            goal="Implement and then run git commit and push."
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_not_called()
+
+    def test_goal_with_pip_install_rejected_without_llm_call(self):
+        experiment = self.service.create_experiment(
+            goal="Run pip install requests then use it."
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_not_called()
+
+    def test_goal_with_infra_action_rejected_without_llm_call(self):
+        experiment = self.service.create_experiment(
+            goal="Create a new Azure VM for the worker pool."
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_not_called()
+
+    def test_goal_policy_rule_classified_correctly(self):
+        experiment = self.service.create_experiment(
+            goal="Implement and then git commit and push the result."
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.assertEqual(result.policy_rule, "disallowed_keyword")
+
+    def test_benign_goal_passes_safety_check(self):
+        experiment = self.service.create_experiment(
+            goal="Add unit tests for the redaction module."
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertNotEqual(result.status, STATUS_REJECTED)
+
+    # ------------------------------------------------------------------
+    # DB backward compatibility: removed-phase fields are null
+    # ------------------------------------------------------------------
+
+    def test_removed_phase_db_fields_are_null(self):
+        experiment = self.service.create_experiment(goal="Some task.")
+        result = self.service.run_experiment(experiment.id)
+        # Fields for removed phases must remain null for new experiments.
+        self.assertIsNone(result.selection_usage)
+        self.assertIsNone(result.selection_task_id)
+        self.assertIsNone(result.reformat_retry_usage)
+        self.assertIsNone(result.reformat_retry_task_id)
+        self.assertIsNone(result.policy_replan_usage)
+        self.assertIsNone(result.policy_replan_task_id)
+        self.assertIsNone(result.research_usage)
+        self.assertIsNone(result.research_task_id)
+        self.assertIsNone(result.plan)
+
+    # ------------------------------------------------------------------
+    # Usage summary contains only the implementation call
+    # ------------------------------------------------------------------
+
+    def test_usage_summary_contains_only_implementation_call(self):
+        experiment = self.service.create_experiment(goal="Some task.")
+        result = self.service.run_experiment(experiment.id)
+        # Implementation usage must be present.
+        self.assertIsNotNone(result.implementation_usage)
+        self.assertIsNotNone(result.implementation_runtime_ms)
+        # All selection/research/retry usage fields must be absent.
+        self.assertIsNone(result.selection_usage)
+        self.assertIsNone(result.research_usage)
+        self.assertIsNone(result.reformat_retry_usage)
+        self.assertIsNone(result.policy_replan_usage)
+
+    # ------------------------------------------------------------------
+    # Worktree isolation and sandbox enforcement still apply
+    # ------------------------------------------------------------------
+
+    def test_main_repo_unchanged_after_run(self):
+        experiment = self.service.create_experiment(goal="Some task.")
+        self.service.run_experiment(experiment.id)
+        status = subprocess.run(
+            ["git", "-C", str(self.repo_root), "status", "--short"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(status.stdout.strip(), "")
+
+    def test_worktree_created_on_isolated_branch(self):
+        experiment = self.service.create_experiment(goal="Some task.")
+        result = self.service.run_experiment(experiment.id)
+        self.assertIsNotNone(result.worktree_path)
+        self.assertTrue(Path(result.worktree_path).is_dir())
+        self.assertTrue(result.branch_name.startswith("experiment/"))
+
+    # ------------------------------------------------------------------
+    # Quality gate (plan=None) still catches tests-only diffs
+    # ------------------------------------------------------------------
+
+    def test_quality_gate_requires_non_test_file_change(self):
+        # An implementation that only touches test files must be flagged.
+        def tests_only_impl(*args, **kwargs):
+            working_dir = kwargs.get("working_dir")
+            if working_dir:
+                target = Path(working_dir) / "tests" / "test_new.py"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("def test_pass(): assert True\n")
+            return _make_result(final_message="done", sandbox="workspace-write")
+
+        self.implementation_worker.run.side_effect = tests_only_impl
+        experiment = self.service.create_experiment(goal="Add tests only.")
+        result = self.service.run_experiment(experiment.id)
+        # With no non-test changes and a goal that doesn't explicitly request
+        # tests-only, the quality gate should flag this for review.
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+
+    # ------------------------------------------------------------------
+    # _build_direct_implementation_prompt helper
+    # ------------------------------------------------------------------
+
+    def test_direct_implementation_prompt_contains_goal(self):
+        prompt = _build_direct_implementation_prompt("UNIQUE_GOAL_TEXT")
+        self.assertIn("UNIQUE_GOAL_TEXT", prompt)
+
+    def test_direct_implementation_prompt_carries_nexus_identity(self):
+        prompt = _build_direct_implementation_prompt("some goal")
+        self.assertTrue(prompt.startswith("You are operating"))
+        self.assertIn("worker for Nexus", prompt)
+
+    def test_direct_implementation_prompt_forbids_commit_push_merge(self):
+        prompt = _build_direct_implementation_prompt("some goal")
+        self.assertIn("commit", prompt.lower())
+        self.assertIn("push", prompt.lower())
+        # The no-commit instruction must be present.
+        self.assertIn("Do NOT run", prompt)
+
+    # ------------------------------------------------------------------
+    # _check_goal_policy helper
+    # ------------------------------------------------------------------
+
+    def test_check_goal_policy_blocks_commit(self):
+        self.assertIsNotNone(_check_goal_policy("implement and commit the change"))
+
+    def test_check_goal_policy_blocks_infra_action(self):
+        self.assertIsNotNone(_check_goal_policy("create a new Azure VM"))
+
+    def test_check_goal_policy_blocks_secret_action(self):
+        self.assertIsNotNone(_check_goal_policy("read the api key from environment"))
+
+    def test_check_goal_policy_allows_benign_goal(self):
+        self.assertIsNone(_check_goal_policy("add unit tests for the cost monitor"))
+
+    def test_check_goal_policy_allows_negated_mention(self):
+        # "no secrets" / "without logging tokens" must not block.
+        self.assertIsNone(_check_goal_policy("Ensure no secrets are logged in the output."))
+
+    # ------------------------------------------------------------------
+    # Git-action detection: word/action-aware + negation-aware
+    # ------------------------------------------------------------------
+
+    # Imperative git actions that MUST be blocked ---
+
+    def test_git_commit_command_is_blocked(self):
+        # Explicit "git commit" sub-command is always a requested git action.
+        self.assertIsNotNone(_check_goal_policy("implement it and then run git commit"))
+
+    def test_git_push_command_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("after tests pass, run git push"))
+
+    def test_git_merge_command_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("run git merge to integrate changes"))
+
+    def test_commit_changes_is_blocked(self):
+        # Verb + object proximity: "commit the changes" is a git action.
+        self.assertIsNotNone(_check_goal_policy("commit the changes to the repo"))
+
+    def test_push_branch_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("push the branch to origin"))
+
+    def test_merge_pull_request_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("merge the pull request after review"))
+
+    def test_commit_result_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("implement and commit the result"))
+
+    def test_push_code_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("push the code when done"))
+
+    def test_merge_pr_is_blocked(self):
+        self.assertIsNotNone(_check_goal_policy("merge the pr and mark complete"))
+
+    def test_git_action_rule_classified_as_disallowed_keyword(self):
+        # The policy_rule for a git-action rejection must be disallowed_keyword.
+        experiment = self.service.create_experiment(
+            goal="push the branch after the implementation is done"
+        )
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_REJECTED)
+        self.assertEqual(result.policy_rule, "disallowed_keyword")
+
+    # Negated or incidental mentions that MUST be allowed ---
+
+    def test_do_not_commit_or_push_is_allowed(self):
+        # Explicit safety constraint — must never be rejected.
+        self.assertIsNone(_check_goal_policy("do not commit or push"))
+
+    def test_negated_commit_push_in_goal_is_allowed(self):
+        self.assertIsNone(
+            _check_goal_policy(
+                "Implement feature X. Do not commit, push, or merge anything."
+            )
+        )
+
+    def test_wont_merge_constraint_is_allowed(self):
+        self.assertIsNone(_check_goal_policy("ensure the service won't merge branches automatically"))
+
+    def test_merge_conflict_handling_is_allowed(self):
+        # Incidental noun phrase — "merge" is part of "merge-conflict", not a git command.
+        self.assertIsNone(_check_goal_policy("improve merge-conflict handling in the parser"))
+
+    def test_commit_message_noun_is_allowed(self):
+        # "commit message" is a domain noun, not a git operation request.
+        self.assertIsNone(_check_goal_policy("handle commit message parsing edge cases"))
+
+    def test_push_notification_is_allowed(self):
+        # Unrelated product domain — must not be rejected.
+        self.assertIsNone(_check_goal_policy("add push notification support to the mobile app"))
+
+    def test_committed_adjective_is_allowed(self):
+        # "committed" is an adjective here, not the bare verb "commit".
+        self.assertIsNone(_check_goal_policy("ensure all committed changes are visible in the UI"))
+
+    def test_without_committing_is_allowed(self):
+        # Negated/gerund form — the constraint itself must not be rejected.
+        self.assertIsNone(_check_goal_policy("write tests without committing anything"))
 
 
 if __name__ == "__main__":

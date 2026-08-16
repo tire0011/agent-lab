@@ -128,11 +128,14 @@ _TERMINAL_STATUSES = (
 )
 
 # Allowed forward transitions. ``run_experiment`` walks this graph and
-# refuses to run twice: only queued -> selecting is a valid entry point.
+# refuses to run twice: only queued -> implementing is a valid entry point
+# for new experiments. queued -> selecting is retained for backward
+# compatibility with any stored experiments that began under the old
+# multi-phase pipeline (research → selection → implementation).
 _ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
-    STATUS_QUEUED: (STATUS_SELECTING,),
+    STATUS_QUEUED: (STATUS_IMPLEMENTING, STATUS_REJECTED, STATUS_FAILED, STATUS_SELECTING),
     STATUS_SELECTING: (STATUS_REJECTED, STATUS_IMPLEMENTING, STATUS_FAILED, STATUS_TIMED_OUT),
-    STATUS_IMPLEMENTING: (STATUS_VERIFYING, STATUS_FAILED, STATUS_TIMED_OUT),
+    STATUS_IMPLEMENTING: (STATUS_VERIFYING, STATUS_REJECTED, STATUS_FAILED, STATUS_TIMED_OUT),
     STATUS_VERIFYING: (STATUS_SUCCEEDED, STATUS_FAILED, STATUS_NEEDS_REVIEW),
 }
 
@@ -176,6 +179,13 @@ _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
 # handled by the action-based _SECRET_ACTION_REGEXES check below, since a
 # bare mention (e.g. "without secrets", "tests the redaction logic for
 # tokens") is a common, safe statement that must not reject a plan.
+#
+# NOTE: "commit", "push", and "merge" are kept here for the plan-level check
+# (plan_violates_policy) where the haystack is LLM-generated plan JSON and
+# any occurrence unambiguously means a planned git operation.  For the
+# goal-level check (_check_goal_policy) these three verbs are handled by the
+# word-boundary and negation-aware _GIT_ACTION_REGEXES instead — see the
+# _GIT_ACTION_KEYWORDS frozenset below.
 _REJECT_KEYWORDS: tuple[str, ...] = (
     "commit", "push", "merge",
     "pip install", "npm install", "apt install", "apt-get install",
@@ -189,6 +199,10 @@ _REJECT_KEYWORDS: tuple[str, ...] = (
     "enable billing", "paid tier", "spend money",
     "increase budget", "increase the budget", "credit card",
 )
+
+# The three git-action keywords that are treated specially in
+# _check_goal_policy (word/context-aware instead of plain substring).
+_GIT_ACTION_KEYWORDS: frozenset[str] = frozenset({"commit", "push", "merge"})
 
 # Action-based infrastructure/deployment check. Bare mentions of terms
 # such as "VM", "Azure", "deploy", or "infrastructure" must NOT alone
@@ -246,6 +260,49 @@ _INFRA_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
     re.compile(
         rf"\b(?:{_INFRA_NOUN_ALT})\b(?:\s+\S+){{0,{_INFRA_ACTION_MAX_FILLER_WORDS}}}\s+"
         rf"\b(?:{_INFRA_VERB_ALT})\b",
+        re.IGNORECASE,
+    ),
+)
+
+# Git-action detection for the goal-level policy check (_check_goal_policy).
+# The plan-level check (plan_violates_policy) keeps the simple substring
+# matches in _REJECT_KEYWORDS because the haystack there is LLM-generated
+# plan JSON and any occurrence of "commit" / "push" / "merge" is
+# unambiguously a planned git operation.
+#
+# Raw user goals are different: they routinely contain safe incidental
+# mentions that would be false-positively flagged by substring matching:
+#   "do not commit or push"           (safety constraint / negation)
+#   "improve merge-conflict handling" (incidental compound noun)
+#   "handle commit message parsing"   (domain noun, not a git command)
+#   "push-notification support"       (unrelated product domain)
+#
+# The word-boundary and negation-aware checks below are therefore used
+# instead for raw goal text:
+#   (a) Explicit git sub-command: "git commit / push / merge"  → always
+#       an imperative git action; reject unless a negation precedes it.
+#   (b) Git verb + git-object proximity: "commit the changes",
+#       "push the branch", "merge the PR"  → reject unless negated.
+#
+# Both patterns reuse _infra_action_match_is_false_positive so that
+# explicit negations ("do not commit", "without pushing", "won't merge")
+# and clause-level negations ("never ..., commit ...") are accepted.
+_GIT_OBJECT_NOUNS: tuple[str, ...] = (
+    "change", "changes", "code", "branch", "branches",
+    "result", "results", "implementation", "work",
+    "pr", "prs", "pull request", "pull requests",
+    "it", "them", "this", "that", "everything", "all",
+)
+_GIT_ACTION_MAX_FILLER = 4
+_GIT_NOUN_ALT = "|".join(re.escape(n) for n in _GIT_OBJECT_NOUNS)
+_GIT_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
+    # (a) Explicit git sub-command: "git commit", "git push", "git merge"
+    re.compile(r"\bgit\s+(?:commit|push|merge)\b", re.IGNORECASE),
+    # (b) Git verb within a few words of a recognisable git-object noun:
+    #     "commit the changes", "push the branch", "merge the PR"
+    re.compile(
+        rf"\b(?:commit|push|merge)\b(?:\s+\S+){{0,{_GIT_ACTION_MAX_FILLER}}}\s+"
+        rf"\b(?:{_GIT_NOUN_ALT})\b",
         re.IGNORECASE,
     ),
 )
@@ -1066,6 +1123,56 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
     return None
 
 
+def _check_goal_policy(goal: str) -> str | None:
+    """Apply the safety denylist directly to the raw goal text.
+
+    This is the pre-implementation security check for the single-call
+    pipeline (no LLM-generated plan to scan).  Returns a human-readable
+    rejection reason or ``None`` if the goal is acceptable.
+
+    Unlike the plan-level check (plan_violates_policy), the git-action
+    keywords "commit", "push", and "merge" are handled by the word-boundary
+    and negation-aware _GIT_ACTION_REGEXES rather than the plain substring
+    scan.  This avoids false-positive rejections of safe goals such as
+    "do not commit or push", "improve merge-conflict handling", or
+    "handle commit message parsing".
+    """
+    haystack = (goal or "").lower()
+    # Plain substring check — skip git-action keywords; they are checked
+    # with word-boundary and context awareness below.
+    for keyword in _REJECT_KEYWORDS:
+        if keyword in _GIT_ACTION_KEYWORDS:
+            continue
+        if keyword in haystack:
+            return f"goal mentions disallowed keyword: {keyword!r}"
+    # Word-boundary + negation-aware git-action check.
+    for regex in _GIT_ACTION_REGEXES:
+        for match in regex.finditer(haystack):
+            preceding = haystack[max(0, match.start() - 200):match.start()]
+            if _infra_action_match_is_false_positive(match.group(0), preceding):
+                continue
+            return f"goal requests a disallowed git action: {match.group(0)!r}"
+    for regex in _INFRA_ACTION_REGEXES:
+        for match in regex.finditer(haystack):
+            preceding = haystack[max(0, match.start() - 200):match.start()]
+            if _infra_action_match_is_false_positive(match.group(0), preceding):
+                continue
+            return (
+                "goal describes an actual infrastructure/deployment action "
+                f"with external effect: {match.group(0)!r}"
+            )
+    for regex in _SECRET_ACTION_REGEXES:
+        for match in regex.finditer(haystack):
+            preceding = haystack[max(0, match.start() - 200):match.start()]
+            if _infra_action_match_is_false_positive(match.group(0), preceding):
+                continue
+            return (
+                "goal describes an actual secret/credential action: "
+                f"{match.group(0)!r}"
+            )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Policy rule classification — turns a free-text rejection reason (produced
 # by plan_violates_policy() or by the surrounding pipeline) into a short,
@@ -1080,8 +1187,12 @@ _POLICY_RULE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("agent found no suitable improvement", "no_suitable_improvement"),
     ("agent found no suitable alternative improvement", "no_suitable_improvement"),
     ("plan mentions disallowed keyword", "disallowed_keyword"),
+    ("goal mentions disallowed keyword", "disallowed_keyword"),
+    ("goal requests a disallowed git action", "disallowed_keyword"),
     ("plan describes an actual infrastructure/deployment action", "infra_action"),
+    ("goal describes an actual infrastructure/deployment action", "infra_action"),
     ("plan describes an actual secret/credential action", "secret_action"),
+    ("goal describes an actual secret/credential action", "secret_action"),
     ("plan title looks like a placeholder/intention-only statement", "placeholder_title"),
     ("plan does not touch any concrete code or test file", "documentation_only"),
     ("plan touches too many files", "too_many_files"),
@@ -1383,6 +1494,37 @@ def _build_implementation_prompt(plan: ExperimentPlan) -> str:
             acceptance_criteria=", ".join(plan.acceptance_criteria) or "(none declared)",
             planned_tests=plan.planned_tests,
         )
+    )
+
+
+_DIRECT_IMPLEMENTATION_PROMPT_TEMPLATE = """Implement the following task in this repository.
+
+Task: {goal}
+
+Instructions:
+1. Investigate the repository to understand the relevant code (read files,
+   search, list directories).
+2. Plan your implementation based on what you find.
+3. Implement the change described in the task. If the task requires
+   creating or modifying non-test source files, you MUST do so — adding
+   or editing tests alone is not sufficient.
+4. Add or update tests so the change is verifiable.
+5. Do not commit or push. Leave the working tree with your changes
+   unstaged.
+
+Allowed boundaries (must not be violated):
+- Only modify files inside this working directory.
+- Do not install any package or dependency.
+- Do not change infrastructure, deployment, or Azure configuration.
+- Do not read or output secrets or credentials.
+- Do NOT run `git commit`, `git push`, or any merge.
+"""
+
+
+def _build_direct_implementation_prompt(goal: str) -> str:
+    """Build the single Codex implementation prompt directly from the task goal."""
+    return _with_nexus_identity(
+        _DIRECT_IMPLEMENTATION_PROMPT_TEMPLATE.replace("{goal}", goal)
     )
 
 
@@ -1818,8 +1960,8 @@ class ExperimentService:
         elog.info(STATUS_QUEUED, "run_experiment_started", "Experiment pipeline starting")
 
         moved = self._transition(
-            experiment_id, STATUS_QUEUED, STATUS_SELECTING,
-            selection_started_at=_utcnow_iso(),
+            experiment_id, STATUS_QUEUED, STATUS_IMPLEMENTING,
+            implementation_started_at=_utcnow_iso(),
         )
         if not moved:
             # Raced with another start attempt; refuse rather than double-run.
@@ -1850,321 +1992,46 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
     def _run_pipeline(self, experiment_id: str) -> Experiment:
+        """Single-call implementation pipeline.
+
+        Phases (in order):
+          1. Goal security check (deterministic, no LLM call).
+          2. Isolated git worktree creation.
+          3. One Codex call — the worker analyses the repo, plans, and
+             implements the goal directly inside the worktree.
+          4. Verification — git diff + tests + deterministic quality gate.
+
+        No commit, push, merge, or deployment is ever performed here.
+        Reuses ``modules.codex_worker.CodexWorker`` (no duplicated
+        subprocess/worker logic) and the existing SQLite store.
+        """
         experiment = self.get_experiment(experiment_id)
         elog = self.get_experiment_logger(experiment_id)
 
-        # ---- Phase 1: research (read-only, free-form, tools allowed) -----
-        elog.info("research", "research_started", "Starting research phase (read-only)")
-        research_started_at = _utcnow_iso()
-        research_prompt = _build_research_prompt(experiment.goal)
-        research_task_id = uuid.uuid4().hex
-        research_result: CodexResult = self.selection_worker.run(
-            task=research_prompt,
-            working_dir=self.repo_root,
-            sandbox="read-only",
-            timeout_seconds=_DEFAULT_RESEARCH_TIMEOUT_SECONDS,
-            experiment_logger=elog,
-            phase="research",
-        )
-
-        research_fields = dict(
-            research_started_at=research_started_at,
-            research_ended_at=_utcnow_iso(),
-            research_task_id=research_task_id,
-            research_runtime_ms=research_result.runtime_ms,
-            research_usage_json=json.dumps(research_result.usage) if research_result.usage else None,
-            research_raw_summary=_truncate_text(
-                _redact_secrets(research_result.final_message or ""),
-                self.max_raw_message_bytes,
-                label="research summary",
-            ),
-            research_diagnostic_log=_extract_diagnostic_log(
-                research_result.stdout, self.max_diagnostic_log_bytes
-            ),
-        )
-
-        if research_result.timed_out:
-            self._force_status(
-                experiment_id, STATUS_TIMED_OUT,
-                ended_at=_utcnow_iso(),
-                error="research phase timed out",
-                **research_fields,
-            )
-            return self.get_experiment(experiment_id)
-
-        if research_result.error or not research_result.success:
-            self._force_status(
-                experiment_id, STATUS_FAILED,
-                ended_at=_utcnow_iso(),
-                error=research_result.error or "research phase failed (non-zero exit)",
-                **research_fields,
-            )
-            return self.get_experiment(experiment_id)
-
-        research_summary = research_result.final_message or ""
-        elog.info(
-            "research", "research_completed",
-            "Research phase completed successfully",
-            duration_ms=research_result.runtime_ms,
-        )
-
-        # ---- Phase 2: plan (no tools, schema-constrained, isolated) -------
-        # The plan-phase worker is scoped to a fresh, empty scratch
-        # directory (never repo_root): even if the model attempted to run
-        # a shell command, there is no repository content there to
-        # research further. The directory is removed again once the plan
-        # phase (including its one reformat retry) has finished.
-        elog.debug("selection", "scratch_dir_created", "Creating isolated scratch directory for plan phase")
-        Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
-        scratch_dir = tempfile.mkdtemp(prefix=f"plan-{experiment_id}-", dir=self.worktrees_root)
-        try:
-            plan_worker = self.plan_worker_factory(scratch_dir)
-
-            elog.info("selection", "selection_started", "Starting plan selection phase (isolated, tool-less)")
-            plan_prompt = _build_plan_prompt(experiment.goal, research_summary)
-            selection_task_id = uuid.uuid4().hex
-            selection_result: CodexResult = plan_worker.run(
-                task=plan_prompt,
-                working_dir=scratch_dir,
-                sandbox="read-only",
-                timeout_seconds=_DEFAULT_PLAN_TIMEOUT_SECONDS,
-                output_schema=PLAN_JSON_SCHEMA,
-                skip_git_repo_check=True,
-                experiment_logger=elog,
-                phase="selection",
-            )
-
-            if selection_result.timed_out:
-                self._force_status(
-                    experiment_id, STATUS_TIMED_OUT,
-                    ended_at=_utcnow_iso(),
-                    selection_ended_at=_utcnow_iso(),
-                    selection_task_id=selection_task_id,
-                    selection_runtime_ms=selection_result.runtime_ms,
-                    selection_usage_json=json.dumps(selection_result.usage) if selection_result.usage else None,
-                    selection_raw_message=_truncate_text(
-                        selection_result.final_message or "", self.max_raw_message_bytes, label="raw message"
-                    ),
-                    selection_diagnostic_log=_extract_diagnostic_log(
-                        selection_result.stdout, self.max_diagnostic_log_bytes
-                    ),
-                    error="plan phase timed out",
-                    **research_fields,
-                )
-                return self.get_experiment(experiment_id)
-
-            if selection_result.error or not selection_result.success:
-                self._force_status(
-                    experiment_id, STATUS_FAILED,
-                    ended_at=_utcnow_iso(),
-                    selection_ended_at=_utcnow_iso(),
-                    selection_task_id=selection_task_id,
-                    selection_runtime_ms=selection_result.runtime_ms,
-                    selection_usage_json=json.dumps(selection_result.usage) if selection_result.usage else None,
-                    selection_raw_message=_truncate_text(
-                        selection_result.final_message or "", self.max_raw_message_bytes, label="raw message"
-                    ),
-                    selection_diagnostic_log=_extract_diagnostic_log(
-                        selection_result.stdout, self.max_diagnostic_log_bytes
-                    ),
-                    error=selection_result.error or "plan phase failed (non-zero exit)",
-                    **research_fields,
-                )
-                return self.get_experiment(experiment_id)
-
-            plan = parse_plan(selection_result.final_message)
-            if plan is not None:
-                elog.debug("selection", "plan_parsed", f"Plan parsed successfully: {plan.title}")
-            reformat_task_id: str | None = None
-            reformat_runtime_ms: int | None = None
-            reformat_usage: dict[str, Any] | None = None
-            reformat_raw_message: str | None = None
-            reformat_diagnostic_log: str | None = None
-
-            # Exactly one read-only formatting retry: only triggered when no
-            # JSON object could be extracted at all (a genuine formatting
-            # problem), never for a policy violation or "NONE" plan, and
-            # never more than once. The retry uses the same tool-less,
-            # isolated plan_worker/scratch_dir — it never regains repo
-            # access either.
-            if plan is None:
-                elog.warning(
-                    "selection", "plan_reformat_retry",
-                    "Plan output could not be parsed; issuing one read-only reformat retry",
-                )
-                reformat_task_id = uuid.uuid4().hex
-                reformat_prompt = _build_reformat_retry_prompt(selection_result.final_message or "")
-                reformat_result: CodexResult = plan_worker.run(
-                    task=reformat_prompt,
-                    working_dir=scratch_dir,
-                    sandbox="read-only",
-                    timeout_seconds=_REFORMAT_RETRY_TIMEOUT_SECONDS,
-                    output_schema=PLAN_JSON_SCHEMA,
-                    skip_git_repo_check=True,
-                    experiment_logger=elog,
-                    phase="selection_reformat_retry",
-                )
-                reformat_runtime_ms = reformat_result.runtime_ms
-                reformat_usage = reformat_result.usage
-                reformat_raw_message = _truncate_text(
-                    reformat_result.final_message or "", self.max_raw_message_bytes, label="raw message"
-                )
-                reformat_diagnostic_log = _extract_diagnostic_log(
-                    reformat_result.stdout, self.max_diagnostic_log_bytes
-                )
-
-                if not reformat_result.timed_out and not reformat_result.error and reformat_result.success:
-                    plan = parse_plan(reformat_result.final_message)
-                    # Guard against the retry silently picking a new feature:
-                    # if a plan was recovered, the title must not differ from
-                    # what a naive re-parse of the *original* text would
-                    # otherwise suggest is a wholesale new selection. We cannot
-                    # know the original intended title if it was unparseable,
-                    # so we only guard the one case we CAN check: NONE markers
-                    # and policy are still evaluated exactly as for the first
-                    # attempt below (a retry that fabricates a new, non-"NONE"
-                    # feature will still be subject to the same policy checks;
-                    # it cannot bypass validation).
-
-            # ---- Policy check (+ exactly one policy replan) ---------------
-            # A syntactically valid, schema-conformant plan may still be
-            # rejected by plan_violates_policy(). Distinct from the parser
-            # reformat retry above (which only ever fires on unparseable
-            # output): here the plan parsed fine but its *content* violates
-            # policy, so we give the plan phase exactly one more chance to
-            # pick a different, policy-compliant feature — never a second
-            # attempt at reformatting the same rejected content, and never
-            # triggered by a parse failure or a "NONE" plan.
-            policy_replan_task_id: str | None = None
-            policy_replan_runtime_ms: int | None = None
-            policy_replan_usage: dict[str, Any] | None = None
-            policy_replan_raw_message: str | None = None
-            policy_replan_diagnostic_log: str | None = None
-
-            rejection_reason: str | None = None
-            if plan is None:
-                rejection_reason = "plan output could not be reliably parsed into a structured plan"
-            elif plan.title.strip().upper() == "NONE":
-                rejection_reason = f"agent found no suitable improvement: {plan.motivation}"
-            else:
-                rejection_reason = plan_violates_policy(
-                    plan, selection_result.final_message or ""
-                ) or validate_plan_completeness(plan, experiment.goal)
-
-            if rejection_reason is not None and plan is not None and plan.title.strip().upper() != "NONE":
-                # This is specifically a policy violation on an otherwise
-                # valid plan (never a parse failure, never a "NONE" plan).
-                elog.warning(
-                    "selection", "policy_replan_retry",
-                    f"Plan rejected by policy ({rejection_reason}); issuing one policy replan attempt",
-                    policy_rule=_policy_rule_for_reason(rejection_reason),
-                )
-                policy_replan_task_id = uuid.uuid4().hex
-                policy_replan_prompt = _build_policy_replan_prompt(
-                    goal=experiment.goal,
-                    research_summary=research_summary,
-                    rejected_plan_json=json.dumps(plan.to_dict()),
-                    rejection_reason=rejection_reason,
-                )
-                policy_replan_result: CodexResult = plan_worker.run(
-                    task=policy_replan_prompt,
-                    working_dir=scratch_dir,
-                    sandbox="read-only",
-                    timeout_seconds=_DEFAULT_PLAN_TIMEOUT_SECONDS,
-                    output_schema=PLAN_JSON_SCHEMA,
-                    skip_git_repo_check=True,
-                    experiment_logger=elog,
-                    phase="selection_policy_replan",
-                )
-                policy_replan_runtime_ms = policy_replan_result.runtime_ms
-                policy_replan_usage = policy_replan_result.usage
-                policy_replan_raw_message = _truncate_text(
-                    _redact_secrets(policy_replan_result.final_message or ""),
-                    self.max_raw_message_bytes,
-                    label="raw message",
-                )
-                policy_replan_diagnostic_log = _extract_diagnostic_log(
-                    policy_replan_result.stdout, self.max_diagnostic_log_bytes
-                )
-
-                if (
-                    not policy_replan_result.timed_out
-                    and not policy_replan_result.error
-                    and policy_replan_result.success
-                ):
-                    new_plan = parse_plan(policy_replan_result.final_message)
-                    if new_plan is None:
-                        rejection_reason = (
-                            "policy replan output could not be reliably parsed into a "
-                            "structured plan"
-                        )
-                    elif new_plan.title.strip().upper() == "NONE":
-                        rejection_reason = (
-                            f"agent found no suitable alternative improvement: {new_plan.motivation}"
-                        )
-                    else:
-                        new_rejection_reason = plan_violates_policy(
-                            new_plan, policy_replan_result.final_message or ""
-                        ) or validate_plan_completeness(new_plan, experiment.goal)
-                        plan = new_plan
-                        rejection_reason = new_rejection_reason
-                else:
-                    rejection_reason = (
-                        policy_replan_result.error or "policy replan failed (non-zero exit)"
-                    )
-        finally:
-            shutil.rmtree(scratch_dir, ignore_errors=True)
-
-        common_selection_fields = dict(
-            **research_fields,
-            selection_ended_at=_utcnow_iso(),
-            selection_task_id=selection_task_id,
-            selection_runtime_ms=selection_result.runtime_ms,
-            selection_usage_json=json.dumps(selection_result.usage) if selection_result.usage else None,
-            reformat_retry_task_id=reformat_task_id,
-            reformat_retry_runtime_ms=reformat_runtime_ms,
-            reformat_retry_usage_json=json.dumps(reformat_usage) if reformat_usage else None,
-            policy_replan_task_id=policy_replan_task_id,
-            policy_replan_runtime_ms=policy_replan_runtime_ms,
-            policy_replan_usage_json=json.dumps(policy_replan_usage) if policy_replan_usage else None,
-            selection_raw_message=_truncate_text(
-                selection_result.final_message or "", self.max_raw_message_bytes, label="raw message"
-            ),
-            reformat_raw_message=reformat_raw_message,
-            policy_replan_raw_message=policy_replan_raw_message,
-            selection_diagnostic_log=_extract_diagnostic_log(
-                selection_result.stdout, self.max_diagnostic_log_bytes
-            ),
-            reformat_diagnostic_log=reformat_diagnostic_log,
-            policy_replan_diagnostic_log=policy_replan_diagnostic_log,
-            plan_json=json.dumps(plan.to_dict()) if plan is not None else None,
-        )
-
+        # ---- Security check: apply safety denylist to the raw goal --------
+        rejection_reason = _check_goal_policy(experiment.goal)
         if rejection_reason is not None:
-            self._transition(
-                experiment_id, STATUS_SELECTING, STATUS_REJECTED,
+            elog.warning(
+                "implementing", "goal_policy_rejected",
+                f"Goal rejected by safety policy before any LLM call: {rejection_reason}",
+                policy_rule=_policy_rule_for_reason(rejection_reason),
+            )
+            self._force_status(
+                experiment_id, STATUS_REJECTED,
                 ended_at=_utcnow_iso(),
                 error=rejection_reason,
                 policy_rule=_policy_rule_for_reason(rejection_reason),
-                **common_selection_fields,
             )
             return self.get_experiment(experiment_id)
 
-        assert plan is not None  # for type-checkers; rejection_reason is None here
-
-        moved = self._transition(
-            experiment_id, STATUS_SELECTING, STATUS_IMPLEMENTING,
-            implementation_started_at=_utcnow_iso(),
-            **common_selection_fields,
-        )
-        if not moved:
-            return self.get_experiment(experiment_id)
-
-        # ---- Phase 3: isolated worktree -----------------------------------
+        # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
 
-        elog.debug("implementation", "worktree_check", f"Creating isolated git worktree at branch {branch_name}")
+        elog.debug(
+            "implementation", "worktree_check",
+            f"Creating isolated git worktree at branch {branch_name}",
+        )
         try:
             Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
             create_proc = _run_git(
@@ -2197,16 +2064,22 @@ class ExperimentService:
             )
             return self.get_experiment(experiment_id)
 
-        elog.info("implementation", "worktree_created", f"Git worktree created at {branch_name}")
+        elog.info(
+            "implementation", "worktree_created",
+            f"Git worktree created at {branch_name}",
+        )
         self._force_status(
             experiment_id, STATUS_IMPLEMENTING,
             worktree_path=worktree_path,
             branch_name=branch_name,
         )
 
-        # ---- Phase 3: implementation (workspace-write, worktree only) -----
-        elog.info("implementation", "implementation_started", "Starting implementation phase (workspace-write, worktree only)")
-        implementation_prompt = _build_implementation_prompt(plan)
+        # ---- Single Codex implementation call -----------------------------
+        elog.info(
+            "implementation", "implementation_started",
+            "Starting implementation (single Codex call: analyse, plan, implement)",
+        )
+        implementation_prompt = _build_direct_implementation_prompt(experiment.goal)
         implementation_task_id = uuid.uuid4().hex
         worker = self.worker_factory(worktree_path)
 
@@ -2258,7 +2131,7 @@ class ExperimentService:
             if implementation_result.usage else None,
         )
 
-        # ---- Phase 4: verification -----------------------------------------
+        # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
         return self._verify(experiment_id, worktree_path, elog)
 
