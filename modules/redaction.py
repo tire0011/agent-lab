@@ -57,6 +57,37 @@ def bounded_lines(raw: str | None, *, max_lines: int = 100, max_line_chars: int 
     return [redact(line)[:max_line_chars] for line in lines]
 
 
+_FAILURE_TAIL_MAX_LINES = 30
+_FAILURE_TAIL_MAX_CHARS = 4000
+
+
+def test_failure_tail(raw: str | None) -> list[str]:
+    """Return a bounded, redacted tail of test output for diagnostics.
+
+    At most ``_FAILURE_TAIL_MAX_LINES`` lines are returned, each truncated to
+    500 characters, and the total character count is capped at
+    ``_FAILURE_TAIL_MAX_CHARS``.  The budget is built from the *end* so that
+    the final assertion/FAILED lines are always preserved when the limit is
+    hit.  When there is no output an empty list is returned, so callers can
+    omit the field cleanly.
+    """
+    if not raw or not raw.strip():
+        return []
+    lines = raw.splitlines()[-_FAILURE_TAIL_MAX_LINES:]
+    # Collect from the end so the last lines are always kept under the budget.
+    collected: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        line = redact(line)[:500]
+        cost = len(line) + 1  # +1 for the implicit newline
+        if total + cost > _FAILURE_TAIL_MAX_CHARS:
+            break
+        collected.append(line)
+        total += cost
+    collected.reverse()
+    return collected
+
+
 def sanitized_reason(raw: str | None, *, max_chars: int = 500) -> str | None:
     """Bounded, redacted single-line reason/error text for diagnostics."""
     if not raw:

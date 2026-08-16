@@ -279,6 +279,7 @@ class ExperimentDetail(BaseModel):
     test_command: list[str] | None = None
     test_exit_code: int | None = None
     test_output: str | None = None
+    test_failure_tail: list[str] = Field(default_factory=list)
     git_status: str | None = None
     diff_stat: str | None = None
     diff_text: str | None = None

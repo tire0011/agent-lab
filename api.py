@@ -708,6 +708,8 @@ def get_experiment(
     adoption_service = _resolve_experiment_adoption_service()
     adoption = adoption_service.get(experiment.id)
     payload = experiment.to_dict()
+    if experiment.test_exit_code not in (None, 0):
+        payload["test_failure_tail"] = redaction.test_failure_tail(experiment.test_output)
     if adoption.status != "not_started":
         payload["adoption"] = adoption.to_dict()
     return ExperimentDetail(**payload)

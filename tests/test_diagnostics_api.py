@@ -60,6 +60,8 @@ class DiagnosticsPublicApiTests(unittest.TestCase):
         response = self.client.get("/diagnostics/public")
         body = response.json()
         serialized = json.dumps(body)
+        # These must never appear — raw secret value, internal path prefix,
+        # goal prompt, or env-var names.
         forbidden = (
             SECRET, "/agent", "user input prompt",
             "AGENT_API_KEY", "AssertionError", "API_KEY",
