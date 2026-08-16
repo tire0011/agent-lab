@@ -166,6 +166,7 @@ not a significance ranking.
 - Testausgaben tokenoptimiert reduzieren Der Test-Runner soll standardmäßig möglichst kompakte Ausgaben erzeugen. Bei erfolgreichen Tests reichen Status, Anzahl der Tests und Laufzeit. Bei Fehlern sollen nur relevante Fehlermeldungen und Stacktraces erhalten bleiben. Ziel ist, gespeicherte und später an LLMs übergebene Testausgaben deutlich zu verkleinern, ohne Diagnoseinformationen zu verlieren. Messbar: Output-Größe/Tokens vor und nach der Änderung vergleichen. `new`
 - Tool-Ausgaben als Teil des Token-Budgets behandeln Alle Tools von Nexus sollten berücksichtigen, dass ihre Ausgaben später in einen LLM-Context gelangen können. Lange Logs, Git-Ausgaben, Testresultate, API-Antworten usw. sollen deshalb möglichst gefiltert, zusammengefasst oder begrenzt werden. Vollständige Rohdaten können bei Bedarf separat gespeichert und gezielt abgerufen werden. Grundprinzip: Nicht möglichst viele Daten an das LLM geben, sondern möglichst viel relevante Information pro Toke `new`
 - Ideen eingabefeld auf der Website ist zu klein `new`
+- Wurde ein Experiment übernommen sollte auch gleich ein restart durchgeführt werden damit die Änderungen aktiv werden `new`
 
 
 ## Open unknowns
