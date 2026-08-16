@@ -156,7 +156,7 @@ _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 1200  # 20 minutes
 # the main repository's already-installed interpreter/site-packages,
 # without copying a .venv or installing any package into the worktree.
 _ALLOWED_TEST_COMMANDS: dict[str, list[str]] = {
-    "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests"],
+    "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
 

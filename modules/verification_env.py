@@ -2,7 +2,7 @@
 subprocesses started by ``ExperimentService._verify``.
 
 Root cause this fixes: the verification test subprocess (``python -m
-unittest discover -s tests`` inside the experiment worktree) previously ran
+unittest discover -s tests -q`` inside the experiment worktree) previously ran
 via ``subprocess.run(..., env=None)``, which means it silently inherited the
 *entire* environment of the running ``agent-api`` process - including the
 real, production ``AGENT_API_KEY``. Since ``api.py`` reads
