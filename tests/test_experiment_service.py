@@ -450,11 +450,47 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.implementation_worker.run.assert_called_once()
 
     def test_succeeded_when_tests_pass(self):
+        self.service.test_python_executable = sys.executable
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_SUCCEEDED)
         self.assertEqual(result.test_exit_code, 0)
-        self.assertIn("OK", result.test_output or "")
+        output = result.test_output or ""
+        self.assertIn("OK", output)
+        self.assertRegex(output, r"(?m)^Ran \d+ tests? in ")
+        self.assertNotRegex(output, r"(?m)^[.]+$")
+
+    def test_default_test_command_uses_quiet_unittest_discover(self):
+        self.service.test_python_executable = sys.executable
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(
+            result.test_command,
+            [self.service.test_python_executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+        )
+
+    @patch("subprocess.run")
+    def test_explicit_custom_test_command_is_unchanged(self, mock_run):
+        real_run = _ORIGINAL_SUBPROCESS_RUN
+
+        def fake_run(args, **kwargs):
+            if args and args[0] == "git":
+                return real_run(args, **kwargs)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="custom\n", stderr="")
+
+        mock_run.side_effect = fake_run
+        custom_command = ["python", "-m", "pytest", "tests/test_placeholder.py"]
+        with patch.dict(
+            "modules.experiment_service._ALLOWED_TEST_COMMANDS",
+            {"unittest-discover": custom_command},
+            clear=False,
+        ):
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.assertEqual(result.test_command, custom_command)
+        self.assertNotIn("-q", result.test_command)
 
     def test_test_command_uses_configured_python_interpreter(self):
         # Default interpreter is the main repo's own venv python so a
@@ -864,6 +900,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
 
     def test_failing_tests_yield_failed_status(self):
+        self.service.test_python_executable = sys.executable
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
             "import unittest\n\n"
             "class T(unittest.TestCase):\n"
@@ -879,6 +916,10 @@ class ExperimentServiceTestCase(unittest.TestCase):
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_FAILED)
         self.assertNotEqual(result.test_exit_code, 0)
+        output = result.test_output or ""
+        self.assertIn("Traceback (most recent call last)", output)
+        self.assertRegex(output, r"(?m)^Ran \d+ tests? in ")
+        self.assertIn("FAILED (failures=1)", output)
 
     # ------------------------------------------------------------------
     # Size limits

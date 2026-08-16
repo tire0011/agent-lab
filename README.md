@@ -107,7 +107,7 @@ CLI runner):
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
 - Optional for GitHub mailbox webhook: `AGENT_GITHUB_WEBHOOK_SECRET=<value>`
-- Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests`
+- Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests -q`
 
 ## Adding ideas
 
