@@ -534,3 +534,38 @@ class OperationChainResult(BaseModel):
     steps_failed: int
     steps: list[OperationChainStepResult] = Field(default_factory=list)
     rejection_reason: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Self-Healing / Operations Executor models
+# ---------------------------------------------------------------------------
+
+
+class GitCommitPushRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=500)
+    files: list[str] = Field(..., min_length=1, max_length=50)
+
+
+class ServiceRestartRequest(BaseModel):
+    service: str = Field(..., min_length=1, max_length=50)
+
+
+class LlamaModelTestRequest(BaseModel):
+    model: str = Field(..., min_length=1, max_length=50)
+    prompt: str = Field(default="ping", min_length=1, max_length=500)
+
+
+class SetConfigRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=100, pattern="^[A-Z_][A-Z0-9_]*$")
+    value: str = Field(..., max_length=1000)
+
+
+class OperationResponse(BaseModel):
+    """Standardised wrapper for all /operations/* responses."""
+    success: bool
+    status: str
+    operation: str
+    timestamp: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    duration_ms: int = 0

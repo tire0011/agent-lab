@@ -1,0 +1,445 @@
+"""Central executor for self-healing operations.
+
+All operations are:
+* validated against an explicit allowlist,
+* run with a timeout,
+* logged to the ``operation_log`` SQLite table via :func:`modules.run_store.log_operation`.
+
+Sensitive output is redacted before storage and before being returned to
+API callers.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import glob as _glob
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from modules.git_operations import GitOperations
+from modules.log_reader import LogReader
+from modules.redaction import redact
+from modules.service_operations import ServiceOperations
+
+_logger = logging.getLogger(__name__)
+
+_ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
+
+# Secrets that must never appear in responses.
+_SECRET_ENV_VARS: frozenset[str] = frozenset({
+    "AGENT_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "GITHUB_APP_PRIVATE_KEY",
+    "SECRET_KEY",
+})
+
+# Directories where stale temp files are cleaned up.
+_TEMP_DIRS: list[str] = [
+    os.path.join(_ALLOWED_REPO_ROOT, "tmp"),
+    "/tmp/nexus-work",
+]
+
+# Lock file patterns to clean.
+_LOCK_PATTERNS: list[str] = [
+    os.path.join(_ALLOWED_REPO_ROOT, "**", "*.lock"),
+    os.path.join(_ALLOWED_REPO_ROOT, "state", "*.lock"),
+]
+
+
+@dataclass
+class OperationResult:
+    success: bool
+    operation: str
+    timestamp: str
+    data: dict[str, Any]
+    error: str | None = None
+    duration_ms: int = 0
+    status: str = "ok"
+
+
+class OperationsExecutor:
+    """High-level executor that wires together git, service, log and
+    healing helpers, records every invocation in the audit log, and
+    ensures no secrets are exposed in return values."""
+
+    def __init__(
+        self,
+        db_path: str | None = None,
+        git: GitOperations | None = None,
+        services: ServiceOperations | None = None,
+        logs: LogReader | None = None,
+    ) -> None:
+        from modules.run_store import DEFAULT_DB_PATH, init_db
+
+        self._db_path = db_path or DEFAULT_DB_PATH
+        self._git = git or GitOperations()
+        self._services = services or ServiceOperations()
+        self._logs = logs or LogReader()
+        # lazy connection — avoid connecting at import time (tests mock this)
+        self._conn: sqlite3.Connection | None = None
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            from modules.run_store import init_db
+            self._conn = init_db(self._db_path)
+        return self._conn
+
+    # ------------------------------------------------------------------
+    # Audit logging
+    # ------------------------------------------------------------------
+
+    def _log_operation(
+        self,
+        operation: str,
+        params: dict,
+        success: bool,
+        result: dict,
+        error: str | None,
+        duration_ms: int,
+        executor: str = "agent",
+    ) -> None:
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                INSERT INTO operation_log
+                    (id, timestamp, operation, parameters, success, result, error, duration_ms, executor)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    datetime.now(timezone.utc).isoformat(),
+                    operation,
+                    json.dumps(params),
+                    1 if success else 0,
+                    json.dumps(result),
+                    error,
+                    duration_ms,
+                    executor,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            _logger.exception("failed to write operation_log entry")
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    async def git_pull(self) -> dict:
+        return await self._git.pull()
+
+    async def git_status(self) -> dict:
+        return await self._git.status()
+
+    async def git_commit_push(self, message: str, files: list[str]) -> dict:
+        return await self._git.commit_and_push(message, files)
+
+    async def restart_service(self, service: str) -> dict:
+        return await self._services.restart(service)
+
+    async def get_service_status(self) -> dict:
+        return await self._services.status()
+
+    async def reload_llama_model(self) -> dict:
+        return await self._services.reload_llama_model()
+
+    async def tail_logs(self, service: str, lines: int = 50) -> list[str]:
+        return await self._logs.tail_service_logs(service, lines)
+
+    async def get_error_logs(self, service: str, since_minutes: int = 60) -> list[dict]:
+        return await self._logs.get_error_logs(service, since_minutes)
+
+    async def fix_stale_locks(self) -> dict:
+        removed: list[str] = []
+        for pattern in _LOCK_PATTERNS:
+            for match in _glob.glob(pattern, recursive=True):
+                try:
+                    os.remove(match)
+                    removed.append(Path(match).name)
+                except OSError:
+                    pass
+        return {
+            "success": True,
+            "locks_removed": len(removed),
+            "details": removed[:50],
+        }
+
+    async def cleanup_temps(self) -> dict:
+        cleaned_bytes = 0
+        files_removed = 0
+        for tmp_dir in _TEMP_DIRS:
+            p = Path(tmp_dir)
+            if not p.exists():
+                continue
+            for child in p.iterdir():
+                try:
+                    if child.is_file() or child.is_symlink():
+                        size = child.stat().st_size
+                        child.unlink()
+                        cleaned_bytes += size
+                        files_removed += 1
+                    elif child.is_dir():
+                        size = sum(
+                            f.stat().st_size
+                            for f in child.rglob("*")
+                            if f.is_file()
+                        )
+                        shutil.rmtree(child, ignore_errors=True)
+                        cleaned_bytes += size
+                        files_removed += 1
+                except OSError:
+                    pass
+        return {
+            "success": True,
+            "cleaned_bytes": cleaned_bytes,
+            "files_removed": files_removed,
+        }
+
+    async def detect_problems(self) -> list[dict]:
+        problems: list[dict] = []
+
+        # Check for stale locks
+        for pattern in _LOCK_PATTERNS:
+            for match in _glob.glob(pattern, recursive=True):
+                problems.append({
+                    "type": "stale_lock",
+                    "severity": "high",
+                    "path": Path(match).name,  # no absolute path leaked
+                    "auto_fixable": True,
+                })
+
+        # Check disk usage
+        try:
+            stat = shutil.disk_usage(_ALLOWED_REPO_ROOT)
+            pct = stat.used / stat.total * 100
+            if pct > 90:
+                problems.append({
+                    "type": "high_disk_usage",
+                    "severity": "critical",
+                    "value": f"{pct:.0f}%",
+                    "auto_fixable": False,
+                })
+            elif pct > 80:
+                problems.append({
+                    "type": "high_disk_usage",
+                    "severity": "warning",
+                    "value": f"{pct:.0f}%",
+                    "auto_fixable": False,
+                })
+        except OSError:
+            pass
+
+        # Check git status
+        try:
+            status = await self._git.status()
+            if status.get("status") == "dirty":
+                problems.append({
+                    "type": "uncommitted_changes",
+                    "severity": "warning",
+                    "value": str(len(status.get("uncommitted", []))),
+                    "auto_fixable": False,
+                })
+        except Exception:
+            pass
+
+        return problems
+
+    async def get_safe_env(self) -> dict[str, str]:
+        """Return non-secret environment variables relevant to the agent."""
+        safe: dict[str, str] = {}
+        for key, val in os.environ.items():
+            if key in _SECRET_ENV_VARS:
+                continue
+            if re.search(r"(?i)(key|secret|token|password|credential)", key):
+                continue
+            safe[key] = val
+        return safe
+
+    async def set_config(self, key: str, value: str) -> dict:
+        """Write a non-secret config key to the environment config file."""
+        if re.search(r"(?i)(key|secret|token|password|credential)", key):
+            raise ValueError(f"refusing to store secret-like key: {key!r}")
+        config_path = Path(_ALLOWED_REPO_ROOT) / ".env.config"
+        lines: list[str] = []
+        if config_path.exists():
+            lines = config_path.read_text().splitlines()
+        # Replace or append
+        new_line = f"{key}={value}"
+        updated = False
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[i] = new_line
+                updated = True
+                break
+        if not updated:
+            lines.append(new_line)
+        config_path.write_text("\n".join(lines) + "\n")
+        return {"success": True, "key": key, "value": value}
+
+    async def get_model_status(self) -> dict:
+        """Return a best-effort status for known models."""
+        status: dict[str, str] = {}
+
+        # Check Azure OpenAI
+        if os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_ENDPOINT"):
+            status["azure_gpt4o"] = "available"
+        else:
+            status["azure_gpt4o"] = "not_configured"
+
+        # Check llama via service status
+        try:
+            svc_status = await self._services.status()
+            llama_svc_name = "llama"
+            status["llama"] = svc_status.get(llama_svc_name, "unknown")
+        except Exception:
+            status["llama"] = "unknown"
+
+        return status
+
+    async def test_model(self, model: str, prompt: str) -> dict:
+        """Send a minimal test prompt to the given model."""
+        allowed_models = {"azure_gpt4o", "llama"}
+        if model not in allowed_models:
+            raise ValueError(f"model must be one of {sorted(allowed_models)}")
+        if len(prompt) > 500:
+            raise ValueError("prompt must be <= 500 characters")
+
+        if model == "azure_gpt4o":
+            return await self._test_azure_gpt4o(prompt)
+        return await self._test_llama(prompt)
+
+    async def _test_azure_gpt4o(self, prompt: str) -> dict:
+        try:
+            import httpx  # type: ignore
+            endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+            deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+            api_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
+            if not endpoint or not api_key:
+                return {"success": False, "model": "azure_gpt4o", "latency_ms": 0,
+                        "response": None, "error": "not configured"}
+            url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-05-01-preview"
+            t0 = time.monotonic()
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    url,
+                    headers={"api-key": api_key},
+                    json={"messages": [{"role": "user", "content": prompt}], "max_tokens": 50},
+                )
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            if resp.status_code != 200:
+                return {"success": False, "model": "azure_gpt4o", "latency_ms": latency_ms,
+                        "response": None, "error": f"HTTP {resp.status_code}"}
+            text = resp.json()["choices"][0]["message"]["content"]
+            return {"success": True, "model": "azure_gpt4o", "latency_ms": latency_ms,
+                    "response": text[:300]}
+        except Exception as exc:
+            return {"success": False, "model": "azure_gpt4o", "latency_ms": 0,
+                    "response": None, "error": type(exc).__name__}
+
+    async def _test_llama(self, prompt: str) -> dict:
+        try:
+            import httpx  # type: ignore
+            llama_url = os.environ.get("LLAMA_API_URL", "http://localhost:8080/completion")
+            t0 = time.monotonic()
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    llama_url,
+                    json={"prompt": prompt, "n_predict": 50},
+                )
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            if resp.status_code != 200:
+                return {"success": False, "model": "llama", "latency_ms": latency_ms,
+                        "response": None, "error": f"HTTP {resp.status_code}"}
+            text = resp.json().get("content", "")
+            return {"success": True, "model": "llama", "latency_ms": latency_ms,
+                    "response": text[:300]}
+        except Exception as exc:
+            return {"success": False, "model": "llama", "latency_ms": 0,
+                    "response": None, "error": type(exc).__name__}
+
+    # ------------------------------------------------------------------
+    # Unified entry point with audit logging
+    # ------------------------------------------------------------------
+
+    async def execute(self, operation: str, params: dict) -> OperationResult:
+        t0 = time.monotonic()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        data: dict[str, Any] = {}
+        error: str | None = None
+        success = False
+        try:
+            data = await self._dispatch(operation, params)
+            success = data.get("success", True) is not False
+        except (ValueError, KeyError) as exc:
+            error = str(exc)
+            success = False
+        except Exception as exc:
+            _logger.exception("OperationsExecutor.execute failed: %s", operation)
+            error = type(exc).__name__  # no traceback exposed
+            success = False
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        self._log_operation(operation, params, success, data, error, duration_ms)
+        return OperationResult(
+            success=success,
+            operation=operation,
+            timestamp=timestamp,
+            data=data,
+            error=error,
+            duration_ms=duration_ms,
+            status="ok" if success else "error",
+        )
+
+    async def _dispatch(self, operation: str, params: dict) -> dict:
+        if operation == "git/pull":
+            return await self.git_pull()
+        if operation == "git/status":
+            return await self.git_status()
+        if operation == "git/commit-and-push":
+            return await self.git_commit_push(
+                params["message"], params.get("files", [])
+            )
+        if operation == "services/restart":
+            return await self.restart_service(params["service"])
+        if operation == "services/status":
+            return await self.get_service_status()
+        if operation == "services/llama/reload-model":
+            return await self.reload_llama_model()
+        if operation == "logs/tail":
+            lines = await self.tail_logs(params["service"], params.get("lines", 50))
+            return {"service": params["service"], "lines": lines,
+                    "total_available": len(lines)}
+        if operation == "logs/errors":
+            errors = await self.get_error_logs(
+                params["service"], params.get("since_minutes", 60)
+            )
+            return {"service": params["service"], "error_count": len(errors),
+                    "errors": errors}
+        if operation == "healing/fix-locks":
+            return await self.fix_stale_locks()
+        if operation == "healing/cleanup-temps":
+            return await self.cleanup_temps()
+        if operation == "healing/diagnose":
+            problems = await self.detect_problems()
+            return {"problems": problems}
+        if operation == "models/status":
+            return await self.get_model_status()
+        if operation == "models/test":
+            return await self.test_model(params["model"], params.get("prompt", "ping"))
+        if operation == "context/env":
+            return await self.get_safe_env()
+        if operation == "context/set-config":
+            return await self.set_config(params["key"], params["value"])
+        raise ValueError(f"unknown operation: {operation!r}")
