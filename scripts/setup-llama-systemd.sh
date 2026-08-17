@@ -15,6 +15,11 @@ set -euo pipefail
 LOG_PREFIX="[setup-llama-systemd]"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+# PREREQUISITE: This script requires a Standard_B2ms VM (4 vCPU, 8 GB RAM).
+# The Llama 2 13B Q4_K_M model requires ~7.8 GB RAM.
+# Do NOT run this on a Standard_B1s (1 vCPU, 1 GB RAM) — the service will
+# be killed immediately by the OOM killer.
+# Upgrade the VM in the Azure portal before running this script.
 SERVICE_NAME="llama-cpp"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 VENV_DIR="${LLAMA_VENV:-/opt/llama-venv}"

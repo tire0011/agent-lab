@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError
+from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
 from modules.llama_router import LlamaRouter, RouterDecision
 from modules.prompt_library import render_prompt
 
@@ -105,8 +105,6 @@ class MultiProviderOrchestrator:
             db=db,
             prompts_dir=prompts_dir,
         )
-        if db is not None:
-            _ensure_orchestrator_tables(db)
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -263,9 +261,8 @@ def _decision_to_provider(decision: str) -> str:
 
 
 def _parse_developer_response(raw: str, provider_used: str) -> DeveloperResult:
-    client = LlamaCppClient()
     try:
-        data = client.extract_json(raw)
+        data = extract_json(raw)
     except LlamaCppClientError:
         return DeveloperResult(
             files_changed=[],
@@ -284,9 +281,8 @@ def _parse_developer_response(raw: str, provider_used: str) -> DeveloperResult:
 
 
 def _parse_tester_response(raw: str) -> TesterResult:
-    client = LlamaCppClient()
     try:
-        data = client.extract_json(raw)
+        data = extract_json(raw)
     except LlamaCppClientError:
         return TesterResult(
             verdict="pass_with_notes",
@@ -330,37 +326,9 @@ def _build_final_response(result: OrchestratorResult) -> str:
 
 
 # ── SQLite helpers ────────────────────────────────────────────────────────────
-
-def _ensure_orchestrator_tables(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS provider_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            task TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            sub_task TEXT NOT NULL,
-            summary TEXT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_provider_usage_timestamp
-            ON provider_usage(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_provider_usage_provider
-            ON provider_usage(provider);
-
-        CREATE TABLE IF NOT EXISTS model_consultations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            parent_task TEXT NOT NULL,
-            query TEXT NOT NULL,
-            reply TEXT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_model_consultations_timestamp
-            ON model_consultations(timestamp);
-        """
-    )
-    conn.commit()
+# Note: the router_decisions, provider_usage, and model_consultations tables
+# are created by modules/run_store.py (_migrate_router_tables). The orchestrator
+# relies on run_store.init_db() having been called before use.
 
 
 def _log_provider_usage(

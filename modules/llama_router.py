@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError
+from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
 from modules.prompt_library import render_prompt
 
 
@@ -39,9 +39,7 @@ class RouterDecision:
 
 def _parse_router_response(raw: str) -> RouterDecision:
     """Extract a :class:`RouterDecision` from the model's raw text output."""
-    # LlamaCppClient.extract_json handles prose wrappers around the JSON block.
-    client = LlamaCppClient()
-    data: dict[str, Any] = client.extract_json(raw)
+    data: dict[str, Any] = extract_json(raw)
 
     decision = str(data.get("decision", "")).upper()
     if decision not in VALID_DECISIONS:

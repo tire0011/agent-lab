@@ -1,4 +1,4 @@
-"""Async HTTP client for the llama-cpp-python OpenAI-compatible REST API.
+"""Wrapper for the llama-cpp-python OpenAI-compatible REST API.
 
 The llama-cpp-python server exposes an OpenAI-compatible ``/v1/chat/completions``
 endpoint. This client wraps it with minimal dependencies so the rest of the
@@ -19,6 +19,27 @@ _DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 
 class LlamaCppClientError(Exception):
     """Raised when the llama-cpp server returns an unexpected response."""
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    """Extract the first JSON object from *text*.
+
+    llama-cpp models sometimes add prose around the JSON block; this
+    function is tolerant of that.
+    """
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise LlamaCppClientError(
+            f"No JSON object found in model output: {text[:300]!r}"
+        )
+    raw = text[start:end]
+    try:
+        return json.loads(raw)  # type: ignore[no-any-return]
+    except json.JSONDecodeError as exc:
+        raise LlamaCppClientError(
+            f"Failed to parse JSON from model output: {exc}\nRaw: {raw[:300]!r}"
+        ) from exc
 
 
 class LlamaCppClient:
@@ -125,22 +146,8 @@ class LlamaCppClient:
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
 
+    # Keep as an instance method for backward compatibility; delegates to the
+    # module-level function which does not require any client state.
     def extract_json(self, text: str) -> dict[str, Any]:
-        """Extract the first JSON object from *text*.
-
-        llama-cpp models sometimes add prose around the JSON block; this
-        method is tolerant of that.
-        """
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start == -1 or end == 0:
-            raise LlamaCppClientError(
-                f"No JSON object found in model output: {text[:300]!r}"
-            )
-        raw = text[start:end]
-        try:
-            return json.loads(raw)  # type: ignore[no-any-return]
-        except json.JSONDecodeError as exc:
-            raise LlamaCppClientError(
-                f"Failed to parse JSON from model output: {exc}\nRaw: {raw[:300]!r}"
-            ) from exc
+        """Extract the first JSON object from *text* (delegates to module-level function)."""
+        return extract_json(text)
