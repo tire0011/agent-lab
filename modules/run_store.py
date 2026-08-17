@@ -219,6 +219,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_experiment_adoptions(conn)
     _migrate_operations_audit(conn)
     _migrate_operation_chains(conn)
+    _migrate_router_tables(conn)
     conn.commit()
     return conn
 
@@ -473,6 +474,55 @@ def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE operation_chains ADD COLUMN {column_name} {column_type}"
             )
+
+
+def _migrate_router_tables(conn: sqlite3.Connection) -> None:
+    """Create router_decisions, provider_usage, and model_consultations tables."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS router_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            task TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            reasoning TEXT NOT NULL,
+            consult_query TEXT NULL,
+            sub_tasks_json TEXT NULL,
+            raw_response TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_router_decisions_timestamp
+            ON router_decisions(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_router_decisions_decision
+            ON router_decisions(decision);
+
+        CREATE TABLE IF NOT EXISTS provider_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            task TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            sub_task TEXT NOT NULL,
+            summary TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_usage_timestamp
+            ON provider_usage(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_provider_usage_provider
+            ON provider_usage(provider);
+
+        CREATE TABLE IF NOT EXISTS model_consultations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            parent_task TEXT NOT NULL,
+            query TEXT NOT NULL,
+            reply TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_model_consultations_timestamp
+            ON model_consultations(timestamp);
+        """
+    )
 
 
 def get_applicable_price(

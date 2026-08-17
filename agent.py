@@ -33,6 +33,16 @@ from modules.serialization import to_json_string
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Azure OpenAI task runner")
     parser.add_argument("task", nargs="+", help="Task prompt to send")
+    parser.add_argument(
+        "--use-router",
+        action="store_true",
+        default=False,
+        help=(
+            "Route the task through Llama 2 13B decision router. "
+            "Llama decides whether to handle the task locally, delegate to "
+            "Azure OpenAI, delegate to Codex, or consult another model."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -74,6 +84,33 @@ async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, 
     )
 
 
+async def run_router_pipeline(task: str, db: Any) -> str:
+    """Run the Llama 2 13B router pipeline and return the final response text.
+
+    This function lazily imports the orchestrator modules so the base agent
+    continues to work even when llama-cpp-python is not installed.
+    """
+    from modules.llama_cpp_client import LlamaCppClient
+    from modules.multi_provider_orchestrator import MultiProviderOrchestrator
+
+    llama_client = LlamaCppClient()
+
+    async def azure_run_fn(prompt: str) -> str:
+        response, _, _, _, _, _ = await run_agent(prompt)
+        return response
+
+    orchestrator = MultiProviderOrchestrator(
+        llama_client=llama_client,
+        azure_run_fn=azure_run_fn,
+        db=db,
+    )
+
+    result = await orchestrator.run(task)
+    if result.error:
+        raise RuntimeError(result.error)
+    return result.final_response
+
+
 def main() -> int:
     args = parse_args()
     task = " ".join(args.task).strip()
@@ -82,12 +119,114 @@ def main() -> int:
         return 2
 
     timestamp = datetime.now(timezone.utc).isoformat()
-    provider = "azure_openai"
-    model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
     db = init_db()
     cost_monitor = AzureCostMonitor()
     cost_before = cost_monitor.capture()
     started = time.perf_counter()
+
+    if args.use_router:
+        # ── Router pipeline (Llama 2 13B → Azure/Codex/self) ──────────────
+        provider = "llama_router"
+        model_name = os.getenv("LLAMA_CPP_MODEL", "llama-2-13b-chat")
+        try:
+            response_text = asyncio.run(run_router_pipeline(task, db))
+            runtime_seconds = round(time.perf_counter() - started, 3)
+            runtime_ms = int(round(runtime_seconds * 1000))
+
+            cost_after = cost_monitor.capture()
+            azure_cost = cost_monitor.summarize(cost_before, cost_after)
+
+            entry = {
+                "timestamp": timestamp,
+                "model": model_name,
+                "task": task,
+                "response": response_text,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "runtime_seconds": runtime_seconds,
+                "mcp_tool_calls": [],
+                "azure_cost": azure_cost,
+            }
+            log_run(entry)
+
+            run_id = insert_run(
+                db,
+                timestamp=timestamp,
+                provider=provider,
+                model=model_name,
+                input_description=task,
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                runtime_ms=runtime_ms,
+                estimated_cost=None,
+                actual_cost=None,
+                cost_status="estimated",
+                success=True,
+                error=None,
+            )
+
+            print(response_text)
+            print_cost_summary(azure_cost)
+            print_run_summary(
+                prompt_tokens=0,
+                completion_tokens=0,
+                estimated_cost=None,
+                estimated_cost_currency=None,
+                runtime_ms=runtime_ms,
+                run_id=run_id,
+            )
+            return 0
+        except Exception as exc:
+            runtime_seconds = round(time.perf_counter() - started, 3)
+            runtime_ms = int(round(runtime_seconds * 1000))
+            cost_after = cost_monitor.capture()
+            azure_cost = cost_monitor.summarize(cost_before, cost_after)
+            error_entry = {
+                "timestamp": timestamp,
+                "model": model_name,
+                "task": task,
+                "response": f"ERROR: {exc}",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "runtime_seconds": runtime_seconds,
+                "mcp_tool_calls": [],
+                "azure_cost": azure_cost,
+            }
+            log_run(error_entry)
+            run_id = insert_run(
+                db,
+                timestamp=timestamp,
+                provider=provider,
+                model=model_name,
+                input_description=task,
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                runtime_ms=runtime_ms,
+                estimated_cost=None,
+                actual_cost=None,
+                cost_status="estimated",
+                success=False,
+                error=str(exc),
+            )
+            print_cost_summary(azure_cost)
+            print_run_summary(
+                prompt_tokens=0,
+                completion_tokens=0,
+                estimated_cost=None,
+                estimated_cost_currency=None,
+                runtime_ms=runtime_ms,
+                run_id=run_id,
+            )
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    # ── Standard Azure OpenAI pipeline ────────────────────────────────────────
+    provider = "azure_openai"
+    model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
     try:
         (
