@@ -1,69 +1,84 @@
 #!/usr/bin/env bash
 # install-llama-cpp.sh
-# Installs llama-cpp-python (CPU-only) and its Python dependencies.
-# Designed to run in the background from an iPhone SSH session:
+# Builds llama.cpp (CPU-only) and installs the llama-server binary.
+# Designed to run in the background from an SSH session:
 #
 #   nohup bash scripts/install-llama-cpp.sh > /tmp/install-llama-cpp.log 2>&1 &
 #   echo "Install started, PID=$!"
 #
 # Progress can be monitored:
 #   tail -f /tmp/install-llama-cpp.log
+#
+# Idempotent: re-running the script rebuilds llama.cpp but does not remove
+# any existing model files or service configuration.
 
 set -euo pipefail
 
 LOG_PREFIX="[install-llama-cpp]"
-VENV_DIR="${LLAMA_VENV:-/opt/llama-venv}"
-CMAKE_ARGS="${CMAKE_ARGS:-"-DLLAMA_CUBLAS=OFF -DLLAMA_METAL=OFF"}"
-# Number of CPU threads for compilation – use all available cores
+LLAMA_DIR="${LLAMA_DIR:-/opt/llama.cpp}"
+INSTALL_DIR="${LLAMA_INSTALL_DIR:-/usr/local/bin}"
 MAKE_JOBS="$(nproc 2>/dev/null || echo 2)"
 
-echo "$LOG_PREFIX Starting llama-cpp-python installation  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "$LOG_PREFIX VENV_DIR=$VENV_DIR  MAKE_JOBS=$MAKE_JOBS"
+echo "$LOG_PREFIX Starting llama.cpp build  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "$LOG_PREFIX Source dir : $LLAMA_DIR"
+echo "$LOG_PREFIX Install dir: $INSTALL_DIR"
+echo "$LOG_PREFIX Build jobs : $MAKE_JOBS"
 
 # ── System packages ──────────────────────────────────────────────────────────
-echo "$LOG_PREFIX Installing system packages…"
+echo "$LOG_PREFIX Installing system build dependencies…"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
-    build-essential cmake git curl \
+    build-essential \
+    cmake \
+    git \
+    curl \
     libopenblas-dev \
     > /dev/null
 
-# ── Python virtual environment ───────────────────────────────────────────────
-echo "$LOG_PREFIX Creating Python virtual environment at $VENV_DIR…"
-python3 -m venv "$VENV_DIR"
-# shellcheck source=/dev/null
-source "$VENV_DIR/bin/activate"
+# ── Clone or update llama.cpp ────────────────────────────────────────────────
+if [[ -d "$LLAMA_DIR/.git" ]]; then
+    echo "$LOG_PREFIX Updating existing llama.cpp checkout at $LLAMA_DIR…"
+    git -C "$LLAMA_DIR" fetch --depth=1 origin
+    git -C "$LLAMA_DIR" reset --hard FETCH_HEAD
+else
+    echo "$LOG_PREFIX Cloning llama.cpp into $LLAMA_DIR…"
+    git clone --depth=1 https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
+fi
 
-echo "$LOG_PREFIX Upgrading pip…"
-pip install --upgrade pip --quiet
+# ── Build (CPU-only, OpenBLAS for throughput) ─────────────────────────────────
+echo "$LOG_PREFIX Building llama.cpp (CPU-only, OpenBLAS) — this may take 5–15 minutes…"
+cmake \
+    -S "$LLAMA_DIR" \
+    -B "$LLAMA_DIR/build" \
+    -DGGML_NATIVE=OFF \
+    -DGGML_CUDA=OFF \
+    -DGGML_METAL=OFF \
+    -DGGML_BLAS=ON \
+    -DGGML_BLAS_VENDOR=OpenBLAS \
+    -DLLAMA_BUILD_SERVER=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    > /dev/null
 
-# ── llama-cpp-python (CPU-only build) ────────────────────────────────────────
-# CMAKE_ARGS controls the build; FORCE_CMAKE=1 ensures a source build.
-echo "$LOG_PREFIX Installing llama-cpp-python (CPU-only, this may take 5-15 minutes)…"
-CMAKE_ARGS="$CMAKE_ARGS" \
-FORCE_CMAKE=1 \
-    pip install llama-cpp-python --verbose 2>&1 | tail -n 20
+cmake --build "$LLAMA_DIR/build" --config Release -j "$MAKE_JOBS"
 
-# ── Additional Python dependencies ───────────────────────────────────────────
-echo "$LOG_PREFIX Installing additional Python dependencies…"
-pip install --quiet \
-    httpx \
-    fastapi \
-    uvicorn[standard] \
-    "openai>=1.0.0" \
-    aiohttp
+# ── Install binaries ──────────────────────────────────────────────────────────
+echo "$LOG_PREFIX Installing llama-server and llama-cli to $INSTALL_DIR…"
+for binary in llama-server llama-cli; do
+    BIN_PATH="$LLAMA_DIR/build/bin/$binary"
+    if [[ -f "$BIN_PATH" ]]; then
+        install -m 0755 "$BIN_PATH" "$INSTALL_DIR/$binary"
+        echo "$LOG_PREFIX   Installed $binary"
+    else
+        echo "$LOG_PREFIX   WARNING: $binary not found in build output — skipping" >&2
+    fi
+done
 
-# ── Write activation helper ──────────────────────────────────────────────────
-HELPER="/usr/local/bin/llama-activate"
-cat > "$HELPER" <<'EOF'
-#!/usr/bin/env bash
-# Source this file to activate the llama virtual environment:
-#   source /usr/local/bin/llama-activate
-source /opt/llama-venv/bin/activate
-EOF
-chmod +x "$HELPER"
+# Verify llama-server is executable.
+if ! command -v llama-server &>/dev/null; then
+    echo "$LOG_PREFIX ERROR: llama-server not found in PATH after installation." >&2
+    exit 1
+fi
 
-echo "$LOG_PREFIX ✅ llama-cpp-python installation complete  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "$LOG_PREFIX Activate the venv with:  source $HELPER"
-echo "$LOG_PREFIX Next step: run scripts/download-llama2-13b.sh"
+echo "$LOG_PREFIX ✅ llama.cpp build complete  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "$LOG_PREFIX llama-server: $(llama-server --version 2>&1 | head -1 || true)"
+echo "$LOG_PREFIX Next step: run scripts/download-local-model.sh"

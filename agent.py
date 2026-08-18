@@ -146,7 +146,7 @@ def main() -> int:
     if args.use_router:
         # ── Router pipeline (local model → Azure/Codex/local) ─────────────
         provider = "local_router"
-        model_name = os.getenv("LLAMA_CPP_MODEL", "local-model")
+        model_name = os.getenv("LOCAL_MODEL_NAME") or os.getenv("LLAMA_CPP_MODEL", "qwen2.5-coder-7b-instruct")
         try:
             response_text = asyncio.run(run_router_pipeline(task, db))
             runtime_seconds = round(time.perf_counter() - started, 3)

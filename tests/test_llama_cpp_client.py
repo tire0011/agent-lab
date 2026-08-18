@@ -1,14 +1,87 @@
 """Tests for modules/llama_cpp_client.py."""
 
 import json
+import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError
+from modules.llama_cpp_client import (
+    LlamaCppClient,
+    LlamaCppClientError,
+    _DEFAULT_BASE_URL,
+    _DEFAULT_MODEL_NAME,
+)
 
 
 def make_client(base_url: str = "http://localhost:8080/v1") -> LlamaCppClient:
     return LlamaCppClient(base_url=base_url, model="test-model")
+
+
+# ── Default configuration ─────────────────────────────────────────────────────
+
+def test_default_base_url():
+    client = LlamaCppClient()
+    assert client.base_url == _DEFAULT_BASE_URL.rstrip("/")
+
+
+def test_default_model_name_is_qwen():
+    """Default model should be Qwen2.5-Coder-7B-Instruct, not Llama 2."""
+    client = LlamaCppClient()
+    assert "qwen" in client.model.lower()
+    assert "llama" not in client.model.lower()
+    assert "2-13b" not in client.model.lower()
+
+
+def test_default_model_name_constant():
+    assert _DEFAULT_MODEL_NAME == "qwen2.5-coder-7b-instruct"
+
+
+def test_local_model_url_env_var(monkeypatch):
+    monkeypatch.setenv("LOCAL_MODEL_URL", "http://127.0.0.1:9090/v1")
+    client = LlamaCppClient()
+    assert client.base_url == "http://127.0.0.1:9090/v1"
+
+
+def test_local_model_name_env_var(monkeypatch):
+    monkeypatch.setenv("LOCAL_MODEL_NAME", "my-custom-model")
+    client = LlamaCppClient()
+    assert client.model == "my-custom-model"
+
+
+def test_legacy_llama_cpp_base_url_still_accepted(monkeypatch):
+    """LLAMA_CPP_BASE_URL is a backward-compat alias for LOCAL_MODEL_URL."""
+    monkeypatch.delenv("LOCAL_MODEL_URL", raising=False)
+    monkeypatch.setenv("LLAMA_CPP_BASE_URL", "http://127.0.0.1:7777/v1")
+    client = LlamaCppClient()
+    assert client.base_url == "http://127.0.0.1:7777/v1"
+
+
+def test_legacy_llama_cpp_model_still_accepted(monkeypatch):
+    """LLAMA_CPP_MODEL is a backward-compat alias for LOCAL_MODEL_NAME."""
+    monkeypatch.delenv("LOCAL_MODEL_NAME", raising=False)
+    monkeypatch.setenv("LLAMA_CPP_MODEL", "legacy-model")
+    client = LlamaCppClient()
+    assert client.model == "legacy-model"
+
+
+def test_local_model_url_takes_priority_over_legacy(monkeypatch):
+    monkeypatch.setenv("LOCAL_MODEL_URL", "http://primary/v1")
+    monkeypatch.setenv("LLAMA_CPP_BASE_URL", "http://legacy/v1")
+    client = LlamaCppClient()
+    assert client.base_url == "http://primary/v1"
+
+
+def test_local_model_name_takes_priority_over_legacy(monkeypatch):
+    monkeypatch.setenv("LOCAL_MODEL_NAME", "primary-model")
+    monkeypatch.setenv("LLAMA_CPP_MODEL", "legacy-model")
+    client = LlamaCppClient()
+    assert client.model == "primary-model"
+
+
+def test_no_llama2_in_default_url():
+    """Default URL must not embed Llama 2 assumptions."""
+    assert "llama-2" not in _DEFAULT_BASE_URL.lower()
+    assert "13b" not in _DEFAULT_BASE_URL.lower()
 
 
 # ── extract_json ──────────────────────────────────────────────────────────────
@@ -135,3 +208,4 @@ async def test_is_available_false_on_connection_error():
 
         client = make_client()
         assert await client.is_available() is False
+

@@ -1,16 +1,21 @@
 """Wrapper for OpenAI-compatible local model REST APIs.
 
-The llama.cpp server (and other compatible servers such as llama-cpp-python)
-expose an OpenAI-compatible ``/v1/chat/completions`` endpoint.  This client
-wraps it with minimal dependencies so the rest of the codebase can treat it
-identically to the Azure OpenAI client.
+The llama-server (llama.cpp) exposes an OpenAI-compatible
+``/v1/chat/completions`` endpoint.  This client wraps it with minimal
+dependencies so the rest of the codebase can treat it identically to the
+Azure OpenAI client.
 
 Configuration is driven entirely by environment variables so the local model
 can be swapped (different GGUF, different quantisation, different server) without
 changing any orchestration code:
 
-* ``LLAMA_CPP_BASE_URL`` — server base URL (default: ``http://127.0.0.1:8080/v1``)
-* ``LLAMA_CPP_MODEL``    — model name sent in requests, for logging (default: ``local-model``)
+* ``LOCAL_MODEL_URL``  — server base URL (default: ``http://127.0.0.1:8080/v1``)
+* ``LOCAL_MODEL_NAME`` — model name sent in requests, for logging
+                         (default: ``qwen2.5-coder-7b-instruct``)
+
+Deprecated aliases (still accepted for backward compatibility):
+* ``LLAMA_CPP_BASE_URL`` — maps to ``LOCAL_MODEL_URL``
+* ``LLAMA_CPP_MODEL``    — maps to ``LOCAL_MODEL_NAME``
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import httpx
 
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
+_DEFAULT_MODEL_NAME = "qwen2.5-coder-7b-instruct"
 
 
 class LlamaCppClientError(Exception):
@@ -53,21 +59,23 @@ def extract_json(text: str) -> dict[str, Any]:
 class LlamaCppClient:
     """Minimal async client for a local OpenAI-compatible model server.
 
-    Works with llama.cpp / llama-server, llama-cpp-python, and any server that
-    exposes the ``/v1/chat/completions`` endpoint.
+    Works with llama-server (llama.cpp) or any server that exposes the
+    ``/v1/chat/completions`` endpoint.
 
     Parameters
     ----------
     base_url:
-        Base URL of the server (default: ``LLAMA_CPP_BASE_URL`` env var,
+        Base URL of the server (default: ``LOCAL_MODEL_URL`` env var,
         falling back to ``http://127.0.0.1:8080/v1``).
+        The legacy ``LLAMA_CPP_BASE_URL`` env var is also accepted.
     timeout:
         HTTP request timeout in seconds. Inference on CPU can be slow, so the
         default is intentionally high (300 s).
     model:
-        Model name sent in the request body (default: ``LLAMA_CPP_MODEL`` env
-        var, falling back to ``local-model``).  Most servers ignore this field
-        but it is useful for logging and tracing.
+        Model name sent in the request body (default: ``LOCAL_MODEL_NAME`` env
+        var, falling back to ``qwen2.5-coder-7b-instruct``).  The server
+        typically ignores this field but it is useful for logging and tracing.
+        The legacy ``LLAMA_CPP_MODEL`` env var is also accepted.
     """
 
     def __init__(
@@ -76,15 +84,19 @@ class LlamaCppClient:
         timeout: float = 300.0,
         model: str | None = None,
     ) -> None:
+        # Prefer the generic LOCAL_MODEL_URL; fall back to legacy LLAMA_CPP_BASE_URL.
         self.base_url = (
             base_url
+            or os.getenv("LOCAL_MODEL_URL")
             or os.getenv("LLAMA_CPP_BASE_URL", _DEFAULT_BASE_URL)
         ).rstrip("/")
         self.timeout = timeout
-        # Model name sent in the request body (the llama.cpp server typically
-        # ignores it but it is useful for logging). Override via LLAMA_CPP_MODEL
-        # so we can swap GGUF files without changing orchestration code.
-        self.model = model or os.getenv("LLAMA_CPP_MODEL", "local-model")
+        # Prefer the generic LOCAL_MODEL_NAME; fall back to legacy LLAMA_CPP_MODEL.
+        self.model = (
+            model
+            or os.getenv("LOCAL_MODEL_NAME")
+            or os.getenv("LLAMA_CPP_MODEL", _DEFAULT_MODEL_NAME)
+        )
 
     async def chat_completion(
         self,

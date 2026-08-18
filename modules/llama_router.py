@@ -139,9 +139,10 @@ def _parse_router_response(raw: str) -> RouterDecision:
 class LlamaRouter:
     """Routes tasks to the appropriate execution provider using a local model.
 
-    The local model server endpoint is configured via the ``LLAMA_CPP_BASE_URL``
+    The local model server endpoint is configured via the ``LOCAL_MODEL_URL``
     environment variable (default: ``http://127.0.0.1:8080/v1``).  The model
-    itself is configured via ``LLAMA_CPP_MODEL`` (default: ``local-model``).
+    itself is configured via ``LOCAL_MODEL_NAME``
+    (default: ``qwen2.5-coder-7b-instruct``).
     This makes the router server/model-agnostic: swap GGUF files or switch to
     a different llama.cpp build without changing orchestration code.
 
