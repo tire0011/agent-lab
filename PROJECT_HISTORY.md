@@ -247,6 +247,12 @@ The durable design lesson is to separate **capability architecture** from **spec
 
 A measurement decision was also made to re-run the earliest simple webpage-change experiment using the newer pipeline and compare it with the original baseline. This is intended to provide a concrete before/after check on whether the many orchestration changes improved cost, token use, runtime, and quality. No new measured result is recorded here yet.
 
+### 18. 2026-08-18: B2ms resource envelope for persistent local inference
+
+The Azure VM was resized to **Standard_B2ms (8 GB RAM)**. This is a deliberate low-cost infrastructure step toward keeping a local model continuously available for routing, context gathering, and small/medium tasks instead of consuming external-provider quota for every decision.
+
+The 8-GB envelope is now an explicit experimental constraint rather than an abstract local-model idea. Model choice remains open: the concrete model should be selected by measured fit, context capacity, latency, quality, and memory headroom for Nexus itself rather than by the provisional Llama 2 13B choice in PR #21. This creates a useful near-term benchmark question: **which current quantized model gives the best routing/coding usefulness per GB and per second while coexisting with the agent services on B2ms?**
+
 ## What Nexus currently learns
 
 Nexus already accumulates several kinds of machine-readable or repository-visible information:
@@ -295,7 +301,7 @@ This turns "Nexus should remember our development" into a measurable experiment 
 
 At the current stage the project contains several cooperating layers:
 
-- persistent Azure VM,
+- persistent Azure VM, currently Standard_B2ms with 8 GB RAM,
 - baseline and MCP-oriented agent code,
 - LLM/provider access,
 - single-call Codex experiment execution,
@@ -337,6 +343,7 @@ Current directions worth investigating include:
 - measuring the real token/cost reduction and implementation-quality impact of the single-call pipeline and quiet verification output,
 - persistent local-first routing for small/medium work, context gathering, and delegation decisions,
 - model routing by task difficulty, expected value, provider limits, and measured quality,
+- benchmark current quantized local models within the B2ms 8-GB RAM envelope, including usable context size and memory headroom for Nexus services,
 - safe autonomous operations/self-healing with narrow allowlists and audit logs,
 - stronger automatic evaluation of proposed changes,
 - measuring improvement quality per euro and per token,
@@ -354,7 +361,7 @@ The immediate work should remain small. Strong candidates now include:
 
 1. **Project-memory experiment:** expose this history to Nexus through a minimal retrieval/context mechanism and measure whether its next idea selections improve.
 2. **Single-call before/after measurement:** re-run a representative early experiment and compare quality, total tokens, runtime, and estimated cost against the historical multi-stage result.
-3. **Local-router experiment:** test a small current local model as the always-available router/context-gatherer, while keeping execution sequential and measuring how often delegation is actually necessary.
+3. **Local-router experiment:** benchmark a small current quantized model inside the B2ms 8-GB envelope as the always-available router/context-gatherer, while keeping execution sequential and measuring memory headroom, latency, context size, and how often delegation is actually necessary.
 4. **Operational-autonomy review:** evaluate the draft self-healing operations against least-privilege, rollback, auditability, and measurable reduction in human intervention before adoption.
 
 The next choice should be based on expected learning value, implementation effort, risk, and measurable benefit rather than on architectural completeness.
