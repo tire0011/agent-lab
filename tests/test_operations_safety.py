@@ -401,5 +401,106 @@ class TestExecuteErrorSanitization(unittest.TestCase):
         self.assertTrue(result["success"])
 
 
+# ---------------------------------------------------------------------------
+# Recursive audit redaction
+# ---------------------------------------------------------------------------
+
+class TestRecursiveAuditRedaction(unittest.TestCase):
+    """_redact_audit_dict must sanitize secrets at every nesting level."""
+
+    def _r(self, d):
+        from modules.operations_executor import _redact_audit_dict
+        return _redact_audit_dict(d)
+
+    def test_nested_dict_token_redacted(self):
+        result = self._r({"config": {"token": "secret"}})
+        self.assertEqual(result["config"]["token"], "***")
+
+    def test_nested_dict_password_redacted(self):
+        result = self._r({"db": {"password": "hunter2"}})
+        self.assertEqual(result["db"]["password"], "***")
+
+    def test_list_of_dicts_redacted(self):
+        result = self._r({"items": [{"password": "s3cr3t"}, {"name": "alice"}]})
+        self.assertEqual(result["items"][0]["password"], "***")
+        self.assertEqual(result["items"][1]["name"], "alice")
+
+    def test_deeply_nested_redacted(self):
+        result = self._r({"a": {"b": {"c": {"token": "deep-secret"}}}})
+        self.assertEqual(result["a"]["b"]["c"]["token"], "***")
+
+    def test_non_sensitive_nested_values_preserved(self):
+        result = self._r({"meta": {"model": "gpt-4o", "count": 3}})
+        self.assertEqual(result["meta"]["model"], "gpt-4o")
+        self.assertEqual(result["meta"]["count"], 3)
+
+    def test_list_at_top_level_not_a_dict_returns_empty(self):
+        result = self._r(None)
+        self.assertEqual(result, {})
+
+    def test_tuple_of_dicts_redacted(self):
+        from modules.operations_executor import _redact_audit_value
+        result = _redact_audit_value(({"secret": "x"}, {"name": "y"}))
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(result[0]["secret"], "***")
+        self.assertEqual(result[1]["name"], "y")
+
+    def test_nested_list_within_list_redacted(self):
+        result = self._r({"outer": [[{"token": "nested-list-secret"}]]})
+        self.assertEqual(result["outer"][0][0]["token"], "***")
+
+
+class TestRecursiveAuditLogPersistence(unittest.TestCase):
+    """Verify that nested secrets are not stored in operation_log."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmpdir.name, "test.db")
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def _make_executor(self):
+        from modules.operations_executor import OperationsExecutor
+        from modules.run_store import init_db
+        conn = init_db(self.db_path)
+        ex = OperationsExecutor(db_path=self.db_path)
+        ex._conn = conn
+        return ex
+
+    def test_nested_token_not_stored_in_params(self):
+        ex = self._make_executor()
+        ex._log_operation(
+            operation="context/set-config",
+            params={"config": {"token": "nested-secret"}},
+            success=True,
+            result={},
+            error=None,
+            duration_ms=1,
+        )
+        row = ex._conn.execute(
+            "SELECT parameters FROM operation_log ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        stored = json.loads(row[0])
+        self.assertEqual(stored["config"]["token"], "***")
+        self.assertNotIn("nested-secret", json.dumps(stored))
+
+    def test_list_of_dicts_with_password_not_stored(self):
+        ex = self._make_executor()
+        ex._log_operation(
+            operation="models/test",
+            params={},
+            success=True,
+            result={"items": [{"password": "topsecret"}, {"model": "gpt-4o"}]},
+            error=None,
+            duration_ms=1,
+        )
+        row = ex._conn.execute(
+            "SELECT result FROM operation_log ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        stored = json.loads(row[0])
+        self.assertEqual(stored["items"][0]["password"], "***")
+        self.assertEqual(stored["items"][1]["model"], "gpt-4o")
+        self.assertNotIn("topsecret", json.dumps(stored))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -78,8 +78,23 @@ def _is_stale_lock(path: Path) -> bool:
         return False
 
 
+def _redact_audit_value(v: object) -> object:
+    """Recursively redact *v*, descending into dicts, lists, and tuples."""
+    if isinstance(v, dict):
+        return _redact_audit_dict(v)
+    if isinstance(v, list):
+        return [_redact_audit_value(item) for item in v]
+    if isinstance(v, tuple):
+        return tuple(_redact_audit_value(item) for item in v)
+    return v
+
+
 def _redact_audit_dict(d: dict | None) -> dict:
-    """Return a shallow copy of *d* with sensitive values replaced.
+    """Return a deep copy of *d* with sensitive values replaced at any depth.
+
+    Keys matching the sensitive-key pattern have their value replaced with
+    ``"***"`` regardless of how deeply they are nested.  Non-sensitive values
+    are recursed into so that nested structures are also sanitized.
 
     If *d* is not a dict (e.g. ``None`` for failed operations), returns ``{}``.
     """
@@ -90,7 +105,7 @@ def _redact_audit_dict(d: dict | None) -> dict:
         if _AUDIT_REDACT_KEYS_RE.search(str(k)):
             out[k] = "***"
         else:
-            out[k] = v
+            out[k] = _redact_audit_value(v)
     return out
 
 _logger = logging.getLogger(__name__)
