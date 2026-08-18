@@ -276,7 +276,7 @@ class TestContextEndpoints(unittest.TestCase):
 
     def test_set_config_success(self):
         mock = _make_executor("context/set-config",
-                              {"success": True, "key": "FEATURE_FLAG_ROUTER", "value": "true"})
+                              {"success": True, "key": "FEATURE_FLAG_ROUTER"})
         self._override(mock)
         resp = self.client.post("/operations/context/set-config", headers=_HEADERS,
                                 json={"key": "FEATURE_FLAG_ROUTER", "value": "true"})

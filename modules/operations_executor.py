@@ -31,6 +31,68 @@ from modules.log_reader import LogReader
 from modules.redaction import redact
 from modules.service_operations import ServiceOperations
 
+# A lock file is considered stale only when it is older than this threshold
+# AND its owning process (if recorded inside the file) is no longer alive.
+_LOCK_STALE_AGE_SECONDS: int = 3600  # 1 hour
+
+# Keys whose values must never be stored in the audit log parameters/results.
+_AUDIT_REDACT_KEYS_RE = re.compile(r"(?i)(key|secret|token|password|credential|value)")
+
+
+def _is_stale_lock(path: Path) -> bool:
+    """Return True only if *path* is definitely a stale, ownerless lock file.
+
+    A lock is considered safe to remove when **all** of the following hold:
+    1. The file is older than ``_LOCK_STALE_AGE_SECONDS``.
+    2. The file does NOT contain a PID of a running process (if it contains
+       one at all — empty/non-numeric files satisfy this condition trivially).
+    """
+    try:
+        age = time.time() - path.stat().st_mtime
+        if age < _LOCK_STALE_AGE_SECONDS:
+            return False
+
+        # Try to read a PID from the file content (common convention).
+        try:
+            content = path.read_text(errors="replace").strip()
+        except OSError:
+            # Can't read → treat as potentially active.
+            return False
+
+        if content.isdigit():
+            pid = int(content)
+            try:
+                # Signal 0 checks liveness without actually signalling.
+                os.kill(pid, 0)
+                # Process is alive → lock is not stale.
+                return False
+            except ProcessLookupError:
+                # PID does not exist → process is gone.
+                pass
+            except PermissionError:
+                # Process exists but we can't signal it → treat as active.
+                return False
+
+        return True
+    except OSError:
+        return False
+
+
+def _redact_audit_dict(d: dict | None) -> dict:
+    """Return a shallow copy of *d* with sensitive values replaced.
+
+    If *d* is not a dict (e.g. ``None`` for failed operations), returns ``{}``.
+    """
+    if not isinstance(d, dict):
+        return {}
+    out: dict = {}
+    for k, v in d.items():
+        if _AUDIT_REDACT_KEYS_RE.search(str(k)):
+            out[k] = "***"
+        else:
+            out[k] = v
+    return out
+
 _logger = logging.getLogger(__name__)
 
 _ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
@@ -122,9 +184,9 @@ class OperationsExecutor:
                     str(uuid.uuid4()),
                     datetime.now(timezone.utc).isoformat(),
                     operation,
-                    json.dumps(params),
+                    json.dumps(_redact_audit_dict(params)),
                     1 if success else 0,
-                    json.dumps(result),
+                    json.dumps(_redact_audit_dict(result)),
                     error,
                     duration_ms,
                     executor,
@@ -164,16 +226,23 @@ class OperationsExecutor:
 
     async def fix_stale_locks(self) -> dict:
         removed: list[str] = []
+        skipped: list[str] = []
         for pattern in _LOCK_PATTERNS:
             for match in _glob.glob(pattern, recursive=True):
+                p = Path(match)
                 try:
-                    os.remove(match)
-                    removed.append(Path(match).name)
+                    verdict = _is_stale_lock(p)
+                    if verdict:
+                        os.remove(match)
+                        removed.append(p.name)
+                    else:
+                        skipped.append(p.name)
                 except OSError:
-                    pass
+                    skipped.append(p.name)
         return {
             "success": True,
             "locks_removed": len(removed),
+            "locks_skipped": len(skipped),
             "details": removed[:50],
         }
 
@@ -287,7 +356,7 @@ class OperationsExecutor:
         if not updated:
             lines.append(new_line)
         config_path.write_text("\n".join(lines) + "\n")
-        return {"success": True, "key": key, "value": value}
+        return {"success": True, "key": key}
 
     async def get_model_status(self) -> dict:
         """Return a best-effort status for known models."""

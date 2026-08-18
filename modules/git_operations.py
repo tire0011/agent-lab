@@ -94,12 +94,24 @@ class GitOperations:
             raise ValueError("commit message must be 1-500 characters")
         if not files:
             raise ValueError("files list must not be empty")
+
+        repo_root = Path(self._repo_path).resolve()
+        validated_files: list[str] = []
         for f in files:
             if not _SAFE_FILE_PATTERN.match(f):
                 raise ValueError(f"unsafe file path: {f!r}")
+            # Resolve against repo root to block traversal and symlink escapes.
+            candidate = (repo_root / f).resolve()
+            if candidate != repo_root and not str(candidate).startswith(str(repo_root) + "/"):
+                raise ValueError(f"file path escapes repo root: {f!r}")
+            # Use the validated relative form for git add.
+            relative = str(candidate.relative_to(repo_root))
+            if not _SAFE_FILE_PATTERN.match(relative):
+                raise ValueError(f"resolved path contains unsafe characters: {relative!r}")
+            validated_files.append(relative)
 
         # Stage files
-        rc, _, stderr = await _run(["git", "add", "--"] + files, self._repo_path)
+        rc, _, stderr = await _run(["git", "add", "--"] + validated_files, self._repo_path)
         if rc != 0:
             return {"success": False, "commit_sha": None, "message": redact(stderr)[:300]}
 
