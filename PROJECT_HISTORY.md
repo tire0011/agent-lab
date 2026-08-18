@@ -232,6 +232,21 @@ The durable lesson is that **tool output should be shaped for the consumer**: no
 
 A related usability improvement exposes the full experiment ID with a copy action in the detail UI, reducing ambiguity when diagnosing failures or building operation chains remotely.
 
+### 17. 2026-08-17 to 2026-08-18: local-first routing and broader operational autonomy under review
+
+A stronger architectural direction emerged from repeated concern that external provider quotas and token budgets can become the limiting resource for continuous operation. The preferred direction is now to keep a local model available on the VM even when it is relatively slow, use it for small/medium tasks, context gathering, routing, and role changes, and delegate only work that clearly needs a stronger external model.
+
+The desired execution model remains deliberately sequential rather than a large concurrent multi-agent system: one active model/agent at a time, with prompt-defined roles such as router, planner, developer, or tester. This keeps RAM, token use, concurrency, and causal debugging bounded while still allowing specialization.
+
+Two draft pull requests prototype parts of this direction but are **not yet adopted on `main`**:
+
+- PR #21 proposes a local-model routing/orchestration layer with persisted routing/provider-usage decisions and a sequential route -> plan -> develop -> test flow. Its concrete Llama 2 13B choice should be treated as an implementation experiment, not as a settled model decision.
+- PR #22 proposes authenticated operational/self-healing capabilities for Git, services, logs, diagnosis, model testing, and configuration, with explicit allowlists, path validation, redaction, and operation logging. This explores whether Nexus can safely perform more of its own routine operation and recovery work.
+
+The durable design lesson is to separate **capability architecture** from **specific model choice**: Nexus benefits from an always-available local decision layer and measured provider routing even if the best local model changes frequently.
+
+A measurement decision was also made to re-run the earliest simple webpage-change experiment using the newer pipeline and compare it with the original baseline. This is intended to provide a concrete before/after check on whether the many orchestration changes improved cost, token use, runtime, and quality. No new measured result is recorded here yet.
+
 ## What Nexus currently learns
 
 Nexus already accumulates several kinds of machine-readable or repository-visible information:
@@ -295,6 +310,8 @@ At the current stage the project contains several cooperating layers:
 - token-efficient verification with bounded failure evidence,
 - tests and policy boundaries.
 
+Draft work is exploring a persistent local routing layer and broader self-healing operations, but these are not yet current `main` capabilities.
+
 The system is still intentionally small enough to understand.
 
 ## Important lessons so far
@@ -308,7 +325,8 @@ The system is still intentionally small enough to understand.
 7. **Failures are research data.** Selection failures, CLI incompatibilities, merge conflicts, timeouts, rejected experiments, and stale regression assumptions are useful inputs to the next iteration.
 8. **Optimize orchestration before buying more model capacity.** Collapsing 3-5 LLM calls to one and reducing routine tool output can lower cost without changing providers; quality must then be measured explicitly.
 9. **Compact output and useful diagnostics are compatible.** Quiet success output plus bounded/redacted failure evidence gives a better signal-to-token ratio than verbose logs everywhere.
-10. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
+10. **Separate routing architecture from model identity.** An always-available local decision layer can remain useful while the concrete local model is replaced as better small models appear.
+11. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
 
 ## Open research directions
 
@@ -317,8 +335,9 @@ Current directions worth investigating include:
 - project memory and retrieval from this history,
 - event-driven mailbox wake-up (for example via GitHub-triggered notification) so Nexus can react immediately to new inbox commits while retaining the timer as fallback,
 - measuring the real token/cost reduction and implementation-quality impact of the single-call pipeline and quiet verification output,
-- using a small local LLM for frequent action selection and reflection,
-- model routing by task difficulty and expected value,
+- persistent local-first routing for small/medium work, context gathering, and delegation decisions,
+- model routing by task difficulty, expected value, provider limits, and measured quality,
+- safe autonomous operations/self-healing with narrow allowlists and audit logs,
 - stronger automatic evaluation of proposed changes,
 - measuring improvement quality per euro and per token,
 - automatic discovery of recurring operational problems,
@@ -334,9 +353,9 @@ Current directions worth investigating include:
 The immediate work should remain small. Strong candidates now include:
 
 1. **Project-memory experiment:** expose this history to Nexus through a minimal retrieval/context mechanism and measure whether its next idea selections improve.
-2. **Single-call before/after measurement:** compare quality, total tokens, runtime, and estimated cost against representative historical multi-stage experiments to verify that the simplification is a real improvement rather than only fewer calls.
-3. **Event-driven mailbox experiment:** compare a GitHub-triggered wake-up against the current one-minute polling path for latency, reliability, complexity, and operational cost while preserving polling as a fallback.
-4. **Cheap local decision model:** test whether a small model running on existing hardware can handle frequent low-risk decisions cheaply enough to reduce API use.
+2. **Single-call before/after measurement:** re-run a representative early experiment and compare quality, total tokens, runtime, and estimated cost against the historical multi-stage result.
+3. **Local-router experiment:** test a small current local model as the always-available router/context-gatherer, while keeping execution sequential and measuring how often delegation is actually necessary.
+4. **Operational-autonomy review:** evaluate the draft self-healing operations against least-privilege, rollback, auditability, and measurable reduction in human intervention before adoption.
 
 The next choice should be based on expected learning value, implementation effort, risk, and measurable benefit rather than on architectural completeness.
 
