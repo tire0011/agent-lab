@@ -12,6 +12,8 @@ from modules.llama_cpp_client import LlamaCppClientError
 from modules.llama_router import (
     LlamaRouter,
     RouterDecision,
+    VALID_PROVIDERS,
+    VALID_ROLES,
     _ensure_router_tables,
     _parse_router_response,
 )
@@ -19,28 +21,41 @@ from modules.llama_router import (
 
 # ── _parse_router_response ────────────────────────────────────────────────────
 
-def test_parse_router_response_self():
+def test_parse_router_response_legacy_self():
     raw = json.dumps(
         {"decision": "SELF", "confidence": 0.9, "reasoning": "Simple task."}
     )
     d = _parse_router_response(raw)
     assert d.decision == "SELF"
+    assert d.provider == "local"
     assert d.confidence == 0.9
     assert d.reasoning == "Simple task."
 
 
-def test_parse_router_response_azure():
+def test_parse_router_response_legacy_azure():
     raw = json.dumps(
         {"decision": "AZURE_OPENAI", "confidence": 0.7, "reasoning": "Complex."}
     )
     d = _parse_router_response(raw)
     assert d.decision == "AZURE_OPENAI"
+    assert d.provider == "azure_openai"
+
+
+def test_parse_router_response_new_format_provider_role():
+    raw = json.dumps(
+        {"provider": "codex", "role": "developer", "confidence": 0.85, "reasoning": "Automated."}
+    )
+    d = _parse_router_response(raw)
+    assert d.provider == "codex"
+    assert d.role == "developer"
+    assert d.decision == "CODEX"
 
 
 def test_parse_router_response_with_sub_tasks():
     raw = json.dumps(
         {
-            "decision": "CODEX",
+            "provider": "codex",
+            "role": "developer",
             "confidence": 0.8,
             "reasoning": "Needs code change.",
             "sub_tasks": ["task1", "task2"],
@@ -59,13 +74,14 @@ def test_parse_router_response_unknown_decision_raises():
 # ── RouterDecision.is_valid ───────────────────────────────────────────────────
 
 def test_router_decision_is_valid():
-    for decision in ("SELF", "AZURE_OPENAI", "CODEX", "CONSULT"):
-        d = RouterDecision(decision=decision, confidence=1.0, reasoning="ok")
-        assert d.is_valid()
+    for provider in ("local", "azure_openai", "codex", "copilot"):
+        for role in ("developer", "planner", "reviewer", "context_gatherer"):
+            d = RouterDecision(provider=provider, role=role, confidence=1.0, reasoning="ok")
+            assert d.is_valid(), f"Expected valid for provider={provider} role={role}"
 
 
 def test_router_decision_is_invalid():
-    d = RouterDecision(decision="RANDOM", confidence=0.0, reasoning="")
+    d = RouterDecision(provider="unknown_provider", role="developer", confidence=0.0, reasoning="")
     assert not d.is_valid()
 
 

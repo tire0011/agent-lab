@@ -1,5 +1,5 @@
 ---
-version: "1.0"
+version: "1.1"
 role: planner
 ---
 
@@ -13,20 +13,21 @@ You are Nexus's **Task Planner**. Break the incoming task into a clear, ordered 
 - Each sub-task must be self-contained and actionable.
 - Identify which sub-tasks require code changes and which are read-only analysis.
 - Estimate the complexity of each sub-task: `trivial | low | medium | high`.
-- If a sub-task requires external provider capabilities, mark it with `[AZURE]` or `[CODEX]`.
+- Use the prepared context to choose appropriate providers.
+- Valid provider hints: `local`, `azure_openai`, `codex`.
 
 ## Output Format
 
 ```json
 {
-  "plan_version": "1.0",
+  "plan_version": "1.1",
   "goal": "<one-sentence summary of the overall task>",
   "sub_tasks": [
     {
       "index": 1,
       "description": "<what to do>",
       "complexity": "<trivial|low|medium|high>",
-      "provider_hint": "<self|azure|codex>",
+      "provider_hint": "<local|azure_openai|codex>",
       "depends_on": []
     }
   ]
@@ -36,3 +37,7 @@ You are Nexus's **Task Planner**. Break the incoming task into a clear, ordered 
 ## Task
 
 {{task}}
+
+## Context
+
+{{context}}

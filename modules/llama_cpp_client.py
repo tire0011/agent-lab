@@ -1,8 +1,16 @@
-"""Wrapper for the llama-cpp-python OpenAI-compatible REST API.
+"""Wrapper for OpenAI-compatible local model REST APIs.
 
-The llama-cpp-python server exposes an OpenAI-compatible ``/v1/chat/completions``
-endpoint. This client wraps it with minimal dependencies so the rest of the
-codebase can treat it identically to the Azure OpenAI client.
+The llama.cpp server (and other compatible servers such as llama-cpp-python)
+expose an OpenAI-compatible ``/v1/chat/completions`` endpoint.  This client
+wraps it with minimal dependencies so the rest of the codebase can treat it
+identically to the Azure OpenAI client.
+
+Configuration is driven entirely by environment variables so the local model
+can be swapped (different GGUF, different quantisation, different server) without
+changing any orchestration code:
+
+* ``LLAMA_CPP_BASE_URL`` — server base URL (default: ``http://127.0.0.1:8080/v1``)
+* ``LLAMA_CPP_MODEL``    — model name sent in requests, for logging (default: ``local-model``)
 """
 
 from __future__ import annotations
@@ -43,33 +51,40 @@ def extract_json(text: str) -> dict[str, Any]:
 
 
 class LlamaCppClient:
-    """Minimal async client for the llama-cpp-python HTTP server.
+    """Minimal async client for a local OpenAI-compatible model server.
+
+    Works with llama.cpp / llama-server, llama-cpp-python, and any server that
+    exposes the ``/v1/chat/completions`` endpoint.
 
     Parameters
     ----------
     base_url:
-        Base URL of the llama-cpp-python server (default: ``LLAMA_CPP_BASE_URL``
-        env var, falling back to ``http://127.0.0.1:8080/v1``).
+        Base URL of the server (default: ``LLAMA_CPP_BASE_URL`` env var,
+        falling back to ``http://127.0.0.1:8080/v1``).
     timeout:
         HTTP request timeout in seconds. Inference on CPU can be slow, so the
         default is intentionally high (300 s).
     model:
-        Model name sent in the request body. The llama-cpp server ignores this
-        but it is useful for logging.
+        Model name sent in the request body (default: ``LLAMA_CPP_MODEL`` env
+        var, falling back to ``local-model``).  Most servers ignore this field
+        but it is useful for logging and tracing.
     """
 
     def __init__(
         self,
         base_url: str | None = None,
         timeout: float = 300.0,
-        model: str = "llama-2-13b-chat",
+        model: str | None = None,
     ) -> None:
         self.base_url = (
             base_url
             or os.getenv("LLAMA_CPP_BASE_URL", _DEFAULT_BASE_URL)
         ).rstrip("/")
         self.timeout = timeout
-        self.model = model
+        # Model name sent in the request body (the llama.cpp server typically
+        # ignores it but it is useful for logging). Override via LLAMA_CPP_MODEL
+        # so we can swap GGUF files without changing orchestration code.
+        self.model = model or os.getenv("LLAMA_CPP_MODEL", "local-model")
 
     async def chat_completion(
         self,

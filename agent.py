@@ -38,9 +38,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Route the task through Llama 2 13B decision router. "
-            "Llama decides whether to handle the task locally, delegate to "
-            "Azure OpenAI, delegate to Codex, or consult another model."
+            "Route the task through the local model decision router. "
+            "The local model decides the provider (local / azure_openai / codex) "
+            "and orchestrates context-gathering, planning, development, "
+            "real verification, and review sequentially."
         ),
     )
     return parser.parse_args()
@@ -85,10 +86,10 @@ async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, 
 
 
 async def run_router_pipeline(task: str, db: Any) -> str:
-    """Run the Llama 2 13B router pipeline and return the final response text.
+    """Run the local-model router pipeline and return the final response text.
 
     This function lazily imports the orchestrator modules so the base agent
-    continues to work even when llama-cpp-python is not installed.
+    continues to work even when the local model server is not running.
     """
     from modules.llama_cpp_client import LlamaCppClient
     from modules.multi_provider_orchestrator import MultiProviderOrchestrator
@@ -99,9 +100,27 @@ async def run_router_pipeline(task: str, db: Any) -> str:
         response, _, _, _, _, _ = await run_agent(prompt)
         return response
 
+    async def codex_run_fn(prompt: str) -> str:
+        """Delegate a sub-task to Codex via CodexTaskService."""
+        from modules.codex_task_service import CodexTaskService, STATUS_SUCCEEDED
+        from modules.run_store import DEFAULT_DB_PATH
+
+        service = CodexTaskService(db_path=DEFAULT_DB_PATH)
+        codex_task = service.create_task(
+            prompt=prompt,
+            working_dir=os.getcwd(),
+        )
+        completed = service.run_task(codex_task.id)
+        if completed.status == STATUS_SUCCEEDED:
+            return completed.final_message or "(Codex completed with no output)"
+        raise RuntimeError(
+            f"Codex task failed (status={completed.status}): {completed.error}"
+        )
+
     orchestrator = MultiProviderOrchestrator(
         llama_client=llama_client,
         azure_run_fn=azure_run_fn,
+        codex_run_fn=codex_run_fn,
         db=db,
     )
 
@@ -125,9 +144,9 @@ def main() -> int:
     started = time.perf_counter()
 
     if args.use_router:
-        # ── Router pipeline (Llama 2 13B → Azure/Codex/self) ──────────────
-        provider = "llama_router"
-        model_name = os.getenv("LLAMA_CPP_MODEL", "llama-2-13b-chat")
+        # ── Router pipeline (local model → Azure/Codex/local) ─────────────
+        provider = "local_router"
+        model_name = os.getenv("LLAMA_CPP_MODEL", "local-model")
         try:
             response_text = asyncio.run(run_router_pipeline(task, db))
             runtime_seconds = round(time.perf_counter() - started, 3)

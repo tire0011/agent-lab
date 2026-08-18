@@ -17,7 +17,7 @@ from typing import Any
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 # Supported prompt roles (= file stem without extension).
-PROMPT_ROLES = ("router", "planner", "developer", "tester")
+PROMPT_ROLES = ("router", "planner", "developer", "tester", "context", "reviewer")
 
 
 class PromptLibraryError(Exception):

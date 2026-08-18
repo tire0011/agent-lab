@@ -1,21 +1,39 @@
 """Multi-Provider Orchestrator.
 
-Coordinates the sequential execution pipeline used when ``--use-router`` is
-active:
+Coordinates the strictly-sequential execution pipeline used when
+``--use-router`` is active.  Each step returns control to Nexus before the
+next role/provider is selected.
 
-1. **Router** (Llama 2 13B)  — decides SELF / AZURE_OPENAI / CODEX / CONSULT.
-2. **Planner** (Llama 2 13B)  — breaks the task into ordered sub-tasks.
-3. **Developer** (chosen provider) — implements each sub-task.
-4. **Tester** (Llama 2 13B)  — validates the developer output.
+Pipeline
+--------
+1. **Router** (local model) — decides *provider* (local / azure_openai / codex)
+   and *role* (developer by default).  Roles and providers are independent:
+   any role can run on any provider.
+2. **Context Gatherer** (local model) — reads relevant files, git log, and
+   state; packages a compact context string for the downstream steps.
+3. **Planner** (local model) — breaks the task into ordered sub-tasks with
+   per-sub-task provider hints.
+4. **Developer** (chosen provider) — implements each sub-task.  External
+   providers receive only the prepared context, not the whole repo.
+5. **Verifier** (real tools: git diff + test runner) — produces an objective
+   pass/fail result.  No LLM involvement at this stage.
+6. **Reviewer** (local model) — interprets the real verification output and
+   returns a structured assessment.
 
-Each provider_usage and model_consultation event is written to SQLite so costs
-and routing patterns can be reported later.
+Provider/usage events are written to SQLite so costs and routing patterns can
+be reported later.  The ``provider_actually_used`` column records the provider
+that *ran* the sub-task, which may differ from the router hint if a fallback
+was triggered.
 """
 
 from __future__ import annotations
 
-import json
+import os
+import re
 import sqlite3
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +44,17 @@ from modules.prompt_library import render_prompt
 
 
 # ── Result dataclasses ────────────────────────────────────────────────────────
+
+@dataclass
+class ContextResult:
+    """Output of the context-gathering step."""
+
+    relevant_files: list[str]
+    git_diff_summary: str
+    state_summary: str
+    context_package: str   # compact text sent to downstream providers
+    raw_response: str = ""
+
 
 @dataclass
 class PlanResult:
@@ -39,13 +68,31 @@ class DeveloperResult:
     files_changed: list[str]
     summary: str
     notes: str
-    provider_used: str
+    provider_hint: str      # provider requested by router/planner
+    provider_used: str      # provider that actually ran the sub-task
+    input_tokens: int = 0
+    output_tokens: int = 0
+    runtime_ms: int = 0
     raw_response: str = ""
 
 
 @dataclass
-class TesterResult:
-    verdict: str  # pass | pass_with_notes | fail
+class VerificationResult:
+    """Output of the real-tools verification step (no LLM)."""
+
+    git_diff: str
+    test_output: str
+    tests_passed: bool
+    tests_run: int
+    tests_failed: int
+    error: str = ""
+
+
+@dataclass
+class ReviewerResult:
+    """Local model's interpretation of real verification results."""
+
+    verdict: str    # pass | pass_with_notes | fail
     issues: list[dict[str, Any]]
     suggested_tests: list[str]
     summary: str
@@ -58,9 +105,11 @@ class OrchestratorResult:
 
     task: str
     router_decision: RouterDecision
+    context: ContextResult | None = None
     plan: PlanResult | None = None
     developer_results: list[DeveloperResult] = field(default_factory=list)
-    tester_result: TesterResult | None = None
+    verification: VerificationResult | None = None
+    reviewer_result: ReviewerResult | None = None
     final_response: str = ""
     error: str = ""
 
@@ -68,12 +117,17 @@ class OrchestratorResult:
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 class MultiProviderOrchestrator:
-    """Coordinates Llama 2 13B with Azure OpenAI and Codex for task execution.
+    """Coordinates a local model with Azure OpenAI and Codex for task execution.
+
+    The local model acts as the persistent brain: it routes, gathers context,
+    plans, and reviews.  External providers (azure_openai, codex) handle only
+    the developer step when the router selects them, and receive only the
+    context package prepared by the local model.
 
     Parameters
     ----------
     llama_client:
-        Client for the local llama-cpp-python server.
+        Client for the local model server.
     azure_run_fn:
         Async callable ``(task: str) -> str`` that forwards the task to the
         Azure OpenAI agent and returns its final text response.
@@ -85,6 +139,12 @@ class MultiProviderOrchestrator:
         model_consultations rows.
     prompts_dir:
         Override the default prompts directory (useful in tests).
+    repo_root:
+        Root directory of the repository for git diff / test runner.
+        Defaults to the ``REPO_ROOT`` env var or the current working directory.
+    test_cmd:
+        Command used to run the test suite during verification.  Defaults to
+        ``python -m pytest tests/ -q --tb=short``.
     """
 
     def __init__(
@@ -94,12 +154,16 @@ class MultiProviderOrchestrator:
         codex_run_fn: Any = None,
         db: sqlite3.Connection | None = None,
         prompts_dir: Any = None,
+        repo_root: str | None = None,
+        test_cmd: list[str] | None = None,
     ) -> None:
         self._llama = llama_client or LlamaCppClient()
         self._azure_run_fn = azure_run_fn
         self._codex_run_fn = codex_run_fn
         self._db = db
         self._prompts_dir = prompts_dir
+        self._repo_root = repo_root or os.getenv("REPO_ROOT", os.getcwd())
+        self._test_cmd = test_cmd or [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=short"]
         self._router = LlamaRouter(
             client=self._llama,
             db=db,
@@ -109,14 +173,15 @@ class MultiProviderOrchestrator:
     # ── Public entry point ────────────────────────────────────────────────────
 
     async def run(self, task: str) -> OrchestratorResult:
-        """Execute *task* through the full router → plan → dev → test pipeline.
+        """Execute *task* through the full sequential pipeline.
 
         Returns an :class:`OrchestratorResult` regardless of whether the run
         succeeded or failed; callers should check ``result.error``.
         """
-        result = OrchestratorResult(task=task, router_decision=RouterDecision(
-            decision="SELF", confidence=0.0, reasoning=""
-        ))
+        result = OrchestratorResult(
+            task=task,
+            router_decision=RouterDecision(provider="local", role="developer"),
+        )
 
         # ── Step 1: Route ─────────────────────────────────────────────────────
         try:
@@ -126,56 +191,53 @@ class MultiProviderOrchestrator:
             result.error = f"Router failed: {exc}"
             return result
 
-        # ── Step 1b: CONSULT (optional detour) ───────────────────────────────
-        if decision.decision == "CONSULT":
-            try:
-                consultation_reply = await self._consult(
-                    decision.consult_query or task
-                )
-                _log_consultation(self._db, task, decision.consult_query or task, consultation_reply)
-                # Re-route with the consultation answer appended.
-                enriched_task = (
-                    f"{task}\n\n[Consultation result]: {consultation_reply}"
-                )
-                decision = await self._router.route(enriched_task)
-                result.router_decision = decision
-            except Exception as exc:  # noqa: BLE001
-                result.error = f"Consultation failed: {exc}"
-                return result
-
-        # ── Step 2: Plan ──────────────────────────────────────────────────────
+        # ── Step 2: Gather context ────────────────────────────────────────────
         try:
-            plan = await self._plan(task)
+            ctx = await self._gather_context(task)
+            result.context = ctx
+        except Exception as exc:  # noqa: BLE001
+            result.error = f"Context gatherer failed: {exc}"
+            return result
+
+        # ── Step 3: Plan ──────────────────────────────────────────────────────
+        try:
+            plan = await self._plan(task, ctx.context_package)
             result.plan = plan
         except Exception as exc:  # noqa: BLE001
             result.error = f"Planner failed: {exc}"
             return result
 
-        # ── Step 3: Develop ───────────────────────────────────────────────────
-        provider = _decision_to_provider(decision.decision)
+        # ── Step 4: Develop ───────────────────────────────────────────────────
         for sub_task in plan.sub_tasks:
             sub_desc = sub_task.get("description", str(sub_task))
-            provider_hint = sub_task.get("provider_hint", provider)
+            # Sub-task may override provider; fall back to router decision.
+            provider_hint = sub_task.get("provider_hint", decision.provider)
+            t0 = time.monotonic()
             try:
-                dev_result = await self._develop(sub_desc, provider_hint, task)
+                dev_result = await self._develop(
+                    sub_desc, provider_hint, ctx.context_package
+                )
+                dev_result.runtime_ms = int((time.monotonic() - t0) * 1000)
                 result.developer_results.append(dev_result)
-                _log_provider_usage(self._db, task, provider_hint, sub_desc, dev_result.summary)
+                _log_provider_usage(self._db, task, provider_hint, dev_result.provider_used, sub_desc, dev_result.summary, dev_result.input_tokens, dev_result.output_tokens, dev_result.runtime_ms)
             except Exception as exc:  # noqa: BLE001
                 result.error = f"Developer failed on sub-task {sub_desc!r}: {exc}"
                 return result
 
-        # ── Step 4: Test ──────────────────────────────────────────────────────
+        # ── Step 5: Verify (real tools) ───────────────────────────────────────
         try:
-            developer_summary = "\n".join(
-                dr.summary for dr in result.developer_results
-            )
-            files_changed = [
-                f for dr in result.developer_results for f in dr.files_changed
-            ]
-            tester_result = await self._test(developer_summary, files_changed)
-            result.tester_result = tester_result
+            verification = self._verify()
+            result.verification = verification
         except Exception as exc:  # noqa: BLE001
-            result.error = f"Tester failed: {exc}"
+            result.error = f"Verifier failed: {exc}"
+            return result
+
+        # ── Step 6: Review (local model interprets real results) ──────────────
+        try:
+            reviewer_result = await self._review(verification, result.developer_results)
+            result.reviewer_result = reviewer_result
+        except Exception as exc:  # noqa: BLE001
+            result.error = f"Reviewer failed: {exc}"
             return result
 
         result.final_response = _build_final_response(result)
@@ -183,84 +245,171 @@ class MultiProviderOrchestrator:
 
     # ── Private step implementations ──────────────────────────────────────────
 
-    async def _plan(self, task: str) -> PlanResult:
+    async def _gather_context(self, task: str) -> ContextResult:
+        """Ask the local model to identify relevant files and prepare a context package."""
+        git_diff = _run_git_diff(self._repo_root)
         prompt = render_prompt(
-            "planner", {"task": task}, prompts_dir=self._prompts_dir
+            "context",
+            {"task": task, "git_diff": git_diff[:2000]},
+            prompts_dir=self._prompts_dir,
         )
         raw = await self._llama.complete(prompt=prompt, temperature=0.0, max_tokens=1024)
-        data = self._llama.extract_json(raw)
+        try:
+            data = extract_json(raw)
+        except LlamaCppClientError:
+            return ContextResult(
+                relevant_files=[],
+                git_diff_summary=git_diff[:500],
+                state_summary="",
+                context_package=f"Task: {task}\n\nRecent changes:\n{git_diff[:1000]}",
+                raw_response=raw,
+            )
+        return ContextResult(
+            relevant_files=list(data.get("relevant_files") or []),
+            git_diff_summary=str(data.get("git_diff_summary", "")),
+            state_summary=str(data.get("state_summary", "")),
+            context_package=str(data.get("context_package", f"Task: {task}")),
+            raw_response=raw,
+        )
+
+    async def _plan(self, task: str, context_package: str) -> PlanResult:
+        prompt = render_prompt(
+            "planner",
+            {"task": task, "context": context_package},
+            prompts_dir=self._prompts_dir,
+        )
+        raw = await self._llama.complete(prompt=prompt, temperature=0.0, max_tokens=1024)
+        try:
+            data = extract_json(raw)
+        except LlamaCppClientError:
+            data = {}
         return PlanResult(
             goal=str(data.get("goal", task)),
-            sub_tasks=list(data.get("sub_tasks") or [{"description": task, "provider_hint": "self"}]),
+            sub_tasks=list(data.get("sub_tasks") or [{"description": task, "provider_hint": "local"}]),
             raw_response=raw,
         )
 
     async def _develop(
-        self, sub_task: str, provider_hint: str, context: str
+        self, sub_task: str, provider_hint: str, context_package: str
     ) -> DeveloperResult:
-        if provider_hint in ("azure", "AZURE_OPENAI") and self._azure_run_fn:
-            prompt = render_prompt(
-                "developer",
-                {"sub_task": sub_task, "context": context},
-                prompts_dir=self._prompts_dir,
-            )
-            raw = await self._azure_run_fn(prompt)
-            return _parse_developer_response(raw, provider_used="azure_openai")
-
-        if provider_hint in ("codex", "CODEX") and self._codex_run_fn:
-            prompt = render_prompt(
-                "developer",
-                {"sub_task": sub_task, "context": context},
-                prompts_dir=self._prompts_dir,
-            )
-            raw = await self._codex_run_fn(prompt)
-            return _parse_developer_response(raw, provider_used="codex")
-
-        # Default: handle locally with Llama.
         prompt = render_prompt(
             "developer",
-            {"sub_task": sub_task, "context": context},
+            {"sub_task": sub_task, "context": context_package},
             prompts_dir=self._prompts_dir,
         )
-        raw = await self._llama.complete(prompt=prompt, temperature=0.1, max_tokens=2048)
-        return _parse_developer_response(raw, provider_used="llama_local")
 
-    async def _test(
-        self, developer_summary: str, files_changed: list[str]
-    ) -> TesterResult:
+        provider_actually_used: str
+        raw: str
+
+        if provider_hint in ("azure", "azure_openai", "AZURE_OPENAI") and self._azure_run_fn:
+            raw = await self._azure_run_fn(prompt)
+            provider_actually_used = "azure_openai"
+        elif provider_hint in ("codex", "CODEX") and self._codex_run_fn:
+            raw = await self._codex_run_fn(prompt)
+            provider_actually_used = "codex"
+        elif provider_hint in ("copilot",) and self._azure_run_fn:
+            # Copilot uses the Azure OpenAI path when azure_run_fn is available.
+            raw = await self._azure_run_fn(prompt)
+            provider_actually_used = "copilot_via_azure"
+        else:
+            # Default: handle locally.
+            raw = await self._llama.complete(prompt=prompt, temperature=0.1, max_tokens=2048)
+            provider_actually_used = "local"
+
+        return _parse_developer_response(raw, provider_hint=provider_hint, provider_used=provider_actually_used)
+
+    def _verify(self) -> VerificationResult:
+        """Run real verification tools and return an objective result.
+
+        Uses ``git diff HEAD`` to capture changes and the configured test
+        command to run the test suite.  The LLM is not involved in this step.
+        """
+        git_diff = _run_git_diff(self._repo_root)
+
+        # Run the test suite.
+        try:
+            proc = subprocess.run(
+                self._test_cmd,
+                cwd=self._repo_root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            test_output = (proc.stdout + proc.stderr)[:4000]
+            tests_passed = proc.returncode == 0
+            # Parse simple pass/fail counts from pytest output if available.
+            tests_run, tests_failed = _parse_pytest_summary(proc.stdout)
+        except subprocess.TimeoutExpired:
+            test_output = "Test runner timed out after 300 s"
+            tests_passed = False
+            tests_run = 0
+            tests_failed = 0
+        except Exception as exc:  # noqa: BLE001
+            test_output = f"Test runner error: {exc}"
+            tests_passed = False
+            tests_run = 0
+            tests_failed = 0
+
+        return VerificationResult(
+            git_diff=git_diff[:3000],
+            test_output=test_output,
+            tests_passed=tests_passed,
+            tests_run=tests_run,
+            tests_failed=tests_failed,
+        )
+
+    async def _review(
+        self,
+        verification: VerificationResult,
+        developer_results: list[DeveloperResult],
+    ) -> ReviewerResult:
+        """Ask the local model to interpret real verification results."""
+        files_changed = [f for dr in developer_results for f in dr.files_changed]
         prompt = render_prompt(
-            "tester",
+            "reviewer",
             {
-                "developer_output": developer_summary,
-                "files_changed": "\n".join(files_changed) or "(none)",
+                "git_diff": verification.git_diff[:2000],
+                "test_output": verification.test_output[:2000],
+                "tests_passed": str(verification.tests_passed),
+                "tests_run": str(verification.tests_run),
+                "tests_failed": str(verification.tests_failed),
+                "files_changed": "\n".join(files_changed) or "(none reported)",
             },
             prompts_dir=self._prompts_dir,
         )
         raw = await self._llama.complete(prompt=prompt, temperature=0.0, max_tokens=1024)
-        return _parse_tester_response(raw)
-
-    async def _consult(self, query: str) -> str:
-        """Ask Azure OpenAI for advice when Llama is uncertain."""
-        if self._azure_run_fn:
-            return await self._azure_run_fn(query)
-        # Fallback: Llama answers its own query (for offline scenarios).
-        return await self._llama.complete(
-            prompt=query, temperature=0.3, max_tokens=512
-        )
+        return _parse_reviewer_response(raw, verification)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _decision_to_provider(decision: str) -> str:
-    return {
-        "SELF": "self",
-        "AZURE_OPENAI": "azure",
-        "CODEX": "codex",
-        "CONSULT": "self",
-    }.get(decision, "self")
+def _run_git_diff(repo_root: str) -> str:
+    """Return ``git diff HEAD`` output, or empty string on error."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.stdout[:4000]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
-def _parse_developer_response(raw: str, provider_used: str) -> DeveloperResult:
+def _parse_pytest_summary(output: str) -> tuple[int, int]:
+    """Extract (tests_run, tests_failed) from pytest summary line."""
+    # Match: "3 failed, 10 passed" or "13 passed"
+    m = re.search(r"(\d+) failed", output)
+    failed = int(m.group(1)) if m else 0
+    m2 = re.search(r"(\d+) passed", output)
+    passed = int(m2.group(1)) if m2 else 0
+    total = passed + failed
+    return total, failed
+
+
+def _parse_developer_response(raw: str, provider_hint: str, provider_used: str) -> DeveloperResult:
     try:
         data = extract_json(raw)
     except LlamaCppClientError:
@@ -268,6 +417,7 @@ def _parse_developer_response(raw: str, provider_used: str) -> DeveloperResult:
             files_changed=[],
             summary=raw[:500],
             notes="",
+            provider_hint=provider_hint,
             provider_used=provider_used,
             raw_response=raw,
         )
@@ -275,24 +425,39 @@ def _parse_developer_response(raw: str, provider_used: str) -> DeveloperResult:
         files_changed=list(data.get("files_changed") or []),
         summary=str(data.get("summary", raw[:300])),
         notes=str(data.get("notes", "")),
+        provider_hint=provider_hint,
         provider_used=provider_used,
+        input_tokens=int(data.get("input_tokens", 0)),
+        output_tokens=int(data.get("output_tokens", 0)),
         raw_response=raw,
     )
 
 
-def _parse_tester_response(raw: str) -> TesterResult:
+def _parse_reviewer_response(raw: str, verification: VerificationResult) -> ReviewerResult:
+    # The objective pass/fail comes from verification tools, not the LLM.
+    objective_verdict = "pass" if verification.tests_passed else "fail"
     try:
         data = extract_json(raw)
     except LlamaCppClientError:
-        return TesterResult(
-            verdict="pass_with_notes",
+        return ReviewerResult(
+            verdict=objective_verdict,
             issues=[],
             suggested_tests=[],
             summary=raw[:500],
             raw_response=raw,
         )
-    return TesterResult(
-        verdict=str(data.get("verdict", "pass_with_notes")),
+    # Honour LLM's pass_with_notes only when tests actually passed.
+    llm_verdict = str(data.get("verdict", objective_verdict))
+    if not verification.tests_passed:
+        # Tests failed: override to fail regardless of LLM opinion.
+        verdict = "fail"
+    elif llm_verdict == "pass_with_notes":
+        verdict = "pass_with_notes"
+    else:
+        verdict = objective_verdict
+
+    return ReviewerResult(
+        verdict=verdict,
         issues=list(data.get("issues") or []),
         suggested_tests=list(data.get("suggested_tests") or []),
         summary=str(data.get("summary", "")),
@@ -303,24 +468,38 @@ def _parse_tester_response(raw: str) -> TesterResult:
 def _build_final_response(result: OrchestratorResult) -> str:
     lines = [
         f"Task: {result.task}",
-        f"Router decision: {result.router_decision.decision} "
+        f"Router: provider={result.router_decision.provider} "
+        f"role={result.router_decision.role} "
         f"(confidence={result.router_decision.confidence:.2f})",
         f"Reasoning: {result.router_decision.reasoning}",
         "",
     ]
+    if result.context:
+        lines.append(f"Context files: {', '.join(result.context.relevant_files) or '(none)'}")
+        lines.append("")
+
     if result.plan:
         lines.append(f"Goal: {result.plan.goal}")
         lines.append(f"Sub-tasks: {len(result.plan.sub_tasks)}")
         lines.append("")
 
     for i, dev in enumerate(result.developer_results, start=1):
-        lines.append(f"[Dev {i}/{len(result.developer_results)}] "
-                     f"Provider={dev.provider_used} — {dev.summary}")
+        lines.append(
+            f"[Dev {i}/{len(result.developer_results)}] "
+            f"hint={dev.provider_hint} actual={dev.provider_used} — {dev.summary}"
+        )
 
-    if result.tester_result:
+    if result.verification:
+        v = result.verification
         lines.append("")
-        lines.append(f"Tester verdict: {result.tester_result.verdict}")
-        lines.append(result.tester_result.summary)
+        lines.append(
+            f"Verification: tests_passed={v.tests_passed} "
+            f"({v.tests_run} run, {v.tests_failed} failed)"
+        )
+
+    if result.reviewer_result:
+        lines.append(f"Reviewer verdict: {result.reviewer_result.verdict}")
+        lines.append(result.reviewer_result.summary)
 
     return "\n".join(lines)
 
@@ -334,18 +513,34 @@ def _build_final_response(result: OrchestratorResult) -> str:
 def _log_provider_usage(
     db: sqlite3.Connection | None,
     task: str,
-    provider: str,
+    provider_hint: str,
+    provider_actually_used: str,
     sub_task: str,
     summary: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    runtime_ms: int = 0,
 ) -> None:
     if db is None:
         return
     db.execute(
         """
-        INSERT INTO provider_usage (timestamp, task, provider, sub_task, summary)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO provider_usage
+            (timestamp, task, provider, provider_actually_used,
+             sub_task, summary, input_tokens, output_tokens, runtime_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (datetime.now(timezone.utc).isoformat(), task, provider, sub_task, summary),
+        (
+            datetime.now(timezone.utc).isoformat(),
+            task,
+            provider_hint,
+            provider_actually_used,
+            sub_task,
+            summary,
+            input_tokens,
+            output_tokens,
+            runtime_ms,
+        ),
     )
     db.commit()
 

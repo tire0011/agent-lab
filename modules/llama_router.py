@@ -1,9 +1,21 @@
-"""Llama 2 13B Decision Router.
+"""Local-model Decision Router.
 
-Uses the local llama-cpp-python server to parse an incoming task and decide
-which execution strategy to use: SELF, AZURE_OPENAI, CODEX, or CONSULT.
+Uses a local OpenAI-compatible model server (llama.cpp / llama-server or any
+compatible endpoint) to parse an incoming task and decide which execution
+strategy to use.
 
-The router decision is persisted to the ``router_decisions`` SQLite table so
+Routing separates **role** from **provider**:
+
+* **Roles** describe *what* step runs next:
+  ``router``, ``context_gatherer``, ``planner``, ``developer``, ``reviewer``.
+* **Providers** describe *who* executes a role:
+  ``local``, ``azure_openai``, ``codex``, ``copilot``.
+
+The legacy ``decision`` field (``SELF / AZURE_OPENAI / CODEX / CONSULT``) is
+retained for backward compatibility and is derived automatically from
+``provider`` when not explicitly set by the model.
+
+Router decisions are persisted to the ``router_decisions`` SQLite table so
 costs and routing patterns can be analysed over time.
 """
 
@@ -19,35 +31,102 @@ from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extrac
 from modules.prompt_library import render_prompt
 
 
+# ── Valid values ──────────────────────────────────────────────────────────────
+
+# Legacy decision tokens kept for backward compatibility.
 VALID_DECISIONS = frozenset({"SELF", "AZURE_OPENAI", "CODEX", "CONSULT"})
+
+# New role/provider vocabulary.
+VALID_PROVIDERS = frozenset({"local", "azure_openai", "codex", "copilot"})
+VALID_ROLES = frozenset({"router", "context_gatherer", "planner", "developer", "reviewer"})
+
+# Mapping from legacy decision tokens to provider strings.
+_DECISION_TO_PROVIDER: dict[str, str] = {
+    "SELF": "local",
+    "AZURE_OPENAI": "azure_openai",
+    "CODEX": "codex",
+    "CONSULT": "local",  # context_gatherer is always local
+}
+
+# Mapping from provider strings to legacy decision tokens.
+_PROVIDER_TO_DECISION: dict[str, str] = {
+    "local": "SELF",
+    "azure_openai": "AZURE_OPENAI",
+    "codex": "CODEX",
+    "copilot": "AZURE_OPENAI",
+}
 
 
 @dataclass
 class RouterDecision:
-    """Parsed output of a single router call."""
+    """Parsed output of a single router call.
 
-    decision: str
-    confidence: float
-    reasoning: str
+    The ``provider`` and ``role`` fields carry the new role/provider
+    vocabulary.  The legacy ``decision`` field is retained for backward
+    compatibility and is always set (derived from ``provider`` if not
+    provided explicitly by the model).
+    """
+
+    # New fields (preferred)
+    provider: str = "local"   # local | azure_openai | codex | copilot
+    role: str = "developer"   # context_gatherer | planner | developer | reviewer
+
+    # Legacy / derived fields (kept for backward compat)
+    decision: str = ""        # SELF | AZURE_OPENAI | CODEX | CONSULT (derived)
+    confidence: float = 0.0
+    reasoning: str = ""
     consult_query: str = ""
     sub_tasks: list[str] = field(default_factory=list)
     raw_response: str = ""
 
+    def __post_init__(self) -> None:
+        # Derive ``decision`` from ``provider`` when not explicitly set.
+        if not self.decision:
+            self.decision = _PROVIDER_TO_DECISION.get(self.provider, "SELF")
+
     def is_valid(self) -> bool:
-        return self.decision in VALID_DECISIONS
+        return self.provider in VALID_PROVIDERS and self.role in VALID_ROLES
 
 
 def _parse_router_response(raw: str) -> RouterDecision:
-    """Extract a :class:`RouterDecision` from the model's raw text output."""
+    """Extract a :class:`RouterDecision` from the model's raw text output.
+
+    Accepts both the new ``provider``/``role`` format and the legacy
+    ``decision`` format, so old prompt templates continue to work.
+    """
     data: dict[str, Any] = extract_json(raw)
 
-    decision = str(data.get("decision", "")).upper()
-    if decision not in VALID_DECISIONS:
-        raise LlamaCppClientError(
-            f"Router returned unknown decision {decision!r}. Raw: {raw[:300]!r}"
-        )
+    # ── New format: provider + role ───────────────────────────────────────
+    provider_raw = str(data.get("provider", "")).lower()
+    role_raw = str(data.get("role", "")).lower()
+
+    # ── Legacy format: decision ───────────────────────────────────────────
+    decision_raw = str(data.get("decision", "")).upper()
+
+    if provider_raw and provider_raw in VALID_PROVIDERS:
+        provider = provider_raw
+    elif decision_raw in VALID_DECISIONS:
+        provider = _DECISION_TO_PROVIDER[decision_raw]
+    else:
+        # Accept unknown decision token if provider is known.
+        if decision_raw and decision_raw not in VALID_DECISIONS:
+            raise LlamaCppClientError(
+                f"Router returned unknown decision {decision_raw!r}. Raw: {raw[:300]!r}"
+            )
+        provider = "local"
+
+    if role_raw and role_raw in VALID_ROLES:
+        role = role_raw
+    else:
+        # Default role based on provider: if delegating externally, use developer.
+        role = "developer"
+
+    # Derive legacy decision from provider for backward compat.
+    decision = decision_raw if decision_raw in VALID_DECISIONS else _PROVIDER_TO_DECISION.get(provider, "SELF")
 
     return RouterDecision(
+        provider=provider,
+        role=role,
         decision=decision,
         confidence=float(data.get("confidence", 0.0)),
         reasoning=str(data.get("reasoning", "")),
@@ -58,7 +137,13 @@ def _parse_router_response(raw: str) -> RouterDecision:
 
 
 class LlamaRouter:
-    """Uses Llama 2 13B to route tasks to the appropriate execution provider.
+    """Routes tasks to the appropriate execution provider using a local model.
+
+    The local model server endpoint is configured via the ``LLAMA_CPP_BASE_URL``
+    environment variable (default: ``http://127.0.0.1:8080/v1``).  The model
+    itself is configured via ``LLAMA_CPP_MODEL`` (default: ``local-model``).
+    This makes the router server/model-agnostic: swap GGUF files or switch to
+    a different llama.cpp build without changing orchestration code.
 
     Parameters
     ----------
@@ -85,12 +170,13 @@ class LlamaRouter:
             _ensure_router_tables(db)
 
     async def route(self, task: str) -> RouterDecision:
-        """Ask Llama 2 to decide how to handle *task*.
+        """Ask the local model to decide how to handle *task*.
 
         Returns
         -------
         RouterDecision
-            The routing decision with metadata.
+            The routing decision with metadata, including the new ``provider``
+            and ``role`` fields and the legacy ``decision`` token.
 
         Raises
         ------
@@ -124,7 +210,11 @@ class LlamaRouter:
 # ── SQLite helpers ────────────────────────────────────────────────────────────
 
 def _ensure_router_tables(conn: sqlite3.Connection) -> None:
-    """Create the router_decisions table if it does not exist."""
+    """Create the router_decisions table if it does not exist.
+
+    The ``provider`` and ``role`` columns are added additively if the table
+    already exists from an earlier schema version.
+    """
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS router_decisions (
@@ -132,6 +222,8 @@ def _ensure_router_tables(conn: sqlite3.Connection) -> None:
             timestamp TEXT NOT NULL,
             task TEXT NOT NULL,
             decision TEXT NOT NULL,
+            provider TEXT NULL,
+            role TEXT NULL,
             confidence REAL NOT NULL,
             reasoning TEXT NOT NULL,
             consult_query TEXT NULL,
@@ -143,8 +235,15 @@ def _ensure_router_tables(conn: sqlite3.Connection) -> None:
             ON router_decisions(timestamp);
         CREATE INDEX IF NOT EXISTS idx_router_decisions_decision
             ON router_decisions(decision);
+        CREATE INDEX IF NOT EXISTS idx_router_decisions_provider
+            ON router_decisions(provider);
         """
     )
+    # Additive migration: add provider/role if missing (older schema).
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(router_decisions)")}
+    for col, coltype in [("provider", "TEXT"), ("role", "TEXT")]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE router_decisions ADD COLUMN {col} {coltype} NULL")
     conn.commit()
 
 
@@ -155,14 +254,16 @@ def _persist_decision(
     conn.execute(
         """
         INSERT INTO router_decisions
-            (timestamp, task, decision, confidence, reasoning,
+            (timestamp, task, decision, provider, role, confidence, reasoning,
              consult_query, sub_tasks_json, raw_response)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
             task,
             decision.decision,
+            decision.provider,
+            decision.role,
             decision.confidence,
             decision.reasoning,
             decision.consult_query or None,
