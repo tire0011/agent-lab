@@ -220,6 +220,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_operations_audit(conn)
     _migrate_operation_chains(conn)
     _migrate_operation_log(conn)
+    _migrate_router_tables(conn)
     conn.commit()
     return conn
 
@@ -474,6 +475,87 @@ def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE operation_chains ADD COLUMN {column_name} {column_type}"
             )
+
+
+def _migrate_router_tables(conn: sqlite3.Connection) -> None:
+    """Create router_decisions, provider_usage, and model_consultations tables."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS router_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            task TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            provider TEXT NULL,
+            role TEXT NULL,
+            confidence REAL NOT NULL,
+            reasoning TEXT NOT NULL,
+            consult_query TEXT NULL,
+            sub_tasks_json TEXT NULL,
+            raw_response TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_router_decisions_timestamp
+            ON router_decisions(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_router_decisions_decision
+            ON router_decisions(decision);
+        CREATE INDEX IF NOT EXISTS idx_router_decisions_provider
+            ON router_decisions(provider);
+
+        CREATE TABLE IF NOT EXISTS provider_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            task TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_actually_used TEXT NULL,
+            sub_task TEXT NOT NULL,
+            summary TEXT NULL,
+            input_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            runtime_ms INTEGER NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provider_usage_timestamp
+            ON provider_usage(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_provider_usage_provider
+            ON provider_usage(provider);
+        CREATE INDEX IF NOT EXISTS idx_provider_usage_provider_actually_used
+            ON provider_usage(provider_actually_used);
+
+        CREATE TABLE IF NOT EXISTS model_consultations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            parent_task TEXT NOT NULL,
+            query TEXT NOT NULL,
+            reply TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_model_consultations_timestamp
+            ON model_consultations(timestamp);
+        """
+    )
+    # Additive migrations for existing databases.
+    _migrate_router_decisions_columns(conn)
+    _migrate_provider_usage_columns(conn)
+
+
+def _migrate_router_decisions_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(router_decisions)")}
+    for col, coltype in [("provider", "TEXT"), ("role", "TEXT")]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE router_decisions ADD COLUMN {col} {coltype} NULL")
+
+
+def _migrate_provider_usage_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(provider_usage)")}
+    for col, coltype in [
+        ("provider_actually_used", "TEXT"),
+        ("input_tokens", "INTEGER"),
+        ("output_tokens", "INTEGER"),
+        ("runtime_ms", "INTEGER"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE provider_usage ADD COLUMN {col} {coltype} NULL")
 
 
 def get_applicable_price(

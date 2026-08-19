@@ -536,6 +536,35 @@ class OperationChainResult(BaseModel):
     rejection_reason: str | None = None
 
 
+# ── Maintenance API models ────────────────────────────────────────────────────
+
+class MaintenanceExecuteRequest(BaseModel):
+    operation: str
+    args: dict = Field(default_factory=dict)
+
+
+class MaintenanceExecuteResponse(BaseModel):
+    operation: str
+    result: dict
+
+
+class MaintenanceAuditEntry(BaseModel):
+    timestamp: str
+    operation: str
+    args: dict
+    outcome: str
+
+
+class MaintenanceAuditResponse(BaseModel):
+    entries: list[MaintenanceAuditEntry]
+    total: int
+
+
+class MaintenanceStatusResponse(BaseModel):
+    enabled: bool
+    expiry: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Self-Healing / Operations Executor models
 # ---------------------------------------------------------------------------

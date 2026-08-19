@@ -149,6 +149,21 @@ Review deliberately tightened the safety boundary before adoption:
 
 A separate measurement decision remains open: re-run an early simple webpage-change experiment with the newer pipeline and compare quality, total tokens, runtime, and estimated cost against the historical baseline. No measured result is recorded yet.
 
+### 17. 2026-08-17 to 2026-08-18: local-first routing and broader operational autonomy under review
+
+A stronger architectural direction emerged from repeated concern that external provider quotas and token budgets can become the limiting resource for continuous operation. The preferred direction is now to keep a local model available on the VM even when it is relatively slow, use it for small/medium tasks, context gathering, routing, and role changes, and delegate only work that clearly needs a stronger external model.
+
+The desired execution model remains deliberately sequential rather than a large concurrent multi-agent system: one active model/agent at a time, with prompt-defined roles such as router, planner, developer, or tester. This keeps RAM, token use, concurrency, and causal debugging bounded while still allowing specialization.
+
+Two draft pull requests prototype parts of this direction but are **not yet adopted on `main`**:
+
+- PR #21 proposes a local-model routing/orchestration layer with persisted routing/provider-usage decisions and a sequential route -> plan -> develop -> test flow. Its concrete Llama 2 13B choice should be treated as an implementation experiment, not as a settled model decision.
+- PR #22 proposes authenticated operational/self-healing capabilities for Git, services, logs, diagnosis, model testing, and configuration, with explicit allowlists, path validation, redaction, and operation logging. This explores whether Nexus can safely perform more of its own routine operation and recovery work.
+
+The durable design lesson is to separate **capability architecture** from **specific model choice**: Nexus benefits from an always-available local decision layer and measured provider routing even if the best local model changes frequently.
+
+A measurement decision was also made to re-run the earliest simple webpage-change experiment using the newer pipeline and compare it with the original baseline. This is intended to provide a concrete before/after check on whether the many orchestration changes improved cost, token use, runtime, and quality. No new measured result is recorded here yet.
+
 ## What Nexus currently learns
 
 Nexus already accumulates durable information from:
