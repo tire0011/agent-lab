@@ -25,10 +25,11 @@ MODEL_DIR="${LOCAL_MODEL_PATH:-/opt/local-models}"
 MODEL_FILE="${MODEL_FILE:-qwen2.5-coder-7b-instruct-q4_k_m.gguf}"
 MODEL_FULL_PATH="${MODEL_FULL_PATH:-${MODEL_DIR}/${MODEL_FILE}}"
 
-SERVICE_USER="${LOCAL_MODEL_SERVICE_USER:-ubuntu}"
+# Nexus services on the VM run as the dedicated agent user by default.
+SERVICE_USER="${LOCAL_MODEL_SERVICE_USER:-agent}"
 
-# B2ms has 4 vCPU — use all of them.
-N_THREADS="${LOCAL_MODEL_THREADS:-4}"
+# Standard_B2ms has 2 vCPUs; use a conservative default of 2 threads.
+N_THREADS="${LOCAL_MODEL_THREADS:-2}"
 # Context window (tokens).  8192 is conservative for a 7B Q4_K_M on 8 GB RAM.
 CTX_SIZE="${LOCAL_MODEL_CONTEXT:-8192}"
 # Server port (OpenAI-compatible API).
@@ -101,4 +102,3 @@ echo "$LOG_PREFIX ✅ Systemd service '$SERVICE_NAME' installed and started  $(d
 echo "$LOG_PREFIX Check status : systemctl status $SERVICE_NAME"
 echo "$LOG_PREFIX Follow logs  : journalctl -u $SERVICE_NAME -f"
 echo "$LOG_PREFIX API base URL : http://127.0.0.1:${SERVER_PORT}/v1"
-
