@@ -51,10 +51,12 @@ from models import (
     ExperimentLogEntry,
     ExperimentLogsResponse,
     ExperimentsResponse,
+    GitCommitPushRequest,
     HealthResponse,
     Idea,
     IdeaCreateRequest,
     IdeasResponse,
+    LlamaModelTestRequest,
     MailboxMessageEntry,
     MailboxMessagesResponse,
     MaintenanceAuditResponse,
@@ -62,6 +64,7 @@ from models import (
     MaintenanceExecuteResponse,
     MaintenanceStatusResponse,
     OperationCatalogEntry,
+    OperationResponse,
     OperationsCatalogResponse,
     OperationsExecuteRequest,
     OperationsExecuteResponse,
@@ -79,8 +82,11 @@ from models import (
     ProblemsResponse,
     PublicActivityResponse,
     PublicExperimentSummary,
+    ServiceRestartRequest,
+    SetConfigRequest,
     StatusResponse,
 )
+from modules.operations_executor import OperationsExecutor
 from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
 from modules.redaction import sanitized_reason as _sanitized_reason
 from modules import experiment_logger as experiment_logger_module
@@ -220,6 +226,12 @@ def _resolve_operation_chain_service() -> OperationChainService:
     if override is not None:
         return override()
     return get_operation_chain_service()
+
+
+@lru_cache(maxsize=1)
+def get_operations_executor() -> OperationsExecutor:
+    """Singleton OperationsExecutor for the process."""
+    return OperationsExecutor()
 
 
 @asynccontextmanager
@@ -1308,3 +1320,211 @@ def get_maintenance_audit(
         ],
         total=len(entries),
     )
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _op_response(result, operation: str) -> OperationResponse:
+    from modules.operations_executor import OperationResult
+    return OperationResponse(
+        success=result.success,
+        status=result.status,
+        operation=operation,
+        timestamp=result.timestamp,
+        data=result.data,
+        error=result.error,
+        duration_ms=result.duration_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Git Operations  (/operations/git/*)
+# ---------------------------------------------------------------------------
+
+@app.post("/operations/git/pull", response_model=OperationResponse)
+async def operations_git_pull(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("git/pull", {})
+    return _op_response(result, "git/pull")
+
+
+@app.get("/operations/git/status", response_model=OperationResponse)
+async def operations_git_status(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("git/status", {})
+    return _op_response(result, "git/status")
+
+
+@app.post("/operations/git/commit-and-push", response_model=OperationResponse)
+async def operations_git_commit_push(
+    request: GitCommitPushRequest,
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute(
+        "git/commit-and-push",
+        {"message": request.message, "files": request.files},
+    )
+    return _op_response(result, "git/commit-and-push")
+
+
+# ---------------------------------------------------------------------------
+# Service Management  (/operations/services/*)
+# ---------------------------------------------------------------------------
+
+@app.post("/operations/services/restart", response_model=OperationResponse)
+async def operations_services_restart(
+    request: ServiceRestartRequest,
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("services/restart", {"service": request.service})
+    return _op_response(result, "services/restart")
+
+
+@app.get("/operations/services/status", response_model=OperationResponse)
+async def operations_services_status(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("services/status", {})
+    return _op_response(result, "services/status")
+
+
+@app.post("/operations/services/llama/reload-model", response_model=OperationResponse)
+async def operations_llama_reload_model(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("services/llama/reload-model", {})
+    return _op_response(result, "services/llama/reload-model")
+
+
+# ---------------------------------------------------------------------------
+# Logging  (/operations/logs/*)
+# ---------------------------------------------------------------------------
+
+@app.get("/operations/logs/tail", response_model=OperationResponse)
+async def operations_logs_tail(
+    service: str = Query(...),
+    lines: int = Query(default=50, ge=1, le=500),
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("logs/tail", {"service": service, "lines": lines})
+    return _op_response(result, "logs/tail")
+
+
+@app.get("/operations/logs/errors", response_model=OperationResponse)
+async def operations_logs_errors(
+    service: str = Query(...),
+    since_minutes: int = Query(default=60, ge=1, le=1440),
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute(
+        "logs/errors", {"service": service, "since_minutes": since_minutes}
+    )
+    return _op_response(result, "logs/errors")
+
+
+# ---------------------------------------------------------------------------
+# Self-Healing  (/operations/healing/*)
+# ---------------------------------------------------------------------------
+
+@app.post("/operations/healing/fix-locks", response_model=OperationResponse)
+async def operations_healing_fix_locks(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("healing/fix-locks", {})
+    return _op_response(result, "healing/fix-locks")
+
+
+@app.post("/operations/healing/cleanup-temps", response_model=OperationResponse)
+async def operations_healing_cleanup_temps(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("healing/cleanup-temps", {})
+    return _op_response(result, "healing/cleanup-temps")
+
+
+@app.get("/operations/healing/diagnose", response_model=OperationResponse)
+async def operations_healing_diagnose(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("healing/diagnose", {})
+    return _op_response(result, "healing/diagnose")
+
+
+# ---------------------------------------------------------------------------
+# Model Management  (/operations/models/*)
+# ---------------------------------------------------------------------------
+
+@app.get("/operations/models/status", response_model=OperationResponse)
+async def operations_models_status(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("models/status", {})
+    return _op_response(result, "models/status")
+
+
+@app.post("/operations/models/test", response_model=OperationResponse)
+async def operations_models_test(
+    request: LlamaModelTestRequest,
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute(
+        "models/test", {"model": request.model, "prompt": request.prompt}
+    )
+    return _op_response(result, "models/test")
+
+
+# ---------------------------------------------------------------------------
+# Context / Config  (/operations/context/*)
+# ---------------------------------------------------------------------------
+
+@app.get("/operations/context/env", response_model=OperationResponse)
+async def operations_context_env(
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute("context/env", {})
+    return _op_response(result, "context/env")
+
+
+@app.post("/operations/context/set-config", response_model=OperationResponse)
+async def operations_context_set_config(
+    request: SetConfigRequest,
+    x_api_key: str | None = Header(default=None),
+    executor: OperationsExecutor = Depends(get_operations_executor),
+) -> OperationResponse:
+    authorize(x_api_key)
+    result = await executor.execute(
+        "context/set-config", {"key": request.key, "value": request.value}
+    )
+    return _op_response(result, "context/set-config")

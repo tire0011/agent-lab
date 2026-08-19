@@ -219,6 +219,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_experiment_adoptions(conn)
     _migrate_operations_audit(conn)
     _migrate_operation_chains(conn)
+    _migrate_operation_log(conn)
     _migrate_router_tables(conn)
     conn.commit()
     return conn
@@ -774,3 +775,27 @@ def list_activity(
         }
         for row in rows
     ]
+
+
+def _migrate_operation_log(conn: sqlite3.Connection) -> None:
+    """Create operation_log table (idempotent additive migration)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS operation_log (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            parameters TEXT,
+            success INTEGER NOT NULL CHECK (success IN (0, 1)),
+            result TEXT,
+            error TEXT,
+            duration_ms INTEGER,
+            executor TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_operation_log_timestamp
+            ON operation_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_operation_log_operation
+            ON operation_log(operation);
+        """
+    )
