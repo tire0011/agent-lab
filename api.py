@@ -96,9 +96,11 @@ from modules.maintenance_service import (
     MaintenanceOperationError,
     MaintenanceService,
 )
+from nexus_mcp import create_mcp_mount
 
 _PROCESS_START_TIME = time.time()
 _logger = logging.getLogger(__name__)
+_MCP_MOUNT = create_mcp_mount()
 
 
 
@@ -236,50 +238,55 @@ def get_operations_executor() -> OperationsExecutor:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
-    # Never restarts execution and never starts a Codex process.
-    _resolve_codex_service().mark_interrupted_tasks_failed()
-    mts = _resolve_mailbox_task_service()
-    mts.recover_after_restart()
-    _resolve_experiment_adoption_service().recover_after_restart()
-    _resolve_operation_chain_service().recover_after_restart()
+    async with _MCP_MOUNT.lifespan():
+        # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
+        # Never restarts execution and never starts a Codex process.
+        _resolve_codex_service().mark_interrupted_tasks_failed()
+        mts = _resolve_mailbox_task_service()
+        mts.recover_after_restart()
+        _resolve_experiment_adoption_service().recover_after_restart()
+        _resolve_operation_chain_service().recover_after_restart()
 
-    # Best-effort outbox recovery: publish any un-pushed outbox records from
-    # a previous crash.  Both publishers share the same MailboxConfig / DB.
-    # Each publisher is fully wrapped so that a constructor *or* close failure
-    # never skips the next publisher and never aborts the API startup.
-    # exc_info is intentionally omitted: raw tracebacks can expose paths /
-    # tokens; the redacted message is sufficient for diagnosis.
-    _mc = MailboxConfig.from_env()
-    for _pub_cls in (OperationChainOutboxPublisher, TaskApprovalOutboxPublisher):
-        _cls_name = getattr(_pub_cls, "__name__", repr(_pub_cls))
-        _pub = None
+        # Best-effort outbox recovery: publish any un-pushed outbox records from
+        # a previous crash.  Both publishers share the same MailboxConfig / DB.
+        # Each publisher is fully wrapped so that a constructor *or* close failure
+        # never skips the next publisher and never aborts the API startup.
+        # exc_info is intentionally omitted: raw tracebacks can expose paths /
+        # tokens; the redacted message is sufficient for diagnosis.
+        _mc = MailboxConfig.from_env()
+        for _pub_cls in (OperationChainOutboxPublisher, TaskApprovalOutboxPublisher):
+            _cls_name = getattr(_pub_cls, "__name__", repr(_pub_cls))
+            _pub = None
+            try:
+                _pub = _pub_cls(mailbox_config=_mc)
+                _pub.publish_pending()
+            except Exception as _exc:
+                _logger.warning(
+                    "Startup outbox recovery failed for %s: %s",
+                    _cls_name,
+                    _sanitized_reason(str(_exc)),
+                )
+            finally:
+                if _pub is not None:
+                    try:
+                        _pub.close()
+                    except Exception as _close_exc:
+                        _logger.warning(
+                            "Startup outbox close failed for %s: %s",
+                            _cls_name,
+                            _sanitized_reason(str(_close_exc)),
+                        )
+
+        worker = MailboxTaskWorker(mts)
+        worker.start()
         try:
-            _pub = _pub_cls(mailbox_config=_mc)
-            _pub.publish_pending()
-        except Exception as _exc:
-            _logger.warning(
-                "Startup outbox recovery failed for %s: %s",
-                _cls_name,
-                _sanitized_reason(str(_exc)),
-            )
+            yield
         finally:
-            if _pub is not None:
-                try:
-                    _pub.close()
-                except Exception as _close_exc:
-                    _logger.warning(
-                        "Startup outbox close failed for %s: %s",
-                        _cls_name,
-                        _sanitized_reason(str(_close_exc)),
-                    )
-
-    worker = MailboxTaskWorker(mts)
-    worker.start()
-    yield
+            worker.stop()
 
 
 app = FastAPI(lifespan=lifespan)
+app.mount("/mcp", _MCP_MOUNT)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

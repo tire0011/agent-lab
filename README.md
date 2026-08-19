@@ -109,6 +109,61 @@ CLI runner):
 - Optional for GitHub mailbox webhook: `AGENT_GITHUB_WEBHOOK_SECRET=<value>`
 - Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests -q`
 
+## MCP endpoint quick start
+
+The FastAPI service also mounts a read-only MCP HTTP endpoint for Nexus at
+`/mcp/`.
+
+- Start it with the normal API server:
+  - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
+  - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000`
+- MCP URL: `http://127.0.0.1:8000/mcp/`
+- Authentication: send the same `x-api-key: <AGENT_API_KEY>` header used by
+  `/secure-health`, `/experiments`, `/codex/tasks*`, and related authenticated
+  API routes.
+
+Available MCP tools mirror the current **read-only** Nexus API surface:
+
+- `health`, `secure_health`, `status`, `problems`, `ideas`, `chat`
+- `codex_tasks_list`, `codex_task_get`
+- `mailbox_tasks_list`, `mailbox_task_get`, `mailbox_messages_list`
+- `experiments_list`, `experiment_get`, `experiment_logs`,
+  `experiment_adoption_get`, `experiment_public_get`
+- `activity_public_list`, `activity_list`, `diagnostics_public_get`
+- `operations_catalog_get`, `operation_chains_list`, `operation_chain_get`
+- `maintenance_status_get`, `maintenance_audit_get`
+
+Intentionally **not** exposed over MCP in this task:
+
+- all write endpoints (`POST /ideas`, task approval/rejection, experiment
+  adoption, operation-chain creation, etc.)
+- shell-backed `/operations/*` execution endpoints
+- webhook endpoints
+
+Example remote MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "nexus": {
+      "type": "streamable-http",
+      "url": "https://agent-lab.example.com/mcp/",
+      "headers": {
+        "x-api-key": "${AGENT_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- The endpoint returns compact structured tool results to reduce token usage.
+- Experiment logs stay bounded through the existing `limit` parameter exposed by
+  the `experiment_logs` MCP tool.
+- The trailing slash in `/mcp/` is part of the endpoint URL and should be kept
+  in client configuration.
+
 ## Adding ideas
 
 `POST /ideas` (authenticated with `x-api-key`, same as `/secure-health` and

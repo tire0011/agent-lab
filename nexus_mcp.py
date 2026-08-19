@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from mcp.server import MCPServer
+
+from models import ChatRequest
+
+
+def _api():
+    import api as nexus_api
+
+    return nexus_api
+
+
+def _internal_api_key() -> str:
+    nexus_api = _api()
+    return getattr(nexus_api, "API_KEY", os.environ["AGENT_API_KEY"])
+
+
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "to_dict"):
+        return _jsonable(value.to_dict())
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _call_api(route, /, *args: Any, **kwargs: Any) -> Any:
+    try:
+        return _jsonable(route(*args, **kwargs))
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        raise ValueError(f"{exc.status_code}: {detail}") from exc
+
+
+@dataclass
+class NexusMcpMount:
+    app: FastAPI | None = field(default=None, init=False)
+
+    @asynccontextmanager
+    async def lifespan(self):
+        app, session_manager = _build_mount_app()
+        self.app = app
+        async with session_manager.run():
+            yield
+        self.app = None
+
+    async def __call__(self, scope, receive, send):
+        if self.app is None:
+            raise RuntimeError("MCP app not initialized")
+        await self.app(scope, receive, send)
+
+
+def _build_mount_app() -> tuple[FastAPI, Any]:
+    mcp = MCPServer(
+        name="nexus",
+        title="Nexus MCP Adapter",
+        description=(
+            "Read-only MCP adapter for Nexus. Reuses the existing Nexus API and services, "
+            "returns compact structured responses, and excludes write/shell operations."
+        ),
+        instructions=(
+            "Use the read-only tools to inspect Nexus status, mailbox, experiments, activity, "
+            "diagnostics, Codex task records, and maintenance state. No write tools are exposed."
+        ),
+        version="1.0.0",
+    )
+
+    @mcp.tool(description="GET /health", structured_output=True)
+    def health() -> dict[str, Any]:
+        return _call_api(_api().health)
+
+    @mcp.tool(description="GET /secure-health", structured_output=True)
+    def secure_health() -> dict[str, Any]:
+        return _call_api(_api().secure_health, x_api_key=_internal_api_key())
+
+    @mcp.tool(description="GET /status", structured_output=True)
+    def status() -> dict[str, Any]:
+        return _call_api(_api().status)
+
+    @mcp.tool(description="GET /problems", structured_output=True)
+    def problems() -> dict[str, Any]:
+        return _call_api(_api().problems)
+
+    @mcp.tool(description="GET /ideas", structured_output=True)
+    def ideas() -> dict[str, Any]:
+        return _call_api(_api().ideas)
+
+    @mcp.tool(description="POST /chat (read-only)", structured_output=True)
+    def chat(message: str) -> dict[str, Any]:
+        return _call_api(_api().chat, ChatRequest(message=message))
+
+    @mcp.tool(description="GET /codex/tasks", structured_output=True)
+    def codex_tasks_list(limit: int = 20) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.list_codex_tasks,
+            x_api_key=_internal_api_key(),
+            limit=limit,
+            service=nexus_api._resolve_codex_service(),
+        )
+
+    @mcp.tool(description="GET /codex/tasks/{task_id}", structured_output=True)
+    def codex_task_get(task_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_codex_task,
+            task_id=task_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_codex_service(),
+        )
+
+    @mcp.tool(description="GET /mailbox/tasks", structured_output=True)
+    def mailbox_tasks_list(limit: int = 20) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.list_mailbox_tasks,
+            x_api_key=_internal_api_key(),
+            limit=limit,
+            service=nexus_api._resolve_mailbox_task_service(),
+        )
+
+    @mcp.tool(description="GET /mailbox/tasks/{approval_id}", structured_output=True)
+    def mailbox_task_get(approval_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_mailbox_task,
+            approval_id=approval_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_mailbox_task_service(),
+        )
+
+    @mcp.tool(description="GET /mailbox/messages", structured_output=True)
+    def mailbox_messages_list(limit: int = 20) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.list_mailbox_messages,
+            limit=limit,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /experiments", structured_output=True)
+    def experiments_list(limit: int = 20) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.list_experiments,
+            x_api_key=_internal_api_key(),
+            limit=limit,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /experiments/{experiment_id}", structured_output=True)
+    def experiment_get(experiment_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_experiment,
+            experiment_id=experiment_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
+    def experiment_logs(
+        experiment_id: str,
+        limit: int = 500,
+        level: str | None = None,
+        phase: str | None = None,
+    ) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_experiment_logs,
+            experiment_id=experiment_id,
+            x_api_key=_internal_api_key(),
+            level=level,
+            phase=phase,
+            limit=limit,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /experiments/{experiment_id}/adoption", structured_output=True)
+    def experiment_adoption_get(experiment_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_experiment_adoption,
+            experiment_id=experiment_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_experiment_service(),
+            adoption_service=nexus_api._resolve_experiment_adoption_service(),
+        )
+
+    @mcp.tool(description="GET /experiments/{experiment_id}/public", structured_output=True)
+    def experiment_public_get(experiment_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_public_experiment,
+            experiment_id=experiment_id,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /activity/public", structured_output=True)
+    def activity_public_list() -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.list_public_activity,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /activity", structured_output=True)
+    def activity_list(
+        limit: int = 50,
+        experiment_id: str | None = None,
+        mailbox_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.list_activity,
+            x_api_key=_internal_api_key(),
+            limit=limit,
+            experiment_id=experiment_id,
+            mailbox_task_id=mailbox_task_id,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /diagnostics/public", structured_output=True)
+    def diagnostics_public_get(limit: int = 10) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_public_diagnostics,
+            limit=limit,
+            service=nexus_api._resolve_experiment_service(),
+            mailbox_service=nexus_api._resolve_mailbox_task_service(),
+        )
+
+    @mcp.tool(description="GET /operations/catalog", structured_output=True)
+    def operations_catalog_get() -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_operations_catalog,
+            x_api_key=_internal_api_key(),
+            operations_service=nexus_api._resolve_operations_service(),
+        )
+
+    @mcp.tool(description="GET /operations/chains", structured_output=True)
+    def operation_chains_list(limit: int = 20) -> list[dict[str, Any]]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.list_operation_chains,
+            limit=limit,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_operation_chain_service(),
+        )
+
+    @mcp.tool(description="GET /operations/chains/{request_id}", structured_output=True)
+    def operation_chain_get(request_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_operation_chain,
+            request_id=request_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_operation_chain_service(),
+        )
+
+    @mcp.tool(description="GET /maintenance/status", structured_output=True)
+    def maintenance_status_get() -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_maintenance_status,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_maintenance_service(),
+        )
+
+    @mcp.tool(description="GET /maintenance/audit", structured_output=True)
+    def maintenance_audit_get() -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_maintenance_audit,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_maintenance_service(),
+        )
+
+    subapp = FastAPI()
+
+    @subapp.middleware("http")
+    async def require_api_key(request: Request, call_next):
+        if request.headers.get("x-api-key") != _internal_api_key():
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        return await call_next(request)
+
+    mcp_http_app = mcp.streamable_http_app(
+        streamable_http_path="/",
+        json_response=True,
+        stateless_http=True,
+        host="0.0.0.0",
+    )
+    subapp.mount("", mcp_http_app)
+    return subapp, mcp.session_manager
+
+
+def create_mcp_mount() -> NexusMcpMount:
+    return NexusMcpMount()
