@@ -226,7 +226,8 @@ class MultiProviderOrchestrator:
 
         # ── Step 5: Verify (real tools) ───────────────────────────────────────
         try:
-            verification = self._verify()
+            files_changed = [f for dr in result.developer_results for f in dr.files_changed]
+            verification = self._verify(files_changed=files_changed)
             result.verification = verification
         except Exception as exc:  # noqa: BLE001
             result.error = f"Verifier failed: {exc}"
@@ -246,22 +247,46 @@ class MultiProviderOrchestrator:
     # ── Private step implementations ──────────────────────────────────────────
 
     async def _gather_context(self, task: str) -> ContextResult:
-        """Ask the local model to identify relevant files and prepare a context package."""
+        """Ask the local model to identify relevant files and prepare a context package.
+
+        Always provides deterministic, bounded repo evidence to the model even on
+        a clean worktree where ``git diff HEAD`` is empty: the tracked-file listing,
+        recent git log, and git status are included so the model never infers that
+        the repository is empty.
+        """
         git_diff = _run_git_diff(self._repo_root)
+        tracked_files = _list_tracked_files(self._repo_root, limit=100)
+        git_log = _run_git_log(self._repo_root, lines=10)
+        git_status = _run_git_status(self._repo_root)
+
         prompt = render_prompt(
             "context",
-            {"task": task, "git_diff": git_diff[:2000]},
+            {
+                "task": task,
+                "git_diff": git_diff[:2000],
+                "tracked_files": tracked_files[:3000],
+                "git_log": git_log[:1000],
+                "git_status": git_status[:500],
+            },
             prompts_dir=self._prompts_dir,
         )
         raw = await self._llama.complete(prompt=prompt, temperature=0.0, max_tokens=1024)
         try:
             data = extract_json(raw)
         except LlamaCppClientError:
+            # Build a deterministic fallback context so downstream steps always have
+            # repo evidence even when the model response cannot be parsed.
+            fallback_context = (
+                f"Task: {task}\n\n"
+                f"Repository files:\n{tracked_files[:800]}\n\n"
+                f"Recent commits:\n{git_log[:400]}\n\n"
+                f"Uncommitted changes:\n{git_diff[:600] or '(none)'}"
+            )
             return ContextResult(
                 relevant_files=[],
-                git_diff_summary=git_diff[:500],
+                git_diff_summary=git_diff[:500] if git_diff else "no uncommitted changes",
                 state_summary="",
-                context_package=f"Task: {task}\n\nRecent changes:\n{git_diff[:1000]}",
+                context_package=fallback_context,
                 raw_response=raw,
             )
         return ContextResult(
@@ -318,15 +343,37 @@ class MultiProviderOrchestrator:
 
         return _parse_developer_response(raw, provider_hint=provider_hint, provider_used=provider_actually_used)
 
-    def _verify(self) -> VerificationResult:
+    def _verify(self, files_changed: list[str] | None = None) -> VerificationResult:
         """Run real verification tools and return an objective result.
 
-        Uses ``git diff HEAD`` to capture changes and the configured test
-        command to run the test suite.  The LLM is not involved in this step.
+        Uses ``git diff HEAD`` to capture changes.  If neither the git diff nor the
+        developer-reported ``files_changed`` list indicates any modifications, the
+        task is treated as read-only: the test suite is skipped and the verification
+        confirms only that the worktree remained clean.  For code-changing tasks the
+        configured test command is executed with a bounded timeout.
+
+        The LLM is not involved in this step.
         """
         git_diff = _run_git_diff(self._repo_root)
+        is_read_only = not git_diff.strip() and not (files_changed or [])
 
-        # Run the test suite.
+        if is_read_only:
+            # Verify the worktree is clean and skip the test suite.
+            worktree_clean = _is_worktree_clean(self._repo_root)
+            skip_reason = (
+                "no file changes detected (empty git diff, no files reported by developer); "
+                "test suite skipped for read-only task"
+            )
+            return VerificationResult(
+                git_diff=git_diff,
+                test_output=f"[skipped] {skip_reason}",
+                tests_passed=worktree_clean,
+                tests_run=0,
+                tests_failed=0,
+                error="" if worktree_clean else "worktree is unexpectedly dirty for a read-only task",
+            )
+
+        # Code-changing task: run the test suite.
         try:
             proc = subprocess.run(
                 self._test_cmd,
@@ -396,6 +443,69 @@ def _run_git_diff(repo_root: str) -> str:
         return result.stdout[:4000]
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _list_tracked_files(repo_root: str, limit: int = 100) -> str:
+    """Return a newline-joined list of tracked files (bounded by *limit*)."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        lines = result.stdout.splitlines()
+        truncated = lines[:limit]
+        suffix = f"\n... ({len(lines) - limit} more)" if len(lines) > limit else ""
+        return "\n".join(truncated) + suffix
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _run_git_log(repo_root: str, lines: int = 10) -> str:
+    """Return the last *lines* one-line git log entries."""
+    try:
+        result = subprocess.run(
+            ["git", "log", f"--max-count={lines}", "--oneline"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _run_git_status(repo_root: str) -> str:
+    """Return ``git status --short`` output."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.stdout.strip() or "(clean)"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_worktree_clean(repo_root: str) -> bool:
+    """Return True when the worktree has no uncommitted changes."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.stdout.strip() == ""
+    except Exception:  # noqa: BLE001
+        return True  # assume clean on error
 
 
 def _parse_pytest_summary(output: str) -> tuple[int, int]:

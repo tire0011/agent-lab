@@ -186,3 +186,89 @@ If agent/API behavior regresses:
 3. Confirm env var presence and endpoint credentials.
 4. Re-run minimal known-good task.
 5. Log findings in `IDEAS.md`/`DECISIONS.md` before broad changes.
+
+## Maintenance API (temporary remote-maintenance bridge)
+
+The maintenance API provides a fixed set of named operations for remote VM
+maintenance without keeping SSH open.  **It is disabled by default** and must
+be explicitly enabled for each maintenance window.
+
+### Enabling the maintenance window
+
+Add to `/etc/agent-lab/agent.env` (or export before starting the API):
+
+```bash
+MAINTENANCE_ENABLED=true
+MAINTENANCE_TOKEN=<random-long-token>           # second auth factor
+MAINTENANCE_EXPIRY=2026-08-20T22:00:00Z        # auto-disable after this UTC time
+```
+
+Reload the service:
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart agent-api
+```
+
+### Disabling after use
+
+Remove or unset `MAINTENANCE_ENABLED` and `MAINTENANCE_TOKEN`, then reload:
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart agent-api
+```
+
+### Authentication
+
+All `/maintenance/*` endpoints require **both**:
+- `X-Api-Key: <AGENT_API_KEY>` (normal API key)
+- `X-Maintenance-Token: <MAINTENANCE_TOKEN>` (second factor, only for `/maintenance/execute`)
+
+`/maintenance/status` and `/maintenance/audit` need only `X-Api-Key`.
+
+### Available operations
+
+| Operation           | Required args              | Description                                      |
+|---------------------|---------------------------|--------------------------------------------------|
+| git_pull            | —                         | `git pull` in the repo root                      |
+| git_status          | —                         | `git status --short`                             |
+| git_log             | `lines` (1–50, default 10)| Recent one-line git log                          |
+| run_router_test     | `prompt` (required)       | Start `agent.py --use-router <prompt>` in bg     |
+| router_task_status  | `task_id`                 | Status of a background router test task          |
+| router_task_result  | `task_id`                 | Output of a completed router test task           |
+| run_tests           | —                         | Run the repo test suite in background            |
+| test_task_status    | `task_id`                 | Status of a background test run                  |
+| test_task_result    | `task_id`                 | Output of a completed test run                   |
+| local_model_status  | —                         | `GET /v1/models` against local llama-server      |
+| local_model_test    | `prompt` (optional)       | Short chat completion against local llama-server |
+| service_status      | `service`                 | `systemctl is-active` for allowed service        |
+| service_restart     | `service`                 | `sudo systemctl restart` for allowed service     |
+| service_logs        | `service`, `lines`        | `journalctl` tail for allowed service            |
+| process_status      | —                         | Filtered `ps aux` for known Nexus processes      |
+
+Allowed service names: `llama-server`, `agent-api`.
+
+### Example: run the test suite remotely
+
+```bash
+# Launch test run
+curl -s -X POST https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com/maintenance/execute \
+  -H "X-Api-Key: $AGENT_API_KEY" \
+  -H "X-Maintenance-Token: $MAINTENANCE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"operation": "run_tests"}' | jq .
+
+# Poll result (use task_id from above)
+curl -s -X POST .../maintenance/execute \
+  -H "X-Api-Key: $AGENT_API_KEY" \
+  -H "X-Maintenance-Token: $MAINTENANCE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"operation": "test_task_result", "args": {"task_id": "<id>"}}' | jq .
+```
+
+### Security properties
+
+- Disabled by default; no operations execute unless `MAINTENANCE_ENABLED=true`.
+- Requires two independent auth factors (`X-Api-Key` + `X-Maintenance-Token`).
+- `MAINTENANCE_EXPIRY` auto-disables the window at a specified UTC time.
+- No arbitrary command strings; only the named operations above are accepted.
+- Only `llama-server` and `agent-api` are accepted as service names.
+- All output is truncated and redacted (API keys, tokens, secrets).
+- Every operation call is written to an in-memory audit log (`GET /maintenance/audit`).
