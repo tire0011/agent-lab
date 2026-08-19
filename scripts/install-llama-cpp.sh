@@ -32,6 +32,7 @@ apt-get install -y --no-install-recommends \
     cmake \
     git \
     curl \
+    pkg-config \
     libopenblas-dev \
     > /dev/null
 
