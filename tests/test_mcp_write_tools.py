@@ -485,8 +485,10 @@ class TestShellConfinement(unittest.TestCase):
 
         with _mock.patch.object(operations_executor, "_SYSTEMD_RUN", _fake_systemd_run), \
              _mock.patch("subprocess.Popen", return_value=_start_proc), \
-             _mock.patch("subprocess.run", side_effect=_fake_run), \
-             _mock.patch("os.getpgid", return_value=None):
+             _mock.patch("subprocess.run", side_effect=_fake_run):
+            # os.getpgid(99999999) raises ProcessLookupError → caught →
+            # _pgid = None, which is fine: the cleanup-failure path under test
+            # is driven entirely by systemctl stop returning non-zero.
             ex = OperationsExecutor.__new__(OperationsExecutor)
             result = _run(ex.shell("echo test", timeout_seconds=5))
         self.assertFalse(result["success"],
