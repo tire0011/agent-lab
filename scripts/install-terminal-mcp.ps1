@@ -130,15 +130,10 @@ User=$ServiceUser
 WorkingDirectory=/agent
 Environment=MCP_COMMAND_TIMEOUT=$CommandTimeoutSeconds
 Environment=MCP_SHELL=/bin/bash
-ExecStart=$Binary --http --port $Port
+ExecStart=$Binary --http --host 127.0.0.1 --port $Port
 Restart=always
 RestartSec=3
-NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=/agent /tmp
-IPAddressDeny=any
-IPAddressAllow=localhost
 StandardOutput=journal
 StandardError=journal
 
@@ -182,4 +177,4 @@ Write-Host "\nTerminal MCP is installed and independent from agent-api." -Foregr
 Write-Host "Local MCP endpoint: http://127.0.0.1:$Port/mcp"
 Write-Host "Service: $ServiceName"
 Write-Host "Logs: journalctl -u $ServiceName -n 100 --no-pager"
-Write-Host 'Note: this installer intentionally exposes the service only on loopback. A separately authenticated reverse-proxy route is required before using it remotely.' -ForegroundColor Yellow
+Write-Host 'The MCP server binds only to 127.0.0.1. Add an authenticated reverse-proxy route before exposing it remotely.' -ForegroundColor Yellow
