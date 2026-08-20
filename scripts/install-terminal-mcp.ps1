@@ -21,15 +21,16 @@ $ServiceFile = "/etc/systemd/system/$ServiceName"
 $ServiceUser = 'agent'
 
 function Write-Step([string]$Text) {
-    Write-Host "\n=== $Text ===" -ForegroundColor Cyan
+    Write-Host "`n=== $Text ===" -ForegroundColor Cyan
 }
 
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)] [string]$FilePath,
-        [Parameter(ValueFromRemainingArguments = $true)] [string[]]$Arguments
+        [Parameter(Mandatory = $true)] [string[]]$ArgumentList
     )
-    & $FilePath @Arguments
+
+    & $FilePath @ArgumentList
     if ($LASTEXITCODE -ne 0) {
         throw "$FilePath failed with exit code $LASTEXITCODE"
     }
@@ -76,9 +77,9 @@ function Get-GoExecutable {
             throw 'Go archive checksum mismatch.'
         }
 
-        Invoke-Checked sudo rm -rf $GoRoot
-        Invoke-Checked sudo mkdir -p $InstallRoot
-        Invoke-Checked sudo tar -C $InstallRoot -xzf $tmp
+        Invoke-Checked 'sudo' @('rm', '-rf', $GoRoot)
+        Invoke-Checked 'sudo' @('mkdir', '-p', $InstallRoot)
+        Invoke-Checked 'sudo' @('tar', '-C', $InstallRoot, '-xzf', $tmp)
     }
     finally {
         Remove-Item -Force $tmp -ErrorAction SilentlyContinue
@@ -92,30 +93,30 @@ function Get-GoExecutable {
 Write-Step 'Preparing standalone Terminal MCP'
 $go = Get-GoExecutable
 
-Invoke-Checked sudo mkdir -p $InstallRoot $BinDir
-Invoke-Checked sudo chown -R "${ServiceUser}:${ServiceUser}" $InstallRoot
+Invoke-Checked 'sudo' @('mkdir', '-p', $InstallRoot, $BinDir)
+Invoke-Checked 'sudo' @('chown', '-R', "${ServiceUser}:${ServiceUser}", $InstallRoot)
 
 if (Test-Path "$SourceDir/.git") {
     Write-Host 'Updating existing Terminal MCP source checkout.'
-    Invoke-Checked git -C $SourceDir fetch --depth 1 origin main
-    Invoke-Checked git -C $SourceDir reset --hard origin/main
+    Invoke-Checked 'git' @('-C', $SourceDir, 'fetch', '--depth', '1', 'origin', 'main')
+    Invoke-Checked 'git' @('-C', $SourceDir, 'reset', '--hard', 'origin/main')
 } else {
     if (Test-Path $SourceDir) {
-        Invoke-Checked sudo rm -rf $SourceDir
+        Invoke-Checked 'sudo' @('rm', '-rf', $SourceDir)
     }
-    Invoke-Checked git clone --depth 1 $SourceRepo $SourceDir
+    Invoke-Checked 'git' @('clone', '--depth', '1', $SourceRepo, $SourceDir)
 }
 
 Write-Step 'Building Terminal MCP'
 Push-Location $SourceDir
 try {
     $env:CGO_ENABLED = '0'
-    Invoke-Checked $go build -trimpath -o $Binary .
+    Invoke-Checked $go @('build', '-trimpath', '-o', $Binary, '.')
 }
 finally {
     Pop-Location
 }
-Invoke-Checked chmod 0755 $Binary
+Invoke-Checked 'chmod' @('0755', $Binary)
 
 Write-Step 'Registering independent systemd service'
 $unit = @"
@@ -144,15 +145,15 @@ WantedBy=multi-user.target
 $tmpUnit = Join-Path ([IO.Path]::GetTempPath()) 'nexus-terminal-mcp.service'
 try {
     [IO.File]::WriteAllText($tmpUnit, $unit, [Text.UTF8Encoding]::new($false))
-    Invoke-Checked sudo install -m 0644 $tmpUnit $ServiceFile
+    Invoke-Checked 'sudo' @('install', '-m', '0644', $tmpUnit, $ServiceFile)
 }
 finally {
     Remove-Item -Force $tmpUnit -ErrorAction SilentlyContinue
 }
 
-Invoke-Checked sudo systemctl daemon-reload
-Invoke-Checked sudo systemctl enable --now $ServiceName
-Invoke-Checked sudo systemctl restart $ServiceName
+Invoke-Checked 'sudo' @('systemctl', 'daemon-reload')
+Invoke-Checked 'sudo' @('systemctl', 'enable', '--now', $ServiceName)
+Invoke-Checked 'sudo' @('systemctl', 'restart', $ServiceName)
 Start-Sleep -Seconds 2
 
 Write-Step 'Checking service'
@@ -162,7 +163,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "$ServiceName did not start successfully."
 }
 
-# Streamable HTTP initialization is enough to prove the MCP endpoint answers.
 $payload = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nexus-installer","version":"1.0"}}}'
 try {
     $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/mcp" -Method Post -ContentType 'application/json' -Body $payload -TimeoutSec 10
@@ -173,7 +173,7 @@ catch {
     throw "Service is running but MCP endpoint test failed: $($_.Exception.Message)"
 }
 
-Write-Host "\nTerminal MCP is installed and independent from agent-api." -ForegroundColor Green
+Write-Host "`nTerminal MCP is installed and independent from agent-api." -ForegroundColor Green
 Write-Host "Local MCP endpoint: http://127.0.0.1:$Port/mcp"
 Write-Host "Service: $ServiceName"
 Write-Host "Logs: journalctl -u $ServiceName -n 100 --no-pager"
