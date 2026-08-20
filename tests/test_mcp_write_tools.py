@@ -235,6 +235,15 @@ class TestShellOperation(unittest.TestCase):
                 )
             except ProcessLookupError:
                 pass  # Expected: process group was killed after normal shell exit
+            except PermissionError:
+                # PermissionError means a process with this PID exists but is
+                # owned by a different user — the PID may have been recycled.
+                # This is a genuine failure: the original child should be dead.
+                self.fail(
+                    f"Background child {child_pid}: got PermissionError from kill(0); "
+                    "PID may have been recycled, implying the original child outlived "
+                    "the shell and the process group was not killed promptly."
+                )
         finally:
             try:
                 os.unlink(pid_file)
@@ -410,9 +419,7 @@ class TestMcpRunTests(unittest.TestCase):
                     pass
 
             with patch("subprocess.Popen", _FakePopen):
-                result = asyncio.get_event_loop().run_until_complete(
-                    run_tests(timeout_seconds=30)
-                )
+                result = _run(run_tests(timeout_seconds=30))
             # Output must be bounded — should be truncated and lines ≤ 200
             self.assertLessEqual(len(result.get("lines", [])), 200)
 

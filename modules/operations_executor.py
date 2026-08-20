@@ -545,7 +545,7 @@ class OperationsExecutor:
             def _killer() -> None:
                 try:
                     proc.wait()
-                except Exception:
+                except (ChildProcessError, OSError):
                     pass
                 _kill_group()
 
