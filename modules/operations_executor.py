@@ -128,6 +128,11 @@ _SHELL_MAX_TIMEOUT: int = 120         # hard ceiling in seconds
 _SHELL_DEFAULT_TIMEOUT: int = 30
 _SHELL_MAX_OUTPUT_BYTES: int = 16_384  # 16 KiB before truncation
 
+# Path to ``systemd-run`` if available on this host.  Used to confine each
+# shell invocation in a transient cgroup scope so that children calling
+# ``setsid()`` cannot escape the kill boundary.
+_SYSTEMD_RUN: str | None = shutil.which("systemd-run")
+
 # Secrets that must never appear in responses.
 _SECRET_ENV_VARS: frozenset[str] = frozenset({
     "AGENT_API_KEY",
@@ -494,22 +499,29 @@ class OperationsExecutor:
     def _shell_sync(self, command: str, timeout_seconds: int, cwd: str | None) -> dict:
         """Synchronous core of :meth:`shell`; runs in a thread pool worker.
 
-        Uses ``subprocess.Popen`` (blocking ``waitpid``) so that shell-exit
-        detection is independent of asyncio's child-watcher state.  This is
-        important in test environments where multiple ``asyncio.run()`` calls
-        happen in sequence — the child watcher sometimes does not fire promptly
-        for subsequent event loops, causing the ``proc.returncode`` polling
-        approach to miss exits.
+        Confinement strategy
+        --------------------
+        When ``systemd-run`` is available the command is wrapped in a transient
+        user-scoped cgroup (``systemd-run --scope --user``).  This means every
+        process spawned by the shell — including those that call ``setsid()`` —
+        remains inside the same cgroup and is unconditionally killed when the
+        scope is stopped.  On hosts without ``systemd-run`` the shell is still
+        isolated in its own session via ``start_new_session=True`` and killed
+        via ``os.killpg``; ``setsid`` children may escape in that fallback case
+        and the limitation is documented.
 
-        Flow
-        ----
-        1. ``killer_thread``: blocks on ``proc.wait()`` until the shell exits,
-           then sends SIGKILL to the whole process group.  This releases the
-           stdout pipe that background children may be holding open.
-        2. ``reader_thread``: reads stdout with a hard byte cap; kills the
-           group on overflow.
-        3. Main (thread-pool) thread: waits for the reader with a deadline;
-           kills the group if the deadline is exceeded.
+        Timeout enforcement
+        -------------------
+        A ``threading.Timer`` fires after exactly *timeout_seconds* and kills
+        the scope/process-group regardless of whether the stdout pipe has been
+        closed.  This prevents commands like ``exec >/dev/null 2>&1; sleep 300``
+        from bypassing the deadline by closing the pipe early.
+
+        Killing on normal exit
+        ----------------------
+        A ``killer_thread`` blocks on ``proc.wait()`` and kills the scope/group
+        as soon as the shell exits with any code, freeing pipes that background
+        children may be holding open.
         """
         import subprocess
         import threading
@@ -519,11 +531,45 @@ class OperationsExecutor:
         truncated = False
         timed_out = False
 
+        # Build the scope unit name before we start the process so it is
+        # available inside the closures below.
+        scope_unit: str | None = None
+        if _SYSTEMD_RUN:
+            scope_unit = f"nexus-shell-{uuid.uuid4().hex[:12]}.scope"
+            argv = [
+                _SYSTEMD_RUN, "--scope", "--user", "--collect", "--quiet",
+                f"--unit={scope_unit}",
+                "-p", "KillMode=control-group",
+                "/bin/sh", "-c", command,
+            ]
+        else:
+            argv = ["/bin/sh", "-c", command]
+
+        def _kill_scope_and_group(pgid: int | None) -> None:
+            """Kill every process in the scope cgroup (systemd) AND the pgid."""
+            # systemd scope: kills all cgroup members regardless of setsid
+            if scope_unit:
+                try:
+                    import subprocess as _sp
+                    _sp.run(
+                        ["systemctl", "--user", "stop", scope_unit],
+                        timeout=5,
+                        capture_output=True,
+                    )
+                except Exception:
+                    pass
+            # pgid fallback: kills process group even without systemd
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
         with subprocess.Popen(
-            ["/bin/sh", "-c", command],
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,  # safe in multithreaded/asyncio contexts
             cwd=cwd,
         ) as proc:
             # Capture PGID immediately while the process is alive.
@@ -532,22 +578,35 @@ class OperationsExecutor:
             except (ProcessLookupError, OSError):
                 _pgid = None
 
-            def _kill_group() -> None:
-                try:
-                    if _pgid is not None:
-                        os.killpg(_pgid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+            def _kill() -> None:
+                _kill_scope_and_group(_pgid)
 
             # ------------------------------------------------------------------
-            # killer_thread: wait for shell exit then free the pipe
+            # Absolute deadline timer — fires after timeout_seconds regardless
+            # of stdout state.  Prevents pipe-close bypass.
             # ------------------------------------------------------------------
+            def _on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                _kill()
+
+            timer = threading.Timer(timeout_seconds, _on_timeout)
+            timer.daemon = True
+            timer.start()
+
+            # ------------------------------------------------------------------
+            # killer_thread: wait for shell exit then free the pipe; sets
+            # _proc_done so the main thread knows the process is truly gone.
+            # ------------------------------------------------------------------
+            _proc_done = threading.Event()
+
             def _killer() -> None:
                 try:
                     proc.wait()
                 except (ChildProcessError, OSError):
                     pass
-                _kill_group()
+                _proc_done.set()
+                _kill()
 
             killer_thread = threading.Thread(target=_killer, daemon=True)
             killer_thread.start()
@@ -566,7 +625,7 @@ class OperationsExecutor:
                     remaining = _SHELL_MAX_OUTPUT_BYTES - total_bytes
                     if remaining <= 0:
                         truncated = True
-                        _kill_group()
+                        _kill()
                         while proc.stdout.read(chunk_size):
                             pass
                         break
@@ -576,7 +635,7 @@ class OperationsExecutor:
                         chunks.append(chunk[:remaining])
                         total_bytes += remaining
                         truncated = True
-                        _kill_group()
+                        _kill()
                         while proc.stdout.read(chunk_size):
                             pass
                         break
@@ -589,7 +648,7 @@ class OperationsExecutor:
                         lookahead = proc.stdout.read(1)
                         if lookahead:
                             truncated = True
-                            _kill_group()
+                            _kill()
                             while proc.stdout.read(chunk_size):
                                 pass
                         break
@@ -598,12 +657,25 @@ class OperationsExecutor:
             reader_thread.start()
 
             # ------------------------------------------------------------------
-            # Wait for reader within deadline
+            # Wait for reader.  The Timer is the true deadline; cancelling it
+            # is only safe when the process is CONFIRMED dead (via _proc_done).
+            # If the command closed its stdout early (e.g. exec >/dev/null) the
+            # reader exits immediately but the process keeps running — in that
+            # case we must NOT cancel the timer; it will fire and kill the
+            # process after timeout_seconds.
             # ------------------------------------------------------------------
-            reader_thread.join(timeout=timeout_seconds)
+            reader_thread.join(timeout=timeout_seconds + 10)
+
+            if _proc_done.is_set():
+                # Process exited naturally before the deadline.
+                timer.cancel()
+            # else: timer will fire (or already fired) to kill the process.
+
             if reader_thread.is_alive():
+                # Reader still blocked — process must still be running.
+                # The timer should fire soon; kill defensively now too.
                 timed_out = True
-                _kill_group()
+                _kill()
                 reader_thread.join(timeout=5)
 
             # Ensure the killer thread also finishes before reading returncode.

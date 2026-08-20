@@ -250,6 +250,113 @@ class TestShellOperation(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_pipe_close_timeout_respected(self):
+        """Timeout fires even when the command closes stdout before the deadline.
+
+        A command like ``exec >/dev/null 2>&1; sleep 300`` closes the stdout
+        pipe immediately; the reader thread exits right away.  The timer-based
+        deadline must still kill the process after *timeout_seconds*, not block
+        indefinitely on proc.wait().
+        """
+        import tempfile
+        from modules.operations_executor import OperationsExecutor
+        ex = OperationsExecutor.__new__(OperationsExecutor)
+        pid_file = os.path.join(tempfile.gettempdir(), f"nexus_pipe_close_{os.getpid()}.pid")
+        try:
+            # Close stdout, write PID, then sleep 300.  Reader exits at once;
+            # timer must fire after 1 s and kill the process.
+            cmd = f"echo $$ > {pid_file}; exec >/dev/null 2>&1; sleep 300"
+            t0 = time.monotonic()
+            result = _run(ex.shell(cmd, timeout_seconds=1))
+            elapsed = time.monotonic() - t0
+            self.assertFalse(result["success"],
+                             "Command should fail (timed out)")
+            self.assertIn("timed out", result.get("output", "").lower(),
+                          "Result should report timeout")
+            # Must return promptly — well within the drain window.
+            self.assertLess(elapsed, 15,
+                            f"shell() took {elapsed:.1f}s — timeout bypass suspected")
+            # The process must be dead.
+            if os.path.exists(pid_file):
+                with open(pid_file) as fh:
+                    pid_str = fh.read().strip()
+                if pid_str.isdigit():
+                    child_pid = int(pid_str)
+                    time.sleep(0.3)
+                    try:
+                        os.kill(child_pid, 0)
+                        self.fail(
+                            f"Process {child_pid} is still alive after timeout — "
+                            "pipe-close timeout bypass not fixed"
+                        )
+                    except ProcessLookupError:
+                        pass  # expected
+        finally:
+            try:
+                os.unlink(pid_file)
+            except OSError:
+                pass
+
+    def test_setsid_child_killed_via_scope(self):
+        """A child that calls setsid() must be killed along with the shell.
+
+        With systemd-run scope confinement every process — even those that call
+        ``setsid`` to create a new session — remains inside the same cgroup and
+        is killed when the scope is stopped.  Without systemd-run (fallback)
+        this test is skipped because setsid children can escape os.killpg.
+
+        The test explicitly fails (not silently passes) if the PID file is not
+        written, because that indicates the child never started.
+        """
+        import shutil
+        import tempfile
+        from modules.operations_executor import _SYSTEMD_RUN, OperationsExecutor
+
+        if not _SYSTEMD_RUN:
+            self.skipTest("systemd-run not available; setsid escape not preventable")
+
+        ex = OperationsExecutor.__new__(OperationsExecutor)
+        pid_file = os.path.join(
+            tempfile.gettempdir(), f"nexus_setsid_{os.getpid()}.pid"
+        )
+        try:
+            # Shell exits immediately; setsid child writes PID then sleeps 30.
+            cmd = (
+                f"setsid sh -c 'echo $$ > {pid_file}; sleep 30' &"
+            )
+            result = _run(ex.shell(cmd, timeout_seconds=5))
+            # Allow child a moment to write PID and detach.
+            time.sleep(0.6)
+            self.assertTrue(
+                os.path.exists(pid_file),
+                "PID file not written — setsid child may not have started at all"
+            )
+            with open(pid_file) as fh:
+                pid_str = fh.read().strip()
+            self.assertTrue(
+                pid_str.isdigit(),
+                f"PID file did not contain a numeric PID: {pid_str!r}"
+            )
+            child_pid = int(pid_str)
+            try:
+                os.kill(child_pid, 0)
+                self.fail(
+                    f"setsid child {child_pid} is still alive — "
+                    "cgroup scope did not kill it"
+                )
+            except ProcessLookupError:
+                pass  # expected
+            except PermissionError:
+                self.fail(
+                    f"setsid child {child_pid}: PermissionError from kill(0) — "
+                    "PID may have been recycled, original child likely outlived scope"
+                )
+        finally:
+            try:
+                os.unlink(pid_file)
+            except OSError:
+                pass
+
     def test_secret_redacted_in_output(self):
         from modules.operations_executor import OperationsExecutor
         ex = OperationsExecutor.__new__(OperationsExecutor)
@@ -397,31 +504,30 @@ class TestMcpRunTests(unittest.TestCase):
 
     def test_run_tests_large_output_bounded_during_execution(self):
         """run_tests must not buffer unbounded output in RAM during execution."""
-        import asyncio
-        with patch.dict(os.environ, {"MCP_WRITE_ENABLED": "true", "AGENT_FS_ROOT": "/tmp"}):
-            from nexus_mcp import run_tests
-            # Temporarily monkey-patch Popen to return a large-output fake process.
-            import io
-            large_bytes = b"X\n" * 300_000  # ~600 KiB > 512 KiB cap
+        import io
+        from nexus_mcp import _run_tests_sync
+        large_bytes = b"X\n" * 300_000  # ~600 KiB > 512 KiB cap
 
-            class _FakePopen:
-                def __init__(self, *a, **kw):
-                    self.stdout = io.BytesIO(large_bytes)
-                    self.returncode = None
-                def kill(self):
-                    pass
-                def wait(self):
-                    self.returncode = 0
-                    return 0
-                def __enter__(self):
-                    return self
-                def __exit__(self, *a):
-                    pass
+        class _FakePopen:
+            def __init__(self, *a, **kw):
+                self.stdout = io.BytesIO(large_bytes)
+                self.returncode = None
+                # Use a definitely-dead PID so getpgid raises and _pgid stays None.
+                self.pid = 999999999
+            def kill(self):
+                pass
+            def wait(self):
+                self.returncode = 0
+                return 0
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
 
-            with patch("subprocess.Popen", _FakePopen):
-                result = _run(run_tests(timeout_seconds=30))
-            # Output must be bounded — should be truncated and lines ≤ 200
-            self.assertLessEqual(len(result.get("lines", [])), 200)
+        with patch("subprocess.Popen", _FakePopen):
+            result = _run_tests_sync(30, "/tmp")
+        # Output must be bounded — should be truncated and lines ≤ 200
+        self.assertLessEqual(len(result.get("lines", [])), 200)
 
     def test_run_tests_timeout_returns_error(self):
         """TimeoutExpired is caught and returned as a failure dict."""

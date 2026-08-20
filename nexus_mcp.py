@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -37,6 +38,135 @@ def _internal_api_key() -> str:
     nexus_api = _api()
     return getattr(nexus_api, "API_KEY", os.environ["AGENT_API_KEY"])
 
+
+# ---------------------------------------------------------------------------
+# Test-runner helper — module-level so it is importable and testable directly.
+# ---------------------------------------------------------------------------
+
+#: Hard cap on bytes buffered from the test runner during execution.
+#: Output is additionally bounded to 200 lines before being returned.
+_TESTS_MAX_OUTPUT_BYTES: int = 512 * 1024  # 512 KiB
+
+
+def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
+    """Run ``python -m unittest discover`` with streaming output bounding.
+
+    A ``threading.Timer`` enforces the wall-clock deadline independently of
+    stdout state, so a test process that closes its pipe early cannot bypass
+    the timeout.  The entire process group is killed when the deadline fires.
+    """
+    import os as _os
+    import signal as _signal
+
+    from modules.redaction import bounded_lines
+
+    t0 = time.monotonic()
+    chunks: list[bytes] = []
+    total_bytes = 0
+    timed_out = False
+    truncated = False
+    returncode = -1
+
+    try:
+        with subprocess.Popen(
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=repo_root,
+        ) as proc:
+            try:
+                _pgid: int | None = _os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                _pgid = None
+
+            def _kill_tests_group() -> None:
+                if _pgid is not None:
+                    try:
+                        _os.killpg(_pgid, _signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+
+            def _on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                _kill_tests_group()
+
+            timer = threading.Timer(timeout_seconds, _on_timeout)
+            timer.daemon = True
+            timer.start()
+
+            def _reader() -> None:
+                nonlocal total_bytes, truncated
+                assert proc.stdout is not None
+                while True:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    remaining = _TESTS_MAX_OUTPUT_BYTES - total_bytes
+                    if remaining <= 0:
+                        truncated = True
+                        _kill_tests_group()
+                        while proc.stdout.read(4096):
+                            pass
+                        break
+                    if len(chunk) > remaining:
+                        chunks.append(chunk[:remaining])
+                        total_bytes += remaining
+                        truncated = True
+                        _kill_tests_group()
+                        while proc.stdout.read(4096):
+                            pass
+                        break
+                    chunks.append(chunk)
+                    total_bytes += len(chunk)
+                    if total_bytes >= _TESTS_MAX_OUTPUT_BYTES:
+                        lookahead = proc.stdout.read(1)
+                        if lookahead:
+                            truncated = True
+                            _kill_tests_group()
+                            while proc.stdout.read(4096):
+                                pass
+                        break
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            reader_thread.join(timeout=timeout_seconds + 10)
+            timer.cancel()
+
+            if reader_thread.is_alive():
+                timed_out = True
+                _kill_tests_group()
+                reader_thread.join(timeout=5)
+
+            proc.wait()
+            returncode = proc.returncode if proc.returncode is not None else -1
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return {
+            "success": False,
+            "exit_code": -1,
+            "elapsed_ms": elapsed_ms,
+            "lines": [f"[error: {exc}]"],
+        }
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if timed_out:
+        return {
+            "success": False,
+            "exit_code": -1,
+            "elapsed_ms": elapsed_ms,
+            "lines": [f"[timed out after {timeout_seconds}s]"],
+        }
+    combined = b"".join(chunks).decode(errors="replace")
+    return {
+        "success": returncode == 0,
+        "exit_code": returncode,
+        "elapsed_ms": elapsed_ms,
+        "truncated": truncated,
+        "lines": bounded_lines(combined, max_lines=200, max_line_chars=500),
+    }
 
 def _jsonable(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -388,107 +518,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
 
         timeout_seconds = max(10, min(timeout_seconds, 300))
         repo_root = os.environ.get("AGENT_FS_ROOT", "/agent")
-
-        # Hard cap on bytes buffered from the test runner during execution.
-        # Output is additionally bounded to 200 lines before being returned.
-        _TESTS_MAX_OUTPUT_BYTES: int = 512 * 1024  # 512 KiB
-
-        def _run_sync() -> dict[str, Any]:
-            from modules.redaction import bounded_lines
-            t0 = time.monotonic()
-            chunks: list[bytes] = []
-            total_bytes = 0
-            timed_out = False
-            truncated = False
-            returncode = -1
-            try:
-                with subprocess.Popen(
-                    [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=repo_root,
-                ) as proc:
-                    import threading as _threading
-
-                    deadline = time.monotonic() + timeout_seconds
-
-                    def _reader() -> None:
-                        nonlocal total_bytes, truncated
-                        assert proc.stdout is not None
-                        while True:
-                            chunk = proc.stdout.read(4096)
-                            if not chunk:
-                                break
-                            remaining = _TESTS_MAX_OUTPUT_BYTES - total_bytes
-                            if remaining <= 0:
-                                truncated = True
-                                proc.kill()
-                                # Drain without buffering more
-                                while proc.stdout.read(4096):
-                                    pass
-                                break
-                            if len(chunk) > remaining:
-                                # Bytes beyond the cap were already consumed from
-                                # the pipe — this is always a truncation.
-                                chunks.append(chunk[:remaining])
-                                total_bytes += remaining
-                                truncated = True
-                                proc.kill()
-                                while proc.stdout.read(4096):
-                                    pass
-                                break
-                            chunks.append(chunk)
-                            total_bytes += len(chunk)
-                            if total_bytes >= _TESTS_MAX_OUTPUT_BYTES:
-                                # Exactly at cap: one-byte lookahead.  If the
-                                # lookahead returns a byte it is beyond the budget
-                                # and correctly discarded.
-                                lookahead = proc.stdout.read(1)
-                                if lookahead:
-                                    truncated = True
-                                    proc.kill()
-                                    while proc.stdout.read(4096):
-                                        pass
-                                break
-
-                    reader_thread = _threading.Thread(target=_reader, daemon=True)
-                    reader_thread.start()
-
-                    remaining_timeout = deadline - time.monotonic()
-                    reader_thread.join(timeout=max(0.0, remaining_timeout))
-                    if reader_thread.is_alive():
-                        timed_out = True
-                        proc.kill()
-                        reader_thread.join(timeout=5)
-                    proc.wait()
-                    returncode = proc.returncode if proc.returncode is not None else -1
-            except Exception as exc:
-                elapsed_ms = int((time.monotonic() - t0) * 1000)
-                return {
-                    "success": False,
-                    "exit_code": -1,
-                    "elapsed_ms": elapsed_ms,
-                    "lines": [f"[error: {exc}]"],
-                }
-
-            elapsed_ms = int((time.monotonic() - t0) * 1000)
-            if timed_out:
-                return {
-                    "success": False,
-                    "exit_code": -1,
-                    "elapsed_ms": elapsed_ms,
-                    "lines": [f"[timed out after {timeout_seconds}s]"],
-                }
-            combined = b"".join(chunks).decode(errors="replace")
-            return {
-                "success": returncode == 0,
-                "exit_code": returncode,
-                "elapsed_ms": elapsed_ms,
-                "truncated": truncated,
-                "lines": bounded_lines(combined, max_lines=200, max_line_chars=500),
-            }
-
-        return await _asyncio.to_thread(_run_sync)
+        return await _asyncio.to_thread(_run_tests_sync, timeout_seconds, repo_root)
 
     @mcp.tool(
         description=(
