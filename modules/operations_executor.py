@@ -524,16 +524,17 @@ class OperationsExecutor:
                     # Limit already reached — discard the rest and kill.
                     truncated = True
                     _kill_group()
-                    # Drain without accumulating.
                     while await proc.stdout.read(chunk_size):
                         pass
                     break
                 if len(chunk) > remaining:
                     chunk = chunk[:remaining]
-                    truncated = True
                 chunks.append(chunk)
                 total_bytes += len(chunk)
-                if truncated:
+                # Kill and drain as soon as we reach or exceed the cap
+                # (covers both the trimmed-chunk and exact-boundary cases).
+                if total_bytes >= _SHELL_MAX_OUTPUT_BYTES:
+                    truncated = True
                     _kill_group()
                     while await proc.stdout.read(chunk_size):
                         pass
@@ -541,7 +542,7 @@ class OperationsExecutor:
 
         try:
             await asyncio.wait_for(
-                asyncio.gather(_read_bounded(), proc.wait()),
+                asyncio.gather(_read_bounded(), proc.wait(), return_exceptions=True),
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:

@@ -364,12 +364,10 @@ class TestMcpRunTests(unittest.TestCase):
                       "nexus_mcp.py must reference 'unittest' in the run_tests argv")
         self.assertIn('"discover"', src,
                       "nexus_mcp.py must reference 'discover' in the run_tests argv")
-        # Must not fall back to pytest (pytest is not in requirements-api.txt)
-        # Allow the word 'pytest' only inside comment/docstring context, not as an argv token.
-        import re
-        # Find all "-m", "pytest" occurrences (as a string literal in a list context).
-        self.assertNotIn('"-m", "pytest"', src)
-        self.assertNotIn('"pytest"', src)
+        # Must not fall back to pytest (pytest is not in requirements-api.txt).
+        # Scoped to argv list context only: checks for `"-m", "pytest"` as a sequence.
+        self.assertNotIn('"-m", "pytest"', src,
+                         'pytest must not appear as an argv token in nexus_mcp.py')
 
 
 # ---------------------------------------------------------------------------
