@@ -389,33 +389,104 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         timeout_seconds = max(10, min(timeout_seconds, 300))
         repo_root = os.environ.get("AGENT_FS_ROOT", "/agent")
 
+        # Hard cap on bytes buffered from the test runner during execution.
+        # Output is additionally bounded to 200 lines before being returned.
+        _TESTS_MAX_OUTPUT_BYTES: int = 512 * 1024  # 512 KiB
+
         def _run_sync() -> dict[str, Any]:
+            from modules.redaction import bounded_lines
             t0 = time.monotonic()
+            chunks: list[bytes] = []
+            total_bytes = 0
+            timed_out = False
+            truncated = False
+            returncode = -1
             try:
-                proc = subprocess.run(
+                with subprocess.Popen(
                     [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_seconds,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     cwd=repo_root,
-                )
+                ) as proc:
+                    import threading as _threading
+
+                    deadline = time.monotonic() + timeout_seconds
+
+                    def _reader() -> None:
+                        nonlocal total_bytes, truncated
+                        assert proc.stdout is not None
+                        while True:
+                            chunk = proc.stdout.read(4096)
+                            if not chunk:
+                                break
+                            remaining = _TESTS_MAX_OUTPUT_BYTES - total_bytes
+                            if remaining <= 0:
+                                truncated = True
+                                proc.kill()
+                                # Drain without buffering more
+                                while proc.stdout.read(4096):
+                                    pass
+                                break
+                            if len(chunk) > remaining:
+                                # Bytes beyond the cap were already consumed from
+                                # the pipe — this is always a truncation.
+                                chunks.append(chunk[:remaining])
+                                total_bytes += remaining
+                                truncated = True
+                                proc.kill()
+                                while proc.stdout.read(4096):
+                                    pass
+                                break
+                            chunks.append(chunk)
+                            total_bytes += len(chunk)
+                            if total_bytes >= _TESTS_MAX_OUTPUT_BYTES:
+                                # Exactly at cap: one-byte lookahead.  If the
+                                # lookahead returns a byte it is beyond the budget
+                                # and correctly discarded.
+                                lookahead = proc.stdout.read(1)
+                                if lookahead:
+                                    truncated = True
+                                    proc.kill()
+                                    while proc.stdout.read(4096):
+                                        pass
+                                break
+
+                    reader_thread = _threading.Thread(target=_reader, daemon=True)
+                    reader_thread.start()
+
+                    remaining_timeout = deadline - time.monotonic()
+                    reader_thread.join(timeout=max(0.0, remaining_timeout))
+                    if reader_thread.is_alive():
+                        timed_out = True
+                        proc.kill()
+                        reader_thread.join(timeout=5)
+                    proc.wait()
+                    returncode = proc.returncode if proc.returncode is not None else -1
+            except Exception as exc:
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
-                from modules.redaction import bounded_lines
-                combined = proc.stdout + proc.stderr
                 return {
-                    "success": proc.returncode == 0,
-                    "exit_code": proc.returncode,
+                    "success": False,
+                    "exit_code": -1,
                     "elapsed_ms": elapsed_ms,
-                    "lines": bounded_lines(combined, max_lines=200, max_line_chars=500),
+                    "lines": [f"[error: {exc}]"],
                 }
-            except subprocess.TimeoutExpired:
-                elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            if timed_out:
                 return {
                     "success": False,
                     "exit_code": -1,
                     "elapsed_ms": elapsed_ms,
                     "lines": [f"[timed out after {timeout_seconds}s]"],
                 }
+            combined = b"".join(chunks).decode(errors="replace")
+            return {
+                "success": returncode == 0,
+                "exit_code": returncode,
+                "elapsed_ms": elapsed_ms,
+                "truncated": truncated,
+                "lines": bounded_lines(combined, max_lines=200, max_line_chars=500),
+            }
 
         return await _asyncio.to_thread(_run_sync)
 

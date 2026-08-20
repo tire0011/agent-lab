@@ -488,71 +488,128 @@ class OperationsExecutor:
         if not command or not command.strip():
             raise ValueError("command must not be empty")
         timeout_seconds = max(1, min(timeout_seconds, _SHELL_MAX_TIMEOUT))
+        cwd: str | None = os.environ.get("AGENT_FS_ROOT", "/agent") or None
+        return await asyncio.to_thread(self._shell_sync, command, timeout_seconds, cwd)
 
-        cwd = os.environ.get("AGENT_FS_ROOT", "/agent")
-        proc = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=cwd,
-            # Start in a new session so we can kill the whole process group.
-            preexec_fn=os.setsid,
-        )
+    def _shell_sync(self, command: str, timeout_seconds: int, cwd: str | None) -> dict:
+        """Synchronous core of :meth:`shell`; runs in a thread pool worker.
 
-        def _kill_group() -> None:
-            """Send SIGKILL to the entire process group."""
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+        Uses ``subprocess.Popen`` (blocking ``waitpid``) so that shell-exit
+        detection is independent of asyncio's child-watcher state.  This is
+        important in test environments where multiple ``asyncio.run()`` calls
+        happen in sequence — the child watcher sometimes does not fire promptly
+        for subsequent event loops, causing the ``proc.returncode`` polling
+        approach to miss exits.
+
+        Flow
+        ----
+        1. ``killer_thread``: blocks on ``proc.wait()`` until the shell exits,
+           then sends SIGKILL to the whole process group.  This releases the
+           stdout pipe that background children may be holding open.
+        2. ``reader_thread``: reads stdout with a hard byte cap; kills the
+           group on overflow.
+        3. Main (thread-pool) thread: waits for the reader with a deadline;
+           kills the group if the deadline is exceeded.
+        """
+        import subprocess
+        import threading
 
         chunks: list[bytes] = []
         total_bytes = 0
         truncated = False
         timed_out = False
 
-        async def _read_bounded() -> None:
-            nonlocal total_bytes, truncated
-            assert proc.stdout is not None
-            chunk_size = 4096
-            while True:
-                chunk = await proc.stdout.read(chunk_size)
-                if not chunk:
-                    break
-                remaining = _SHELL_MAX_OUTPUT_BYTES - total_bytes
-                if remaining <= 0:
-                    # Limit already reached — discard the rest and kill.
-                    truncated = True
-                    _kill_group()
-                    while await proc.stdout.read(chunk_size):
-                        pass
-                    break
-                if len(chunk) > remaining:
-                    chunk = chunk[:remaining]
-                chunks.append(chunk)
-                total_bytes += len(chunk)
-                # Kill and drain as soon as we reach or exceed the cap
-                # (covers both the trimmed-chunk and exact-boundary cases).
-                if total_bytes >= _SHELL_MAX_OUTPUT_BYTES:
-                    truncated = True
-                    _kill_group()
-                    while await proc.stdout.read(chunk_size):
-                        pass
-                    break
-
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(_read_bounded(), proc.wait(), return_exceptions=True),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            timed_out = True
-            _kill_group()
-            # Give the group a short window to die, then move on.
+        with subprocess.Popen(
+            ["/bin/sh", "-c", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+            cwd=cwd,
+        ) as proc:
+            # Capture PGID immediately while the process is alive.
             try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except (asyncio.TimeoutError, Exception):
-                pass
+                _pgid: int | None = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                _pgid = None
+
+            def _kill_group() -> None:
+                try:
+                    if _pgid is not None:
+                        os.killpg(_pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            # ------------------------------------------------------------------
+            # killer_thread: wait for shell exit then free the pipe
+            # ------------------------------------------------------------------
+            def _killer() -> None:
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+                _kill_group()
+
+            killer_thread = threading.Thread(target=_killer, daemon=True)
+            killer_thread.start()
+
+            # ------------------------------------------------------------------
+            # reader_thread: bounded stdout read
+            # ------------------------------------------------------------------
+            def _reader() -> None:
+                nonlocal total_bytes, truncated
+                assert proc.stdout is not None
+                chunk_size = 4096
+                while True:
+                    chunk = proc.stdout.read(chunk_size)
+                    if not chunk:
+                        break
+                    remaining = _SHELL_MAX_OUTPUT_BYTES - total_bytes
+                    if remaining <= 0:
+                        truncated = True
+                        _kill_group()
+                        while proc.stdout.read(chunk_size):
+                            pass
+                        break
+                    if len(chunk) > remaining:
+                        # Bytes beyond the cap were already consumed —
+                        # trimming always means truncation.
+                        chunks.append(chunk[:remaining])
+                        total_bytes += remaining
+                        truncated = True
+                        _kill_group()
+                        while proc.stdout.read(chunk_size):
+                            pass
+                        break
+                    chunks.append(chunk)
+                    total_bytes += len(chunk)
+                    if total_bytes >= _SHELL_MAX_OUTPUT_BYTES:
+                        # One-byte lookahead: if EOF the output was exactly at
+                        # the cap (not truncated); if a byte is returned we are
+                        # over the cap and the byte is correctly discarded.
+                        lookahead = proc.stdout.read(1)
+                        if lookahead:
+                            truncated = True
+                            _kill_group()
+                            while proc.stdout.read(chunk_size):
+                                pass
+                        break
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            # ------------------------------------------------------------------
+            # Wait for reader within deadline
+            # ------------------------------------------------------------------
+            reader_thread.join(timeout=timeout_seconds)
+            if reader_thread.is_alive():
+                timed_out = True
+                _kill_group()
+                reader_thread.join(timeout=5)
+
+            # Ensure the killer thread also finishes before reading returncode.
+            killer_thread.join(timeout=5)
+            proc.wait()  # idempotent; ensures returncode is set
+            returncode = proc.returncode if proc.returncode is not None else -1
 
         if timed_out:
             return {
@@ -564,10 +621,9 @@ class OperationsExecutor:
 
         raw = b"".join(chunks).decode(errors="replace")
         output = redact(raw)
-
         return {
-            "success": proc.returncode == 0,
-            "exit_code": proc.returncode,
+            "success": returncode == 0,
+            "exit_code": returncode,
             "truncated": truncated,
             "output": output,
         }

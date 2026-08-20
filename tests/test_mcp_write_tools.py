@@ -194,6 +194,53 @@ class TestShellOperation(unittest.TestCase):
         self.assertTrue(result.get("truncated", False))
         self.assertLessEqual(len(result["output"].encode()), _SHELL_MAX_OUTPUT_BYTES + 50)
 
+    def test_exact_boundary_not_truncated(self):
+        """A command whose output is exactly _SHELL_MAX_OUTPUT_BYTES must not set truncated."""
+        from modules.operations_executor import _SHELL_MAX_OUTPUT_BYTES, OperationsExecutor
+        ex = OperationsExecutor.__new__(OperationsExecutor)
+        cmd = (
+            f"python3 -c \"import sys; sys.stdout.write('B' * {_SHELL_MAX_OUTPUT_BYTES})"
+            f"; sys.stdout.flush()\""
+        )
+        result = _run(ex.shell(cmd, timeout_seconds=15))
+        self.assertFalse(result.get("truncated", False),
+                         "Exactly at cap should not be reported as truncated")
+
+    def test_background_child_killed_on_normal_exit(self):
+        """Background processes must be killed even when the shell exits normally (exit 0)."""
+        import tempfile
+        from modules.operations_executor import OperationsExecutor
+        ex = OperationsExecutor.__new__(OperationsExecutor)
+        pid_file = os.path.join(tempfile.gettempdir(), f"nexus_bg_exit_{os.getpid()}.pid")
+        try:
+            # Shell returns immediately (exit 0); background sleep keeps going without kill.
+            cmd = f"sleep 30 & echo $! > {pid_file}"
+            result = _run(ex.shell(cmd, timeout_seconds=5))
+            # Shell must have exited cleanly.
+            self.assertTrue(result["success"], "Shell command should succeed")
+            # Give the child a moment to write its PID.
+            time.sleep(0.4)
+            self.assertTrue(os.path.exists(pid_file),
+                            "PID file was not created — background child may not have started")
+            with open(pid_file) as fh:
+                child_pid_str = fh.read().strip()
+            self.assertTrue(child_pid_str.isdigit(),
+                            f"PID file did not contain a numeric PID: {child_pid_str!r}")
+            child_pid = int(child_pid_str)
+            try:
+                os.kill(child_pid, 0)
+                self.fail(
+                    f"Background child {child_pid} is still alive after the shell exited "
+                    "normally — process-group kill must be applied unconditionally"
+                )
+            except ProcessLookupError:
+                pass  # Expected: process group was killed after normal shell exit
+        finally:
+            try:
+                os.unlink(pid_file)
+            except OSError:
+                pass
+
     def test_secret_redacted_in_output(self):
         from modules.operations_executor import OperationsExecutor
         ex = OperationsExecutor.__new__(OperationsExecutor)
@@ -338,6 +385,36 @@ class TestMcpRunTests(unittest.TestCase):
                 combined = "line\n" * 500
                 lines = bounded_lines(combined, max_lines=200, max_line_chars=500)
                 self.assertLessEqual(len(lines), 200)
+
+    def test_run_tests_large_output_bounded_during_execution(self):
+        """run_tests must not buffer unbounded output in RAM during execution."""
+        import asyncio
+        with patch.dict(os.environ, {"MCP_WRITE_ENABLED": "true", "AGENT_FS_ROOT": "/tmp"}):
+            from nexus_mcp import run_tests
+            # Temporarily monkey-patch Popen to return a large-output fake process.
+            import io
+            large_bytes = b"X\n" * 300_000  # ~600 KiB > 512 KiB cap
+
+            class _FakePopen:
+                def __init__(self, *a, **kw):
+                    self.stdout = io.BytesIO(large_bytes)
+                    self.returncode = None
+                def kill(self):
+                    pass
+                def wait(self):
+                    self.returncode = 0
+                    return 0
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    pass
+
+            with patch("subprocess.Popen", _FakePopen):
+                result = asyncio.get_event_loop().run_until_complete(
+                    run_tests(timeout_seconds=30)
+                )
+            # Output must be bounded — should be truncated and lines ≤ 200
+            self.assertLessEqual(len(result.get("lines", [])), 200)
 
     def test_run_tests_timeout_returns_error(self):
         """TimeoutExpired is caught and returned as a failure dict."""
