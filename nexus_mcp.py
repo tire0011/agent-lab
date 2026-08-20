@@ -375,7 +375,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
 
     @mcp.tool(
         description=(
-            "Run the bounded test suite (pytest tests/ -q --tb=short) "
+            "Run the bounded test suite (python -m unittest discover -s tests -q) "
             "with a configurable timeout (default 120 s, max 300 s). "
             "Returns redacted, truncated output. "
             "Requires MCP_WRITE_ENABLED=true."
@@ -393,7 +393,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             t0 = time.monotonic()
             try:
                 proc = subprocess.run(
-                    [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=short"],
+                    [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
                     capture_output=True,
                     text=True,
                     timeout=timeout_seconds,

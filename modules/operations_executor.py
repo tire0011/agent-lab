@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import time
 import uuid
@@ -37,6 +38,11 @@ _LOCK_STALE_AGE_SECONDS: int = 3600  # 1 hour
 
 # Keys whose values must never be stored in the audit log parameters/results.
 _AUDIT_REDACT_KEYS_RE = re.compile(r"(?i)(key|secret|token|password|credential|value)")
+
+# Keys whose string values must be run through the string redactor before
+# storage (they may contain embedded secrets even though the key name itself
+# does not match the sensitive-key pattern).
+_AUDIT_REDACT_VALUE_KEYS: frozenset[str] = frozenset({"command"})
 
 
 def _is_stale_lock(path: Path) -> bool:
@@ -93,8 +99,11 @@ def _redact_audit_dict(d: dict | None) -> dict:
     """Return a deep copy of *d* with sensitive values replaced at any depth.
 
     Keys matching the sensitive-key pattern have their value replaced with
-    ``"***"`` regardless of how deeply they are nested.  Non-sensitive values
-    are recursed into so that nested structures are also sanitized.
+    ``"***"`` regardless of how deeply they are nested.  Keys in
+    ``_AUDIT_REDACT_VALUE_KEYS`` have their string values run through the
+    string redactor so that embedded secrets (e.g. tokens inside a shell
+    command) are also sanitised.  Non-sensitive values are recursed into so
+    that nested structures are also sanitized.
 
     If *d* is not a dict (e.g. ``None`` for failed operations), returns ``{}``.
     """
@@ -104,6 +113,8 @@ def _redact_audit_dict(d: dict | None) -> dict:
     for k, v in d.items():
         if _AUDIT_REDACT_KEYS_RE.search(str(k)):
             out[k] = "***"
+        elif k in _AUDIT_REDACT_VALUE_KEYS and isinstance(v, str):
+            out[k] = redact(v)
         else:
             out[k] = _redact_audit_value(v)
     return out
@@ -467,9 +478,12 @@ class OperationsExecutor:
         """Run *command* in a bounded, audited shell.
 
         Only available when ``MCP_WRITE_ENABLED=true``. Executes as the current
-        service user with cwd ``AGENT_FS_ROOT`` (default ``/agent``). Output is
-        bounded and redacted before returning; no daemon/background spawning is
-        allowed.
+        service user with cwd ``AGENT_FS_ROOT`` (default ``/agent``). The
+        process is started in its own process group so that the entire group
+        (including any child processes) is reliably killed on timeout or output
+        overflow — preventing background-daemon spawning.  Output is streamed
+        with a hard byte cap; the process is killed if the cap is exceeded.
+        Output is redacted before returning.
         """
         if not command or not command.strip():
             raise ValueError("command must not be empty")
@@ -481,21 +495,65 @@ class OperationsExecutor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=cwd,
+            # Start in a new session so we can kill the whole process group.
+            preexec_fn=os.setsid,
         )
-        truncated = False
-        try:
-            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
+
+        def _kill_group() -> None:
+            """Send SIGKILL to the entire process group."""
             try:
-                proc.kill()
-            except ProcessLookupError:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
                 pass
-            # Drain the pipe with a short deadline to avoid hanging if a
-            # child process inherits the fd and stays alive after the kill.
+
+        chunks: list[bytes] = []
+        total_bytes = 0
+        truncated = False
+        timed_out = False
+
+        async def _read_bounded() -> None:
+            nonlocal total_bytes, truncated
+            assert proc.stdout is not None
+            chunk_size = 4096
+            while True:
+                chunk = await proc.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                remaining = _SHELL_MAX_OUTPUT_BYTES - total_bytes
+                if remaining <= 0:
+                    # Limit already reached — discard the rest and kill.
+                    truncated = True
+                    _kill_group()
+                    # Drain without accumulating.
+                    while await proc.stdout.read(chunk_size):
+                        pass
+                    break
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+                    truncated = True
+                chunks.append(chunk)
+                total_bytes += len(chunk)
+                if truncated:
+                    _kill_group()
+                    while await proc.stdout.read(chunk_size):
+                        pass
+                    break
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(_read_bounded(), proc.wait()),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            _kill_group()
+            # Give the group a short window to die, then move on.
             try:
-                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.wait_for(proc.wait(), timeout=5)
             except (asyncio.TimeoutError, Exception):
                 pass
+
+        if timed_out:
             return {
                 "success": False,
                 "exit_code": -1,
@@ -503,13 +561,8 @@ class OperationsExecutor:
                 "output": f"[timed out after {timeout_seconds}s]",
             }
 
-        raw = stdout_b.decode(errors="replace")
-        if len(raw.encode()) > _SHELL_MAX_OUTPUT_BYTES:
-            raw = raw.encode()[:_SHELL_MAX_OUTPUT_BYTES].decode(errors="replace")
-            truncated = True
-
-        from modules.redaction import redact as _redact
-        output = _redact(raw)
+        raw = b"".join(chunks).decode(errors="replace")
+        output = redact(raw)
 
         return {
             "success": proc.returncode == 0,

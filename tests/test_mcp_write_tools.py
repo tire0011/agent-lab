@@ -138,58 +138,59 @@ class TestShellOperation(unittest.TestCase):
         """A slow command times out: exit_code=-1 and success=False."""
         from modules.operations_executor import OperationsExecutor
         ex = OperationsExecutor.__new__(OperationsExecutor)
-
-        # Use a mock that simulates a slow process to avoid actually waiting
-        slow_proc = MagicMock()
-        slow_proc.returncode = None
-        _calls = [0]
-
-        async def communicate_side_effect():
-            import asyncio as _asyncio
-            _calls[0] += 1
-            if _calls[0] == 1:
-                # First call: simulate slow process
-                await _asyncio.sleep(9999)
-                return b"", b""
-            # Second call (after kill): return immediately
-            return b"", b""
-
-        slow_proc.communicate = communicate_side_effect
-        slow_proc.kill = MagicMock()
-
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=slow_proc)):
-            result = _run(ex.shell("sleep 9999", timeout_seconds=1))
-
+        result = _run(ex.shell("sleep 30", timeout_seconds=1))
         self.assertFalse(result["success"])
         self.assertEqual(result["exit_code"], -1)
         self.assertIn("timed out", result["output"])
 
+    def test_timeout_kills_child_processes(self):
+        """On timeout, child processes (incl. background ones) are killed via killpg."""
+        import tempfile
+        from modules.operations_executor import OperationsExecutor
+        ex = OperationsExecutor.__new__(OperationsExecutor)
+        pid_file = os.path.join(tempfile.gettempdir(), f"nexus_test_{os.getpid()}.pid")
+        try:
+            # Start a background sleep that writes its PID to a file, then sleeps.
+            # In a non-interactive shell with setsid, background children share the pgid.
+            cmd = f"sleep 30 & echo $! > {pid_file}; sleep 30"
+            _run(ex.shell(cmd, timeout_seconds=1))
+            # Allow a brief moment for the pid file to be flushed.
+            time.sleep(0.3)
+            if not os.path.exists(pid_file):
+                return  # PID file not written before kill — skip liveness check
+            with open(pid_file) as fh:
+                child_pid_str = fh.read().strip()
+            if not child_pid_str.isdigit():
+                return
+            child_pid = int(child_pid_str)
+            try:
+                os.kill(child_pid, 0)
+                self.fail(f"Child process {child_pid} still alive after group kill")
+            except ProcessLookupError:
+                pass  # Expected: child was killed along with the process group
+        finally:
+            try:
+                os.unlink(pid_file)
+            except OSError:
+                pass
+
     def test_timeout_capped_at_max(self):
         """timeout_seconds > _SHELL_MAX_TIMEOUT is silently capped."""
-        from modules.operations_executor import _SHELL_MAX_TIMEOUT, OperationsExecutor
+        from modules.operations_executor import OperationsExecutor
         ex = OperationsExecutor.__new__(OperationsExecutor)
-        # Just verify the cap logic doesn't raise; we don't actually wait.
-        # We patch asyncio.create_subprocess_exec to return immediately.
-        async def fake_proc():
-            proc = MagicMock()
-            proc.returncode = 0
-            proc.communicate = AsyncMock(return_value=(b"ok", b""))
-            return proc
-
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=MagicMock(
-            returncode=0,
-            communicate=AsyncMock(return_value=(b"ok", b"")),
-        ))):
-            result = _run(ex.shell("echo x", timeout_seconds=99999))
-        # It should succeed (capped internally but still ran)
+        result = _run(ex.shell("echo x", timeout_seconds=99999))
         self.assertIsInstance(result, dict)
+        self.assertTrue(result["success"])
 
     def test_output_truncated_at_limit(self):
         from modules.operations_executor import _SHELL_MAX_OUTPUT_BYTES, OperationsExecutor
         ex = OperationsExecutor.__new__(OperationsExecutor)
-        # Generate output larger than the cap
-        big = "A" * (_SHELL_MAX_OUTPUT_BYTES + 100)
-        result = _run(ex.shell(f"printf '{big}'"))
+        # Generate output clearly larger than the cap via Python (avoids shell quoting issues).
+        cmd = (
+            f"python3 -c \"import sys; sys.stdout.write('A' * {_SHELL_MAX_OUTPUT_BYTES + 4096})"
+            f"; sys.stdout.flush()\""
+        )
+        result = _run(ex.shell(cmd, timeout_seconds=15))
         self.assertTrue(result.get("truncated", False))
         self.assertLessEqual(len(result["output"].encode()), _SHELL_MAX_OUTPUT_BYTES + 50)
 
@@ -351,6 +352,25 @@ class TestMcpRunTests(unittest.TestCase):
                 self.assertFalse(result["success"])
                 self.assertEqual(result["exit_code"], -1)
 
+    def test_run_tests_uses_unittest_discover(self):
+        """run_tests invokes 'python -m unittest discover -s tests', not pytest.
+
+        Verified by source inspection so no heavyweight API mock is needed.
+        """
+        import pathlib
+        src = (pathlib.Path(__file__).parent.parent / "nexus_mcp.py").read_text()
+        # The run_tests tool must call unittest discover
+        self.assertIn('"unittest"', src,
+                      "nexus_mcp.py must reference 'unittest' in the run_tests argv")
+        self.assertIn('"discover"', src,
+                      "nexus_mcp.py must reference 'discover' in the run_tests argv")
+        # Must not fall back to pytest (pytest is not in requirements-api.txt)
+        # Allow the word 'pytest' only inside comment/docstring context, not as an argv token.
+        import re
+        # Find all "-m", "pytest" occurrences (as a string literal in a list context).
+        self.assertNotIn('"-m", "pytest"', src)
+        self.assertNotIn('"pytest"', src)
+
 
 # ---------------------------------------------------------------------------
 # MCP write tool: experiment_start
@@ -473,6 +493,30 @@ class TestShellAuditLogging(unittest.TestCase):
         conn.close()
 
         self.assertTrue(len(rows) >= 1, "shell operation should appear in operation_log")
+
+    def test_command_secret_redacted_in_audit(self):
+        """A secret embedded in the shell command is not stored verbatim in the audit log."""
+        import sqlite3
+        import tempfile
+
+        from modules.operations_executor import OperationsExecutor
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        ex = OperationsExecutor(db_path=db_path)
+        secret = "sk-supersecret9876"
+        _run(ex.execute("shell", {"command": f"echo {secret}"}))
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT parameters FROM operation_log WHERE operation='shell'"
+        ).fetchall()
+        conn.close()
+
+        self.assertTrue(rows, "audit row expected in operation_log")
+        params_json = rows[0][0]
+        self.assertNotIn(secret, params_json, "secret must be redacted in audit params")
 
 
 if __name__ == "__main__":
