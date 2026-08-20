@@ -23,6 +23,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $ApiBaseUrl = 'http://127.0.0.1:8000'
+$AgentEnvironmentFile = '/etc/agent-lab/agent.env'
 $Services = @(
     'agent-api.service',
     'nexus-mailbox.service',
@@ -32,6 +33,25 @@ $Services = @(
 function Write-Section([string]$Title) {
     Write-Host ""
     Write-Host "=== $Title ===" -ForegroundColor Cyan
+}
+
+function Assert-AgentApiConfiguration {
+    if (-not (Test-Path -LiteralPath $AgentEnvironmentFile)) {
+        throw "agent-api configuration missing: $AgentEnvironmentFile does not exist. Restart aborted."
+    }
+
+    # Read only the variable names, never print or retain the secret value.
+    $HasApiKey = $false
+    foreach ($Line in Get-Content -LiteralPath $AgentEnvironmentFile) {
+        if ($Line -match '^\s*AGENT_API_KEY\s*=.+$') {
+            $HasApiKey = $true
+            break
+        }
+    }
+
+    if (-not $HasApiKey) {
+        throw "agent-api configuration invalid: AGENT_API_KEY is missing or empty in $AgentEnvironmentFile. Restart aborted to keep the existing service state intact."
+    }
 }
 
 function Get-NexusState {
@@ -191,6 +211,10 @@ function Invoke-NexusMailbox {
 }
 
 function Restart-Nexus {
+    Write-Section 'Validating Nexus configuration'
+    Assert-AgentApiConfiguration
+    Write-Host 'agent-api configuration OK (AGENT_API_KEY present).' -ForegroundColor Green
+
     Write-Section 'Restarting Nexus'
     sudo systemctl daemon-reload
     sudo systemctl enable --now nexus-mailbox.timer
