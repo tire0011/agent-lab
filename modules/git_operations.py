@@ -22,6 +22,7 @@ _ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
 
 # Allowlist of service names that can appear in commit messages/file paths.
 _SAFE_FILE_PATTERN = re.compile(r"^[\w./\- ]+$")
+_DEPENDENCY_SYNC_TIMEOUT = 300
 
 
 def _validate_repo_path(repo_path: str) -> Path:
@@ -55,15 +56,35 @@ class GitOperations:
         self._repo_path = str(_validate_repo_path(repo_path))
 
     async def pull(self) -> dict:
-        """Run ``git pull`` and return a summary dict."""
+        """Run ``git pull``, then synchronize API dependencies on success."""
         rc, stdout, stderr = await _run(["git", "pull", "--ff-only"], self._repo_path)
-        success = rc == 0
         output = redact(stdout + stderr)
+        if rc != 0:
+            return {
+                "success": False,
+                "commits_pulled": 0,
+                "message": output.strip()[:500],
+            }
+
+        sync_script = str(Path(self._repo_path) / "scripts" / "sync-api-deps.sh")
+        sync_rc, sync_stdout, sync_stderr = await _run(
+            ["/bin/bash", sync_script],
+            self._repo_path,
+            timeout=_DEPENDENCY_SYNC_TIMEOUT,
+        )
+        if sync_rc != 0:
+            sync_output = redact(sync_stdout + sync_stderr).strip()[:400]
+            return {
+                "success": False,
+                "commits_pulled": 0,
+                "message": f"dependency synchronization failed: {sync_output}"[:500],
+            }
+
         # Count "fast-forward" lines as a proxy for commits pulled.
         commits_pulled = stdout.count("\n") - 1 if "Fast-forward" in stdout else 0
         commits_pulled = max(0, commits_pulled)
         return {
-            "success": success,
+            "success": True,
             "commits_pulled": commits_pulled,
             "message": output.strip()[:500],
         }
@@ -77,19 +98,17 @@ class GitOperations:
         branch = "unknown"
         if lines and lines[0].startswith("##"):
             branch_line = lines[0][3:]
-            # Strip remote tracking info like "main...origin/main"
             branch = branch_line.split("...")[0].strip()
         uncommitted = [l[3:] for l in lines[1:] if l.strip()]
         dirty = len(uncommitted) > 0
         return {
             "status": "dirty" if dirty else "clean",
             "branch": branch,
-            "uncommitted": uncommitted[:50],  # cap list length
+            "uncommitted": uncommitted[:50],
         }
 
     async def commit_and_push(self, message: str, files: list[str]) -> dict:
         """Stage *files*, commit with *message*, and push."""
-        # Validate inputs
         if not message or len(message) > 500:
             raise ValueError("commit message must be 1-500 characters")
         if not files:
@@ -100,31 +119,25 @@ class GitOperations:
         for f in files:
             if not _SAFE_FILE_PATTERN.match(f):
                 raise ValueError(f"unsafe file path: {f!r}")
-            # Resolve against repo root to block traversal and symlink escapes.
             candidate = (repo_root / f).resolve()
             if candidate != repo_root and not str(candidate).startswith(str(repo_root) + "/"):
                 raise ValueError(f"file path escapes repo root: {f!r}")
-            # Use the validated relative form for git add.
             relative = str(candidate.relative_to(repo_root))
             if not _SAFE_FILE_PATTERN.match(relative):
                 raise ValueError(f"resolved path contains unsafe characters: {relative!r}")
             validated_files.append(relative)
 
-        # Stage files
         rc, _, stderr = await _run(["git", "add", "--"] + validated_files, self._repo_path)
         if rc != 0:
             return {"success": False, "commit_sha": None, "message": redact(stderr)[:300]}
 
-        # Commit
         rc, _, stderr = await _run(["git", "commit", "-m", message], self._repo_path)
         if rc != 0:
             return {"success": False, "commit_sha": None, "message": redact(stderr)[:300]}
 
-        # Get sha
         _, sha, _ = await _run(["git", "rev-parse", "HEAD"], self._repo_path)
         sha = sha.strip()[:40]
 
-        # Push
         rc, _, stderr = await _run(["git", "push"], self._repo_path, timeout=60)
         if rc != 0:
             return {"success": False, "commit_sha": sha, "message": redact(stderr)[:300]}
