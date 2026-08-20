@@ -128,10 +128,35 @@ _SHELL_MAX_TIMEOUT: int = 120         # hard ceiling in seconds
 _SHELL_DEFAULT_TIMEOUT: int = 30
 _SHELL_MAX_OUTPUT_BYTES: int = 16_384  # 16 KiB before truncation
 
-# Path to ``systemd-run`` if available on this host.  Used to confine each
-# shell invocation in a transient cgroup scope so that children calling
-# ``setsid()`` cannot escape the kill boundary.
-_SYSTEMD_RUN: str | None = shutil.which("systemd-run")
+# Path to ``systemd-run`` **only** when a ``--scope --user`` invocation is
+# actually usable on this host.  Checking binary existence alone is not
+# sufficient: on hosts where ``agent-api`` runs as a *system* service (not a
+# user session) the binary is present but ``systemd --user`` is not started
+# and every ``--scope --user`` call fails with "Failed to connect to bus".  A
+# trivial probe at import time detects this reliably.
+def _probe_systemd_scope() -> str | None:
+    """Return the path to ``systemd-run`` only if a scope can actually be
+    created on this host, otherwise ``None``."""
+    path = shutil.which("systemd-run")
+    if path is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                path, "--scope", "--user", "--collect", "--quiet",
+                "--unit=nexus-probe.scope",
+                "-p", "KillMode=control-group",
+                "/bin/true",
+            ],
+            timeout=5,
+            capture_output=True,
+        )
+        return path if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+_SYSTEMD_RUN: str | None = _probe_systemd_scope()
 
 # Secrets that must never appear in responses.
 _SECRET_ENV_VARS: frozenset[str] = frozenset({
@@ -501,63 +526,87 @@ class OperationsExecutor:
 
         Confinement strategy
         --------------------
-        When ``systemd-run`` is available the command is wrapped in a transient
-        user-scoped cgroup (``systemd-run --scope --user``).  This means every
-        process spawned by the shell — including those that call ``setsid()`` —
-        remains inside the same cgroup and is unconditionally killed when the
-        scope is stopped.  On hosts without ``systemd-run`` the shell is still
-        isolated in its own session via ``start_new_session=True`` and killed
-        via ``os.killpg``; ``setsid`` children may escape in that fallback case
-        and the limitation is documented.
+        The command is wrapped in a transient user-scoped cgroup via
+        ``systemd-run --scope --user``.  Every process spawned by the shell —
+        including those that call ``setsid()`` — remains inside the same cgroup
+        and is killed when the scope is stopped.
+
+        The shell **refuses to execute** (returns ``success=False``) when a
+        usable cgroup scope cannot be established.  There is no unsafe fallback
+        to pgid-only kill: a ``setsid`` child can escape a bare process group,
+        which violates the "no background daemon spawning" contract.
 
         Timeout enforcement
         -------------------
         A ``threading.Timer`` fires after exactly *timeout_seconds* and kills
-        the scope/process-group regardless of whether the stdout pipe has been
-        closed.  This prevents commands like ``exec >/dev/null 2>&1; sleep 300``
-        from bypassing the deadline by closing the pipe early.
+        the scope regardless of whether the stdout pipe has been closed.  This
+        prevents commands like ``exec >/dev/null 2>&1; sleep 300`` from
+        bypassing the deadline by closing the pipe early.
 
         Killing on normal exit
         ----------------------
-        A ``killer_thread`` blocks on ``proc.wait()`` and kills the scope/group
-        as soon as the shell exits with any code, freeing pipes that background
+        A ``killer_thread`` blocks on ``proc.wait()`` and kills the scope as
+        soon as the shell exits with any code, freeing pipes that background
         children may be holding open.
+
+        Scope cleanup
+        -------------
+        If ``systemctl --user stop`` fails, the scope may not have been fully
+        torn down.  In that case ``success`` is forced to ``False`` so the
+        caller is never silently told the operation succeeded when the cleanup
+        boundary is broken.
         """
         import subprocess
         import threading
+
+        # Fail-closed: refuse to run without a real cgroup kill boundary.
+        if not _SYSTEMD_RUN:
+            return {
+                "success": False,
+                "exit_code": -1,
+                "truncated": False,
+                "output": (
+                    "shell: cgroup confinement unavailable — "
+                    "systemd-run --scope --user is not usable on this host. "
+                    "Refusing to execute without a reliable kill boundary."
+                ),
+            }
 
         chunks: list[bytes] = []
         total_bytes = 0
         truncated = False
         timed_out = False
+        cleanup_failed = False
 
-        # Build the scope unit name before we start the process so it is
-        # available inside the closures below.
-        scope_unit: str | None = None
-        if _SYSTEMD_RUN:
-            scope_unit = f"nexus-shell-{uuid.uuid4().hex[:12]}.scope"
-            argv = [
-                _SYSTEMD_RUN, "--scope", "--user", "--collect", "--quiet",
-                f"--unit={scope_unit}",
-                "-p", "KillMode=control-group",
-                "/bin/sh", "-c", command,
-            ]
-        else:
-            argv = ["/bin/sh", "-c", command]
+        scope_unit = f"nexus-shell-{uuid.uuid4().hex[:12]}.scope"
+        argv = [
+            _SYSTEMD_RUN, "--scope", "--user", "--collect", "--quiet",
+            f"--unit={scope_unit}",
+            "-p", "KillMode=control-group",
+            "/bin/sh", "-c", command,
+        ]
 
         def _kill_scope_and_group(pgid: int | None) -> None:
-            """Kill every process in the scope cgroup (systemd) AND the pgid."""
+            """Stop the scope cgroup; also kill pgid as belt-and-suspenders.
+
+            Sets ``cleanup_failed`` in the enclosing scope if
+            ``systemctl --user stop`` exits non-zero or raises, so the
+            final result can report the failure instead of silently returning
+            ``success=True``.
+            """
+            nonlocal cleanup_failed
             # systemd scope: kills all cgroup members regardless of setsid
-            if scope_unit:
-                try:
-                    subprocess.run(
-                        ["systemctl", "--user", "stop", scope_unit],
-                        timeout=5,
-                        capture_output=True,
-                    )
-                except Exception:
-                    pass
-            # pgid fallback: kills process group even without systemd
+            try:
+                r = subprocess.run(
+                    ["systemctl", "--user", "stop", scope_unit],
+                    timeout=5,
+                    capture_output=True,
+                )
+                if r.returncode != 0:
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+            # Belt-and-suspenders: also kill the pgid directly.
             if pgid is not None:
                 try:
                     os.killpg(pgid, signal.SIGKILL)
@@ -692,6 +741,15 @@ class OperationsExecutor:
 
         raw = b"".join(chunks).decode(errors="replace")
         output = redact(raw)
+        if cleanup_failed:
+            # Scope teardown failed — a detached child may still be running.
+            # Force success=False so callers are never silently misled.
+            return {
+                "success": False,
+                "exit_code": returncode,
+                "truncated": truncated,
+                "output": output + "\n[scope cleanup failed — cgroup stop returned non-zero]",
+            }
         return {
             "success": returncode == 0,
             "exit_code": returncode,

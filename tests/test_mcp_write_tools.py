@@ -113,6 +113,24 @@ class TestServiceAllowlist(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestShellOperation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        """Skip the whole class when systemd-run --scope --user is not usable.
+
+        All tests in this class actually execute shell commands, which now
+        requires a working cgroup scope boundary.  On hosts without a user bus
+        (e.g. CI runners, system services) the shell tool correctly fails
+        closed, making real-execution tests meaningless to run.  The
+        confinement-contract tests that do *not* require a live cgroup are in
+        :class:`TestShellConfinement` below and always run.
+        """
+        from modules.operations_executor import _SYSTEMD_RUN
+        if not _SYSTEMD_RUN:
+            raise unittest.SkipTest(
+                "systemd-run --scope --user not usable on this host; "
+                "shell requires cgroup boundary — skipping live-execution tests"
+            )
+
     def setUp(self):
         os.environ["AGENT_FS_ROOT"] = "/tmp"
 
@@ -383,6 +401,97 @@ class TestShellOperation(unittest.TestCase):
         ex._log_operation = capturing_log
         _run(ex.execute("shell", {"command": "echo audit-test"}))
         self.assertTrue(any("shell" in str(entry) for entry in logged))
+
+
+# ---------------------------------------------------------------------------
+# Shell confinement contract — always runs, mocks subprocess
+# ---------------------------------------------------------------------------
+
+
+class TestShellConfinement(unittest.TestCase):
+    """Tests for the cgroup confinement contract.
+
+    These tests do NOT require a working systemd user bus.  They mock the
+    relevant subprocess and module-level variables to verify the security
+    contracts independently of the host environment.
+    """
+
+    def setUp(self):
+        os.environ["AGENT_FS_ROOT"] = "/tmp"
+
+    def tearDown(self):
+        os.environ.pop("AGENT_FS_ROOT", None)
+
+    def test_shell_fails_closed_when_no_cgroup_boundary(self):
+        """Shell must fail-closed (success=False) when systemd-run --scope --user
+        is unavailable — binary present but user bus unreachable is the key case
+        (e.g. agent-api runs as a system service without a user session).
+
+        The test patches _SYSTEMD_RUN to None to simulate this reliably.
+        """
+        import unittest.mock as _mock
+        from modules import operations_executor
+        from modules.operations_executor import OperationsExecutor
+
+        with _mock.patch.object(operations_executor, "_SYSTEMD_RUN", None):
+            ex = OperationsExecutor.__new__(OperationsExecutor)
+            result = _run(ex.shell("echo hi"))
+            self.assertFalse(result["success"],
+                             "shell must fail-closed when cgroup boundary is unavailable")
+            self.assertIn("cgroup", result["output"].lower(),
+                          "error message must mention cgroup confinement")
+
+    def test_shell_fails_closed_even_when_binary_exists(self):
+        """Simulates the case where systemd-run binary is found by which() but the
+        --scope --user probe exits non-zero (no user bus / Failed to connect to bus).
+        _probe_systemd_scope must return None so _SYSTEMD_RUN is None and the shell
+        tool fails closed.
+        """
+        import unittest.mock as _mock
+        import shutil as _shutil
+        from modules import operations_executor
+
+        _fake_which = _mock.MagicMock(return_value="/usr/bin/systemd-run")
+        _fake_run = _mock.MagicMock(return_value=_mock.MagicMock(returncode=1))
+        with _mock.patch.object(_shutil, "which", _fake_which), \
+             _mock.patch("subprocess.run", _fake_run):
+            result = operations_executor._probe_systemd_scope()
+        self.assertIsNone(result,
+                          "_probe_systemd_scope must return None when probe exits non-zero")
+
+    def test_scope_cleanup_failure_returns_success_false(self):
+        """If systemctl --user stop exits non-zero during scope teardown the
+        operation must return success=False (not silently succeed).
+        """
+        import unittest.mock as _mock
+        from modules import operations_executor
+        from modules.operations_executor import OperationsExecutor
+
+        _fake_systemd_run = "/usr/bin/systemd-run"
+
+        _start_proc = _mock.MagicMock()
+        _start_proc.__enter__ = _mock.MagicMock(return_value=_start_proc)
+        _start_proc.__exit__ = _mock.MagicMock(return_value=False)
+        _start_proc.pid = 99999999
+        _start_proc.stdout = _mock.MagicMock()
+        _start_proc.stdout.read = _mock.MagicMock(return_value=b"")
+        _start_proc.wait = _mock.MagicMock(return_value=0)
+        _start_proc.returncode = 0
+
+        def _fake_run(argv, **kwargs):
+            r = _mock.MagicMock()
+            r.returncode = 1 if "stop" in argv else 0
+            return r
+
+        with _mock.patch.object(operations_executor, "_SYSTEMD_RUN", _fake_systemd_run), \
+             _mock.patch("subprocess.Popen", return_value=_start_proc), \
+             _mock.patch("subprocess.run", side_effect=_fake_run), \
+             _mock.patch("os.getpgid", return_value=None):
+            ex = OperationsExecutor.__new__(OperationsExecutor)
+            result = _run(ex.shell("echo test", timeout_seconds=5))
+        self.assertFalse(result["success"],
+                         "scope cleanup failure must force success=False")
+        self.assertIn("scope cleanup failed", result["output"].lower())
 
 
 # ---------------------------------------------------------------------------
