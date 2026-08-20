@@ -298,6 +298,25 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("invalid limit", body["content"][0]["text"])
         self.chains.list_chains.assert_not_called()
 
+    def test_operation_chains_list_tool_rejects_limit_above_maximum(self):
+        self._initialize_mcp()
+        response = self._mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "operation_chains_list",
+                    "arguments": {"limit": api.OPERATION_CHAINS_MAX_LIMIT + 1},
+                },
+            }
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["result"]
+        self.assertTrue(body["isError"])
+        self.assertIn("invalid limit", body["content"][0]["text"])
+        self.chains.list_chains.assert_not_called()
+
     def test_mcp_lists_only_read_only_tools(self):
         self._initialize_mcp()
         response = self._mcp_post(
