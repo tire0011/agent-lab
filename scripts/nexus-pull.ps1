@@ -23,6 +23,12 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Nexus pull failed. No merge or reset was performed.'
 }
 
+$SyncScript = Join-Path $RepoRoot 'scripts/sync-api-deps.sh'
+& /bin/bash $SyncScript
+if ($LASTEXITCODE -ne 0) {
+    throw 'Nexus pull completed, but API dependency synchronization failed.'
+}
+
 git -C $RepoRoot log -1 --oneline
 if ($LASTEXITCODE -ne 0) {
     throw 'Could not display the deployed Nexus revision.'
