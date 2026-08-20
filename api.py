@@ -96,9 +96,11 @@ from modules.maintenance_service import (
     MaintenanceOperationError,
     MaintenanceService,
 )
+from nexus_mcp import create_mcp_mount
 
 _PROCESS_START_TIME = time.time()
 _logger = logging.getLogger(__name__)
+_MCP_MOUNT = create_mcp_mount()
 
 
 
@@ -113,9 +115,20 @@ CODEX_WORKING_DIR = "/agent"
 CODEX_SANDBOX = "read-only"
 CODEX_DEFAULT_TIMEOUT_SECONDS = 120
 CODEX_MAX_TIMEOUT_SECONDS = 120
+LIMIT_MIN = 1
 CODEX_LIST_DEFAULT_LIMIT = 20
 CODEX_LIST_MAX_LIMIT = 100
 CODEX_LIST_PROMPT_PREVIEW_CHARS = 80
+MAILBOX_TASKS_DEFAULT_LIMIT = 20
+MAILBOX_TASKS_MAX_LIMIT = 100
+EXPERIMENTS_DEFAULT_LIMIT = 20
+EXPERIMENTS_MAX_LIMIT = 100
+EXPERIMENT_LOGS_DEFAULT_LIMIT = 500
+EXPERIMENT_LOGS_MAX_LIMIT = 5000
+ACTIVITY_DEFAULT_LIMIT = 50
+ACTIVITY_MAX_LIMIT = 200
+OPERATION_CHAINS_DEFAULT_LIMIT = 20
+OPERATION_CHAINS_MAX_LIMIT = 100
 
 
 @lru_cache(maxsize=1)
@@ -236,50 +249,55 @@ def get_operations_executor() -> OperationsExecutor:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
-    # Never restarts execution and never starts a Codex process.
-    _resolve_codex_service().mark_interrupted_tasks_failed()
-    mts = _resolve_mailbox_task_service()
-    mts.recover_after_restart()
-    _resolve_experiment_adoption_service().recover_after_restart()
-    _resolve_operation_chain_service().recover_after_restart()
+    async with _MCP_MOUNT.lifespan():
+        # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
+        # Never restarts execution and never starts a Codex process.
+        _resolve_codex_service().mark_interrupted_tasks_failed()
+        mts = _resolve_mailbox_task_service()
+        mts.recover_after_restart()
+        _resolve_experiment_adoption_service().recover_after_restart()
+        _resolve_operation_chain_service().recover_after_restart()
 
-    # Best-effort outbox recovery: publish any un-pushed outbox records from
-    # a previous crash.  Both publishers share the same MailboxConfig / DB.
-    # Each publisher is fully wrapped so that a constructor *or* close failure
-    # never skips the next publisher and never aborts the API startup.
-    # exc_info is intentionally omitted: raw tracebacks can expose paths /
-    # tokens; the redacted message is sufficient for diagnosis.
-    _mc = MailboxConfig.from_env()
-    for _pub_cls in (OperationChainOutboxPublisher, TaskApprovalOutboxPublisher):
-        _cls_name = getattr(_pub_cls, "__name__", repr(_pub_cls))
-        _pub = None
+        # Best-effort outbox recovery: publish any un-pushed outbox records from
+        # a previous crash.  Both publishers share the same MailboxConfig / DB.
+        # Each publisher is fully wrapped so that a constructor *or* close failure
+        # never skips the next publisher and never aborts the API startup.
+        # exc_info is intentionally omitted: raw tracebacks can expose paths /
+        # tokens; the redacted message is sufficient for diagnosis.
+        _mc = MailboxConfig.from_env()
+        for _pub_cls in (OperationChainOutboxPublisher, TaskApprovalOutboxPublisher):
+            _cls_name = getattr(_pub_cls, "__name__", repr(_pub_cls))
+            _pub = None
+            try:
+                _pub = _pub_cls(mailbox_config=_mc)
+                _pub.publish_pending()
+            except Exception as _exc:
+                _logger.warning(
+                    "Startup outbox recovery failed for %s: %s",
+                    _cls_name,
+                    _sanitized_reason(str(_exc)),
+                )
+            finally:
+                if _pub is not None:
+                    try:
+                        _pub.close()
+                    except Exception as _close_exc:
+                        _logger.warning(
+                            "Startup outbox close failed for %s: %s",
+                            _cls_name,
+                            _sanitized_reason(str(_close_exc)),
+                        )
+
+        worker = MailboxTaskWorker(mts)
+        worker.start()
         try:
-            _pub = _pub_cls(mailbox_config=_mc)
-            _pub.publish_pending()
-        except Exception as _exc:
-            _logger.warning(
-                "Startup outbox recovery failed for %s: %s",
-                _cls_name,
-                _sanitized_reason(str(_exc)),
-            )
+            yield
         finally:
-            if _pub is not None:
-                try:
-                    _pub.close()
-                except Exception as _close_exc:
-                    _logger.warning(
-                        "Startup outbox close failed for %s: %s",
-                        _cls_name,
-                        _sanitized_reason(str(_close_exc)),
-                    )
-
-    worker = MailboxTaskWorker(mts)
-    worker.start()
-    yield
+            worker.stop()
 
 
 app = FastAPI(lifespan=lifespan)
+app.mount("/mcp", _MCP_MOUNT)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -428,7 +446,7 @@ def _prompt_preview(prompt: str, max_chars: int = CODEX_LIST_PROMPT_PREVIEW_CHAR
 @app.get("/codex/tasks", response_model=CodexTaskListResponse)
 def list_codex_tasks(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=CODEX_LIST_DEFAULT_LIMIT, ge=1, le=CODEX_LIST_MAX_LIMIT),
+    limit: int = Query(default=CODEX_LIST_DEFAULT_LIMIT, ge=LIMIT_MIN, le=CODEX_LIST_MAX_LIMIT),
     service: CodexTaskService = Depends(get_codex_service),
 ) -> CodexTaskListResponse:
     authorize(x_api_key)
@@ -495,7 +513,7 @@ def _approval_to_response(approval) -> MailboxTaskApproval:
 @app.get("/mailbox/tasks", response_model=MailboxTaskApprovalsResponse)
 def list_mailbox_tasks(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=MAILBOX_TASKS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=MAILBOX_TASKS_MAX_LIMIT),
     service: MailboxTaskService = Depends(get_mailbox_task_service),
 ) -> MailboxTaskApprovalsResponse:
     authorize(x_api_key)
@@ -607,8 +625,8 @@ async def mailbox_github_webhook(
 # out, without ever exposing full prompts, file paths, or secrets.
 # ---------------------------------------------------------------------------
 
-_MAILBOX_MESSAGES_DEFAULT_LIMIT = 20
-_MAILBOX_MESSAGES_MAX_LIMIT = 100
+MAILBOX_MESSAGES_DEFAULT_LIMIT = 20
+MAILBOX_MESSAGES_MAX_LIMIT = 100
 
 _MAILBOX_TYPE_LABELS_DE = {
     "idea": "Idee",
@@ -687,7 +705,7 @@ def _outbox_entries(limit: int) -> list[MailboxMessageEntry]:
 
 @app.get("/mailbox/messages", response_model=MailboxMessagesResponse)
 def list_mailbox_messages(
-    limit: int = Query(default=_MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=1, le=_MAILBOX_MESSAGES_MAX_LIMIT),
+    limit: int = Query(default=MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=LIMIT_MIN, le=MAILBOX_MESSAGES_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> MailboxMessagesResponse:
     inbox = _inbox_entries(service, limit)
@@ -711,7 +729,7 @@ def list_mailbox_messages(
 @app.get("/experiments", response_model=ExperimentsResponse)
 def list_experiments(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=EXPERIMENTS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENTS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentsResponse:
     authorize(x_api_key)
@@ -752,7 +770,7 @@ def get_experiment_logs(
     x_api_key: str | None = Header(default=None),
     level: str | None = Query(default=None),
     phase: str | None = Query(default=None),
-    limit: int = Query(default=500, ge=1, le=5000),
+    limit: int = Query(default=EXPERIMENT_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENT_LOGS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentLogsResponse:
     """Single, chronological, structured view of one experiment's complete
@@ -986,7 +1004,7 @@ def list_public_activity(
 @app.get("/activity", response_model=DiagnosticActivityResponse)
 def list_activity(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=ACTIVITY_DEFAULT_LIMIT, ge=LIMIT_MIN, le=ACTIVITY_MAX_LIMIT),
     experiment_id: str | None = Query(default=None),
     mailbox_task_id: str | None = Query(default=None),
     service: ExperimentService = Depends(get_experiment_service),
@@ -1033,8 +1051,8 @@ def list_activity(
 # unrestricted/raw command output.
 # ---------------------------------------------------------------------------
 
-_DIAGNOSTICS_DEFAULT_LIMIT = 10
-_DIAGNOSTICS_MAX_LIMIT = 100
+DIAGNOSTICS_DEFAULT_LIMIT = 10
+DIAGNOSTICS_MAX_LIMIT = 100
 
 
 @lru_cache(maxsize=1)
@@ -1210,7 +1228,7 @@ def get_operation_chain(
 
 @app.get("/operations/chains", response_model=list[OperationChainResult])
 def list_operation_chains(
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=OPERATION_CHAINS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=OPERATION_CHAINS_MAX_LIMIT),
     x_api_key: str | None = Header(default=None),
     service: OperationChainService = Depends(get_operation_chain_service),
 ) -> list[OperationChainResult]:
@@ -1220,7 +1238,7 @@ def list_operation_chains(
 
 @app.get("/diagnostics/public", response_model=PublicDiagnosticsResponse)
 def get_public_diagnostics(
-    limit: int = Query(default=_DIAGNOSTICS_DEFAULT_LIMIT, ge=1, le=_DIAGNOSTICS_MAX_LIMIT),
+    limit: int = Query(default=DIAGNOSTICS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=DIAGNOSTICS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
     mailbox_service: MailboxTaskService = Depends(get_mailbox_task_service),
 ) -> PublicDiagnosticsResponse:

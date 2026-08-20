@@ -41,6 +41,9 @@
   - `GET /health` (public)
   - `GET /secure-health` (requires `x-api-key` matching `AGENT_API_KEY`)
   - `GET /status`, `GET /problems`, `GET /ideas`, `POST /chat` (read-only; consistent data via `data_sources.py`)
+  - `POST /mcp/` (requires `x-api-key`) — mounted Streamable HTTP MCP adapter
+    that reuses the existing API/service logic for read-only Nexus inspection
+    tools; no write tools, shell execution, or new business logic
   - `POST /ideas` (requires `x-api-key`) — appends a sanitized, state-`new`
     idea to a fixed `### Inbox` subsection at the end of `IDEAS.md`'s
     `## Ideas` section; `data_sources.add_idea()` guards the read-modify-write
