@@ -84,7 +84,7 @@ The communication/source split was implemented. `/agent` is the source repositor
 
 ### 14. 2026-08-15: crash-safe outbox publication
 
-Task and operation-chain results now use a persistent `OutboxPublisher` lifecycle such as:
+Task and operation-chain results use a persistent `OutboxPublisher` lifecycle such as:
 
 `pending_write -> written -> committing -> committed -> pushed`
 
@@ -92,7 +92,13 @@ Intent is persisted before the atomic file write; publication is serialized; rec
 
 **Lesson:** asynchronous communication requires idempotent delivery semantics; writing an outbox file is not the same as reliably delivering it.
 
-### 15. 2026-08-16: single-call experiment pipeline
+### 15. 2026-08-15: event-driven mailbox wake-up
+
+A signed GitHub webhook adapter was merged for mailbox changes, sharing the same single-poll processor as the timer-based path. The timer remains a fallback rather than the only wake-up mechanism.
+
+**Lesson:** event-driven wake-up can reduce latency without removing the simpler recovery path.
+
+### 16. 2026-08-16: single-call experiment pipeline
 
 The normal Codex experiment path was reduced from roughly **3-5 LLM calls to one implementation call**. The model now receives the raw goal and investigates/plans/implements/tests within one call; safety checks remain before execution and implementation quality/verification remain after it.
 
@@ -100,81 +106,78 @@ A regression showed that explicit tests-only goals need separate classification:
 
 The key research trade-off is now measurable: **how much cost/token reduction is gained, and does implementation quality remain acceptable?**
 
-### 16. 2026-08-16: token-efficient verification with bounded failure evidence
+### 17. 2026-08-16: token-efficient verification with bounded failure evidence
 
 Default `unittest` verification uses quiet mode (`-q`). Success keeps only useful summary output; failures retain a bounded/redacted tail (30 lines, 500 characters/line, 4,000 characters total). Twenty-two focused regression tests covered truncation, redaction, API/operation/UI behavior, omission on success, and safe rendering.
 
 **Lesson:** tool output should be shaped for its consumer—compact on success, minimal actionable evidence on failure.
 
-### 17. 2026-08-17 to 2026-08-18: local-first routing direction
+### 18. 2026-08-17 to 2026-08-19: local-first routing developed and validated
 
 Repeated external-provider quota pressure strengthened the local-first design: keep one small local model available continuously for routing, context gathering, planning, and small/medium tasks; escalate only when a stronger external provider is justified.
 
 Execution is deliberately **sequential**: one model/provider active at a time, with roles such as router, context/research, planner, developer, and reviewer/tester. This bounds RAM, concurrency, token use, and causal complexity.
 
-PR #21 prototypes this architecture but remains open/draft and is **not adopted on `main`**. Review caused several important design corrections:
+PR #21 evolved through real-VM testing and review. Important corrections included:
 
-- role and provider are separate concepts; a role can be executed by different providers,
-- the local server/model configuration is generic rather than tied to a model family,
-- context gathering is a first-class local step before expensive delegation,
-- Codex delegation must execute for real rather than silently falling back to local,
+- role and provider are separate concepts,
+- local server/model configuration is model-agnostic,
+- deterministic repo context is gathered before expensive delegation,
+- a clean worktree must not be mistaken for an empty repository,
+- read-only/no-change tasks verify worktree cleanliness instead of running the full test suite,
+- Codex delegation executes for real rather than silently falling back,
 - provider accounting records the provider actually used plus runtime/token data where available,
-- verification uses real tests and `git diff`; an LLM reviewer interprets evidence but cannot override a failed real test,
-- direct orchestrator tests cover delegation, fallback, sequential execution, verification, and provider logging (55 tests reported after the architectural refactor).
+- real tests and `git diff` are authoritative; an LLM reviewer cannot override failed objective verification.
 
-The preferred current default candidate in the PR is **Qwen2.5-Coder-7B-Instruct Q4_K_M**, served through generic `llama.cpp`/`llama-server` infrastructure rather than `llama-cpp-python`. The architecture remains model-agnostic so this default can change after benchmarking.
+The preferred default is **Qwen2.5-Coder-7B-Instruct Q4_K_M** via native `llama.cpp`/`llama-server`, while the orchestration layer remains model-agnostic.
 
-### 18. 2026-08-18: B2ms resource envelope for persistent local inference
+### 19. 2026-08-18: B2ms resource envelope for persistent local inference
 
-The Azure VM was resized to **Standard_B2ms: 2 vCPUs and 8 GiB RAM**. PR #21's conservative deployment defaults now target roughly 8k context, one parallel slot, two CPU threads, local-only binding (`127.0.0.1`), and the `agent` service user. These remain configurable.
+The Azure VM was resized to **Standard_B2ms: 2 vCPUs and 8 GiB RAM**. Conservative local-server defaults target roughly 8k context, one parallel slot, two CPU threads, local-only binding (`127.0.0.1`), and the `agent` service user.
 
-This turns local-model selection into a concrete resource-constrained benchmark: quality and routing/coding usefulness must be weighed against memory headroom, usable context, latency, and coexistence with Nexus services.
+Real deployment exposed a missing OpenBLAS build dependency (`pkg-config`). The install script was subsequently fixed before the local-router branch was merged.
 
-Deployment on the real VM also exposed a missing build dependency: the OpenBLAS `llama.cpp` build failed because `pkg-config` was absent. At the latest inspected PR head, `scripts/install-llama-cpp.sh` still lacked `pkg-config`, so PR #21 remains unfinished. This is a useful reminder that installation scripts must be validated on the actual target environment, not only through unit tests or static review.
+**Lesson:** installation scripts must be validated on the actual target environment, not only through unit tests or static review.
 
-### 19. 2026-08-18: self-healing operations adopted on main
+### 20. 2026-08-18: self-healing operations adopted on main
 
-PR #22 was reviewed, hardened, approved, and merged into `main`. Nexus now has authenticated `/operations/*` capabilities for bounded Git operations, service status/restart, log inspection, diagnostics/self-healing, local-model status/testing, and restricted configuration operations. Invocations are centrally dispatched and persisted in an operation log.
+PR #22 was reviewed, hardened, approved, and merged into `main`. Nexus gained authenticated `/operations/*` capabilities for bounded Git operations, service status/restart, log inspection, diagnostics/self-healing, local-model status/testing, and restricted configuration operations. Invocations are centrally dispatched and persisted in an operation log.
 
-Review deliberately tightened the safety boundary before adoption:
+Review tightened the safety boundary: stale-lock cleanup uses age/liveness evidence; Git path traversal/symlink escape is rejected; service actions are allowlisted; configuration values are not echoed; audit parameters/results are recursively redacted; and direct safety tests cover implementation boundaries.
 
-- lock cleanup only treats locks as stale when age/liveness evidence supports it; active/unknown locks are preserved,
-- Git paths are resolved against the repository root and traversal/symlink escape is rejected,
-- service actions use explicit allowlists,
-- configuration values are not echoed back,
-- audit parameters/results are recursively redacted through nested dict/list/tuple structures before persistence,
-- direct safety tests cover these implementation boundaries rather than mocking only HTTP endpoints.
+**Lesson:** increasing autonomy should come with narrower, testable capabilities and auditability—not unrestricted shell access.
 
-**Lesson:** increasing autonomy should come with narrower, testable capabilities and auditability—not unrestricted shell access. Safety review can expand practical autonomy when it removes concrete failure modes instead of blocking the capability wholesale.
+### 21. 2026-08-19: local-first multi-provider orchestration adopted on main
 
-A separate measurement decision remains open: re-run an early simple webpage-change experiment with the newer pipeline and compare quality, total tokens, runtime, and estimated cost against the historical baseline. No measured result is recorded yet.
+PR #21 was merged into `main` after target-VM fixes and read-only/context-gathering regressions were addressed. Nexus now has a model-agnostic sequential pipeline:
 
-### 17. 2026-08-17 to 2026-08-18: local-first routing and broader operational autonomy under review
+`Router -> Context Gatherer -> Planner -> Developer -> real-tool Verification -> Reviewer`
 
-A stronger architectural direction emerged from repeated concern that external provider quotas and token budgets can become the limiting resource for continuous operation. The preferred direction is now to keep a local model available on the VM even when it is relatively slow, use it for small/medium tasks, context gathering, routing, and role changes, and delegate only work that clearly needs a stronger external model.
+The persistent local model is the default low-cost decision layer, while Azure OpenAI and Codex are escalation providers when configured. A temporary disabled-by-default maintenance bridge supports bounded remote status/tests/router/service/log operations behind an additional token and optional expiry.
 
-The desired execution model remains deliberately sequential rather than a large concurrent multi-agent system: one active model/agent at a time, with prompt-defined roles such as router, planner, developer, or tester. This keeps RAM, token use, concurrency, and causal debugging bounded while still allowing specialization.
+No quality/latency/cost benchmark has yet established that Qwen2.5-Coder-7B Q4_K_M is the best B2ms model; the merge adopts the capability architecture, not a permanent model choice.
 
-Two draft pull requests prototype parts of this direction but are **not yet adopted on `main`**:
+### 22. 2026-08-20: read-only MCP HTTP adapter adopted on main
 
-- PR #21 proposes a local-model routing/orchestration layer with persisted routing/provider-usage decisions and a sequential route -> plan -> develop -> test flow. Its concrete Llama 2 13B choice should be treated as an implementation experiment, not as a settled model decision.
-- PR #22 proposes authenticated operational/self-healing capabilities for Git, services, logs, diagnosis, model testing, and configuration, with explicit allowlists, path validation, redaction, and operation logging. This explores whether Nexus can safely perform more of its own routine operation and recovery work.
+PR #27 added a dedicated Streamable HTTP MCP surface at `/mcp/`. It reuses existing FastAPI/service logic rather than introducing a parallel implementation and applies the existing API-key authentication model.
 
-The durable design lesson is to separate **capability architecture** from **specific model choice**: Nexus benefits from an always-available local decision layer and measured provider routing even if the best local model changes frequently.
+The MCP surface is intentionally **read-only**. It exposes compact structured inspection tools for status, problems, ideas/chat, Codex task reads, mailbox reads, experiment state/logs/adoption, activity/diagnostics, operation catalogs/chains, and maintenance status/audit. It deliberately excludes write endpoints, shell-backed operations, webhooks, and new filesystem capabilities.
 
-A measurement decision was also made to re-run the earliest simple webpage-change experiment using the newer pipeline and compare it with the original baseline. This is intended to provide a concrete before/after check on whether the many orchestration changes improved cost, token use, runtime, and quality. No new measured result is recorded here yet.
+Limit validation was centralized/shared with API constants and covered for MCP-side error cases before merge.
+
+**Lesson:** MCP is most useful here as a thin capability adapter over tested domain services; remote interoperability does not require duplicating business logic or widening permissions.
 
 ## What Nexus currently learns
 
-Nexus already accumulates durable information from:
+Nexus accumulates durable information from:
 
 - code and tests,
-- project/idea/decision documents,
+- project/idea/decision/history documents,
 - SQLite experiment and operation state,
 - mailbox `context` knowledge,
 - experiment outcomes, diagnostics, activity, usage, and cost data where available.
 
-It does **not automatically inherit the full reasoning history from ChatGPT conversations**. `PROJECT_HISTORY.md` exists to preserve durable decisions, rejected alternatives, cost concerns, failures, and long-running research directions that would otherwise be lost.
+It does **not automatically inherit the full reasoning history from ChatGPT conversations**. `PROJECT_HISTORY.md` preserves durable decisions, rejected alternatives, cost concerns, failures, and long-running research directions that would otherwise be lost.
 
 ## Recommended use as Nexus project memory
 
@@ -191,16 +194,17 @@ Measure relevance of proposed ideas, duplicate work, consistency with previous d
 Current `main` includes:
 
 - persistent Standard_B2ms Azure VM,
-- baseline/MCP-oriented agent code and provider access,
+- persistent local `llama.cpp` model capability plus model-agnostic sequential routing/orchestration,
+- Azure OpenAI/Codex escalation paths with provider accounting,
 - single-call Codex experiment execution,
-- experiment orchestration, worktree isolation, quality gating, and verification,
-- SQLite state and durable project/idea/decision documents,
+- experiment orchestration, worktree isolation, quality gating, and real-tool verification,
+- SQLite state and durable project/idea/decision/history documents,
 - separate Git-backed mailbox repository with crash-safe outbox publication,
+- signed GitHub webhook wake-up with timer fallback,
 - API/web UI, public/authenticated diagnostics, and compact failure evidence,
 - authenticated, audited, allowlisted self-healing/operations capabilities,
+- authenticated read-only MCP HTTP inspection surface,
 - tests and policy boundaries.
-
-PR #21 is still exploring the persistent local routing/orchestration layer; it is not yet a `main` capability.
 
 ## Important lessons so far
 
@@ -216,33 +220,36 @@ PR #21 is still exploring the persistent local routing/orchestration layer; it i
 10. **Separate capability architecture from model identity.** The routing layer should survive model replacement.
 11. **Target-environment validation matters.** Deployment scripts can fail despite clean architectural review and unit tests.
 12. **Safety can enable more autonomy.** Narrow allowlists, path boundaries, recursive redaction, liveness checks, and audit logs made self-healing operations acceptable to merge.
-13. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
+13. **Adapters should reuse domain logic.** MCP/API surfaces should expose existing tested capabilities rather than fork behavior.
+14. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
 
 ## Open research directions
 
 - project-memory retrieval from this history,
-- event-driven mailbox wake-up with timer fallback,
 - measured token/cost/quality impact of the single-call pipeline and compact tool output,
-- finish and deploy the generic local-first router after fixing the remaining VM build issue,
 - benchmark Qwen2.5-Coder-7B-Instruct Q4_K_M and alternative quantized models inside the B2ms envelope,
+- test what the merged local model/router can accomplish on genuinely read-only small and medium tasks before granting broader autonomy,
 - route by task difficulty, expected value, provider limits, historical quality, and resource cost,
 - measure how much local context preparation reduces external-provider tokens,
 - evaluate whether merged self-healing operations materially reduce human intervention without increasing incidents,
+- evaluate MCP as the standard inspection/integration path for external agents before adding any write-capable MCP tools,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
 - agent-generated experiments for prompts/tools/context,
 - context compression/retrieval strategies,
 - quantization/fine-tuning where evidence justifies it,
+- adaptive two-pass context research / richer repo-map approaches when small context is insufficient,
 - multi-agent specialization only when measurable benefit exceeds complexity,
 - controlled exploration of useful products, services, public open-source work, and eventually partial cost recovery.
 
 ## Current next-step candidates
 
-1. **Finish PR #21 deployment validation:** add the missing `pkg-config` dependency, build on the real B2ms VM, run the local server, and record memory/latency/context observations before merge.
-2. **Local-router benchmark:** test Qwen2.5-Coder-7B Q4_K_M against at least one plausible alternative under the same B2ms limits; measure routing accuracy/usefulness, latency, RAM, context, and delegation rate.
+1. **Read-only local-router evaluation:** give Nexus representative inspection/reasoning tasks and record success, latency, context use, routing/delegation behavior, and failures without allowing code changes.
+2. **Local-model benchmark:** compare Qwen2.5-Coder-7B Q4_K_M with at least one plausible alternative under identical B2ms limits.
 3. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
 4. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
-5. **Operational-autonomy measurement:** use the merged `/operations/*` layer in normal Nexus operation and measure successful self-recovery, human interventions avoided, and any safety/false-positive incidents.
+5. **Operational-autonomy measurement:** measure successful self-recovery, human interventions avoided, and safety/false-positive incidents using the merged `/operations/*` layer.
+6. **MCP integration experiment:** connect an external read-only client/agent to `/mcp/` and compare usability/token overhead with direct REST inspection.
 
 Choose the next step by expected learning value, effort, risk, and measurable benefit—not architectural completeness.
 
