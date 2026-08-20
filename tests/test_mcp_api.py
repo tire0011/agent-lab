@@ -162,6 +162,20 @@ class McpApiTests(unittest.TestCase):
             headers["mcp-protocol-version"] = "2025-06-18"
         return self.client.post("/mcp/", headers=headers, json=body)
 
+    def _initialize_mcp(self):
+        self._mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1.0"},
+                },
+            }
+        )
+
     def test_mcp_requires_api_key(self):
         response = self._mcp_post(
             {
@@ -179,19 +193,94 @@ class McpApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), {"detail": "Unauthorized"})
 
-    def test_mcp_lists_only_read_only_tools(self):
-        self._mcp_post(
+    def test_experiment_logs_tool_rejects_limit_zero(self):
+        self._initialize_mcp()
+        with patch.object(api.experiment_logger_module, "read_log_entries") as read_logs:
+            response = self._mcp_post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "experiment_logs",
+                        "arguments": {
+                            "experiment_id": "exp-123",
+                            "limit": 0,
+                        },
+                    },
+                }
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["result"]
+        self.assertTrue(body["isError"])
+        self.assertIn("invalid limit", body["content"][0]["text"])
+        self.experiment.resolve_experiment.assert_not_called()
+        read_logs.assert_not_called()
+
+    def test_experiment_logs_tool_rejects_limit_above_maximum(self):
+        self._initialize_mcp()
+        with patch.object(api.experiment_logger_module, "read_log_entries") as read_logs:
+            response = self._mcp_post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "experiment_logs",
+                        "arguments": {
+                            "experiment_id": "exp-123",
+                            "limit": api.EXPERIMENT_LOGS_MAX_LIMIT + 1,
+                        },
+                    },
+                }
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["result"]
+        self.assertTrue(body["isError"])
+        self.assertIn("invalid limit", body["content"][0]["text"])
+        self.experiment.resolve_experiment.assert_not_called()
+        read_logs.assert_not_called()
+
+    def test_activity_list_tool_rejects_limit_zero(self):
+        self._initialize_mcp()
+        response = self._mcp_post(
             {
                 "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
+                "id": 2,
+                "method": "tools/call",
                 "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "1.0"},
+                    "name": "activity_list",
+                    "arguments": {"limit": 0},
                 },
             }
         )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["result"]
+        self.assertTrue(body["isError"])
+        self.assertIn("invalid limit", body["content"][0]["text"])
+        self.experiment.list_activity.assert_not_called()
+
+    def test_activity_list_tool_rejects_limit_above_maximum(self):
+        self._initialize_mcp()
+        response = self._mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "activity_list",
+                    "arguments": {"limit": api.ACTIVITY_MAX_LIMIT + 1},
+                },
+            }
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["result"]
+        self.assertTrue(body["isError"])
+        self.assertIn("invalid limit", body["content"][0]["text"])
+        self.experiment.list_activity.assert_not_called()
+
+    def test_mcp_lists_only_read_only_tools(self):
+        self._initialize_mcp()
         response = self._mcp_post(
             {
                 "jsonrpc": "2.0",
@@ -229,18 +318,7 @@ class McpApiTests(unittest.TestCase):
         )
 
     def test_status_tool_returns_structured_content(self):
-        self._mcp_post(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "1.0"},
-                },
-            }
-        )
+        self._initialize_mcp()
         response = self._mcp_post(
             {
                 "jsonrpc": "2.0",
@@ -290,18 +368,7 @@ class McpApiTests(unittest.TestCase):
             }
         ]
 
-        self._mcp_post(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "1.0"},
-                },
-            }
-        )
+        self._initialize_mcp()
         with patch.object(api.experiment_logger_module, "read_log_entries", return_value=entries) as read_logs:
             response = self._mcp_post(
                 {

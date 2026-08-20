@@ -115,9 +115,20 @@ CODEX_WORKING_DIR = "/agent"
 CODEX_SANDBOX = "read-only"
 CODEX_DEFAULT_TIMEOUT_SECONDS = 120
 CODEX_MAX_TIMEOUT_SECONDS = 120
+LIMIT_MIN = 1
 CODEX_LIST_DEFAULT_LIMIT = 20
 CODEX_LIST_MAX_LIMIT = 100
 CODEX_LIST_PROMPT_PREVIEW_CHARS = 80
+MAILBOX_TASKS_DEFAULT_LIMIT = 20
+MAILBOX_TASKS_MAX_LIMIT = 100
+EXPERIMENTS_DEFAULT_LIMIT = 20
+EXPERIMENTS_MAX_LIMIT = 100
+EXPERIMENT_LOGS_DEFAULT_LIMIT = 500
+EXPERIMENT_LOGS_MAX_LIMIT = 5000
+ACTIVITY_DEFAULT_LIMIT = 50
+ACTIVITY_MAX_LIMIT = 200
+OPERATION_CHAINS_DEFAULT_LIMIT = 20
+OPERATION_CHAINS_MAX_LIMIT = 100
 
 
 @lru_cache(maxsize=1)
@@ -435,7 +446,7 @@ def _prompt_preview(prompt: str, max_chars: int = CODEX_LIST_PROMPT_PREVIEW_CHAR
 @app.get("/codex/tasks", response_model=CodexTaskListResponse)
 def list_codex_tasks(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=CODEX_LIST_DEFAULT_LIMIT, ge=1, le=CODEX_LIST_MAX_LIMIT),
+    limit: int = Query(default=CODEX_LIST_DEFAULT_LIMIT, ge=LIMIT_MIN, le=CODEX_LIST_MAX_LIMIT),
     service: CodexTaskService = Depends(get_codex_service),
 ) -> CodexTaskListResponse:
     authorize(x_api_key)
@@ -502,7 +513,7 @@ def _approval_to_response(approval) -> MailboxTaskApproval:
 @app.get("/mailbox/tasks", response_model=MailboxTaskApprovalsResponse)
 def list_mailbox_tasks(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=MAILBOX_TASKS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=MAILBOX_TASKS_MAX_LIMIT),
     service: MailboxTaskService = Depends(get_mailbox_task_service),
 ) -> MailboxTaskApprovalsResponse:
     authorize(x_api_key)
@@ -694,7 +705,7 @@ def _outbox_entries(limit: int) -> list[MailboxMessageEntry]:
 
 @app.get("/mailbox/messages", response_model=MailboxMessagesResponse)
 def list_mailbox_messages(
-    limit: int = Query(default=_MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=1, le=_MAILBOX_MESSAGES_MAX_LIMIT),
+    limit: int = Query(default=_MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=LIMIT_MIN, le=_MAILBOX_MESSAGES_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> MailboxMessagesResponse:
     inbox = _inbox_entries(service, limit)
@@ -718,7 +729,7 @@ def list_mailbox_messages(
 @app.get("/experiments", response_model=ExperimentsResponse)
 def list_experiments(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=EXPERIMENTS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENTS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentsResponse:
     authorize(x_api_key)
@@ -759,7 +770,7 @@ def get_experiment_logs(
     x_api_key: str | None = Header(default=None),
     level: str | None = Query(default=None),
     phase: str | None = Query(default=None),
-    limit: int = Query(default=500, ge=1, le=5000),
+    limit: int = Query(default=EXPERIMENT_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENT_LOGS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentLogsResponse:
     """Single, chronological, structured view of one experiment's complete
@@ -993,7 +1004,7 @@ def list_public_activity(
 @app.get("/activity", response_model=DiagnosticActivityResponse)
 def list_activity(
     x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=ACTIVITY_DEFAULT_LIMIT, ge=LIMIT_MIN, le=ACTIVITY_MAX_LIMIT),
     experiment_id: str | None = Query(default=None),
     mailbox_task_id: str | None = Query(default=None),
     service: ExperimentService = Depends(get_experiment_service),
@@ -1217,7 +1228,7 @@ def get_operation_chain(
 
 @app.get("/operations/chains", response_model=list[OperationChainResult])
 def list_operation_chains(
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=OPERATION_CHAINS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=OPERATION_CHAINS_MAX_LIMIT),
     x_api_key: str | None = Header(default=None),
     service: OperationChainService = Depends(get_operation_chain_service),
 ) -> list[OperationChainResult]:
@@ -1227,7 +1238,7 @@ def list_operation_chains(
 
 @app.get("/diagnostics/public", response_model=PublicDiagnosticsResponse)
 def get_public_diagnostics(
-    limit: int = Query(default=_DIAGNOSTICS_DEFAULT_LIMIT, ge=1, le=_DIAGNOSTICS_MAX_LIMIT),
+    limit: int = Query(default=_DIAGNOSTICS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=_DIAGNOSTICS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
     mailbox_service: MailboxTaskService = Depends(get_mailbox_task_service),
 ) -> PublicDiagnosticsResponse:
