@@ -550,8 +550,7 @@ class OperationsExecutor:
             # systemd scope: kills all cgroup members regardless of setsid
             if scope_unit:
                 try:
-                    import subprocess as _sp
-                    _sp.run(
+                    subprocess.run(
                         ["systemctl", "--user", "stop", scope_unit],
                         timeout=5,
                         capture_output=True,

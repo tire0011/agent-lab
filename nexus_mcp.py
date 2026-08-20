@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -55,9 +56,6 @@ def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
     stdout state, so a test process that closes its pipe early cannot bypass
     the timeout.  The entire process group is killed when the deadline fires.
     """
-    import os as _os
-    import signal as _signal
-
     from modules.redaction import bounded_lines
 
     t0 = time.monotonic()
@@ -76,14 +74,14 @@ def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
             cwd=repo_root,
         ) as proc:
             try:
-                _pgid: int | None = _os.getpgid(proc.pid)
+                _pgid: int | None = os.getpgid(proc.pid)
             except (ProcessLookupError, OSError):
                 _pgid = None
 
             def _kill_tests_group() -> None:
                 if _pgid is not None:
                     try:
-                        _os.killpg(_pgid, _signal.SIGKILL)
+                        os.killpg(_pgid, signal.SIGKILL)
                     except (ProcessLookupError, OSError):
                         pass
 
@@ -95,6 +93,20 @@ def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
             timer = threading.Timer(timeout_seconds, _on_timeout)
             timer.daemon = True
             timer.start()
+
+            # killer_thread: wait for proc exit, set _proc_done, free pipe.
+            _proc_done = threading.Event()
+
+            def _killer() -> None:
+                try:
+                    proc.wait()
+                except (ChildProcessError, OSError):
+                    pass
+                _proc_done.set()
+                _kill_tests_group()
+
+            killer_thread = threading.Thread(target=_killer, daemon=True)
+            killer_thread.start()
 
             def _reader() -> None:
                 nonlocal total_bytes, truncated
@@ -133,13 +145,18 @@ def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
             reader_thread.start()
 
             reader_thread.join(timeout=timeout_seconds + 10)
-            timer.cancel()
+            # Only cancel the timer when the process is confirmed dead.
+            # If stdout was closed early (pipe-close bypass) the reader exits
+            # but the process is still running; the timer must NOT be cancelled.
+            if _proc_done.is_set():
+                timer.cancel()
 
             if reader_thread.is_alive():
                 timed_out = True
                 _kill_tests_group()
                 reader_thread.join(timeout=5)
 
+            killer_thread.join(timeout=5)
             proc.wait()
             returncode = proc.returncode if proc.returncode is not None else -1
     except Exception as exc:
