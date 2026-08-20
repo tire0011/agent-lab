@@ -22,6 +22,7 @@ _ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
 
 # Allowlist of service names that can appear in commit messages/file paths.
 _SAFE_FILE_PATTERN = re.compile(r"^[\w./\- ]+$")
+_DEPENDENCY_SYNC_TIMEOUT = 300
 
 
 def _validate_repo_path(repo_path: str) -> Path:
@@ -55,15 +56,35 @@ class GitOperations:
         self._repo_path = str(_validate_repo_path(repo_path))
 
     async def pull(self) -> dict:
-        """Run ``git pull`` and return a summary dict."""
+        """Run ``git pull``, then synchronize API dependencies on success."""
         rc, stdout, stderr = await _run(["git", "pull", "--ff-only"], self._repo_path)
-        success = rc == 0
         output = redact(stdout + stderr)
+        if rc != 0:
+            return {
+                "success": False,
+                "commits_pulled": 0,
+                "message": output.strip()[:500],
+            }
+
+        sync_script = str(Path(self._repo_path) / "scripts" / "sync-api-deps.sh")
+        sync_rc, sync_stdout, sync_stderr = await _run(
+            ["/bin/bash", sync_script],
+            self._repo_path,
+            timeout=_DEPENDENCY_SYNC_TIMEOUT,
+        )
+        if sync_rc != 0:
+            sync_output = redact(sync_stdout + sync_stderr).strip()[:400]
+            return {
+                "success": False,
+                "commits_pulled": 0,
+                "message": f"dependency synchronization failed: {sync_output}"[:500],
+            }
+
         # Count "fast-forward" lines as a proxy for commits pulled.
         commits_pulled = stdout.count("\n") - 1 if "Fast-forward" in stdout else 0
         commits_pulled = max(0, commits_pulled)
         return {
-            "success": success,
+            "success": True,
             "commits_pulled": commits_pulled,
             "message": output.strip()[:500],
         }
