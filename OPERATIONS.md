@@ -272,3 +272,43 @@ curl -s -X POST .../maintenance/execute \
 - Only `llama-server` and `agent-api` are accepted as service names.
 - All output is truncated and redacted (API keys, tokens, secrets).
 - Every operation call is written to an in-memory audit log (`GET /maintenance/audit`).
+
+---
+
+## MCP write tools (`MCP_WRITE_ENABLED`)
+
+The MCP server exposes write-capable tools (shell, git_pull, service_restart, …)
+when `MCP_WRITE_ENABLED=true` is set.  These are disabled by default.
+
+### Shell tool cgroup setup on the VM
+
+The `shell` tool wraps every command in a transient systemd scope
+(`systemd-run --scope`) to guarantee all spawned processes (including those
+that call `setsid()`) are killed when the scope ends.  The tool refuses to
+execute without a working scope.
+
+Two modes are probed at startup:
+
+1. **User scope** (`--user`): requires the service user to have an active user
+   manager.  Enable this with:
+   ```bash
+   # Run once as root on the VM:
+   loginctl enable-linger <service-user>   # e.g. loginctl enable-linger agent
+   ```
+   Then add `XDG_RUNTIME_DIR=/run/user/<uid>` to the service env file
+   (`/etc/agent-api.env`) and restart `agent-api`.  User scope is the
+   preferred mode.
+
+2. **System scope** (no `--user` flag): used when the process has sufficient
+   privileges (running as root or with `CAP_SYS_ADMIN`).  Applicable when
+   `agent-api` runs as root or is granted the capability explicitly.
+
+If neither probe succeeds the shell tool returns `success=False` with a
+descriptive error message.  No unsafe pgid-only fallback is used.
+
+Enable write tools at runtime:
+```bash
+# Add to /etc/agent-api.env, then restart:
+MCP_WRITE_ENABLED=true
+XDG_RUNTIME_DIR=/run/user/1001    # replace 1001 with the service user's UID
+```

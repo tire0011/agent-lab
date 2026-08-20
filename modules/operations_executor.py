@@ -128,36 +128,60 @@ _SHELL_MAX_TIMEOUT: int = 120         # hard ceiling in seconds
 _SHELL_DEFAULT_TIMEOUT: int = 30
 _SHELL_MAX_OUTPUT_BYTES: int = 16_384  # 16 KiB before truncation
 
-# Path to ``systemd-run`` **only** when a ``--scope --user`` invocation is
-# actually usable on this host.  Checking binary existence alone is not
-# sufficient: on hosts where ``agent-api`` runs as a *system* service (not a
-# user session) the binary is present but ``systemd --user`` is not started
-# and every ``--scope --user`` call fails with "Failed to connect to bus".  A
-# trivial probe at import time detects this reliably.
-def _probe_systemd_scope() -> str | None:
-    """Return the path to ``systemd-run`` only if a scope can actually be
-    created on this host, otherwise ``None``."""
+# Path to ``systemd-run`` and the scope mode (``"user"`` or ``"system"``)
+# when a ``--scope`` invocation is actually usable on this host.
+#
+# Two modes are probed in order:
+#   1. ``--user`` scope — works in a user session or when user lingering is
+#      enabled (``loginctl enable-linger <user>`` + ``XDG_RUNTIME_DIR`` set).
+#      This is the preferred mode.
+#   2. System scope (no ``--user`` flag) — available when the process has
+#      sufficient privileges (root or ``CAP_SYS_ADMIN``).  Used when
+#      ``agent-api`` runs as a *system* service without a user manager.
+#
+# Checking binary existence alone is not sufficient: the binary may be present
+# but ``systemd --user`` unreachable ("Failed to connect to bus"), or the
+# process may lack permissions for system scope.  The probe detects both cases.
+#
+# On the VM: enable user scope for the service user with
+#   loginctl enable-linger <user>
+# and add ``XDG_RUNTIME_DIR=/run/user/<uid>`` to the service environment file
+# (``/etc/agent-api.env``).  Then restart ``agent-api`` — the probe will
+# succeed with ``"user"`` mode and the shell tool becomes available.
+def _probe_systemd_scope() -> tuple[str, str] | None:
+    """Return ``(systemd_run_path, mode)`` if a scope can be created, else ``None``.
+
+    *mode* is ``"user"`` when ``--scope --user`` works, ``"system"`` when the
+    process can create a system-level scope.  Returns ``None`` if neither works.
+    """
     path = shutil.which("systemd-run")
     if path is None:
         return None
-    try:
-        result = subprocess.run(
-            [
-                path, "--scope", "--user", "--collect", "--quiet",
-                "--unit=nexus-probe.scope",
-                "-p", "KillMode=control-group",
-                "/bin/true",
-            ],
-            timeout=5,
-            capture_output=True,
-        )
-        return path if result.returncode == 0 else None
-    except Exception:
-        return None
+
+    def _try(extra_flags: list[str], unit_suffix: str) -> bool:
+        try:
+            r = subprocess.run(
+                [path, "--scope"] + extra_flags + [
+                    "--collect", "--quiet",
+                    f"--unit=nexus-probe-{unit_suffix}.scope",
+                    "-p", "KillMode=control-group",
+                    "/bin/true",
+                ],
+                timeout=5,
+                capture_output=True,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    if _try(["--user"], "user"):
+        return (path, "user")
+    if _try([], "system"):
+        return (path, "system")
+    return None
 
 
-_SYSTEMD_RUN: str | None = _probe_systemd_scope()
-
+_SYSTEMD_SCOPE: tuple[str, str] | None = _probe_systemd_scope()
 # Secrets that must never appear in responses.
 _SECRET_ENV_VARS: frozenset[str] = frozenset({
     "AGENT_API_KEY",
@@ -526,8 +550,9 @@ class OperationsExecutor:
 
         Confinement strategy
         --------------------
-        The command is wrapped in a transient user-scoped cgroup via
-        ``systemd-run --scope --user``.  Every process spawned by the shell —
+        The command is wrapped in a transient cgroup via ``systemd-run --scope``.
+        The mode (``user`` or ``system``) is selected at import time by
+        :func:`_probe_systemd_scope`.  Every process spawned by the shell —
         including those that call ``setsid()`` — remains inside the same cgroup
         and is killed when the scope is stopped.
 
@@ -551,26 +576,34 @@ class OperationsExecutor:
 
         Scope cleanup
         -------------
-        If ``systemctl --user stop`` fails, the scope may not have been fully
-        torn down.  In that case ``success`` is forced to ``False`` so the
-        caller is never silently told the operation succeeded when the cleanup
-        boundary is broken.
+        Cleanup is idempotent: if the scope has already been collected by
+        systemd (because the shell exited normally and ``--collect`` triggered
+        auto-removal) ``systemctl stop`` returns non-zero, but
+        ``systemctl is-active`` will confirm the unit is inactive.  That case
+        is treated as success.  Only when the unit is still active but cannot
+        be stopped is ``success`` forced to ``False``.
         """
         import subprocess
         import threading
 
         # Fail-closed: refuse to run without a real cgroup kill boundary.
-        if not _SYSTEMD_RUN:
+        if not _SYSTEMD_SCOPE:
             return {
                 "success": False,
                 "exit_code": -1,
                 "truncated": False,
                 "output": (
                     "shell: cgroup confinement unavailable — "
-                    "systemd-run --scope --user is not usable on this host. "
-                    "Refusing to execute without a reliable kill boundary."
+                    "systemd-run --scope is not usable on this host "
+                    "(neither user-scope nor system-scope probe succeeded). "
+                    "Refusing to execute without a reliable kill boundary.\n"
+                    "To enable user-scope: loginctl enable-linger <user> and "
+                    "set XDG_RUNTIME_DIR=/run/user/<uid> in the service env."
                 ),
             }
+
+        _sdr_path, _scope_mode = _SYSTEMD_SCOPE
+        _mode_flags = ["--user"] if _scope_mode == "user" else []
 
         chunks: list[bytes] = []
         total_bytes = 0
@@ -580,7 +613,7 @@ class OperationsExecutor:
 
         scope_unit = f"nexus-shell-{uuid.uuid4().hex[:12]}.scope"
         argv = [
-            _SYSTEMD_RUN, "--scope", "--user", "--collect", "--quiet",
+            _sdr_path, "--scope"] + _mode_flags + ["--collect", "--quiet",
             f"--unit={scope_unit}",
             "-p", "KillMode=control-group",
             "/bin/sh", "-c", command,
@@ -589,21 +622,38 @@ class OperationsExecutor:
         def _kill_scope_and_group(pgid: int | None) -> None:
             """Stop the scope cgroup; also kill pgid as belt-and-suspenders.
 
-            Sets ``cleanup_failed`` in the enclosing scope if
-            ``systemctl --user stop`` exits non-zero or raises, so the
-            final result can report the failure instead of silently returning
-            ``success=True``.
+            Idempotent: if the scope was already auto-collected by systemd
+            (``--collect`` on normal exit), ``systemctl stop`` returns non-zero
+            but ``is-active`` confirms the unit is inactive — that is success.
+            Only when the scope is still active but stop fails is
+            ``cleanup_failed`` set.
             """
             nonlocal cleanup_failed
             # systemd scope: kills all cgroup members regardless of setsid
             try:
                 r = subprocess.run(
-                    ["systemctl", "--user", "stop", scope_unit],
+                    ["systemctl"] + _mode_flags + ["stop", scope_unit],
                     timeout=5,
                     capture_output=True,
                 )
                 if r.returncode != 0:
-                    cleanup_failed = True
+                    # Idempotency: check whether the unit is already inactive.
+                    # systemctl is-active returns 0 (active) or non-zero
+                    # (inactive/not-found/error).  Any non-zero reply means the
+                    # scope is gone — treat that as successful cleanup.
+                    try:
+                        ia = subprocess.run(
+                            ["systemctl"] + _mode_flags + ["is-active", scope_unit],
+                            timeout=3,
+                            capture_output=True,
+                        )
+                        if ia.returncode == 0:
+                            # Unit still active — stop genuinely failed.
+                            cleanup_failed = True
+                        # else: inactive/not-found → auto-collected, success.
+                    except Exception:
+                        # Cannot verify state; assume cleanup failed to be safe.
+                        cleanup_failed = True
             except Exception:
                 cleanup_failed = True
             # Belt-and-suspenders: also kill the pgid directly.
