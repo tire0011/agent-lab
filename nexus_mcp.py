@@ -107,8 +107,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         return _call_api(_api().chat, ChatRequest(message=message))
 
     @mcp.tool(description="GET /codex/tasks", structured_output=True)
-    def codex_tasks_list(limit: int = 20) -> dict[str, Any]:
+    def codex_tasks_list(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()
+        limit = nexus_api.CODEX_LIST_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.CODEX_LIST_MAX_LIMIT)
         return _call_api(
             nexus_api.list_codex_tasks,
@@ -128,8 +129,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         )
 
     @mcp.tool(description="GET /mailbox/tasks", structured_output=True)
-    def mailbox_tasks_list(limit: int = 20) -> dict[str, Any]:
+    def mailbox_tasks_list(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()
+        limit = nexus_api.MAILBOX_TASKS_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.MAILBOX_TASKS_MAX_LIMIT)
         return _call_api(
             nexus_api.list_mailbox_tasks,
@@ -149,8 +151,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         )
 
     @mcp.tool(description="GET /mailbox/messages", structured_output=True)
-    def mailbox_messages_list(limit: int = 20) -> dict[str, Any]:
+    def mailbox_messages_list(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()
+        limit = nexus_api.MAILBOX_MESSAGES_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.MAILBOX_MESSAGES_MAX_LIMIT)
         return _call_api(
             nexus_api.list_mailbox_messages,
@@ -159,8 +162,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         )
 
     @mcp.tool(description="GET /experiments", structured_output=True)
-    def experiments_list(limit: int = 20) -> dict[str, Any]:
+    def experiments_list(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()
+        limit = nexus_api.EXPERIMENTS_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.EXPERIMENTS_MAX_LIMIT)
         return _call_api(
             nexus_api.list_experiments,
@@ -182,11 +186,12 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
     @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
     def experiment_logs(
         experiment_id: str,
-        limit: int = 500,
+        limit: int | None = None,
         level: str | None = None,
         phase: str | None = None,
     ) -> dict[str, Any]:
         nexus_api = _api()
+        limit = nexus_api.EXPERIMENT_LOGS_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.EXPERIMENT_LOGS_MAX_LIMIT)
         return _call_api(
             nexus_api.get_experiment_logs,
@@ -228,11 +233,12 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
 
     @mcp.tool(description="GET /activity", structured_output=True)
     def activity_list(
-        limit: int = 50,
+        limit: int | None = None,
         experiment_id: str | None = None,
         mailbox_task_id: str | None = None,
     ) -> dict[str, Any]:
         nexus_api = _api()
+        limit = nexus_api.ACTIVITY_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.ACTIVITY_MAX_LIMIT)
         return _call_api(
             nexus_api.list_activity,
@@ -244,8 +250,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         )
 
     @mcp.tool(description="GET /diagnostics/public", structured_output=True)
-    def diagnostics_public_get(limit: int = 10) -> dict[str, Any]:
+    def diagnostics_public_get(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()
+        limit = nexus_api.DIAGNOSTICS_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.DIAGNOSTICS_MAX_LIMIT)
         return _call_api(
             nexus_api.get_public_diagnostics,
@@ -264,8 +271,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         )
 
     @mcp.tool(description="GET /operations/chains", structured_output=True)
-    def operation_chains_list(limit: int = 20) -> list[dict[str, Any]]:
+    def operation_chains_list(limit: int | None = None) -> list[dict[str, Any]]:
         nexus_api = _api()
+        limit = nexus_api.OPERATION_CHAINS_DEFAULT_LIMIT if limit is None else limit
         limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.OPERATION_CHAINS_MAX_LIMIT)
         return _call_api(
             nexus_api.list_operation_chains,
