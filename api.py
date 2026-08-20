@@ -625,8 +625,8 @@ async def mailbox_github_webhook(
 # out, without ever exposing full prompts, file paths, or secrets.
 # ---------------------------------------------------------------------------
 
-_MAILBOX_MESSAGES_DEFAULT_LIMIT = 20
-_MAILBOX_MESSAGES_MAX_LIMIT = 100
+MAILBOX_MESSAGES_DEFAULT_LIMIT = 20
+MAILBOX_MESSAGES_MAX_LIMIT = 100
 
 _MAILBOX_TYPE_LABELS_DE = {
     "idea": "Idee",
@@ -705,7 +705,7 @@ def _outbox_entries(limit: int) -> list[MailboxMessageEntry]:
 
 @app.get("/mailbox/messages", response_model=MailboxMessagesResponse)
 def list_mailbox_messages(
-    limit: int = Query(default=_MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=LIMIT_MIN, le=_MAILBOX_MESSAGES_MAX_LIMIT),
+    limit: int = Query(default=MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=LIMIT_MIN, le=MAILBOX_MESSAGES_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> MailboxMessagesResponse:
     inbox = _inbox_entries(service, limit)
@@ -1051,8 +1051,8 @@ def list_activity(
 # unrestricted/raw command output.
 # ---------------------------------------------------------------------------
 
-_DIAGNOSTICS_DEFAULT_LIMIT = 10
-_DIAGNOSTICS_MAX_LIMIT = 100
+DIAGNOSTICS_DEFAULT_LIMIT = 10
+DIAGNOSTICS_MAX_LIMIT = 100
 
 
 @lru_cache(maxsize=1)
@@ -1238,7 +1238,7 @@ def list_operation_chains(
 
 @app.get("/diagnostics/public", response_model=PublicDiagnosticsResponse)
 def get_public_diagnostics(
-    limit: int = Query(default=_DIAGNOSTICS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=_DIAGNOSTICS_MAX_LIMIT),
+    limit: int = Query(default=DIAGNOSTICS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=DIAGNOSTICS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
     mailbox_service: MailboxTaskService = Depends(get_mailbox_task_service),
 ) -> PublicDiagnosticsResponse:

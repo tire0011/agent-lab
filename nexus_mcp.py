@@ -151,7 +151,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
     @mcp.tool(description="GET /mailbox/messages", structured_output=True)
     def mailbox_messages_list(limit: int = 20) -> dict[str, Any]:
         nexus_api = _api()
-        limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api._MAILBOX_MESSAGES_MAX_LIMIT)
+        limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.MAILBOX_MESSAGES_MAX_LIMIT)
         return _call_api(
             nexus_api.list_mailbox_messages,
             limit=limit,
@@ -246,7 +246,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
     @mcp.tool(description="GET /diagnostics/public", structured_output=True)
     def diagnostics_public_get(limit: int = 10) -> dict[str, Any]:
         nexus_api = _api()
-        limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api._DIAGNOSTICS_MAX_LIMIT)
+        limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.DIAGNOSTICS_MAX_LIMIT)
         return _call_api(
             nexus_api.get_public_diagnostics,
             limit=limit,
