@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
+import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,10 +23,167 @@ def _api():
     return nexus_api
 
 
+def _write_enabled() -> bool:
+    """Return True when MCP write tools are active (``MCP_WRITE_ENABLED=true``)."""
+    return os.environ.get("MCP_WRITE_ENABLED", "").lower() == "true"
+
+
+def _require_write_enabled() -> None:
+    """Raise ValueError if write tools are disabled."""
+    if not _write_enabled():
+        raise ValueError(
+            "Write tools are disabled. Set MCP_WRITE_ENABLED=true to enable them."
+        )
+
 def _internal_api_key() -> str:
     nexus_api = _api()
     return getattr(nexus_api, "API_KEY", os.environ["AGENT_API_KEY"])
 
+
+# ---------------------------------------------------------------------------
+# Test-runner helper — module-level so it is importable and testable directly.
+# ---------------------------------------------------------------------------
+
+#: Hard cap on bytes buffered from the test runner during execution.
+#: Output is additionally bounded to 200 lines before being returned.
+_TESTS_MAX_OUTPUT_BYTES: int = 512 * 1024  # 512 KiB
+
+
+def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
+    """Run ``python -m unittest discover`` with streaming output bounding.
+
+    A ``threading.Timer`` enforces the wall-clock deadline independently of
+    stdout state, so a test process that closes its pipe early cannot bypass
+    the timeout.  The entire process group is killed when the deadline fires.
+    """
+    from modules.redaction import bounded_lines
+
+    t0 = time.monotonic()
+    chunks: list[bytes] = []
+    total_bytes = 0
+    timed_out = False
+    truncated = False
+    returncode = -1
+
+    try:
+        with subprocess.Popen(
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=repo_root,
+        ) as proc:
+            try:
+                _pgid: int | None = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                _pgid = None
+
+            def _kill_tests_group() -> None:
+                if _pgid is not None:
+                    try:
+                        os.killpg(_pgid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+
+            def _on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                _kill_tests_group()
+
+            timer = threading.Timer(timeout_seconds, _on_timeout)
+            timer.daemon = True
+            timer.start()
+
+            # killer_thread: wait for proc exit, set _proc_done, free pipe.
+            _proc_done = threading.Event()
+
+            def _killer() -> None:
+                try:
+                    proc.wait()
+                except (ChildProcessError, OSError):
+                    pass
+                _proc_done.set()
+                _kill_tests_group()
+
+            killer_thread = threading.Thread(target=_killer, daemon=True)
+            killer_thread.start()
+
+            def _reader() -> None:
+                nonlocal total_bytes, truncated
+                assert proc.stdout is not None
+                while True:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    remaining = _TESTS_MAX_OUTPUT_BYTES - total_bytes
+                    if remaining <= 0:
+                        truncated = True
+                        _kill_tests_group()
+                        while proc.stdout.read(4096):
+                            pass
+                        break
+                    if len(chunk) > remaining:
+                        chunks.append(chunk[:remaining])
+                        total_bytes += remaining
+                        truncated = True
+                        _kill_tests_group()
+                        while proc.stdout.read(4096):
+                            pass
+                        break
+                    chunks.append(chunk)
+                    total_bytes += len(chunk)
+                    if total_bytes >= _TESTS_MAX_OUTPUT_BYTES:
+                        lookahead = proc.stdout.read(1)
+                        if lookahead:
+                            truncated = True
+                            _kill_tests_group()
+                            while proc.stdout.read(4096):
+                                pass
+                        break
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            reader_thread.join(timeout=timeout_seconds + 10)
+            # Only cancel the timer when the process is confirmed dead.
+            # If stdout was closed early (pipe-close bypass) the reader exits
+            # but the process is still running; the timer must NOT be cancelled.
+            if _proc_done.is_set():
+                timer.cancel()
+
+            if reader_thread.is_alive():
+                timed_out = True
+                _kill_tests_group()
+                reader_thread.join(timeout=5)
+
+            killer_thread.join(timeout=5)
+            proc.wait()
+            returncode = proc.returncode if proc.returncode is not None else -1
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return {
+            "success": False,
+            "exit_code": -1,
+            "elapsed_ms": elapsed_ms,
+            "lines": [f"[error: {exc}]"],
+        }
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if timed_out:
+        return {
+            "success": False,
+            "exit_code": -1,
+            "elapsed_ms": elapsed_ms,
+            "lines": [f"[timed out after {timeout_seconds}s]"],
+        }
+    combined = b"".join(chunks).decode(errors="replace")
+    return {
+        "success": returncode == 0,
+        "exit_code": returncode,
+        "elapsed_ms": elapsed_ms,
+        "truncated": truncated,
+        "lines": bounded_lines(combined, max_lines=200, max_line_chars=500),
+    }
 
 def _jsonable(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -309,6 +471,139 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             x_api_key=_internal_api_key(),
             service=nexus_api._resolve_maintenance_service(),
         )
+
+    # ------------------------------------------------------------------
+    # Write tools — only active when MCP_WRITE_ENABLED=true
+    # All tools call _require_write_enabled() as their first action so
+    # they fail immediately (and loudly) when the flag is off.
+    # ------------------------------------------------------------------
+
+    @mcp.tool(
+        description=(
+            "Pull the latest commits for /agent via git pull --ff-only. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def git_pull() -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute("git/pull", {})
+        return {"success": result.success, "data": result.data, "error": result.error}
+
+    @mcp.tool(
+        description=(
+            "Restart a systemd service by name. Allowed names: agent-api, nexus-mailbox, "
+            "llama-server, all. Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def service_restart(service: str) -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute("services/restart", {"service": service})
+        return {"success": result.success, "data": result.data, "error": result.error}
+
+    @mcp.tool(
+        description=(
+            "Return the systemd status of all allowed services. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def service_status() -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute("services/status", {})
+        return {"success": result.success, "data": result.data, "error": result.error}
+
+    @mcp.tool(
+        description=(
+            "Run the bounded test suite (python -m unittest discover -s tests -q) "
+            "with a configurable timeout (default 120 s, max 300 s). "
+            "Returns redacted, truncated output. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def run_tests(timeout_seconds: int = 120) -> dict[str, Any]:
+        _require_write_enabled()
+        import asyncio as _asyncio
+
+        timeout_seconds = max(10, min(timeout_seconds, 300))
+        repo_root = os.environ.get("AGENT_FS_ROOT", "/agent")
+        return await _asyncio.to_thread(_run_tests_sync, timeout_seconds, repo_root)
+
+    @mcp.tool(
+        description=(
+            "Create and start a self-improvement experiment with the given goal. "
+            "Returns experiment_id immediately; poll experiment_get for status. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def experiment_start(goal: str) -> dict[str, Any]:
+        _require_write_enabled()
+        import asyncio as _asyncio
+        import threading
+
+        nexus_api = _api()
+        svc = nexus_api._resolve_experiment_service()
+        # create_experiment does SQLite I/O; run it off the event loop thread.
+        experiment = await _asyncio.to_thread(svc.create_experiment, goal)
+
+        def _run():
+            try:
+                svc.run_experiment(experiment.id)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_run, daemon=True, name=f"mcp-exp-{experiment.id[:8]}")
+        t.start()
+        return {"experiment_id": experiment.id, "status": experiment.status}
+
+    @mcp.tool(
+        description=(
+            "Route a task through the local llama-cpp router and return the decision. "
+            "Returns decision, provider, role, and reasoning. "
+            "Requires MCP_WRITE_ENABLED=true and a running llama-server."
+        ),
+        structured_output=True,
+    )
+    async def router_run(task: str) -> dict[str, Any]:
+        _require_write_enabled()
+        from modules.llama_router import LlamaRouter
+
+        router = LlamaRouter()
+        decision = await router.route(task)
+        return {
+            "decision": decision.decision,
+            "provider": decision.provider,
+            "role": decision.role,
+            "reasoning": decision.reasoning,
+            "confidence": decision.confidence,
+        }
+
+    @mcp.tool(
+        description=(
+            "Execute an arbitrary shell command as the service user with cwd /agent. "
+            "Bounded timeout (default 30 s, max 120 s) and output (16 KiB). "
+            "Output is redacted. Command and result are audit-logged. "
+            "TEMPORARY bootstrap tool — only available when MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def shell(command: str, timeout_seconds: int = 30) -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute(
+            "shell", {"command": command, "timeout_seconds": timeout_seconds}
+        )
+        return {"success": result.success, "data": result.data, "error": result.error}
 
     subapp = FastAPI()
 

@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import time
 import uuid
@@ -37,6 +38,11 @@ _LOCK_STALE_AGE_SECONDS: int = 3600  # 1 hour
 
 # Keys whose values must never be stored in the audit log parameters/results.
 _AUDIT_REDACT_KEYS_RE = re.compile(r"(?i)(key|secret|token|password|credential|value)")
+
+# Keys whose string values must be run through the string redactor before
+# storage (they may contain embedded secrets even though the key name itself
+# does not match the sensitive-key pattern).
+_AUDIT_REDACT_VALUE_KEYS: frozenset[str] = frozenset({"command"})
 
 
 def _is_stale_lock(path: Path) -> bool:
@@ -93,8 +99,11 @@ def _redact_audit_dict(d: dict | None) -> dict:
     """Return a deep copy of *d* with sensitive values replaced at any depth.
 
     Keys matching the sensitive-key pattern have their value replaced with
-    ``"***"`` regardless of how deeply they are nested.  Non-sensitive values
-    are recursed into so that nested structures are also sanitized.
+    ``"***"`` regardless of how deeply they are nested.  Keys in
+    ``_AUDIT_REDACT_VALUE_KEYS`` have their string values run through the
+    string redactor so that embedded secrets (e.g. tokens inside a shell
+    command) are also sanitised.  Non-sensitive values are recursed into so
+    that nested structures are also sanitized.
 
     If *d* is not a dict (e.g. ``None`` for failed operations), returns ``{}``.
     """
@@ -104,6 +113,8 @@ def _redact_audit_dict(d: dict | None) -> dict:
     for k, v in d.items():
         if _AUDIT_REDACT_KEYS_RE.search(str(k)):
             out[k] = "***"
+        elif k in _AUDIT_REDACT_VALUE_KEYS and isinstance(v, str):
+            out[k] = redact(v)
         else:
             out[k] = _redact_audit_value(v)
     return out
@@ -112,6 +123,65 @@ _logger = logging.getLogger(__name__)
 
 _ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
 
+# Shell tool limits (bootstrap-phase only, available when MCP_WRITE_ENABLED=true).
+_SHELL_MAX_TIMEOUT: int = 120         # hard ceiling in seconds
+_SHELL_DEFAULT_TIMEOUT: int = 30
+_SHELL_MAX_OUTPUT_BYTES: int = 16_384  # 16 KiB before truncation
+
+# Path to ``systemd-run`` and the scope mode (``"user"`` or ``"system"``)
+# when a ``--scope`` invocation is actually usable on this host.
+#
+# Two modes are probed in order:
+#   1. ``--user`` scope — works in a user session or when user lingering is
+#      enabled (``loginctl enable-linger <user>`` + ``XDG_RUNTIME_DIR`` set).
+#      This is the preferred mode.
+#   2. System scope (no ``--user`` flag) — available when the process has
+#      sufficient privileges (root or ``CAP_SYS_ADMIN``).  Used when
+#      ``agent-api`` runs as a *system* service without a user manager.
+#
+# Checking binary existence alone is not sufficient: the binary may be present
+# but ``systemd --user`` unreachable ("Failed to connect to bus"), or the
+# process may lack permissions for system scope.  The probe detects both cases.
+#
+# On the VM: enable user scope for the service user with
+#   loginctl enable-linger <user>
+# and add ``XDG_RUNTIME_DIR=/run/user/<uid>`` to the service environment file
+# (``/etc/agent-api.env``).  Then restart ``agent-api`` — the probe will
+# succeed with ``"user"`` mode and the shell tool becomes available.
+def _probe_systemd_scope() -> tuple[str, str] | None:
+    """Return ``(systemd_run_path, mode)`` if a scope can be created, else ``None``.
+
+    *mode* is ``"user"`` when ``--scope --user`` works, ``"system"`` when the
+    process can create a system-level scope.  Returns ``None`` if neither works.
+    """
+    path = shutil.which("systemd-run")
+    if path is None:
+        return None
+
+    def _try(extra_flags: list[str], unit_suffix: str) -> bool:
+        try:
+            r = subprocess.run(
+                [path, "--scope"] + extra_flags + [
+                    "--collect", "--quiet",
+                    f"--unit=nexus-probe-{unit_suffix}.scope",
+                    "-p", "KillMode=control-group",
+                    "/bin/true",
+                ],
+                timeout=5,
+                capture_output=True,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    if _try(["--user"], "user"):
+        return (path, "user")
+    if _try([], "system"):
+        return (path, "system")
+    return None
+
+
+_SYSTEMD_SCOPE: tuple[str, str] | None = _probe_systemd_scope()
 # Secrets that must never appear in responses.
 _SECRET_ENV_VARS: frozenset[str] = frozenset({
     "AGENT_API_KEY",
@@ -455,6 +525,289 @@ class OperationsExecutor:
                     "response": None, "error": type(exc).__name__}
 
     # ------------------------------------------------------------------
+    # Bootstrap shell (bounded, redacted, audited)
+    # ------------------------------------------------------------------
+
+    async def shell(self, command: str, timeout_seconds: int = _SHELL_DEFAULT_TIMEOUT) -> dict:
+        """Run *command* in a bounded, audited shell.
+
+        Only available when ``MCP_WRITE_ENABLED=true``. Executes as the current
+        service user with cwd ``AGENT_FS_ROOT`` (default ``/agent``). The
+        process is started in its own process group so that the entire group
+        (including any child processes) is reliably killed on timeout or output
+        overflow — preventing background-daemon spawning.  Output is streamed
+        with a hard byte cap; the process is killed if the cap is exceeded.
+        Output is redacted before returning.
+        """
+        if not command or not command.strip():
+            raise ValueError("command must not be empty")
+        timeout_seconds = max(1, min(timeout_seconds, _SHELL_MAX_TIMEOUT))
+        cwd: str | None = os.environ.get("AGENT_FS_ROOT", "/agent") or None
+        return await asyncio.to_thread(self._shell_sync, command, timeout_seconds, cwd)
+
+    def _shell_sync(self, command: str, timeout_seconds: int, cwd: str | None) -> dict:
+        """Synchronous core of :meth:`shell`; runs in a thread pool worker.
+
+        Confinement strategy
+        --------------------
+        The command is wrapped in a transient cgroup via ``systemd-run --scope``.
+        The mode (``user`` or ``system``) is selected at import time by
+        :func:`_probe_systemd_scope`.  Every process spawned by the shell —
+        including those that call ``setsid()`` — remains inside the same cgroup
+        and is killed when the scope is stopped.
+
+        The shell **refuses to execute** (returns ``success=False``) when a
+        usable cgroup scope cannot be established.  There is no unsafe fallback
+        to pgid-only kill: a ``setsid`` child can escape a bare process group,
+        which violates the "no background daemon spawning" contract.
+
+        Timeout enforcement
+        -------------------
+        A ``threading.Timer`` fires after exactly *timeout_seconds* and kills
+        the scope regardless of whether the stdout pipe has been closed.  This
+        prevents commands like ``exec >/dev/null 2>&1; sleep 300`` from
+        bypassing the deadline by closing the pipe early.
+
+        Killing on normal exit
+        ----------------------
+        A ``killer_thread`` blocks on ``proc.wait()`` and kills the scope as
+        soon as the shell exits with any code, freeing pipes that background
+        children may be holding open.
+
+        Scope cleanup
+        -------------
+        Cleanup is idempotent: if the scope has already been collected by
+        systemd (because the shell exited normally and ``--collect`` triggered
+        auto-removal) ``systemctl stop`` returns non-zero, but
+        ``systemctl is-active`` will confirm the unit is inactive.  That case
+        is treated as success.  Only when the unit is still active but cannot
+        be stopped is ``success`` forced to ``False``.
+        """
+        import subprocess
+        import threading
+
+        # Fail-closed: refuse to run without a real cgroup kill boundary.
+        if not _SYSTEMD_SCOPE:
+            return {
+                "success": False,
+                "exit_code": -1,
+                "truncated": False,
+                "output": (
+                    "shell: cgroup confinement unavailable — "
+                    "systemd-run --scope is not usable on this host "
+                    "(neither user-scope nor system-scope probe succeeded). "
+                    "Refusing to execute without a reliable kill boundary.\n"
+                    "To enable user-scope: loginctl enable-linger <user> and "
+                    "set XDG_RUNTIME_DIR=/run/user/<uid> in the service env."
+                ),
+            }
+
+        _sdr_path, _scope_mode = _SYSTEMD_SCOPE
+        _mode_flags = ["--user"] if _scope_mode == "user" else []
+
+        chunks: list[bytes] = []
+        total_bytes = 0
+        truncated = False
+        timed_out = False
+        cleanup_failed = False
+
+        scope_unit = f"nexus-shell-{uuid.uuid4().hex[:12]}.scope"
+        argv = [
+            _sdr_path, "--scope"] + _mode_flags + ["--collect", "--quiet",
+            f"--unit={scope_unit}",
+            "-p", "KillMode=control-group",
+            "/bin/sh", "-c", command,
+        ]
+
+        def _kill_scope_and_group(pgid: int | None) -> None:
+            """Stop the scope cgroup; also kill pgid as belt-and-suspenders.
+
+            Idempotent: if the scope was already auto-collected by systemd
+            (``--collect`` on normal exit), ``systemctl stop`` returns non-zero
+            but ``is-active`` confirms the unit is inactive — that is success.
+            Only when the scope is still active but stop fails is
+            ``cleanup_failed`` set.
+            """
+            nonlocal cleanup_failed
+            # systemd scope: kills all cgroup members regardless of setsid
+            try:
+                r = subprocess.run(
+                    ["systemctl"] + _mode_flags + ["stop", scope_unit],
+                    timeout=5,
+                    capture_output=True,
+                )
+                if r.returncode != 0:
+                    # Idempotency: check whether the unit is already inactive.
+                    # systemctl is-active returns 0 (active) or non-zero
+                    # (inactive/not-found/error).  Any non-zero reply means the
+                    # scope is gone — treat that as successful cleanup.
+                    try:
+                        ia = subprocess.run(
+                            ["systemctl"] + _mode_flags + ["is-active", scope_unit],
+                            timeout=3,
+                            capture_output=True,
+                        )
+                        if ia.returncode == 0:
+                            # Unit still active — stop genuinely failed.
+                            cleanup_failed = True
+                        # else: inactive/not-found → auto-collected, success.
+                    except Exception:
+                        # Cannot verify state; assume cleanup failed to be safe.
+                        cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+            # Belt-and-suspenders: also kill the pgid directly.
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+        with subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # safe in multithreaded/asyncio contexts
+            cwd=cwd,
+        ) as proc:
+            # Capture PGID immediately while the process is alive.
+            try:
+                _pgid: int | None = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                _pgid = None
+
+            def _kill() -> None:
+                _kill_scope_and_group(_pgid)
+
+            # ------------------------------------------------------------------
+            # Absolute deadline timer — fires after timeout_seconds regardless
+            # of stdout state.  Prevents pipe-close bypass.
+            # ------------------------------------------------------------------
+            def _on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                _kill()
+
+            timer = threading.Timer(timeout_seconds, _on_timeout)
+            timer.daemon = True
+            timer.start()
+
+            # ------------------------------------------------------------------
+            # killer_thread: wait for shell exit then free the pipe; sets
+            # _proc_done so the main thread knows the process is truly gone.
+            # ------------------------------------------------------------------
+            _proc_done = threading.Event()
+
+            def _killer() -> None:
+                try:
+                    proc.wait()
+                except (ChildProcessError, OSError):
+                    pass
+                _proc_done.set()
+                _kill()
+
+            killer_thread = threading.Thread(target=_killer, daemon=True)
+            killer_thread.start()
+
+            # ------------------------------------------------------------------
+            # reader_thread: bounded stdout read
+            # ------------------------------------------------------------------
+            def _reader() -> None:
+                nonlocal total_bytes, truncated
+                assert proc.stdout is not None
+                chunk_size = 4096
+                while True:
+                    chunk = proc.stdout.read(chunk_size)
+                    if not chunk:
+                        break
+                    remaining = _SHELL_MAX_OUTPUT_BYTES - total_bytes
+                    if remaining <= 0:
+                        truncated = True
+                        _kill()
+                        while proc.stdout.read(chunk_size):
+                            pass
+                        break
+                    if len(chunk) > remaining:
+                        # Bytes beyond the cap were already consumed —
+                        # trimming always means truncation.
+                        chunks.append(chunk[:remaining])
+                        total_bytes += remaining
+                        truncated = True
+                        _kill()
+                        while proc.stdout.read(chunk_size):
+                            pass
+                        break
+                    chunks.append(chunk)
+                    total_bytes += len(chunk)
+                    if total_bytes >= _SHELL_MAX_OUTPUT_BYTES:
+                        # One-byte lookahead: if EOF the output was exactly at
+                        # the cap (not truncated); if a byte is returned we are
+                        # over the cap and the byte is correctly discarded.
+                        lookahead = proc.stdout.read(1)
+                        if lookahead:
+                            truncated = True
+                            _kill()
+                            while proc.stdout.read(chunk_size):
+                                pass
+                        break
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            # ------------------------------------------------------------------
+            # Wait for reader.  The Timer is the true deadline; cancelling it
+            # is only safe when the process is CONFIRMED dead (via _proc_done).
+            # If the command closed its stdout early (e.g. exec >/dev/null) the
+            # reader exits immediately but the process keeps running — in that
+            # case we must NOT cancel the timer; it will fire and kill the
+            # process after timeout_seconds.
+            # ------------------------------------------------------------------
+            reader_thread.join(timeout=timeout_seconds + 10)
+
+            if _proc_done.is_set():
+                # Process exited naturally before the deadline.
+                timer.cancel()
+            # else: timer will fire (or already fired) to kill the process.
+
+            if reader_thread.is_alive():
+                # Reader still blocked — process must still be running.
+                # The timer should fire soon; kill defensively now too.
+                timed_out = True
+                _kill()
+                reader_thread.join(timeout=5)
+
+            # Ensure the killer thread also finishes before reading returncode.
+            killer_thread.join(timeout=5)
+            proc.wait()  # idempotent; ensures returncode is set
+            returncode = proc.returncode if proc.returncode is not None else -1
+
+        if timed_out:
+            return {
+                "success": False,
+                "exit_code": -1,
+                "truncated": False,
+                "output": f"[timed out after {timeout_seconds}s]",
+            }
+
+        raw = b"".join(chunks).decode(errors="replace")
+        output = redact(raw)
+        if cleanup_failed:
+            # Scope teardown failed — a detached child may still be running.
+            # Force success=False so callers are never silently misled.
+            return {
+                "success": False,
+                "exit_code": returncode,
+                "truncated": truncated,
+                "output": output + "\n[scope cleanup failed — cgroup stop returned non-zero]",
+            }
+        return {
+            "success": returncode == 0,
+            "exit_code": returncode,
+            "truncated": truncated,
+            "output": output,
+        }
+
+    # ------------------------------------------------------------------
     # Unified entry point with audit logging
     # ------------------------------------------------------------------
 
@@ -526,4 +879,9 @@ class OperationsExecutor:
             return await self.get_safe_env()
         if operation == "context/set-config":
             return await self.set_config(params["key"], params["value"])
+        if operation == "shell":
+            return await self.shell(
+                params["command"],
+                params.get("timeout_seconds", _SHELL_DEFAULT_TIMEOUT),
+            )
         raise ValueError(f"unknown operation: {operation!r}")

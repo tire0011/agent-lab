@@ -15,10 +15,12 @@ from modules.redaction import redact
 _logger = logging.getLogger(__name__)
 
 # Services the agent is allowed to interact with.
+# Real VM service names: agent-api (FastAPI/uvicorn), llama-server (llama.cpp),
+# and nexus-mailbox (mailbox polling timer/service).
 _ALLOWED_SERVICES: frozenset[str] = frozenset({
-    "nexus-api",
+    "agent-api",
     "nexus-mailbox",
-    "llama",
+    "llama-server",
 })
 
 _GRACEFUL_STOP_TIMEOUT = 5  # seconds before SIGKILL
@@ -84,17 +86,17 @@ class ServiceOperations:
         return result
 
     async def reload_llama_model(self) -> dict:
-        """Send SIGHUP to the llama service to trigger a model reload."""
-        rc, out = await _systemctl(["kill", "-s", "HUP", "llama"], timeout=10)
+        """Send SIGHUP to the llama-server service to trigger a model reload."""
+        rc, out = await _systemctl(["kill", "-s", "HUP", "llama-server"], timeout=10)
         if rc != 0:
             return {
                 "status": "error",
-                "model": "llama",
+                "model": "llama-server",
                 "message": redact(out)[:200],
             }
         return {
             "status": "reloading",
-            "model": "llama",
+            "model": "llama-server",
             "eta_seconds": 30,
-            "message": "SIGHUP sent to llama service",
+            "message": "SIGHUP sent to llama-server service",
         }
