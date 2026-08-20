@@ -113,21 +113,21 @@ class TestServiceOperationsEndpoints(unittest.TestCase):
         api.app.dependency_overrides.pop(get_operations_executor, None)
 
     def test_restart_requires_auth(self):
-        resp = self.client.post("/operations/services/restart", json={"service": "nexus-api"})
+        resp = self.client.post("/operations/services/restart", json={"service": "agent-api"})
         self.assertEqual(resp.status_code, 401)
 
     def test_restart_success(self):
         mock = _make_executor("services/restart", {
-            "status": "restarting", "service": "nexus-api", "results": {}, "message": "ok"
+            "status": "restarting", "service": "agent-api", "results": {}, "message": "ok"
         })
         self._override(mock)
         resp = self.client.post("/operations/services/restart", headers=_HEADERS,
-                                json={"service": "nexus-api"})
+                                json={"service": "agent-api"})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["status"], "restarting")
 
     def test_services_status_success(self):
-        mock = _make_executor("services/status", {"nexus-api": "running", "nexus-mailbox": "running"})
+        mock = _make_executor("services/status", {"agent-api": "running", "nexus-mailbox": "running"})
         self._override(mock)
         resp = self.client.get("/operations/services/status", headers=_HEADERS)
         self.assertEqual(resp.status_code, 200)
@@ -135,7 +135,7 @@ class TestServiceOperationsEndpoints(unittest.TestCase):
 
     def test_llama_reload_success(self):
         mock = _make_executor("services/llama/reload-model",
-                              {"status": "reloading", "model": "llama", "eta_seconds": 30})
+                              {"status": "reloading", "model": "llama-server", "eta_seconds": 30})
         self._override(mock)
         resp = self.client.post("/operations/services/llama/reload-model", headers=_HEADERS)
         self.assertEqual(resp.status_code, 200)
@@ -153,13 +153,13 @@ class TestLogsEndpoints(unittest.TestCase):
         api.app.dependency_overrides.pop(get_operations_executor, None)
 
     def test_tail_requires_auth(self):
-        resp = self.client.get("/operations/logs/tail?service=nexus-api")
+        resp = self.client.get("/operations/logs/tail?service=agent-api")
         self.assertEqual(resp.status_code, 401)
 
     def test_tail_success(self):
-        mock = _make_executor("logs/tail", {"service": "nexus-api", "lines": ["line1"], "total_available": 1})
+        mock = _make_executor("logs/tail", {"service": "agent-api", "lines": ["line1"], "total_available": 1})
         self._override(mock)
-        resp = self.client.get("/operations/logs/tail?service=nexus-api&lines=10", headers=_HEADERS)
+        resp = self.client.get("/operations/logs/tail?service=agent-api&lines=10", headers=_HEADERS)
         self.assertEqual(resp.status_code, 200)
         self.assertIn("lines", resp.json()["data"])
 
@@ -171,9 +171,9 @@ class TestLogsEndpoints(unittest.TestCase):
 
     def test_errors_success(self):
         mock = _make_executor("logs/errors",
-                              {"service": "nexus-api", "error_count": 0, "errors": []})
+                              {"service": "agent-api", "error_count": 0, "errors": []})
         self._override(mock)
-        resp = self.client.get("/operations/logs/errors?service=nexus-api", headers=_HEADERS)
+        resp = self.client.get("/operations/logs/errors?service=agent-api", headers=_HEADERS)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["error_count"], 0)
 
@@ -230,7 +230,7 @@ class TestModelManagementEndpoints(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
 
     def test_models_status_success(self):
-        mock = _make_executor("models/status", {"azure_gpt4o": "available", "llama": "unknown"})
+        mock = _make_executor("models/status", {"azure_gpt4o": "available", "llama-server": "unknown"})
         self._override(mock)
         resp = self.client.get("/operations/models/status", headers=_HEADERS)
         self.assertEqual(resp.status_code, 200)

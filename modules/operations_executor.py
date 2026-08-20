@@ -112,6 +112,11 @@ _logger = logging.getLogger(__name__)
 
 _ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
 
+# Shell tool limits (bootstrap-phase only, available when MCP_WRITE_ENABLED=true).
+_SHELL_MAX_TIMEOUT: int = 120         # hard ceiling in seconds
+_SHELL_DEFAULT_TIMEOUT: int = 30
+_SHELL_MAX_OUTPUT_BYTES: int = 16_384  # 16 KiB before truncation
+
 # Secrets that must never appear in responses.
 _SECRET_ENV_VARS: frozenset[str] = frozenset({
     "AGENT_API_KEY",
@@ -455,6 +460,65 @@ class OperationsExecutor:
                     "response": None, "error": type(exc).__name__}
 
     # ------------------------------------------------------------------
+    # Bootstrap shell (bounded, redacted, audited)
+    # ------------------------------------------------------------------
+
+    async def shell(self, command: str, timeout_seconds: int = _SHELL_DEFAULT_TIMEOUT) -> dict:
+        """Run *command* in a bounded, audited shell.
+
+        Only available when ``MCP_WRITE_ENABLED=true``. Executes as the current
+        service user with cwd ``AGENT_FS_ROOT`` (default ``/agent``). Output is
+        bounded and redacted before returning; no daemon/background spawning is
+        allowed.
+        """
+        if not command or not command.strip():
+            raise ValueError("command must not be empty")
+        timeout_seconds = max(1, min(timeout_seconds, _SHELL_MAX_TIMEOUT))
+
+        cwd = os.environ.get("AGENT_FS_ROOT", "/agent")
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=cwd,
+        )
+        truncated = False
+        try:
+            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            # Drain the pipe with a short deadline to avoid hanging if a
+            # child process inherits the fd and stays alive after the kill.
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            return {
+                "success": False,
+                "exit_code": -1,
+                "truncated": False,
+                "output": f"[timed out after {timeout_seconds}s]",
+            }
+
+        raw = stdout_b.decode(errors="replace")
+        if len(raw.encode()) > _SHELL_MAX_OUTPUT_BYTES:
+            raw = raw.encode()[:_SHELL_MAX_OUTPUT_BYTES].decode(errors="replace")
+            truncated = True
+
+        from modules.redaction import redact as _redact
+        output = _redact(raw)
+
+        return {
+            "success": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "truncated": truncated,
+            "output": output,
+        }
+
+    # ------------------------------------------------------------------
     # Unified entry point with audit logging
     # ------------------------------------------------------------------
 
@@ -526,4 +590,9 @@ class OperationsExecutor:
             return await self.get_safe_env()
         if operation == "context/set-config":
             return await self.set_config(params["key"], params["value"])
+        if operation == "shell":
+            return await self.shell(
+                params["command"],
+                params.get("timeout_seconds", _SHELL_DEFAULT_TIMEOUT),
+            )
         raise ValueError(f"unknown operation: {operation!r}")

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +20,18 @@ def _api():
 
     return nexus_api
 
+
+def _write_enabled() -> bool:
+    """Return True when MCP write tools are active (``MCP_WRITE_ENABLED=true``)."""
+    return os.environ.get("MCP_WRITE_ENABLED", "").lower() == "true"
+
+
+def _require_write_enabled() -> None:
+    """Raise ValueError if write tools are disabled."""
+    if not _write_enabled():
+        raise ValueError(
+            "Write tools are disabled. Set MCP_WRITE_ENABLED=true to enable them."
+        )
 
 def _internal_api_key() -> str:
     nexus_api = _api()
@@ -309,6 +324,168 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             x_api_key=_internal_api_key(),
             service=nexus_api._resolve_maintenance_service(),
         )
+
+    # ------------------------------------------------------------------
+    # Write tools — only active when MCP_WRITE_ENABLED=true
+    # All tools call _require_write_enabled() as their first action so
+    # they fail immediately (and loudly) when the flag is off.
+    # ------------------------------------------------------------------
+
+    @mcp.tool(
+        description=(
+            "Pull the latest commits for /agent via git pull --ff-only. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def git_pull() -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute("git/pull", {})
+        return {"success": result.success, "data": result.data, "error": result.error}
+
+    @mcp.tool(
+        description=(
+            "Restart a systemd service by name. Allowed names: agent-api, nexus-mailbox, "
+            "llama-server, all. Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def service_restart(service: str) -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute("services/restart", {"service": service})
+        return {"success": result.success, "data": result.data, "error": result.error}
+
+    @mcp.tool(
+        description=(
+            "Return the systemd status of all allowed services. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def service_status() -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute("services/status", {})
+        return {"success": result.success, "data": result.data, "error": result.error}
+
+    @mcp.tool(
+        description=(
+            "Run the bounded test suite (pytest tests/ -q --tb=short) "
+            "with a configurable timeout (default 120 s, max 300 s). "
+            "Returns redacted, truncated output. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def run_tests(timeout_seconds: int = 120) -> dict[str, Any]:
+        _require_write_enabled()
+        import asyncio as _asyncio
+
+        timeout_seconds = max(10, min(timeout_seconds, 300))
+        repo_root = os.environ.get("AGENT_FS_ROOT", "/agent")
+
+        def _run_sync() -> dict[str, Any]:
+            t0 = time.monotonic()
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=short"],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    cwd=repo_root,
+                )
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                from modules.redaction import bounded_lines
+                combined = proc.stdout + proc.stderr
+                return {
+                    "success": proc.returncode == 0,
+                    "exit_code": proc.returncode,
+                    "elapsed_ms": elapsed_ms,
+                    "lines": bounded_lines(combined, max_lines=200, max_line_chars=500),
+                }
+            except subprocess.TimeoutExpired:
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return {
+                    "success": False,
+                    "exit_code": -1,
+                    "elapsed_ms": elapsed_ms,
+                    "lines": [f"[timed out after {timeout_seconds}s]"],
+                }
+
+        return await _asyncio.to_thread(_run_sync)
+
+    @mcp.tool(
+        description=(
+            "Create and start a self-improvement experiment with the given goal. "
+            "Returns experiment_id immediately; poll experiment_get for status. "
+            "Requires MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def experiment_start(goal: str) -> dict[str, Any]:
+        _require_write_enabled()
+        import asyncio as _asyncio
+        import threading
+
+        nexus_api = _api()
+        svc = nexus_api._resolve_experiment_service()
+        # create_experiment does SQLite I/O; run it off the event loop thread.
+        experiment = await _asyncio.to_thread(svc.create_experiment, goal)
+
+        def _run():
+            try:
+                svc.run_experiment(experiment.id)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_run, daemon=True, name=f"mcp-exp-{experiment.id[:8]}")
+        t.start()
+        return {"experiment_id": experiment.id, "status": experiment.status}
+
+    @mcp.tool(
+        description=(
+            "Route a task through the local llama-cpp router and return the decision. "
+            "Returns decision, provider, role, and reasoning. "
+            "Requires MCP_WRITE_ENABLED=true and a running llama-server."
+        ),
+        structured_output=True,
+    )
+    async def router_run(task: str) -> dict[str, Any]:
+        _require_write_enabled()
+        from modules.llama_router import LlamaRouter
+
+        router = LlamaRouter()
+        decision = await router.route(task)
+        return {
+            "decision": decision.decision,
+            "provider": decision.provider,
+            "role": decision.role,
+            "reasoning": decision.reasoning,
+            "confidence": decision.confidence,
+        }
+
+    @mcp.tool(
+        description=(
+            "Execute an arbitrary shell command as the service user with cwd /agent. "
+            "Bounded timeout (default 30 s, max 120 s) and output (16 KiB). "
+            "Output is redacted. Command and result are audit-logged. "
+            "TEMPORARY bootstrap tool — only available when MCP_WRITE_ENABLED=true."
+        ),
+        structured_output=True,
+    )
+    async def shell(command: str, timeout_seconds: int = 30) -> dict[str, Any]:
+        _require_write_enabled()
+        nexus_api = _api()
+        executor = nexus_api.get_operations_executor()
+        result = await executor.execute(
+            "shell", {"command": command, "timeout_seconds": timeout_seconds}
+        )
+        return {"success": result.success, "data": result.data, "error": result.error}
 
     subapp = FastAPI()
 

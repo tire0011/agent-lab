@@ -17,9 +17,9 @@ from modules.redaction import redact
 _logger = logging.getLogger(__name__)
 
 _ALLOWED_SERVICES: frozenset[str] = frozenset({
-    "nexus-api",
+    "agent-api",
     "nexus-mailbox",
-    "llama",
+    "llama-server",
 })
 
 _MAX_LINES = 500  # hard upper bound regardless of what caller requests

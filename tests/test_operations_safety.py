@@ -109,15 +109,15 @@ class TestServiceOperationsAllowlist(unittest.TestCase):
             _run(self._svc.restart("evil-service"))
 
     def test_unknown_service_restart_with_extra_rejected(self):
-        # Ensure injections like "nexus-api; evil" are also blocked.
+        # Ensure injections like "agent-api; evil" are also blocked.
         with self.assertRaises(ValueError):
-            _run(self._svc.restart("nexus-api; rm -rf /"))
+            _run(self._svc.restart("agent-api; rm -rf /"))
 
     def test_allowed_service_passes_validation(self):
         # We don't actually call systemctl; just check validation passes.
         with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, "active"))):
-            result = _run(self._svc.restart("nexus-api"))
-        self.assertIn("nexus-api", result["results"])
+            result = _run(self._svc.restart("agent-api"))
+        self.assertIn("agent-api", result["results"])
 
     def test_all_keyword_accepted(self):
         with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))):
@@ -144,13 +144,13 @@ class TestLogReaderAllowlist(unittest.TestCase):
 
     def test_allowed_service_tail_works(self):
         with patch("modules.log_reader._run_journalctl", new=AsyncMock(return_value=(0, "line1\nline2"))):
-            lines = _run(self._lr.tail_service_logs("nexus-api"))
+            lines = _run(self._lr.tail_service_logs("agent-api"))
         self.assertIsInstance(lines, list)
 
     def test_line_cap_enforced(self):
         with patch("modules.log_reader._run_journalctl", new=AsyncMock(return_value=(0, ""))):
             # Request more than _MAX_LINES (500); call must succeed (capped internally).
-            _run(self._lr.tail_service_logs("nexus-api", lines=9999))
+            _run(self._lr.tail_service_logs("agent-api", lines=9999))
 
 
 # ---------------------------------------------------------------------------
