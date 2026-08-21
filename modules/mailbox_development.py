@@ -1,7 +1,7 @@
-"""Opt-in development extensions for the Git-backed Nexus mailbox.
+"""Development extensions for the Git-backed Nexus mailbox.
 
-This module intentionally provides a broad development escape hatch for a trusted
-mailbox. It is inactive unless NEXUS_DEVELOPMENT_MODE is explicitly enabled.
+The command channel is intentionally unrestricted for the trusted development
+mailbox. NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
 """
 
 from __future__ import annotations
@@ -68,13 +68,6 @@ def process_command(
     db_msg_id: int,
 ) -> tuple[str, None]:
     """Run the message body as unrestricted Bash in the code repository."""
-    if not development_mode_enabled():
-        return (
-            "Command rejected: development mode is disabled. Set "
-            "`NEXUS_DEVELOPMENT_MODE=1` on the Nexus service to enable it.",
-            None,
-        )
-
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")
@@ -129,11 +122,10 @@ def process_command(
 
 
 def install(mailbox_module: Any) -> None:
-    """Install command + auto-approved task support into modules.mailbox.
+    """Install unrestricted command + optional auto-approved task support.
 
-    Calling this repeatedly is safe. The extensions are registered even while
-    development mode is disabled so command messages get a useful rejection
-    response instead of failing parsing; execution itself remains opt-in.
+    Calling this repeatedly is safe. Command execution is always available;
+    NEXUS_DEVELOPMENT_MODE only gates automatic approval of task messages.
     """
     mailbox_module.SUPPORTED_TYPES.add("command")
     mailbox_module._PROCESSORS["command"] = process_command
