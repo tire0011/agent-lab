@@ -1,0 +1,353 @@
+name: implement-development-mailbox-command
+
+on:
+  push:
+    branches:
+      - chatgpt/dev-mailbox-command
+    paths:
+      - .github/workflows/dev-mailbox-command-implementation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/dev-mailbox-command
+          fetch-depth: 0
+
+      - name: Implement development mailbox command mode
+        shell: python
+        run: |
+          from pathlib import Path
+
+          command_module = '''"""Development-mode command execution for Git mailbox messages.
+
+          This module is intentionally opt-in.  It provides a temporary development
+          escape hatch for trusted mailbox users while keeping execution bounded,
+          auditable, and redacted before results are written to the outbox.
+          """
+
+          from __future__ import annotations
+
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+          from typing import Any
+
+          from modules.redaction import redact
+
+          DEFAULT_TIMEOUT_SECONDS = 120
+          MAX_TIMEOUT_SECONDS = 3600
+          MAX_OUTPUT_CHARS = 32_000
+          _TRUE_VALUES = {"1", "true", "yes", "on"}
+          _SENSITIVE_ENV_MARKERS = (
+              "TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AZURE_OPENAI"
+          )
+
+
+          def development_mode_enabled() -> bool:
+              return os.environ.get("NEXUS_DEVELOPMENT_MODE", "").strip().lower() in _TRUE_VALUES
+
+
+          def _parse_timeout(value: str | None) -> int:
+              if value is None or not value.strip():
+                  return DEFAULT_TIMEOUT_SECONDS
+              try:
+                  timeout = int(value)
+              except ValueError as exc:
+                  raise ValueError("timeout must be an integer number of seconds") from exc
+              if not 1 <= timeout <= MAX_TIMEOUT_SECONDS:
+                  raise ValueError(f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds")
+              return timeout
+
+
+          def _command_environment() -> dict[str, str]:
+              """Keep the normal process environment except obvious credential variables.
+
+              SSH/git credential helpers that rely on HOME continue to work, while API
+              tokens and common secret variables are not handed directly to arbitrary
+              commands.
+              """
+              return {
+                  key: value
+                  for key, value in os.environ.items()
+                  if not any(marker in key.upper() for marker in _SENSITIVE_ENV_MARKERS)
+              }
+
+
+          def _bounded_redacted(text: str) -> str:
+              clean = redact(text or "")
+              if len(clean) <= MAX_OUTPUT_CHARS:
+                  return clean
+              omitted = len(clean) - MAX_OUTPUT_CHARS
+              return clean[:MAX_OUTPUT_CHARS] + f"\\n...[truncated {omitted} chars]"
+
+
+          def process_command(msg: Any, repo_path: Path, conn: Any, db_msg_id: int) -> tuple[str, None]:
+              """Execute the mailbox body as Bash in the code repository.
+
+              No command allowlist is applied in development mode.  Execution is still
+              bounded by a timeout and output limit, and output is redacted before it
+              can reach the Git outbox.
+              """
+              if not development_mode_enabled():
+                  return (
+                      "Command rejected: development mode is disabled. Set "
+                      "`NEXUS_DEVELOPMENT_MODE=1` on the Nexus service to enable it.",
+                      None,
+                  )
+
+              command = msg.body.strip()
+              if not command:
+                  raise ValueError("command body must not be empty")
+              timeout = _parse_timeout(msg.meta.get("timeout"))
+
+              started = time.monotonic()
+              try:
+                  result = subprocess.run(
+                      ["/bin/bash", "-lc", command],
+                      cwd=str(repo_path),
+                      env=_command_environment(),
+                      capture_output=True,
+                      text=True,
+                      timeout=timeout,
+                      check=False,
+                  )
+                  duration = time.monotonic() - started
+                  stdout = _bounded_redacted(result.stdout)
+                  stderr = _bounded_redacted(result.stderr)
+                  body = [
+                      f"**Exit code:** {result.returncode}",
+                      f"**Duration:** {duration:.3f}s",
+                      f"**Working directory:** `{repo_path.name or '/'}`",
+                      "",
+                      "### stdout",
+                      "",
+                      "```text",
+                      stdout,
+                      "```",
+                      "",
+                      "### stderr",
+                      "",
+                      "```text",
+                      stderr,
+                      "```",
+                  ]
+                  return "\\n".join(body), None
+              except subprocess.TimeoutExpired as exc:
+                  duration = time.monotonic() - started
+                  stdout = _bounded_redacted(exc.stdout if isinstance(exc.stdout, str) else "")
+                  stderr = _bounded_redacted(exc.stderr if isinstance(exc.stderr, str) else "")
+                  return (
+                      f"Command timed out after {timeout}s (runtime {duration:.3f}s).\\n\\n"
+                      f"### stdout\\n\\n```text\\n{stdout}\\n```\\n\\n"
+                      f"### stderr\\n\\n```text\\n{stderr}\\n```",
+                      None,
+                  )
+          '''
+          Path("modules/mailbox_command.py").write_text(command_module, encoding="utf-8")
+
+          p = Path("modules/mailbox.py")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace(
+              'SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain"}',
+              'SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain", "command"}',
+              1,
+          )
+          import_anchor = 'from modules.redaction import redact as _redact\n'
+          if import_anchor not in s:
+              raise SystemExit("mailbox command import anchor not found")
+          s = s.replace(
+              import_anchor,
+              import_anchor + 'from modules.mailbox_command import development_mode_enabled, process_command\n',
+              1,
+          )
+
+          old_status = '''            conn.execute(
+                          """
+                          INSERT INTO mailbox_task_approvals
+                              (id, mailbox_msg_id, task_body, sender, file_path,
+                               received_at, status, created_at, updated_at)
+                          VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+                          """,
+                          (approval_id, db_msg_id, msg.body, msg.created_by,
+                           str(msg.file_path), now, now, now),
+                      )
+          '''
+          new_status = '''            auto_approve = (
+                          development_mode_enabled()
+                          and msg.meta.get("auto_approve", "").strip().lower()
+                          in {"1", "true", "yes", "on"}
+                      )
+                      approval_status = "approved" if auto_approve else "pending_approval"
+                      conn.execute(
+                          """
+                          INSERT INTO mailbox_task_approvals
+                              (id, mailbox_msg_id, task_body, sender, file_path,
+                               received_at, status, created_at, updated_at)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          """,
+                          (approval_id, db_msg_id, msg.body, msg.created_by,
+                           str(msg.file_path), now, approval_status, now, now),
+                      )
+          '''
+          if old_status not in s:
+              raise SystemExit("task approval anchor not found")
+          s = s.replace(old_status, new_status, 1)
+
+          old_result = '''    result_body = (
+                  "Your task request has been recorded and is queued for human review.\\n\\n"
+                  "Tasks submitted via the mailbox require human approval before execution. "
+                  "A Nexus operator will evaluate the request and decide whether to run it."
+              )
+          '''
+          new_result = '''    if development_mode_enabled() and msg.meta.get("auto_approve", "").strip().lower() in {"1", "true", "yes", "on"}:
+                  result_body = (
+                      "Your task request has been recorded and automatically approved because "
+                      "Nexus development mode is enabled. The mailbox task worker will submit it "
+                      "for execution."
+                  )
+              else:
+                  result_body = (
+                      "Your task request has been recorded and is queued for human review.\\n\\n"
+                      "Tasks submitted via the mailbox require human approval before execution. "
+                      "A Nexus operator will evaluate the request and decide whether to run it."
+                  )
+          '''
+          if old_result not in s:
+              raise SystemExit("task result anchor not found")
+          s = s.replace(old_result, new_result, 1)
+
+          processors_anchor = '''    "context": _process_context,
+              # operation_chain is handled separately (needs service injection)
+          '''
+          processors_new = '''    "context": _process_context,
+              "command": process_command,
+              # operation_chain is handled separately (needs service injection)
+          '''
+          if processors_anchor not in s:
+              raise SystemExit("processor registry anchor not found")
+          s = s.replace(processors_anchor, processors_new, 1)
+          p.write_text(s, encoding="utf-8")
+
+          tests = '''"""Tests for development-mode mailbox command execution."""
+
+          from __future__ import annotations
+
+          import os
+          import tempfile
+          import unittest
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import patch
+
+          from modules.mailbox import MailboxMessage
+          from modules.mailbox_command import development_mode_enabled, process_command
+
+
+          class TestMailboxDevelopmentCommand(unittest.TestCase):
+              def test_command_type_is_valid(self):
+                  with tempfile.TemporaryDirectory() as tmp:
+                      inbox = Path(tmp)
+                      path = inbox / "command.md"
+                      path.write_text(
+                          "---\\ntype: command\\ncreated_by: rene\\n---\\n\\nprintf hello",
+                          encoding="utf-8",
+                      )
+                      msg = MailboxMessage.load(path, inbox)
+                      self.assertEqual(msg.msg_type, "command")
+
+              def test_development_mode_is_opt_in(self):
+                  with patch.dict(os.environ, {}, clear=True):
+                      self.assertFalse(development_mode_enabled())
+                  with patch.dict(os.environ, {"NEXUS_DEVELOPMENT_MODE": "1"}, clear=True):
+                      self.assertTrue(development_mode_enabled())
+
+              def test_command_rejected_when_disabled(self):
+                  msg = SimpleNamespace(body="printf hello", meta={})
+                  with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+                      body, idea_id = process_command(msg, Path(tmp), None, 1)
+                  self.assertIn("development mode is disabled", body)
+                  self.assertIsNone(idea_id)
+
+              def test_command_executes_in_repo_when_enabled(self):
+                  msg = SimpleNamespace(body="printf hello", meta={"timeout": "5"})
+                  with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                      os.environ,
+                      {"NEXUS_DEVELOPMENT_MODE": "1", "PATH": os.environ.get("PATH", "")},
+                      clear=True,
+                  ):
+                      body, _ = process_command(msg, Path(tmp), None, 1)
+                  self.assertIn("**Exit code:** 0", body)
+                  self.assertIn("hello", body)
+
+              def test_command_can_change_workspace(self):
+                  msg = SimpleNamespace(body="printf changed > created.txt", meta={})
+                  with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                      os.environ,
+                      {"NEXUS_DEVELOPMENT_MODE": "true", "PATH": os.environ.get("PATH", "")},
+                      clear=True,
+                  ):
+                      repo = Path(tmp)
+                      body, _ = process_command(msg, repo, None, 1)
+                      self.assertEqual((repo / "created.txt").read_text(), "changed")
+                  self.assertIn("**Exit code:** 0", body)
+
+              def test_timeout_is_bounded(self):
+                  msg = SimpleNamespace(body="printf hello", meta={"timeout": "3601"})
+                  with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                      os.environ,
+                      {"NEXUS_DEVELOPMENT_MODE": "1", "PATH": os.environ.get("PATH", "")},
+                      clear=True,
+                  ):
+                      with self.assertRaises(ValueError):
+                          process_command(msg, Path(tmp), None, 1)
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          '''
+          Path("tests/test_mailbox_command.py").write_text(tests, encoding="utf-8")
+
+          p = Path("README.md")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace(
+              'Supported message types: `idea`, `task`, `question`, `context`.',
+              'Supported message types: `idea`, `task`, `question`, `context`, `command`, `operation_chain`.',
+              1,
+          )
+          mailbox_task_line = '- `task` — body stored in SQLite, `pending_approval` record created in `mailbox_task_approvals`; requires human approval via API/Web UI before execution by `ExperimentService`.\n'
+          mailbox_task_new = mailbox_task_line + '- `command` — when `NEXUS_DEVELOPMENT_MODE=1`, executes the body as unrestricted Bash in the code repository, with timeout, bounded/redacted output, and an outbox result.\n'
+          if mailbox_task_line not in s:
+              raise SystemExit("README task anchor not found")
+          s = s.replace(mailbox_task_line, mailbox_task_new, 1)
+          safety_anchor = '**Safety:**\n\n'
+          safety_note = (
+              '> Development escape hatch: `task` messages may use `auto_approve: true` and '
+              '`command` messages may execute arbitrary Bash only while '
+              '`NEXUS_DEVELOPMENT_MODE=1`. Disable that environment variable to restore the '
+              'normal approval-only behavior.\\n\\n'
+          )
+          if safety_anchor not in s:
+              raise SystemExit("README safety anchor not found")
+          s = s.replace(safety_anchor, safety_anchor + safety_note, 1)
+          p.write_text(s, encoding="utf-8")
+
+      - name: Verify focused tests
+        run: |
+          python -m unittest tests.test_mailbox_command tests.test_mailbox -q
+          git diff --check
+
+      - name: Commit implementation and remove helper workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- modules/mailbox.py modules/mailbox_command.py tests/test_mailbox_command.py README.md
+          git rm .github/workflows/dev-mailbox-command-implementation.yml
+          git commit -m "Add development mailbox command mode"
+          git push origin HEAD:chatgpt/dev-mailbox-command
