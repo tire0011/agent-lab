@@ -36,20 +36,15 @@ function Write-Section([string]$Title) {
 }
 
 function Assert-AgentApiConfiguration {
-    if (-not (Test-Path -LiteralPath $AgentEnvironmentFile)) {
+    # agent.env is intentionally root-owned and not readable by the agent user.
+    # Use sudo + grep as a boolean presence check; never read or print the secret.
+    sudo test -f $AgentEnvironmentFile
+    if ($LASTEXITCODE -ne 0) {
         throw "agent-api configuration missing: $AgentEnvironmentFile does not exist. Restart aborted."
     }
 
-    # Read only the variable names, never print or retain the secret value.
-    $HasApiKey = $false
-    foreach ($Line in Get-Content -LiteralPath $AgentEnvironmentFile) {
-        if ($Line -match '^\s*AGENT_API_KEY\s*=.+$') {
-            $HasApiKey = $true
-            break
-        }
-    }
-
-    if (-not $HasApiKey) {
+    sudo grep -Eq '^\s*AGENT_API_KEY\s*=.+$' $AgentEnvironmentFile
+    if ($LASTEXITCODE -ne 0) {
         throw "agent-api configuration invalid: AGENT_API_KEY is missing or empty in $AgentEnvironmentFile. Restart aborted to keep the existing service state intact."
     }
 }
