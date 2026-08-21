@@ -138,6 +138,50 @@ class OperationsRegistryTests(unittest.TestCase):
         self.assertNotIn("hunter2", serialized)
         self.assertNotIn("/agent", serialized)
 
+    def test_mailbox_status_accepts_successful_inactive_oneshot_service(self):
+        def runner(command, **kwargs):
+            unit = command[2]
+            if unit == "nexus-mailbox.service":
+                return subprocess.CompletedProcess(
+                    args=command,
+                    returncode=3,
+                    stdout=(
+                        "○ nexus-mailbox.service - Nexus mailbox processor\n"
+                        "     Active: inactive (dead) since Fri 2026-08-21 18:21:38 UTC\n"
+                        "    Process: 174444 ExecStart=/usr/bin/python mailbox_processor.py "
+                        "(code=exited, status=0/SUCCESS)\n"
+                        "   Main PID: 174444 (code=exited, status=0/SUCCESS)\n"
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout=(
+                    "● nexus-mailbox.timer - Run Nexus mailbox processor every minute\n"
+                    "     Active: active (waiting)\n"
+                ),
+                stderr="",
+            )
+
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-mailbox-oneshot.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("mailbox_status", {})
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(result.error_summary)
+        serialized = json.dumps(result.output_lines)
+        self.assertIn("inactive (dead)", serialized)
+        self.assertIn("status=0/SUCCESS", serialized)
+
     def test_mailbox_status_rejects_arguments_and_safely_reports_nonzero_exit(self):
         runner = MagicMock(return_value=subprocess.CompletedProcess(
             args=[], returncode=3, stdout="token=secret", stderr="password=hunter2 /var/lib/private"
