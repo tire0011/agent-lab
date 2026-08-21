@@ -1,4 +1,4 @@
-"""Tests for the opt-in development mailbox adapter."""
+"""Tests for the development mailbox adapter."""
 
 from __future__ import annotations
 
@@ -26,11 +26,16 @@ class TestMailboxDevelopment(unittest.TestCase):
         with patch.dict(os.environ, {"NEXUS_DEVELOPMENT_MODE": "1"}, clear=True):
             self.assertTrue(development_mode_enabled())
 
-    def test_command_is_rejected_when_disabled(self):
+    def test_command_executes_without_development_mode(self):
         msg = SimpleNamespace(body="printf hello", meta={})
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
             body, idea_id = process_command(msg, Path(tmp), None, 1)
-        self.assertIn("development mode is disabled", body)
+        self.assertIn("**Exit code:** 0", body)
+        self.assertIn("hello", body)
         self.assertIsNone(idea_id)
 
     def test_command_executes_and_can_change_workspace(self):
@@ -39,7 +44,6 @@ class TestMailboxDevelopment(unittest.TestCase):
             meta={"timeout": "5"},
         )
         env = {
-            "NEXUS_DEVELOPMENT_MODE": "1",
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
         }
@@ -53,7 +57,6 @@ class TestMailboxDevelopment(unittest.TestCase):
     def test_command_timeout_is_bounded(self):
         msg = SimpleNamespace(body="printf hello", meta={"timeout": "3601"})
         env = {
-            "NEXUS_DEVELOPMENT_MODE": "1",
             "PATH": os.environ.get("PATH", ""),
         }
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
