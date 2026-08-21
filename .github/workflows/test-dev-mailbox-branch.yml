@@ -1,0 +1,35 @@
+name: test-development-mailbox-branch
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/test-dev-mailbox-branch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/dev-mailbox-command
+          fetch-depth: 0
+      - name: Run focused tests
+        run: |
+          python -m unittest tests.test_mailbox_development tests.test_mailbox -q
+          git diff --check
+      - name: Remove temporary workflow from main
+        if: always()
+        run: |
+          git fetch origin main
+          git switch main
+          git reset --hard origin/main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/test-dev-mailbox-branch.yml
+          git commit -m "chore: remove development mailbox test workflow"
+          git push origin main
