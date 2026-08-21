@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -7,11 +8,48 @@ from typing import Any
 from modules.mailbox_config import MailboxConfig
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class MailboxPollRunResult:
     status: str
     results: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+
+
+def _sync_mailbox_repo(mailbox_module: Any, repo_path: Path, max_attempts: int = 3) -> bool:
+    """Synchronize append-oriented mailbox commits without discarding local work."""
+    if not mailbox_module.git_is_clean(repo_path):
+        logger.warning("Mailbox sync refused: working tree is not clean")
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        fetch = mailbox_module._git(["fetch"], repo_path, check=False)
+        if fetch.returncode != 0:
+            logger.warning("Mailbox sync fetch failed (exit %d)", fetch.returncode)
+            return False
+
+        rebase = mailbox_module._git(["rebase", "@{u}"], repo_path, check=False)
+        if rebase.returncode != 0:
+            mailbox_module._git(["rebase", "--abort"], repo_path, check=False)
+            logger.error(
+                "Mailbox sync rebase failed; rebase aborted and local commits were preserved"
+            )
+            return False
+
+        if mailbox_module.git_push(repo_path):
+            return True
+
+        if attempt < max_attempts:
+            logger.info(
+                "Mailbox push rejected; retrying fetch/rebase/push (%d/%d)",
+                attempt + 1,
+                max_attempts,
+            )
+
+    logger.warning("Mailbox sync failed after %d attempts", max_attempts)
+    return False
 
 
 def run_mailbox_poll_once(
@@ -77,12 +115,14 @@ def run_mailbox_poll_once(
         if not dry_run:
             publisher.publish_pending()
             task_publisher.publish_pending()
-            processor.retry_unpushed_commits()
             processor.retry_pending_git_commits()
             if not processor.ensure_clean_worktree():
                 result = MailboxPollRunResult(status="dirty_worktree")
-            elif not processor.pull():
-                result = MailboxPollRunResult(status="pull_failed")
+            elif not _sync_mailbox_repo(
+                mailbox_module,
+                mailbox_config.mailbox_repo_path,
+            ):
+                result = MailboxPollRunResult(status="sync_failed")
             else:
                 results = processor.process_inbox()
                 result = MailboxPollRunResult(status="processed", results=results)
