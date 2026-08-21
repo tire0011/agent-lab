@@ -30,8 +30,8 @@ def run_mailbox_poll_once(
     from modules.operations_registry import OperationsRegistry
     from modules.outbox_publisher import TaskApprovalOutboxPublisher
 
-    # Register the development mailbox extensions before any inbox file is parsed.
-    # Execution remains opt-in via NEXUS_DEVELOPMENT_MODE inside the adapter.
+    # Register unrestricted mailbox commands before any inbox file is parsed.
+    # NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
     install_mailbox_development(mailbox_module)
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
