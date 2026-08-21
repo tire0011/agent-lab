@@ -432,6 +432,44 @@ _SECRET_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+# Generic "token" is overloaded: it can mean a credential or an LLM
+# accounting/tokenization unit.  Keep credential-qualified tokens strict,
+# and exempt only explicit metric/tokenization phrases in the immediate
+# context of a generic token match.
+_LLM_TOKEN_METRIC_REGEXES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:input|output|prompt|completion|context)\s+tokens?\b", re.IGNORECASE),
+    re.compile(r"\btokens?\s+counts?\b", re.IGNORECASE),
+    re.compile(r"\bcount\s+tokens?\b", re.IGNORECASE),
+    re.compile(r"\btokens?\s+usage\b", re.IGNORECASE),
+    re.compile(r"\btokens?\s+budget\b", re.IGNORECASE),
+    re.compile(r"\btokens?\s+per\s+second\b", re.IGNORECASE),
+    re.compile(r"\btokens?\s+rate\b", re.IGNORECASE),
+)
+_CREDENTIAL_QUALIFIED_TOKEN_REGEX = re.compile(
+    r"\b(?:access|auth|authentication|api|bearer|credential|secret|session|oauth)\s+tokens?\b",
+    re.IGNORECASE,
+)
+
+
+def _secret_action_match_is_false_positive(
+    matched_text: str,
+    preceding_text: str = "",
+    following_text: str = "",
+) -> bool:
+    """Return True only for negated or clearly LLM-token metric matches."""
+    if _infra_action_match_is_false_positive(matched_text, preceding_text):
+        return True
+
+    # Metric exemptions apply only to matches whose secret noun is the
+    # ambiguous generic token(s), never api keys/passwords/etc.
+    if not re.search(r"\btokens?\b", matched_text, re.IGNORECASE):
+        return False
+
+    context = f"{preceding_text[-120:]} {matched_text} {following_text[:120]}"
+    if _CREDENTIAL_QUALIFIED_TOKEN_REGEX.search(context):
+        return False
+    return any(regex.search(context) for regex in _LLM_TOKEN_METRIC_REGEXES)
+
 
 # Title phrases that indicate a placeholder/intention-only response rather
 # than a concrete, already-selected feature (e.g. the model announcing it
@@ -1073,7 +1111,8 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
     for regex in _SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
-            if _infra_action_match_is_false_positive(match.group(0), preceding):
+            following = haystack[match.end():min(len(haystack), match.end() + 120)]
+            if _secret_action_match_is_false_positive(match.group(0), preceding, following):
                 continue
             return (
                 "plan describes an actual secret/credential action: "
@@ -1164,7 +1203,8 @@ def _check_goal_policy(goal: str) -> str | None:
     for regex in _SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
-            if _infra_action_match_is_false_positive(match.group(0), preceding):
+            following = haystack[match.end():min(len(haystack), match.end() + 120)]
+            if _secret_action_match_is_false_positive(match.group(0), preceding, following):
                 continue
             return (
                 "goal describes an actual secret/credential action: "
