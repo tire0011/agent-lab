@@ -167,6 +167,40 @@ Limit validation was centralized/shared with API constants and covered for MCP-s
 
 **Lesson:** MCP is most useful here as a thin capability adapter over tested domain services; remote interoperability does not require duplicating business logic or widening permissions.
 
+### 23. 2026-08-20: bootstrap MCP write capabilities adopted on main
+
+PR #29 extended the MCP surface with write-capable bootstrap tools behind `MCP_WRITE_ENABLED=true`. Remote clients can invoke existing operations for Git pull, service status/restart, bounded tests, experiment start, local-router execution, and a temporary shell tool. The real VM service allowlist was corrected to `agent-api`, `llama-server`, and the still-valid mailbox service.
+
+The shell path is deliberately bounded and audited: output is capped and redacted, timeout is capped at 120 seconds, execution is logged through the existing operation log, and the implementation fails closed when a reliable systemd cgroup scope cannot be established. Thirty-one focused tests were added around disabled-mode behavior, service boundaries, shell timeout/output/redaction/audit semantics, and tool delegation.
+
+**Lesson:** a temporary broad bootstrap capability can remain testable and observable when it reuses existing operations, is explicitly gated, and fails closed on process-confinement uncertainty.
+
+### 24. 2026-08-20: API dependency synchronization became automatic
+
+A real deployment failure after adding MCP exposed stale Python dependencies: `agent-api` could restart against an old `.venv` and fail with a missing module even though source code was current. PR #32 added one reusable dependency-sync helper for `requirements-api.txt` and wires it into systemd startup, refresh/deploy, and operations-driven Git pull paths.
+
+Dependency installation failure now prevents uvicorn from starting and remains visible in the journal. Tests use a fake pip executable so failure propagation and ordering are covered without network access.
+
+**Lesson:** source deployment and runtime dependency state are one atomic operational concern; every supported deployment/restart path must converge on the same dependency-sync behavior.
+
+### 25. 2026-08-21: secret policy false-positive for LLM token metrics fixed
+
+Experiment `93b21000cb8c4cc09cdd783d104244d2` was rejected because the policy interpreted the phrase `output tokens` as an instruction to expose a credential. Issue #33 identified the collision between LLM token-accounting terminology and generic credential-token vocabulary.
+
+PR #35 introduced a narrow context-specific exception shared by goal- and plan-level checks for phrases such as input/output/prompt/completion/context tokens, token counts/usage/budget/rate, while credential-qualified access/auth/API/bearer token actions remain rejected. Regression tests cover both safe metric wording and unsafe credential cases.
+
+**Lesson:** safety policy quality must include false-positive measurement. Narrow semantic exceptions are preferable to deleting protective vocabulary globally.
+
+### 26. 2026-08-21: trusted development mailbox became a command interface
+
+PR #34 added a mailbox `command` message type capable of running arbitrary Bash in the code repository, originally gated by `NEXUS_DEVELOPMENT_MODE=1`; it also added optional task auto-approval in development mode. Commands remain time/output bounded, outputs are redacted, and obvious credential environment variables are withheld.
+
+PR #36 then deliberately removed the development-mode execution gate for `command` messages. In the current trusted-development setup, arbitrary mailbox commands are accepted by default; `NEXUS_DEVELOPMENT_MODE` now only controls optional task auto-approval. The timeout/output/redaction/environment protections remain because they constrain impact and leakage rather than reject command content.
+
+This changes the mailbox from a typed request channel into a practical remote development/control interface during the experimental phase.
+
+**Lesson:** trusted-channel policy and command-content policy are separate design choices. For rapid experimentation the project currently trusts mailbox command intent, while retaining bounded execution and secret-handling controls.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -203,7 +237,9 @@ Current `main` includes:
 - signed GitHub webhook wake-up with timer fallback,
 - API/web UI, public/authenticated diagnostics, and compact failure evidence,
 - authenticated, audited, allowlisted self-healing/operations capabilities,
-- authenticated read-only MCP HTTP inspection surface,
+- authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
+- trusted-development mailbox `command` execution with bounded/redacted output,
+- automatic API dependency synchronization across service startup and deploy paths,
 - tests and policy boundaries.
 
 ## Important lessons so far
@@ -222,17 +258,21 @@ Current `main` includes:
 12. **Safety can enable more autonomy.** Narrow allowlists, path boundaries, recursive redaction, liveness checks, and audit logs made self-healing operations acceptable to merge.
 13. **Adapters should reuse domain logic.** MCP/API surfaces should expose existing tested capabilities rather than fork behavior.
 14. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
+15. **Deployment includes dependencies.** Pulling new source without synchronizing the runtime environment is not a complete deployment.
+16. **Safety policies need precision, not only strictness.** False positives such as LLM `output tokens` can block useful experiments; narrow contextual guards preserve protection better than broad exemptions.
+17. **Capability trust is layered.** The project may trust a development mailbox to request arbitrary commands while still bounding runtime, output, environment exposure, logging, and process cleanup.
 
 ## Open research directions
 
 - project-memory retrieval from this history,
 - measured token/cost/quality impact of the single-call pipeline and compact tool output,
 - benchmark Qwen2.5-Coder-7B-Instruct Q4_K_M and alternative quantized models inside the B2ms envelope,
-- test what the merged local model/router can accomplish on genuinely read-only small and medium tasks before granting broader autonomy,
+- test what the merged local model/router can accomplish on genuinely read-only small and medium tasks before granting broader autonomous decision authority,
 - route by task difficulty, expected value, provider limits, historical quality, and resource cost,
 - measure how much local context preparation reduces external-provider tokens,
 - evaluate whether merged self-healing operations materially reduce human intervention without increasing incidents,
-- evaluate MCP as the standard inspection/integration path for external agents before adding any write-capable MCP tools,
+- evaluate MCP as the standard integration/control path and determine which temporary bootstrap write capabilities can later be replaced by narrower operations,
+- measure the reliability and security trade-offs of the trusted mailbox command path during active development,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
 - agent-generated experiments for prompts/tools/context,
@@ -248,8 +288,8 @@ Current `main` includes:
 2. **Local-model benchmark:** compare Qwen2.5-Coder-7B Q4_K_M with at least one plausible alternative under identical B2ms limits.
 3. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
 4. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
-5. **Operational-autonomy measurement:** measure successful self-recovery, human interventions avoided, and safety/false-positive incidents using the merged `/operations/*` layer.
-6. **MCP integration experiment:** connect an external read-only client/agent to `/mcp/` and compare usability/token overhead with direct REST inspection.
+5. **Operational-autonomy measurement:** measure successful self-recovery, human interventions avoided, and safety/false-positive incidents using the merged operations/MCP/mailbox control surfaces.
+6. **Bootstrap-surface convergence:** track real usage of MCP write tools and mailbox commands, then replace frequently used broad commands with narrower audited operations where that reduces risk without slowing research.
 
 Choose the next step by expected learning value, effort, risk, and measurable benefit—not architectural completeness.
 
