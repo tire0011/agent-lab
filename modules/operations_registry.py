@@ -308,19 +308,35 @@ class OperationsRegistry:
             )
             checks.append((unit, check))
 
+        def check_is_healthy(unit: str, check: OperationResult) -> bool:
+            if check.success:
+                return True
+            if unit != "nexus-mailbox.service" or check.exit_code != 3:
+                return False
+            # systemctl status returns 3 for an inactive unit. That is the
+            # expected steady state for this timer-triggered oneshot service
+            # after a successful run, so treat it as healthy only when the
+            # status output proves both facts explicitly.
+            status_text = "\n".join(check.output_lines).lower()
+            return (
+                "active: inactive (dead)" in status_text
+                and "status=0/success" in status_text
+            )
+
         output_lines: list[str] = []
         failure_details: list[str] = []
+        failed_checks: list[OperationResult] = []
         for unit, check in checks:
             output_lines.append(f"{unit}:")
             # Reserve room for both unit labels and exit-code lines while
             # keeping the combined response within the 200-line bound.
             output_lines.extend(bounded_lines("\n".join(check.output_lines), max_lines=96))
             output_lines.append(f"exit_code: {check.exit_code if check.exit_code is not None else '-'}")
-            if not check.success:
+            if not check_is_healthy(unit, check):
+                failed_checks.append(check)
                 reason = sanitized_reason(check.error_summary) or "Statusprüfung fehlgeschlagen."
                 failure_details.append(f"{unit}: {reason}")
 
-        failed_checks = [check for _, check in checks if not check.success]
         return OperationResult(
             operation="mailbox_status",
             success=not failed_checks,
