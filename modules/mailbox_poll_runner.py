@@ -22,11 +22,17 @@ def run_mailbox_poll_once(
     dry_run: bool,
 ) -> MailboxPollRunResult:
     from modules.experiment_service import ExperimentService
+    from modules import mailbox as mailbox_module
     from modules.mailbox import MailboxLock, MailboxProcessor
+    from modules.mailbox_development import install as install_mailbox_development
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
     from modules.outbox_publisher import TaskApprovalOutboxPublisher
+
+    # Register the development mailbox extensions before any inbox file is parsed.
+    # Execution remains opt-in via NEXUS_DEVELOPMENT_MODE inside the adapter.
+    install_mailbox_development(mailbox_module)
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = MailboxLock(lock_path)
