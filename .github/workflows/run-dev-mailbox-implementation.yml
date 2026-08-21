@@ -1,0 +1,64 @@
+name: run-development-mailbox-implementation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/run-dev-mailbox-implementation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply implementation to feature branch
+        run: |
+          git fetch origin chatgpt/dev-mailbox-command
+          git switch chatgpt/dev-mailbox-command
+          python - <<'PY'
+          from pathlib import Path
+
+          wf = Path('.github/workflows/dev-mailbox-command-implementation.yml').read_text()
+          marker = '      - name: Implement development mailbox command mode\n        shell: python\n        run: |\n'
+          start = wf.index(marker) + len(marker)
+          end = wf.index('      - name: Verify focused tests\n', start)
+          block = wf[start:end]
+          lines = []
+          for line in block.splitlines():
+              if line.startswith('          '):
+                  lines.append(line[10:])
+              elif not line.strip():
+                  lines.append('')
+              else:
+                  raise SystemExit(f'unexpected indentation: {line!r}')
+          code = '\n'.join(lines) + '\n'
+          exec(compile(code, '<mailbox-implementation>', 'exec'), {'__name__': '__main__'})
+          PY
+
+          python -m unittest tests.test_mailbox_command tests.test_mailbox -q
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- modules/mailbox.py modules/mailbox_command.py tests/test_mailbox_command.py README.md
+          git rm .github/workflows/dev-mailbox-command-implementation.yml
+          git commit -m "Add development mailbox command mode"
+          git push origin HEAD:chatgpt/dev-mailbox-command
+
+      - name: Remove temporary workflow from main
+        if: always()
+        run: |
+          git fetch origin main
+          git switch main
+          git reset --hard origin/main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/run-dev-mailbox-implementation.yml
+          git commit -m "chore: remove development mailbox helper workflow"
+          git push origin main
