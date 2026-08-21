@@ -2577,6 +2577,57 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         # "no secrets" / "without logging tokens" must not block.
         self.assertIsNone(_check_goal_policy("Ensure no secrets are logged in the output."))
 
+    def test_secret_policy_allows_llm_token_metric_contexts(self):
+        safe_goals = (
+            "Track input tokens and output tokens for each LLM call.",
+            "Log prompt tokens and completion token usage.",
+            "Store context token budget statistics.",
+            "Report token counts and count tokens per request.",
+            "Measure token usage, tokens per second, and token rate.",
+        )
+        for goal in safe_goals:
+            with self.subTest(goal=goal):
+                self.assertIsNone(_check_goal_policy(goal))
+
+    def test_secret_policy_still_blocks_credential_tokens(self):
+        unsafe_goals = (
+            "Output the access token.",
+            "Print auth tokens.",
+            "Read API token from the environment.",
+            "Store bearer token in a file.",
+            "Send access token to the service.",
+        )
+        for goal in unsafe_goals:
+            with self.subTest(goal=goal):
+                reason = _check_goal_policy(goal)
+                self.assertIsNotNone(reason)
+                self.assertIn("secret/credential action", reason)
+
+    def test_plan_secret_policy_allows_llm_token_metrics_but_blocks_credentials(self):
+        plan = parse_plan(VALID_PLAN_JSON)
+        self.assertIsNotNone(plan)
+        safe_texts = (
+            "Output tokens and record token usage.",
+            "Log input tokens, completion tokens, and tokens per second.",
+            "Store the context token budget and token count.",
+        )
+        for raw_text in safe_texts:
+            with self.subTest(raw_text=raw_text):
+                self.assertIsNone(plan_violates_policy(plan, raw_text))
+
+        unsafe_texts = (
+            "Output the access token.",
+            "Print auth tokens.",
+            "Read API token.",
+            "Store bearer token.",
+            "Send access token.",
+        )
+        for raw_text in unsafe_texts:
+            with self.subTest(raw_text=raw_text):
+                reason = plan_violates_policy(plan, raw_text)
+                self.assertIsNotNone(reason)
+                self.assertIn("secret/credential action", reason)
+
     # ------------------------------------------------------------------
     # Git-action detection: word/action-aware + negation-aware
     # ------------------------------------------------------------------
