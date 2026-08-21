@@ -1,0 +1,192 @@
+name: issue-33-self-patch
+
+on:
+  push:
+    branches:
+      - issue-33-token-policy
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: issue-33-token-policy
+          fetch-depth: 0
+      - name: Apply narrow token-metric policy fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          service_path = Path("modules/experiment_service.py")
+          service = service_path.read_text()
+
+          anchor = '''_SECRET_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
+              re.compile(
+                  rf"\\b(?:{_SECRET_VERB_ALT})\\b(?:\\s+\\S+){{0,{_SECRET_ACTION_MAX_FILLER_WORDS}}}\\s+"
+                  rf"\\b(?:{_SECRET_NOUN_ALT})\\b",
+                  re.IGNORECASE,
+              ),
+              re.compile(
+                  rf"\\b(?:{_SECRET_NOUN_ALT})\\b(?:\\s+\\S+){{0,{_SECRET_ACTION_MAX_FILLER_WORDS}}}\\s+"
+                  rf"\\b(?:{_SECRET_VERB_ALT})\\b",
+                  re.IGNORECASE,
+              ),
+          )
+          '''
+          replacement = anchor + '''
+          # Generic "token" is overloaded: it can mean a credential or an LLM
+          # accounting/tokenization unit.  Keep credential-qualified tokens strict,
+          # and exempt only explicit metric/tokenization phrases in the immediate
+          # context of a generic token match.
+          _LLM_TOKEN_METRIC_REGEXES: tuple[re.Pattern[str], ...] = (
+              re.compile(r"\\b(?:input|output|prompt|completion|context)\\s+tokens?\\b", re.IGNORECASE),
+              re.compile(r"\\btokens?\\s+counts?\\b", re.IGNORECASE),
+              re.compile(r"\\bcount\\s+tokens?\\b", re.IGNORECASE),
+              re.compile(r"\\btokens?\\s+usage\\b", re.IGNORECASE),
+              re.compile(r"\\btokens?\\s+budget\\b", re.IGNORECASE),
+              re.compile(r"\\btokens?\\s+per\\s+second\\b", re.IGNORECASE),
+              re.compile(r"\\btokens?\\s+rate\\b", re.IGNORECASE),
+          )
+          _CREDENTIAL_QUALIFIED_TOKEN_REGEX = re.compile(
+              r"\\b(?:access|auth|authentication|api|bearer|credential|secret|session|oauth)\\s+tokens?\\b",
+              re.IGNORECASE,
+          )
+
+
+          def _secret_action_match_is_false_positive(
+              matched_text: str,
+              preceding_text: str = "",
+              following_text: str = "",
+          ) -> bool:
+              """Return True only for negated or clearly LLM-token metric matches."""
+              if _infra_action_match_is_false_positive(matched_text, preceding_text):
+                  return True
+
+              # Metric exemptions apply only to matches whose secret noun is the
+              # ambiguous generic token(s), never api keys/passwords/etc.
+              if not re.search(r"\\btokens?\\b", matched_text, re.IGNORECASE):
+                  return False
+
+              context = f"{preceding_text[-120:]} {matched_text} {following_text[:120]}"
+              if _CREDENTIAL_QUALIFIED_TOKEN_REGEX.search(context):
+                  return False
+              return any(regex.search(context) for regex in _LLM_TOKEN_METRIC_REGEXES)
+          '''
+          if anchor not in service:
+              raise SystemExit("secret regex anchor not found")
+          service = service.replace(anchor, replacement, 1)
+
+          old_plan = '''            preceding = haystack[max(0, match.start() - 200):match.start()]
+                      if _infra_action_match_is_false_positive(match.group(0), preceding):
+                          continue
+                      return (
+                          "plan describes an actual secret/credential action: "
+          '''
+          new_plan = '''            preceding = haystack[max(0, match.start() - 200):match.start()]
+                      following = haystack[match.end():min(len(haystack), match.end() + 120)]
+                      if _secret_action_match_is_false_positive(match.group(0), preceding, following):
+                          continue
+                      return (
+                          "plan describes an actual secret/credential action: "
+          '''
+          if old_plan not in service:
+              raise SystemExit("plan secret-policy block not found")
+          service = service.replace(old_plan, new_plan, 1)
+
+          old_goal = '''            preceding = haystack[max(0, match.start() - 200):match.start()]
+                      if _infra_action_match_is_false_positive(match.group(0), preceding):
+                          continue
+                      return (
+                          "goal describes an actual secret/credential action: "
+          '''
+          new_goal = '''            preceding = haystack[max(0, match.start() - 200):match.start()]
+                      following = haystack[match.end():min(len(haystack), match.end() + 120)]
+                      if _secret_action_match_is_false_positive(match.group(0), preceding, following):
+                          continue
+                      return (
+                          "goal describes an actual secret/credential action: "
+          '''
+          if old_goal not in service:
+              raise SystemExit("goal secret-policy block not found")
+          service = service.replace(old_goal, new_goal, 1)
+          service_path.write_text(service)
+
+          test_path = Path("tests/test_experiment_service.py")
+          tests = test_path.read_text()
+          test_anchor = '''    def test_check_goal_policy_allows_negated_mention(self):
+                  # "no secrets" / "without logging tokens" must not block.
+                  self.assertIsNone(_check_goal_policy("Ensure no secrets are logged in the output."))
+          '''
+          test_replacement = test_anchor + '''
+              def test_secret_policy_allows_llm_token_metric_contexts(self):
+                  safe_goals = (
+                      "Track input tokens and output tokens for each LLM call.",
+                      "Log prompt tokens and completion token usage.",
+                      "Store context token budget statistics.",
+                      "Report token counts and count tokens per request.",
+                      "Measure token usage, tokens per second, and token rate.",
+                  )
+                  for goal in safe_goals:
+                      with self.subTest(goal=goal):
+                          self.assertIsNone(_check_goal_policy(goal))
+
+              def test_secret_policy_still_blocks_credential_tokens(self):
+                  unsafe_goals = (
+                      "Output the access token.",
+                      "Print auth tokens.",
+                      "Read API token from the environment.",
+                      "Store bearer token in a file.",
+                      "Send access token to the service.",
+                  )
+                  for goal in unsafe_goals:
+                      with self.subTest(goal=goal):
+                          reason = _check_goal_policy(goal)
+                          self.assertIsNotNone(reason)
+                          self.assertIn("secret/credential action", reason)
+
+              def test_plan_secret_policy_allows_llm_token_metrics_but_blocks_credentials(self):
+                  plan = parse_plan(VALID_PLAN_JSON)
+                  self.assertIsNotNone(plan)
+                  safe_texts = (
+                      "Output tokens and record token usage.",
+                      "Log input tokens, completion tokens, and tokens per second.",
+                      "Store the context token budget and token count.",
+                  )
+                  for raw_text in safe_texts:
+                      with self.subTest(raw_text=raw_text):
+                          self.assertIsNone(plan_violates_policy(plan, raw_text))
+
+                  unsafe_texts = (
+                      "Output the access token.",
+                      "Print auth tokens.",
+                      "Read API token.",
+                      "Store bearer token.",
+                      "Send access token.",
+                  )
+                  for raw_text in unsafe_texts:
+                      with self.subTest(raw_text=raw_text):
+                          reason = plan_violates_policy(plan, raw_text)
+                          self.assertIsNotNone(reason)
+                          self.assertIn("secret/credential action", reason)
+          '''
+          if test_anchor not in tests:
+              raise SystemExit("test insertion anchor not found")
+          tests = tests.replace(test_anchor, test_replacement, 1)
+          test_path.write_text(tests)
+
+      - name: Verify focused tests
+        run: |
+          python -m unittest tests.test_experiment_service -q
+          git diff --check
+      - name: Commit patch and remove temporary workflow
+        run: |
+          rm .github/workflows/issue-33-self-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- modules/experiment_service.py tests/test_experiment_service.py .github/workflows/issue-33-self-patch.yml
+          git commit -m "Fix LLM token metric secret-policy false positives"
+          git push origin HEAD:issue-33-token-policy
