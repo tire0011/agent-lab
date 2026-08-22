@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import httpx
+
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
 
 if TYPE_CHECKING:
@@ -185,5 +187,5 @@ def classify_task_intent(
                 client=client,
             )
         )
-    except (LlamaCppClientError, OSError, TimeoutError) as exc:
+    except (LlamaCppClientError, httpx.RequestError, OSError, TimeoutError) as exc:
         return _fallback_decision(task_body, experiment_service, str(exc))
