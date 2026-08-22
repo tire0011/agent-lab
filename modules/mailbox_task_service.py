@@ -1,17 +1,8 @@
-"""Approval-gated bridge from mailbox task messages to ExperimentService.
+"""Approval-gated bridge from free-form mailbox tasks to Nexus capabilities.
 
-State machine:
-    pending_approval → approved → submitted → running → succeeded
-                     → rejected                       → failed
-                                                      → needs_review
-
-Exactly-once guarantee: the submitted transition uses an atomic
-  UPDATE ... WHERE status='approved' so concurrent callers or retries
-  cannot create two experiments for the same approval.
-
-Recovery after restart: on startup the service scans for approvals in
-  non-terminal states and updates them based on the current experiment
-  status, or requeues them if the experiment was never started.
+The local Nexus LLM is the orchestration layer. It may inspect real Nexus
+state through read-only operations before selecting a lifecycle/action.
+Experiments are execution primitives, not the default control flow.
 """
 
 from __future__ import annotations
@@ -24,10 +15,23 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import Any, TYPE_CHECKING
 
-from modules.run_store import init_db, DEFAULT_DB_PATH
+from modules.experiment_resume import resume_experiment
+from modules.mailbox_development import process_command
 from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
+from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.task_orchestrator import (
+    ACTION_ANSWER,
+    ACTION_CLARIFICATION,
+    ACTION_COMMAND,
+    ACTION_MISSING_CAPABILITY,
+    ACTION_NEW_EXPERIMENT,
+    ACTION_RESUME_EXPERIMENT,
+    NexusTaskOrchestrator,
+    TaskDecision,
+)
 
 if TYPE_CHECKING:
     from modules.experiment_service import ExperimentService
@@ -45,11 +49,8 @@ _STATUS_NEEDS_REVIEW = "needs_review"
 
 _TERMINAL_STATUSES = {_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STATUS_NEEDS_REVIEW}
 _NON_TERMINAL_STATUSES = {_STATUS_PENDING, _STATUS_APPROVED, _STATUS_SUBMITTED, _STATUS_RUNNING}
-
-# Experiment statuses considered terminal
 _EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
-
 _REJECTION_REASON_RE = re.compile(r"^[\w\s.,!?()\'\"\-]{1,500}$")
 
 
@@ -62,32 +63,24 @@ class ApprovalStateError(RuntimeError):
 
 
 class MailboxTaskApproval:
-    """In-memory representation of a mailbox_task_approvals row."""
-
     __slots__ = (
         "id", "mailbox_msg_id", "task_body", "sender", "file_path",
         "received_at", "status", "approved_at", "rejected_at",
         "rejection_reason", "experiment_id", "outbox_file",
-        "publish_status", "publish_commit_sha",
-        "result_summary", "error", "created_at", "updated_at",
+        "publish_status", "publish_commit_sha", "result_summary", "error",
+        "created_at", "updated_at",
     )
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         for slot in self.__slots__:
             setattr(self, slot, kwargs.get(slot))
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {slot: getattr(self, slot) for slot in self.__slots__}
 
 
 def _row_to_approval(row: sqlite3.Row | tuple) -> MailboxTaskApproval:
-    keys = (
-        "id", "mailbox_msg_id", "task_body", "sender", "file_path",
-        "received_at", "status", "approved_at", "rejected_at",
-        "rejection_reason", "experiment_id", "outbox_file",
-        "publish_status", "publish_commit_sha",
-        "result_summary", "error", "created_at", "updated_at",
-    )
+    keys = MailboxTaskApproval.__slots__
     if isinstance(row, sqlite3.Row):
         return MailboxTaskApproval(**{k: row[k] for k in keys if k in row.keys()})
     return MailboxTaskApproval(**dict(zip(keys, row)))
@@ -97,8 +90,19 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _safe_error(error: str | None) -> str | None:
+    if not error:
+        return None
+    redacted = re.sub(
+        r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
+        "[REDACTED]",
+        error,
+    )
+    return redacted[:500]
+
+
 class MailboxTaskService:
-    """Approval-gated bridge from mailbox task messages to ExperimentService."""
+    """Route approved free-form tasks through the local LLM orchestrator."""
 
     def __init__(
         self,
@@ -106,29 +110,50 @@ class MailboxTaskService:
         experiment_service: "ExperimentService | None" = None,
         outbox_dir: str = "/agent/communication/outbox",
         repo_path: str = "/agent",
-        mailbox_config: "Any | None" = None,
+        mailbox_config: Any | None = None,
+        operations_registry: Any | None = None,
+        orchestrator_factory: Any | None = None,
     ) -> None:
         self.db_path = db_path
         self.experiment_service = experiment_service
         if mailbox_config is not None:
-            self.outbox_dir = mailbox_config.outbox_dir
-            self.repo_path = mailbox_config.code_repo_path
+            self.outbox_dir = Path(mailbox_config.outbox_dir)
+            self.repo_path = Path(mailbox_config.code_repo_path)
             self.mailbox_repo_path = Path(mailbox_config.mailbox_repo_path)
         else:
             self.outbox_dir = Path(outbox_dir)
             self.repo_path = Path(repo_path)
             self.mailbox_repo_path = self.repo_path
-        self._lock = threading.Lock()
+
+        self._lock = threading.RLock()
         self._repo_lock = RepoLock(self.mailbox_repo_path)
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
 
+        if operations_registry is None and experiment_service is not None:
+            from modules.operations_registry import OperationsRegistry
+            operations_registry = OperationsRegistry(
+                experiment_service=experiment_service,
+                db_path=db_path,
+                repo_root=str(self.repo_path),
+            )
+        self.operations_registry = operations_registry
+        self._owns_operations_registry = operations_registry is not None
+        self._orchestrator_factory = orchestrator_factory or NexusTaskOrchestrator
+
     def close(self) -> None:
+        if self._owns_operations_registry and self.operations_registry is not None:
+            close = getattr(self.operations_registry, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    logger.exception("mailbox_task: failed closing operations registry")
         self._conn.close()
 
     # ------------------------------------------------------------------
-    # CRUD
+    # CRUD / approval state
     # ------------------------------------------------------------------
 
     def create_approval(
@@ -139,7 +164,6 @@ class MailboxTaskService:
         file_path: str,
         received_at: str,
     ) -> MailboxTaskApproval:
-        """Create a pending_approval record (idempotent per mailbox_msg_id)."""
         with self._lock:
             existing = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
@@ -147,16 +171,13 @@ class MailboxTaskService:
             ).fetchone()
             if existing is not None:
                 return _row_to_approval(existing)
-
             approval_id = uuid.uuid4().hex
             now = _now_iso()
             self._conn.execute(
-                """
-                INSERT INTO mailbox_task_approvals
-                    (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-                     status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """INSERT INTO mailbox_task_approvals
+                   (id, mailbox_msg_id, task_body, sender, file_path, received_at,
+                    status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (approval_id, mailbox_msg_id, task_body or "", sender, file_path,
                  received_at, _STATUS_PENDING, now, now),
             )
@@ -164,10 +185,6 @@ class MailboxTaskService:
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
-        logger.info(
-            "mailbox_task: received task approval=%s from sender=%s (pending_approval)",
-            approval_id[:8], sender,
-        )
         return _row_to_approval(row)
 
     def get(self, approval_id: str) -> MailboxTaskApproval:
@@ -182,10 +199,10 @@ class MailboxTaskService:
     def list_pending(self, limit: int = 50) -> list[MailboxTaskApproval]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM mailbox_task_approvals WHERE status=? ORDER BY created_at DESC LIMIT ?",
                 (_STATUS_PENDING, limit),
             ).fetchall()
-        return [_row_to_approval(r) for r in rows]
+        return [_row_to_approval(row) for row in rows]
 
     def list_recent(self, limit: int = 20) -> list[MailboxTaskApproval]:
         with self._lock:
@@ -193,26 +210,20 @@ class MailboxTaskService:
                 "SELECT * FROM mailbox_task_approvals ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [_row_to_approval(r) for r in rows]
-
-    # ------------------------------------------------------------------
-    # State transitions
-    # ------------------------------------------------------------------
+        return [_row_to_approval(row) for row in rows]
 
     def approve(self, approval_id: str) -> MailboxTaskApproval:
-        """Atomically transition pending_approval → approved. Idempotent if already approved."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
+                "SELECT * FROM mailbox_task_approvals WHERE id=?", (approval_id,)
             ).fetchone()
             if row is None:
                 raise ApprovalNotFoundError(f"no approval with id {approval_id!r}")
-            status = row["status"]
-            if status == _STATUS_APPROVED:
+            if row["status"] == _STATUS_APPROVED:
                 return _row_to_approval(row)
-            if status != _STATUS_PENDING:
+            if row["status"] != _STATUS_PENDING:
                 raise ApprovalStateError(
-                    f"cannot approve approval in status {status!r} (only pending_approval allowed)"
+                    f"cannot approve approval in status {row['status']!r}"
                 )
             now = _now_iso()
             self._conn.execute(
@@ -220,27 +231,21 @@ class MailboxTaskService:
                 (_STATUS_APPROVED, now, now, approval_id, _STATUS_PENDING),
             )
             self._conn.commit()
-            row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
-            ).fetchone()
-        logger.info("mailbox_task: approval=%s approved", approval_id[:8])
-        return _row_to_approval(row)
+        return self.get(approval_id)
 
     def reject(self, approval_id: str, reason: str) -> MailboxTaskApproval:
-        """Transition pending_approval → rejected."""
         reason = reason.strip()
         if not _REJECTION_REASON_RE.match(reason):
             raise ValueError("rejection reason contains disallowed characters or is empty")
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
+                "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval_id,)
             ).fetchone()
             if row is None:
                 raise ApprovalNotFoundError(f"no approval with id {approval_id!r}")
-            status = row["status"]
-            if status != _STATUS_PENDING:
+            if row["status"] != _STATUS_PENDING:
                 raise ApprovalStateError(
-                    f"cannot reject approval in status {status!r} (only pending_approval allowed)"
+                    f"cannot reject approval in status {row['status']!r}"
                 )
             now = _now_iso()
             self._conn.execute(
@@ -250,169 +255,258 @@ class MailboxTaskService:
                 (_STATUS_REJECTED, now, reason, now, approval_id, _STATUS_PENDING),
             )
             self._conn.commit()
-            row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
-            ).fetchone()
-        logger.info("mailbox_task: approval=%s rejected reason=%s", approval_id[:8], reason)
-        return _row_to_approval(row)
+        return self.get(approval_id)
 
     # ------------------------------------------------------------------
-    # Background processing
+    # Agentic orchestration
     # ------------------------------------------------------------------
 
     def submit_approved(self) -> None:
-        """Find one approved record, atomically create experiment, transition to submitted."""
-        if self.experiment_service is None:
+        """Let the local model inspect state and choose the actual Nexus action."""
+        if self.experiment_service is None or self.operations_registry is None:
             return
-
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE status = ? LIMIT 1",
+                "SELECT * FROM mailbox_task_approvals WHERE status=? ORDER BY created_at LIMIT 1",
                 (_STATUS_APPROVED,),
             ).fetchone()
-            if row is None:
-                return
-            approval = _row_to_approval(row)
-
-            # Atomic transition: only move if still approved
-            now = _now_iso()
-            experiment = self.experiment_service.create_experiment(approval.task_body)
-            updated = self._conn.execute(
-                """UPDATE mailbox_task_approvals
-                   SET status=?, experiment_id=?, updated_at=?
-                   WHERE id=? AND status=?""",
-                (_STATUS_SUBMITTED, experiment.id, now, approval.id, _STATUS_APPROVED),
-            ).rowcount
-            self._conn.commit()
-
-        if not updated:
-            # Raced; abort the experiment (it's still queued and harmless, but mark it)
-            logger.warning("mailbox_task: lost race for approval %s, experiment %s orphaned",
-                           approval.id, experiment.id)
-            try:
-                elog = self.experiment_service.get_experiment_logger(experiment.id, mailbox_task_id=approval.id)
-                elog.warning(
-                    "mailbox", "mailbox_task_submit_race_lost",
-                    f"lost race for approval {approval.id[:8]}, experiment orphaned",
-                )
-            except Exception:
-                logger.exception("mailbox_task: failed to log race-lost for approval %s", approval.id)
+        if row is None:
             return
+        approval = _row_to_approval(row)
 
         try:
-            elog = self.experiment_service.get_experiment_logger(experiment.id, mailbox_task_id=approval.id)
-            elog.info(
-                "mailbox", "mailbox_task_submitted",
-                f"mailbox task approval {approval.id[:8]} submitted as experiment",
+            orchestrator = self._orchestrator_factory(
+                operations_registry=self.operations_registry,
+                experiment_service=self.experiment_service,
             )
-        except Exception:
-            logger.exception("mailbox_task: failed to log submission for approval %s", approval.id)
-        logger.info("mailbox_task: approval=%s submitted as experiment=%s", approval.id[:8], experiment.id[:8])
-
-        # Run experiment in a daemon thread
-        def _run():
-            try:
-                self.experiment_service.run_experiment(experiment.id)
-            except Exception:
-                logger.exception("mailbox_task: experiment %s raised during run", experiment.id)
-
-        t = threading.Thread(target=_run, daemon=True, name=f"mts-exp-{experiment.id[:8]}")
-        t.start()
-
-    def poll_running(self) -> None:
-        """Check submitted/running approvals and advance state machine."""
-        if self.experiment_service is None:
+            decision: TaskDecision = orchestrator.run(approval.task_body)
+        except Exception as exc:  # local LLM/orchestration failure must not become an experiment
+            logger.exception("mailbox_task: local orchestrator failed for %s", approval.id)
+            self._complete_without_experiment(
+                approval,
+                _STATUS_NEEDS_REVIEW,
+                f"Local Nexus orchestration failed: {_safe_error(str(exc)) or type(exc).__name__}",
+                error=str(exc),
+            )
             return
 
+        logger.info(
+            "mailbox_task: approval=%s selected action=%s reason=%s",
+            approval.id[:8], decision.action, decision.reason[:300],
+        )
+
+        if decision.action == ACTION_NEW_EXPERIMENT:
+            self._start_new_experiment(approval)
+        elif decision.action == ACTION_RESUME_EXPERIMENT:
+            self._resume_existing_experiment(approval, decision)
+        elif decision.action == ACTION_COMMAND:
+            self._run_command(approval, decision)
+        elif decision.action == ACTION_ANSWER:
+            self._complete_without_experiment(
+                approval, _STATUS_SUCCEEDED,
+                decision.message or decision.reason or "Task answered from Nexus state.",
+            )
+        elif decision.action in (ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY):
+            self._complete_without_experiment(
+                approval, _STATUS_NEEDS_REVIEW,
+                decision.message or decision.reason or decision.action,
+                error=decision.reason or decision.message,
+            )
+        else:
+            self._complete_without_experiment(
+                approval, _STATUS_NEEDS_REVIEW,
+                f"Unsupported orchestrator action: {decision.action}",
+                error=decision.reason,
+            )
+
+    def _start_new_experiment(self, approval: MailboxTaskApproval) -> None:
+        with self._lock:
+            current = self._conn.execute(
+                "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
+            ).fetchone()
+            if current is None or current["status"] != _STATUS_APPROVED:
+                return
+            experiment = self.experiment_service.create_experiment(approval.task_body)
+            updated = self._conn.execute(
+                """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
+                   WHERE id=? AND status=?""",
+                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_APPROVED),
+            ).rowcount
+            self._conn.commit()
+        if not updated:
+            logger.warning("mailbox_task: lost race after creating experiment %s", experiment.id)
+            return
+        self._start_thread(
+            experiment.id,
+            lambda: self.experiment_service.run_experiment(experiment.id),
+        )
+
+    def _resume_existing_experiment(self, approval: MailboxTaskApproval, decision: TaskDecision) -> None:
+        if not decision.experiment_id:
+            self._complete_without_experiment(
+                approval, _STATUS_NEEDS_REVIEW,
+                "The local orchestrator chose resume but did not identify an experiment.",
+            )
+            return
+        experiment = self.experiment_service.resolve_experiment(decision.experiment_id)
+        with self._lock:
+            updated = self._conn.execute(
+                """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
+                   WHERE id=? AND status=?""",
+                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_APPROVED),
+            ).rowcount
+            self._conn.commit()
+        if not updated:
+            return
+        self._start_thread(
+            experiment.id,
+            lambda: resume_experiment(self.experiment_service, experiment.id),
+        )
+
+    def _run_command(self, approval: MailboxTaskApproval, decision: TaskDecision) -> None:
+        command = (decision.command or "").strip()
+        if not command:
+            self._complete_without_experiment(
+                approval, _STATUS_NEEDS_REVIEW,
+                "The local orchestrator chose command but did not provide a command.",
+            )
+            return
+        with self._lock:
+            claimed = self._conn.execute(
+                "UPDATE mailbox_task_approvals SET status=?, updated_at=? WHERE id=? AND status=?",
+                (_STATUS_RUNNING, _now_iso(), approval.id, _STATUS_APPROVED),
+            ).rowcount
+            self._conn.commit()
+        if not claimed:
+            return
+        try:
+            msg = SimpleNamespace(body=command, meta={})
+            result_body, _ = process_command(
+                msg, self.repo_path, self._conn, approval.mailbox_msg_id
+            )
+            success = "**Exit code:** 0" in result_body
+            self._complete_claimed_without_experiment(
+                approval,
+                _STATUS_SUCCEEDED if success else _STATUS_FAILED,
+                result_body,
+                error=None if success else "command failed",
+            )
+        except Exception as exc:
+            self._complete_claimed_without_experiment(
+                approval, _STATUS_FAILED,
+                f"Command execution failed: {_safe_error(str(exc)) or type(exc).__name__}",
+                error=str(exc),
+            )
+
+    def _start_thread(self, experiment_id: str, target: Any) -> None:
+        def _run() -> None:
+            try:
+                target()
+            except Exception:
+                logger.exception("mailbox_task: experiment %s raised during execution", experiment_id)
+        threading.Thread(
+            target=_run,
+            daemon=True,
+            name=f"mts-exp-{experiment_id[:8]}",
+        ).start()
+
+    # ------------------------------------------------------------------
+    # Experiment polling / recovery
+    # ------------------------------------------------------------------
+
+    def poll_running(self) -> None:
+        if self.experiment_service is None:
+            return
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE status IN (?, ?)",
+                "SELECT * FROM mailbox_task_approvals WHERE status IN (?, ?) AND experiment_id IS NOT NULL",
                 (_STATUS_SUBMITTED, _STATUS_RUNNING),
             ).fetchall()
-
         for row in rows:
             approval = _row_to_approval(row)
-            if not approval.experiment_id:
-                continue
             try:
                 exp = self.experiment_service.get_experiment(approval.experiment_id)
             except Exception:
                 logger.exception("mailbox_task: failed to fetch experiment %s", approval.experiment_id)
                 continue
-
-            now = _now_iso()
-            if exp.status in _EXP_RUNNING:
-                if approval.status != _STATUS_RUNNING:
-                    with self._lock:
-                        self._conn.execute(
-                            "UPDATE mailbox_task_approvals SET status=?, updated_at=? WHERE id=?",
-                            (_STATUS_RUNNING, now, approval.id),
-                        )
-                        self._conn.commit()
-                    self._log_mailbox_event(
-                        approval, "mailbox", "mailbox_task_running",
-                        f"mailbox task approval {approval.id[:8]} now running (experiment status={exp.status})",
+            if exp.status in _EXP_RUNNING or (
+                approval.status == _STATUS_SUBMITTED and exp.status not in _EXP_TERMINAL
+            ):
+                with self._lock:
+                    self._conn.execute(
+                        "UPDATE mailbox_task_approvals SET status=?, updated_at=? WHERE id=?",
+                        (_STATUS_RUNNING, _now_iso(), approval.id),
                     )
+                    self._conn.commit()
             elif exp.status == "succeeded":
                 self._transition_terminal(approval, _STATUS_SUCCEEDED, exp)
             elif exp.status in ("failed", "timed_out"):
                 self._transition_terminal(approval, _STATUS_FAILED, exp)
             elif exp.status == "needs_review":
                 self._transition_terminal(approval, _STATUS_NEEDS_REVIEW, exp)
-            # queued/selecting/etc → just update to running
-            elif approval.status == _STATUS_SUBMITTED and exp.status not in _EXP_TERMINAL:
-                with self._lock:
-                    self._conn.execute(
-                        "UPDATE mailbox_task_approvals SET status=?, updated_at=? WHERE id=?",
-                        (_STATUS_RUNNING, now, approval.id),
-                    )
-                    self._conn.commit()
-                self._log_mailbox_event(
-                    approval, "mailbox", "mailbox_task_running",
-                    f"mailbox task approval {approval.id[:8]} now running (experiment status={exp.status})",
-                )
 
-    def _log_mailbox_event(self, approval: MailboxTaskApproval, phase: str, event: str, message: str, level: str = "info") -> None:
-        """Best-effort mailbox event log into the experiment's JSONL log (never raises)."""
-        if self.experiment_service is None or not approval.experiment_id:
-            return
-        try:
-            elog = self.experiment_service.get_experiment_logger(approval.experiment_id, mailbox_task_id=approval.id)
-            getattr(elog, level)(phase, event, message)
-        except Exception:
-            logger.exception("mailbox_task: failed to log event %s for approval %s", event, approval.id)
-
-    def _transition_terminal(self, approval: MailboxTaskApproval, new_status: str, exp) -> None:
-        now = _now_iso()
-        result_summary = self._make_result_summary(exp)
-        # _write_outbox sets outbox_file and publish_status in the DB itself
-        # so that the publish lifecycle (pending_write → written) is persisted
-        # before the business-status transition.
-        self._write_outbox(approval, new_status, exp, result_summary)
-
+    def recover_after_restart(self) -> None:
+        # A command/non-experiment action that died with the process is not
+        # silently replayed. Surface it for review instead.
         with self._lock:
             self._conn.execute(
                 """UPDATE mailbox_task_approvals
-                   SET status=?, result_summary=?, error=?, updated_at=?
-                   WHERE id=?""",
-                (new_status,
-                 result_summary,
-                 _safe_error(exp.error) if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW) else None,
-                 now,
-                 approval.id),
+                   SET status=?, error=?, updated_at=?
+                   WHERE status=? AND experiment_id IS NULL""",
+                (_STATUS_NEEDS_REVIEW, "non-experiment task interrupted by restart", _now_iso(), _STATUS_RUNNING),
             )
             self._conn.commit()
+        self.poll_running()
 
-        self._log_mailbox_event(
-            approval, "mailbox", "mailbox_task_terminal",
-            f"mailbox task approval {approval.id[:8]} reached terminal status={new_status}; {result_summary}",
-            level="warning" if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW) else "info",
-        )
+    # ------------------------------------------------------------------
+    # Terminal results / outbox
+    # ------------------------------------------------------------------
 
+    def _transition_terminal(self, approval: MailboxTaskApproval, new_status: str, exp: Any) -> None:
+        summary = self._make_result_summary(exp)
+        self._write_result_outbox(approval, new_status, summary, exp)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE mailbox_task_approvals
+                   SET status=?, result_summary=?, error=?, updated_at=? WHERE id=?""",
+                (new_status, summary,
+                 _safe_error(exp.error) if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW) else None,
+                 _now_iso(), approval.id),
+            )
+            self._conn.commit()
         if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW):
-            self._write_problem(approval, new_status, result_summary, exp)
+            self._write_problem(approval, new_status, summary, exp)
 
-    def _make_result_summary(self, exp) -> str:
+    def _complete_without_experiment(
+        self, approval: MailboxTaskApproval, status: str, summary: str,
+        *, error: str | None = None,
+    ) -> None:
+        with self._lock:
+            updated = self._conn.execute(
+                """UPDATE mailbox_task_approvals
+                   SET status=?, experiment_id=NULL, result_summary=?, error=?, updated_at=?
+                   WHERE id=? AND status=?""",
+                (status, summary[:8000], _safe_error(error), _now_iso(), approval.id, _STATUS_APPROVED),
+            ).rowcount
+            self._conn.commit()
+        if updated:
+            self._write_result_outbox(approval, status, summary, None)
+
+    def _complete_claimed_without_experiment(
+        self, approval: MailboxTaskApproval, status: str, summary: str,
+        *, error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE mailbox_task_approvals
+                   SET status=?, result_summary=?, error=?, updated_at=? WHERE id=?""",
+                (status, summary[:8000], _safe_error(error), _now_iso(), approval.id),
+            )
+            self._conn.commit()
+        self._write_result_outbox(approval, status, summary, None)
+
+    @staticmethod
+    def _make_result_summary(exp: Any) -> str:
         parts = [f"status={exp.status}"]
         if exp.test_exit_code is not None:
             parts.append(f"tests={'pass' if exp.test_exit_code == 0 else 'fail'}")
@@ -420,52 +514,34 @@ class MailboxTaskService:
             parts.append(f"diff_stat={exp.diff_stat[:100]}")
         return "; ".join(parts)
 
-    def _write_outbox(self, approval: MailboxTaskApproval, status: str, exp, summary: str) -> str | None:
-        """Write the outbox result file using the persistent publish lifecycle.
-
-        Persists ``outbox_content`` + ``publish_status=pending_write`` (+ ``outbox_file``)
-        before the atomic write so that ``TaskApprovalOutboxPublisher`` can
-        reconstruct the file from the DB if the process crashes after the DB
-        write but before the file write completes.  Advances to
-        ``publish_status=written`` on success.  The actual git commit/push is
-        handled by ``TaskApprovalOutboxPublisher.publish_pending()``.
-
-        The entire write (DB intent → file write → DB confirmation) is wrapped
-        in the per-repo ``RepoLock`` so that the publisher's own lock and the
-        write path share the same ``fcntl.flock`` serialisation, also across
-        processes.
-
-        Returns the relative outbox path (from mailbox_repo_root) on success,
-        or None on failure.
-        """
+    def _write_result_outbox(
+        self, approval: MailboxTaskApproval, status: str, summary: str, exp: Any | None,
+    ) -> str | None:
         try:
             self.outbox_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             filename = f"{ts}-task-approval-{approval.id[:8]}.md"
+            experiment_id = exp.id if exp is not None else "none"
             test_result = ""
-            if exp.test_exit_code is not None:
+            if exp is not None and exp.test_exit_code is not None:
                 test_result = f"\ntest_result: {'pass' if exp.test_exit_code == 0 else 'fail'}"
             content = (
-                f"---\n"
-                f"type: task_approval_result\n"
+                "---\n"
+                "type: task_approval_result\n"
                 f"status: {status}\n"
                 f"approval_id: {approval.id}\n"
-                f"experiment_id: {exp.id}\n"
+                f"experiment_id: {experiment_id}\n"
                 f"sender: {approval.sender}\n"
                 f"source: {Path(approval.file_path).name}\n"
                 f"created_at: {approval.created_at}{test_result}\n"
-                f"---\n\n"
-                f"## Task Approval Result\n\n"
+                "---\n\n"
+                "## Task Approval Result\n\n"
                 f"**Status:** {status}\n\n"
-                f"**Summary:** {summary}\n"
+                f"{summary[:32000]}\n"
             )
             path = self.outbox_dir / filename
-            # Store relative path from mailbox repo root for the publisher.
             rel_path = str(path.relative_to(self.mailbox_repo_path))
-
             with self._repo_lock:
-                # Persist publish intent + full content before the file write so
-                # that a crash between write and DB update is recoverable.
                 with self._lock:
                     self._conn.execute(
                         """UPDATE mailbox_task_approvals
@@ -474,87 +550,44 @@ class MailboxTaskService:
                         (rel_path, content, PUBLISH_PENDING_WRITE, _now_iso(), approval.id),
                     )
                     self._conn.commit()
-
                 tmp = path.with_suffix(".tmp")
                 tmp.write_text(content, encoding="utf-8")
-                tmp.replace(path)  # atomic rename
-
-                # Advance to written so the publisher knows the file exists.
+                tmp.replace(path)
                 with self._lock:
                     self._conn.execute(
-                        """UPDATE mailbox_task_approvals
-                           SET publish_status=?, updated_at=?
-                           WHERE id=?""",
+                        "UPDATE mailbox_task_approvals SET publish_status=?, updated_at=? WHERE id=?",
                         (PUBLISH_WRITTEN, _now_iso(), approval.id),
                     )
                     self._conn.commit()
-
-            self._log_mailbox_event(
-                approval, "mailbox", "outbox_written",
-                f"outbox file {filename} written for approval {approval.id[:8]} (status={status})",
-            )
             return rel_path
         except Exception:
-            logger.exception("mailbox_task: failed to write outbox for approval %s", approval.id)
-            self._log_mailbox_event(
-                approval, "mailbox", "outbox_write_failed",
-                f"failed to write outbox for approval {approval.id[:8]}",
-                level="error",
-            )
+            logger.exception("mailbox_task: failed to write outbox for %s", approval.id)
             return None
 
-    def _write_problem(self, approval: MailboxTaskApproval, status: str, summary: str, exp) -> None:
+    # Backward-compatible name used by existing tests/helpers.
+    def _write_outbox(self, approval: MailboxTaskApproval, status: str, exp: Any, summary: str) -> str | None:
+        return self._write_result_outbox(approval, status, summary, exp)
+
+    def _write_problem(self, approval: MailboxTaskApproval, status: str, summary: str, exp: Any) -> None:
         try:
             runs_dir = self.repo_path / "state" / "runs"
             runs_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            filename = runs_dir / f"{ts}-task-approval-{approval.id[:8]}.json"
-            data = {
-                "timestamp": _now_iso(),
-                "source": "mailbox_task_service",
-                "approval_id": approval.id,
-                "experiment_id": exp.id,
-                "response": f"ERROR: task approval {approval.id[:8]} ended with status={status}; {summary}",
-            }
-            filename.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            self._log_mailbox_event(
-                approval, "mailbox", "problem_file_written",
-                f"problem file written for approval {approval.id[:8]} (status={status})",
-                level="warning",
+            filename = runs_dir / f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-task-approval-{approval.id[:8]}.json"
+            filename.write_text(
+                json.dumps({
+                    "timestamp": _now_iso(),
+                    "source": "mailbox_task_service",
+                    "approval_id": approval.id,
+                    "experiment_id": exp.id,
+                    "response": f"ERROR: task approval {approval.id[:8]} ended with status={status}; {summary}",
+                }, indent=2),
+                encoding="utf-8",
             )
         except Exception:
-            logger.exception("mailbox_task: failed to write problem for approval %s", approval.id)
-            self._log_mailbox_event(
-                approval, "mailbox", "problem_write_failed",
-                f"failed to write problem file for approval {approval.id[:8]}",
-                level="error",
-            )
-
-    def recover_after_restart(self) -> None:
-        """On startup: advance state machine for non-terminal approvals."""
-        if self.experiment_service is None:
-            return
-        try:
-            self.poll_running()
-        except Exception:
-            logger.exception("mailbox_task: recover_after_restart failed")
-
-
-def _safe_error(error: str | None) -> str | None:
-    if not error:
-        return None
-    # Redact anything that looks like a secret or path
-    redacted = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+", "[REDACTED]", error)
-    return redacted[:500]
+            logger.exception("mailbox_task: failed to write problem for %s", approval.id)
 
 
 class MailboxTaskWorker(threading.Thread):
-    """Single background daemon that processes approved mailbox tasks.
-
-    Runs submit_approved() + poll_running() every 10 seconds.
-    Single-threaded so experiments run serially (appropriate for 1-VM budget).
-    """
-
     def __init__(self, service: MailboxTaskService, interval: float = 10.0) -> None:
         super().__init__(daemon=True, name="mailbox-task-worker")
         self._service = service
