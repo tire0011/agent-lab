@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
@@ -107,7 +109,7 @@ class NexusTaskOrchestrator:
             if action == ACTION_COMMAND and not command:
                 raise TaskOrchestratorError("command action requires command")
 
-            return TaskDecision(
+            result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
                 message=str(decision.get("message", ""))[:2000],
@@ -115,6 +117,9 @@ class NexusTaskOrchestrator:
                 command=command,
                 observations=observations,
             )
+            if action == ACTION_MISSING_CAPABILITY:
+                self._record_missing_capability(task, result)
+            return result
 
         return TaskDecision(
             action=ACTION_CLARIFICATION,
@@ -149,7 +154,7 @@ class NexusTaskOrchestrator:
             },
             {
                 "name": ACTION_MISSING_CAPABILITY,
-                "description": "State that no available Nexus capability can complete the request and describe the missing capability.",
+                "description": "State that no available Nexus capability can complete the request; Nexus records this as a structured capability requirement.",
             },
             {
                 "name": ACTION_CLARIFICATION,
@@ -184,7 +189,7 @@ Rules:
 - For a request to continue an existing experiment, inspect it if useful, then choose resume_experiment with its id/prefix.
 - For an explicit operational command, choose command rather than creating an experiment.
 - If inspection answers the request, choose answer.
-- If the needed capability does not exist, choose missing_capability instead of pretending another workflow fits.
+- If the needed capability does not exist, choose missing_capability instead of pretending another workflow fits. Describe the missing capability concretely in message/reason.
 - Ask clarification only when tools/state cannot resolve a material ambiguity.
 - Never invent operation names or experiment IDs.
 - Return JSON only.
@@ -225,3 +230,33 @@ Rules:
             "args": args,
             "result": payload,
         }
+
+    def _record_missing_capability(self, task: str, decision: TaskDecision) -> None:
+        """Best-effort durable requirement discovered while handling real work."""
+        repo_root = getattr(self.operations_registry, "repo_root", None)
+        if repo_root is None:
+            return
+        try:
+            root = Path(repo_root) / "state" / "requirements"
+            root.mkdir(parents=True, exist_ok=True)
+            now = datetime.now(timezone.utc)
+            path = root / f"{now.strftime('%Y%m%d%H%M%S%f')}-missing-capability.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "timestamp": now.isoformat(),
+                        "type": "missing_capability",
+                        "trigger_task": task[:4000],
+                        "requirement": decision.message[:2000],
+                        "reason": decision.reason[:1000],
+                        "source": "local_task_orchestrator",
+                        "status": "new",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            # Missing-capability detection itself remains a valid outcome even
+            # when the optional durable requirement file cannot be written.
+            return
