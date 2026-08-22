@@ -68,7 +68,7 @@ from modules.experiment_evaluation import (
 )
 from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
-from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
+from modules.run_store import DEFAULT_DB_PATH, get_setting, init_db, insert_activity, list_activity, set_setting
 from modules.verification_env import build_verification_test_env
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,21 @@ _DEFAULT_RESEARCH_TIMEOUT_SECONDS = 120
 _DEFAULT_PLAN_TIMEOUT_SECONDS = 90
 _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 1200  # 20 minutes
+
+# Adaptive verification test timeout. The subprocess running the test
+# command starts out bounded by ``_DEFAULT_TEST_TIMEOUT_SECONDS``; each time
+# a full verification run ends with ``test_timeout`` (the suite did not
+# finish in time, as opposed to a normal test failure), the timeout used for
+# the *next* run is multiplied by ``_TEST_TIMEOUT_BACKOFF_FACTOR`` and capped
+# at ``_MAX_TEST_TIMEOUT_SECONDS`` so a hanging test can never grow the
+# timeout without bound. The learned value is persisted in the
+# ``service_settings`` table (see ``modules.run_store``) so it survives
+# process restarts and is reused by later verification runs, not just later
+# calls on the same ``ExperimentService`` instance.
+_DEFAULT_TEST_TIMEOUT_SECONDS = 300  # 5 minutes
+_MAX_TEST_TIMEOUT_SECONDS = 1800  # 30 minutes
+_TEST_TIMEOUT_BACKOFF_FACTOR = 1.5
+_TEST_TIMEOUT_SETTING_KEY = "verification_test_timeout_seconds"
 
 # Test-command allowlist, keyed by a fixed identifier. The plan/LLM output
 # never supplies a raw shell string; the service only ever chooses one of
@@ -1635,6 +1650,9 @@ class ExperimentService:
         max_diagnostic_log_bytes: int = _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES,
         test_python_executable: str = _DEFAULT_TEST_PYTHON_EXECUTABLE,
         experiment_log_dir: str | None = None,
+        default_test_timeout_seconds: int = _DEFAULT_TEST_TIMEOUT_SECONDS,
+        max_test_timeout_seconds: int = _MAX_TEST_TIMEOUT_SECONDS,
+        test_timeout_backoff_factor: float = _TEST_TIMEOUT_BACKOFF_FACTOR,
     ) -> None:
         """
         Parameters
@@ -1681,6 +1699,16 @@ class ExperimentService:
             experiment (``<experiment_log_dir>/<experiment_id>.jsonl``),
             written via ``modules.experiment_logger.ExperimentLogger``.
             Defaults to ``<repo_root>/state/experiment-logs``.
+        default_test_timeout_seconds:
+            Starting timeout (seconds) for the verification test subprocess
+            before any automatic increase has ever been learned/persisted.
+        max_test_timeout_seconds:
+            Hard cap on the automatically-increased verification test
+            timeout, so a hanging test can never grow the timeout without
+            bound.
+        test_timeout_backoff_factor:
+            Multiplier applied to the current verification test timeout
+            each time a full run ends with ``test_timeout``.
         """
         self.selection_worker = selection_worker if selection_worker is not None else CodexWorker(
             allowed_roots=(repo_root,)
@@ -1699,6 +1727,9 @@ class ExperimentService:
         self.max_raw_message_bytes = max_raw_message_bytes
         self.max_diagnostic_log_bytes = max_diagnostic_log_bytes
         self.test_python_executable = test_python_executable
+        self.default_test_timeout_seconds = default_test_timeout_seconds
+        self.max_test_timeout_seconds = max_test_timeout_seconds
+        self.test_timeout_backoff_factor = test_timeout_backoff_factor
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
         # cleanliness is asserted directly, so the log directory must never
@@ -1715,6 +1746,49 @@ class ExperimentService:
 
     def close(self) -> None:
         self._conn.close()
+
+    # ------------------------------------------------------------------
+    # adaptive verification test timeout
+    # ------------------------------------------------------------------
+
+    def _get_test_timeout_seconds(self) -> int:
+        """Return the timeout (seconds) to use for the *next* verification
+        test subprocess run, reusing any previously learned/persisted value
+        so a suite that has already required more time does not keep
+        hitting the same limit on later runs."""
+        with self._lock:
+            raw = get_setting(self._conn, _TEST_TIMEOUT_SETTING_KEY)
+        if raw is None:
+            return self.default_test_timeout_seconds
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return self.default_test_timeout_seconds
+        if value <= 0:
+            return self.default_test_timeout_seconds
+        return value
+
+    def _increase_test_timeout_seconds(self, current_timeout: int) -> int:
+        """Persist a larger timeout after a ``test_timeout`` and return it.
+
+        ``next_timeout = min(current_timeout * factor, max_timeout)``. The
+        new value is stored in ``service_settings`` so subsequent
+        verification runs (including in later processes) start from it
+        instead of the original default.
+        """
+        next_timeout = min(
+            int(current_timeout * self.test_timeout_backoff_factor),
+            self.max_test_timeout_seconds,
+        )
+        next_timeout = max(next_timeout, current_timeout)
+        with self._lock:
+            set_setting(
+                self._conn,
+                _TEST_TIMEOUT_SETTING_KEY,
+                str(next_timeout),
+                updated_at=_utcnow_iso(),
+            )
+        return next_timeout
 
     # ------------------------------------------------------------------
     # create_experiment
@@ -2258,10 +2332,12 @@ class ExperimentService:
             )
             return self.get_experiment(experiment_id)
 
+        test_timeout_seconds = self._get_test_timeout_seconds()
         elog.info(
             "verifying", "tests_started",
             "Running verification test command",
             command=test_command, cwd=worktree_path,
+            timeout_seconds=test_timeout_seconds,
         )
         # Isolated, allowlisted environment for the test subprocess only:
         # never the full parent (agent-api) environment, so a production
@@ -2280,7 +2356,7 @@ class ExperimentService:
                 cwd=worktree_path,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=test_timeout_seconds,
                 shell=False,
                 env=test_env,
             )
@@ -2304,8 +2380,17 @@ class ExperimentService:
                 "Test command timed out",
                 command=test_command, cwd=worktree_path,
                 duration_ms=int((time.perf_counter() - test_started) * 1000),
-                timed_out=True, level="ERROR",
+                timed_out=True, level="ERROR", timeout_seconds=test_timeout_seconds,
             )
+            next_timeout_seconds = self._increase_test_timeout_seconds(test_timeout_seconds)
+            if next_timeout_seconds > test_timeout_seconds:
+                elog.warning(
+                    "verifying", "test_timeout_increased",
+                    f"Verification test timeout increased from {test_timeout_seconds}s to "
+                    f"{next_timeout_seconds}s for future runs",
+                    previous_timeout_seconds=test_timeout_seconds,
+                    new_timeout_seconds=next_timeout_seconds,
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             test_exit_code = None
             test_output = f"failed to run test command: {exc}"
