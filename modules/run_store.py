@@ -210,6 +210,12 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
         CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id);
+
+        CREATE TABLE IF NOT EXISTS service_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     _migrate_experiments_columns(conn)
@@ -775,6 +781,29 @@ def list_activity(
         }
         for row in rows
     ]
+
+
+def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
+    """Return the persisted value for ``key`` from ``service_settings``, or
+    ``None`` if it has never been set. Used for small, durable pieces of
+    adaptive service state (e.g. the auto-tuned verification test timeout)
+    that must be reused across process restarts, not just within a single
+    long-lived connection."""
+    row = conn.execute("SELECT value FROM service_settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row is not None else None
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str, *, updated_at: str) -> None:
+    """Upsert a single ``service_settings`` key/value pair."""
+    conn.execute(
+        """
+        INSERT INTO service_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, updated_at),
+    )
+    conn.commit()
 
 
 def _migrate_operation_log(conn: sqlite3.Connection) -> None:

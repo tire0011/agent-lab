@@ -2297,6 +2297,121 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         ]
         self.assertTrue(status_change, "expected a status_forced -> timed_out entry")
 
+    def _make_timeout_service(self, db_path: str, **overrides) -> ExperimentService:
+        kwargs = dict(
+            selection_worker=self.selection_worker,
+            plan_worker_factory=lambda scratch_dir: self.plan_worker,
+            worker_factory=lambda worktree_path: self.implementation_worker,
+            db_path=db_path,
+            repo_root=str(self.repo_root),
+            worktrees_root=str(self.worktrees_root),
+            experiment_log_dir=str(self.log_dir),
+            test_python_executable=sys.executable,
+            default_test_timeout_seconds=10,
+            max_test_timeout_seconds=25,
+            test_timeout_backoff_factor=2.0,
+        )
+        kwargs.update(overrides)
+        service = ExperimentService(**kwargs)
+        self.addCleanup(service.close)
+        return service
+
+    @staticmethod
+    def _always_time_out(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and "unittest" in cmd and "discover" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 300))
+        return _ORIGINAL_SUBPROCESS_RUN(cmd, *args, **kwargs)
+
+    def test_test_timeout_increases_next_run_timeout(self):
+        """A ``test_timeout`` must grow the timeout for the next run using
+        ``min(current * factor, max)`` and log the increase."""
+        db_path = str(Path(self.tmp.name) / "timeout-increase.db")
+        service = self._make_timeout_service(db_path)
+        self.assertEqual(service._get_test_timeout_seconds(), 10)
+
+        experiment = service.create_experiment(goal="g")
+        with patch("subprocess.run", side_effect=self._always_time_out):
+            result = service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_TIMED_OUT)
+
+        # 10 * 2.0 = 20, still below the 25 cap.
+        self.assertEqual(service._get_test_timeout_seconds(), 20)
+
+        entries = self._read_log(experiment.id)
+        increases = [e for e in entries if e["event"] == "test_timeout_increased"]
+        self.assertEqual(len(increases), 1)
+        self.assertEqual(increases[0]["previous_timeout_seconds"], 10)
+        self.assertEqual(increases[0]["new_timeout_seconds"], 20)
+        started = [e for e in entries if e["event"] == "tests_started"]
+        self.assertEqual(started[0]["timeout_seconds"], 10)
+
+    def test_increased_timeout_is_persisted_and_reused_across_instances(self):
+        """The learned timeout must be reused by later runs, including from
+        a brand-new ``ExperimentService`` instance pointed at the same DB
+        (simulating a process restart), not just within one process."""
+        db_path = str(Path(self.tmp.name) / "timeout-reuse.db")
+        service = self._make_timeout_service(db_path)
+
+        experiment = service.create_experiment(goal="g")
+        with patch("subprocess.run", side_effect=self._always_time_out):
+            service.run_experiment(experiment.id)
+        self.assertEqual(service._get_test_timeout_seconds(), 20)
+
+        # A fresh instance (default_test_timeout_seconds=10 again) must
+        # still see the persisted, increased value.
+        other_service = self._make_timeout_service(db_path)
+        self.assertEqual(other_service._get_test_timeout_seconds(), 20)
+
+        experiment2 = other_service.create_experiment(goal="g2")
+        with patch("subprocess.run", side_effect=self._always_time_out):
+            other_service.run_experiment(experiment2.id)
+        # 20 * 2.0 = 40, capped at 25.
+        self.assertEqual(other_service._get_test_timeout_seconds(), 25)
+
+    def test_timeout_growth_is_capped_at_maximum(self):
+        db_path = str(Path(self.tmp.name) / "timeout-cap.db")
+        service = self._make_timeout_service(db_path)
+
+        for i in range(5):
+            experiment = service.create_experiment(goal=f"g{i}")
+            with patch("subprocess.run", side_effect=self._always_time_out):
+                result = service.run_experiment(experiment.id)
+            self.assertEqual(result.status, STATUS_TIMED_OUT)
+            self.assertLessEqual(service._get_test_timeout_seconds(), 25)
+
+        self.assertEqual(service._get_test_timeout_seconds(), 25)
+
+    def test_successful_run_does_not_increase_timeout(self):
+        db_path = str(Path(self.tmp.name) / "timeout-success.db")
+        service = self._make_timeout_service(db_path)
+        experiment = service.create_experiment(goal="g")
+        result = service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.assertEqual(service._get_test_timeout_seconds(), 10)
+
+        entries = self._read_log(experiment.id)
+        self.assertEqual([e for e in entries if e["event"] == "test_timeout_increased"], [])
+
+    def test_normal_test_failure_does_not_increase_timeout(self):
+        (self.repo_root / "tests" / "test_placeholder.py").write_text(
+            "import unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_fail(self):\n"
+            "        self.assertTrue(False)\n"
+        )
+        subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.repo_root), "commit", "-q", "-m", "failing test"], check=True)
+
+        db_path = str(Path(self.tmp.name) / "timeout-failure.db")
+        service = self._make_timeout_service(db_path)
+        experiment = service.create_experiment(goal="g")
+        result = service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertEqual(service._get_test_timeout_seconds(), 10)
+
+        entries = self._read_log(experiment.id)
+        self.assertEqual([e for e in entries if e["event"] == "test_timeout_increased"], [])
+
     def test_unhandled_exception_is_logged_with_stacktrace(self):
         self.implementation_worker.run.side_effect = RuntimeError("impl boom")
         experiment = self.service.create_experiment(goal="g")
