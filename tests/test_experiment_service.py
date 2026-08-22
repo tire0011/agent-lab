@@ -426,6 +426,26 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(kwargs["working_dir"], result.worktree_path)
         self.assertEqual(self.worker_factory_calls, [result.worktree_path])
 
+    def test_resume_experiment_reuses_worktree_without_reimplementing(self):
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.implementation_worker.run.assert_called_once()
+
+        resumed = self.service.resume_experiment(experiment.id)
+
+        # Same experiment/worktree, not a new one; implementation never re-run.
+        self.assertEqual(resumed.id, experiment.id)
+        self.assertEqual(resumed.worktree_path, result.worktree_path)
+        self.assertEqual(resumed.status, STATUS_SUCCEEDED)
+        self.implementation_worker.run.assert_called_once()
+        self.assertEqual(self.worker_factory_calls, [result.worktree_path])
+
+    def test_resume_experiment_without_worktree_raises(self):
+        experiment = self.service.create_experiment(goal="g")
+        with self.assertRaises(ExperimentNotRunnableError):
+            self.service.resume_experiment(experiment.id)
+
     def test_main_working_directory_unchanged_after_run(self):
         experiment = self.service.create_experiment(goal="g")
         self.service.run_experiment(experiment.id)

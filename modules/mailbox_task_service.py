@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from modules.run_store import init_db, DEFAULT_DB_PATH
 from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
+from modules.task_intent import ACTION_RESUME_EXPERIMENT, classify_task_intent
 
 if TYPE_CHECKING:
     from modules.experiment_service import ExperimentService
@@ -261,7 +262,16 @@ class MailboxTaskService:
     # ------------------------------------------------------------------
 
     def submit_approved(self) -> None:
-        """Find one approved record, atomically create experiment, transition to submitted."""
+        """Find one approved record, dispatch it to the right workflow, transition to submitted.
+
+        Before automatically starting a brand-new experiment, the approved
+        task body is classified via :func:`modules.task_intent.classify_task_intent`.
+        This lets an explicit "resume experiment <id>" style request reuse
+        the existing experiment's persisted id and worktree instead of
+        creating a new experiment/worktree for work that already has one
+        (see issue: local LLM/intent step must run before automatic
+        experiment creation).
+        """
         if self.experiment_service is None:
             return
 
@@ -274,9 +284,15 @@ class MailboxTaskService:
                 return
             approval = _row_to_approval(row)
 
+            intent = classify_task_intent(approval.task_body, self.experiment_service)
+            is_resume = intent.action == ACTION_RESUME_EXPERIMENT and intent.experiment_id is not None
+            if is_resume:
+                experiment = self.experiment_service.get_experiment(intent.experiment_id)
+            else:
+                experiment = self.experiment_service.create_experiment(approval.task_body)
+
             # Atomic transition: only move if still approved
             now = _now_iso()
-            experiment = self.experiment_service.create_experiment(approval.task_body)
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals
                    SET status=?, experiment_id=?, updated_at=?
@@ -286,7 +302,15 @@ class MailboxTaskService:
             self._conn.commit()
 
         if not updated:
-            # Raced; abort the experiment (it's still queued and harmless, but mark it)
+            # Raced; a freshly-created experiment is harmless but orphaned. A
+            # resumed experiment already existed before this call, so there is
+            # nothing to abandon in that case.
+            if is_resume:
+                logger.warning(
+                    "mailbox_task: lost race for approval %s while resuming experiment %s",
+                    approval.id, experiment.id,
+                )
+                return
             logger.warning("mailbox_task: lost race for approval %s, experiment %s orphaned",
                            approval.id, experiment.id)
             try:
@@ -302,17 +326,28 @@ class MailboxTaskService:
         try:
             elog = self.experiment_service.get_experiment_logger(experiment.id, mailbox_task_id=approval.id)
             elog.info(
-                "mailbox", "mailbox_task_submitted",
-                f"mailbox task approval {approval.id[:8]} submitted as experiment",
+                "mailbox",
+                "mailbox_task_resumed" if is_resume else "mailbox_task_submitted",
+                (
+                    f"mailbox task approval {approval.id[:8]} resumed experiment {experiment.id[:8]} ({intent.reason})"
+                    if is_resume
+                    else f"mailbox task approval {approval.id[:8]} submitted as experiment"
+                ),
             )
         except Exception:
             logger.exception("mailbox_task: failed to log submission for approval %s", approval.id)
-        logger.info("mailbox_task: approval=%s submitted as experiment=%s", approval.id[:8], experiment.id[:8])
+        logger.info(
+            "mailbox_task: approval=%s %s experiment=%s",
+            approval.id[:8], "resumed" if is_resume else "submitted as", experiment.id[:8],
+        )
 
-        # Run experiment in a daemon thread
+        # Run the experiment (or resume it) in a daemon thread
         def _run():
             try:
-                self.experiment_service.run_experiment(experiment.id)
+                if is_resume:
+                    self.experiment_service.resume_experiment(experiment.id)
+                else:
+                    self.experiment_service.run_experiment(experiment.id)
             except Exception:
                 logger.exception("mailbox_task: experiment %s raised during run", experiment.id)
 

@@ -2105,6 +2105,49 @@ class ExperimentService:
             )
             return self.get_experiment(experiment_id)
 
+    def resume_experiment(self, experiment_id: str) -> Experiment:
+        """Resume an existing, previously-started experiment without reimplementing.
+
+        Unlike :meth:`run_experiment` (which only starts a brand-new
+        ``queued`` experiment through the full worktree+implementation+
+        verification pipeline), this reuses the experiment's *existing*
+        git worktree and re-runs only the verification phase (git diff +
+        tests + quality gate). It never re-creates a worktree, never
+        re-invokes the implementation worker, and never allocates a new
+        experiment id — it is the internal primitive backing "resume
+        experiment X" style intents so callers don't have to fabricate a
+        new experiment for work that already has a worktree.
+        """
+        experiment = self.resolve_experiment(experiment_id)
+        elog = self.get_experiment_logger(experiment.id)
+
+        if not experiment.worktree_path or not Path(experiment.worktree_path).is_dir():
+            raise ExperimentNotRunnableError(
+                f"experiment {experiment.id!r} has no existing worktree to resume "
+                f"(worktree_path={experiment.worktree_path!r})"
+            )
+
+        if experiment.status in _TERMINAL_STATUSES:
+            elog.info(
+                experiment.status, "resume_noop",
+                f"resume_experiment called but experiment already terminal "
+                f"(status={experiment.status}); returning as-is without reimplementing",
+            )
+            return experiment
+
+        elog.info(
+            experiment.status, "resume_requested",
+            f"Resuming experiment {experiment.id} from status={experiment.status}; "
+            "reusing existing worktree, not reimplementing",
+        )
+
+        # Whatever non-terminal stage it was interrupted at (implementing or
+        # verifying), the safe, idempotent way to continue without
+        # reimplementing is to (re-)run verification against the worktree's
+        # current state.
+        self._force_status(experiment.id, STATUS_VERIFYING)
+        return self._verify(experiment.id, experiment.worktree_path, elog)
+
     def _run_pipeline(self, experiment_id: str) -> Experiment:
         """Single-call implementation pipeline.
 

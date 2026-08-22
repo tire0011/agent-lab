@@ -242,6 +242,35 @@ class TestSubmitApproved(unittest.TestCase):
 
         es.create_experiment.assert_called_once()
 
+    def test_submit_approved_resumes_existing_experiment_instead_of_creating_new(self):
+        existing_id = "bd9720b26ec74f15a2693e5641adf141"
+        exp = _make_exp(id=existing_id, status="verifying")
+        es = self._make_exp_service(exp)
+        es.resolve_experiment.return_value = exp
+        es.resume_experiment.return_value = exp
+        svc = _make_service(self.tmp, exp_service=es)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(
+            msg_id,
+            (
+                "Resume and finish existing experiment bd9720b26ec74f15a2693e5641adf141.\n"
+                "Do not reimplement and do not create a new experiment.\n"
+                "Continue using its existing worktree and verification state."
+            ),
+            "alice", "/f.md", "2026-01-01T00:00:00Z",
+        )
+        svc.approve(approval.id)
+
+        svc.submit_approved()
+        import time; time.sleep(0.1)
+
+        es.create_experiment.assert_not_called()
+        es.resume_experiment.assert_called_once_with(existing_id)
+
+        updated = svc.get(approval.id)
+        self.assertEqual(updated.experiment_id, existing_id)
+        self.assertIn(updated.status, (_STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_SUCCEEDED, _STATUS_FAILED))
+
 
 class TestPollRunning(unittest.TestCase):
     def setUp(self):
