@@ -36,7 +36,7 @@ The first deliberately small baseline runs locally and on the Azure VM, can call
 
 ### 4. MCP and V1 direction
 
-MCP-style tools were introduced as an architectural direction so model reasoning and external capabilities can evolve independently rather than becoming one monolithic process. V1 remains an evolving direction rather than a finished architecture.
+MCP-style tools were introduced so model reasoning and external capabilities can evolve independently rather than becoming one monolithic process. The architecture remains intentionally replaceable.
 
 ### 5. Web API and browser control surface
 
@@ -50,11 +50,11 @@ Codex CLI became the first controlled implementation path. Important lessons wer
 
 `ExperimentService` turned improvement ideas into isolated experiments with research/selection, implementation, verification, and terminal states such as success, failure, rejection, timeout, or `needs_review`. Git worktrees isolate changes; verification uses allowlisted commands; risky actions are bounded.
 
-The conceptual step was separating **proposing a change** from **adopting a change**. A self-improving system must be able to reject its own bad changes.
+The key conceptual step was separating **proposing a change** from **adopting a change**. A self-improving system must be able to reject its own bad changes.
 
 ### 8. Better selection and diagnostics
 
-Weak/placeholder experiment selections led to tighter validation requiring meaningful affected files and implementation scope. Selection/reformat failures became visible through diagnostics instead of silently disappearing. Observability is treated as part of intelligence: failures that cannot be explained cannot be systematically improved.
+Weak or placeholder experiment selections led to tighter validation requiring meaningful affected files and implementation scope. Selection/reformat failures became visible through diagnostics instead of silently disappearing. Observability is treated as part of intelligence: failures that cannot be explained cannot be systematically improved.
 
 ### 9. Human approval loop
 
@@ -66,7 +66,7 @@ The boundary is intentionally evolvable; later experiments may identify low-risk
 
 ### 10. Git-backed Nexus mailbox
 
-A Git-backed inbox/outbox created a simple, human-readable, versioned protocol between humans, ChatGPT, Nexus, and future agents. It also exposed an important systems lesson: communication commits have a different write pattern from source-code integration and can cause non-fast-forward/contention problems.
+A Git-backed inbox/outbox created a simple, human-readable, versioned protocol between humans, ChatGPT, Nexus, and future agents. It also exposed an important systems lesson: communication commits have a different write pattern from source-code integration and can create non-fast-forward/contention problems.
 
 ### 11. Public activity and diagnostics
 
@@ -100,15 +100,15 @@ A signed GitHub webhook adapter was merged for mailbox changes, sharing the same
 
 ### 16. 2026-08-16: single-call experiment pipeline
 
-The normal Codex experiment path was reduced from roughly **3-5 LLM calls to one implementation call**. The model now receives the raw goal and investigates/plans/implements/tests within one call; safety checks remain before execution and implementation quality/verification remain after it.
+The normal Codex experiment path was reduced from roughly **3-5 LLM calls to one implementation call**. The model receives the raw goal and investigates/plans/implements/tests within one call; safety checks remain before execution and implementation quality/verification remain after it.
 
 A regression showed that explicit tests-only goals need separate classification: legitimate test-only experiments may succeed, while ordinary implementation goals that modify only tests still go to `needs_review`.
 
-The key research trade-off is now measurable: **how much cost/token reduction is gained, and does implementation quality remain acceptable?**
+The key research trade-off is measurable: **how much cost/token reduction is gained, and does implementation quality remain acceptable?**
 
 ### 17. 2026-08-16: token-efficient verification with bounded failure evidence
 
-Default `unittest` verification uses quiet mode (`-q`). Success keeps only useful summary output; failures retain a bounded/redacted tail (30 lines, 500 characters/line, 4,000 characters total). Twenty-two focused regression tests covered truncation, redaction, API/operation/UI behavior, omission on success, and safe rendering.
+Default `unittest` verification uses quiet mode (`-q`). Success keeps only useful summary output; failures retain a bounded/redacted tail. Focused regression tests cover truncation, redaction, API/operation/UI behavior, omission on success, and safe rendering.
 
 **Lesson:** tool output should be shaped for its consumer—compact on success, minimal actionable evidence on failure.
 
@@ -118,88 +118,100 @@ Repeated external-provider quota pressure strengthened the local-first design: k
 
 Execution is deliberately **sequential**: one model/provider active at a time, with roles such as router, context/research, planner, developer, and reviewer/tester. This bounds RAM, concurrency, token use, and causal complexity.
 
-PR #21 evolved through real-VM testing and review. Important corrections included:
+PR #21 evolved through real-VM testing and review. Important corrections included role/provider separation, model-agnostic configuration, deterministic repo context before expensive delegation, clean-worktree handling, read-only verification behavior, real Codex delegation, actual-provider accounting, and objective verification through real tests and `git diff`.
 
-- role and provider are separate concepts,
-- local server/model configuration is model-agnostic,
-- deterministic repo context is gathered before expensive delegation,
-- a clean worktree must not be mistaken for an empty repository,
-- read-only/no-change tasks verify worktree cleanliness instead of running the full test suite,
-- Codex delegation executes for real rather than silently falling back,
-- provider accounting records the provider actually used plus runtime/token data where available,
-- real tests and `git diff` are authoritative; an LLM reviewer cannot override failed objective verification.
-
-The preferred default is **Qwen2.5-Coder-7B-Instruct Q4_K_M** via native `llama.cpp`/`llama-server`, while the orchestration layer remains model-agnostic.
+The preferred default became **Qwen2.5-Coder-7B-Instruct Q4_K_M** via native `llama.cpp`/`llama-server`, while the orchestration layer remains model-agnostic.
 
 ### 19. 2026-08-18: B2ms resource envelope for persistent local inference
 
-The Azure VM was resized to **Standard_B2ms: 2 vCPUs and 8 GiB RAM**. Conservative local-server defaults target roughly 8k context, one parallel slot, two CPU threads, local-only binding (`127.0.0.1`), and the `agent` service user.
+The Azure VM was resized to **Standard_B2ms: 2 vCPUs and 8 GiB RAM**. Conservative local-server defaults target roughly 8k context, one parallel slot, two CPU threads, local-only binding, and the `agent` service user.
 
-Real deployment exposed a missing OpenBLAS build dependency (`pkg-config`). The install script was subsequently fixed before the local-router branch was merged.
+Real deployment exposed a missing OpenBLAS build dependency (`pkg-config`), which was fixed before merge.
 
 **Lesson:** installation scripts must be validated on the actual target environment, not only through unit tests or static review.
 
 ### 20. 2026-08-18: self-healing operations adopted on main
 
-PR #22 was reviewed, hardened, approved, and merged into `main`. Nexus gained authenticated `/operations/*` capabilities for bounded Git operations, service status/restart, log inspection, diagnostics/self-healing, local-model status/testing, and restricted configuration operations. Invocations are centrally dispatched and persisted in an operation log.
+PR #22 added authenticated `/operations/*` capabilities for bounded Git operations, service status/restart, log inspection, diagnostics/self-healing, local-model status/testing, and restricted configuration operations. Invocations are centrally dispatched and persisted in an operation log.
 
-Review tightened the safety boundary: stale-lock cleanup uses age/liveness evidence; Git path traversal/symlink escape is rejected; service actions are allowlisted; configuration values are not echoed; audit parameters/results are recursively redacted; and direct safety tests cover implementation boundaries.
+Review tightened stale-lock cleanup, path/symlink boundaries, service allowlists, configuration output, recursive redaction, and safety tests.
 
 **Lesson:** increasing autonomy should come with narrower, testable capabilities and auditability—not unrestricted shell access.
 
 ### 21. 2026-08-19: local-first multi-provider orchestration adopted on main
 
-PR #21 was merged into `main` after target-VM fixes and read-only/context-gathering regressions were addressed. Nexus now has a model-agnostic sequential pipeline:
+PR #21 was merged. Nexus gained a model-agnostic sequential pipeline:
 
 `Router -> Context Gatherer -> Planner -> Developer -> real-tool Verification -> Reviewer`
 
-The persistent local model is the default low-cost decision layer, while Azure OpenAI and Codex are escalation providers when configured. A temporary disabled-by-default maintenance bridge supports bounded remote status/tests/router/service/log operations behind an additional token and optional expiry.
-
-No quality/latency/cost benchmark has yet established that Qwen2.5-Coder-7B Q4_K_M is the best B2ms model; the merge adopts the capability architecture, not a permanent model choice.
+The persistent local model is the default low-cost decision layer, while Azure OpenAI and Codex are escalation providers when configured. No quality/latency/cost benchmark has yet established that the current Qwen model is optimal for B2ms; the merge adopted the capability architecture, not a permanent model choice.
 
 ### 22. 2026-08-20: read-only MCP HTTP adapter adopted on main
 
-PR #27 added a dedicated Streamable HTTP MCP surface at `/mcp/`. It reuses existing FastAPI/service logic rather than introducing a parallel implementation and applies the existing API-key authentication model.
+PR #27 added a Streamable HTTP MCP surface at `/mcp/`, reusing existing FastAPI/service logic and API-key authentication. It exposes compact read-only inspection tools and deliberately excludes write endpoints, shell-backed operations, webhooks, and new filesystem capabilities.
 
-The MCP surface is intentionally **read-only**. It exposes compact structured inspection tools for status, problems, ideas/chat, Codex task reads, mailbox reads, experiment state/logs/adoption, activity/diagnostics, operation catalogs/chains, and maintenance status/audit. It deliberately excludes write endpoints, shell-backed operations, webhooks, and new filesystem capabilities.
-
-Limit validation was centralized/shared with API constants and covered for MCP-side error cases before merge.
-
-**Lesson:** MCP is most useful here as a thin capability adapter over tested domain services; remote interoperability does not require duplicating business logic or widening permissions.
+**Lesson:** MCP is most useful here as a thin capability adapter over tested domain services; interoperability does not require duplicating business logic.
 
 ### 23. 2026-08-20: bootstrap MCP write capabilities adopted on main
 
-PR #29 extended the MCP surface with write-capable bootstrap tools behind `MCP_WRITE_ENABLED=true`. Remote clients can invoke existing operations for Git pull, service status/restart, bounded tests, experiment start, local-router execution, and a temporary shell tool. The real VM service allowlist was corrected to `agent-api`, `llama-server`, and the still-valid mailbox service.
+PR #29 added write-capable MCP bootstrap tools behind `MCP_WRITE_ENABLED=true`, including Git pull, service status/restart, bounded tests, experiment start, local-router execution, and a temporary shell tool. Shell execution remains time/output bounded, redacted, audited, and fails closed when reliable process confinement cannot be established.
 
-The shell path is deliberately bounded and audited: output is capped and redacted, timeout is capped at 120 seconds, execution is logged through the existing operation log, and the implementation fails closed when a reliable systemd cgroup scope cannot be established. Thirty-one focused tests were added around disabled-mode behavior, service boundaries, shell timeout/output/redaction/audit semantics, and tool delegation.
-
-**Lesson:** a temporary broad bootstrap capability can remain testable and observable when it reuses existing operations, is explicitly gated, and fails closed on process-confinement uncertainty.
+**Lesson:** temporary broad bootstrap capability can remain testable and observable when explicitly gated and built on existing operations.
 
 ### 24. 2026-08-20: API dependency synchronization became automatic
 
-A real deployment failure after adding MCP exposed stale Python dependencies: `agent-api` could restart against an old `.venv` and fail with a missing module even though source code was current. PR #32 added one reusable dependency-sync helper for `requirements-api.txt` and wires it into systemd startup, refresh/deploy, and operations-driven Git pull paths.
+A real deployment failure exposed stale Python dependencies after source updates. PR #32 added one reusable dependency-sync helper for `requirements-api.txt` and wired it into service startup, refresh/deploy, and operations-driven Git pull paths. Dependency installation failure prevents uvicorn from starting and remains visible in the journal.
 
-Dependency installation failure now prevents uvicorn from starting and remains visible in the journal. Tests use a fake pip executable so failure propagation and ordering are covered without network access.
+**Lesson:** source deployment and runtime dependency state are one atomic operational concern.
 
-**Lesson:** source deployment and runtime dependency state are one atomic operational concern; every supported deployment/restart path must converge on the same dependency-sync behavior.
+### 25. 2026-08-21: secret-policy false positive for LLM token metrics fixed
 
-### 25. 2026-08-21: secret policy false-positive for LLM token metrics fixed
+An experiment was rejected because `output tokens` was interpreted as a credential action. Issue #33/PR #35 introduced a narrow context-specific exception for LLM token metrics while credential-qualified access/auth/API/bearer token actions remain rejected.
 
-Experiment `93b21000cb8c4cc09cdd783d104244d2` was rejected because the policy interpreted the phrase `output tokens` as an instruction to expose a credential. Issue #33 identified the collision between LLM token-accounting terminology and generic credential-token vocabulary.
-
-PR #35 introduced a narrow context-specific exception shared by goal- and plan-level checks for phrases such as input/output/prompt/completion/context tokens, token counts/usage/budget/rate, while credential-qualified access/auth/API/bearer token actions remain rejected. Regression tests cover both safe metric wording and unsafe credential cases.
-
-**Lesson:** safety policy quality must include false-positive measurement. Narrow semantic exceptions are preferable to deleting protective vocabulary globally.
+**Lesson:** safety-policy quality must include false-positive measurement. Narrow semantic exceptions are preferable to globally weakening protective vocabulary.
 
 ### 26. 2026-08-21: trusted development mailbox became a command interface
 
-PR #34 added a mailbox `command` message type capable of running arbitrary Bash in the code repository, originally gated by `NEXUS_DEVELOPMENT_MODE=1`; it also added optional task auto-approval in development mode. Commands remain time/output bounded, outputs are redacted, and obvious credential environment variables are withheld.
+PR #34 added a mailbox `command` message type and optional task auto-approval in development mode. PR #36 then removed the development-mode execution gate for command messages in the trusted development setup. Timeout/output/redaction/environment protections remain.
 
-PR #36 then deliberately removed the development-mode execution gate for `command` messages. In the current trusted-development setup, arbitrary mailbox commands are accepted by default; `NEXUS_DEVELOPMENT_MODE` now only controls optional task auto-approval. The timeout/output/redaction/environment protections remain because they constrain impact and leakage rather than reject command content.
+This turns the mailbox from a typed request channel into a practical remote development/control interface during the experimental phase.
 
-This changes the mailbox from a typed request channel into a practical remote development/control interface during the experimental phase.
+**Lesson:** trusted-channel policy and command-content policy are separate design choices.
 
-**Lesson:** trusted-channel policy and command-content policy are separate design choices. For rapid experimentation the project currently trusts mailbox command intent, while retaining bounded execution and secret-handling controls.
+### 27. 2026-08-21 to 2026-08-22: mailbox Git synchronization became self-healing for normal divergence
+
+The separate mailbox repository exposed a deadlock pattern: Nexus could have a local outbox commit while a new inbox commit arrived remotely. A push-first strategy followed by `pull --ff-only` could then fail in both directions because the histories had diverged.
+
+PR #38 replaced this path with a bounded **fetch -> rebase onto upstream -> push** loop. The working tree must be clean first; push races retry up to a small bound; a real rebase conflict triggers `rebase --abort` and fails safely; force-push/reset/discard are not used. A real-Git regression test reproduces simultaneous local outbox and remote inbox commits and verifies both survive and the histories converge. The timer-triggered mailbox oneshot is also classified as healthy when it completed successfully even though systemd reports it as inactive/dead afterward.
+
+**Lesson:** append-oriented distributed Git writers need reconciliation semantics, not only push/pull commands. A safe rebase retry loop is sufficient for the normal non-overlapping inbox/outbox case while preserving explicit failure for real conflicts.
+
+### 28. 2026-08-22: verification timeout became a first-class outcome
+
+Issue #39 changed verification semantics so a subprocess timeout is no longer folded into a normal failed-test/`needs_review` path with `exit_code=None`. Nexus now records a distinct `test_timeout` event and terminal timed-out state while real non-zero test failures remain unchanged.
+
+**Lesson:** different failure classes must remain distinguishable if the system is expected to learn different responses to them.
+
+### 29. 2026-08-22: Nexus learned and persisted an adaptive verification timeout
+
+Issue #40 / PR #45 introduced the first small persisted runtime adaptation based directly on an observed failure class. Verification starts at 300 seconds; after `test_timeout`, the next timeout is increased by a configurable factor (currently 1.5) up to a 1,800-second cap. The value is stored in SQLite `service_settings`, survives process restarts, and is reused by future experiments. Successful or ordinary failing tests do not increase it. The full suite reported **905 tests, OK** after the change.
+
+This is deliberately simple rather than an ML mechanism, but it is an important self-improvement milestone: Nexus observes a repeated operational limit, changes one bounded parameter, persists the change, and reuses it automatically.
+
+**Lesson:** useful self-improvement can begin with small evidence-driven parameter adaptation before attempting complex self-modifying policies.
+
+### 30. 2026-08-22: GitHub and MCP emerged as the next durable coordination/control-plane direction
+
+Several new issues define a coherent next stage rather than isolated features:
+
+- **#41:** integrate the official GitHub MCP server so Nexus can work directly with Issues and repository metadata; migrate still-open local todos/problems once, then use GitHub Issues as the durable shared work list while SQLite remains runtime/experiment state.
+- **#42:** publish experiment branches to GitHub and automatically create/reuse Draft PRs for `needs_review`, making remote human review possible without VM access.
+- **#43:** post concise experiment/task progress to the associated GitHub Issue at meaningful state transitions, with experiment IDs and PR/result references, while detailed logs stay in Nexus.
+- **#44:** experiment with a **global MCP gateway** exposed as the single MCP endpoint to agents. A cheap local LLM would route requests to specialized MCPs/tools, reducing tool-schema context in stronger models and providing a natural place for discovery, logging, permissions, result compression, and detection of missing capabilities. If a useful capability is missing, the gateway could create a structured issue/proposal and later drive small self-extension experiments.
+
+None of these issues should be treated as adopted architecture yet. The first global-MCP experiment should stay small: 2-3 capabilities, direct selection versus gateway routing, measuring routing accuracy, task success, main-model tool-schema tokens, local-model tokens, latency, cost, and wrong-tool failures.
+
+**Research question:** can a cheap local LLM act as an effective **tool-control plane** for stronger models, reducing MCP/context complexity while allowing the system to discover and expand missing capabilities over time?
 
 ## What Nexus currently learns
 
@@ -207,7 +219,7 @@ Nexus accumulates durable information from:
 
 - code and tests,
 - project/idea/decision/history documents,
-- SQLite experiment and operation state,
+- SQLite experiment, operation, and small adaptive service state,
 - mailbox `context` knowledge,
 - experiment outcomes, diagnostics, activity, usage, and cost data where available.
 
@@ -231,9 +243,9 @@ Current `main` includes:
 - persistent local `llama.cpp` model capability plus model-agnostic sequential routing/orchestration,
 - Azure OpenAI/Codex escalation paths with provider accounting,
 - single-call Codex experiment execution,
-- experiment orchestration, worktree isolation, quality gating, and real-tool verification,
+- experiment orchestration, worktree isolation, quality gating, real-tool verification, distinct timeout state, and persisted adaptive verification timeout,
 - SQLite state and durable project/idea/decision/history documents,
-- separate Git-backed mailbox repository with crash-safe outbox publication,
+- separate Git-backed mailbox repository with crash-safe outbox publication and bounded fetch/rebase/push synchronization for normal concurrent writers,
 - signed GitHub webhook wake-up with timer fallback,
 - API/web UI, public/authenticated diagnostics, and compact failure evidence,
 - authenticated, audited, allowlisted self-healing/operations capabilities,
@@ -242,25 +254,30 @@ Current `main` includes:
 - automatic API dependency synchronization across service startup and deploy paths,
 - tests and policy boundaries.
 
+The GitHub-Issue workflow and global MCP gateway are current research directions, not yet part of the adopted architecture.
+
 ## Important lessons so far
 
 1. **Autonomy requires observability.** A result without evidence is hard to improve.
 2. **Self-modification needs evaluation and rollback.** Generating code is easier than deciding whether to adopt it.
 3. **Different state types may need different repositories.** Mailbox traffic and source integration had incompatible Git write patterns.
-4. **Communication needs delivery semantics.** Persistence, locking, retry, recovery, and idempotence matter.
+4. **Communication needs delivery semantics.** Persistence, locking, retry, recovery, idempotence, and safe reconciliation matter.
 5. **Cheap reasoning matters.** Local/small models should handle work that does not justify an expensive provider.
 6. **Context is a resource.** Retrieve or compress relevant memory instead of blindly increasing context.
-7. **Failures are research data.** CLI mistakes, merge conflicts, stale assumptions, deployment failures, and rejected experiments should influence the next iteration.
+7. **Failures are research data.** CLI mistakes, merge conflicts, stale assumptions, deployment failures, rejected experiments, and timeouts should influence the next iteration.
 8. **Optimize orchestration before buying more capacity.** Fewer LLM calls and quieter tools can reduce cost before changing models.
 9. **Real tools are the source of truth for verification.** LLM reviewers may interpret evidence but should not invent pass/fail state.
 10. **Separate capability architecture from model identity.** The routing layer should survive model replacement.
 11. **Target-environment validation matters.** Deployment scripts can fail despite clean architectural review and unit tests.
-12. **Safety can enable more autonomy.** Narrow allowlists, path boundaries, recursive redaction, liveness checks, and audit logs made self-healing operations acceptable to merge.
+12. **Safety can enable more autonomy.** Narrow boundaries, redaction, liveness checks, and audit logs can support stronger capabilities.
 13. **Adapters should reuse domain logic.** MCP/API surfaces should expose existing tested capabilities rather than fork behavior.
 14. **Keep the loop small.** Build, run, measure, understand, then choose the next improvement.
-15. **Deployment includes dependencies.** Pulling new source without synchronizing the runtime environment is not a complete deployment.
-16. **Safety policies need precision, not only strictness.** False positives such as LLM `output tokens` can block useful experiments; narrow contextual guards preserve protection better than broad exemptions.
-17. **Capability trust is layered.** The project may trust a development mailbox to request arbitrary commands while still bounding runtime, output, environment exposure, logging, and process cleanup.
+15. **Deployment includes dependencies.** Pulling source without synchronizing the runtime environment is incomplete.
+16. **Safety policies need precision, not only strictness.** False positives can block useful experiments; narrow contextual guards preserve protection better than broad exemptions.
+17. **Capability trust is layered.** A trusted development channel can allow broad commands while runtime/output/secrets remain bounded.
+18. **Failure taxonomy enables adaptation.** `test_timeout` must be distinct from `test_failed` if Nexus should react differently.
+19. **Simple persisted adaptation counts.** Automatically increasing a bounded timeout after measured timeouts is a real self-improvement loop, even without another LLM call.
+20. **A control plane may reduce model context.** Tool discovery/routing is itself a candidate task for a cheap local model instead of exposing every tool schema to every stronger model.
 
 ## Open research directions
 
@@ -272,7 +289,10 @@ Current `main` includes:
 - measure how much local context preparation reduces external-provider tokens,
 - evaluate whether merged self-healing operations materially reduce human intervention without increasing incidents,
 - evaluate MCP as the standard integration/control path and determine which temporary bootstrap write capabilities can later be replaced by narrower operations,
-- measure the reliability and security trade-offs of the trusted mailbox command path during active development,
+- integrate GitHub Issues/PRs as the durable remote work/review surface and measure whether it reduces manual coordination,
+- prototype the global MCP gateway with only 2-3 tools and measure routing accuracy, schema-token reduction, latency, total cost, and failures,
+- investigate missing-capability detection and structured issue creation before any automatic tool generation,
+- measure the reliability/security trade-offs of the trusted mailbox command path during active development,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
 - agent-generated experiments for prompts/tools/context,
@@ -289,7 +309,9 @@ Current `main` includes:
 3. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
 4. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
 5. **Operational-autonomy measurement:** measure successful self-recovery, human interventions avoided, and safety/false-positive incidents using the merged operations/MCP/mailbox control surfaces.
-6. **Bootstrap-surface convergence:** track real usage of MCP write tools and mailbox commands, then replace frequently used broad commands with narrower audited operations where that reduces risk without slowing research.
+6. **GitHub work-surface experiment:** integrate the official GitHub MCP, migrate only open actionable work, and test whether issue/branch/PR visibility improves fire-and-forget development and review.
+7. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection before building dynamic discovery or self-extension.
+8. **Adaptive-runtime measurement:** observe whether the learned verification timeout prevents repeated false timeouts without masking genuinely hung tests or creating excessive runtime/cost.
 
 Choose the next step by expected learning value, effort, risk, and measurable benefit—not architectural completeness.
 
