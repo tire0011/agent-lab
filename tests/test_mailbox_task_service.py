@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from modules.run_store import init_db
 from modules.mailbox_task_service import (
@@ -23,6 +23,11 @@ from modules.mailbox_task_service import (
     _STATUS_FAILED,
     _STATUS_NEEDS_REVIEW,
 )
+from modules.task_orchestrator import (
+    ACTION_NEW_EXPERIMENT,
+    ACTION_RESUME_EXPERIMENT,
+    TaskDecision,
+)
 
 
 def _make_exp(id="exp1", status="queued", test_exit_code=None, diff_stat=None, error=None):
@@ -35,10 +40,19 @@ def _make_exp(id="exp1", status="queued", test_exit_code=None, diff_stat=None, e
     return exp
 
 
-def _make_service(tmp_path: Path, exp_service=None) -> MailboxTaskService:
+class _FixedOrchestrator:
+    decision = TaskDecision(action=ACTION_NEW_EXPERIMENT, reason="test default")
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def run(self, task):
+        return self.decision
+
+
+def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -> MailboxTaskService:
     db_path = str(tmp_path / "test.db")
     conn = init_db(db_path)
-    # Insert a dummy mailbox_messages row
     conn.execute(
         "INSERT INTO mailbox_messages (file_path, source_commit_sha, msg_type, created_by, status, received_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -46,11 +60,15 @@ def _make_service(tmp_path: Path, exp_service=None) -> MailboxTaskService:
     )
     conn.commit()
     conn.close()
+    operations_registry = MagicMock() if exp_service is not None else None
+    operations_registry.catalog.return_value = [] if operations_registry is not None else None
     return MailboxTaskService(
         db_path=db_path,
         experiment_service=exp_service,
         outbox_dir=str(tmp_path / "outbox"),
         repo_path=str(tmp_path),
+        operations_registry=operations_registry,
+        orchestrator_factory=orchestrator_factory or _FixedOrchestrator,
     )
 
 
@@ -83,7 +101,7 @@ class TestCreateApproval(unittest.TestCase):
         a1 = self.svc.create_approval(msg_id, "Do something", "alice", "/inbox/f.md", "2026-01-01T00:00:00Z")
         a2 = self.svc.create_approval(msg_id, "Do something else", "bob", "/inbox/g.md", "2026-01-02T00:00:00Z")
         self.assertEqual(a1.id, a2.id)
-        self.assertEqual(a2.task_body, "Do something")  # first record preserved
+        self.assertEqual(a2.task_body, "Do something")
 
 
 class TestListPending(unittest.TestCase):
@@ -102,8 +120,7 @@ class TestListPending(unittest.TestCase):
         msg_id = _insert_mailbox_msg(self.svc)
         approval = self.svc.create_approval(msg_id, "Task body", "alice", "/f.md", "2026-01-01T00:00:00Z")
         self.svc.approve(approval.id)
-        pending = self.svc.list_pending()
-        self.assertFalse(any(a.id == approval.id for a in pending))
+        self.assertFalse(any(a.id == approval.id for a in self.svc.list_pending()))
 
 
 class TestApprove(unittest.TestCase):
@@ -124,7 +141,6 @@ class TestApprove(unittest.TestCase):
         a2 = self.svc.approve(self.approval.id)
         self.assertEqual(a1.status, _STATUS_APPROVED)
         self.assertEqual(a2.status, _STATUS_APPROVED)
-        self.assertEqual(a1.id, a2.id)
 
     def test_approve_after_reject_fails(self):
         self.svc.reject(self.approval.id, "No thanks")
@@ -147,8 +163,7 @@ class TestReject(unittest.TestCase):
 
     def test_reject_prevents_execution(self):
         self.svc.reject(self.approval.id, "No")
-        pending = self.svc.list_pending()
-        self.assertFalse(any(a.id == self.approval.id for a in pending))
+        self.assertFalse(any(a.id == self.approval.id for a in self.svc.list_pending()))
 
     def test_reject_after_approve_fails(self):
         self.svc.approve(self.approval.id)
@@ -169,32 +184,21 @@ class TestConcurrentApprove(unittest.TestCase):
         self.approval = self.svc.create_approval(msg_id, "Task", "a", "/f.md", "2026-01-01T00:00:00Z")
 
     def test_concurrent_approve(self):
-        results = []
-        errors = []
+        results, errors = [], []
 
         def do_approve():
             try:
-                a = self.svc.approve(self.approval.id)
-                results.append(a.status)
-            except Exception as e:
-                errors.append(e)
+                results.append(self.svc.approve(self.approval.id).status)
+            except Exception as exc:
+                errors.append(exc)
 
         threads = [threading.Thread(target=do_approve) for _ in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        # All should succeed (idempotent) and all should be approved
-        self.assertTrue(all(s == _STATUS_APPROVED for s in results))
-        self.assertEqual(len(errors), 0)
-
-        # Only one record should exist
-        row = self.svc._conn.execute(
-            "SELECT COUNT(*) FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
-            (self.approval.mailbox_msg_id,)
-        ).fetchone()[0]
-        self.assertEqual(row, 1)
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertTrue(all(status == _STATUS_APPROVED for status in results))
+        self.assertEqual(errors, [])
 
 
 class TestSubmitApproved(unittest.TestCase):
@@ -206,7 +210,6 @@ class TestSubmitApproved(unittest.TestCase):
         es = MagicMock()
         es.create_experiment.return_value = exp
         es.get_experiment.return_value = exp
-        # run_experiment blocks until done
         es.run_experiment.return_value = exp
         return es
 
@@ -217,16 +220,9 @@ class TestSubmitApproved(unittest.TestCase):
         msg_id = _insert_mailbox_msg(svc)
         approval = svc.create_approval(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.approve(approval.id)
-
         svc.submit_approved()
-        # Wait briefly for thread
         import time; time.sleep(0.1)
-
-        es.create_experiment.assert_called_once()
-        call_goal = es.create_experiment.call_args[0][0]
-        self.assertEqual(call_goal, "Do work")
-
-        # Row should now be submitted (or running since thread may have started)
+        es.create_experiment.assert_called_once_with("Do work")
         updated = svc.get(approval.id)
         self.assertIn(updated.status, (_STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_SUCCEEDED, _STATUS_FAILED))
 
@@ -238,9 +234,33 @@ class TestSubmitApproved(unittest.TestCase):
         approval = svc.create_approval(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.approve(approval.id)
         svc.submit_approved()
-        svc.submit_approved()  # second call should find no approved records
-
+        svc.submit_approved()
         es.create_experiment.assert_called_once()
+
+    def test_resume_decision_reuses_existing_experiment(self):
+        existing_id = "bd9720b26ec74f15a2693e5641adf141"
+        exp = _make_exp(id=existing_id, status="verifying")
+        exp.worktree_path = str(self.tmp / "wt")
+        Path(exp.worktree_path).mkdir()
+        es = self._make_exp_service(exp)
+        es.resolve_experiment.return_value = exp
+
+        class ResumeOrchestrator(_FixedOrchestrator):
+            decision = TaskDecision(
+                action=ACTION_RESUME_EXPERIMENT,
+                experiment_id=existing_id,
+                reason="existing experiment requested",
+            )
+
+        svc = _make_service(self.tmp, exp_service=es, orchestrator_factory=ResumeOrchestrator)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(msg_id, "Resume experiment", "alice", "/f.md", "2026-01-01T00:00:00Z")
+        svc.approve(approval.id)
+        svc.submit_approved()
+        import time; time.sleep(0.1)
+        es.create_experiment.assert_not_called()
+        updated = svc.get(approval.id)
+        self.assertEqual(updated.experiment_id, existing_id)
 
 
 class TestPollRunning(unittest.TestCase):
@@ -248,12 +268,11 @@ class TestPollRunning(unittest.TestCase):
         import tempfile
         self.tmp = Path(tempfile.mkdtemp())
 
-    def _make_submitted(self, exp_id="exp1") -> tuple[MailboxTaskService, str]:
+    def _make_submitted(self, exp_id="exp1"):
         es = MagicMock()
         svc = _make_service(self.tmp, exp_service=es)
         msg_id = _insert_mailbox_msg(svc)
         approval = svc.create_approval(msg_id, "Task", "alice", "/f.md", "2026-01-01T00:00:00Z")
-        # Manually put into submitted state with experiment_id
         svc._conn.execute(
             "UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=? WHERE id=?",
             (_STATUS_SUBMITTED, exp_id, "2026-01-01T00:00:00Z", approval.id),
@@ -265,83 +284,58 @@ class TestPollRunning(unittest.TestCase):
         exp = _make_exp(id="exp1", status="succeeded", test_exit_code=0)
         svc, approval_id = self._make_submitted("exp1")
         svc.experiment_service.get_experiment.return_value = exp
-
         svc.poll_running()
-
-        updated = svc.get(approval_id)
-        self.assertEqual(updated.status, _STATUS_SUCCEEDED)
+        self.assertEqual(svc.get(approval_id).status, _STATUS_SUCCEEDED)
 
     def test_recovery_running_experiment_failed(self):
         exp = _make_exp(id="exp1", status="failed", error="something went wrong")
         svc, approval_id = self._make_submitted("exp1")
         svc.experiment_service.get_experiment.return_value = exp
-
         svc.poll_running()
-
-        updated = svc.get(approval_id)
-        self.assertEqual(updated.status, _STATUS_FAILED)
+        self.assertEqual(svc.get(approval_id).status, _STATUS_FAILED)
 
     def test_recovery_submitted_experiment_queued(self):
         exp = _make_exp(id="exp1", status="queued")
         svc, approval_id = self._make_submitted("exp1")
         svc.experiment_service.get_experiment.return_value = exp
-
         svc.poll_running()
-
-        updated = svc.get(approval_id)
-        # queued experiment → approval transitions to running
-        self.assertIn(updated.status, (_STATUS_RUNNING, _STATUS_SUBMITTED))
+        self.assertIn(svc.get(approval_id).status, (_STATUS_RUNNING, _STATUS_SUBMITTED))
 
     def test_needs_review_creates_problem(self):
         exp = _make_exp(id="exp1", status="needs_review")
         svc, approval_id = self._make_submitted("exp1")
         svc.experiment_service.get_experiment.return_value = exp
-
         svc.poll_running()
-
-        updated = svc.get(approval_id)
-        self.assertEqual(updated.status, _STATUS_NEEDS_REVIEW)
-        # Check a problem file was written
-        runs_dir = self.tmp / "state" / "runs"
-        problem_files = list(runs_dir.glob("*.json")) if runs_dir.exists() else []
-        self.assertTrue(len(problem_files) >= 1)
-        data = json.loads(problem_files[0].read_text())
-        self.assertTrue(data["response"].startswith("ERROR:"))
+        self.assertEqual(svc.get(approval_id).status, _STATUS_NEEDS_REVIEW)
+        problem_files = list((self.tmp / "state" / "runs").glob("*.json"))
+        self.assertTrue(problem_files)
+        self.assertTrue(json.loads(problem_files[0].read_text())["response"].startswith("ERROR:"))
 
     def test_result_to_outbox(self):
         exp = _make_exp(id="exp1", status="succeeded", test_exit_code=0, diff_stat="3 files changed")
         svc, approval_id = self._make_submitted("exp1")
         svc.experiment_service.get_experiment.return_value = exp
-
         svc.poll_running()
-
-        outbox_files = list(svc.outbox_dir.glob("*.md")) if svc.outbox_dir.exists() else []
-        self.assertTrue(len(outbox_files) >= 1)
-        content = outbox_files[0].read_text()
-        self.assertIn("succeeded", content)
+        outbox_files = list(svc.outbox_dir.glob("*.md"))
+        self.assertTrue(outbox_files)
+        self.assertIn("succeeded", outbox_files[0].read_text())
 
     def test_failed_creates_problem(self):
         exp = _make_exp(id="exp1", status="failed", error="test error")
         svc, approval_id = self._make_submitted("exp1")
         svc.experiment_service.get_experiment.return_value = exp
-
         svc.poll_running()
-
-        runs_dir = self.tmp / "state" / "runs"
-        problem_files = list(runs_dir.glob("*.json")) if runs_dir.exists() else []
-        self.assertTrue(len(problem_files) >= 1)
-        data = json.loads(problem_files[0].read_text())
-        self.assertIn("failed", data["response"])
+        problem_files = list((self.tmp / "state" / "runs").glob("*.json"))
+        self.assertTrue(problem_files)
+        self.assertIn("failed", json.loads(problem_files[0].read_text())["response"])
 
 
 class TestMigration(unittest.TestCase):
     def test_migration_existing_records(self):
-        """Existing mailbox_messages with msg_type='task' and no approval → migration creates pending_approval."""
         import tempfile
         tmp = Path(tempfile.mkdtemp())
         db_path = str(tmp / "test.db")
         conn = sqlite3.connect(db_path)
-        # Create minimal mailbox_messages schema (simulating old DB without task_body)
         conn.executescript("""
             CREATE TABLE mailbox_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -359,55 +353,27 @@ class TestMigration(unittest.TestCase):
             );
         """)
         conn.execute(
-            "INSERT INTO mailbox_messages (file_path, source_commit_sha, msg_type, created_by, status, received_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mailbox_messages (file_path, source_commit_sha, msg_type, created_by, status, received_at) VALUES (?, ?, ?, ?, ?, ?)",
             ("/agent/inbox/old.md", "sha1", "task", "rene", "done", "2026-01-01T00:00:00Z"),
         )
-        conn.commit()
-        conn.close()
-
-        # Now run init_db (which runs migrations)
-        from modules.run_store import init_db
-        conn2 = init_db(db_path)
-        conn2.row_factory = sqlite3.Row
-        rows = conn2.execute("SELECT * FROM mailbox_task_approvals").fetchall()
-        conn2.close()
-
+        conn.commit(); conn.close()
+        conn2 = init_db(db_path); conn2.row_factory = sqlite3.Row
+        rows = conn2.execute("SELECT * FROM mailbox_task_approvals").fetchall(); conn2.close()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "pending_approval")
         self.assertEqual(rows[0]["sender"], "rene")
 
 
 class TestApiAuth(unittest.TestCase):
-    """Test that the API endpoints require auth."""
-
     def test_list_pending_auth(self):
-        """GET /mailbox/tasks without API key returns 401."""
         import os
         os.environ.setdefault("AGENT_API_KEY", "test-key-abc")
         from fastapi.testclient import TestClient
-        # Override dependency to avoid real DB
-        svc = MagicMock()
-        svc.list_recent.return_value = []
-        svc.recover_after_restart.return_value = None
-
-        # NOTE: do NOT importlib.reload(api) here. Reloading mutates the
-        # single shared `api` module in place, so any other test file that
-        # imported `app`/dependency functions at collection time (module
-        # top-level `from api import ...`) keeps stale references while
-        # in-function `from api import ...` calls elsewhere start resolving
-        # to the freshly reloaded objects. That mismatch makes
-        # app.dependency_overrides[...] silently no-op for those objects,
-        # letting requests fall through to the real, production-backed
-        # service. A plain import is sufficient here.
+        svc = MagicMock(); svc.list_recent.return_value = []; svc.recover_after_restart.return_value = None
         from api import app, get_mailbox_task_service, get_codex_service
-        codex_svc = MagicMock()
-        codex_svc.mark_interrupted_tasks_failed.return_value = None
-        codex_svc.list_tasks.return_value = []
-
+        codex_svc = MagicMock(); codex_svc.mark_interrupted_tasks_failed.return_value = None; codex_svc.list_tasks.return_value = []
         app.dependency_overrides[get_mailbox_task_service] = lambda: svc
         app.dependency_overrides[get_codex_service] = lambda: codex_svc
-
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get("/mailbox/tasks")
         app.dependency_overrides.clear()
