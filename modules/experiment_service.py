@@ -136,7 +136,7 @@ _ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
     STATUS_QUEUED: (STATUS_IMPLEMENTING, STATUS_REJECTED, STATUS_FAILED, STATUS_SELECTING),
     STATUS_SELECTING: (STATUS_REJECTED, STATUS_IMPLEMENTING, STATUS_FAILED, STATUS_TIMED_OUT),
     STATUS_IMPLEMENTING: (STATUS_VERIFYING, STATUS_REJECTED, STATUS_FAILED, STATUS_TIMED_OUT),
-    STATUS_VERIFYING: (STATUS_SUCCEEDED, STATUS_FAILED, STATUS_NEEDS_REVIEW),
+    STATUS_VERIFYING: (STATUS_SUCCEEDED, STATUS_FAILED, STATUS_NEEDS_REVIEW, STATUS_TIMED_OUT),
 }
 
 _DEFAULT_MAX_TEST_OUTPUT_BYTES = 32 * 1024
@@ -2273,6 +2273,7 @@ class ExperimentService:
             f"Verification test subprocess uses an isolated environment ({len(test_env)} allowlisted variables)",
         )
         test_started = time.perf_counter()
+        test_timed_out = False
         try:
             test_proc = subprocess.run(
                 test_command,
@@ -2294,11 +2295,12 @@ class ExperimentService:
             )
         except subprocess.TimeoutExpired as exc:
             test_exit_code = None
+            test_timed_out = True
             test_output = (
                 (exc.stdout or "") if isinstance(exc.stdout, str) else ""
             ) + "\n[test command timed out]"
             elog.log_process(
-                "verifying", "tests_timeout",
+                "verifying", "test_timeout",
                 "Test command timed out",
                 command=test_command, cwd=worktree_path,
                 duration_ms=int((time.perf_counter() - test_started) * 1000),
@@ -2322,6 +2324,15 @@ class ExperimentService:
             final_status = STATUS_NEEDS_REVIEW
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
             elog.warning("verifying", "diff_check_issue", f"git diff --check reported issues: {diff_check_issue}")
+        elif test_timed_out:
+            # A timed-out test run is not a normal test failure: the tests
+            # never finished (exit_code=None is expected and must not be
+            # mistaken for a real failing exit status). Keep this branch
+            # ahead of the exit-code check below so it can never be folded
+            # into "tests failed". The distinct "test_timeout" event was
+            # already logged above when the TimeoutExpired was caught.
+            final_status = STATUS_TIMED_OUT
+            error = "tests timed out (no exit code, test command did not finish within the time limit)"
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"

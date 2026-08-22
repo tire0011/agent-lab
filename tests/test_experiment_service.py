@@ -2266,6 +2266,37 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         status_change = [e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_FAILED]
         self.assertTrue(status_change, "expected a status_forced -> failed entry")
 
+    def test_test_run_timeout_is_not_classified_as_a_test_failure(self):
+        """A verification test run that hits the subprocess timeout must be
+        reported as its own ``test_timeout`` case, never conflated with a
+        normal ``tests_failed`` (exit_code != 0) outcome."""
+
+        def _run_or_time_out(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and "unittest" in cmd and "discover" in cmd:
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 300))
+            return _ORIGINAL_SUBPROCESS_RUN(cmd, *args, **kwargs)
+
+        experiment = self.service.create_experiment(goal="g")
+        with patch("subprocess.run", side_effect=_run_or_time_out):
+            result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_TIMED_OUT)
+        self.assertIsNone(result.test_exit_code)
+
+        entries = self._read_log(experiment.id)
+        timeouts = [e for e in entries if e["event"] == "test_timeout"]
+        self.assertEqual(len(timeouts), 1)
+        self.assertEqual(timeouts[0]["level"], "ERROR")
+        self.assertEqual(timeouts[0]["phase"], "verifying")
+        self.assertTrue(timeouts[0].get("timed_out"))
+
+        # Never classified as a plain test failure.
+        self.assertEqual([e for e in entries if e["event"] == "tests_failed"], [])
+        status_change = [
+            e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_TIMED_OUT
+        ]
+        self.assertTrue(status_change, "expected a status_forced -> timed_out entry")
+
     def test_unhandled_exception_is_logged_with_stacktrace(self):
         self.implementation_worker.run.side_effect = RuntimeError("impl boom")
         experiment = self.service.create_experiment(goal="g")
