@@ -1,8 +1,8 @@
 """Approval-gated bridge from free-form mailbox tasks to Nexus capabilities.
 
 The local Nexus LLM is the orchestration layer. It may inspect real Nexus
-state through read-only operations before selecting a lifecycle/action.
-Experiments are execution primitives, not the default control flow.
+state, search memory, delegate bounded sub-problems, discuss ambiguity and
+only then select an execution primitive.
 """
 
 from __future__ import annotations
@@ -102,7 +102,7 @@ def _safe_error(error: str | None) -> str | None:
 
 
 class MailboxTaskService:
-    """Route approved free-form tasks through the local LLM orchestrator."""
+    """Route approved free-form tasks through the persistent local controller."""
 
     def __init__(
         self,
@@ -131,15 +131,17 @@ class MailboxTaskService:
         conn.row_factory = sqlite3.Row
         self._conn = conn
 
-        if operations_registry is None and experiment_service is not None:
+        owns_registry = operations_registry is None and experiment_service is not None
+        if owns_registry:
             from modules.operations_registry import OperationsRegistry
+
             operations_registry = OperationsRegistry(
                 experiment_service=experiment_service,
                 db_path=db_path,
                 repo_root=str(self.repo_path),
             )
         self.operations_registry = operations_registry
-        self._owns_operations_registry = operations_registry is not None
+        self._owns_operations_registry = owns_registry
         self._orchestrator_factory = orchestrator_factory or NexusTaskOrchestrator
 
     def close(self) -> None:
@@ -178,8 +180,17 @@ class MailboxTaskService:
                    (id, mailbox_msg_id, task_body, sender, file_path, received_at,
                     status, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (approval_id, mailbox_msg_id, task_body or "", sender, file_path,
-                 received_at, _STATUS_PENDING, now, now),
+                (
+                    approval_id,
+                    mailbox_msg_id,
+                    task_body or "",
+                    sender,
+                    file_path,
+                    received_at,
+                    _STATUS_PENDING,
+                    now,
+                    now,
+                ),
             )
             self._conn.commit()
             row = self._conn.execute(
@@ -258,7 +269,7 @@ class MailboxTaskService:
         return self.get(approval_id)
 
     # ------------------------------------------------------------------
-    # Agentic orchestration
+    # Persistent agentic orchestration
     # ------------------------------------------------------------------
 
     def submit_approved(self) -> None:
@@ -273,14 +284,64 @@ class MailboxTaskService:
         if row is None:
             return
         approval = _row_to_approval(row)
+        self._orchestrate_approval(approval, approval.task_body)
 
+    def continue_discussion(self, approval_id: str, user_message: str) -> MailboxTaskApproval:
+        """Continue the SAME persistent Nexus task after a clarification/review reply.
+
+        This is an internal primitive for API/MCP/UI adapters. It deliberately
+        reuses the approval id as the controller source id, so the durable
+        Nexus task session and memory/history are recovered automatically.
+        """
+        message = (user_message or "").strip()
+        if not message:
+            raise ValueError("user_message must not be empty")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mailbox_task_approvals WHERE id=?", (approval_id,)
+            ).fetchone()
+            if row is None:
+                raise ApprovalNotFoundError(f"no approval with id {approval_id!r}")
+            approval = _row_to_approval(row)
+            if approval.status != _STATUS_NEEDS_REVIEW or approval.experiment_id:
+                raise ApprovalStateError(
+                    "discussion can only continue for a non-experiment task awaiting review"
+                )
+            combined = (
+                f"{approval.task_body.rstrip()}\n\n"
+                f"User follow-up:\n{message}"
+            )[:32000]
+            updated = self._conn.execute(
+                """UPDATE mailbox_task_approvals
+                   SET status=?, task_body=?, result_summary=NULL, error=NULL, updated_at=?
+                   WHERE id=? AND status=? AND experiment_id IS NULL""",
+                (_STATUS_APPROVED, combined, _now_iso(), approval.id, _STATUS_NEEDS_REVIEW),
+            ).rowcount
+            self._conn.commit()
+        if not updated:
+            raise ApprovalStateError("task discussion state changed concurrently")
+        refreshed = self.get(approval_id)
+        self._orchestrate_approval(refreshed, message)
+        return self.get(approval_id)
+
+    def _orchestrate_approval(
+        self,
+        approval: MailboxTaskApproval,
+        current_input: str,
+    ) -> None:
+        orchestrator = None
         try:
             orchestrator = self._orchestrator_factory(
                 operations_registry=self.operations_registry,
                 experiment_service=self.experiment_service,
             )
-            decision: TaskDecision = orchestrator.run(approval.task_body)
-        except Exception as exc:  # local LLM/orchestration failure must not become an experiment
+            decision: TaskDecision = orchestrator.run(
+                current_input,
+                source_type="task",
+                source_id=approval.id,
+                title=f"Mailbox task {approval.id[:8]}",
+            )
+        except Exception as exc:
             logger.exception("mailbox_task: local orchestrator failed for %s", approval.id)
             self._complete_without_experiment(
                 approval,
@@ -289,12 +350,29 @@ class MailboxTaskService:
                 error=str(exc),
             )
             return
+        finally:
+            if orchestrator is not None:
+                close = getattr(orchestrator, "close", None)
+                if close:
+                    try:
+                        close()
+                    except Exception:
+                        logger.exception("mailbox_task: failed closing task orchestrator")
 
         logger.info(
-            "mailbox_task: approval=%s selected action=%s reason=%s",
-            approval.id[:8], decision.action, decision.reason[:300],
+            "mailbox_task: approval=%s session=%s selected action=%s reason=%s",
+            approval.id[:8],
+            (decision.session_id or "-")[:8],
+            decision.action,
+            decision.reason[:300],
         )
+        self._dispatch_decision(approval, decision)
 
+    def _dispatch_decision(
+        self,
+        approval: MailboxTaskApproval,
+        decision: TaskDecision,
+    ) -> None:
         if decision.action == ACTION_NEW_EXPERIMENT:
             self._start_new_experiment(approval)
         elif decision.action == ACTION_RESUME_EXPERIMENT:
@@ -303,30 +381,39 @@ class MailboxTaskService:
             self._run_command(approval, decision)
         elif decision.action == ACTION_ANSWER:
             self._complete_without_experiment(
-                approval, _STATUS_SUCCEEDED,
+                approval,
+                _STATUS_SUCCEEDED,
                 decision.message or decision.reason or "Task answered from Nexus state.",
             )
         elif decision.action in (ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY):
+            summary = decision.message or decision.reason or decision.action
+            if decision.session_id:
+                summary = f"{summary}\n\nNexus session: {decision.session_id}"
             self._complete_without_experiment(
-                approval, _STATUS_NEEDS_REVIEW,
-                decision.message or decision.reason or decision.action,
+                approval,
+                _STATUS_NEEDS_REVIEW,
+                summary,
                 error=decision.reason or decision.message,
             )
         else:
             self._complete_without_experiment(
-                approval, _STATUS_NEEDS_REVIEW,
+                approval,
+                _STATUS_NEEDS_REVIEW,
                 f"Unsupported orchestrator action: {decision.action}",
                 error=decision.reason,
             )
 
     def _start_new_experiment(self, approval: MailboxTaskApproval) -> None:
+        # Re-read task_body so clarification follow-ups accumulated by
+        # continue_discussion are included in the implementation goal.
+        current_approval = self.get(approval.id)
         with self._lock:
             current = self._conn.execute(
                 "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
             ).fetchone()
             if current is None or current["status"] != _STATUS_APPROVED:
                 return
-            experiment = self.experiment_service.create_experiment(approval.task_body)
+            experiment = self.experiment_service.create_experiment(current_approval.task_body)
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
                    WHERE id=? AND status=?""",
@@ -341,10 +428,15 @@ class MailboxTaskService:
             lambda: self.experiment_service.run_experiment(experiment.id),
         )
 
-    def _resume_existing_experiment(self, approval: MailboxTaskApproval, decision: TaskDecision) -> None:
+    def _resume_existing_experiment(
+        self,
+        approval: MailboxTaskApproval,
+        decision: TaskDecision,
+    ) -> None:
         if not decision.experiment_id:
             self._complete_without_experiment(
-                approval, _STATUS_NEEDS_REVIEW,
+                approval,
+                _STATUS_NEEDS_REVIEW,
                 "The local orchestrator chose resume but did not identify an experiment.",
             )
             return
@@ -367,7 +459,8 @@ class MailboxTaskService:
         command = (decision.command or "").strip()
         if not command:
             self._complete_without_experiment(
-                approval, _STATUS_NEEDS_REVIEW,
+                approval,
+                _STATUS_NEEDS_REVIEW,
                 "The local orchestrator chose command but did not provide a command.",
             )
             return
@@ -382,7 +475,10 @@ class MailboxTaskService:
         try:
             msg = SimpleNamespace(body=command, meta={})
             result_body, _ = process_command(
-                msg, self.repo_path, self._conn, approval.mailbox_msg_id
+                msg,
+                self.repo_path,
+                self._conn,
+                approval.mailbox_msg_id,
             )
             success = "**Exit code:** 0" in result_body
             self._complete_claimed_without_experiment(
@@ -393,7 +489,8 @@ class MailboxTaskService:
             )
         except Exception as exc:
             self._complete_claimed_without_experiment(
-                approval, _STATUS_FAILED,
+                approval,
+                _STATUS_FAILED,
                 f"Command execution failed: {_safe_error(str(exc)) or type(exc).__name__}",
                 error=str(exc),
             )
@@ -403,7 +500,10 @@ class MailboxTaskService:
             try:
                 target()
             except Exception:
-                logger.exception("mailbox_task: experiment %s raised during execution", experiment_id)
+                logger.exception(
+                    "mailbox_task: experiment %s raised during execution", experiment_id
+                )
+
         threading.Thread(
             target=_run,
             daemon=True,
@@ -427,7 +527,9 @@ class MailboxTaskService:
             try:
                 exp = self.experiment_service.get_experiment(approval.experiment_id)
             except Exception:
-                logger.exception("mailbox_task: failed to fetch experiment %s", approval.experiment_id)
+                logger.exception(
+                    "mailbox_task: failed to fetch experiment %s", approval.experiment_id
+                )
                 continue
             if exp.status in _EXP_RUNNING or (
                 approval.status == _STATUS_SUBMITTED and exp.status not in _EXP_TERMINAL
@@ -446,14 +548,17 @@ class MailboxTaskService:
                 self._transition_terminal(approval, _STATUS_NEEDS_REVIEW, exp)
 
     def recover_after_restart(self) -> None:
-        # A command/non-experiment action that died with the process is not
-        # silently replayed. Surface it for review instead.
         with self._lock:
             self._conn.execute(
                 """UPDATE mailbox_task_approvals
                    SET status=?, error=?, updated_at=?
                    WHERE status=? AND experiment_id IS NULL""",
-                (_STATUS_NEEDS_REVIEW, "non-experiment task interrupted by restart", _now_iso(), _STATUS_RUNNING),
+                (
+                    _STATUS_NEEDS_REVIEW,
+                    "non-experiment task interrupted by restart",
+                    _now_iso(),
+                    _STATUS_RUNNING,
+                ),
             )
             self._conn.commit()
         self.poll_running()
@@ -462,39 +567,65 @@ class MailboxTaskService:
     # Terminal results / outbox
     # ------------------------------------------------------------------
 
-    def _transition_terminal(self, approval: MailboxTaskApproval, new_status: str, exp: Any) -> None:
+    def _transition_terminal(
+        self,
+        approval: MailboxTaskApproval,
+        new_status: str,
+        exp: Any,
+    ) -> None:
         summary = self._make_result_summary(exp)
         self._write_result_outbox(approval, new_status, summary, exp)
         with self._lock:
             self._conn.execute(
                 """UPDATE mailbox_task_approvals
                    SET status=?, result_summary=?, error=?, updated_at=? WHERE id=?""",
-                (new_status, summary,
-                 _safe_error(exp.error) if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW) else None,
-                 _now_iso(), approval.id),
+                (
+                    new_status,
+                    summary,
+                    _safe_error(exp.error)
+                    if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW)
+                    else None,
+                    _now_iso(),
+                    approval.id,
+                ),
             )
             self._conn.commit()
         if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW):
             self._write_problem(approval, new_status, summary, exp)
 
     def _complete_without_experiment(
-        self, approval: MailboxTaskApproval, status: str, summary: str,
-        *, error: str | None = None,
+        self,
+        approval: MailboxTaskApproval,
+        status: str,
+        summary: str,
+        *,
+        error: str | None = None,
     ) -> None:
         with self._lock:
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals
                    SET status=?, experiment_id=NULL, result_summary=?, error=?, updated_at=?
                    WHERE id=? AND status=?""",
-                (status, summary[:8000], _safe_error(error), _now_iso(), approval.id, _STATUS_APPROVED),
+                (
+                    status,
+                    summary[:8000],
+                    _safe_error(error),
+                    _now_iso(),
+                    approval.id,
+                    _STATUS_APPROVED,
+                ),
             ).rowcount
             self._conn.commit()
         if updated:
             self._write_result_outbox(approval, status, summary, None)
 
     def _complete_claimed_without_experiment(
-        self, approval: MailboxTaskApproval, status: str, summary: str,
-        *, error: str | None = None,
+        self,
+        approval: MailboxTaskApproval,
+        status: str,
+        summary: str,
+        *,
+        error: str | None = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
@@ -515,7 +646,11 @@ class MailboxTaskService:
         return "; ".join(parts)
 
     def _write_result_outbox(
-        self, approval: MailboxTaskApproval, status: str, summary: str, exp: Any | None,
+        self,
+        approval: MailboxTaskApproval,
+        status: str,
+        summary: str,
+        exp: Any | None,
     ) -> str | None:
         try:
             self.outbox_dir.mkdir(parents=True, exist_ok=True)
@@ -524,7 +659,9 @@ class MailboxTaskService:
             experiment_id = exp.id if exp is not None else "none"
             test_result = ""
             if exp is not None and exp.test_exit_code is not None:
-                test_result = f"\ntest_result: {'pass' if exp.test_exit_code == 0 else 'fail'}"
+                test_result = (
+                    f"\ntest_result: {'pass' if exp.test_exit_code == 0 else 'fail'}"
+                )
             content = (
                 "---\n"
                 "type: task_approval_result\n"
@@ -547,7 +684,13 @@ class MailboxTaskService:
                         """UPDATE mailbox_task_approvals
                            SET outbox_file=?, outbox_content=?, publish_status=?, updated_at=?
                            WHERE id=?""",
-                        (rel_path, content, PUBLISH_PENDING_WRITE, _now_iso(), approval.id),
+                        (
+                            rel_path,
+                            content,
+                            PUBLISH_PENDING_WRITE,
+                            _now_iso(),
+                            approval.id,
+                        ),
                     )
                     self._conn.commit()
                 tmp = path.with_suffix(".tmp")
@@ -565,22 +708,43 @@ class MailboxTaskService:
             return None
 
     # Backward-compatible name used by existing tests/helpers.
-    def _write_outbox(self, approval: MailboxTaskApproval, status: str, exp: Any, summary: str) -> str | None:
+    def _write_outbox(
+        self,
+        approval: MailboxTaskApproval,
+        status: str,
+        exp: Any,
+        summary: str,
+    ) -> str | None:
         return self._write_result_outbox(approval, status, summary, exp)
 
-    def _write_problem(self, approval: MailboxTaskApproval, status: str, summary: str, exp: Any) -> None:
+    def _write_problem(
+        self,
+        approval: MailboxTaskApproval,
+        status: str,
+        summary: str,
+        exp: Any,
+    ) -> None:
         try:
             runs_dir = self.repo_path / "state" / "runs"
             runs_dir.mkdir(parents=True, exist_ok=True)
-            filename = runs_dir / f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-task-approval-{approval.id[:8]}.json"
+            filename = runs_dir / (
+                f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                f"-task-approval-{approval.id[:8]}.json"
+            )
             filename.write_text(
-                json.dumps({
-                    "timestamp": _now_iso(),
-                    "source": "mailbox_task_service",
-                    "approval_id": approval.id,
-                    "experiment_id": exp.id,
-                    "response": f"ERROR: task approval {approval.id[:8]} ended with status={status}; {summary}",
-                }, indent=2),
+                json.dumps(
+                    {
+                        "timestamp": _now_iso(),
+                        "source": "mailbox_task_service",
+                        "approval_id": approval.id,
+                        "experiment_id": exp.id,
+                        "response": (
+                            f"ERROR: task approval {approval.id[:8]} "
+                            f"ended with status={status}; {summary}"
+                        ),
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
         except Exception:
