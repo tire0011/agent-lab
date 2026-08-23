@@ -1,25 +1,93 @@
-# Issue 46: agentic task orchestration
+# Issue 46: persistent agentic Nexus controller
 
-The local Nexus model is the workflow controller for approved free-form tasks.
+The local Nexus model is the high-level controller. It is not an intent classifier and a new experiment is not the default workflow.
 
-Flow:
+## Inputs
 
-1. Receive the natural-language task.
-2. Present the local model with the currently available Nexus capabilities.
-3. The model may call a bounded read/inspection operation.
-4. Feed the real operation result back to the model.
-5. Repeat for a small bounded number of steps.
-6. The model chooses the final execution primitive:
-   - new experiment
-   - resume existing experiment
-   - command
-   - direct answer
-   - clarification
-   - missing capability
-7. Only then is the selected primitive executed.
+The same controller can work on natural-language sources such as:
 
-Existing experiment, command, and operation implementations remain separate primitives. The orchestrator does not require users to provide workflow syntax.
+- mailbox tasks;
+- GitHub issues supplied by a GitHub/MCP adapter;
+- ideas from `IDEAS.md`;
+- a user reply in an existing Nexus discussion session.
 
-A `missing_capability` result is persisted as a structured JSON requirement under `state/requirements/` so it can later feed Nexus self-improvement or GitHub issue creation.
+Each source has a stable `source_type` and optional `source_id`. Nexus stores a durable task session and event journal in SQLite so a clarification can be answered later without losing the original task, previous tool observations, or discussion context.
 
-The orchestrator deliberately has no automatic `new_experiment` fallback when the local model fails. If orchestration itself is unavailable, the task stops for review rather than accidentally entering an unrelated lifecycle pipeline.
+## Control loop
+
+A bounded run follows this shape:
+
+1. Give the local model the current request, compact persistent task history and available capabilities.
+2. Let the model choose one next step.
+3. If it chooses a tool, execute the real tool and return the observation to the local model.
+4. Persist the observation and let the local model decide again.
+5. Finish only when the local model selects an execution/final action or requests clarification.
+
+The local model therefore keeps control after every tool and delegate call.
+
+## Tools
+
+### Nexus operations
+
+The existing `OperationsRegistry` catalog is exposed as an inspection/tool surface. This includes experiment state, logs, git status, worktrees, service state and other registered operations.
+
+### Memory search
+
+`memory_search` searches existing Nexus memory instead of injecting all history into every prompt. The initial low-cost backend searches:
+
+- SQLite `knowledge` entries;
+- previous Nexus task/discussion events;
+- `PROJECT_HISTORY.md`;
+- `DECISIONS.md`;
+- `ARCHITECTURE.md`;
+- `IDEAS.md`.
+
+Only compact matches enter the local model context. The tool interface is independent of the backend, so lexical search can later be replaced by embeddings/RAG without changing the controller.
+
+### LLM delegation
+
+`delegate` lets the local controller ask another bounded model for a sub-problem and then inspect the returned result before deciding again.
+
+Available delegation providers currently include:
+
+- `local_worker`: another bounded local-model reasoning pass;
+- `codex_readonly`: existing Codex task infrastructure in read-only mode for difficult repository analysis/review;
+- `azure_openai`: only advertised when Azure OpenAI is configured.
+
+Delegation is not a transfer of control. External models return observations to the local Nexus model. Prompts explicitly prefer local/cheap work first and reserve external models for cases where they add material value.
+
+## Final actions
+
+The local model may choose:
+
+- `new_experiment`: start the existing isolated implementation pipeline;
+- `resume_experiment`: continue an existing persisted experiment;
+- `command`: execute an explicit operational command through the trusted development command primitive;
+- `answer`: finish directly from its own reasoning/tool/delegate results;
+- `clarification`: pause the persistent session and ask the user one material question;
+- `missing_capability`: stop honestly and record a structured requirement.
+
+There is deliberately no automatic `new_experiment` fallback if local orchestration fails.
+
+## Persistent discussion
+
+A clarification marks the Nexus session as `waiting_for_user`. A later reply can resume the same session. Mailbox tasks use the approval id as their stable source id; `continue_discussion(...)` returns the task to orchestration with the same identity and preserves the follow-up in the eventual experiment goal when implementation is selected.
+
+## Missing capabilities
+
+A `missing_capability` result is written as structured JSON under `state/requirements/`, including the triggering task, session, requirement and reason. This creates a durable input for later self-improvement or automatic Issue/tool creation.
+
+## Resume correctness
+
+Resume is explicit rather than guessed:
+
+- `queued` starts the same experiment id through its normal pipeline;
+- `verifying`, `timed_out` and verification-related `needs_review` reuse the existing worktree and rerun verification without implementation;
+- `succeeded` is already complete;
+- ambiguous/unsafe lifecycle states such as `implementing`, `selecting`, `failed` or `rejected` are rejected instead of being silently forced into verification.
+
+This fixes the original regression where Nexus could correctly understand “resume experiment X” yet create or run the wrong lifecycle.
+
+## Context/cost bounds
+
+Persistent storage is larger than prompt context. Recent discussion history, memory matches and tool observations are truncated/bounded before being sent to the local model. This keeps the architecture usable with a small local model and avoids making long-term memory equivalent to an ever-growing prompt.
