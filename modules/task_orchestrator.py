@@ -1,7 +1,8 @@
-"""Agentic local-LLM orchestration for free-form Nexus tasks.
+"""Agentic local-LLM controller for free-form Nexus work.
 
-This layer decides *what Nexus should do* before any lifecycle pipeline is
-started. Existing pipelines and operations remain execution primitives.
+The local model remains in control across tasks, issues, ideas and discussions.
+It can inspect Nexus state, search persistent memory, consult other LLMs and
+then decide what Nexus should do next. Existing pipelines remain tools.
 """
 
 from __future__ import annotations
@@ -14,6 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
+from modules.nexus_delegation import NexusDelegationService
+from modules.nexus_memory import NexusMemory
+from modules.nexus_task_store import NexusTaskStore
+from modules.run_store import DEFAULT_DB_PATH
 
 
 ACTION_NEW_EXPERIMENT = "new_experiment"
@@ -41,6 +46,7 @@ class TaskDecision:
     experiment_id: str | None = None
     command: str | None = None
     observations: list[dict[str, Any]] = field(default_factory=list)
+    session_id: str | None = None
 
 
 class TaskOrchestratorError(RuntimeError):
@@ -48,11 +54,11 @@ class TaskOrchestratorError(RuntimeError):
 
 
 class NexusTaskOrchestrator:
-    """Let the local Nexus model choose and refine the next workflow action.
+    """Persistent local-LLM controller that chooses Nexus's next action.
 
-    The model may inspect Nexus through existing read-only OperationsRegistry
-    tools, receive the real tool output, and then choose again. Only after that
-    loop finishes does it return a write/lifecycle action to the caller.
+    A run is a bounded ReAct-style loop. The controller may call tools, inspect
+    their real observations, and reconsider. It can also pause for user input;
+    a later call with the same session/source resumes with durable history.
     """
 
     def __init__(
@@ -61,29 +67,113 @@ class NexusTaskOrchestrator:
         operations_registry: Any,
         experiment_service: Any,
         llama_client: LlamaCppClient | None = None,
-        max_steps: int = 4,
+        memory: NexusMemory | None = None,
+        delegation_service: NexusDelegationService | None = None,
+        task_store: NexusTaskStore | None = None,
+        max_steps: int = 6,
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
         self.llama = llama_client or LlamaCppClient(timeout=90.0)
-        self.max_steps = max(1, min(max_steps, 8))
+        self.max_steps = max(1, min(max_steps, 10))
+        db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
+        repo_root = str(getattr(operations_registry, "repo_root", "/agent"))
+        self.task_store = task_store or NexusTaskStore(db_path=db_path)
+        self._owns_task_store = task_store is None
+        self.memory = memory or NexusMemory(
+            db_path=db_path, repo_root=repo_root, task_store=self.task_store
+        )
+        self._owns_memory = memory is None
+        self.delegation = delegation_service or NexusDelegationService(
+            llama_client=self.llama, db_path=db_path, repo_root=repo_root
+        )
+        self._owns_delegation = delegation_service is None
 
-    def run(self, task: str) -> TaskDecision:
-        return asyncio.run(self.run_async(task))
+    def close(self) -> None:
+        if self._owns_delegation:
+            self.delegation.close()
+        if self._owns_memory:
+            self.memory.close()
+        if self._owns_task_store:
+            self.task_store.close()
 
-    async def run_async(self, task: str) -> TaskDecision:
+    def run(
+        self,
+        task: str,
+        *,
+        source_type: str = "task",
+        source_id: str | None = None,
+        title: str | None = None,
+        session_id: str | None = None,
+    ) -> TaskDecision:
+        return asyncio.run(
+            self.run_async(
+                task,
+                source_type=source_type,
+                source_id=source_id,
+                title=title,
+                session_id=session_id,
+            )
+        )
+
+    def continue_session(self, session_id: str, user_message: str) -> TaskDecision:
+        session = self.task_store.get(session_id)
+        if session is None:
+            raise TaskOrchestratorError(f"unknown Nexus task session {session_id!r}")
+        return self.run(
+            user_message,
+            source_type=session.source_type,
+            source_id=session.source_id,
+            title=session.title,
+            session_id=session.id,
+        )
+
+    async def run_async(
+        self,
+        task: str,
+        *,
+        source_type: str = "task",
+        source_id: str | None = None,
+        title: str | None = None,
+        session_id: str | None = None,
+    ) -> TaskDecision:
+        if not task or not task.strip():
+            raise TaskOrchestratorError("task must not be empty")
+        session = self.task_store.get_or_create(
+            source_type=source_type,
+            source_id=source_id,
+            title=title,
+            session_id=session_id,
+        )
+        self.task_store.set_status(session.id, "active")
+        self.task_store.append_event(
+            session.id,
+            role="user",
+            kind="input",
+            content=task.strip(),
+            metadata={"source_type": session.source_type, "source_id": session.source_id},
+        )
         observations: list[dict[str, Any]] = []
+
         for _ in range(self.max_steps):
+            history = self.task_store.history(session.id, limit=24)
             raw = await self.llama.complete(
-                prompt=self._prompt(task, observations),
+                prompt=self._prompt(session, task, history, observations),
                 temperature=0.0,
-                max_tokens=450,
+                max_tokens=550,
             )
             decision = self._parse(raw)
 
             if decision.get("type") == "tool":
-                observation = self._execute_tool(decision)
+                observation = await self._execute_tool(decision)
                 observations.append(observation)
+                self.task_store.append_event(
+                    session.id,
+                    role="tool",
+                    kind=str(observation.get("tool", "tool")),
+                    content=json.dumps(observation, separators=(",", ":"))[:12000],
+                    metadata={"reason": str(decision.get("reason", ""))[:1000]},
+                )
                 continue
 
             action = str(decision.get("action", "")).strip().lower()
@@ -112,86 +202,117 @@ class NexusTaskOrchestrator:
             result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
-                message=str(decision.get("message", ""))[:2000],
+                message=str(decision.get("message", ""))[:3000],
                 experiment_id=experiment_id,
                 command=command,
                 observations=observations,
+                session_id=session.id,
             )
-            if action == ACTION_MISSING_CAPABILITY:
-                self._record_missing_capability(task, result)
+            self._persist_final(session.id, task, result)
             return result
 
-        return TaskDecision(
+        result = TaskDecision(
             action=ACTION_CLARIFICATION,
             reason="local orchestrator reached its bounded decision-step limit",
             message="I need one more piece of information before I can choose a reliable action.",
             observations=observations,
+            session_id=session.id,
         )
+        self._persist_final(session.id, task, result)
+        return result
 
     def _capabilities(self) -> list[dict[str, Any]]:
         operations = [spec.to_dict() for spec in self.operations_registry.catalog()]
         return [
             {
                 "name": "operation",
-                "description": "Execute one existing read-only Nexus operation and inspect its real result before deciding again.",
+                "description": "Execute one existing Nexus inspection/operation and receive its real result before deciding again.",
                 "operations": operations,
             },
             {
+                "name": "memory_search",
+                "description": "Search Nexus memory: structured knowledge, previous task/dialog history and project memory documents.",
+                "arguments": {"query": "string", "limit": "1..20"},
+            },
+            {
+                "name": "delegate",
+                "description": "Ask another bounded LLM worker for analysis/research/review. The result returns to the local controller; delegation never transfers control.",
+                "providers": self.delegation.catalog(),
+                "arguments": {"provider": "provider name", "task": "sub-problem", "context": "optional compact context"},
+            },
+            {
                 "name": ACTION_NEW_EXPERIMENT,
-                "description": "Start a new implementation experiment using the existing experiment pipeline.",
+                "description": "Start a new isolated implementation experiment. Use for repository changes too large to solve through existing direct tools.",
             },
             {
                 "name": ACTION_RESUME_EXPERIMENT,
-                "description": "Resume an existing persisted experiment/worktree without creating another experiment.",
+                "description": "Resume an existing persisted experiment/worktree without allocating another experiment.",
             },
             {
                 "name": ACTION_COMMAND,
-                "description": "Execute an explicit operational shell command through the existing trusted mailbox command primitive.",
+                "description": "Execute an explicit operational shell command through the trusted mailbox command primitive.",
             },
             {
                 "name": ACTION_ANSWER,
-                "description": "Return a direct result when inspection already answered the request and no mutation is needed.",
+                "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request.",
             },
             {
                 "name": ACTION_MISSING_CAPABILITY,
-                "description": "State that no available Nexus capability can complete the request; Nexus records this as a structured capability requirement.",
+                "description": "State that no available capability can complete the request and record a structured requirement.",
             },
             {
                 "name": ACTION_CLARIFICATION,
-                "description": "Ask one concise question only when a material ambiguity cannot be resolved with available tools/state.",
+                "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory.",
             },
         ]
 
-    def _prompt(self, task: str, observations: list[dict[str, Any]]) -> str:
-        return f"""You are Nexus, the local orchestration model. You decide WHAT Nexus does next.
-Do not force every request into an experiment. Existing pipelines are tools, not the control flow.
+    def _prompt(
+        self,
+        session: Any,
+        current_input: str,
+        history: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> str:
+        return f"""You are Nexus, the LOCAL persistent controller. You decide WHAT Nexus does next.
+You are not merely an intent classifier. Work on the request yourself when practical, use tools and memory, consult other LLMs when that is valuable, and keep control after every observation.
 
-User task:
-{task}
+SOURCE:
+{json.dumps({'type': session.source_type, 'id': session.source_id, 'title': session.title}, separators=(',', ':'))}
 
-Available capabilities:
+CURRENT INPUT:
+{current_input}
+
+PERSISTENT TASK/DISCUSSION HISTORY:
+{json.dumps(history, separators=(',', ':'))}
+
+AVAILABLE CAPABILITIES:
 {json.dumps(self._capabilities(), separators=(',', ':'))}
 
-Observations from tools already used in this task:
+OBSERVATIONS FROM TOOLS USED IN THIS RUN:
 {json.dumps(observations, separators=(',', ':'))}
 
 Choose exactly one next step.
 
-To inspect state first, return JSON:
+Tool call forms:
 {{"type":"tool","tool":"operation","operation":"<catalog operation>","args":{{...}},"reason":"..."}}
+{{"type":"tool","tool":"memory_search","query":"...","limit":8,"reason":"..."}}
+{{"type":"tool","tool":"delegate","provider":"local_worker|codex_readonly|azure_openai","task":"bounded sub-problem","context":"optional","reason":"..."}}
 
-To finish routing, return JSON:
+Final action form:
 {{"type":"action","action":"new_experiment|resume_experiment|command|answer|missing_capability|clarification","experiment_id":null,"command":null,"message":"...","reason":"..."}}
 
 Rules:
-- Prefer using a read-only operation when state can resolve uncertainty.
-- For a clear new code change, choose new_experiment.
-- For a request to continue an existing experiment, inspect it if useful, then choose resume_experiment with its id/prefix.
-- For an explicit operational command, choose command rather than creating an experiment.
-- If inspection answers the request, choose answer.
-- If the needed capability does not exist, choose missing_capability instead of pretending another workflow fits. Describe the missing capability concretely in message/reason.
-- Ask clarification only when tools/state cannot resolve a material ambiguity.
-- Never invent operation names or experiment IDs.
+- The natural-language source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all of them as work to understand and advance.
+- Search memory when previous project decisions, experiments, discussions or ideas may materially help. Do not search it mechanically when irrelevant.
+- Prefer cheap/local reasoning and existing tools first. Delegate only when another model can materially improve a difficult analysis, review or research step.
+- Delegation is a tool call, not a hand-off of control. Inspect the delegate result and decide again.
+- `codex_readonly` and `azure_openai` are external/costlier; use them when the expected value justifies it.
+- For repository implementation changes, use new_experiment rather than asking a read-only delegate to modify files.
+- For a clear existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
+- If you can solve a small request using operations/commands/reasoning, do it and then answer instead of creating an experiment.
+- Ask clarification only when the missing information materially changes the result and cannot be obtained from tools or memory. The session will persist and resume after the reply.
+- If a capability is genuinely missing, choose missing_capability and describe exactly what is needed.
+- Never invent tool names, provider names, operation results or experiment IDs.
 - Return JSON only.
 """
 
@@ -205,34 +326,70 @@ Rules:
             raise TaskOrchestratorError("orchestrator response must be a JSON object")
         return data
 
-    def _execute_tool(self, decision: dict[str, Any]) -> dict[str, Any]:
-        if decision.get("tool") != "operation":
-            raise TaskOrchestratorError(f"unknown tool {decision.get('tool')!r}")
+    async def _execute_tool(self, decision: dict[str, Any]) -> dict[str, Any]:
+        tool = str(decision.get("tool", "")).strip()
+        if tool == "operation":
+            return self._execute_operation(decision)
+        if tool == "memory_search":
+            query = str(decision.get("query", "")).strip()
+            if not query:
+                raise TaskOrchestratorError("memory_search requires query")
+            try:
+                limit = int(decision.get("limit", 8))
+            except (TypeError, ValueError):
+                limit = 8
+            results = self.memory.search(query, limit=limit)
+            return {"tool": "memory_search", "query": query[:500], "results": results}
+        if tool == "delegate":
+            provider = str(decision.get("provider", "")).strip()
+            subtask = str(decision.get("task", "")).strip()
+            context = str(decision.get("context", ""))
+            available = {item["provider"] for item in self.delegation.catalog()}
+            if provider not in available:
+                raise TaskOrchestratorError(f"delegation provider {provider!r} is not available")
+            if not subtask:
+                raise TaskOrchestratorError("delegate requires task")
+            result = await self.delegation.delegate(provider, subtask, context=context)
+            return {"tool": "delegate", "result": result.to_dict()}
+        raise TaskOrchestratorError(f"unknown tool {tool!r}")
+
+    def _execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
         operation = str(decision.get("operation", "")).strip()
         args = decision.get("args") or {}
         if not isinstance(args, dict):
             raise TaskOrchestratorError("operation args must be an object")
-
         available = {spec.name for spec in self.operations_registry.catalog()}
         if operation not in available:
             raise TaskOrchestratorError(f"operation {operation!r} is not available")
-
         result = self.operations_registry.execute(
-            operation,
-            args,
-            caller="local task orchestrator",
+            operation, args, caller="local task orchestrator"
         )
         payload = result.to_dict()
         lines = list(payload.get("output_lines") or [])[:80]
         payload["output_lines"] = [str(line)[:500] for line in lines]
-        return {
-            "operation": operation,
-            "args": args,
-            "result": payload,
-        }
+        return {"tool": "operation", "operation": operation, "args": args, "result": payload}
+
+    def _persist_final(self, session_id: str, task: str, decision: TaskDecision) -> None:
+        self.task_store.append_event(
+            session_id,
+            role="assistant",
+            kind=decision.action,
+            content=decision.message or decision.reason or decision.action,
+            metadata={
+                "reason": decision.reason,
+                "experiment_id": decision.experiment_id,
+                "has_command": bool(decision.command),
+            },
+        )
+        if decision.action == ACTION_CLARIFICATION:
+            self.task_store.set_status(session_id, "waiting_for_user")
+        elif decision.action == ACTION_MISSING_CAPABILITY:
+            self.task_store.set_status(session_id, "blocked_missing_capability")
+            self._record_missing_capability(task, decision)
+        else:
+            self.task_store.set_status(session_id, "action_selected")
 
     def _record_missing_capability(self, task: str, decision: TaskDecision) -> None:
-        """Best-effort durable requirement discovered while handling real work."""
         repo_root = getattr(self.operations_registry, "repo_root", None)
         if repo_root is None:
             return
@@ -246,8 +403,9 @@ Rules:
                     {
                         "timestamp": now.isoformat(),
                         "type": "missing_capability",
+                        "session_id": decision.session_id,
                         "trigger_task": task[:4000],
-                        "requirement": decision.message[:2000],
+                        "requirement": decision.message[:3000],
                         "reason": decision.reason[:1000],
                         "source": "local_task_orchestrator",
                         "status": "new",
@@ -257,6 +415,4 @@ Rules:
                 encoding="utf-8",
             )
         except OSError:
-            # Missing-capability detection itself remains a valid outcome even
-            # when the optional durable requirement file cannot be written.
             return
