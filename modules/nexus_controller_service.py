@@ -80,12 +80,41 @@ class NexusControllerService:
 
     def reply(self, session_id: str, message: str) -> TaskDecision:
         decision = self.orchestrator.continue_session(session_id, message)
-        self._execute(decision, message)
+        self._execute(decision, self._execution_goal(session_id, message))
         return decision
+
+    def _execution_goal(self, session_id: str, fallback: str) -> str:
+        """Reconstruct the user-visible task across clarification replies.
+
+        Tool observations remain available to the controller through persistent
+        history/memory but are not copied verbatim into an implementation goal.
+        """
+        try:
+            history = self.orchestrator.task_store.history(
+                session_id,
+                limit=50,
+                max_chars=20000,
+            )
+        except Exception:
+            return fallback
+        user_inputs = [
+            str(event.get("content", "")).strip()
+            for event in history
+            if event.get("role") == "user" and event.get("kind") == "input"
+        ]
+        user_inputs = [item for item in user_inputs if item]
+        if not user_inputs:
+            return fallback
+        return "\n\nUser follow-up:\n".join(user_inputs)[:24000]
 
     def _execute(self, decision: TaskDecision, source_content: str) -> None:
         if decision.action == ACTION_NEW_EXPERIMENT:
             experiment = self.experiment_service.create_experiment(source_content)
+            self._record_execution(
+                decision,
+                "experiment_started",
+                f"experiment_id={experiment.id}",
+            )
             self._start_experiment_thread(
                 experiment.id,
                 lambda: self.experiment_service.run_experiment(experiment.id),
@@ -96,6 +125,11 @@ class NexusControllerService:
             if not decision.experiment_id:
                 raise RuntimeError("resume decision has no experiment id")
             experiment_id = decision.experiment_id
+            self._record_execution(
+                decision,
+                "experiment_resume_started",
+                f"experiment_id={experiment_id}",
+            )
             self._start_experiment_thread(
                 experiment_id,
                 lambda: resume_experiment(self.experiment_service, experiment_id),
@@ -106,14 +140,26 @@ class NexusControllerService:
             command = (decision.command or "").strip()
             if not command:
                 raise RuntimeError("command decision has no command")
-            # Reuse the trusted development command primitive; it already
-            # applies bounded output, timeout handling and secret-redacted env.
-            process_command(
+            result, _ = process_command(
                 SimpleNamespace(body=command, meta={}),
                 self.repo_root,
                 None,
                 0,
             )
+            self._record_execution(decision, "command_result", result[:4000])
+
+    def _record_execution(self, decision: TaskDecision, kind: str, content: str) -> None:
+        if not decision.session_id:
+            return
+        try:
+            self.orchestrator.task_store.append_event(
+                decision.session_id,
+                role="tool",
+                kind=kind,
+                content=content,
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _start_experiment_thread(experiment_id: str, target) -> None:
