@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,7 +69,9 @@ class NexusTaskOrchestrator:
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
-        self.llama = llama_client or LlamaCppClient(timeout=90.0)
+        controller_timeout = float(os.environ.get("NEXUS_CONTROLLER_LLM_TIMEOUT_SECONDS", "300"))
+        controller_timeout = max(30.0, min(controller_timeout, 900.0))
+        self.llama = llama_client or LlamaCppClient(timeout=controller_timeout)
         self.max_steps = max(1, min(max_steps, 10))
         db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
         repo_root = str(getattr(operations_registry, "repo_root", "/agent"))
