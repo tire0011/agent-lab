@@ -120,6 +120,7 @@ class NexusTaskStore:
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        """Persist the full bounded event; prompt history is compacted separately."""
         now = _now()
         with self._lock:
             self._conn.execute(
@@ -141,30 +142,49 @@ class NexusTaskStore:
             )
             self._conn.commit()
 
-    def history(self, session_id: str, *, limit: int = 24) -> list[dict[str, Any]]:
+    def history(
+        self,
+        session_id: str,
+        *,
+        limit: int = 24,
+        max_chars: int = 9000,
+    ) -> list[dict[str, Any]]:
+        """Return recent history compact enough for a small local context window.
+
+        Storage keeps larger event bodies. Only this prompt-facing view truncates
+        individual events and stops once the aggregate character budget is hit.
+        """
+        limit = max(1, min(limit, 100))
+        max_chars = max(1000, min(max_chars, 32000))
         with self._lock:
             rows = self._conn.execute(
                 """SELECT role, kind, content, metadata_json, created_at
                    FROM nexus_task_events WHERE session_id=?
                    ORDER BY id DESC LIMIT ?""",
-                (session_id, max(1, min(limit, 100))),
+                (session_id, limit),
             ).fetchall()
-        items: list[dict[str, Any]] = []
-        for row in reversed(rows):
+        newest_first: list[dict[str, Any]] = []
+        used = 0
+        for row in rows:
             try:
                 metadata = json.loads(row["metadata_json"] or "{}")
             except json.JSONDecodeError:
                 metadata = {}
-            items.append(
+            content = str(row["content"] or "")[:1800]
+            event_cost = len(content) + 300
+            if newest_first and used + event_cost > max_chars:
+                break
+            newest_first.append(
                 {
                     "role": row["role"],
                     "kind": row["kind"],
-                    "content": row["content"],
+                    "content": content,
                     "metadata": metadata,
                     "created_at": row["created_at"],
                 }
             )
-        return items
+            used += event_cost
+        return list(reversed(newest_first))
 
     def set_status(self, session_id: str, status: str) -> None:
         with self._lock:
