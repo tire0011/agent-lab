@@ -69,7 +69,7 @@ class NexusTaskOrchestrator:
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
-        controller_timeout = float(os.environ.get("NEXUS_CONTROLLER_LLM_TIMEOUT_SECONDS", "300"))
+        controller_timeout = float(os.environ.get("NEXUS_CONTROLLER_LLM_TIMEOUT_SECONDS", "600"))
         controller_timeout = max(30.0, min(controller_timeout, 900.0))
         self.llama = llama_client or LlamaCppClient(timeout=controller_timeout)
         self.max_steps = max(1, min(max_steps, 10))
