@@ -28,7 +28,7 @@ class DelegationResult:
         return {
             "provider": self.provider,
             "success": self.success,
-            "content": self.content[:8000],
+            "content": self.content[:4000],
             "metadata": self.metadata,
         }
 
@@ -82,13 +82,7 @@ class NexusDelegationService:
             )
         return providers
 
-    async def delegate(
-        self,
-        provider: str,
-        task: str,
-        *,
-        context: str = "",
-    ) -> DelegationResult:
+    async def delegate(self, provider: str, task: str, *, context: str = "") -> DelegationResult:
         provider = provider.strip().lower()
         if provider == "local_worker":
             return await self._local(task, context)
@@ -96,39 +90,26 @@ class NexusDelegationService:
             return await self._codex(task, context)
         if provider == "azure_openai":
             return await self._azure(task, context)
-        return DelegationResult(
-            provider=provider,
-            success=False,
-            content=f"Unknown delegation provider: {provider}",
-            metadata={},
-        )
+        return DelegationResult(provider, False, f"Unknown delegation provider: {provider}", {})
 
     async def _local(self, task: str, context: str) -> DelegationResult:
         prompt = (
             "You are a bounded worker consulted by the Nexus controller. "
             "Solve or analyse the sub-problem below. Do not claim to have used tools. "
             "Return concise findings and a recommended next step.\n\n"
-            f"SUB-PROBLEM:\n{task[:6000]}\n\n"
-            f"CONTEXT:\n{context[:8000]}"
+            f"SUB-PROBLEM:\n{task[:6000]}\n\nCONTEXT:\n{context[:6000]}"
         )
         try:
-            raw = await self.llama.complete(
-                prompt=prompt,
-                temperature=0.1,
-                max_tokens=1200,
-            )
+            raw = await self.llama.complete(prompt=prompt, temperature=0.1, max_tokens=900)
             return DelegationResult("local_worker", True, raw, {})
         except Exception as exc:  # noqa: BLE001
-            return DelegationResult(
-                "local_worker", False, "", {"error": type(exc).__name__}
-            )
+            return DelegationResult("local_worker", False, "", {"error": type(exc).__name__})
 
     async def _codex(self, task: str, context: str) -> DelegationResult:
         try:
             service = self.codex_service
             if service is None:
                 from modules.codex_task_service import CodexTaskService
-
                 service = CodexTaskService(db_path=self.db_path)
                 self.codex_service = service
                 self._owns_codex = True
@@ -136,81 +117,48 @@ class NexusDelegationService:
                 "You are a read-only specialist consulted by the Nexus controller. "
                 "Inspect the repository as needed, but do not modify files. Analyse the "
                 "sub-problem and return findings, evidence and a recommended next step.\n\n"
-                f"SUB-PROBLEM:\n{task[:6000]}\n\n"
-                f"KNOWN CONTEXT:\n{context[:8000]}"
+                f"SUB-PROBLEM:\n{task[:6000]}\n\nKNOWN CONTEXT:\n{context[:6000]}"
             )
-            created = await asyncio.to_thread(
-                service.create_task,
-                prompt,
-                self.repo_root,
-                "read-only",
-                120,
-            )
+            created = await asyncio.to_thread(service.create_task, prompt, self.repo_root, "read-only", 120)
             finished = await asyncio.to_thread(service.run_task, created.id)
             content = finished.final_message or finished.error or f"Codex status: {finished.status}"
             return DelegationResult(
                 "codex_readonly",
                 finished.status == "succeeded",
                 content,
-                {
-                    "task_id": finished.id,
-                    "status": finished.status,
-                    "runtime_ms": finished.runtime_ms,
-                    "usage": finished.usage,
-                },
+                {"task_id": finished.id, "status": finished.status, "runtime_ms": finished.runtime_ms, "usage": finished.usage},
             )
         except Exception as exc:  # noqa: BLE001
-            return DelegationResult(
-                "codex_readonly", False, "", {"error": type(exc).__name__}
-            )
+            return DelegationResult("codex_readonly", False, "", {"error": type(exc).__name__})
 
     async def _azure(self, task: str, context: str) -> DelegationResult:
         endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
         api_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
         deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         if not endpoint or not api_key:
-            return DelegationResult(
-                "azure_openai", False, "", {"error": "not_configured"}
-            )
-        url = (
-            f"{endpoint}/openai/deployments/{deployment}/chat/completions"
-            "?api-version=2024-05-01-preview"
-        )
+            return DelegationResult("azure_openai", False, "", {"error": "not_configured"})
+        url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-05-01-preview"
         prompt = (
             "You are a specialist consulted by a local Nexus controller. Analyse the "
             "sub-problem and return concise findings and a recommended next action. "
             "You do not control execution and must not claim to have used unavailable tools.\n\n"
-            f"SUB-PROBLEM:\n{task[:6000]}\n\n"
-            f"CONTEXT:\n{context[:8000]}"
+            f"SUB-PROBLEM:\n{task[:6000]}\n\nCONTEXT:\n{context[:6000]}"
         )
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
                     url,
                     headers={"api-key": api_key, "Content-Type": "application/json"},
-                    json={
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": 1200,
-                    },
+                    json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 900},
                 )
             if response.status_code != 200:
-                return DelegationResult(
-                    "azure_openai",
-                    False,
-                    "",
-                    {"error": f"HTTP {response.status_code}"},
-                )
+                return DelegationResult("azure_openai", False, "", {"error": f"HTTP {response.status_code}"})
             data = response.json()
-            content = str(data["choices"][0]["message"]["content"])
-            usage = data.get("usage") or {}
             return DelegationResult(
                 "azure_openai",
                 True,
-                content,
-                {"deployment": deployment, "usage": usage},
+                str(data["choices"][0]["message"]["content"]),
+                {"deployment": deployment, "usage": data.get("usage") or {}},
             )
         except Exception as exc:  # noqa: BLE001
-            return DelegationResult(
-                "azure_openai", False, "", {"error": type(exc).__name__}
-            )
+            return DelegationResult("azure_openai", False, "", {"error": type(exc).__name__})
