@@ -281,6 +281,12 @@ Rules:
         tool = str(decision.get("tool", "")).strip()
         if tool == "operation":
             return self._execute_operation(decision)
+        available_operations = {spec.name for spec in self.operations_registry.catalog()}
+        if tool in available_operations:
+            normalized = dict(decision)
+            normalized["tool"] = "operation"
+            normalized["operation"] = tool
+            return self._execute_operation(normalized)
         if tool == "memory_search":
             query = str(decision.get("query", "")).strip()
             if not query:

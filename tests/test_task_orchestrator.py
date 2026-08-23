@@ -135,6 +135,22 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("status: verifying", client.prompts[1])
         self.assertIsNotNone(result.session_id)
 
+    def test_registered_operation_name_is_accepted_as_direct_tool_alias(self):
+        client = _Client([
+            '{"type":"tool","tool":"experiment_show","args":{"experiment_id":"bd9720b2"},'
+            '"reason":"inspect current state"}',
+            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
+            '"message":"Experiment inspected.","reason":"tool result is sufficient"}',
+        ])
+
+        result = self._orchestrator(client).run("Inspect experiment bd9720b2")
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(self.registry.calls[0][0], "experiment_show")
+        self.assertEqual(self.registry.calls[0][1], {"experiment_id": "bd9720b2"})
+        self.assertIn('"tool":"operation"', client.prompts[1])
+        self.assertIn('"operation":"experiment_show"', client.prompts[1])
+
     def test_memory_is_a_tool_and_result_returns_to_controller(self):
         memory = _Memory([
             {
