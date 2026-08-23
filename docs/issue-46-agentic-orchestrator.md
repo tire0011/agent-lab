@@ -95,3 +95,7 @@ This fixes the original regression where Nexus could correctly understand “res
 ## Context/cost bounds
 
 Persistent storage is larger than prompt context. Recent discussion history, memory matches and delegate/tool observations are truncated/bounded before being sent to the local model. This keeps the architecture usable with a small local model and avoids making long-term memory equivalent to an ever-growing prompt.
+
+## Verification status
+
+Focused unit tests were added for tool-driven resume, memory search, delegation, persistent clarification/reply, generic task/issue/idea sources, mailbox discussion continuation and timed-out verification resume. This branch still requires an actual test-suite/runtime run on Nexus with the local model before merge; the repository currently has no GitHub Actions run for these commits.
