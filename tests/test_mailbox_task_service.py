@@ -24,6 +24,7 @@ from modules.mailbox_task_service import (
     _STATUS_NEEDS_REVIEW,
 )
 from modules.task_orchestrator import (
+    ACTION_CLARIFICATION,
     ACTION_NEW_EXPERIMENT,
     ACTION_RESUME_EXPERIMENT,
     TaskDecision,
@@ -42,12 +43,17 @@ def _make_exp(id="exp1", status="queued", test_exit_code=None, diff_stat=None, e
 
 class _FixedOrchestrator:
     decision = TaskDecision(action=ACTION_NEW_EXPERIMENT, reason="test default")
+    calls = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
-    def run(self, task):
+    def run(self, task, **kwargs):
+        type(self).calls.append((task, kwargs))
         return self.decision
+
+    def close(self):
+        return None
 
 
 def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -> MailboxTaskService:
@@ -61,7 +67,8 @@ def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -
     conn.commit()
     conn.close()
     operations_registry = MagicMock() if exp_service is not None else None
-    operations_registry.catalog.return_value = [] if operations_registry is not None else None
+    if operations_registry is not None:
+        operations_registry.catalog.return_value = []
     return MailboxTaskService(
         db_path=db_path,
         experiment_service=exp_service,
@@ -205,6 +212,7 @@ class TestSubmitApproved(unittest.TestCase):
     def setUp(self):
         import tempfile
         self.tmp = Path(tempfile.mkdtemp())
+        _FixedOrchestrator.calls = []
 
     def _make_exp_service(self, exp):
         es = MagicMock()
@@ -225,6 +233,9 @@ class TestSubmitApproved(unittest.TestCase):
         es.create_experiment.assert_called_once_with("Do work")
         updated = svc.get(approval.id)
         self.assertIn(updated.status, (_STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_SUCCEEDED, _STATUS_FAILED))
+        _, kwargs = _FixedOrchestrator.calls[-1]
+        self.assertEqual(kwargs["source_type"], "task")
+        self.assertEqual(kwargs["source_id"], approval.id)
 
     def test_submit_approved_no_double_submit(self):
         exp = _make_exp(id="expXYZ", status="queued")
@@ -259,8 +270,46 @@ class TestSubmitApproved(unittest.TestCase):
         svc.submit_approved()
         import time; time.sleep(0.1)
         es.create_experiment.assert_not_called()
-        updated = svc.get(approval.id)
-        self.assertEqual(updated.experiment_id, existing_id)
+        self.assertEqual(svc.get(approval.id).experiment_id, existing_id)
+
+    def test_clarification_can_continue_same_task_and_preserve_followup(self):
+        exp = _make_exp(id="expAfterReply", status="queued")
+        es = self._make_exp_service(exp)
+
+        class DiscussionOrchestrator(_FixedOrchestrator):
+            decisions = [
+                TaskDecision(
+                    action=ACTION_CLARIFICATION,
+                    message="Optimize for cost or latency?",
+                    reason="material tradeoff",
+                    session_id="session-abc",
+                ),
+                TaskDecision(action=ACTION_NEW_EXPERIMENT, reason="clarified"),
+            ]
+            calls = []
+
+            def run(self, task, **kwargs):
+                type(self).calls.append((task, kwargs))
+                return type(self).decisions.pop(0)
+
+        svc = _make_service(self.tmp, exp_service=es, orchestrator_factory=DiscussionOrchestrator)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(msg_id, "Improve routing", "alice", "/f.md", "2026-01-01T00:00:00Z")
+        svc.approve(approval.id)
+        svc.submit_approved()
+        waiting = svc.get(approval.id)
+        self.assertEqual(waiting.status, _STATUS_NEEDS_REVIEW)
+        self.assertIn("Nexus session: session-abc", waiting.result_summary)
+
+        svc.continue_discussion(approval.id, "Optimize for cost")
+        import time; time.sleep(0.1)
+
+        es.create_experiment.assert_called_once()
+        goal = es.create_experiment.call_args[0][0]
+        self.assertIn("Improve routing", goal)
+        self.assertIn("Optimize for cost", goal)
+        self.assertEqual(DiscussionOrchestrator.calls[0][1]["source_id"], approval.id)
+        self.assertEqual(DiscussionOrchestrator.calls[1][1]["source_id"], approval.id)
 
 
 class TestPollRunning(unittest.TestCase):
@@ -356,9 +405,12 @@ class TestMigration(unittest.TestCase):
             "INSERT INTO mailbox_messages (file_path, source_commit_sha, msg_type, created_by, status, received_at) VALUES (?, ?, ?, ?, ?, ?)",
             ("/agent/inbox/old.md", "sha1", "task", "rene", "done", "2026-01-01T00:00:00Z"),
         )
-        conn.commit(); conn.close()
-        conn2 = init_db(db_path); conn2.row_factory = sqlite3.Row
-        rows = conn2.execute("SELECT * FROM mailbox_task_approvals").fetchall(); conn2.close()
+        conn.commit()
+        conn.close()
+        conn2 = init_db(db_path)
+        conn2.row_factory = sqlite3.Row
+        rows = conn2.execute("SELECT * FROM mailbox_task_approvals").fetchall()
+        conn2.close()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "pending_approval")
         self.assertEqual(rows[0]["sender"], "rene")
@@ -369,9 +421,13 @@ class TestApiAuth(unittest.TestCase):
         import os
         os.environ.setdefault("AGENT_API_KEY", "test-key-abc")
         from fastapi.testclient import TestClient
-        svc = MagicMock(); svc.list_recent.return_value = []; svc.recover_after_restart.return_value = None
+        svc = MagicMock()
+        svc.list_recent.return_value = []
+        svc.recover_after_restart.return_value = None
         from api import app, get_mailbox_task_service, get_codex_service
-        codex_svc = MagicMock(); codex_svc.mark_interrupted_tasks_failed.return_value = None; codex_svc.list_tasks.return_value = []
+        codex_svc = MagicMock()
+        codex_svc.mark_interrupted_tasks_failed.return_value = None
+        codex_svc.list_tasks.return_value = []
         app.dependency_overrides[get_mailbox_task_service] = lambda: svc
         app.dependency_overrides[get_codex_service] = lambda: codex_svc
         client = TestClient(app, raise_server_exceptions=False)
