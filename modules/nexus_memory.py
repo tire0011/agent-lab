@@ -44,7 +44,7 @@ def _score(text: str, terms: list[str]) -> int:
     return sum(3 if low.startswith(term) else low.count(term) for term in terms)
 
 
-def _chunks(text: str, max_chars: int = 1400) -> list[str]:
+def _chunks(text: str, max_chars: int = 800) -> list[str]:
     chunks: list[str] = []
     current = ""
     for paragraph in re.split(r"\n\s*\n", text):
@@ -81,11 +81,11 @@ class NexusMemory:
         if self._owns_task_store:
             self.task_store.close()
 
-    def search(self, query: str, *, limit: int = 8) -> list[dict[str, Any]]:
+    def search(self, query: str, *, limit: int = 6) -> list[dict[str, Any]]:
         terms = _terms(query)
         if not terms:
             return []
-        limit = max(1, min(limit, 20))
+        limit = max(1, min(limit, 10))
         candidates: list[tuple[int, dict[str, Any]]] = []
         self._search_knowledge(terms, candidates)
         self._search_task_events(terms, candidates)
@@ -114,7 +114,7 @@ class NexusMemory:
                             "source": "knowledge",
                             "category": row["category"],
                             "key": row["key"],
-                            "content": str(row["value"])[:1800],
+                            "content": str(row["value"])[:900],
                             "timestamp": row["timestamp"],
                         },
                     )
@@ -147,7 +147,7 @@ class NexusMemory:
                             "source_id": row["source_id"],
                             "role": row["role"],
                             "kind": row["kind"],
-                            "content": str(row["content"])[:1800],
+                            "content": str(row["content"])[:900],
                             "timestamp": row["created_at"],
                         },
                     )
@@ -174,7 +174,7 @@ class NexusMemory:
                                 "source": "project_document",
                                 "document": filename,
                                 "chunk": index,
-                                "content": chunk[:1800],
+                                "content": chunk[:900],
                             },
                         )
                     )
