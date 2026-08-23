@@ -18,6 +18,8 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.orchestrator.run.return_value = TaskDecision(action="answer", session_id="session-1")
         self.orchestrator.experiment_service = MagicMock()
         self.orchestrator.operations_registry = SimpleNamespace(repo_root=Path(self.tmp.name))
+        self.orchestrator.task_store = MagicMock()
+        self.orchestrator.task_store.history.return_value = []
         self.service = NexusControllerService(self.orchestrator)
 
     def tearDown(self):
@@ -59,9 +61,25 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.orchestrator.experiment_service.create_experiment.assert_called_once_with(
             "Implement the requested feature"
         )
-        # The asynchronous runner is started only after the exact same experiment
-        # object has been selected; the important regression is that dispatch is
-        # driven by the controller decision rather than unconditional creation.
+
+    def test_reply_new_experiment_uses_original_input_and_followup(self):
+        experiment = SimpleNamespace(id="exp-after-reply")
+        self.orchestrator.continue_session.return_value = TaskDecision(
+            action=ACTION_NEW_EXPERIMENT,
+            session_id="session-1",
+        )
+        self.orchestrator.experiment_service.create_experiment.return_value = experiment
+        self.orchestrator.task_store.history.return_value = [
+            {"role": "user", "kind": "input", "content": "Improve model routing"},
+            {"role": "assistant", "kind": "clarification", "content": "Cost or latency?"},
+            {"role": "user", "kind": "input", "content": "Optimize for cost"},
+        ]
+
+        self.service.reply("session-1", "Optimize for cost")
+
+        goal = self.orchestrator.experiment_service.create_experiment.call_args[0][0]
+        self.assertIn("Improve model routing", goal)
+        self.assertIn("Optimize for cost", goal)
 
     def test_reply_resumes_same_persistent_session(self):
         self.orchestrator.continue_session.return_value = TaskDecision(
