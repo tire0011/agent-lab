@@ -13,6 +13,8 @@ The same controller can work on natural-language sources such as:
 
 Each source has a stable `source_type` and optional `source_id`. Nexus stores a durable task session and event journal in SQLite so a clarification can be answered later without losing the original task, previous tool observations, or discussion context.
 
+`NexusControllerService` is the generic code-level entry point. GitHub fetching stays outside the controller: `issue_source(...)` accepts issue data supplied by the official GitHub MCP or a future global MCP gateway. This keeps orchestration independent from one GitHub client implementation.
+
 ## Control loop
 
 A bounded run follows this shape:
@@ -73,6 +75,8 @@ There is deliberately no automatic `new_experiment` fallback if local orchestrat
 
 A clarification marks the Nexus session as `waiting_for_user`. A later reply can resume the same session. Mailbox tasks use the approval id as their stable source id; `continue_discussion(...)` returns the task to orchestration with the same identity and preserves the follow-up in the eventual experiment goal when implementation is selected.
 
+The code-level generic controller also exposes `reply(session_id, message)` so future API, web and MCP surfaces can continue the same persistent session directly.
+
 ## Missing capabilities
 
 A `missing_capability` result is written as structured JSON under `state/requirements/`, including the triggering task, session, requirement and reason. This creates a durable input for later self-improvement or automatic Issue/tool creation.
@@ -90,4 +94,4 @@ This fixes the original regression where Nexus could correctly understand “res
 
 ## Context/cost bounds
 
-Persistent storage is larger than prompt context. Recent discussion history, memory matches and tool observations are truncated/bounded before being sent to the local model. This keeps the architecture usable with a small local model and avoids making long-term memory equivalent to an ever-growing prompt.
+Persistent storage is larger than prompt context. Recent discussion history, memory matches and delegate/tool observations are truncated/bounded before being sent to the local model. This keeps the architecture usable with a small local model and avoids making long-term memory equivalent to an ever-growing prompt.
