@@ -213,6 +213,20 @@ None of these issues should be treated as adopted architecture yet. The first gl
 
 **Research question:** can a cheap local LLM act as an effective **tool-control plane** for stronger models, reducing MCP/context complexity while allowing the system to discover and expand missing capabilities over time?
 
+### 31. 2026-08-22 to 2026-08-23: Issue #46 evolved from intent routing into a persistent local-LLM controller
+
+A real resume request exposed a deeper orchestration flaw: Nexus could understand that an existing experiment should be continued yet still create a new experiment/worktree because workflow selection happened too late. The first fix (PR #47) added local-LLM intent classification before experiment creation, but this was still too shallow for the intended architecture.
+
+Issue #46 was therefore reframed around a stronger principle: **the local Nexus model should remain the high-level controller, not merely classify a task once and hand control to a fixed pipeline.** PR #48 proposes a bounded ReAct-style loop in which the local model chooses a tool or final action, receives the real observation, and decides again.
+
+The proposed controller unifies natural-language sources such as mailbox tasks, GitHub issues supplied by an adapter, ideas, and follow-up discussion replies. Durable SQLite sessions preserve source identity and task/discussion history. Its tool surface includes existing Nexus operations, a bounded `memory_search` over SQLite knowledge/task history plus project documents, and `delegate` calls to a local worker, read-only Codex, or Azure OpenAI when available. Delegation returns an observation to the local controller rather than transferring ownership of the task.
+
+Valid final outcomes include `new_experiment`, `resume_experiment`, `command`, `answer`, `clarification`, and `missing_capability`. Missing capabilities become structured requirements instead of being forced through an unrelated workflow; clarification can pause a persistent session and resume it later. Resume behavior is explicit: queued experiments reuse the same ID, verification-related states reuse the existing worktree and rerun verification without implementation, while ambiguous lifecycle states are rejected rather than guessed.
+
+PR #48 is **open and not yet adopted**. Focused tests were added, but the branch still needs a real full-suite/runtime run on Nexus with the local model before merge.
+
+**Lesson:** intent classification is not orchestration. If the local model is meant to be the agent, control should return to it after tool and delegate observations so it can decide the next step from evidence.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -254,7 +268,7 @@ Current `main` includes:
 - automatic API dependency synchronization across service startup and deploy paths,
 - tests and policy boundaries.
 
-The GitHub-Issue workflow and global MCP gateway are current research directions, not yet part of the adopted architecture.
+The GitHub-Issue workflow, global MCP gateway, and Issue #46 persistent local-controller design are current research/development directions, not yet part of the adopted architecture.
 
 ## Important lessons so far
 
@@ -278,12 +292,14 @@ The GitHub-Issue workflow and global MCP gateway are current research directions
 18. **Failure taxonomy enables adaptation.** `test_timeout` must be distinct from `test_failed` if Nexus should react differently.
 19. **Simple persisted adaptation counts.** Automatically increasing a bounded timeout after measured timeouts is a real self-improvement loop, even without another LLM call.
 20. **A control plane may reduce model context.** Tool discovery/routing is itself a candidate task for a cheap local model instead of exposing every tool schema to every stronger model.
+21. **Routing is not control.** A persistent agentic controller should regain control after tool/delegate observations rather than making one early classification and disappearing behind a fixed workflow.
 
 ## Open research directions
 
 - project-memory retrieval from this history,
 - measured token/cost/quality impact of the single-call pipeline and compact tool output,
 - benchmark Qwen2.5-Coder-7B-Instruct Q4_K_M and alternative quantized models inside the B2ms envelope,
+- validate PR #48 on the real Nexus runtime: local-model tool choice, memory use, bounded delegation, clarification/resume, missing-capability behavior, and full-suite correctness before adoption,
 - test what the merged local model/router can accomplish on genuinely read-only small and medium tasks before granting broader autonomous decision authority,
 - route by task difficulty, expected value, provider limits, historical quality, and resource cost,
 - measure how much local context preparation reduces external-provider tokens,
@@ -304,7 +320,7 @@ The GitHub-Issue workflow and global MCP gateway are current research directions
 
 ## Current next-step candidates
 
-1. **Read-only local-router evaluation:** give Nexus representative inspection/reasoning tasks and record success, latency, context use, routing/delegation behavior, and failures without allowing code changes.
+1. **Issue #46 controller validation:** run PR #48 on Nexus with the real local model and full suite; test tool-observation loops, memory retrieval, delegation, clarification/reply persistence, missing-capability output, and exact experiment resume without new IDs/worktrees.
 2. **Local-model benchmark:** compare Qwen2.5-Coder-7B Q4_K_M with at least one plausible alternative under identical B2ms limits.
 3. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
 4. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
