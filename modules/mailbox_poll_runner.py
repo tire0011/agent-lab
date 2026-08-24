@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,37 +19,63 @@ class MailboxPollRunResult:
     error: str | None = None
 
 
+def _safe_result_summary(results: list[dict[str, Any]], limit: int = 20) -> str:
+    """Return bounded, content-free metadata for mailbox result logging."""
+    items: list[str] = []
+    for result in results[:limit]:
+        status = str(result.get("status") or "?")[:32]
+        file_value = result.get("file")
+        filename = Path(str(file_value)).name[:160] if file_value else "?"
+        items.append(f"{status}:{filename}")
+    if len(results) > limit:
+        items.append(f"+{len(results) - limit}_more")
+    return ",".join(items) or "none"
+
+
 def _sync_mailbox_repo(mailbox_module: Any, repo_path: Path, max_attempts: int = 3) -> bool:
     """Synchronize append-oriented mailbox commits without discarding local work."""
+    run_name = threading.current_thread().name
     if not mailbox_module.git_is_clean(repo_path):
-        logger.warning("Mailbox sync refused: working tree is not clean")
+        logger.warning("Mailbox sync refused run=%s reason=dirty_worktree", run_name)
         return False
 
     for attempt in range(1, max_attempts + 1):
+        logger.info("Mailbox sync fetch run=%s attempt=%d/%d", run_name, attempt, max_attempts)
         fetch = mailbox_module._git(["fetch"], repo_path, check=False)
         if fetch.returncode != 0:
-            logger.warning("Mailbox sync fetch failed (exit %d)", fetch.returncode)
+            logger.warning(
+                "Mailbox sync fetch failed run=%s attempt=%d/%d exit=%d",
+                run_name,
+                attempt,
+                max_attempts,
+                fetch.returncode,
+            )
             return False
 
         rebase = mailbox_module._git(["rebase", "@{u}"], repo_path, check=False)
         if rebase.returncode != 0:
             mailbox_module._git(["rebase", "--abort"], repo_path, check=False)
             logger.error(
-                "Mailbox sync rebase failed; rebase aborted and local commits were preserved"
+                "Mailbox sync rebase failed run=%s attempt=%d/%d; rebase aborted and local commits were preserved",
+                run_name,
+                attempt,
+                max_attempts,
             )
             return False
 
         if mailbox_module.git_push(repo_path):
+            logger.info("Mailbox sync complete run=%s attempt=%d/%d", run_name, attempt, max_attempts)
             return True
 
         if attempt < max_attempts:
             logger.info(
-                "Mailbox push rejected; retrying fetch/rebase/push (%d/%d)",
+                "Mailbox push rejected run=%s; retrying fetch/rebase/push (%d/%d)",
+                run_name,
                 attempt + 1,
                 max_attempts,
             )
 
-    logger.warning("Mailbox sync failed after %d attempts", max_attempts)
+    logger.warning("Mailbox sync failed run=%s after=%d_attempts", run_name, max_attempts)
     return False
 
 
@@ -68,6 +95,9 @@ def run_mailbox_poll_once(
     from modules.operations_registry import OperationsRegistry
     from modules.outbox_publisher import TaskApprovalOutboxPublisher
 
+    run_name = threading.current_thread().name
+    logger.info("Mailbox poll start run=%s dry_run=%s", run_name, dry_run)
+
     # Register unrestricted mailbox commands before any inbox file is parsed.
     # NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
     install_mailbox_development(mailbox_module)
@@ -75,6 +105,7 @@ def run_mailbox_poll_once(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = MailboxLock(lock_path)
     if not lock.acquire():
+        logger.warning("Mailbox poll skipped run=%s reason=busy", run_name)
         return MailboxPollRunResult(status="busy")
 
     result = MailboxPollRunResult(status="error", error="unknown mailbox processing failure")
@@ -125,11 +156,24 @@ def run_mailbox_poll_once(
                 result = MailboxPollRunResult(status="sync_failed")
             else:
                 results = processor.process_inbox()
+                logger.info(
+                    "Mailbox poll processed run=%s count=%d results=%s",
+                    run_name,
+                    len(results),
+                    _safe_result_summary(results),
+                )
                 result = MailboxPollRunResult(status="processed", results=results)
         else:
             results = processor.process_inbox()
+            logger.info(
+                "Mailbox poll processed run=%s count=%d results=%s",
+                run_name,
+                len(results),
+                _safe_result_summary(results),
+            )
             result = MailboxPollRunResult(status="processed", results=results)
     except Exception as exc:
+        logger.error("Mailbox poll exception run=%s type=%s", run_name, type(exc).__name__)
         result = MailboxPollRunResult(status="error", error=str(exc))
     finally:
         try:
@@ -157,14 +201,22 @@ def run_mailbox_poll_once(
         details = ", ".join(cleanup_failures)
         if result.status == "error":
             base = result.error or "unknown mailbox processing failure"
-            return MailboxPollRunResult(
+            result = MailboxPollRunResult(
                 status="error",
                 results=result.results,
                 error=f"{base}; cleanup_failed={details}",
             )
-        return MailboxPollRunResult(
-            status="error",
-            results=result.results,
-            error=f"mailbox processing cleanup_failed={details}",
-        )
+        else:
+            result = MailboxPollRunResult(
+                status="error",
+                results=result.results,
+                error=f"mailbox processing cleanup_failed={details}",
+            )
+
+    logger.info(
+        "Mailbox poll end run=%s status=%s count=%d",
+        run_name,
+        result.status,
+        len(result.results),
+    )
     return result
