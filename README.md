@@ -4,29 +4,20 @@ Experimental project for distributed self-improving LLM agents under strict budg
 
 ## Mailbox
 
-Nexus polls an inbox/outbox Git-backed mailbox every minute via a systemd timer.
+Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed mailbox communication. GitHub push events affecting `inbox/` trigger immediate processing through `POST /mailbox/webhook/github`; the systemd timer remains as a one-minute fallback.
 
-**Inbox** (`communication/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus.
+**Inbox** (`agent-lab-mailbox/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus.
 
 Supported message types: `idea`, `task`, `question`, `context`.
 
-Example (`communication/examples/idea-template.md`):
+Example: `agent-lab-mailbox/examples/idea-template.md`.
 
-```markdown
----
-type: idea
-created_by: rene
----
-
-Add local model action selection so the agent picks the cheapest model for simple tasks.
-```
-
-**Outbox** (`communication/outbox/`): Nexus writes a response file here for each processed message.
+**Outbox** (`agent-lab-mailbox/outbox/`): Nexus writes responses here. Processed mailbox state is kept in the dedicated mailbox repository rather than under `agent-lab/communication/`.
 
 **Processing rules:**
 
 - `idea` — appended to `IDEAS.md` under `### Mailbox submissions` with state `new`; response committed and pushed.
-- `task` — body stored in SQLite, `pending_approval` record created in `mailbox_task_approvals`; requires human approval via API/Web UI before execution by `ExperimentService`.
+- `task` — body stored in SQLite and submitted through the mailbox task/experiment workflow.
 - `question` — acknowledged; response placed in outbox.
 - `context` — stored in the `knowledge` table under category `mailbox_context`.
 
@@ -39,8 +30,10 @@ Add local model action selection so the agent picks the cheapest model for simpl
 **Run manually:**
 
 ```bash
-python mailbox_processor.py [--dry-run] [--db-path PATH] [--repo-path PATH]
+python mailbox_processor.py [--dry-run] [--db-path PATH] [--code-repo-path PATH] [--mailbox-repo-path PATH]
 ```
+
+The VM normally sets `AGENT_CODE_REPO_PATH=/agent` and `AGENT_MAILBOX_REPO_PATH` to the separate mailbox checkout.
 
 ## Current status
 
@@ -236,7 +229,7 @@ All endpoints require the `x-api-key` header.
 
 State machine: `pending_approval → approved → submitted → running → succeeded / failed / needs_review`.
 A background `MailboxTaskWorker` daemon (10 s poll interval) calls
-`submit_approved()` + `poll_running()` on each tick.  Experiments run
+`submit_approved()` + `poll_running()` on each tick. Experiments run
 serially (one VM, one budget). The Web UI Task Approvals card shows all records
 and provides Approve/Reject buttons when an API key is entered.
 
