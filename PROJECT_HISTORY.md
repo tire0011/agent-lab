@@ -217,13 +217,13 @@ None of these issues should be treated as adopted architecture yet. The first gl
 
 A real resume request exposed a deeper orchestration flaw: Nexus could understand that an existing experiment should be continued yet still create a new experiment/worktree because workflow selection happened too late. The first fix (PR #47) added local-LLM intent classification before experiment creation, but this was still too shallow for the intended architecture.
 
-Issue #46 was therefore reframed around a stronger principle: **the local Nexus model should remain the high-level controller, not merely classify a task once and hand control to a fixed pipeline.** PR #48 proposes a bounded ReAct-style loop in which the local model chooses a tool or final action, receives the real observation, and decides again.
+Issue #46 was therefore reframed around a stronger principle: **the local Nexus model should remain the high-level controller, not merely classify a task once and hand control to a fixed pipeline.** PR #48 implemented a bounded ReAct-style loop in which the local model chooses a tool or final action, receives the real observation, and decides again.
 
-The proposed controller unifies natural-language sources such as mailbox tasks, GitHub issues supplied by an adapter, ideas, and follow-up discussion replies. Durable SQLite sessions preserve source identity and task/discussion history. Its tool surface includes existing Nexus operations, a bounded `memory_search` over SQLite knowledge/task history plus project documents, and `delegate` calls to a local worker, read-only Codex, or Azure OpenAI when available. Delegation returns an observation to the local controller rather than transferring ownership of the task.
+The adopted controller unifies natural-language sources such as mailbox tasks, GitHub issues supplied by an adapter, ideas, and follow-up discussion replies. Durable SQLite sessions preserve source identity and task/discussion history. Its tool surface includes existing Nexus operations, a bounded `memory_search` over SQLite knowledge/task history plus project documents, and `delegate` calls to a local worker, read-only Codex, or Azure OpenAI when available. Delegation returns an observation to the local controller rather than transferring ownership of the task.
 
 Valid final outcomes include `new_experiment`, `resume_experiment`, `command`, `answer`, `clarification`, and `missing_capability`. Missing capabilities become structured requirements instead of being forced through an unrelated workflow; clarification can pause a persistent session and resume it later. Resume behavior is explicit: queued experiments reuse the same ID, verification-related states reuse the existing worktree and rerun verification without implementation, while ambiguous lifecycle states are rejected rather than guessed.
 
-PR #48 is **open and not yet adopted**. Focused tests were added, but the branch still needs a real full-suite/runtime run on Nexus with the local model before merge.
+PR #48 was merged to `main` on 2026-08-24 and Issue #46 was closed as completed. Before adoption, focused controller/mailbox/local-LLM-job tests passed on the real Nexus VM, and the same persistent task session completed an end-to-end Laguna run without creating an experiment. The controller executed `memory_search`, then `git_status`, and produced a final successful outbox response. Because individual local-model turns took roughly 7.5 to 14 minutes, Nexus now persists serialized local inference as SQLite jobs (`queued`/`running`/`succeeded`/`failed`/`cancelled`) and marks the task session `waiting_for_llm` while inference runs. This removed the previous arbitrary 600-second controller read-timeout failure while keeping the mailbox responsive during long inference.
 
 **Lesson:** intent classification is not orchestration. If the local model is meant to be the agent, control should return to it after tool and delegate observations so it can decide the next step from evidence.
 
@@ -268,7 +268,7 @@ Current `main` includes:
 - automatic API dependency synchronization across service startup and deploy paths,
 - tests and policy boundaries.
 
-The GitHub-Issue workflow, global MCP gateway, and Issue #46 persistent local-controller design are current research/development directions, not yet part of the adopted architecture.
+The Issue #46 persistent local-controller design is now adopted on `main`. The GitHub-Issue workflow and global MCP gateway remain research/development directions rather than adopted architecture.
 
 ## Important lessons so far
 
