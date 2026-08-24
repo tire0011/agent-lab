@@ -1,12 +1,18 @@
 """Development extensions for the Git-backed Nexus mailbox.
 
 The command channel is intentionally unrestricted for the trusted development
-mailbox. NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
+mailbox, except for commands that would stop/restart the services responsible
+for processing and publishing the mailbox itself.  Those lifecycle operations
+must be performed by an independent maintenance/deployment path so the current
+mailbox transaction can finish and commit cleanly.
+
+NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -25,6 +31,20 @@ _SENSITIVE_ENV_MARKERS = (
     "PASSWORD",
     "CREDENTIAL",
     "AZURE_OPENAI",
+)
+
+# A mailbox command runs inside Nexus infrastructure.  Restarting/stopping the
+# API or mailbox processor from that same command can terminate the process
+# before its DB/outbox/git transaction is finalized, leaving the mailbox local
+# checkout dirty and preventing subsequent fetch/rebase recovery.
+_SELF_MANAGED_SERVICES = ("agent-api", "agent-api.service", "nexus-mailbox", "nexus-mailbox.service")
+_SYSTEMCTL_DISRUPTIVE_ACTIONS = (
+    "restart",
+    "stop",
+    "kill",
+    "try-restart",
+    "reload-or-restart",
+    "reload-or-try-restart",
 )
 
 
@@ -61,16 +81,54 @@ def _bounded_redacted(text: str | None) -> str:
     return clean[:MAX_OUTPUT_CHARS] + f"\n...[truncated {omitted} chars]"
 
 
+def _contains_self_disruptive_service_action(command: str) -> bool:
+    """Return True when a command would stop/restart its own control plane.
+
+    This is deliberately narrow: normal development shell access stays
+    unrestricted.  We only reject direct service lifecycle operations for the
+    two services whose interruption can strand the current mailbox transaction.
+    """
+    normalized = " ".join(command.lower().split())
+    service_pattern = "(?:" + "|".join(re.escape(s) for s in _SELF_MANAGED_SERVICES) + ")"
+    action_pattern = "(?:" + "|".join(re.escape(a) for a in _SYSTEMCTL_DISRUPTIVE_ACTIONS) + ")"
+
+    # sudo/systemctl restart|stop|kill ... agent-api[.service]
+    if re.search(
+        rf"(?:^|[;&|]\s*)(?:sudo\s+(?:-n\s+)?)?systemctl\s+{action_pattern}\b[^;&|]*\b{service_pattern}\b",
+        normalized,
+    ):
+        return True
+
+    # service agent-api restart|stop
+    if re.search(
+        rf"(?:^|[;&|]\s*)(?:sudo\s+(?:-n\s+)?)?service\s+{service_pattern}\s+{action_pattern}\b",
+        normalized,
+    ):
+        return True
+
+    return False
+
+
 def process_command(
     msg: Any,
     repo_path: Path,
     conn: Any,
     db_msg_id: int,
 ) -> tuple[str, None]:
-    """Run the message body as unrestricted Bash in the code repository."""
+    """Run the message body as trusted Bash in the code repository.
+
+    Lifecycle changes to ``agent-api`` and ``nexus-mailbox`` are rejected here
+    because this process may itself be executing the command.  Use an
+    independent maintenance/deployment mechanism for those operations.
+    """
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")
+    if _contains_self_disruptive_service_action(command):
+        raise ValueError(
+            "mailbox command cannot stop/restart agent-api or nexus-mailbox while "
+            "processing its own transaction; use an independent maintenance/deployment path"
+        )
 
     timeout = _parse_timeout(msg.meta.get("timeout"))
     started = time.monotonic()
@@ -122,7 +180,7 @@ def process_command(
 
 
 def install(mailbox_module: Any) -> None:
-    """Install unrestricted command + optional auto-approved task support.
+    """Install trusted command + optional auto-approved task support.
 
     Calling this repeatedly is safe. Command execution is always available;
     NEXUS_DEVELOPMENT_MODE only gates automatic approval of task messages.
