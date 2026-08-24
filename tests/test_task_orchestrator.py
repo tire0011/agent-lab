@@ -135,6 +135,23 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("status: verifying", client.prompts[1])
         self.assertIsNotNone(result.session_id)
 
+    def test_controller_inference_runs_through_persistent_job_service(self):
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
+            '"message":"done","reason":"finished"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Answer locally", source_id="job-test")
+            self.assertEqual(result.action, ACTION_ANSWER)
+            row = orchestrator.llm_jobs._conn.execute(
+                "SELECT status, session_id FROM local_llm_jobs ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(row["status"], "succeeded")
+            self.assertEqual(row["session_id"], result.session_id)
+        finally:
+            orchestrator.close()
+
     def test_registered_operation_name_is_accepted_as_direct_tool_alias(self):
         client = _Client([
             '{"type":"tool","tool":"experiment_show","args":{"experiment_id":"bd9720b2"},'

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
+from modules.local_llm_jobs import LocalLlmJobError, LocalLlmJobService
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
 from modules.nexus_task_store import NexusTaskStore
@@ -65,15 +66,18 @@ class NexusTaskOrchestrator:
         memory: NexusMemory | None = None,
         delegation_service: NexusDelegationService | None = None,
         task_store: NexusTaskStore | None = None,
+        llm_job_service: LocalLlmJobService | None = None,
         max_steps: int = 6,
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
-        controller_timeout = float(os.environ.get("NEXUS_CONTROLLER_LLM_TIMEOUT_SECONDS", "600"))
-        controller_timeout = max(30.0, min(controller_timeout, 900.0))
-        self.llama = llama_client or LlamaCppClient(timeout=controller_timeout)
+        job_watchdog = float(os.environ.get("NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS", "3600"))
+        job_watchdog = max(300.0, min(job_watchdog, 7200.0))
+        self.llama = llama_client or LlamaCppClient(timeout=job_watchdog)
         self.max_steps = max(1, min(max_steps, 10))
         db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
+        self.llm_jobs = llm_job_service or LocalLlmJobService(db_path=db_path, llama_client=self.llama)
+        self._owns_llm_jobs = llm_job_service is None
         repo_root = str(getattr(operations_registry, "repo_root", "/agent"))
         self.task_store = task_store or NexusTaskStore(db_path=db_path)
         self._owns_task_store = task_store is None
@@ -85,6 +89,8 @@ class NexusTaskOrchestrator:
         self._owns_delegation = delegation_service is None
 
     def close(self) -> None:
+        if self._owns_llm_jobs:
+            self.llm_jobs.close()
         if self._owns_delegation:
             self.delegation.close()
         if self._owns_memory:
@@ -152,11 +158,20 @@ class NexusTaskOrchestrator:
 
         for _ in range(self.max_steps):
             history = self.task_store.history(session.id, limit=18, max_chars=7000)
-            raw = await self.llama.complete(
-                prompt=self._prompt(session, task, history, observations),
+            prompt = self._prompt(session, task, history, observations)
+            job_id = self.llm_jobs.submit(
+                prompt,
                 temperature=0.0,
                 max_tokens=550,
+                session_id=session.id,
             )
+            self.task_store.set_status(session.id, "waiting_for_llm")
+            try:
+                raw = await self.llm_jobs.wait(job_id)
+            except LocalLlmJobError as exc:
+                self.task_store.set_status(session.id, "active")
+                raise TaskOrchestratorError(f"local LLM job failed: {exc}") from exc
+            self.task_store.set_status(session.id, "active")
             decision = self._parse(raw)
             if decision.get("type") == "tool":
                 observation = await self._execute_tool(decision)
