@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import queue
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -12,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient
+from modules.redaction import redact
 from modules.run_store import DEFAULT_DB_PATH
 
 STATUS_QUEUED = "queued"
@@ -21,6 +24,14 @@ STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 _TERMINAL = {STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED}
 
+_LOGGER = logging.getLogger(__name__)
+
+# The systemd unit backing local inference. Diagnostics are best-effort: any
+# failure to reach systemd/journald must never mask the original job error.
+_LLAMA_SERVICE_NAME = "llama-server"
+_DIAG_JOURNAL_LINES = 5
+_DIAG_TIMEOUT_SECONDS = 3
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -28,6 +39,68 @@ def _now() -> str:
 
 class LocalLlmJobError(RuntimeError):
     pass
+
+
+def llama_server_failure_diagnostics(
+    journal_lines: int = _DIAG_JOURNAL_LINES,
+) -> dict[str, Any]:
+    """Best-effort, cheap snapshot of llama-server health for failure logs.
+
+    Collects ``systemctl show`` properties (active state, PID, restart count)
+    and the last few ``journalctl`` lines for the llama-server unit. Never
+    raises: any missing tool, permission error, or timeout is reported as a
+    string under ``"error"`` instead of propagating, since this is only ever
+    called from an exception handler and must not itself fail a job.
+    """
+    diagnostics: dict[str, Any] = {"service": _LLAMA_SERVICE_NAME}
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                _LLAMA_SERVICE_NAME,
+                "--no-pager",
+                "--property=ActiveState,SubState,MainPID,NRestarts",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_DIAG_TIMEOUT_SECONDS,
+            check=False,
+        )
+        props: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                props[key.strip()] = value.strip()
+        diagnostics["active_state"] = props.get("ActiveState")
+        diagnostics["sub_state"] = props.get("SubState")
+        diagnostics["main_pid"] = props.get("MainPID")
+        diagnostics["restart_count"] = props.get("NRestarts")
+    except (OSError, subprocess.SubprocessError) as exc:
+        diagnostics["systemctl_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        result = subprocess.run(
+            [
+                "journalctl",
+                "-u",
+                _LLAMA_SERVICE_NAME,
+                f"-n{max(1, journal_lines)}",
+                "--no-pager",
+                "--output=short-iso",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_DIAG_TIMEOUT_SECONDS,
+            check=False,
+        )
+        diagnostics["recent_journal"] = [
+            redact(line) for line in result.stdout.splitlines() if line.strip()
+        ]
+    except (OSError, subprocess.SubprocessError) as exc:
+        diagnostics["journalctl_error"] = f"{type(exc).__name__}: {exc}"
+
+    return diagnostics
 
 
 @dataclass(slots=True)
@@ -160,7 +233,7 @@ class LocalLlmJobService:
     def _run(self, job_id: str) -> None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT prompt,temperature,max_tokens,status FROM local_llm_jobs WHERE id = ?",
+                "SELECT prompt,temperature,max_tokens,session_id,status FROM local_llm_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if row is None or row["status"] != STATUS_QUEUED:
@@ -170,16 +243,38 @@ class LocalLlmJobService:
                 (STATUS_RUNNING, _now(), job_id),
             )
             self._conn.commit()
+        session_id = row["session_id"]
+        max_tokens = int(row["max_tokens"])
+        prompt_chars = len(str(row["prompt"]))
+        _LOGGER.info(
+            "local_llm job start job_id=%s session_id=%s max_tokens=%s prompt_chars=%s",
+            job_id, session_id, max_tokens, prompt_chars,
+        )
         started = time.perf_counter()
         try:
             result = asyncio.run(
                 self.llama.complete(
                     prompt=str(row["prompt"]),
                     temperature=float(row["temperature"]),
-                    max_tokens=int(row["max_tokens"]),
+                    max_tokens=max_tokens,
                 )
             )
         except Exception as exc:  # noqa: BLE001
+            duration = time.perf_counter() - started
+            diagnostics = llama_server_failure_diagnostics()
+            _LOGGER.error(
+                "local_llm job failed job_id=%s session_id=%s duration=%.3fs "
+                "max_tokens=%s prompt_chars=%s exc_type=%s exc_message=%s "
+                "llama_server_active_state=%s llama_server_sub_state=%s "
+                "llama_server_main_pid=%s llama_server_restart_count=%s "
+                "llama_server_recent_journal=%s",
+                job_id, session_id, duration, max_tokens, prompt_chars,
+                type(exc).__name__, str(exc)[:1000],
+                diagnostics.get("active_state"), diagnostics.get("sub_state"),
+                diagnostics.get("main_pid"), diagnostics.get("restart_count"),
+                diagnostics.get("recent_journal") or diagnostics.get("journalctl_error"),
+                exc_info=True,
+            )
             with self._lock:
                 self._conn.execute(
                     "UPDATE local_llm_jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?",
@@ -187,6 +282,12 @@ class LocalLlmJobService:
                 )
                 self._conn.commit()
             return
+        duration = time.perf_counter() - started
+        _LOGGER.info(
+            "local_llm job succeeded job_id=%s session_id=%s duration=%.3fs max_tokens=%s "
+            "prompt_chars=%s result_chars=%s",
+            job_id, session_id, duration, max_tokens, prompt_chars, len(result),
+        )
         with self._lock:
             self._conn.execute(
                 "UPDATE local_llm_jobs SET status = ?, finished_at = ?, result = ?, error = NULL WHERE id = ?",
