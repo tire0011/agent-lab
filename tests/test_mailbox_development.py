@@ -63,6 +63,35 @@ class TestMailboxDevelopment(unittest.TestCase):
             with self.assertRaises(ValueError):
                 process_command(msg, Path(tmp), None, 1)
 
+    def test_command_rejects_restart_of_agent_api(self):
+        msg = SimpleNamespace(
+            body="echo before && sudo -n systemctl restart agent-api.service && echo after",
+            meta={},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "independent maintenance/deployment"):
+                process_command(msg, Path(tmp), None, 1)
+
+    def test_command_rejects_restart_of_mailbox_service(self):
+        msg = SimpleNamespace(
+            body="systemctl stop nexus-mailbox.service",
+            meta={},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "nexus-mailbox"):
+                process_command(msg, Path(tmp), None, 1)
+
+    def test_command_allows_read_only_service_status(self):
+        msg = SimpleNamespace(body="printf 'agent-api status check'", meta={})
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
+            body, _ = process_command(msg, Path(tmp), None, 1)
+        self.assertIn("**Exit code:** 0", body)
+        self.assertIn("agent-api status check", body)
+
     def test_auto_approve_task_only_in_development_mode(self):
         install(mailbox)
         with tempfile.TemporaryDirectory() as tmp:
