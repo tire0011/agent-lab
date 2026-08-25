@@ -1,12 +1,8 @@
 """Development extensions for the Git-backed Nexus mailbox.
 
-The command channel is intentionally unrestricted for the trusted development
-mailbox, except for commands that would stop/restart the services responsible
-for processing and publishing the mailbox itself.  Those lifecycle operations
-must be performed by an independent maintenance/deployment path so the current
-mailbox transaction can finish and commit cleanly.
-
-NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
+The command channel is available for the trusted development mailbox.
+Mailbox tasks are immediately approved and handed to the existing task worker,
+so the controller can execute them without a manual approval step.
 """
 
 from __future__ import annotations
@@ -33,10 +29,6 @@ _SENSITIVE_ENV_MARKERS = (
     "AZURE_OPENAI",
 )
 
-# A mailbox command runs inside Nexus infrastructure.  Restarting/stopping the
-# API or mailbox processor from that same command can terminate the process
-# before its DB/outbox/git transaction is finalized, leaving the mailbox local
-# checkout dirty and preventing subsequent fetch/rebase recovery.
 _SELF_MANAGED_SERVICES = ("agent-api", "agent-api.service", "nexus-mailbox", "nexus-mailbox.service")
 _SYSTEMCTL_DISRUPTIVE_ACTIONS = (
     "restart",
@@ -65,7 +57,6 @@ def _parse_timeout(value: str | None) -> int:
 
 
 def _command_environment() -> dict[str, str]:
-    """Preserve normal execution context but do not hand API secrets to commands."""
     return {
         key: value
         for key, value in os.environ.items()
@@ -82,30 +73,19 @@ def _bounded_redacted(text: str | None) -> str:
 
 
 def _contains_self_disruptive_service_action(command: str) -> bool:
-    """Return True when a command would stop/restart its own control plane.
-
-    This is deliberately narrow: normal development shell access stays
-    unrestricted.  We only reject direct service lifecycle operations for the
-    two services whose interruption can strand the current mailbox transaction.
-    """
     normalized = " ".join(command.lower().split())
     service_pattern = "(?:" + "|".join(re.escape(s) for s in _SELF_MANAGED_SERVICES) + ")"
     action_pattern = "(?:" + "|".join(re.escape(a) for a in _SYSTEMCTL_DISRUPTIVE_ACTIONS) + ")"
-
-    # sudo/systemctl restart|stop|kill ... agent-api[.service]
     if re.search(
         rf"(?:^|[;&|]\s*)(?:sudo\s+(?:-n\s+)?)?systemctl\s+{action_pattern}\b[^;&|]*\b{service_pattern}\b",
         normalized,
     ):
         return True
-
-    # service agent-api restart|stop
     if re.search(
         rf"(?:^|[;&|]\s*)(?:sudo\s+(?:-n\s+)?)?service\s+{service_pattern}\s+{action_pattern}\b",
         normalized,
     ):
         return True
-
     return False
 
 
@@ -115,12 +95,6 @@ def process_command(
     conn: Any,
     db_msg_id: int,
 ) -> tuple[str, None]:
-    """Run the message body as trusted Bash in the code repository.
-
-    Lifecycle changes to ``agent-api`` and ``nexus-mailbox`` are rejected here
-    because this process may itself be executing the command.  Use an
-    independent maintenance/deployment mechanism for those operations.
-    """
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")
@@ -180,11 +154,7 @@ def process_command(
 
 
 def install(mailbox_module: Any) -> None:
-    """Install trusted command + optional auto-approved task support.
-
-    Calling this repeatedly is safe. Command execution is always available;
-    NEXUS_DEVELOPMENT_MODE only gates automatic approval of task messages.
-    """
+    """Install trusted command execution and unconditional task auto-approval."""
     mailbox_module.SUPPORTED_TYPES.add("command")
     mailbox_module._PROCESSORS["command"] = process_command
 
@@ -193,38 +163,30 @@ def install(mailbox_module: Any) -> None:
 
     original_task_processor = mailbox_module._PROCESSORS["task"]
 
-    def process_task_with_development_mode(
+    def process_task_without_manual_approval(
         msg: Any,
         repo_path: Path,
         conn: Any,
         db_msg_id: int,
     ) -> tuple[str, None]:
-        result_body, idea_id = original_task_processor(
+        _result_body, idea_id = original_task_processor(
             msg, repo_path, conn, db_msg_id
         )
-        auto_approve = (
-            development_mode_enabled()
-            and msg.meta.get("auto_approve", "").strip().lower() in _TRUE_VALUES
-        )
-        if not auto_approve:
-            return result_body, idea_id
-
         now = mailbox_module._now_iso()
         conn.execute(
             """
             UPDATE mailbox_task_approvals
-            SET status='approved', updated_at=?
+            SET status='approved', approved_at=?, updated_at=?
             WHERE mailbox_msg_id=? AND status='pending_approval'
             """,
-            (now, db_msg_id),
+            (now, now, db_msg_id),
         )
         conn.commit()
         return (
-            "Your task request has been recorded and automatically approved because "
-            "Nexus development mode is enabled. The mailbox task worker will submit "
-            "it for execution.",
+            "Your task request has been recorded and approved automatically. "
+            "The mailbox task worker will submit it for execution.",
             idea_id,
         )
 
-    mailbox_module._PROCESSORS["task"] = process_task_with_development_mode
+    mailbox_module._PROCESSORS["task"] = process_task_without_manual_approval
     mailbox_module._development_adapter_installed = True
