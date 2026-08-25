@@ -10,6 +10,7 @@ from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.mailbox_development import process_command
 from modules.nexus_sources import NexusSource, idea_source, issue_source, task_source
+from modules.run_store import DEFAULT_DB_PATH
 from modules.task_orchestrator import (
     ACTION_COMMAND,
     ACTION_NEW_EXPERIMENT,
@@ -38,8 +39,11 @@ class NexusControllerService:
         github_work_tracking: GitHubWorkTrackingService | None = None,
     ) -> None:
         self.orchestrator = orchestrator
+        db_path = getattr(self.experiment_service, "db_path", DEFAULT_DB_PATH)
+        if not isinstance(db_path, (str, Path)):
+            db_path = DEFAULT_DB_PATH
         self.github_work_tracking = github_work_tracking or GitHubWorkTrackingService(
-            db_path=getattr(self.experiment_service, "db_path", None) or "/agent/state/runs.db",
+            db_path=str(db_path),
             repo_root=str(self.repo_root),
         )
 
@@ -133,9 +137,6 @@ class NexusControllerService:
             if source is not None:
                 work_ref = self.github_work_tracking.ensure_for_source(source)
             elif self.github_work_tracking.configured:
-                # A clarification reply can legitimately be the point where
-                # implementation starts. Keep it tracked even when the original
-                # NexusSource object is no longer available in this call.
                 work_ref = self.github_work_tracking.ensure_for_source(
                     task_source(source_content, source_id=decision.session_id)
                 )
