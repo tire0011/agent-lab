@@ -13,10 +13,12 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
 from modules.local_llm_jobs import LocalLlmJobError, LocalLlmJobService
+from modules.mailbox_development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
 from modules.nexus_task_store import NexusTaskStore
@@ -32,7 +34,6 @@ ACTION_MISSING_CAPABILITY = "missing_capability"
 _FINAL_ACTIONS = {
     ACTION_NEW_EXPERIMENT,
     ACTION_RESUME_EXPERIMENT,
-    ACTION_COMMAND,
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
     ACTION_MISSING_CAPABILITY,
@@ -200,16 +201,11 @@ class NexusTaskOrchestrator:
             else:
                 experiment_id = None
 
-            command = str(decision.get("command", "") or "").strip() or None
-            if action == ACTION_COMMAND and not command:
-                raise TaskOrchestratorError("command action requires command")
-
             result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
                 message=str(decision.get("message", ""))[:3000],
                 experiment_id=experiment_id,
-                command=command,
                 observations=observations,
                 session_id=session.id,
             )
@@ -232,9 +228,9 @@ class NexusTaskOrchestrator:
             {"name": "operation", "description": "Execute one existing Nexus inspection/operation and receive its real result before deciding again.", "operations": operations},
             {"name": "memory_search", "description": "Search Nexus memory: structured knowledge, previous task/dialog history and project memory documents.", "arguments": {"query": "string", "limit": "1..10"}},
             {"name": "delegate", "description": "Ask another bounded LLM worker for analysis/research/review. The result returns to the local controller; delegation never transfers control.", "providers": self.delegation.catalog(), "arguments": {"provider": "provider name", "task": "sub-problem", "context": "optional compact context"}},
+            {"name": ACTION_COMMAND, "description": "Execute one shell command through the trusted development command primitive, observe its real output, then keep control and decide again.", "arguments": {"command": "shell command"}},
             {"name": ACTION_NEW_EXPERIMENT, "description": "Start a new isolated implementation experiment. Use for repository changes too large to solve through existing direct tools."},
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
-            {"name": ACTION_COMMAND, "description": "Execute an explicit operational shell command through the trusted mailbox command primitive."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
             {"name": ACTION_CLARIFICATION, "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory."},
@@ -264,14 +260,16 @@ Tool calls:
 {{"type":"tool","tool":"operation","operation":"<catalog operation>","args":{{...}},"reason":"..."}}
 {{"type":"tool","tool":"memory_search","query":"...","limit":6,"reason":"..."}}
 {{"type":"tool","tool":"delegate","provider":"local_worker|codex_readonly|azure_openai","task":"bounded sub-problem","context":"optional","reason":"..."}}
+{{"type":"tool","tool":"command","command":"<shell command>","reason":"..."}}
 Final action:
-{{"type":"action","action":"new_experiment|resume_experiment|command|answer|missing_capability|clarification","experiment_id":null,"command":null,"message":"...","reason":"..."}}
+{{"type":"action","action":"new_experiment|resume_experiment|answer|missing_capability|clarification","experiment_id":null,"message":"...","reason":"..."}}
 
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
+- Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
 - `codex_readonly` and `azure_openai` are external/costlier; use them only when expected value justifies it.
 - For repository implementation changes, use new_experiment rather than asking a read-only delegate to modify files.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
@@ -302,6 +300,20 @@ Rules:
             normalized["tool"] = "operation"
             normalized["operation"] = tool
             return self._execute_operation(normalized)
+        if tool == ACTION_COMMAND:
+            command = str(decision.get("command", "")).strip()
+            if not command:
+                raise TaskOrchestratorError("command tool requires command")
+            try:
+                result, _ = process_command(
+                    SimpleNamespace(body=command, meta={}),
+                    Path(getattr(self.operations_registry, "repo_root", "/agent")),
+                    None,
+                    0,
+                )
+            except (OSError, ValueError) as exc:
+                return {"tool": ACTION_COMMAND, "command": command[:2000], "error": str(exc)[:4000]}
+            return {"tool": ACTION_COMMAND, "command": command[:2000], "result": result[:10000]}
         if tool == "memory_search":
             query = str(decision.get("query", "")).strip()
             if not query:
