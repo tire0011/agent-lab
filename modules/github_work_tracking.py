@@ -82,12 +82,7 @@ Transport = Callable[[str, str, dict[str, Any] | None], Any]
 
 
 class GitHubWorkTrackingService:
-    """Small durable GitHub lifecycle layer for Nexus implementation work.
-
-    GitHub is the human-facing work identity while Nexus experiment UUIDs stay
-    internal execution identities. The service deliberately owns only durable
-    work tracking (Issue/branch/PR/merge), not experiment execution itself.
-    """
+    """Durable GitHub lifecycle identity for Nexus implementation work."""
 
     def __init__(
         self,
@@ -153,9 +148,21 @@ class GitHubWorkTrackingService:
                 ON github_work_links(issue_number)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS github_experiment_links (
+                    experiment_id TEXT PRIMARY KEY,
+                    issue_number INTEGER NOT NULL,
+                    issue_title TEXT NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    pr_number INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
 
     def ensure_for_source(self, source) -> GitHubWorkRef | None:
-        """Resolve/create the durable Issue and ensure its GitHub branch exists."""
         if not self.configured:
             logger.info("GitHub work tracking is not configured; leaving Nexus lifecycle unchanged")
             return None
@@ -176,6 +183,12 @@ class GitHubWorkTrackingService:
             issue = self._request("GET", f"/repos/{self.repository}/issues/{int(source_id)}")
             if "pull_request" in issue:
                 raise GitHubWorkTrackingError(f"GitHub #{source_id} is a pull request, not an Issue")
+            if str(issue.get("state") or "").lower() == "closed":
+                issue = self._request(
+                    "PATCH",
+                    f"/repos/{self.repository}/issues/{int(source_id)}",
+                    {"state": "open"},
+                )
         else:
             issue_title = self._issue_title(title, content)
             issue = self._find_exact_open_issue(issue_title) or self._create_issue(issue_title, content)
@@ -190,7 +203,7 @@ class GitHubWorkTrackingService:
             source_type=source_type,
             source_id=source_id,
         )
-        self._persist(ref)
+        self._persist_source(ref)
         self._ensure_branch(branch_name)
         return ref
 
@@ -206,15 +219,29 @@ class GitHubWorkTrackingService:
             experiment_id=experiment_id,
             pr_number=ref.pr_number,
         )
-        self._persist(bound)
+        if bound.source_id is not None:
+            self._persist_source(bound)
+        self._persist_experiment(bound)
         return bound
 
     def for_experiment(self, experiment_id: str) -> GitHubWorkRef | None:
         row = self._conn.execute(
+            "SELECT * FROM github_experiment_links WHERE experiment_id = ? LIMIT 1",
+            (experiment_id,),
+        ).fetchone()
+        if row is not None:
+            return GitHubWorkRef(
+                issue_number=int(row["issue_number"]),
+                issue_title=str(row["issue_title"]),
+                branch_name=str(row["branch_name"]),
+                experiment_id=str(row["experiment_id"]),
+                pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
+            )
+        legacy = self._conn.execute(
             "SELECT * FROM github_work_links WHERE experiment_id = ? LIMIT 1",
             (experiment_id,),
         ).fetchone()
-        return self._row_to_ref(row) if row is not None else None
+        return self._source_row_to_ref(legacy) if legacy is not None else None
 
     def ensure_pull_request(
         self,
@@ -229,7 +256,7 @@ class GitHubWorkTrackingService:
         owner = self.repository.split("/", 1)[0]
         query = urllib.parse.urlencode(
             {
-                "state": "all",
+                "state": "open",
                 "head": f"{owner}:{ref.branch_name}",
                 "base": self.target_branch,
                 "per_page": 10,
@@ -250,7 +277,10 @@ class GitHubWorkTrackingService:
                 },
             )
         ref.pr_number = int(pr["number"])
-        self._persist(ref)
+        if ref.source_id is not None:
+            self._persist_source(ref)
+        if ref.experiment_id:
+            self._persist_experiment(ref)
         return ref
 
     def merge_and_complete(self, ref: GitHubWorkRef, *, expected_head_sha: str | None = None) -> str:
@@ -333,22 +363,16 @@ class GitHubWorkTrackingService:
             "SELECT * FROM github_work_links WHERE source_type = ? AND source_id = ? ORDER BY id LIMIT 1",
             (source_type, source_id),
         ).fetchone()
-        return self._row_to_ref(row) if row is not None else None
+        return self._source_row_to_ref(row) if row is not None else None
 
-    def _persist(self, ref: GitHubWorkRef) -> None:
+    def _persist_source(self, ref: GitHubWorkRef) -> None:
+        if ref.source_id is None:
+            return
         now = _utcnow_iso()
-        source_key = (ref.source_type, ref.source_id)
-        row = None
-        if ref.experiment_id:
-            row = self._conn.execute(
-                "SELECT id FROM github_work_links WHERE experiment_id = ?",
-                (ref.experiment_id,),
-            ).fetchone()
-        if row is None and ref.source_id is not None:
-            row = self._conn.execute(
-                "SELECT id FROM github_work_links WHERE source_type = ? AND source_id = ?",
-                source_key,
-            ).fetchone()
+        row = self._conn.execute(
+            "SELECT id FROM github_work_links WHERE source_type = ? AND source_id = ?",
+            (ref.source_type, ref.source_id),
+        ).fetchone()
         with self._conn:
             if row is None:
                 self._conn.execute(
@@ -356,12 +380,11 @@ class GitHubWorkTrackingService:
                     INSERT INTO github_work_links (
                         source_type, source_id, experiment_id, issue_number,
                         issue_title, branch_name, pr_number, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ref.source_type,
                         ref.source_id,
-                        ref.experiment_id,
                         ref.issue_number,
                         ref.issue_title,
                         ref.branch_name,
@@ -374,13 +397,11 @@ class GitHubWorkTrackingService:
                 self._conn.execute(
                     """
                     UPDATE github_work_links
-                    SET experiment_id = COALESCE(?, experiment_id),
-                        issue_number = ?, issue_title = ?, branch_name = ?,
+                    SET issue_number = ?, issue_title = ?, branch_name = ?,
                         pr_number = COALESCE(?, pr_number), updated_at = ?
                     WHERE id = ?
                     """,
                     (
-                        ref.experiment_id,
                         ref.issue_number,
                         ref.issue_title,
                         ref.branch_name,
@@ -390,8 +411,37 @@ class GitHubWorkTrackingService:
                     ),
                 )
 
+    def _persist_experiment(self, ref: GitHubWorkRef) -> None:
+        if not ref.experiment_id:
+            return
+        now = _utcnow_iso()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO github_experiment_links (
+                    experiment_id, issue_number, issue_title, branch_name,
+                    pr_number, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(experiment_id) DO UPDATE SET
+                    issue_number=excluded.issue_number,
+                    issue_title=excluded.issue_title,
+                    branch_name=excluded.branch_name,
+                    pr_number=COALESCE(excluded.pr_number, github_experiment_links.pr_number),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    ref.experiment_id,
+                    ref.issue_number,
+                    ref.issue_title,
+                    ref.branch_name,
+                    ref.pr_number,
+                    now,
+                    now,
+                ),
+            )
+
     @staticmethod
-    def _row_to_ref(row: sqlite3.Row) -> GitHubWorkRef:
+    def _source_row_to_ref(row: sqlite3.Row) -> GitHubWorkRef:
         return GitHubWorkRef(
             issue_number=int(row["issue_number"]),
             issue_title=str(row["issue_title"]),
