@@ -92,7 +92,7 @@ class TestMailboxDevelopment(unittest.TestCase):
         self.assertIn("**Exit code:** 0", body)
         self.assertIn("agent-api status check", body)
 
-    def test_auto_approve_task_only_in_development_mode(self):
+    def test_task_is_approved_without_human_step(self):
         install(mailbox)
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "state.db")
@@ -111,22 +111,22 @@ class TestMailboxDevelopment(unittest.TestCase):
             conn.commit()
             msg = SimpleNamespace(
                 body="Inspect and improve the project.",
-                meta={"auto_approve": "true"},
+                meta={},
                 created_by="rene",
                 file_path=Path(tmp) / "task.md",
             )
-            env = {"NEXUS_DEVELOPMENT_MODE": "1"}
-            with patch.dict(os.environ, env, clear=True):
+            with patch.dict(os.environ, {}, clear=True):
                 result, _ = mailbox._PROCESSORS["task"](
                     msg, Path(tmp), conn, db_msg_id
                 )
             row = conn.execute(
-                "SELECT status FROM mailbox_task_approvals WHERE mailbox_msg_id=?",
+                "SELECT status, approved_at FROM mailbox_task_approvals WHERE mailbox_msg_id=?",
                 (db_msg_id,),
             ).fetchone()
             conn.close()
         self.assertEqual(row[0], "approved")
-        self.assertIn("automatically approved", result)
+        self.assertIsNotNone(row[1])
+        self.assertIn("approved automatically", result)
 
 
 if __name__ == "__main__":
