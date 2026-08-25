@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from modules.experiment_resume import resume_experiment
+from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.mailbox_development import process_command
 from modules.nexus_sources import NexusSource, idea_source, issue_source, task_source
 from modules.task_orchestrator import (
@@ -24,10 +25,23 @@ class NexusControllerService:
     The orchestrator chooses the action; this service executes the selected
     primitive. Tool calls performed during reasoning still happen inside the
     orchestrator and always return control to the local model first.
+
+    GitHub work tracking is an outer lifecycle concern: when configured, a
+    durable Issue and human-readable remote branch are resolved/created before
+    a new implementation experiment starts. The isolated experiment worktree
+    remains an internal execution detail.
     """
 
-    def __init__(self, orchestrator: NexusTaskOrchestrator) -> None:
+    def __init__(
+        self,
+        orchestrator: NexusTaskOrchestrator,
+        github_work_tracking: GitHubWorkTrackingService | None = None,
+    ) -> None:
         self.orchestrator = orchestrator
+        self.github_work_tracking = github_work_tracking or GitHubWorkTrackingService(
+            db_path=getattr(self.experiment_service, "db_path", None) or "/agent/state/runs.db",
+            repo_root=str(self.repo_root),
+        )
 
     @property
     def experiment_service(self):
@@ -44,7 +58,7 @@ class NexusControllerService:
             source_id=source.source_id,
             title=source.title,
         )
-        self._execute(decision, source.content)
+        self._execute(decision, source.content, source=source)
         return decision
 
     def handle_task(
@@ -107,9 +121,36 @@ class NexusControllerService:
             return fallback
         return "\n\nUser follow-up:\n".join(user_inputs)[:24000]
 
-    def _execute(self, decision: TaskDecision, source_content: str) -> None:
+    def _execute(
+        self,
+        decision: TaskDecision,
+        source_content: str,
+        *,
+        source: NexusSource | None = None,
+    ) -> None:
         if decision.action == ACTION_NEW_EXPERIMENT:
+            work_ref = None
+            if source is not None:
+                work_ref = self.github_work_tracking.ensure_for_source(source)
+            elif self.github_work_tracking.configured:
+                # A clarification reply can legitimately be the point where
+                # implementation starts. Keep it tracked even when the original
+                # NexusSource object is no longer available in this call.
+                work_ref = self.github_work_tracking.ensure_for_source(
+                    task_source(source_content, source_id=decision.session_id)
+                )
+
             experiment = self.experiment_service.create_experiment(source_content)
+            if work_ref is not None:
+                work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
+                self._record_execution(
+                    decision,
+                    "github_work_linked",
+                    (
+                        f"issue=#{work_ref.issue_number} "
+                        f"branch={work_ref.branch_name} experiment_id={experiment.id}"
+                    ),
+                )
             self._record_execution(
                 decision,
                 "experiment_started",
