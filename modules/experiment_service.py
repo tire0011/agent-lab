@@ -69,7 +69,7 @@ from modules.experiment_evaluation import (
 from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, get_setting, init_db, insert_activity, list_activity, set_setting
-from modules.verification_env import build_verification_test_env
+from modules.verification_runner import run_verification_test
 
 logger = logging.getLogger(__name__)
 
@@ -2339,47 +2339,20 @@ class ExperimentService:
             command=test_command, cwd=worktree_path,
             timeout_seconds=test_timeout_seconds,
         )
-        # Isolated, allowlisted environment for the test subprocess only:
-        # never the full parent (agent-api) environment, so a production
-        # AGENT_API_KEY or provider credential can never leak into the
-        # verification test run. Values themselves are never logged.
-        test_env = build_verification_test_env()
-        elog.debug(
-            "verifying", "test_env_isolated",
-            f"Verification test subprocess uses an isolated environment ({len(test_env)} allowlisted variables)",
+        test_run = run_verification_test(
+            test_command,
+            cwd=worktree_path,
+            timeout_seconds=test_timeout_seconds,
         )
-        test_started = time.perf_counter()
-        test_timed_out = False
-        try:
-            test_proc = subprocess.run(
-                test_command,
-                cwd=worktree_path,
-                capture_output=True,
-                text=True,
-                timeout=test_timeout_seconds,
-                shell=False,
-                env=test_env,
-            )
-            test_exit_code = test_proc.returncode
-            test_output = (test_proc.stdout or "") + (test_proc.stderr or "")
-            elog.log_process(
-                "verifying", "tests_completed",
-                f"Test command finished with exit code {test_exit_code}",
-                command=test_command, cwd=worktree_path,
-                duration_ms=int((time.perf_counter() - test_started) * 1000),
-                exit_code=test_exit_code, stdout=test_proc.stdout, stderr=test_proc.stderr,
-            )
-        except subprocess.TimeoutExpired as exc:
-            test_exit_code = None
-            test_timed_out = True
-            test_output = (
-                (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-            ) + "\n[test command timed out]"
+        test_exit_code = test_run.exit_code
+        test_output = test_run.output
+        test_timed_out = test_run.timed_out
+        if test_run.timed_out:
             elog.log_process(
                 "verifying", "test_timeout",
                 "Test command timed out",
                 command=test_command, cwd=worktree_path,
-                duration_ms=int((time.perf_counter() - test_started) * 1000),
+                duration_ms=test_run.duration_ms,
                 timed_out=True, level="ERROR", timeout_seconds=test_timeout_seconds,
             )
             next_timeout_seconds = self._increase_test_timeout_seconds(test_timeout_seconds)
@@ -2391,13 +2364,19 @@ class ExperimentService:
                     previous_timeout_seconds=test_timeout_seconds,
                     new_timeout_seconds=next_timeout_seconds,
                 )
-        except (OSError, subprocess.SubprocessError) as exc:
-            test_exit_code = None
-            test_output = f"failed to run test command: {exc}"
+        elif test_run.exception is not None:
             elog.error(
                 "verifying", "tests_exception",
-                "Exception while running test command", exc=exc,
+                "Exception while running test command", exc=test_run.exception,
                 command=sanitize_command(test_command), cwd=worktree_path,
+            )
+        else:
+            elog.log_process(
+                "verifying", "tests_completed",
+                f"Test command finished with exit code {test_exit_code}",
+                command=test_command, cwd=worktree_path,
+                duration_ms=test_run.duration_ms,
+                exit_code=test_exit_code, stdout=test_run.stdout, stderr=test_run.stderr,
             )
 
         test_output_capped = _truncate_text(test_output, self.max_test_output_bytes, label="test output")

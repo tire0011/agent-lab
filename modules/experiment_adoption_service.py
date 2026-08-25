@@ -25,7 +25,7 @@ from modules.experiment_service import (
 from modules.mailbox import MailboxLock
 from modules.redaction import bounded_lines, redact, sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db
-from modules.verification_env import build_verification_test_env
+from modules.verification_runner import run_verification_test
 
 logger = logging.getLogger(__name__)
 
@@ -656,56 +656,49 @@ class ExperimentAdoptionService:
 
             test_command_template = _ALLOWED_TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
             test_command = [part.format(python=self.experiment_service.test_python_executable) for part in test_command_template]
-            test_env = build_verification_test_env()
-            test_started = time.perf_counter()
-            try:
-                test_proc = subprocess.run(
-                    test_command,
-                    cwd=str(integration_path),
-                    capture_output=True,
-                    text=True,
-                    timeout=self.test_timeout_seconds,
-                    shell=False,
-                    env=test_env,
-                )
-                elog.log_process(
-                    "adoption",
-                    "integration_tests_completed",
-                    f"Integration tests finished with exit code {test_proc.returncode}",
-                    command=test_command,
-                    cwd=str(integration_path),
-                    duration_ms=int((time.perf_counter() - test_started) * 1000),
-                    exit_code=test_proc.returncode,
-                    stdout=test_proc.stdout,
-                    stderr=test_proc.stderr,
-                )
-                test_exit_code = test_proc.returncode
-                test_output = (test_proc.stdout or "") + (test_proc.stderr or "")
-            except subprocess.TimeoutExpired as exc:
+            test_timeout_seconds = self.experiment_service._get_test_timeout_seconds()
+            test_run = run_verification_test(
+                test_command,
+                cwd=str(integration_path),
+                timeout_seconds=test_timeout_seconds,
+            )
+            test_exit_code = test_run.exit_code
+            test_output = test_run.output
+            if test_run.timed_out:
                 keep_integration = True
-                test_exit_code = None
-                test_output = ((exc.stdout or "") if isinstance(exc.stdout, str) else "") + "\n[test command timed out]"
                 elog.log_process(
-                    "adoption",
-                    "integration_tests_timeout",
+                    "adoption", "integration_tests_timeout",
                     "Integration test command timed out",
-                    command=test_command,
-                    cwd=str(integration_path),
-                    duration_ms=int((time.perf_counter() - test_started) * 1000),
-                    timed_out=True,
-                    level="ERROR",
+                    command=test_command, cwd=str(integration_path),
+                    duration_ms=test_run.duration_ms,
+                    timed_out=True, level="ERROR",
+                    timeout_seconds=test_timeout_seconds,
                 )
-            except OSError as exc:
+                next_timeout_seconds = self.experiment_service._increase_test_timeout_seconds(test_timeout_seconds)
+                if next_timeout_seconds > test_timeout_seconds:
+                    elog.warning(
+                        "adoption", "test_timeout_increased",
+                        f"Verification test timeout increased from {test_timeout_seconds}s to "
+                        f"{next_timeout_seconds}s for future runs",
+                        previous_timeout_seconds=test_timeout_seconds,
+                        new_timeout_seconds=next_timeout_seconds,
+                    )
+            elif test_run.exception is not None:
                 keep_integration = True
-                test_exit_code = None
-                test_output = f"failed to run integration tests: {exc}"
                 elog.error(
-                    "adoption",
-                    "integration_tests_exception",
+                    "adoption", "integration_tests_exception",
                     "Integration test command raised an exception",
-                    exc=exc,
-                    command=test_command,
+                    exc=test_run.exception, command=test_command,
                     cwd=str(integration_path),
+                )
+            else:
+                elog.log_process(
+                    "adoption", "integration_tests_completed",
+                    f"Integration tests finished with exit code {test_exit_code}",
+                    command=test_command, cwd=str(integration_path),
+                    duration_ms=test_run.duration_ms,
+                    exit_code=test_exit_code,
+                    stdout=test_run.stdout, stderr=test_run.stderr,
                 )
 
             bounded_test_output = "\n".join(bounded_lines(test_output, max_lines=200))
