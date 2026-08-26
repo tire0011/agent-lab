@@ -19,6 +19,19 @@ class MailboxPollRunResult:
     error: str | None = None
 
 
+_TERMINAL_VALIDATION_ERROR_PREFIXES = (
+    "Missing YAML front matter",
+    "Unclosed YAML front matter",
+    "Invalid front-matter line",
+    "Missing required front-matter field",
+    "Unknown message type",
+    "File too large",
+    "Binary content is not allowed",
+    "Symlinks are not allowed",
+    "Path traversal detected",
+)
+
+
 def _safe_result_summary(results: list[dict[str, Any]], limit: int = 20) -> str:
     """Return bounded, content-free metadata for mailbox result logging."""
     items: list[str] = []
@@ -30,6 +43,96 @@ def _safe_result_summary(results: list[dict[str, Any]], limit: int = 20) -> str:
     if len(results) > limit:
         items.append(f"+{len(results) - limit}_more")
     return ",".join(items) or "none"
+
+
+def _is_terminal_validation_error(error: str | None) -> bool:
+    if not error:
+        return False
+    return error.startswith(_TERMINAL_VALIDATION_ERROR_PREFIXES)
+
+
+def _finalize_terminal_validation_errors(
+    *,
+    processor: Any,
+    results: list[dict[str, Any]],
+    mailbox_module: Any,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    """Turn deterministic inbox validation failures into rejected outbox replies.
+
+    Parser/schema failures cannot succeed on retry without changing the source
+    message.  They are therefore terminal: produce a bounded/redacted outbox
+    response, mark the DB row done, and finalize the normal inbox/outbox git
+    commit.  Runtime/processing failures are deliberately left untouched so the
+    existing retry policy still applies to transient failures.
+    """
+    for result in results:
+        if result.get("status") != "failed":
+            continue
+        error = str(result.get("error") or "")
+        if not _is_terminal_validation_error(error):
+            continue
+
+        file_value = result.get("file")
+        if not file_value:
+            continue
+        file_path = processor._mailbox_repo_path / str(file_value)
+        existing = processor._get_existing_record(file_path)
+        if not existing:
+            continue
+
+        processed_at = mailbox_module._now_iso()
+        synthetic_msg = mailbox_module.MailboxMessage(
+            file_path=file_path,
+            msg_type="unknown",
+            created_by="unknown",
+            meta={},
+            body="",
+        )
+        outbox_name = mailbox_module._outbox_filename(synthetic_msg, processed_at)
+        outbox_path = processor.outbox / outbox_name
+        safe_error = mailbox_module._redact(error)[:500]
+        outbox_content = mailbox_module._build_outbox_content(
+            synthetic_msg,
+            "rejected",
+            processed_at,
+            f"Mailbox message rejected: {safe_error}",
+            None,
+        )
+
+        if dry_run:
+            result.update(status="rejected", outbox=outbox_name)
+            continue
+
+        mailbox_module._atomic_write(outbox_path, outbox_content)
+        processor.conn.execute(
+            """
+            UPDATE mailbox_messages
+            SET status=?, processed_at=?, outbox_file=?, last_error=?
+            WHERE id=?
+            """,
+            (
+                mailbox_module.STATUS_DONE_PENDING_COMMIT,
+                processed_at,
+                outbox_name,
+                safe_error,
+                existing["id"],
+            ),
+        )
+        processor.conn.commit()
+        processor._finalize_git_commit(
+            {
+                "id": existing["id"],
+                "file_path": file_path,
+                "msg_type": "unknown",
+                "created_by": "unknown",
+                "outbox_file": outbox_name,
+                "status": mailbox_module.STATUS_DONE_PENDING_COMMIT,
+            }
+        )
+        result.update(status="rejected", outbox=outbox_name)
+
+    return results
 
 
 def _sync_mailbox_repo(mailbox_module: Any, repo_path: Path, max_attempts: int = 3) -> bool:
@@ -155,7 +258,12 @@ def run_mailbox_poll_once(
             ):
                 result = MailboxPollRunResult(status="sync_failed")
             else:
-                results = processor.process_inbox()
+                results = _finalize_terminal_validation_errors(
+                    processor=processor,
+                    results=processor.process_inbox(),
+                    mailbox_module=mailbox_module,
+                    dry_run=False,
+                )
                 logger.info(
                     "Mailbox poll processed run=%s count=%d results=%s",
                     run_name,
@@ -164,7 +272,12 @@ def run_mailbox_poll_once(
                 )
                 result = MailboxPollRunResult(status="processed", results=results)
         else:
-            results = processor.process_inbox()
+            results = _finalize_terminal_validation_errors(
+                processor=processor,
+                results=processor.process_inbox(),
+                mailbox_module=mailbox_module,
+                dry_run=True,
+            )
             logger.info(
                 "Mailbox poll processed run=%s count=%d results=%s",
                 run_name,
