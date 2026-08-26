@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from modules.run_store import DEFAULT_DB_PATH
+from modules.run_store import DEFAULT_DB_PATH, _connect
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ class GitHubWorkTrackingService:
         self.api_base = api_base.rstrip("/")
         self.target_branch = target_branch
         self._transport = transport
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = _connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._ensure_schema()
 
