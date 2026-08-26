@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,6 +38,14 @@ _FINAL_ACTIONS = {
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
     ACTION_MISSING_CAPABILITY,
+}
+
+logger = logging.getLogger(__name__)
+
+_PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "local_worker": ("local_worker", "azure_openai", "codex_readonly"),
+    "azure_openai": ("azure_openai", "local_worker", "codex_readonly"),
+    "codex_readonly": ("codex_readonly", "azure_openai", "local_worker"),
 }
 
 
@@ -160,6 +169,10 @@ class NexusTaskOrchestrator:
         for _ in range(self.max_steps):
             history = self.task_store.history(session.id, limit=18, max_chars=7000)
             prompt = self._prompt(session, task, history, observations)
+            logger.info(
+                "llm_provider selected provider=local role=controller session_id=%s reason=persistent_controller",
+                session.id,
+            )
             job_id = self.llm_jobs.submit(
                 prompt,
                 temperature=0.0,
@@ -201,6 +214,13 @@ class NexusTaskOrchestrator:
             else:
                 experiment_id = None
 
+            if action == ACTION_NEW_EXPERIMENT:
+                logger.info(
+                    "llm_provider selected provider=codex role=developer session_id=%s reason=%s",
+                    session.id,
+                    str(decision.get("reason", ""))[:500],
+                )
+
             result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
@@ -227,9 +247,9 @@ class NexusTaskOrchestrator:
         return [
             {"name": "operation", "description": "Execute one existing Nexus inspection/operation and receive its real result before deciding again.", "operations": operations},
             {"name": "memory_search", "description": "Search Nexus memory: structured knowledge, previous task/dialog history and project memory documents.", "arguments": {"query": "string", "limit": "1..10"}},
-            {"name": "delegate", "description": "Ask another bounded LLM worker for analysis/research/review. The result returns to the local controller; delegation never transfers control.", "providers": self.delegation.catalog(), "arguments": {"provider": "provider name", "task": "sub-problem", "context": "optional compact context"}},
-            {"name": ACTION_COMMAND, "description": "Execute one shell command through the trusted development command primitive, observe its real output, then keep control and decide again.", "arguments": {"command": "shell command"}},
-            {"name": ACTION_NEW_EXPERIMENT, "description": "Start a new isolated implementation experiment. Use for repository changes too large to solve through existing direct tools."},
+            {"name": "delegate", "description": "Ask another bounded LLM worker for analysis/research/review. Provider failures automatically fall back to another available model and control then returns to Nexus.", "providers": self.delegation.catalog(), "arguments": {"provider": "provider name", "task": "sub-problem", "context": "optional compact context"}},
+            {"name": ACTION_COMMAND, "description": "Local development tool: execute one shell command through the trusted development command primitive, observe its real output, then keep control and decide again.", "arguments": {"command": "shell command"}},
+            {"name": ACTION_NEW_EXPERIMENT, "description": "Codex development path: start a new isolated implementation experiment for large/complex repository changes."},
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
@@ -264,14 +284,20 @@ Tool calls:
 Final action:
 {{"type":"action","action":"new_experiment|resume_experiment|answer|missing_capability|clarification","experiment_id":null,"message":"...","reason":"..."}}
 
+Model policy:
+- LOCAL is a real development path, not merely a fallback. For small/simple changes, inspect the repository and implement with the command tool directly when practical.
+- Prefer LOCAL for simple analysis, small fixes, inexpensive work, and whenever external providers are unavailable or quota/token limited.
+- Prefer `azure_openai` for research, difficult reasoning and medium programming work. Azure returns specialist guidance; Nexus keeps control and can apply the resulting implementation with local command tools.
+- Prefer `new_experiment` (Codex implementation) for large, broad or complex repository changes where an isolated workspace-writing worker is justified.
+- Do not choose Codex merely because it is strongest. Use the cheapest capable route first.
+- A failed delegate is not a final failure: provider fallback is automatic. Inspect which provider actually succeeded and continue from that observation.
+
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
-- `codex_readonly` and `azure_openai` are external/costlier; use them only when expected value justifies it.
-- For repository implementation changes, use new_experiment rather than asking a read-only delegate to modify files.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply.
@@ -304,6 +330,11 @@ Rules:
             command = str(decision.get("command", "")).strip()
             if not command:
                 raise TaskOrchestratorError("command tool requires command")
+            logger.info(
+                "llm_provider selected provider=local role=developer reason=%s command_chars=%s",
+                str(decision.get("reason", ""))[:500],
+                len(command),
+            )
             try:
                 result, _ = process_command(
                     SimpleNamespace(body=command, meta={}),
@@ -313,7 +344,7 @@ Rules:
                 )
             except (OSError, ValueError) as exc:
                 return {"tool": ACTION_COMMAND, "command": command[:2000], "error": str(exc)[:4000]}
-            return {"tool": ACTION_COMMAND, "command": command[:2000], "result": result[:10000]}
+            return {"tool": ACTION_COMMAND, "command": command[:2000], "result": result[:10000], "provider_used": "local"}
         if tool == "memory_search":
             query = str(decision.get("query", "")).strip()
             if not query:
@@ -327,14 +358,93 @@ Rules:
             provider = str(decision.get("provider", "")).strip()
             subtask = str(decision.get("task", "")).strip()
             context = str(decision.get("context", ""))[:6000]
-            available = {item["provider"] for item in self.delegation.catalog()}
-            if provider not in available:
-                raise TaskOrchestratorError(f"delegation provider {provider!r} is not available")
             if not subtask:
                 raise TaskOrchestratorError("delegate requires task")
-            result = await self.delegation.delegate(provider, subtask, context=context)
-            return {"tool": "delegate", "result": result.to_dict()}
+            return await self._delegate_with_fallback(
+                provider,
+                subtask,
+                context=context,
+                reason=str(decision.get("reason", "")),
+            )
         raise TaskOrchestratorError(f"unknown tool {tool!r}")
+
+    async def _delegate_with_fallback(
+        self,
+        provider: str,
+        task: str,
+        *,
+        context: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        available = {item["provider"] for item in self.delegation.catalog()}
+        if provider not in available:
+            raise TaskOrchestratorError(f"delegation provider {provider!r} is not available")
+
+        order = [p for p in _PROVIDER_FALLBACKS.get(provider, (provider,)) if p in available]
+        attempts: list[dict[str, Any]] = []
+        previous_error = ""
+
+        for index, candidate in enumerate(order):
+            if index == 0:
+                logger.info(
+                    "llm_provider selected provider=%s role=delegate reason=%s",
+                    candidate,
+                    reason[:500],
+                )
+            else:
+                logger.warning(
+                    "llm_provider fallback from=%s to=%s reason=%s",
+                    order[index - 1],
+                    candidate,
+                    previous_error[:500] or "previous_provider_failed",
+                )
+
+            result = await self.delegation.delegate(candidate, task, context=context)
+            payload = result.to_dict()
+            attempts.append(
+                {
+                    "provider": candidate,
+                    "success": bool(payload.get("success")),
+                    "metadata": payload.get("metadata") or {},
+                }
+            )
+            if payload.get("success"):
+                logger.info(
+                    "llm_provider completed provider=%s role=delegate fallback_count=%s",
+                    candidate,
+                    index,
+                )
+                return {
+                    "tool": "delegate",
+                    "requested_provider": provider,
+                    "provider_used": candidate,
+                    "fallback_count": index,
+                    "attempts": attempts,
+                    "result": payload,
+                }
+
+            metadata = payload.get("metadata") or {}
+            previous_error = str(metadata.get("error") or "provider returned unsuccessful result")
+
+        logger.error(
+            "llm_provider exhausted requested=%s attempts=%s reason=%s",
+            provider,
+            [item["provider"] for item in attempts],
+            previous_error[:500],
+        )
+        return {
+            "tool": "delegate",
+            "requested_provider": provider,
+            "provider_used": None,
+            "fallback_count": max(0, len(attempts) - 1),
+            "attempts": attempts,
+            "result": {
+                "provider": provider,
+                "success": False,
+                "content": "",
+                "metadata": {"error": previous_error or "all available providers failed"},
+            },
+        }
 
     def _execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
         operation = str(decision.get("operation", "")).strip()
