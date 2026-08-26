@@ -96,6 +96,19 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.service.close()
         self.tmp.cleanup()
 
+    def test_creates_missing_database_parent_directory(self):
+        nested_db = Path(self.tmp.name) / "state" / "nested" / "nexus.db"
+        service = GitHubWorkTrackingService(
+            db_path=str(nested_db),
+            repo_root=self.tmp.name,
+            repository="tire0011/agent-lab",
+            transport=self.fake,
+        )
+        try:
+            self.assertTrue(nested_db.exists())
+        finally:
+            service.close()
+
     def test_existing_issue_is_reused_and_two_experiments_keep_same_work_identity(self):
         source = SimpleNamespace(
             source_type="issue",
