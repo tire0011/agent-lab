@@ -16,31 +16,23 @@ jobs:
         with:
           ref: issue-61-nexus-chat
           fetch-depth: 0
-      - name: Fix tracked inbox fixture
+      - name: Make mailbox removal tolerate untracked absent files
         run: |
           python - <<'PY'
           from pathlib import Path
-          p = Path('tests/test_mailbox_poll_runner.py')
-          lines = p.read_text(encoding='utf-8').splitlines()
-          matches = [i for i, line in enumerate(lines) if 'bad.write_text(' in line and 'No front matter here' in line]
-          if len(matches) != 1:
-              raise SystemExit(f'expected one bad inbox fixture line, found {len(matches)}')
-          index = matches[0]
-          addition = [
-              '            # Real inbox files arrive through Git and are tracked before Nexus',
-              '            # processes them. Model that state so finalization can remove the',
-              '            # rejected input together with its outbox response.',
-              '            _git(repo, "add", "communication/inbox/bad.md")',
-              '            _git(repo, "commit", "-m", "add invalid inbox message")',
-          ]
-          lines[index + 1:index + 1] = addition
-          p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          p = Path('modules/mailbox.py')
+          text = p.read_text(encoding='utf-8')
+          old = '            _git(["rm", "--", str(rel)], repo_path)'
+          new = '            _git(["rm", "--ignore-unmatch", "--", str(rel)], repo_path)'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one git rm staging call, found {text.count(old)}')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
           Path('.github/workflows/issue61-fix-mailbox-test.yml').unlink()
           PY
-      - name: Commit fixture fix
+      - name: Commit mailbox robustness fix
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tests/test_mailbox_poll_runner.py .github/workflows/issue61-fix-mailbox-test.yml
-          git commit -m "Fix mailbox validation test fixture"
+          git add modules/mailbox.py .github/workflows/issue61-fix-mailbox-test.yml
+          git commit -m "Tolerate absent untracked mailbox files"
           git push origin HEAD:issue-61-nexus-chat
