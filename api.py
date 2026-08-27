@@ -767,7 +767,6 @@ _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 @app.get("/experiments/{experiment_id}/logs", response_model=ExperimentLogsResponse)
 def get_experiment_logs(
     experiment_id: str,
-    request: Request,
     x_api_key: str | None = Header(default=None),
     level: str | None = Query(default=None),
     phase: str | None = Query(default=None),
@@ -779,9 +778,7 @@ def get_experiment_logs(
     implementation, verification, and cleanup - reusing the same durable
     JSONL log written by ``modules.experiment_logger``.
     """
-    client_host = request.client.host if request.client else None
-    if client_host not in {"127.0.0.1", "::1", "testclient"}:
-        authorize(x_api_key)
+    authorize(x_api_key)
     try:
         experiment = service.resolve_experiment(experiment_id)
     except ExperimentNotFoundError:
