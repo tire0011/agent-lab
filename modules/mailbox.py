@@ -32,6 +32,12 @@ MAX_RETRY = 3
 STATUS_DONE = "done"
 STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
 SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain"}
+SECRET_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9]{10,}"),
+    re.compile(r"AZURE_[A-Z_]+\s*=\s*\S"),
+    re.compile(r"API_KEY\s*=\s*\S"),
+    re.compile(r"(?i)api[_-]?key\s*[:=]\s*\S"),
+]
 
 ALLOWED_WRITE_PATHS = {"communication/inbox", "communication/outbox", "IDEAS.md"}
 
@@ -119,6 +125,14 @@ def _is_binary(data: bytes) -> bool:
     """Heuristic: contains NUL bytes → binary."""
     return b"\x00" in data
 
+
+def _has_secret(text: str) -> bool:
+    for pat in SECRET_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+
 def _check_path_traversal(path: Path, inbox_root: Path) -> None:
     """Raise ValueError if path escapes inbox_root."""
     try:
@@ -163,6 +177,9 @@ class MailboxMessage:
             raise ValueError("Binary content is not allowed")
 
         text = raw.decode("utf-8", errors="replace")
+
+        if _has_secret(text):
+            raise ValueError("Potential secret detected in message content")
 
         meta, body = parse_front_matter(text)
 
