@@ -11,15 +11,16 @@ jobs:
         with:
           ref: fix/nexus-cli-chat
       - name: Patch CLI and add Chat.ps1
-        shell: python
         run: |
+          python - <<'PY'
           from pathlib import Path
           p = Path('Client/client.py')
           s = p.read_text(encoding='utf-8')
-          s = s.replace('import sys\n', 'import sys\nimport time\n')
+          if 'import time\n' not in s:
+              s = s.replace('import sys\n', 'import sys\nimport time\n')
           start = s.index('def send_chat_message(')
           end = s.index('\ndef build_parser()', start)
-          replacement = r'''def send_chat_message(
+          replacement = '''def send_chat_message(
               base_url: str,
               chat_path: str,
               message: str,
@@ -32,9 +33,7 @@ jobs:
               if session_id:
                   body["session_id"] = session_id
               _, submitted = request_json(
-                  "POST",
-                  f"{base_url}{chat_path}",
-                  body=body,
+                  "POST", f"{base_url}{chat_path}", body=body,
                   headers={"x-api-key": api_key},
               )
               if not isinstance(submitted, dict) or not submitted.get("job_id"):
@@ -42,8 +41,7 @@ jobs:
               job_id = str(submitted["job_id"])
               while True:
                   _, job = request_json(
-                      "GET",
-                      f"{base_url}{chat_path}/jobs/{job_id}",
+                      "GET", f"{base_url}{chat_path}/jobs/{job_id}",
                       headers={"x-api-key": api_key},
                   )
                   if not isinstance(job, dict):
@@ -75,7 +73,6 @@ def cmd_chat(args: argparse.Namespace) -> int:
               base_url = resolve_base_url(args.base_url)
               chat_path = resolve_chat_path(args.chat_path)
               session_id: str | None = None
-
               if args.interactive:
                   print(f"Nexus chat. Endpoint: {chat_path}")
                   print("Type /quit to exit.")
@@ -91,24 +88,20 @@ def cmd_chat(args: argparse.Namespace) -> int:
                           break
                       try:
                           payload, session_id = send_chat_message(
-                              base_url, chat_path, line,
-                              api_key=api_key,
-                              session_id=session_id,
-                              poll_interval=args.poll_interval,
+                              base_url, chat_path, line, api_key=api_key,
+                              session_id=session_id, poll_interval=args.poll_interval,
                           )
                       except ClientError as exc:
                           print(str(exc), file=sys.stderr)
                           return EXIT_HTTP_ERROR
                       _print_chat_reply(payload)
                   return EXIT_OK
-
               if not args.message:
                   print("Missing chat message. Provide text or use --interactive.", file=sys.stderr)
                   return EXIT_USAGE_ERROR
               try:
                   payload, _ = send_chat_message(
-                      base_url, chat_path, args.message,
-                      api_key=api_key,
+                      base_url, chat_path, args.message, api_key=api_key,
                       poll_interval=args.poll_interval,
                   )
               except ClientError as exc:
@@ -138,17 +131,15 @@ def cmd_chat(args: argparse.Namespace) -> int:
 '''
           if old not in s:
               raise SystemExit('chat parser block not found')
-          s = s.replace(old, new)
-          p.write_text(s, encoding='utf-8')
+          p.write_text(s.replace(old, new), encoding='utf-8')
 
-          Path('scripts/Chat.ps1').write_text(r'''param(
+          Path('scripts/Chat.ps1').write_text('''param(
               [string]$ApiKey = $env:AGENT_API_KEY,
               [string]$BaseUrl = $(if ($env:AGENT_API_BASE_URL) { $env:AGENT_API_BASE_URL } else { "http://127.0.0.1:8000" })
           )
 
           $ErrorActionPreference = "Stop"
           $repoRoot = Split-Path -Parent $PSScriptRoot
-
           if (-not $ApiKey) {
               $secure = Read-Host "Nexus API key" -AsSecureString
               $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
@@ -156,7 +147,6 @@ def cmd_chat(args: argparse.Namespace) -> int:
               finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
           }
           if (-not $ApiKey) { throw "AGENT_API_KEY is required." }
-
           $env:AGENT_API_KEY = $ApiKey
           $env:AGENT_API_BASE_URL = $BaseUrl
           Set-Location $repoRoot
@@ -164,7 +154,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
           exit $LASTEXITCODE
           ''', encoding='utf-8')
 
-          Path('tests/test_client_chat_async.py').write_text(r'''import argparse
+          Path('tests/test_client_chat_async.py').write_text('''import argparse
           import unittest
           from unittest.mock import patch
           from Client import client
@@ -191,6 +181,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
           if __name__ == "__main__":
               unittest.main()
           ''', encoding='utf-8')
+          PY
       - name: Commit patch
         run: |
           git config user.name "github-actions[bot]"
