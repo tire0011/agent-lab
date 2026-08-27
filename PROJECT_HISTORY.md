@@ -198,6 +198,14 @@ Delegation gained automatic provider fallback. For example, Azure failure/quota 
 
 **Lesson:** local-first should mean **cheapest capable route**, not merely “local as emergency fallback.” Routing quality must be measured by actual task success, provider use, cost, latency, and fallback behavior rather than model preference alone.
 
+### 40. 2026-08-26 to 2026-08-27: first CI/smoke-test hardening exposed environment drift
+
+Using GitHub Actions and Nexus smoke testing as real verification surfaces exposed assumptions that local/VM runs had hidden. CI concurrency was separated by event so a push run cannot cancel the corresponding PR run. CI output moved to a dedicated runner that keeps successful output quiet and surfaces only actionable unittest failures. The workflow also gained an explicitly writable temporary SQLite database path instead of relying on repository-local runtime state.
+
+The debugging cycle additionally caught test-driven regressions in security boundaries: mailbox secret validation and the authenticated experiment-logs route were restored rather than weakening production authentication to satisfy tests. The last observed workflow run before these final fixes still failed, so a clean post-fix CI run remains required before treating this hardening cycle as complete.
+
+**Lesson:** remote CI is not only a second place to run tests; it is an environment-parity check. Test isolation must model writable runtime state explicitly, and fixing tests must not silently relax production authentication or secret validation.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -231,7 +239,7 @@ Current `main` includes:
 - single-call Codex experiment execution,
 - worktree-isolated experiments with quality gating, shared real-tool verification/adoption runner, distinct timeout state, and persisted adaptive verification timeout,
 - GitHub-backed outer work lifecycle using reusable Issues, `nexus/**` branches, PRs, merge, and Issue completion,
-- GitHub Actions verification for PRs and `nexus/**` branch pushes,
+- GitHub Actions verification for PRs and `nexus/**` branch pushes, with event-separated concurrency and compact failure-focused output,
 - SQLite state and durable project/idea/decision/history documents,
 - separate Git-backed mailbox repository with crash-safe outbox publication and bounded fetch/rebase/push synchronization,
 - signed GitHub webhook wake-up with timer fallback and bounded content-free diagnostics,
@@ -271,6 +279,7 @@ The persistent local-controller and GitHub experiment-lifecycle designs are adop
 23. **GitHub work identity and runtime experiment identity are complementary.** Human-readable Issues/branches/PRs need not replace isolated internal worktrees.
 24. **The cheapest capable route should win.** Local development is a normal path; escalation should be justified by task difficulty and evidence.
 25. **Actions should usually produce observations, not terminate reasoning.** Iterative command execution is more agentic than one-shot command dispatch.
+26. **CI is an environment-parity test.** Runtime paths, auth, secrets, and event semantics must remain valid outside the long-lived VM; test fixes must not weaken production boundaries.
 
 ## Open research directions
 
@@ -282,7 +291,7 @@ The persistent local-controller and GitHub experiment-lifecycle designs are adop
 - measure persistent local-LLM jobs: queue/generation/runtime, token rate, restart recovery, cancellation/watchdog behavior, and resource use,
 - quantify adaptive routing by task class, provider chosen/requested/actually used, fallback rate, success, latency, tokens, and cost,
 - measure how much local context preparation reduces external-provider tokens,
-- make the verification controller reuse successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
+- stabilize GitHub Actions under a clean runner, then make the verification controller reuse matching successful CI evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
 - evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
 - evaluate MCP as the standard integration/control path and narrow temporary bootstrap capabilities over time,
 - measure whether GitHub Issue/branch/PR lifecycle improves fire-and-forget development, traceability, recovery, and human review,
@@ -300,7 +309,7 @@ The persistent local-controller and GitHub experiment-lifecycle designs are adop
 ## Current next-step candidates
 
 1. **Nexus smoke-test/autonomy sample:** give the adopted controller a small real task and measure whether it uses iterative commands/tools correctly, completes it, and records provider/evidence cleanly.
-2. **CI-evidence fallback integration:** teach verification to accept a matching successful GitHub Actions run for the exact branch/commit and run locally only when that evidence is absent or unusable.
+2. **CI stabilization and evidence reuse:** obtain a clean Actions run with production-equivalent auth/runtime assumptions, then teach verification to accept a matching successful run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
 3. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
 4. **Persistent local-LLM measurement:** quantify Laguna/local-model queue/runtime/token behavior and verify recovery across API/controller restarts.
 5. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
