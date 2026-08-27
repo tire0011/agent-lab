@@ -1,0 +1,225 @@
+name: issue61-patch
+
+on:
+  push:
+    branches: [issue-61-nexus-chat]
+    paths: [.github/workflows/issue61-patch.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: issue-61-nexus-chat
+          fetch-depth: 0
+      - name: Patch chat wiring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if old not in text:
+                  raise SystemExit(f"expected block not found in {path}")
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace("models.py", '''class ChatRequest(BaseModel):
+              message: str = Field(min_length=1, max_length=2000)
+
+
+          class ChatResponse(BaseModel):
+              reply: str
+              intent: str
+          ''', '''class ChatRequest(BaseModel):
+              message: str = Field(min_length=1, max_length=2000)
+              session_id: str | None = Field(default=None, max_length=120)
+
+
+          class ChatResponse(BaseModel):
+              reply: str
+              intent: str
+              session_id: str
+              action: str
+              experiment_id: str | None = None
+              status: str
+          ''')
+
+          replace("api.py", '''from modules.mailbox_task_service import (
+              ApprovalNotFoundError,
+              ApprovalStateError,
+              MailboxTaskService,
+              MailboxTaskWorker,
+          )
+          ''', '''from modules.mailbox_task_service import (
+              ApprovalNotFoundError,
+              ApprovalStateError,
+              MailboxTaskService,
+              MailboxTaskWorker,
+          )
+          from modules.nexus_chat_service import NexusChatService
+          from modules.task_orchestrator import TaskOrchestratorError
+          ''')
+
+          replace("api.py", '''@lru_cache(maxsize=1)
+          def get_operations_service() -> OperationsRegistry:
+              """Singleton safe operations registry for the process."""
+              return OperationsRegistry(experiment_service=_resolve_experiment_service())
+
+
+          @lru_cache(maxsize=1)
+          def get_operation_chain_service() -> OperationChainService:
+          ''', '''@lru_cache(maxsize=1)
+          def get_operations_service() -> OperationsRegistry:
+              """Singleton safe operations registry for the process."""
+              return OperationsRegistry(experiment_service=_resolve_experiment_service())
+
+
+          @lru_cache(maxsize=1)
+          def get_nexus_chat_service() -> NexusChatService:
+              return NexusChatService(
+                  operations_registry=get_operations_service(),
+                  experiment_service=get_experiment_service(),
+              )
+
+
+          @lru_cache(maxsize=1)
+          def get_operation_chain_service() -> OperationChainService:
+          ''')
+
+          replace("api.py", '''@app.post("/chat", response_model=ChatResponse)
+          def chat(request: ChatRequest) -> ChatResponse:
+              message = request.message.strip()
+              if not message:
+                  raise HTTPException(status_code=400, detail="message must not be empty")
+
+              reply, intent = chat_module.answer(message)
+              return ChatResponse(reply=reply, intent=intent)
+          ''', '''@app.post("/chat", response_model=ChatResponse)
+          def chat(
+              request: ChatRequest,
+              x_api_key: str | None = Header(default=None),
+              service: NexusChatService = Depends(get_nexus_chat_service),
+          ) -> ChatResponse:
+              authorize(x_api_key)
+              message = request.message.strip()
+              if not message:
+                  raise HTTPException(status_code=400, detail="message must not be empty")
+              try:
+                  result = service.handle(message, session_id=request.session_id)
+              except ValueError as exc:
+                  raise HTTPException(status_code=400, detail=str(exc)) from exc
+              except TaskOrchestratorError as exc:
+                  raise HTTPException(status_code=503, detail=str(exc)) from exc
+              return ChatResponse(
+                  reply=result.reply,
+                  intent=result.action,
+                  session_id=result.session_id,
+                  action=result.action,
+                  experiment_id=result.experiment_id,
+                  status=result.status,
+              )
+          ''')
+
+          replace("static/app.js", '''const API_KEY_STORAGE_KEY = "agentLabApiKey";
+
+          const state = {
+            apiKey: null,
+            operationsCatalog: [],
+            operationsHistory: [],
+          };
+          ''', '''const API_KEY_STORAGE_KEY = "agentLabApiKey";
+          const CHAT_SESSION_STORAGE_KEY = "nexusChatSessionId";
+
+          const state = {
+            apiKey: null,
+            chatSessionId: sessionStorage.getItem(CHAT_SESSION_STORAGE_KEY),
+            operationsCatalog: [],
+            operationsHistory: [],
+          };
+          ''')
+
+          replace("static/app.js", '''async function sendMessage(event) {
+            event.preventDefault();
+            const message = elements.input.value.trim();
+            if (!message || elements.send.disabled) return;
+
+            addMessage(message, "user");
+            elements.input.value = "";
+            elements.input.disabled = true;
+            elements.send.disabled = true;
+            elements.send.textContent = "Sendet …";
+            elements.chatState.textContent = "Antwort wird geladen …";
+
+            try {
+              const response = await requestJson("/chat", {
+                method: "POST",
+                body: JSON.stringify({ message }),
+              });
+              addMessage(response.reply, "agent");
+              elements.chatState.textContent = "";
+            } catch (error) {
+              addMessage(error.message, "error");
+              elements.chatState.textContent = "Senden fehlgeschlagen";
+            } finally {
+              elements.input.disabled = false;
+              elements.send.disabled = false;
+              elements.send.textContent = "Senden";
+              elements.input.focus();
+            }
+          }
+          ''', '''async function sendMessage(event) {
+            event.preventDefault();
+            const message = elements.input.value.trim();
+            if (!message || elements.send.disabled) return;
+            if (!state.apiKey) {
+              elements.chatState.textContent = "Bitte zuerst oben den API-Key eingeben.";
+              return;
+            }
+
+            addMessage(message, "user");
+            elements.input.value = "";
+            elements.input.disabled = true;
+            elements.send.disabled = true;
+            elements.send.textContent = "Sendet …";
+            elements.chatState.textContent = "Nexus arbeitet …";
+
+            try {
+              const response = await requestJson("/chat", {
+                method: "POST",
+                headers: authHeaders(),
+                body: JSON.stringify({ message, session_id: state.chatSessionId }),
+              });
+              if (response.session_id) {
+                state.chatSessionId = response.session_id;
+                sessionStorage.setItem(CHAT_SESSION_STORAGE_KEY, response.session_id);
+              }
+              addMessage(response.reply, "agent");
+              const details = [response.action, response.status].filter(Boolean);
+              if (response.experiment_id) details.push(`Experiment ${response.experiment_id}`);
+              elements.chatState.textContent = details.join(" · ");
+            } catch (error) {
+              addMessage(error.message, "error");
+              elements.chatState.textContent = "Senden fehlgeschlagen";
+            } finally {
+              elements.input.disabled = false;
+              elements.send.disabled = false;
+              elements.send.textContent = "Senden";
+              elements.input.focus();
+            }
+          }
+          ''')
+
+          Path('.github/workflows/issue61-patch.yml').unlink()
+          PY
+      - name: Commit wiring
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add api.py models.py static/app.js .github/workflows/issue61-patch.yml
+          git commit -m "Wire persistent Nexus chat mode"
+          git push origin HEAD:issue-61-nexus-chat
