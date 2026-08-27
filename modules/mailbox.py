@@ -361,7 +361,7 @@ def git_add_and_commit(
         if f.exists():
             _git(["add", "--", str(rel)], repo_path)
         else:
-            _git(["rm", "--", str(rel)], repo_path)
+            _git(["rm", "--ignore-unmatch", "--", str(rel)], repo_path)
 
     result = _git(
         ["commit", "--no-verify", "-m", message],

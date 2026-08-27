@@ -519,74 +519,10 @@ class CreateIdeaEndpointTests(ApiTestsBase):
         self.assertNotIn("test-key", json.dumps(response.json()))
 
 
-class ChatEndpointTests(ApiTestsBase):
-    def test_chat_rejects_empty_message(self):
-        response = self.client.post("/chat", json={"message": ""})
-        self.assertEqual(response.status_code, 422)
-
-    def test_chat_rejects_whitespace_only_message(self):
-        response = self.client.post("/chat", json={"message": "   "})
-        self.assertEqual(response.status_code, 400)
-
-    def test_chat_rejects_missing_message_field(self):
-        response = self.client.post("/chat", json={})
-        self.assertEqual(response.status_code, 422)
-
-    def test_chat_answers_problem_question(self):
-        self._write_run("run1.json", "ERROR: disk full")
-        response = self.client.post(
-            "/chat", json={"message": "Welche Probleme gibt es?"}
-        )
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(body["intent"], "problems")
-        self.assertIn("disk full", body["reply"])
-
-    def test_chat_answers_idea_question(self):
-        self._write_ideas_md("## Ideas\n\n### Section\n\n- do the thing\n")
-        response = self.client.post(
-            "/chat", json={"message": "Was gibt es an Ideen?"}
-        )
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(body["intent"], "ideas")
-        self.assertIn("do the thing", body["reply"])
-
-    def test_chat_answers_status_question(self):
+class LegacyChatReplacementTests(ApiTestsBase):
+    def test_agentic_chat_requires_authentication(self):
         response = self.client.post("/chat", json={"message": "status?"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["intent"], "status")
-
-    def test_chat_unhandled_message_is_clearly_marked(self):
-        response = self.client.post("/chat", json={"message": "hallo wie geht es dir"})
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(body["intent"], "unhandled")
-        self.assertIn("regelbasierter", body["reply"])
-
-
-class ConsistencyTests(ApiTestsBase):
-    def test_chat_problems_match_problems_endpoint(self):
-        self._write_run("run1.json", "ERROR: consistent error")
-        problems_response = self.client.get("/problems").json()
-        chat_response = self.client.post(
-            "/chat", json={"message": "Probleme?"}
-        ).json()
-
-        self.assertEqual(problems_response["count"], 1)
-        self.assertIn(
-            problems_response["problems"][0]["summary"], chat_response["reply"]
-        )
-
-    def test_chat_ideas_match_ideas_endpoint(self):
-        self._write_ideas_md("## Ideas\n\n### Section\n\n- shared idea item\n")
-        ideas_response = self.client.get("/ideas").json()
-        chat_response = self.client.post(
-            "/chat", json={"message": "next idea?"}
-        ).json()
-
-        self.assertEqual(ideas_response["count"], 1)
-        self.assertIn(ideas_response["ideas"][0]["text"], chat_response["reply"])
+        self.assertEqual(response.status_code, 401)
 
 
 class AdoptionAndOperationsEndpointTests(ApiTestsBase):

@@ -5,9 +5,11 @@
 // ---------------------------------------------------------------------------
 
 const API_KEY_STORAGE_KEY = "agentLabApiKey";
+const CHAT_SESSION_STORAGE_KEY = "nexusChatSessionId";
 
 const state = {
   apiKey: null,
+  chatSessionId: sessionStorage.getItem(CHAT_SESSION_STORAGE_KEY),
   operationsCatalog: [],
   operationsHistory: [],
 };
@@ -341,21 +343,32 @@ async function sendMessage(event) {
   event.preventDefault();
   const message = elements.input.value.trim();
   if (!message || elements.send.disabled) return;
+  if (!state.apiKey) {
+    elements.chatState.textContent = "Bitte zuerst oben den API-Key eingeben.";
+    return;
+  }
 
   addMessage(message, "user");
   elements.input.value = "";
   elements.input.disabled = true;
   elements.send.disabled = true;
   elements.send.textContent = "Sendet …";
-  elements.chatState.textContent = "Antwort wird geladen …";
+  elements.chatState.textContent = "Nexus arbeitet …";
 
   try {
     const response = await requestJson("/chat", {
       method: "POST",
-      body: JSON.stringify({ message }),
+      headers: authHeaders(),
+      body: JSON.stringify({ message, session_id: state.chatSessionId }),
     });
+    if (response.session_id) {
+      state.chatSessionId = response.session_id;
+      sessionStorage.setItem(CHAT_SESSION_STORAGE_KEY, response.session_id);
+    }
     addMessage(response.reply, "agent");
-    elements.chatState.textContent = "";
+    const details = [response.action, response.status].filter(Boolean);
+    if (response.experiment_id) details.push(`Experiment ${response.experiment_id}`);
+    elements.chatState.textContent = details.join(" · ");
   } catch (error) {
     addMessage(error.message, "error");
     elements.chatState.textContent = "Senden fehlgeschlagen";
