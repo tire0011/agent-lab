@@ -63,6 +63,17 @@ class ChatResponse(BaseModel):
     status: str
 
 
+class ChatJobResponse(BaseModel):
+    job_id: str
+    status: str
+    reply: str | None = None
+    intent: str | None = None
+    session_id: str | None = None
+    action: str | None = None
+    experiment_id: str | None = None
+    error: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Codex task models
 #
