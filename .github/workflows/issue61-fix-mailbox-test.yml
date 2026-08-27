@@ -1,0 +1,49 @@
+name: issue61-fix-mailbox-test
+
+on:
+  push:
+    branches: [issue-61-nexus-chat]
+    paths: [.github/workflows/issue61-fix-mailbox-test.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: issue-61-nexus-chat
+          fetch-depth: 0
+      - name: Fix tracked inbox fixture
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/test_mailbox_poll_runner.py')
+          text = p.read_text(encoding='utf-8')
+          old = '''            bad = inbox / "bad.md"
+            bad.write_text("No front matter here\\n", encoding="utf-8")
+            processor = mailbox_module.MailboxProcessor(
+          '''
+          new = '''            bad = inbox / "bad.md"
+            bad.write_text("No front matter here\\n", encoding="utf-8")
+            # Real inbox files arrive through Git and are tracked before Nexus
+            # processes them. Model that state so finalization can `git rm` the
+            # rejected input together with its outbox response.
+            _git(repo, "add", "communication/inbox/bad.md")
+            _git(repo, "commit", "-m", "add invalid inbox message")
+            processor = mailbox_module.MailboxProcessor(
+          '''
+          if old not in text:
+              raise SystemExit('mailbox fixture block not found')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          Path('.github/workflows/issue61-fix-mailbox-test.yml').unlink()
+          PY
+      - name: Commit fixture fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/test_mailbox_poll_runner.py .github/workflows/issue61-fix-mailbox-test.yml
+          git commit -m "Fix mailbox validation test fixture"
+          git push origin HEAD:issue-61-nexus-chat
