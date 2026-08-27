@@ -21,23 +21,21 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           p = Path('tests/test_mailbox_poll_runner.py')
-          text = p.read_text(encoding='utf-8')
-          old = '''            bad = inbox / "bad.md"
-            bad.write_text("No front matter here\\n", encoding="utf-8")
-            processor = mailbox_module.MailboxProcessor(
-          '''
-          new = '''            bad = inbox / "bad.md"
-            bad.write_text("No front matter here\\n", encoding="utf-8")
-            # Real inbox files arrive through Git and are tracked before Nexus
-            # processes them. Model that state so finalization can `git rm` the
-            # rejected input together with its outbox response.
-            _git(repo, "add", "communication/inbox/bad.md")
-            _git(repo, "commit", "-m", "add invalid inbox message")
-            processor = mailbox_module.MailboxProcessor(
-          '''
-          if old not in text:
-              raise SystemExit('mailbox fixture block not found')
-          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          lines = p.read_text(encoding='utf-8').splitlines()
+          needle = '            bad.write_text("No front matter here\\n", encoding="utf-8")'
+          try:
+              index = lines.index(needle)
+          except ValueError:
+              raise SystemExit('bad inbox fixture line not found')
+          addition = [
+              '            # Real inbox files arrive through Git and are tracked before Nexus',
+              '            # processes them. Model that state so finalization can remove the',
+              '            # rejected input together with its outbox response.',
+              '            _git(repo, "add", "communication/inbox/bad.md")',
+              '            _git(repo, "commit", "-m", "add invalid inbox message")',
+          ]
+          lines[index + 1:index + 1] = addition
+          p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           Path('.github/workflows/issue61-fix-mailbox-test.yml').unlink()
           PY
       - name: Commit fixture fix
