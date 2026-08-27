@@ -22,7 +22,7 @@ from modules.task_orchestrator import (
 logger = logging.getLogger(__name__)
 
 _EXECUTION_RE = re.compile(
-    r"^(?:bitte\s+)?(?:mach(?:e)?\s+das|setz(?:e)?\s+das\s+um|implementier(?:e)?\b|beheb(?:e)?\b|fix(?:e)?\b|führ(?:e)?\b|starte\b|änder(?:e)?\b|füg(?:e)?\b|entfern(?:e)?\b|integrier(?:e)?\b|do\s+it\b|implement\b|fix\b|execute\b|apply\b|run\s+it\b|go\s+ahead\b)",
+    r"^(?:bitte\s+)?(?:mach(?:e)?(?:\s+das|\b.*\bweiter\b)|setz(?:e)?(?:\s+das\s+um|\b.*\bfort\b)|implementier(?:e)?\b|beheb(?:e)?\b|fix(?:e)?\b|führ(?:e)?\b|starte\b|änder(?:e)?\b|füg(?:e)?\b|entfern(?:e)?\b|integrier(?:e)?\b|do\s+it\b|implement\b|fix\b|execute\b|apply\b|run\s+it\b|go\s+ahead\b)",
     re.IGNORECASE,
 )
 _POLITE_EXECUTION_RE = re.compile(
