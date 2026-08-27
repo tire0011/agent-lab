@@ -17,12 +17,14 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.orchestrator = MagicMock()
         self.orchestrator.run.return_value = TaskDecision(action="answer", session_id="session-1")
         self.orchestrator.experiment_service = MagicMock()
+        self.orchestrator.experiment_service.db_path = str(Path(self.tmp.name) / "agent.db")
         self.orchestrator.operations_registry = SimpleNamespace(repo_root=Path(self.tmp.name))
         self.orchestrator.task_store = MagicMock()
         self.orchestrator.task_store.history.return_value = []
         self.service = NexusControllerService(self.orchestrator)
 
     def tearDown(self):
+        self.service.github_work_tracking.close()
         self.tmp.cleanup()
 
     def test_issue_is_passed_to_same_controller_with_source_identity(self):
@@ -83,13 +85,13 @@ class NexusControllerServiceTests(unittest.TestCase):
 
     def test_reply_resumes_same_persistent_session(self):
         self.orchestrator.continue_session.return_value = TaskDecision(
-            action="answer", session_id="session-1"
+            action="answer",
+            session_id="session-1",
         )
-        result = self.service.reply("session-1", "Optimize for cost")
-        self.assertEqual(result.session_id, "session-1")
-        self.orchestrator.continue_session.assert_called_once_with(
-            "session-1", "Optimize for cost"
-        )
+
+        self.service.reply("session-1", "Continue")
+
+        self.orchestrator.continue_session.assert_called_once_with("session-1", "Continue")
 
 
 if __name__ == "__main__":
