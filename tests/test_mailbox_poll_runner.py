@@ -14,7 +14,11 @@ import modules.operation_chain_service as operation_chain_service_module
 import modules.operations_registry as operations_registry_module
 import modules.outbox_publisher as outbox_publisher_module
 from modules.mailbox_config import MailboxConfig
-from modules.mailbox_poll_runner import _sync_mailbox_repo, run_mailbox_poll_once
+from modules.mailbox_poll_runner import (
+    _finalize_terminal_validation_errors,
+    _sync_mailbox_repo,
+    run_mailbox_poll_once,
+)
 
 
 class _CloseTracking:
@@ -114,6 +118,68 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
 def _configure_git(repo: Path) -> None:
     _git(repo, "config", "user.name", "Mailbox Test")
     _git(repo, "config", "user.email", "mailbox-test@example.invalid")
+
+
+class MailboxValidationFeedbackTests(unittest.TestCase):
+    def test_missing_front_matter_is_rejected_once_with_outbox_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(
+                ["git", "init", str(repo)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            _configure_git(repo)
+            inbox = repo / "communication" / "inbox"
+            outbox = repo / "communication" / "outbox"
+            state = repo / "state"
+            inbox.mkdir(parents=True)
+            outbox.mkdir(parents=True)
+            state.mkdir()
+            (inbox / ".gitkeep").write_text("", encoding="utf-8")
+            (outbox / ".gitkeep").write_text("", encoding="utf-8")
+            (repo / "README.md").write_text("# mailbox test\n", encoding="utf-8")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "seed mailbox")
+
+            bad = inbox / "bad.md"
+            bad.write_text("No front matter here\n", encoding="utf-8")
+            processor = mailbox_module.MailboxProcessor(
+                repo_path=repo,
+                db_path=str(state / "agent.db"),
+                dry_run=False,
+            )
+            try:
+                results = processor.process_inbox()
+                self.assertEqual(results[0]["status"], "failed")
+                self.assertTrue(bad.exists())
+
+                with patch.object(mailbox_module, "git_push", return_value=True):
+                    results = _finalize_terminal_validation_errors(
+                        processor=processor,
+                        results=results,
+                        mailbox_module=mailbox_module,
+                        dry_run=False,
+                    )
+
+                self.assertEqual(results[0]["status"], "rejected")
+                self.assertFalse(bad.exists())
+                outbox_files = [p for p in outbox.glob("*.md") if p.name != ".gitkeep"]
+                self.assertEqual(len(outbox_files), 1)
+                response = outbox_files[0].read_text(encoding="utf-8")
+                self.assertIn("status: rejected", response)
+                self.assertIn("Missing YAML front matter", response)
+
+                row = processor.conn.execute(
+                    "SELECT status, last_error FROM mailbox_messages WHERE file_path = ?",
+                    (str(bad),),
+                ).fetchone()
+                self.assertEqual(row[0], mailbox_module.STATUS_DONE)
+                self.assertIn("Missing YAML front matter", row[1])
+                self.assertEqual(processor.process_inbox(), [])
+            finally:
+                processor.close()
 
 
 class MailboxSyncTests(unittest.TestCase):
