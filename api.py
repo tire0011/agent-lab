@@ -32,6 +32,8 @@ from modules.mailbox_task_service import (
     MailboxTaskService,
     MailboxTaskWorker,
 )
+from modules.nexus_chat_service import NexusChatService
+from modules.task_orchestrator import TaskOrchestratorError
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
 from modules.operations_registry import OperationValidationError, OperationsRegistry
@@ -176,6 +178,14 @@ def get_experiment_adoption_service() -> ExperimentAdoptionService:
 def get_operations_service() -> OperationsRegistry:
     """Singleton safe operations registry for the process."""
     return OperationsRegistry(experiment_service=_resolve_experiment_service())
+
+
+@lru_cache(maxsize=1)
+def get_nexus_chat_service() -> NexusChatService:
+    return NexusChatService(
+        operations_registry=get_operations_service(),
+        experiment_service=get_experiment_service(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -396,13 +406,29 @@ def create_idea(
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+def chat(
+    request: ChatRequest,
+    x_api_key: str | None = Header(default=None),
+    service: NexusChatService = Depends(get_nexus_chat_service),
+) -> ChatResponse:
+    authorize(x_api_key)
     message = request.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="message must not be empty")
-
-    reply, intent = chat_module.answer(message)
-    return ChatResponse(reply=reply, intent=intent)
+    try:
+        result = service.handle(message, session_id=request.session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TaskOrchestratorError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return ChatResponse(
+        reply=result.reply,
+        intent=result.action,
+        session_id=result.session_id,
+        action=result.action,
+        experiment_id=result.experiment_id,
+        status=result.status,
+    )
 
 
 # ---------------------------------------------------------------------------
