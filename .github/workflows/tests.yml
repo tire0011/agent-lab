@@ -36,4 +36,5 @@ jobs:
       - name: Run tests
         env:
           AGENT_API_KEY: test-key
+          AGENT_DB_PATH: ${{ runner.temp }}/nexus-test/agent.db
         run: python scripts/run_tests_ci.py
