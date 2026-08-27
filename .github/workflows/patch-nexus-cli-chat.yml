@@ -1,0 +1,200 @@
+name: patch-nexus-cli-chat
+on: [push]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/nexus-cli-chat
+      - name: Patch CLI and add Chat.ps1
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('Client/client.py')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('import sys\n', 'import sys\nimport time\n')
+          start = s.index('def send_chat_message(')
+          end = s.index('\ndef build_parser()', start)
+          replacement = r'''def send_chat_message(
+              base_url: str,
+              chat_path: str,
+              message: str,
+              *,
+              api_key: str,
+              session_id: str | None = None,
+              poll_interval: float = 2.0,
+          ) -> tuple[dict[str, Any], str | None]:
+              body: dict[str, Any] = {"message": message}
+              if session_id:
+                  body["session_id"] = session_id
+              _, submitted = request_json(
+                  "POST",
+                  f"{base_url}{chat_path}",
+                  body=body,
+                  headers={"x-api-key": api_key},
+              )
+              if not isinstance(submitted, dict) or not submitted.get("job_id"):
+                  raise ClientError("Chat submit response did not include job_id")
+              job_id = str(submitted["job_id"])
+              while True:
+                  _, job = request_json(
+                      "GET",
+                      f"{base_url}{chat_path}/jobs/{job_id}",
+                      headers={"x-api-key": api_key},
+                  )
+                  if not isinstance(job, dict):
+                      raise ClientError("Chat job response was not an object")
+                  status = str(job.get("status", ""))
+                  if status == "succeeded":
+                      return job, job.get("session_id") or session_id
+                  if status in {"failed", "cancelled"}:
+                      raise ClientError(job.get("error") or f"Chat job {status}")
+                  time.sleep(max(0.2, poll_interval))
+
+
+def _print_chat_reply(payload: dict[str, Any]) -> None:
+              reply = payload.get("reply")
+              if reply:
+                  print(f"nexus> {reply}")
+              details = [payload.get("action"), payload.get("status")]
+              if payload.get("experiment_id"):
+                  details.append(f"experiment={payload['experiment_id']}")
+              details = [str(x) for x in details if x]
+              if details:
+                  print(f"       [{' · '.join(details)}]")
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+              api_key = _require_api_key(args)
+              if not api_key:
+                  return EXIT_USAGE_ERROR
+              base_url = resolve_base_url(args.base_url)
+              chat_path = resolve_chat_path(args.chat_path)
+              session_id: str | None = None
+
+              if args.interactive:
+                  print(f"Nexus chat. Endpoint: {chat_path}")
+                  print("Type /quit to exit.")
+                  while True:
+                      try:
+                          line = input("you> ").strip()
+                      except (EOFError, KeyboardInterrupt):
+                          print()
+                          break
+                      if not line:
+                          continue
+                      if line.lower() in {"/quit", "quit", "exit"}:
+                          break
+                      try:
+                          payload, session_id = send_chat_message(
+                              base_url, chat_path, line,
+                              api_key=api_key,
+                              session_id=session_id,
+                              poll_interval=args.poll_interval,
+                          )
+                      except ClientError as exc:
+                          print(str(exc), file=sys.stderr)
+                          return EXIT_HTTP_ERROR
+                      _print_chat_reply(payload)
+                  return EXIT_OK
+
+              if not args.message:
+                  print("Missing chat message. Provide text or use --interactive.", file=sys.stderr)
+                  return EXIT_USAGE_ERROR
+              try:
+                  payload, _ = send_chat_message(
+                      base_url, chat_path, args.message,
+                      api_key=api_key,
+                      poll_interval=args.poll_interval,
+                  )
+              except ClientError as exc:
+                  print(str(exc), file=sys.stderr)
+                  return EXIT_HTTP_ERROR
+              _print_chat_reply(payload)
+              return EXIT_OK
+
+'''
+          s = s[:start] + replacement + s[end:]
+          old = '''    chat_parser.add_argument(
+              "--chat-path",
+              help="Chat endpoint path (overrides AGENT_API_CHAT_PATH)",
+          )
+          chat_parser.set_defaults(func=cmd_chat)
+'''
+          new = '''    chat_parser.add_argument(
+              "--chat-path",
+              help="Chat endpoint path (overrides AGENT_API_CHAT_PATH)",
+          )
+          chat_parser.add_argument("--api-key", help="API key (overrides AGENT_API_KEY)")
+          chat_parser.add_argument(
+              "--poll-interval", type=float, default=2.0,
+              help="Seconds between async chat job polls (default: 2.0)",
+          )
+          chat_parser.set_defaults(func=cmd_chat)
+'''
+          if old not in s:
+              raise SystemExit('chat parser block not found')
+          s = s.replace(old, new)
+          p.write_text(s, encoding='utf-8')
+
+          Path('scripts/Chat.ps1').write_text(r'''param(
+              [string]$ApiKey = $env:AGENT_API_KEY,
+              [string]$BaseUrl = $(if ($env:AGENT_API_BASE_URL) { $env:AGENT_API_BASE_URL } else { "http://127.0.0.1:8000" })
+          )
+
+          $ErrorActionPreference = "Stop"
+          $repoRoot = Split-Path -Parent $PSScriptRoot
+
+          if (-not $ApiKey) {
+              $secure = Read-Host "Nexus API key" -AsSecureString
+              $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+              try { $ApiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+              finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+          }
+          if (-not $ApiKey) { throw "AGENT_API_KEY is required." }
+
+          $env:AGENT_API_KEY = $ApiKey
+          $env:AGENT_API_BASE_URL = $BaseUrl
+          Set-Location $repoRoot
+          & python "Client/client.py" chat --interactive
+          exit $LASTEXITCODE
+          ''', encoding='utf-8')
+
+          Path('tests/test_client_chat_async.py').write_text(r'''import argparse
+          import unittest
+          from unittest.mock import patch
+          from Client import client
+
+          class AsyncCliChatTests(unittest.TestCase):
+              def test_send_chat_submits_and_polls_preserving_session(self):
+                  responses = [
+                      (202, {"job_id": "j1", "status": "queued"}),
+                      (200, {"job_id": "j1", "status": "running"}),
+                      (200, {"job_id": "j1", "status": "succeeded", "reply": "Hallo", "session_id": "s1", "action": "answer"}),
+                  ]
+                  with patch.object(client, "request_json", side_effect=responses) as request_json, patch.object(client.time, "sleep"):
+                      payload, session_id = client.send_chat_message("http://x", "/chat", "hi", api_key="secret")
+                  self.assertEqual(payload["reply"], "Hallo")
+                  self.assertEqual(session_id, "s1")
+                  self.assertEqual(request_json.call_args_list[0].kwargs["headers"], {"x-api-key": "secret"})
+                  self.assertEqual(request_json.call_args_list[-1].args[:2], ("GET", "http://x/chat/jobs/j1"))
+
+              def test_chat_requires_api_key(self):
+                  args = argparse.Namespace(api_key=None, base_url=None, chat_path=None, interactive=False, message="hi", poll_interval=2.0)
+                  with patch.dict(client.os.environ, {}, clear=True):
+                      self.assertEqual(client.cmd_chat(args), client.EXIT_USAGE_ERROR)
+
+          if __name__ == "__main__":
+              unittest.main()
+          ''', encoding='utf-8')
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Client/client.py scripts/Chat.ps1 tests/test_client_chat_async.py
+          git commit -m "Update CLI for async Nexus chat" || exit 0
+          git push origin HEAD:fix/nexus-cli-chat
