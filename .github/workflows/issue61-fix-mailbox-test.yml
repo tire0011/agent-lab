@@ -22,11 +22,10 @@ jobs:
           from pathlib import Path
           p = Path('tests/test_mailbox_poll_runner.py')
           lines = p.read_text(encoding='utf-8').splitlines()
-          needle = '            bad.write_text("No front matter here\\n", encoding="utf-8")'
-          try:
-              index = lines.index(needle)
-          except ValueError:
-              raise SystemExit('bad inbox fixture line not found')
+          matches = [i for i, line in enumerate(lines) if 'bad.write_text(' in line and 'No front matter here' in line]
+          if len(matches) != 1:
+              raise SystemExit(f'expected one bad inbox fixture line, found {len(matches)}')
+          index = matches[0]
           addition = [
               '            # Real inbox files arrive through Git and are tracked before Nexus',
               '            # processes them. Model that state so finalization can remove the',
