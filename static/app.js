@@ -353,19 +353,33 @@ async function sendMessage(event) {
   elements.input.disabled = true;
   elements.send.disabled = true;
   elements.send.textContent = "Sendet …";
-  elements.chatState.textContent = "Nexus arbeitet …";
+  elements.chatState.textContent = "Nexus wurde gestartet …";
 
   try {
-    const response = await requestJson("/chat", {
+    let response = await requestJson("/chat", {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message, session_id: state.chatSessionId }),
     });
+    const jobId = response.job_id;
+    if (!jobId) throw new Error("Chat-Job wurde ohne ID gestartet");
+
+    while (response.status === "queued" || response.status === "running") {
+      elements.chatState.textContent = response.status === "queued" ? "Nexus wartet …" : "Nexus arbeitet …";
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      response = await requestJson(`/chat/jobs/${encodeURIComponent(jobId)}`, {
+        headers: authHeaders(),
+      });
+    }
+
+    if (response.status === "failed") {
+      throw new Error(response.error || "Nexus-Chat ist fehlgeschlagen");
+    }
     if (response.session_id) {
       state.chatSessionId = response.session_id;
       sessionStorage.setItem(CHAT_SESSION_STORAGE_KEY, response.session_id);
     }
-    addMessage(response.reply, "agent");
+    addMessage(response.reply || "Nexus hat keine Antwort geliefert.", "agent");
     const details = [response.action, response.status].filter(Boolean);
     if (response.experiment_id) details.push(`Experiment ${response.experiment_id}`);
     elements.chatState.textContent = details.join(" · ");

@@ -10,6 +10,8 @@ class NexusChatWebTests(unittest.TestCase):
         self.assertIn('session_id: state.chatSessionId', javascript)
         self.assertIn('sessionStorage.setItem(CHAT_SESSION_STORAGE_KEY, response.session_id)', javascript)
         self.assertIn('response.experiment_id', javascript)
+        self.assertIn('/chat/jobs/${encodeURIComponent(jobId)}', javascript)
+        self.assertIn('setTimeout(resolve, 2000)', javascript)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ from modules.mailbox_task_service import (
     MailboxTaskWorker,
 )
 from modules.nexus_chat_service import NexusChatService
+from modules.nexus_chat_jobs import NexusChatJobService, STATUS_FAILED, STATUS_SUCCEEDED
 from modules.task_orchestrator import TaskOrchestratorError
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
@@ -44,6 +45,7 @@ from models import (
     DiagnosticActivityResponse,
     ChatRequest,
     ChatResponse,
+    ChatJobResponse,
     CodexTaskCreateRequest,
     CodexTaskListResponse,
     CodexTaskResponse,
@@ -186,6 +188,11 @@ def get_nexus_chat_service() -> NexusChatService:
         operations_registry=get_operations_service(),
         experiment_service=get_experiment_service(),
     )
+
+
+@lru_cache(maxsize=1)
+def get_nexus_chat_job_service() -> NexusChatJobService:
+    return NexusChatJobService(get_nexus_chat_service())
 
 
 @lru_cache(maxsize=1)
@@ -405,31 +412,47 @@ def create_idea(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatJobResponse, status_code=202)
 def chat(
     request: ChatRequest,
     x_api_key: str | None = Header(default=None),
-    service: NexusChatService = Depends(get_nexus_chat_service),
-) -> ChatResponse:
+    service: NexusChatJobService = Depends(get_nexus_chat_job_service),
+) -> ChatJobResponse:
     authorize(x_api_key)
-    message = request.message.strip()
-    if not message:
-        raise HTTPException(status_code=400, detail="message must not be empty")
     try:
-        result = service.handle(message, session_id=request.session_id)
+        job = service.submit(request.message, session_id=request.session_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except TaskOrchestratorError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return ChatResponse(
-        reply=result.reply,
-        intent=result.action,
-        session_id=result.session_id,
-        action=result.action,
-        experiment_id=result.experiment_id,
-        status=result.status,
-    )
+    return ChatJobResponse(job_id=job.id, status=job.status, session_id=job.session_id)
 
+
+@app.get("/chat/jobs/{job_id}", response_model=ChatJobResponse)
+def get_chat_job(
+    job_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: NexusChatJobService = Depends(get_nexus_chat_job_service),
+) -> ChatJobResponse:
+    authorize(x_api_key)
+    job = service.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="chat job not found")
+    if job.status == STATUS_SUCCEEDED and job.result is not None:
+        result = job.result
+        return ChatJobResponse(
+  job_id=job.id,
+  status=job.status,
+  reply=result.reply,
+  intent=result.action,
+  session_id=result.session_id,
+  action=result.action,
+  experiment_id=result.experiment_id,
+        )
+    return ChatJobResponse(
+        job_id=job.id,
+        status=job.status,
+        session_id=job.session_id,
+        error=job.error if job.status == STATUS_FAILED else None,
+    )
 
 # ---------------------------------------------------------------------------
 # Codex task endpoints (authenticated, synchronous, read-only sandbox only)

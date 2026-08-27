@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import uuid
+from dataclasses import dataclass
+from typing import Callable
+
+from modules.nexus_chat_service import NexusChatResult, NexusChatService
+
+logger = logging.getLogger(__name__)
+
+STATUS_QUEUED = "queued"
+STATUS_RUNNING = "running"
+STATUS_SUCCEEDED = "succeeded"
+STATUS_FAILED = "failed"
+_TERMINAL = {STATUS_SUCCEEDED, STATUS_FAILED}
+
+
+@dataclass(slots=True)
+class NexusChatJob:
+    id: str
+    status: str
+    message: str
+    session_id: str | None
+    result: NexusChatResult | None = None
+    error: str | None = None
+
+
+class NexusChatJobService:
+    """Run complete Nexus chat turns outside the request/response lifetime.
+
+    Local inference can take minutes on the small Nexus VM. Keeping the whole
+    orchestrator loop inside POST /chat therefore makes the reverse proxy time
+    out even though Nexus is still working. This service keeps one bounded
+    worker queue and lets the browser poll a short-lived job instead.
+    """
+
+    def __init__(
+        self,
+        chat_service: NexusChatService,
+        *,
+        id_factory: Callable[[], str] | None = None,
+    ) -> None:
+        self.chat_service = chat_service
+        self.id_factory = id_factory or (lambda: uuid.uuid4().hex)
+        self._lock = threading.RLock()
+        self._jobs: dict[str, NexusChatJob] = {}
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._closed = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="nexus-chat-job-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        self._queue.put(None)
+        self._worker.join(timeout=2.0)
+
+    def submit(self, message: str, *, session_id: str | None = None) -> NexusChatJob:
+        text = (message or "").strip()
+        if not text:
+            raise ValueError("message must not be empty")
+        job = NexusChatJob(
+            id=self.id_factory(),
+            status=STATUS_QUEUED,
+            message=text,
+            session_id=session_id,
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+        self._queue.put(job.id)
+        return self.get(job.id)  # type: ignore[return-value]
+
+    def get(self, job_id: str) -> NexusChatJob | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            return NexusChatJob(
+                id=job.id,
+                status=job.status,
+                message=job.message,
+                session_id=job.session_id,
+                result=job.result,
+                error=job.error,
+            )
+
+    def _worker_loop(self) -> None:
+        while not self._closed.is_set():
+            job_id = self._queue.get()
+            if job_id is None:
+                return
+            self._run(job_id)
+
+    def _run(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != STATUS_QUEUED:
+                return
+            job.status = STATUS_RUNNING
+            message = job.message
+            session_id = job.session_id
+
+        try:
+            result = self.chat_service.handle(message, session_id=session_id)
+        except Exception as exc:
+            logger.exception("nexus_chat_job failed job_id=%s", job_id)
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is not None:
+                    job.status = STATUS_FAILED
+                    job.error = f"{type(exc).__name__}: {exc}"
+            return
+
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.status = STATUS_SUCCEEDED
+                job.result = result
+                job.session_id = result.session_id
