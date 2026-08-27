@@ -153,6 +153,8 @@ def _sync_mailbox_repo(mailbox_module: Any, repo_path: Path, max_attempts: int =
                 max_attempts,
                 fetch.returncode,
             )
+            if attempt < max_attempts:
+                continue
             return False
 
         rebase = mailbox_module._git(["rebase", "@{u}"], repo_path, check=False)
