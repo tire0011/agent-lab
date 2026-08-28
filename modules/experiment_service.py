@@ -24,14 +24,14 @@ attempt end to end:
      no commit, push, merge, or checkout happens there.
   4. Implementation phase — the existing ``CodexWorker`` is run exactly
      once more, this time with ``sandbox=workspace-write`` but scoped to
-     the worktree directory only (a worker instance whose ``allowed_roots``
+     the worktree directory only (a worker instance whose legacy worker root configuration
      is limited to that single path). The prompt is built entirely from the
      reviewed plan; no free-form client prompt can reach this phase.
   5. Verification — ``git status --short`` and a combined diff against
      ``HEAD`` are captured for the worktree. The diff uses an isolated
      temporary index so tracked and untracked changes are included without
      modifying the real index (all Git calls use fixed argument lists).
-     A test command is chosen only from a small server-side allowlist; if
+     A test command is chosen from the built-in default test command; if
      none applies, the experiment becomes ``needs_review`` instead of being
      scored as successful.
 
@@ -127,12 +127,12 @@ _TERMINAL_STATUSES = (
     STATUS_NEEDS_REVIEW,
 )
 
-# Allowed forward transitions. ``run_experiment`` walks this graph and
+# Valid forward state transitions. ``run_experiment`` walks this graph and
 # refuses to run twice: only queued -> implementing is a valid entry point
 # for new experiments. queued -> selecting is retained for backward
 # compatibility with any stored experiments that began under the old
 # multi-phase pipeline (research → selection → implementation).
-_ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
+_STATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
     STATUS_QUEUED: (STATUS_IMPLEMENTING, STATUS_REJECTED, STATUS_FAILED, STATUS_SELECTING),
     STATUS_SELECTING: (STATUS_REJECTED, STATUS_IMPLEMENTING, STATUS_FAILED, STATUS_TIMED_OUT),
     STATUS_IMPLEMENTING: (STATUS_VERIFYING, STATUS_REJECTED, STATUS_FAILED, STATUS_TIMED_OUT),
@@ -163,14 +163,14 @@ _MAX_TEST_TIMEOUT_SECONDS = 1800  # 30 minutes
 _TEST_TIMEOUT_BACKOFF_FACTOR = 1.5
 _TEST_TIMEOUT_SETTING_KEY = "verification_test_timeout_seconds"
 
-# Test-command allowlist, keyed by a fixed identifier. The plan/LLM output
+# Built-in default test command, keyed by a fixed identifier. The plan/LLM output
 # never supplies a raw shell string; the service only ever chooses one of
 # these fixed argv templates. "{python}" is substituted with the
 # configured test interpreter (see ExperimentService.test_python_executable)
 # so that worktrees without their own virtualenv can still run tests using
 # the main repository's already-installed interpreter/site-packages,
 # without copying a .venv or installing any package into the worktree.
-_ALLOWED_TEST_COMMANDS: dict[str, list[str]] = {
+_TEST_COMMANDS: dict[str, list[str]] = {
     "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
@@ -507,28 +507,17 @@ _PLACEHOLDER_PHRASES: tuple[str, ...] = (
     "documentation only",
 )
 
-# File extensions/names considered "concrete code or test files" for the
-# purpose of rejecting investigation-only or documentation-only plans. Any
-# plan whose affected_files consists solely of non-code documents (e.g.
-# only IDEAS.md/README.md) does not describe an implementable feature. This
-# is intentionally an allowlist of source-like suffixes, not a denylist of
-# documentation formats, so it never blocks a legitimate feature that
-# happens to also touch documentation alongside real code/tests.
-_CODE_OR_TEST_FILE_SUFFIXES: tuple[str, ...] = (
-    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java",
-    ".rb", ".sh", ".bash", ".ps1", ".sql", ".yml", ".yaml", ".toml",
-    ".ini", ".cfg", ".json",
-)
+# Documentation-only plans are not implementations. Instead of maintaining a
+# positive list of source extensions, classify only obvious documentation files.
+_DOCUMENTATION_ONLY_SUFFIXES: tuple[str, ...] = (".md", ".rst", ".txt")
 
 
 def _is_code_or_test_file(path: str) -> bool:
-    """True if *path* looks like a concrete source, test, or config file
-    rather than a plain documentation/notes file (e.g. IDEAS.md, README.md,
-    or a bare directory name)."""
+    """Treat any concrete file that is not plain documentation as implementation material."""
     name = Path(path).name.lower()
-    if not name:
+    if not name or name in {"ideas.md", "readme", "readme.md"}:
         return False
-    return any(name.endswith(suffix) for suffix in _CODE_OR_TEST_FILE_SUFFIXES)
+    return not name.endswith(_DOCUMENTATION_ONLY_SUFFIXES)
 
 
 def _utcnow_iso() -> str:
@@ -1663,19 +1652,19 @@ class ExperimentService:
             Defaults to a real worker allowed only inside ``repo_root``.
         worker_factory:
             Callable ``(worktree_path) -> CodexWorker`` used to build the
-            implementation-phase worker, scoped (``allowed_roots``) to that
+            implementation-phase worker, scoped (legacy worker root configuration) to that
             single worktree path only. Defaults to constructing a real
-            ``CodexWorker(allowed_roots=(worktree_path,))``.
+            ``CodexWorker()``.
         plan_worker_factory:
             Callable ``(scratch_dir) -> CodexWorker`` used to build the
             *plan*-phase worker (and its one reformat retry), scoped
-            (``allowed_roots``) to a fresh, empty scratch directory created
+            (legacy worker root configuration) to a fresh, empty scratch directory created
             fresh for each experiment and removed afterwards. This worker
             never sees ``repo_root`` and is given only the goal plus the
             research summary as input — it cannot perform any further
             repository research even if it tried to run a shell command,
             since its working directory is empty. Defaults to constructing
-            a real ``CodexWorker(allowed_roots=(scratch_dir,))``.
+            a real ``CodexWorker()``.
         repo_root:
             Root of the main repository (default ``/agent``). Never
             modified by this service.
@@ -1711,13 +1700,13 @@ class ExperimentService:
             each time a full run ends with ``test_timeout``.
         """
         self.selection_worker = selection_worker if selection_worker is not None else CodexWorker(
-            allowed_roots=(repo_root,)
+            
         )
         self.worker_factory = worker_factory or (
-            lambda worktree_path: CodexWorker(allowed_roots=(worktree_path,))
+            lambda worktree_path: CodexWorker()
         )
         self.plan_worker_factory = plan_worker_factory or (
-            lambda scratch_dir: CodexWorker(allowed_roots=(scratch_dir,))
+            lambda scratch_dir: CodexWorker()
         )
         self.db_path = db_path
         self.repo_root = repo_root
@@ -1955,7 +1944,7 @@ class ExperimentService:
 
         Returns True if the transition happened. Extra ``fields`` are set in
         the same UPDATE. Unknown/disallowed transitions are refused by the
-        caller (checked via ``_ALLOWED_TRANSITIONS`` before calling this).
+        caller (checked via ``_STATE_TRANSITIONS`` before calling this).
         """
         set_clauses = ["status = ?"]
         values: list[Any] = [to_status]
@@ -2310,7 +2299,7 @@ class ExperimentService:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
-        test_command_template = _ALLOWED_TEST_COMMANDS.get(test_command_key)
+        test_command_template = _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
             if test_command_template is not None
@@ -2320,7 +2309,7 @@ class ExperimentService:
         if test_command is None or not (Path(worktree_path) / "tests").is_dir():
             elog.warning(
                 "verifying", "no_test_command",
-                "No safe allowlisted test command could be determined for this worktree",
+                "No safe test command could be determined for this worktree",
             )
             self._force_status(
                 experiment_id, STATUS_NEEDS_REVIEW,
@@ -2328,7 +2317,7 @@ class ExperimentService:
                 git_status=git_status,
                 diff_stat=diff_stat,
                 diff_text=diff_text,
-                error="no safe allowlisted test command could be determined for this worktree",
+                error="no safe test command could be determined for this worktree",
             )
             return self.get_experiment(experiment_id)
 

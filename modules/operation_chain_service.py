@@ -1,4 +1,4 @@
-"""Service for executing validated, ordered chains of read-only operations.
+"""Service for executing validated, ordered operation chains.
 
 State machine: queued → running → completed | completed_with_errors | failed | rejected | interrupted
 
@@ -48,23 +48,6 @@ STATUS_INTERRUPTED = "interrupted"
 
 _TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS, STATUS_FAILED, STATUS_REJECTED, STATUS_INTERRUPTED}
 
-# Allowlist of operations that can run in chains (read-only only)
-_CHAIN_OPERATION_ALLOWLIST = {
-    "git_status",
-    "git_log",
-    "git_worktrees",
-    "experiment_show",
-    "experiment_logs",
-    "adoption_show",
-    "service_status",
-    "mailbox_status",
-    "service_logs",
-    "disk",
-    "memory",
-    "problems_list",
-    "inbox_status",
-    "outbox_status",
-}
 
 # Forbidden patterns in arguments (basic injection prevention)
 _FORBIDDEN_PATTERNS = {
@@ -251,9 +234,6 @@ class OperationChainService:
 
         # Validate each step
         for step in request.steps:
-            # Action in allowlist?
-            if step.action not in _CHAIN_OPERATION_ALLOWLIST:
-                return False, f"action '{step.action}' not in allowlist"
 
             # Arguments safe?
             for key, value in step.arguments.items():

@@ -16,7 +16,7 @@ from typing import Any
 from modules.experiment_evaluation import ChangedFiles, evaluate_implementation, parse_git_status_short
 from modules.experiment_service import (
     STATUS_SUCCEEDED,
-    _ALLOWED_TEST_COMMANDS,
+    _TEST_COMMANDS,
     _DEFAULT_TEST_COMMAND_KEY,
     _run_git,
     _truncate_text,
@@ -196,6 +196,12 @@ class ExperimentAdoptionService:
         self._conn = conn
 
     def close(self) -> None:
+        # Adoption pipelines run in daemon threads and use both the shared SQLite
+        # connection and temporary worktrees. Closing/removing their resources
+        # while a thread is still active can corrupt sqlite state or crash the
+        # interpreter. Join all known workers before closing the connection.
+        for thread in list(self._threads.values()):
+            thread.join(timeout=self.test_timeout_seconds + _DEFAULT_GIT_TIMEOUT_SECONDS)
         self._conn.close()
 
     def get(self, experiment_id: str) -> ExperimentAdoption:
@@ -665,7 +671,7 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            test_command_template = _ALLOWED_TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
+            test_command_template = _TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
             test_command = [part.format(python=self.experiment_service.test_python_executable) for part in test_command_template]
             test_timeout_seconds = self.experiment_service._get_test_timeout_seconds()
             test_run = run_verification_test(

@@ -39,8 +39,6 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)api[_-]?key\s*[:=]\s*\S"),
 ]
 
-ALLOWED_WRITE_PATHS = {"communication/inbox", "communication/outbox", "IDEAS.md"}
-
 # ---------------------------------------------------------------------------
 # Database migration
 # ---------------------------------------------------------------------------
@@ -203,7 +201,7 @@ class MailboxMessage:
 #
 # These return raw, unsanitized data (front matter + body text) meant only
 # for internal consumption. Callers (api.py) are responsible for applying
-# an explicit field allowlist and redaction before exposing anything in an
+# explicit public-field selection and redaction before exposing anything in an
 # HTTP response.
 # ---------------------------------------------------------------------------
 
@@ -336,28 +334,13 @@ def git_add_and_commit(
     message: str,
     extra_allowed_prefixes: frozenset[str] | None = None,
 ) -> bool:
-    """Stage only allowed files and commit. Return True on success.
+    """Stage the requested repository files and commit. Return True on success.
 
-    *extra_allowed_prefixes* may extend the module-level ``ALLOWED_WRITE_PATHS``
-    allowlist to accommodate the external-repo layout (where inbox/outbox sit
-    directly at the repository root rather than under ``communication/``).  Each
-    entry is matched against the top-level path component of the relative file
-    path; no shell globbing or traversal is permitted.
+    ``extra_allowed_prefixes`` is retained as an ignored compatibility argument.
+    Git paths are passed as argv after ``--`` and must be relative to the repo.
     """
-    effective_allowed = ALLOWED_WRITE_PATHS | (extra_allowed_prefixes or frozenset())
     for f in files:
         rel = f.relative_to(repo_path)
-        parts = str(rel).split("/")
-        # Match single-component prefix (e.g. "inbox") OR two-component prefix
-        # (e.g. "communication/inbox") OR the exact relative path (e.g. "IDEAS.md").
-        # For root-level files (len(parts)==1) top2 equals top1; that is
-        # intentional — the exact-path check further below covers those.
-        top1 = parts[0]
-        top2 = "/".join(parts[:2]) if len(parts) >= 2 else top1
-        if (top1 not in effective_allowed
-                and top2 not in effective_allowed
-                and str(rel) not in effective_allowed):
-            raise PermissionError(f"Not allowed to commit: {rel}")
         if f.exists():
             _git(["add", "--", str(rel)], repo_path)
         else:
@@ -757,9 +740,9 @@ class MailboxProcessor:
             self.repo_path = repo_path
             self.inbox = repo_path / "communication" / "inbox"
             self.outbox = repo_path / "communication" / "outbox"
-        # Compute per-instance commit allowlist from configured inbox/outbox paths
+        # Preserve configured inbox/outbox prefixes for backward-compatible calls.
         # so that external repos (direct inbox/ outbox/ layout) are handled
-        # without weakening the global ALLOWED_WRITE_PATHS constant.
+        # The commit helper no longer restricts writes to those prefixes.
         self._mailbox_commit_prefixes: frozenset[str] = frozenset(
             str(d.relative_to(self._mailbox_repo_path))
             for d in (self.inbox, self.outbox)

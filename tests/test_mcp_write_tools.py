@@ -81,36 +81,15 @@ class TestWriteEnabledGuard(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestServiceAllowlist(unittest.TestCase):
-    def test_correct_service_names(self):
-        from modules.service_operations import _ALLOWED_SERVICES
-        self.assertIn("agent-api", _ALLOWED_SERVICES)
-        self.assertIn("llama-server", _ALLOWED_SERVICES)
-        self.assertIn("nexus-mailbox", _ALLOWED_SERVICES)
+class TestServicePassthrough(unittest.TestCase):
+    def test_arbitrary_service_name_is_forwarded(self):
+        from modules.service_operations import ServiceOperations
+        async def run():
+            with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked:
+                await ServiceOperations().restart("custom-worker")
+                mocked.assert_awaited_once()
+        asyncio.run(run())
 
-    def test_old_names_removed(self):
-        from modules.service_operations import _ALLOWED_SERVICES
-        self.assertNotIn("nexus-api", _ALLOWED_SERVICES)
-        self.assertNotIn("llama", _ALLOWED_SERVICES)
-
-    def test_validate_service_rejects_unknown(self):
-        from modules.service_operations import _validate_service
-        with self.assertRaises(ValueError):
-            _validate_service("unknown-svc")
-
-    def test_validate_service_accepts_all(self):
-        from modules.service_operations import _validate_service
-        _validate_service("all")  # must not raise
-
-    def test_validate_service_accepts_known(self):
-        from modules.service_operations import _validate_service, _ALLOWED_SERVICES
-        for svc in _ALLOWED_SERVICES:
-            _validate_service(svc)  # must not raise
-
-
-# ---------------------------------------------------------------------------
-# Shell operation (OperationsExecutor.shell)
-# ---------------------------------------------------------------------------
 
 class TestShellOperation(unittest.TestCase):
     @classmethod
@@ -609,16 +588,16 @@ class TestMcpServiceRestart(unittest.TestCase):
             status="ok" if success else "error",
         )
 
-    def test_restart_unknown_service_rejected(self):
-        """ServiceOperations.restart rejects unknown service names."""
+    def test_restart_unknown_service_is_forwarded(self):
         from modules.service_operations import ServiceOperations
         svc = ServiceOperations()
-        with self.assertRaises(ValueError):
+        with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked:
             _run(svc.restart("not-a-real-service"))
+            mocked.assert_awaited_once()
 
-    def test_restart_all_uses_allowed_list(self):
-        """restart('all') iterates over the allowed set, not an arbitrary name."""
-        from modules.service_operations import _ALLOWED_SERVICES, ServiceOperations
+    def test_restart_all_uses_default_nexus_services(self):
+        """restart('all') remains a convenience for the default Nexus services."""
+        from modules.service_operations import _DEFAULT_NEXUS_SERVICES, ServiceOperations
         svc = ServiceOperations()
         called_services: list[str] = []
 
@@ -629,7 +608,7 @@ class TestMcpServiceRestart(unittest.TestCase):
         with patch("modules.service_operations._systemctl", side_effect=fake_systemctl):
             _run(svc.restart("all"))
 
-        self.assertEqual(sorted(called_services), sorted(_ALLOWED_SERVICES))
+        self.assertEqual(sorted(called_services), sorted(_DEFAULT_NEXUS_SERVICES))
 
 
 # ---------------------------------------------------------------------------

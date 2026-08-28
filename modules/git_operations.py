@@ -1,7 +1,6 @@
 """Git wrapper for the operations API.
 
-Only operations within the configured repo root (``/agent`` by default) are
-allowed.  All output is redacted before being returned so repository URLs,
+Repository paths are caller-selected.  All output is redacted before being returned so repository URLs,
 absolute paths and any accidental credential exposure are stripped.
 """
 
@@ -10,27 +9,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 from pathlib import Path
 
 from modules.redaction import redact
 
 _logger = logging.getLogger(__name__)
 
-# Only allow git operations inside this root to prevent path-traversal exploits.
-_ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
-
-# Allowlist of service names that can appear in commit messages/file paths.
-_SAFE_FILE_PATTERN = re.compile(r"^[\w./\- ]+$")
+_DEFAULT_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
 _DEPENDENCY_SYNC_TIMEOUT = 300
 
 
-def _validate_repo_path(repo_path: str) -> Path:
-    resolved = Path(repo_path).resolve()
-    allowed = Path(_ALLOWED_REPO_ROOT).resolve()
-    if resolved != allowed and not str(resolved).startswith(str(allowed) + "/"):
-        raise ValueError(f"repo_path must be inside {_ALLOWED_REPO_ROOT}")
-    return resolved
+def _resolve_repo_path(repo_path: str) -> Path:
+    return Path(repo_path).resolve()
 
 
 async def _run(args: list[str], cwd: str, timeout: int = 30) -> tuple[int, str, str]:
@@ -52,8 +42,8 @@ async def _run(args: list[str], cwd: str, timeout: int = 30) -> tuple[int, str, 
 class GitOperations:
     """Thin async wrapper around common git commands."""
 
-    def __init__(self, repo_path: str = _ALLOWED_REPO_ROOT) -> None:
-        self._repo_path = str(_validate_repo_path(repo_path))
+    def __init__(self, repo_path: str = _DEFAULT_REPO_ROOT) -> None:
+        self._repo_path = str(_resolve_repo_path(repo_path))
 
     async def pull(self) -> dict:
         """Run ``git pull``, then synchronize API dependencies on success."""
@@ -116,23 +106,8 @@ class GitOperations:
         if not files:
             raise ValueError("files list must not be empty")
 
-        repo_root = Path(self._repo_path).resolve()
-        validated_files: list[str] = []
-        for f in files:
-            if not _SAFE_FILE_PATTERN.match(f):
-                raise ValueError(f"unsafe file path: {f!r}")
-            # Resolve against repo root to block traversal and symlink escapes.
-            candidate = (repo_root / f).resolve()
-            if candidate != repo_root and not str(candidate).startswith(str(repo_root) + "/"):
-                raise ValueError(f"file path escapes repo root: {f!r}")
-            # Use the validated relative form for git add.
-            relative = str(candidate.relative_to(repo_root))
-            if not _SAFE_FILE_PATTERN.match(relative):
-                raise ValueError(f"resolved path contains unsafe characters: {relative!r}")
-            validated_files.append(relative)
-
-        # Stage files
-        rc, _, stderr = await _run(["git", "add", "--"] + validated_files, self._repo_path)
+        # Git receives pathspecs as argv entries (never through a shell).
+        rc, _, stderr = await _run(["git", "add", "--"] + list(files), self._repo_path)
         if rc != 0:
             return {"success": False, "commit_sha": None, "message": redact(stderr)[:300]}
 

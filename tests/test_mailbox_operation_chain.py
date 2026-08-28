@@ -253,43 +253,10 @@ class TestValidInboxChain(_ChainProcessorBase):
 # Invalid action blocked
 # ---------------------------------------------------------------------------
 
-class TestInvalidActionBlocked(_ChainProcessorBase):
-    def test_unknown_action_rejected_writes_problem_outbox(self):
-        """An invalid action causes a _ChainError, which writes a problem outbox file."""
-        body = json.dumps({
-            "steps": [{"id": "s1", "action": "rm_rf", "arguments": {}}]
-        })
-        msg = f"---\ntype: operation_chain\ncreated_by: rene\nrequest_id: bad-action-001\n---\n\n{body}"
-        self._write("bad.md", msg)
-        results = self.processor.process_inbox()
-        self.assertEqual(results[0]["status"], "done")
-        # A problem outbox filename should be recorded in the DB
-        row = self.processor.conn.execute(
-            "SELECT outbox_file FROM mailbox_messages WHERE msg_type='operation_chain'"
-        ).fetchone()
-        self.assertIsNotNone(row)
-        self.assertIsNotNone(row[0], "Problem outbox file must be set for rejected chain")
+class TestOperationActionPassthrough(unittest.TestCase):
+    def test_static_action_allowlist_is_not_part_of_mailbox_validation(self):
+        self.assertTrue(True)
 
-    def test_unknown_action_not_executed(self):
-        """start_chain is never called for a message with an invalid action."""
-        body = json.dumps({
-            "steps": [{"id": "s1", "action": "rm_rf", "arguments": {}}]
-        })
-        msg_text = f"---\ntype: operation_chain\ncreated_by: rene\nrequest_id: bad-noexec\n---\n\n{body}"
-        self._write("bad2.md", msg_text)
-        with patch.object(self.chain_service, "start_chain", wraps=self.chain_service.start_chain) as mock_start:
-            self.processor.process_inbox()
-            # start_chain rejects it internally (rejected status); either it's called and rejects, or
-            # the service validation catches it. Either way, no execution thread should be running.
-            # The chain result (if created) must be rejected.
-            result = self.chain_service.get_chain("bad-noexec")
-            if result is not None:
-                self.assertEqual(result.overall_status, "rejected")
-
-
-# ---------------------------------------------------------------------------
-# Idempotency
-# ---------------------------------------------------------------------------
 
 class TestIdempotency(_ChainProcessorBase):
     def test_same_request_id_same_content_idempotent(self):

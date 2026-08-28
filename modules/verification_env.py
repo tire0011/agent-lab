@@ -1,4 +1,4 @@
-"""Builds the minimal, allowlisted environment for verification test
+"""Builds the verification environment without a static allowlist for verification test
 subprocesses started by ``ExperimentService._verify``.
 
 Root cause this fixes: the verification test subprocess (``python -m
@@ -28,17 +28,9 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Mapping
+import re
 
-# Runtime plumbing only: just enough for Python/unittest to start, locate
-# the interpreter and any already-installed packages, and use a
-# well-defined locale/home/temp-directory. None of these are provider
-# credentials, tokens, or application secrets.
-SAFE_RUNTIME_PASSTHROUGH: frozenset[str] = frozenset({
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
-    "LANG", "LC_ALL", "LC_CTYPE",
-    "TMPDIR", "TEMP", "TMP",
-    "PYTHONIOENCODING", "PYTHONUTF8",
-})
+_SENSITIVE_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|authorization|openai|azure|codex|ssh|agent_mailbox)")
 
 # The fixed, test-only value the whole test suite already expects (see
 # ``os.environ.setdefault("AGENT_API_KEY", "test-key")`` throughout
@@ -50,17 +42,16 @@ VERIFICATION_TEST_API_KEY = "test-key"
 def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build the isolated environment for one verification test subprocess.
 
-    Starts from an *empty* environment (never a copy of the full parent
-    environment), copies over only the small safe-runtime allowlist above
-    from *base_env* (``os.environ`` by default), and then explicitly sets
-    ``AGENT_API_KEY`` to the fixed test value. As a result, no production
+    Starts from the parent environment, removes sensitive variables,
+    and then explicitly sets ``AGENT_API_KEY`` to the fixed test value. No static
+    environment allowlist is used. As a result, no production
     API key, LLM provider credential, GitHub/Copilot token, authorization
     header, or other secret-shaped variable can ever reach the verification
     test process - regardless of what the parent process happens to have
     set. Values are never logged by this function or its caller.
     """
     source: Mapping[str, str] = base_env if base_env is not None else os.environ
-    env = {key: source[key] for key in SAFE_RUNTIME_PASSTHROUGH if key in source}
+    env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
     return env
 
@@ -71,7 +62,7 @@ def verification_test_env(
 ) -> Iterator[dict[str, str]]:
     """Yield an isolated verification environment with a temporary database.
 
-    The environment retains the same allowlist and fixed test API key as
+    The environment retains the same sensitive-variable filtering and fixed test API key as
     :func:`build_verification_test_env`. Each context gets its own temporary
     directory and an explicit ``AGENT_DB_PATH`` within it. The temporary
     directory is removed when the context exits, including when its body

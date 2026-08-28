@@ -1,7 +1,7 @@
 """Safe log-tailing utilities for the operations API.
 
 Log files are read via ``journalctl`` (systemd) for service logs or from
-explicitly allowed on-disk log files.  Raw output is redacted before being
+on-disk log files.  Raw output is redacted before being
 returned to prevent accidental credential exposure.
 """
 
@@ -16,24 +16,12 @@ from modules.redaction import redact
 
 _logger = logging.getLogger(__name__)
 
-_ALLOWED_SERVICES: frozenset[str] = frozenset({
-    "agent-api",
-    "nexus-mailbox",
-    "llama-server",
-})
 
 _MAX_LINES = 500  # hard upper bound regardless of what caller requests
 _DEFAULT_LINES = 50
 
 # Simple pattern to identify log lines that contain an error/warning level.
 _ERROR_LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|EXCEPTION|Traceback|FAILED)\b", re.IGNORECASE)
-
-
-def _validate_service(service: str) -> None:
-    if service not in _ALLOWED_SERVICES:
-        raise ValueError(
-            f"unknown service {service!r}; allowed: {sorted(_ALLOWED_SERVICES)}"
-        )
 
 
 async def _run_journalctl(args: list[str], timeout: int = 15) -> tuple[int, str]:
@@ -56,7 +44,6 @@ class LogReader:
 
     async def tail_service_logs(self, service: str, lines: int = _DEFAULT_LINES) -> list[str]:
         """Return up to *lines* most recent log lines for *service*."""
-        _validate_service(service)
         lines = min(max(1, lines), _MAX_LINES)
         _, out = await _run_journalctl(
             ["-u", service, f"-n{lines}", "--no-pager", "--output=short-iso"],
@@ -66,7 +53,6 @@ class LogReader:
 
     async def get_error_logs(self, service: str, since_minutes: int = 60) -> list[dict]:
         """Return log lines at ERROR/CRITICAL level from the last *since_minutes* minutes."""
-        _validate_service(service)
         since_minutes = min(max(1, since_minutes), 1440)  # cap at 24 h
         since_dt = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
         since_str = since_dt.strftime("%Y-%m-%d %H:%M:%S")

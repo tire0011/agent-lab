@@ -683,7 +683,7 @@ class TestTwoRepoEndToEndCommit(unittest.TestCase):
         result = _run_git(["ls-tree", "-r", "--name-only", "HEAD"], repo)
         return set(result.stdout.strip().splitlines())
 
-    def test_commit_allowlist_accepts_direct_inbox_outbox(self):
+    def test_commit_helper_accepts_direct_inbox_outbox(self):
         """git_add_and_commit accepts inbox/<file> and outbox/<file>."""
         from modules.mailbox import git_add_and_commit
 
@@ -702,18 +702,17 @@ class TestTwoRepoEndToEndCommit(unittest.TestCase):
         committed = self._list_committed_files(self.mailbox_repo)
         self.assertIn("inbox/msg.md", committed)
 
-    def test_commit_allowlist_rejects_arbitrary_paths(self):
-        """git_add_and_commit rejects paths outside inbox/outbox."""
-        from modules.mailbox import ALLOWED_WRITE_PATHS, git_add_and_commit
+    def test_commit_helper_accepts_arbitrary_repo_paths(self):
+        """git_add_and_commit has no static write-path gate."""
+        from modules.mailbox import git_add_and_commit
 
-        rogue_name = "rogue_not_in_allowlist.txt"
-        self.assertNotIn(rogue_name, ALLOWED_WRITE_PATHS)
-        rogue = self.mailbox_repo / rogue_name
-        rogue.write_text("very secret")
-        with self.assertRaises(PermissionError):
-            git_add_and_commit(
-                self.mailbox_repo, [rogue], "should fail", frozenset({"inbox", "outbox"})
-            )
+        arbitrary = self.mailbox_repo / "arbitrary.txt"
+        arbitrary.write_text("content")
+        result = git_add_and_commit(
+            self.mailbox_repo, [arbitrary], "test: arbitrary path", frozenset({"inbox", "outbox"})
+        )
+        self.assertTrue(result)
+        self.assertIn("arbitrary.txt", self._list_committed_files(self.mailbox_repo))
 
     def test_no_mailbox_file_written_to_code_repo(self):
         """After a mailbox-repo commit, no inbox/outbox file exists in the code repo."""

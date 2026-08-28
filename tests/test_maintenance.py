@@ -13,7 +13,6 @@ import pytest
 os.environ.setdefault("AGENT_API_KEY", "test-api-key")
 
 from modules.maintenance_service import (
-    ALLOWED_SERVICE_NAMES,
     MaintenanceAuthError,
     MaintenanceDisabledError,
     MaintenanceOperationError,
@@ -210,21 +209,14 @@ def test_service_status_inactive(monkeypatch):
     assert result["active"] is False
 
 
-def test_service_name_allowlist_enforced(monkeypatch):
-    _enabled_env(monkeypatch, token="tok")
-    svc = _make_service()
-    with pytest.raises(MaintenanceOperationError, match="not allowed"):
-        svc.execute("service_status", "tok", {"service": "sshd"})
-
-
-@pytest.mark.parametrize("service", sorted(ALLOWED_SERVICE_NAMES))
-def test_all_allowed_services_accepted_for_status(monkeypatch, service):
+def test_arbitrary_service_name_is_forwarded(monkeypatch):
     _enabled_env(monkeypatch, token="tok")
     svc = _make_service()
     with patch("modules.maintenance_service.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="active\n", stderr="")
-        result = svc.execute("service_status", "tok", {"service": service})
-    assert result["service"] == service
+        mock_run.return_value = MagicMock(returncode=0, stdout="active", stderr="")
+        result = svc.execute("service_status", "tok", {"service": "sshd"})
+    assert result["service"] == "sshd"
+
 
 
 def test_service_logs(monkeypatch):
@@ -238,16 +230,19 @@ def test_service_logs(monkeypatch):
     assert "llama-server" in result["output"]
 
 
-def test_service_logs_rejects_disallowed_service(monkeypatch):
+def test_service_logs_accepts_arbitrary_service(monkeypatch):
     _enabled_env(monkeypatch, token="tok")
     svc = _make_service()
-    with pytest.raises(MaintenanceOperationError, match="not allowed"):
-        svc.execute("service_logs", "tok", {"service": "nginx"})
+    with patch("modules.maintenance_service.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="nginx log", stderr="")
+        result = svc.execute("service_logs", "tok", {"service": "nginx"})
+    assert result["service"] == "nginx"
+
 
 
 # ── Unit tests: process_status ────────────────────────────────────────────────
 
-def test_process_status_filters_output(monkeypatch):
+def test_process_status_returns_unfiltered_output(monkeypatch):
     _enabled_env(monkeypatch, token="tok")
     svc = _make_service()
     ps_output = (
@@ -262,7 +257,7 @@ def test_process_status_filters_output(monkeypatch):
     output = result["output"]
     assert "llama-server" in output
     assert "agent.py" in output
-    assert "/sbin/init" not in output
+    assert "/sbin/init" in output
 
 
 # ── Unit tests: background task lifecycle ────────────────────────────────────

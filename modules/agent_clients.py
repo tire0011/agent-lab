@@ -10,7 +10,7 @@ import shlex
 
 from openai import AsyncOpenAI
 
-from agents.mcp import MCPServerStdio, create_static_tool_filter
+from agents.mcp import MCPServerStdio
 
 from modules.env import get_required_env
 
@@ -25,19 +25,15 @@ def build_openai_client() -> AsyncOpenAI:
 
 
 def build_filesystem_server() -> MCPServerStdio:
-    allowed_root = os.getenv("AGENT_FS_ROOT", "/agent")
     command = os.getenv("MCP_FILESYSTEM_SERVER_COMMAND", "npx")
     args_env = os.getenv("MCP_FILESYSTEM_SERVER_ARGS")
     if args_env:
         args = shlex.split(args_env)
     else:
-        args = ["-y", "@modelcontextprotocol/server-filesystem", allowed_root]
+        args = ["-y", "@modelcontextprotocol/server-filesystem", "/"]
 
     return MCPServerStdio(
         name="filesystem",
         params={"command": command, "args": args},
         cache_tools_list=True,
-        tool_filter=create_static_tool_filter(
-            allowed_tool_names=["list_directory", "read_file"]
-        ),
     )

@@ -11,7 +11,7 @@ a structured result. The process is always started with:
   --sandbox <mode>     default read-only; never accepts free-form shell cmds
 
 Security constraints enforced here:
-  - Working directory must be absolute, exist, and be inside allowed_roots.
+  - Working directory must be absolute and exist.
   - No shell=True, no shell-composed command strings.
   - Outputs are capped at max_output_bytes; truncation is flagged in result.
   - No secrets or full env vars are logged.
@@ -35,7 +35,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_DEFAULT_ALLOWED_ROOTS: tuple[str, ...] = ("/agent",)
 _DEFAULT_CODEX_BIN: str = os.environ.get(
     "AGENT_CODEX_BIN", "/home/agent/.local/bin/codex"
 )
@@ -143,9 +142,6 @@ class CodexWorker:
 
     Parameters
     ----------
-    allowed_roots:
-        Absolute directory paths the working_dir must be inside.
-        Defaults to ``("/agent",)``.
     codex_bin:
         Path to the ``codex`` executable.
         Defaults to ``AGENT_CODEX_BIN`` env var or ``/home/agent/.local/bin/codex``.
@@ -159,12 +155,10 @@ class CodexWorker:
 
     def __init__(
         self,
-        allowed_roots: tuple[str, ...] = _DEFAULT_ALLOWED_ROOTS,
         codex_bin: str = _DEFAULT_CODEX_BIN,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
         db_path: str | None = None,
     ) -> None:
-        self.allowed_roots = tuple(str(r).rstrip("/") for r in allowed_roots)
         self.codex_bin = codex_bin
         self.max_output_bytes = max_output_bytes
         self._db_path = db_path
@@ -191,8 +185,7 @@ class CodexWorker:
         task:
             Natural-language coding task. Must be non-empty.
         working_dir:
-            Absolute path to the working directory. Must exist and be inside
-            one of ``allowed_roots``.
+            Absolute path to the working directory. Must exist.
         sandbox:
             One of ``read-only``, ``workspace-write``, ``danger-full-access``.
             Defaults to ``read-only``.
@@ -347,14 +340,6 @@ class CodexWorker:
         if not os.path.isdir(resolved):
             raise WorkerConfigError(
                 f"working_dir does not exist or is not a directory: {resolved!r}"
-            )
-
-        if not any(
-            resolved == root or resolved.startswith(root + "/")
-            for root in self.allowed_roots
-        ):
-            raise WorkerConfigError(
-                f"working_dir {resolved!r} is not inside allowed roots: {self.allowed_roots}"
             )
 
     # ------------------------------------------------------------------

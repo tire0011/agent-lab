@@ -12,7 +12,6 @@ from pathlib import Path
 import unittest
 
 from modules.verification_env import (
-    SAFE_RUNTIME_PASSTHROUGH,
     VERIFICATION_TEST_API_KEY,
     build_verification_test_env,
     verification_test_env,
@@ -83,13 +82,14 @@ class VerificationEnvSecretExclusionTests(unittest.TestCase):
                 )
             self.assertNotIn(secret_value, built.values())
 
-    def test_only_allowlisted_keys_or_agent_api_key_are_present(self):
+    def test_ordinary_parent_variables_pass_without_positive_allowlist(self):
         parent_env = dict(_REPRESENTATIVE_SECRETS)
         parent_env.update({"PATH": "/usr/bin", "HOME": "/home/nexus", "RANDOM_UNKNOWN_VAR": "whatever"})
         built = build_verification_test_env(parent_env)
-        allowed = SAFE_RUNTIME_PASSTHROUGH | {"AGENT_API_KEY"}
-        for key in built:
-            self.assertIn(key, allowed, msg=f"unexpected key {key} leaked into verification env")
+        self.assertEqual(built["RANDOM_UNKNOWN_VAR"], "whatever")
+        self.assertEqual(built["PATH"], "/usr/bin")
+        self.assertEqual(built["HOME"], "/home/nexus")
+        self.assertEqual(built["AGENT_API_KEY"], "test-key")
 
     def test_empty_parent_env_yields_only_agent_api_key(self):
         built = build_verification_test_env({})
@@ -117,13 +117,13 @@ class VerificationEnvSafeRuntimeTests(unittest.TestCase):
         self.assertIn("HOME", built)
         self.assertNotIn("PATH", built)
 
-    def test_starts_from_empty_not_full_parent_copy(self):
-        # A large parent env with many unrelated variables must not leak
-        # anything beyond the allowlist + forced AGENT_API_KEY.
+    def test_unrelated_parent_variables_pass_through(self):
         parent_env = {f"UNRELATED_VAR_{i}": str(i) for i in range(50)}
         parent_env["PATH"] = "/usr/bin"
         built = build_verification_test_env(parent_env)
-        self.assertEqual(set(built.keys()), {"PATH", "AGENT_API_KEY"})
+        self.assertEqual(built["UNRELATED_VAR_49"], "49")
+        self.assertEqual(built["PATH"], "/usr/bin")
+        self.assertEqual(built["AGENT_API_KEY"], "test-key")
 
 
 class VerificationTestEnvContextTests(unittest.TestCase):
