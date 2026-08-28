@@ -57,15 +57,58 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
         blocked = {ACTION_COMMAND, ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT}
         return [item for item in capabilities if item.get("name") not in blocked]
 
+    def _compact_capabilities(self) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for item in self._capabilities():
+            entry = {"name": item.get("name"), "description": item.get("description", "")}
+            if item.get("name") == "operation":
+                entry["operations"] = [{"name": op.get("operation") or op.get("name"), "description": op.get("description", ""), "arguments": [arg.get("name") for arg in op.get("arguments", []) if isinstance(arg, dict)]} for op in item.get("operations", [])]
+            elif "providers" in item:
+                entry["providers"] = [provider.get("provider") for provider in item.get("providers", [])]
+            elif "arguments" in item:
+                entry["arguments"] = item.get("arguments")
+            compact.append(entry)
+        return compact
+
+    @staticmethod
+    def _compact_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        chars = 0
+        for event in reversed(history[-10:]):
+            if event.get("role") == "tool":
+                continue
+            content = str(event.get("content", "")).strip()
+            if not content:
+                continue
+            content = content[:700]
+            if chars + len(content) > 2500 and compact:
+                break
+            compact.append({"role": event.get("role", ""), "kind": event.get("kind", ""), "content": content})
+            chars += len(content)
+            if len(compact) >= 6:
+                break
+        compact.reverse()
+        return compact
+
     def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
-        base = super()._prompt(session, current_input, history, observations)
+        import json
+        allowed_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
+        policy = "Discussion only: use read-only tools when needed; do not mutate."
         if self.allow_mutation:
-            return base + "\nCHAT POLICY: The current user message clearly requests execution. Mutating tools and experiment actions are allowed when useful.\n"
-        return base + (
-            "\nCHAT POLICY: This is discussion/analysis only. Do not execute shell commands, create experiments, "
-            "resume experiments, or make repository changes. Use read-only inspection/memory/delegation and finish with "
-            "answer, clarification, or missing_capability.\n"
-        )
+            allowed_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
+            policy = "Execution explicitly requested: mutating command/experiment actions are allowed when useful."
+        return "\n".join([
+            "You are Nexus, the persistent local chat controller. Be concise and solve the current turn with the cheapest capable path.",
+            "", "CURRENT INPUT:", current_input,
+            "", "RECENT CHAT:", json.dumps(self._compact_history(history), separators=(",", ":")),
+            "", "CAPABILITIES:", json.dumps(self._compact_capabilities(), separators=(",", ":")),
+            "", "OBSERVATIONS:", json.dumps(observations, separators=(",", ":")),
+            "", "POLICY: " + policy,
+            "Use memory/inspection only when it materially helps. Commands are tools, never final actions. After any tool result, decide again. Never invent tool results or IDs.",
+            'Tool JSON: {"type":"tool","tool":"operation|memory_search|delegate|command",...}',
+            'Final JSON: {"type":"action","action":"' + "|".join(allowed_actions) + '","experiment_id":null,"message":"...","reason":"..."}',
+            "Return JSON only.",
+        ])
 
     async def _execute_tool(self, decision: dict[str, Any]) -> dict[str, Any]:
         if not self.allow_mutation and str(decision.get("tool", "")).strip() == ACTION_COMMAND:
