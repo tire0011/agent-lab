@@ -187,6 +187,14 @@ class NexusTaskOrchestrator:
                 raise TaskOrchestratorError(f"local LLM job failed: {exc}") from exc
             self.task_store.set_status(session.id, "active")
             decision = self._parse(raw)
+            # Small local models occasionally emit the command capability with
+            # the final-action envelope (``action: command``) even though the
+            # prompt explicitly defines commands as tools. Treat that shape as
+            # the command tool instead of failing the whole persistent task.
+            if decision.get("type") != "tool" and str(decision.get("action", "")).strip().lower() == ACTION_COMMAND:
+                decision = dict(decision)
+                decision["type"] = "tool"
+                decision["tool"] = ACTION_COMMAND
             if decision.get("type") == "tool":
                 observation = await self._execute_tool(decision)
                 observations.append(observation)
