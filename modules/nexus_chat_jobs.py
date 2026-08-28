@@ -75,6 +75,10 @@ class NexusChatJobService:
         )
         with self._lock:
             self._jobs[job.id] = job
+        logger.info(
+            "nexus_chat_job submitted job_id=%s session_id=%s message_chars=%s",
+            job.id, session_id or "-", len(text),
+        )
         self._queue.put(job.id)
         return self.get(job.id)  # type: ignore[return-value]
 
@@ -108,6 +112,10 @@ class NexusChatJobService:
             message = job.message
             session_id = job.session_id
 
+        logger.info(
+            "nexus_chat_job running job_id=%s session_id=%s message_chars=%s",
+            job_id, session_id or "-", len(message),
+        )
         try:
             result = self.chat_service.handle(message, session_id=session_id)
         except Exception as exc:
@@ -117,6 +125,10 @@ class NexusChatJobService:
                 if job is not None:
                     job.status = STATUS_FAILED
                     job.error = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "nexus_chat_job failed job_id=%s session_id=%s error_type=%s",
+                job_id, session_id or "-", type(exc).__name__,
+            )
             return
 
         with self._lock:
@@ -125,3 +137,7 @@ class NexusChatJobService:
                 job.status = STATUS_SUCCEEDED
                 job.result = result
                 job.session_id = result.session_id
+        logger.info(
+            "nexus_chat_job succeeded job_id=%s session_id=%s action=%s experiment_id=%s",
+            job_id, result.session_id, result.action, result.experiment_id or "-",
+        )

@@ -26,6 +26,23 @@ class NexusChatJobServiceTests(unittest.TestCase):
         self.assertEqual(current.status, STATUS_SUCCEEDED)
         self.assertEqual(current.result.reply, "done")
 
+    def test_job_lifecycle_is_logged(self):
+        service = NexusChatJobService(FakeChatService(), id_factory=lambda: "job-log")
+        self.addCleanup(service.close)
+        with self.assertLogs("modules.nexus_chat_jobs", level="INFO") as logs:
+            service.submit("hello", session_id="s-log")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                current = service.get("job-log")
+                if current and current.status == STATUS_SUCCEEDED:
+                    break
+                time.sleep(0.01)
+
+        combined = "\n".join(logs.output)
+        self.assertIn("nexus_chat_job submitted job_id=job-log", combined)
+        self.assertIn("nexus_chat_job running job_id=job-log", combined)
+        self.assertIn("nexus_chat_job succeeded job_id=job-log", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

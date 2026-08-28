@@ -168,6 +168,29 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn('"tool":"operation"', client.prompts[1])
         self.assertIn('"operation":"experiment_show"', client.prompts[1])
 
+    def test_command_action_envelope_is_normalized_to_tool(self):
+        client = _Client([
+            '{"type":"action","action":"command","command":"git status --short",'
+            '"message":"","reason":"inspect repository"}',
+            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
+            '"message":"Repository inspected.","reason":"command result is sufficient"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\nclean\n", None),
+            ) as command_mock:
+                result = orchestrator.run("Inspect the repository")
+
+            self.assertEqual(result.action, ACTION_ANSWER)
+            command_mock.assert_called_once()
+            self.assertIn('"tool":"command"', client.prompts[1])
+            self.assertIn("clean", client.prompts[1])
+        finally:
+            orchestrator.close()
+
     def test_memory_is_a_tool_and_result_returns_to_controller(self):
         memory = _Memory([
             {
