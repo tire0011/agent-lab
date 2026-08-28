@@ -16,7 +16,7 @@ from typing import Any
 from modules.experiment_evaluation import ChangedFiles, evaluate_implementation, parse_git_status_short
 from modules.experiment_service import (
     STATUS_SUCCEEDED,
-    _ALLOWED_TEST_COMMANDS,
+    _TEST_COMMANDS,
     _DEFAULT_TEST_COMMAND_KEY,
     _run_git,
     _truncate_text,
@@ -665,7 +665,7 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            test_command_template = _ALLOWED_TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
+            test_command_template = _TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
             test_command = [part.format(python=self.experiment_service.test_python_executable) for part in test_command_template]
             test_timeout_seconds = self.experiment_service._get_test_timeout_seconds()
             test_run = run_verification_test(

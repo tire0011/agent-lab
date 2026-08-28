@@ -1,6 +1,6 @@
 """Systemd service management wrapper for the operations API.
 
-Only the explicitly whitelisted service names may be restarted or queried.
+Service names are passed through to systemd without a static application allowlist.
 All subprocess output is sanitized via :mod:`modules.redaction` before being
 returned to callers.
 """
@@ -14,14 +14,7 @@ from modules.redaction import redact
 
 _logger = logging.getLogger(__name__)
 
-# Services the agent is allowed to interact with.
-# Real VM service names: agent-api (FastAPI/uvicorn), llama-server (llama.cpp),
-# and nexus-mailbox (mailbox polling timer/service).
-_ALLOWED_SERVICES: frozenset[str] = frozenset({
-    "agent-api",
-    "nexus-mailbox",
-    "llama-server",
-})
+_DEFAULT_NEXUS_SERVICES: tuple[str, ...] = ("agent-api", "nexus-mailbox", "llama-server")
 
 _GRACEFUL_STOP_TIMEOUT = 5  # seconds before SIGKILL
 
@@ -41,20 +34,12 @@ async def _systemctl(args: list[str], timeout: int = 15) -> tuple[int, str]:
     return proc.returncode or 0, out_b.decode(errors="replace")
 
 
-def _validate_service(service: str) -> None:
-    if service not in _ALLOWED_SERVICES and service != "all":
-        raise ValueError(
-            f"unknown service {service!r}; allowed: {sorted(_ALLOWED_SERVICES) + ['all']}"
-        )
-
-
 class ServiceOperations:
-    """Async wrapper around ``systemctl`` for allowed services."""
+    """Async wrapper around ``systemctl`` without a static service allowlist."""
 
     async def restart(self, service: str) -> dict:
-        """Restart one service or all allowed services."""
-        _validate_service(service)
-        targets = list(_ALLOWED_SERVICES) if service == "all" else [service]
+        """Restart one service. ``all`` remains a convenience for Nexus services."""
+        targets = list(_DEFAULT_NEXUS_SERVICES) if service == "all" else [service]
         results: dict[str, str] = {}
         for svc in targets:
             rc, out = await _systemctl(
@@ -69,9 +54,9 @@ class ServiceOperations:
         }
 
     async def status(self) -> dict:
-        """Return status of all allowed services."""
+        """Return status of the default Nexus services."""
         result: dict[str, str] = {}
-        for svc in sorted(_ALLOWED_SERVICES):
+        for svc in _DEFAULT_NEXUS_SERVICES:
             rc, out = await _systemctl(["is-active", svc], timeout=5)
             # ``is-active`` returns 0 for active, non-zero otherwise.
             state_line = out.strip().lower()

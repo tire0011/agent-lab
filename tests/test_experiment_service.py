@@ -481,7 +481,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         mock_run.side_effect = fake_run
         custom_command = ["python", "-m", "pytest", "tests/test_placeholder.py"]
         with patch.dict(
-            "modules.experiment_service._ALLOWED_TEST_COMMANDS",
+            "modules.experiment_service._TEST_COMMANDS",
             {"unittest-discover": custom_command},
             clear=False,
         ):

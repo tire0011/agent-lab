@@ -31,7 +31,7 @@ attempt end to end:
      ``HEAD`` are captured for the worktree. The diff uses an isolated
      temporary index so tracked and untracked changes are included without
      modifying the real index (all Git calls use fixed argument lists).
-     A test command is chosen only from a small server-side allowlist; if
+     A test command is chosen from the built-in default test command; if
      none applies, the experiment becomes ``needs_review`` instead of being
      scored as successful.
 
@@ -163,14 +163,14 @@ _MAX_TEST_TIMEOUT_SECONDS = 1800  # 30 minutes
 _TEST_TIMEOUT_BACKOFF_FACTOR = 1.5
 _TEST_TIMEOUT_SETTING_KEY = "verification_test_timeout_seconds"
 
-# Test-command allowlist, keyed by a fixed identifier. The plan/LLM output
+# Built-in default test command, keyed by a fixed identifier. The plan/LLM output
 # never supplies a raw shell string; the service only ever chooses one of
 # these fixed argv templates. "{python}" is substituted with the
 # configured test interpreter (see ExperimentService.test_python_executable)
 # so that worktrees without their own virtualenv can still run tests using
 # the main repository's already-installed interpreter/site-packages,
 # without copying a .venv or installing any package into the worktree.
-_ALLOWED_TEST_COMMANDS: dict[str, list[str]] = {
+_TEST_COMMANDS: dict[str, list[str]] = {
     "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
@@ -2310,7 +2310,7 @@ class ExperimentService:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
-        test_command_template = _ALLOWED_TEST_COMMANDS.get(test_command_key)
+        test_command_template = _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
             if test_command_template is not None

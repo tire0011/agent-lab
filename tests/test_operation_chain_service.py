@@ -26,7 +26,6 @@ from modules.operation_chain_service import (
     STATUS_RUNNING,
     STATUS_QUEUED,
     STATUS_INTERRUPTED,
-    _CHAIN_OPERATION_ALLOWLIST,
 )
 from modules.operations_registry import OperationsRegistry
 from modules.run_store import init_db
@@ -111,13 +110,17 @@ class TestOperationChainService:
         assert result.overall_status == STATUS_REJECTED
         assert result.rejection_reason is not None
 
-    def test_action_not_in_allowlist_rejected(self, service):
-        """Test chain with forbidden action is rejected."""
-        request = OperationChainRequest(
-            steps=[OperationChainStep(id="step1", action="git_commit")]  # Not allowed
-        )
+    def test_future_operation_name_is_not_pre_rejected(self, service, mock_registry):
+        request = OperationChainRequest(steps=[OperationChainStep(id="step1", action="local_model_status")])
         result = service.start_chain(request)
-        assert result.overall_status == STATUS_REJECTED
+        assert result.overall_status == STATUS_QUEUED
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            current = service.get_chain(result.request_id)
+            if current and current.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS):
+                break
+            time.sleep(0.01)
+        mock_registry.execute.assert_called_with("local_model_status", {})
 
     def test_max_ten_steps_limit_rejected(self, service):
         """Test chain with >10 steps is rejected."""

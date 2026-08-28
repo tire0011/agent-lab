@@ -177,10 +177,12 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("not exist", result.error)
 
-    def test_disallowed_working_dir_rejected(self):
-        result = self.worker.run("do thing", "/tmp")
-        self.assertFalse(result.success)
-        self.assertIn("allowed roots", result.error)
+    def test_existing_working_dir_outside_old_roots_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = CodexWorker(allowed_roots=("/definitely/not/here",), codex_bin="/fake/codex")
+            result = worker.run("test", tmpdir)
+            self.assertNotIn("allowed roots", result.error or "")
+            self.assertIn("Codex binary not found", result.error or "")
 
     def test_invalid_sandbox_rejected(self):
         result = self.worker.run("do thing", self.tmp.name, sandbox="invalid-mode")

@@ -1,7 +1,7 @@
 """Central executor for self-healing operations.
 
 All operations are:
-* validated against an explicit allowlist,
+* dispatched through the registered operation implementation,
 * run with a timeout,
 * logged to the ``operation_log`` SQLite table via :func:`modules.run_store.log_operation`.
 
@@ -121,7 +121,7 @@ def _redact_audit_dict(d: dict | None) -> dict:
 
 _logger = logging.getLogger(__name__)
 
-_ALLOWED_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
+_REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
 
 # Shell tool limits (bootstrap-phase only, available when MCP_WRITE_ENABLED=true).
 _SHELL_MAX_TIMEOUT: int = 120         # hard ceiling in seconds
@@ -194,14 +194,14 @@ _SECRET_ENV_VARS: frozenset[str] = frozenset({
 
 # Directories where stale temp files are cleaned up.
 _TEMP_DIRS: list[str] = [
-    os.path.join(_ALLOWED_REPO_ROOT, "tmp"),
+    os.path.join(_REPO_ROOT, "tmp"),
     "/tmp/nexus-work",
 ]
 
 # Lock file patterns to clean.
 _LOCK_PATTERNS: list[str] = [
-    os.path.join(_ALLOWED_REPO_ROOT, "**", "*.lock"),
-    os.path.join(_ALLOWED_REPO_ROOT, "state", "*.lock"),
+    os.path.join(_REPO_ROOT, "**", "*.lock"),
+    os.path.join(_REPO_ROOT, "state", "*.lock"),
 ]
 
 
@@ -377,7 +377,7 @@ class OperationsExecutor:
 
         # Check disk usage
         try:
-            stat = shutil.disk_usage(_ALLOWED_REPO_ROOT)
+            stat = shutil.disk_usage(_REPO_ROOT)
             pct = stat.used / stat.total * 100
             if pct > 90:
                 problems.append({
@@ -426,7 +426,7 @@ class OperationsExecutor:
         """Write a non-secret config key to the environment config file."""
         if re.search(r"(?i)(key|secret|token|password|credential)", key):
             raise ValueError(f"refusing to store secret-like key: {key!r}")
-        config_path = Path(_ALLOWED_REPO_ROOT) / ".env.config"
+        config_path = Path(_REPO_ROOT) / ".env.config"
         lines: list[str] = []
         if config_path.exists():
             lines = config_path.read_text().splitlines()

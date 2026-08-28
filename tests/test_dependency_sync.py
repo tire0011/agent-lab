@@ -82,16 +82,15 @@ class TestOperationsGitPullDependencySync(unittest.TestCase):
         import modules.git_operations as git_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.object(git_module, "_ALLOWED_REPO_ROOT", tmpdir):
-                git = git_module.GitOperations(tmpdir)
-                run = AsyncMock(
-                    side_effect=[
-                        (0, "Already up to date.\n", ""),
-                        (0, "API dependency sync complete\n", ""),
-                    ]
-                )
-                with patch("modules.git_operations._run", new=run):
-                    result = _run(git.pull())
+            git = git_module.GitOperations(tmpdir)
+            run = AsyncMock(
+                side_effect=[
+                    (0, "Already up to date.\n", ""),
+                    (0, "API dependency sync complete\n", ""),
+                ]
+            )
+            with patch("modules.git_operations._run", new=run):
+                result = _run(git.pull())
 
         self.assertTrue(result["success"])
         self.assertEqual(run.await_count, 2)
@@ -103,16 +102,15 @@ class TestOperationsGitPullDependencySync(unittest.TestCase):
         import modules.git_operations as git_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.object(git_module, "_ALLOWED_REPO_ROOT", tmpdir):
-                git = git_module.GitOperations(tmpdir)
-                run = AsyncMock(
-                    side_effect=[
-                        (0, "Already up to date.\n", ""),
-                        (17, "", "pip install failed"),
-                    ]
-                )
-                with patch("modules.git_operations._run", new=run):
-                    result = _run(git.pull())
+            git = git_module.GitOperations(tmpdir)
+            run = AsyncMock(
+                side_effect=[
+                    (0, "Already up to date.\n", ""),
+                    (17, "", "pip install failed"),
+                ]
+            )
+            with patch("modules.git_operations._run", new=run):
+                result = _run(git.pull())
 
         self.assertFalse(result["success"])
         self.assertIn("dependency synchronization failed", result["message"])
