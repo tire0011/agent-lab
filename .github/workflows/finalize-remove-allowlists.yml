@@ -1,0 +1,50 @@
+name: Finalize allowlist removal
+on:
+  push:
+    branches: [fix/remove-all-static-allowlists]
+    paths: [.github/workflows/finalize-remove-allowlists.yml]
+permissions:
+  contents: write
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remove-all-static-allowlists
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply product allowlist cleanup
+        shell: python
+        run: |
+          from pathlib import Path
+          import textwrap
+          workflow = Path('.github/workflows/remove-mailbox-write-allowlist.yml').read_text()
+          marker = '      - name: Remove remaining positive allowlists\n        shell: python\n        run: |\n'
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index('\n      - name: Compile changed modules', start)
+          block = textwrap.dedent(workflow[start:end])
+          exec(compile(block, '<allowlist-cleanup>', 'exec'), {})
+      - name: Migrate tests to open behavior
+        run: python scripts/fix_allowlist_tests.py
+      - name: Compile changed modules
+        run: python -m py_compile modules/mailbox.py modules/maintenance_service.py modules/agent_clients.py modules/operations_executor.py modules/experiment_service.py modules/codex_worker.py modules/nexus_chat_service.py
+      - name: Audit remaining positive-gate terminology
+        run: grep -RniE 'allowlist|whitelist|_ALLOWED_|ALLOWED_|allowed_roots|allowed_tool_names|allowed_models' modules --exclude-dir=__pycache__ || true
+      - name: Install tests
+        run: python -m pip install -r requirements-test.txt
+      - name: Full suite
+        env:
+          AGENT_API_KEY: test-key
+          AGENT_DB_PATH: ${{ runner.temp }}/nexus-test/agent.db
+        run: python scripts/run_tests_ci.py
+      - name: Commit final result and remove temporary tooling
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add modules tests
+          git commit -m "Remove remaining positive allowlists"
+          git rm scripts/fix_allowlist_tests.py .github/workflows/remove-mailbox-write-allowlist.yml .github/workflows/finalize-remove-allowlists.yml
+          git commit -m "Remove temporary allowlist cleanup tooling"
+          git push origin HEAD:fix/remove-all-static-allowlists
