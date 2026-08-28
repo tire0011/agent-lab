@@ -2,7 +2,9 @@ name: Finalize allowlist removal
 on:
   push:
     branches: [fix/remove-all-static-allowlists]
-    paths: [.github/workflows/finalize-remove-allowlists.yml]
+    paths:
+      - .github/workflows/finalize-remove-allowlists.yml
+      - scripts/fix_allowlist_tests.py
 permissions:
   contents: write
 jobs:
