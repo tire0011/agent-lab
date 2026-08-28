@@ -1,0 +1,47 @@
+name: Remove mailbox write allowlist
+on:
+  push:
+    branches: [fix/remove-all-static-allowlists]
+    paths: [.github/workflows/remove-mailbox-write-allowlist.yml]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remove-all-static-allowlists
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Remove mailbox path allowlist
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('modules/mailbox.py')
+          t = p.read_text()
+          t = t.replace('ALLOWED_WRITE_PATHS = {"communication/inbox", "communication/outbox", "IDEAS.md"}\n\n', '')
+          old = '''    """Stage only allowed files and commit. Return True on success.\n\n    *extra_allowed_prefixes* may extend the module-level ``ALLOWED_WRITE_PATHS``\n    allowlist to accommodate the external-repo layout (where inbox/outbox sit\n    directly at the repository root rather than under ``communication/``).  Each\n    entry is matched against the top-level path component of the relative file\n    path; no shell globbing or traversal is permitted.\n    """\n    effective_allowed = ALLOWED_WRITE_PATHS | (extra_allowed_prefixes or frozenset())\n    for f in files:\n        rel = f.relative_to(repo_path)\n        parts = str(rel).split("/")\n        # Match single-component prefix (e.g. "inbox") OR two-component prefix\n        # (e.g. "communication/inbox") OR the exact relative path (e.g. "IDEAS.md").\n        # For root-level files (len(parts)==1) top2 equals top1; that is\n        # intentional — the exact-path check further below covers those.\n        top1 = parts[0]\n        top2 = "/".join(parts[:2]) if len(parts) >= 2 else top1\n        if (top1 not in effective_allowed\n                and top2 not in effective_allowed\n                and str(rel) not in effective_allowed):\n            raise PermissionError(f"Not allowed to commit: {rel}")\n        if f.exists():\n'''
+          new = '''    """Stage the requested repository files and commit. Return True on success.\n\n    ``extra_allowed_prefixes`` is retained as an ignored compatibility argument;\n    mailbox commits no longer use a static path allowlist. Git paths are still\n    passed as argv after ``--`` and must be relative to the repository.\n    """\n    for f in files:\n        rel = f.relative_to(repo_path)\n        if f.exists():\n'''
+          if old not in t:
+              raise SystemExit('mailbox allowlist block not found')
+          p.write_text(t.replace(old, new))
+      - name: Audit remaining allowlist wording
+        run: grep -RniE 'allowlist|whitelist|_ALLOWED_|ALLOWED_' modules || true
+      - name: Install tests
+        run: python -m pip install -r requirements-test.txt
+      - name: Full suite
+        env:
+          AGENT_API_KEY: test-key
+          AGENT_DB_PATH: ${{ runner.temp }}/nexus-test/agent.db
+        run: python scripts/run_tests_ci.py
+      - name: Commit and remove helper
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add modules/mailbox.py
+          git commit -m "Remove mailbox write path allowlist"
+          git rm .github/workflows/remove-mailbox-write-allowlist.yml
+          git commit -m "Remove temporary mailbox allowlist workflow"
+          git push origin HEAD:fix/remove-all-static-allowlists
