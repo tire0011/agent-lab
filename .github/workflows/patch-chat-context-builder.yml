@@ -19,24 +19,131 @@ jobs:
 
           path = Path('modules/nexus_chat_service.py')
           text = path.read_text()
-          old = '''    def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:\n        base = super()._prompt(session, current_input, history, observations)\n        if self.allow_mutation:\n            return base + "\\nCHAT POLICY: The current user message clearly requests execution. Mutating tools and experiment actions are allowed when useful.\\n"\n        return base + (\n            "\\nCHAT POLICY: This is discussion/analysis only. Do not execute shell commands, create experiments, "\n            "resume experiments, or make repository changes. Use read-only inspection/memory/delegation and finish with "\n            "answer, clarification, or missing_capability.\\n"\n        )\n'''
-          new = '''    def _compact_capabilities(self) -> list[dict[str, Any]]:\n        compact: list[dict[str, Any]] = []\n        for item in self._capabilities():\n            entry = {"name": item.get("name"), "description": item.get("description", "")}\n            if item.get("name") == "operation":\n                entry["operations"] = [\n                    {\n                        "name": op.get("operation") or op.get("name"),\n                        "description": op.get("description", ""),\n                        "arguments": [arg.get("name") for arg in op.get("arguments", []) if isinstance(arg, dict)],\n                    }\n                    for op in item.get("operations", [])\n                ]\n            elif "providers" in item:\n                entry["providers"] = [provider.get("provider") for provider in item.get("providers", [])]\n            elif "arguments" in item:\n                entry["arguments"] = item.get("arguments")\n            compact.append(entry)\n        return compact\n\n    @staticmethod\n    def _compact_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:\n        compact: list[dict[str, Any]] = []\n        chars = 0\n        for event in reversed(history[-10:]):\n            if event.get("role") == "tool":\n                continue\n            content = str(event.get("content", "")).strip()\n            if not content:\n                continue\n            content = content[:700]\n            if chars + len(content) > 2500 and compact:\n                break\n            compact.append({"role": event.get("role", ""), "kind": event.get("kind", ""), "content": content})\n            chars += len(content)\n            if len(compact) >= 6:\n                break\n        compact.reverse()\n        return compact\n\n    def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:\n        import json\n\n        allowed_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]\n        policy = "Discussion only: use read-only tools when needed; do not mutate."\n        if self.allow_mutation:\n            allowed_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]\n            policy = "Execution explicitly requested: mutating command/experiment actions are allowed when useful."\n\n        return f'''You are Nexus, the persistent local chat controller. Be concise and solve the current turn with the cheapest capable path.\n\nCURRENT INPUT:\n{current_input}\n\nRECENT CHAT:\n{json.dumps(self._compact_history(history), separators=(",", ":"))}\n\nCAPABILITIES:\n{json.dumps(self._compact_capabilities(), separators=(",", ":"))}\n\nOBSERVATIONS:\n{json.dumps(observations, separators=(",", ":"))}\n\nPOLICY: {policy}\nUse memory/inspection only when it materially helps. Commands are tools, never final actions. After any tool result, decide again. Never invent tool results or IDs.\nTool JSON: {{"type":"tool","tool":"operation|memory_search|delegate|command",...}}\nFinal JSON: {{"type":"action","action":"{'|'.join(allowed_actions)}","experiment_id":null,"message":"...","reason":"..."}}\nReturn JSON only.'''\n'''
-          if old not in text:
-              raise SystemExit('target _prompt block not found')
-          path.write_text(text.replace(old, new))
+          start = text.index('    def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:\n', text.index('class _ChatOrchestrator'))
+          end = text.index('    async def _execute_tool', start)
+          new = r'''    def _compact_capabilities(self) -> list[dict[str, Any]]:
+              compact: list[dict[str, Any]] = []
+              for item in self._capabilities():
+                  entry = {"name": item.get("name"), "description": item.get("description", "")}
+                  if item.get("name") == "operation":
+                      entry["operations"] = [
+                          {
+                              "name": op.get("operation") or op.get("name"),
+                              "description": op.get("description", ""),
+                              "arguments": [arg.get("name") for arg in op.get("arguments", []) if isinstance(arg, dict)],
+                          }
+                          for op in item.get("operations", [])
+                      ]
+                  elif "providers" in item:
+                      entry["providers"] = [provider.get("provider") for provider in item.get("providers", [])]
+                  elif "arguments" in item:
+                      entry["arguments"] = item.get("arguments")
+                  compact.append(entry)
+              return compact
 
-          test = Path('tests/test_nexus_chat_service.py')
-          t = test.read_text()
-          marker = '\n\nif __name__ == "__main__":\n'
-          addition = '''\n    def test_chat_prompt_is_compact_and_keeps_recent_context(self):\n        orchestrator = _ChatOrchestrator(\n            operations_registry=self.registry,\n            experiment_service=self.experiment_service,\n            allow_mutation=False,\n            llama_client=MagicMock(),\n        )\n        try:\n            history = [\n                {"role": "user", "kind": "input", "content": f"old-{i}-" + ("x" * 500)}\n                for i in range(12)\n            ]\n            prompt = orchestrator._prompt(SimpleNamespace(), "Hallo Nexus", history, [])\n            self.assertLess(len(prompt), 5000)\n            self.assertIn("Hallo Nexus", prompt)\n            self.assertIn("old-11-", prompt)\n            self.assertNotIn("old-0-", prompt)\n            self.assertIn("Discussion only", prompt)\n        finally:\n            orchestrator.close()\n\n    def test_execution_chat_prompt_keeps_mutating_actions_available(self):\n        orchestrator = _ChatOrchestrator(\n            operations_registry=self.registry,\n            experiment_service=self.experiment_service,\n            allow_mutation=True,\n            llama_client=MagicMock(),\n        )\n        try:\n            prompt = orchestrator._prompt(SimpleNamespace(), "Mach das", [], [])\n            self.assertIn("new_experiment", prompt)\n            self.assertIn("resume_experiment", prompt)\n            self.assertIn("Execution explicitly requested", prompt)\n            self.assertIn("command", prompt)\n        finally:\n            orchestrator.close()\n'''
-          if marker not in t:
-              raise SystemExit('test marker not found')
-          test.write_text(t.replace(marker, addition + marker))
+          @staticmethod
+          def _compact_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+              compact: list[dict[str, Any]] = []
+              chars = 0
+              for event in reversed(history[-10:]):
+                  if event.get("role") == "tool":
+                      continue
+                  content = str(event.get("content", "")).strip()
+                  if not content:
+                      continue
+                  content = content[:700]
+                  if chars + len(content) > 2500 and compact:
+                      break
+                  compact.append({"role": event.get("role", ""), "kind": event.get("kind", ""), "content": content})
+                  chars += len(content)
+                  if len(compact) >= 6:
+                      break
+              compact.reverse()
+              return compact
+
+          def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
+              import json
+
+              allowed_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
+              policy = "Discussion only: use read-only tools when needed; do not mutate."
+              if self.allow_mutation:
+                  allowed_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
+                  policy = "Execution explicitly requested: mutating command/experiment actions are allowed when useful."
+              return "\n".join([
+                  "You are Nexus, the persistent local chat controller. Be concise and solve the current turn with the cheapest capable path.",
+                  "",
+                  "CURRENT INPUT:", current_input,
+                  "",
+                  "RECENT CHAT:", json.dumps(self._compact_history(history), separators=(",", ":")),
+                  "",
+                  "CAPABILITIES:", json.dumps(self._compact_capabilities(), separators=(",", ":")),
+                  "",
+                  "OBSERVATIONS:", json.dumps(observations, separators=(",", ":")),
+                  "",
+                  "POLICY: " + policy,
+                  "Use memory/inspection only when it materially helps. Commands are tools, never final actions. After any tool result, decide again. Never invent tool results or IDs.",
+                  'Tool JSON: {"type":"tool","tool":"operation|memory_search|delegate|command",...}',
+                  'Final JSON: {"type":"action","action":"' + "|".join(allowed_actions) + '","experiment_id":null,"message":"...","reason":"..."}',
+                  "Return JSON only.",
+              ])
+
+          '''
+          path.write_text(text[:start] + new + text[end:])
+
+          test = Path('tests/test_nexus_chat_context.py')
+          test.write_text(r'''import unittest
+          from types import SimpleNamespace
+          from unittest.mock import MagicMock
+
+          from modules.nexus_chat_service import _ChatOrchestrator
+
+
+          class ChatContextTests(unittest.TestCase):
+              def _orchestrator(self, allow_mutation=False):
+                  registry = MagicMock()
+                  registry.catalog.return_value = []
+                  registry.db_path = ':memory:'
+                  registry.repo_root = '/tmp'
+                  return _ChatOrchestrator(
+                      operations_registry=registry,
+                      experiment_service=MagicMock(),
+                      allow_mutation=allow_mutation,
+                      llama_client=MagicMock(),
+                  )
+
+              def test_chat_prompt_is_compact_and_keeps_recent_context(self):
+                  orchestrator = self._orchestrator(False)
+                  try:
+                      history = [{"role":"user","kind":"input","content":f"old-{i}-" + ("x" * 500)} for i in range(12)]
+                      prompt = orchestrator._prompt(SimpleNamespace(), "Hallo Nexus", history, [])
+                      self.assertLess(len(prompt), 5000)
+                      self.assertIn("Hallo Nexus", prompt)
+                      self.assertIn("old-11-", prompt)
+                      self.assertNotIn("old-0-", prompt)
+                      self.assertIn("Discussion only", prompt)
+                  finally:
+                      orchestrator.close()
+
+              def test_execution_prompt_keeps_mutating_actions(self):
+                  orchestrator = self._orchestrator(True)
+                  try:
+                      prompt = orchestrator._prompt(SimpleNamespace(), "Mach das", [], [])
+                      self.assertIn("new_experiment", prompt)
+                      self.assertIn("resume_experiment", prompt)
+                      self.assertIn("command", prompt)
+                      self.assertIn("Execution explicitly requested", prompt)
+                  finally:
+                      orchestrator.close()
+
+
+          if __name__ == '__main__':
+              unittest.main()
+          '''.replace('\n          ', '\n'))
       - name: Commit patch and remove workflow
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add modules/nexus_chat_service.py tests/test_nexus_chat_service.py
+          git add modules/nexus_chat_service.py tests/test_nexus_chat_context.py
           git commit -m "Compact Nexus chat context for all chat clients"
           git rm .github/workflows/patch-chat-context-builder.yml
           git commit -m "Remove temporary chat context patch workflow"
