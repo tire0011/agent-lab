@@ -34,7 +34,7 @@ t = re.sub(
     _enabled_env(monkeypatch, token="tok")
     svc = _make_service()
     with patch("modules.maintenance_service.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="active\\n", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="active", stderr="")
         result = svc.execute("service_status", "tok", {"service": "sshd"})
     assert result["service"] == "sshd"
 
@@ -50,7 +50,7 @@ t = re.sub(
     _enabled_env(monkeypatch, token="tok")
     svc = _make_service()
     with patch("modules.maintenance_service.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="nginx log\\n", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="nginx log", stderr="")
         result = svc.execute("service_logs", "tok", {"service": "nginx"})
     assert result["service"] == "nginx"
 
