@@ -92,10 +92,10 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
 
     def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
         import json
-        allowed_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
+        final_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
         policy = "Discussion only: use read-only tools when needed; do not mutate."
         if self.allow_mutation:
-            allowed_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
+            final_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
             policy = "Execution explicitly requested: mutating command/experiment actions are allowed when useful."
         return "\n".join([
             "You are Nexus, the persistent local chat controller. Be concise and solve the current turn with the cheapest capable path.",
@@ -106,7 +106,7 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
             "", "POLICY: " + policy,
             "Use memory/inspection only when it materially helps. Commands are tools, never final actions. After any tool result, decide again. Never invent tool results or IDs.",
             'Tool JSON: {"type":"tool","tool":"operation|memory_search|delegate|command",...}',
-            'Final JSON: {"type":"action","action":"' + "|".join(allowed_actions) + '","experiment_id":null,"message":"...","reason":"..."}',
+            'Final JSON: {"type":"action","action":"' + "|".join(final_actions) + '","experiment_id":null,"message":"...","reason":"..."}',
             "Return JSON only.",
         ])
 

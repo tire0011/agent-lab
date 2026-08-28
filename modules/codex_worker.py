@@ -142,8 +142,6 @@ class CodexWorker:
 
     Parameters
     ----------
-    allowed_roots:
-        Deprecated compatibility argument; no longer restricts working directories.
     codex_bin:
         Path to the ``codex`` executable.
         Defaults to ``AGENT_CODEX_BIN`` env var or ``/home/agent/.local/bin/codex``.
@@ -157,13 +155,10 @@ class CodexWorker:
 
     def __init__(
         self,
-        allowed_roots: tuple[str, ...] | None = None,
         codex_bin: str = _DEFAULT_CODEX_BIN,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
         db_path: str | None = None,
     ) -> None:
-        # Deprecated compatibility field; no application root allowlist is enforced.
-        self.allowed_roots = tuple(allowed_roots or ())
         self.codex_bin = codex_bin
         self.max_output_bytes = max_output_bytes
         self._db_path = db_path

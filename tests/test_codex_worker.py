@@ -27,7 +27,6 @@ from modules.codex_worker import (
 
 def _make_worker(**kwargs) -> CodexWorker:
     defaults = dict(
-        allowed_roots=("/agent",),
         codex_bin="/fake/codex",
         max_output_bytes=64 * 1024,
         db_path=None,
@@ -154,7 +153,7 @@ class TruncateTests(unittest.TestCase):
 class ValidationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.worker = _make_worker(allowed_roots=(self.tmp.name,))
+        self.worker = _make_worker()
         self.addCleanup(self.tmp.cleanup)
 
     def test_empty_task_rejected(self):
@@ -179,7 +178,7 @@ class ValidationTests(unittest.TestCase):
 
     def test_existing_working_dir_outside_old_roots_is_allowed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            worker = CodexWorker(allowed_roots=("/definitely/not/here",), codex_bin="/fake/codex")
+            worker = CodexWorker(codex_bin="/fake/codex")
             result = worker.run("test", tmpdir)
             self.assertNotIn("allowed roots", result.error or "")
             self.assertIn("Codex binary not found", result.error or "")
@@ -193,7 +192,7 @@ class ValidationTests(unittest.TestCase):
         subdir = Path(self.tmp.name) / "sub"
         subdir.mkdir()
         # Should not be rejected at validation (will fail later at process launch)
-        worker = _make_worker(allowed_roots=(self.tmp.name,))
+        worker = _make_worker()
         with patch("subprocess.run", return_value=_completed_proc(stdout=SAMPLE_JSONL)):
             result = worker.run("do thing", str(subdir))
         self.assertIsNone(result.error)
@@ -206,7 +205,7 @@ class ValidationTests(unittest.TestCase):
 class SuccessfulRunTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.worker = _make_worker(allowed_roots=(self.tmp.name,))
+        self.worker = _make_worker()
         self.addCleanup(self.tmp.cleanup)
 
     @patch("subprocess.run")
@@ -230,7 +229,7 @@ class SuccessfulRunTests(unittest.TestCase):
         # turn.completed event (which carries usage) must still be parsed
         # from the *full* stdout, not from the truncated copy that is
         # stored/displayed.
-        worker = _make_worker(allowed_roots=(self.tmp.name,), max_output_bytes=200)
+        worker = _make_worker(max_output_bytes=200)
         noise_line = json.dumps({
             "type": "item.completed",
             "item": {"id": "noise", "type": "agent_message", "text": "x" * 500},
@@ -420,7 +419,7 @@ class SuccessfulRunTests(unittest.TestCase):
 class NonZeroExitTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.worker = _make_worker(allowed_roots=(self.tmp.name,))
+        self.worker = _make_worker()
         self.addCleanup(self.tmp.cleanup)
 
     @patch("subprocess.run")
@@ -442,7 +441,7 @@ class NonZeroExitTests(unittest.TestCase):
 class TimeoutTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.worker = _make_worker(allowed_roots=(self.tmp.name,))
+        self.worker = _make_worker()
         self.addCleanup(self.tmp.cleanup)
 
     @patch("subprocess.run")
@@ -467,7 +466,6 @@ class MissingBinaryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.worker = _make_worker(
-            allowed_roots=(self.tmp.name,),
             codex_bin="/does/not/exist/codex",
         )
         self.addCleanup(self.tmp.cleanup)
@@ -489,7 +487,6 @@ class OutputTruncationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.worker = _make_worker(
-            allowed_roots=(self.tmp.name,),
             max_output_bytes=50,
         )
         self.addCleanup(self.tmp.cleanup)
@@ -517,7 +514,6 @@ class OutputTruncationTests(unittest.TestCase):
     def test_small_output_not_truncated(self, mock_run):
         mock_run.return_value = _completed_proc(stdout=SAMPLE_JSONL, returncode=0)
         worker = _make_worker(
-            allowed_roots=(self.tmp.name,),
             max_output_bytes=64 * 1024,
         )
         result = worker.run("task", self.tmp.name)
@@ -537,7 +533,7 @@ class ToDictTests(unittest.TestCase):
 
     @patch("subprocess.run")
     def test_to_dict_is_json_serializable(self, mock_run):
-        worker = _make_worker(allowed_roots=(self.tmp.name,))
+        worker = _make_worker()
         mock_run.return_value = _completed_proc(stdout=SAMPLE_JSONL, returncode=0)
         result = worker.run("task", self.tmp.name)
         d = result.to_dict()

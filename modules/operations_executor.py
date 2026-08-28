@@ -465,15 +465,14 @@ class OperationsExecutor:
 
     async def test_model(self, model: str, prompt: str) -> dict:
         """Send a minimal test prompt to the given model."""
-        allowed_models = {"azure_gpt4o", "llama"}
-        if model not in allowed_models:
-            raise ValueError(f"model must be one of {sorted(allowed_models)}")
         if len(prompt) > 500:
             raise ValueError("prompt must be <= 500 characters")
 
         if model == "azure_gpt4o":
             return await self._test_azure_gpt4o(prompt)
-        return await self._test_llama(prompt)
+        if model == "llama":
+            return await self._test_llama(prompt)
+        raise ValueError(f"no model adapter is registered for {model!r}")
 
     async def _test_azure_gpt4o(self, prompt: str) -> dict:
         try:

@@ -196,6 +196,12 @@ class ExperimentAdoptionService:
         self._conn = conn
 
     def close(self) -> None:
+        # Adoption pipelines run in daemon threads and use both the shared SQLite
+        # connection and temporary worktrees. Closing/removing their resources
+        # while a thread is still active can corrupt sqlite state or crash the
+        # interpreter. Join all known workers before closing the connection.
+        for thread in list(self._threads.values()):
+            thread.join(timeout=self.test_timeout_seconds + _DEFAULT_GIT_TIMEOUT_SECONDS)
         self._conn.close()
 
     def get(self, experiment_id: str) -> ExperimentAdoption:

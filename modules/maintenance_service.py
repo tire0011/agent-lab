@@ -72,8 +72,6 @@ except ImportError:  # pragma: no cover
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-ALLOWED_SERVICE_NAMES = frozenset({"llama-server", "agent-api"})
-ALLOWED_PROCESS_PATTERNS = ("llama-server", "llama_server", "agent.py", "nexus", "uvicorn")
 _MAX_LOG_LINES = 200
 _MAX_OUTPUT_CHARS = 8000
 _MAX_AUDIT_ENTRIES = 500
@@ -427,13 +425,7 @@ class MaintenanceService:
                 timeout=_OP_TIMEOUTS["process_status"],
             )
             lines = result.stdout.splitlines()
-            # First line is the header; then filter for known patterns.
-            header = lines[0] if lines else ""
-            filtered = [
-                l for l in lines[1:]
-                if any(pat in l for pat in ALLOWED_PROCESS_PATTERNS)
-            ]
-            output = "\n".join([header] + filtered[:50])
+            output = "\n".join(lines[:50])
         except Exception as exc:  # noqa: BLE001
             output = f"ps error: {exc}"
         return {"output": _redact(output)}
@@ -467,11 +459,9 @@ class MaintenanceService:
             )
 
     def _validate_service(self, service: Any) -> str:
-        s = str(service or "")
-        if s not in ALLOWED_SERVICE_NAMES:
-            raise MaintenanceOperationError(
-                f"service {s!r} is not allowed; choose from {sorted(ALLOWED_SERVICE_NAMES)}"
-            )
+        s = str(service or "").strip()
+        if not s:
+            raise MaintenanceOperationError("service is required")
         return s
 
     def _launch_background(
