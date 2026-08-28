@@ -1,0 +1,38 @@
+name: Remove static execution allowlists
+on:
+  push:
+    branches: [fix/remove-all-static-allowlists]
+    paths:
+      - scripts/remove_static_allowlists.py
+      - .github/workflows/remove-static-allowlists.yml
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remove-all-static-allowlists
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply patch
+        run: python scripts/remove_static_allowlists.py
+      - name: Compile changed modules
+        run: python -m py_compile modules/operation_chain_service.py modules/service_operations.py modules/log_reader.py modules/git_operations.py modules/codex_worker.py modules/verification_env.py modules/experiment_service.py modules/operations_executor.py
+      - name: Install tests
+        run: python -m pip install -r requirements-test.txt
+      - name: Run full suite
+        env:
+          AGENT_API_KEY: test-key
+        run: python scripts/run_tests_ci.py
+      - name: Commit result
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add modules scripts/remove_static_allowlists.py
+          git commit -am "Remove static execution allowlists" || true
+          git rm scripts/remove_static_allowlists.py .github/workflows/remove-static-allowlists.yml
+          git commit -m "Remove temporary allowlist patch tooling"
+          git push origin HEAD:fix/remove-all-static-allowlists
