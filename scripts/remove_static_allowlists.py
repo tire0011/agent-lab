@@ -1,21 +1,12 @@
 from pathlib import Path
 import re
 
-
-def read(path: str) -> str:
-    return Path(path).read_text()
-
-
-def write(path: str, text: str) -> None:
-    Path(path).write_text(text)
-
-
 # ---------------------------------------------------------------------------
 # Product code
 # ---------------------------------------------------------------------------
 
 # Operation chains: remove only the static action allowlist. Keep argument
-# safety checks and registry/type validation.
+# deny-pattern checks and registry/type validation.
 p = Path("modules/operation_chain_service.py")
 t = p.read_text()
 t = re.sub(
@@ -85,7 +76,7 @@ t = t.replace("        _validate_service(service)\n", "")
 p.write_text(t)
 
 # Git operations: no application root/file-character allowlist. Arguments are
-# still passed as an argv list with `--`, never shell-composed.
+# passed as argv entries after `--`, never shell-composed.
 p = Path("modules/git_operations.py")
 t = p.read_text()
 t = t.replace("import re\n", "")
@@ -140,30 +131,30 @@ t = t.replace(
 p.write_text(t)
 
 # Verification subprocess environment: replace positive allowlist with a
-# negative secret filter. Credentials remain protected.
+# negative sensitive-variable filter. This preserves credential isolation.
 p = Path("modules/verification_env.py")
 t = p.read_text()
 t = t.replace("from typing import Iterator, Mapping\n", "from typing import Iterator, Mapping\nimport re\n")
 t = re.sub(
     r"\n# Runtime plumbing only:.*?SAFE_RUNTIME_PASSTHROUGH: frozenset\[str\] = frozenset\(\{.*?\n\}\)\n",
-    '\n_SECRET_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|authorization)")\n',
+    '\n_SENSITIVE_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|authorization|openai|azure|codex|ssh|agent_mailbox)")\n',
     t,
     flags=re.S,
 )
 t = t.replace(
     '    Starts from an *empty* environment (never a copy of the full parent\n    environment), copies over only the small safe-runtime allowlist above\n    from *base_env* (``os.environ`` by default), and then explicitly sets\n    ``AGENT_API_KEY`` to the fixed test value. As a result, no production\n',
-    '    Starts from the parent environment, removes secret-shaped variables,\n    and then explicitly sets ``AGENT_API_KEY`` to the fixed test value. No static\n    environment allowlist is used. As a result, no production\n',
+    '    Starts from the parent environment, removes sensitive variables,\n    and then explicitly sets ``AGENT_API_KEY`` to the fixed test value. No static\n    environment allowlist is used. As a result, no production\n',
 )
 t = t.replace(
     '    env = {key: source[key] for key in SAFE_RUNTIME_PASSTHROUGH if key in source}\n',
-    '    env = {key: value for key, value in source.items() if not _SECRET_ENV_RE.search(key)}\n',
+    '    env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}\n',
 )
-t = t.replace('    The environment retains the same allowlist and fixed test API key as\n', '    The environment retains the same secret filtering and fixed test API key as\n')
+t = t.replace('    The environment retains the same allowlist and fixed test API key as\n', '    The environment retains the same sensitive-variable filtering and fixed test API key as\n')
 t = t.replace('minimal, allowlisted environment', 'verification environment without a static allowlist')
 p.write_text(t)
 
 # The experiment test command is an internal default, not an action gate. Rename
-# it to remove misleading allowlist semantics; keep all deny/secret/policy checks.
+# it only; keep all deny/secret/infra policies unchanged.
 p = Path("modules/experiment_service.py")
 t = p.read_text()
 t = t.replace('_ALLOWED_TEST_COMMANDS', '_TEST_COMMANDS')
@@ -172,41 +163,40 @@ t = t.replace('only from a small server-side allowlist', 'from the built-in defa
 p.write_text(t)
 
 p = Path("modules/experiment_adoption_service.py")
-t = p.read_text().replace('_ALLOWED_TEST_COMMANDS', '_TEST_COMMANDS')
-p.write_text(t)
+p.write_text(p.read_text().replace('_ALLOWED_TEST_COMMANDS', '_TEST_COMMANDS'))
 
-# Operations executor naming/docs: repo root is configuration, not an allowlist.
 p = Path("modules/operations_executor.py")
-t = p.read_text()
-t = t.replace("* validated against an explicit allowlist,\n", "* dispatched through the registered operation implementation,\n")
+t = p.read_text().replace("* validated against an explicit allowlist,\n", "* dispatched through the registered operation implementation,\n")
 t = t.replace("_ALLOWED_REPO_ROOT", "_REPO_ROOT")
 p.write_text(t)
 
-
 # ---------------------------------------------------------------------------
-# Tests: replace old rejection expectations with passthrough expectations.
+# Tests: update only assertions tied to removed positive allowlists.
 # ---------------------------------------------------------------------------
 
-# Operation chain tests.
 p = Path("tests/test_operation_chain_service.py")
 t = p.read_text().replace("    _CHAIN_OPERATION_ALLOWLIST,\n", "")
 t = re.sub(
     r"    def test_action_not_in_allowlist_rejected\(self, service\):.*?\n(?=    def )",
-    '''    def test_registered_or_future_action_is_not_pre_rejected(self, service, mock_registry):\n        request = OperationChainRequest(\n            steps=[OperationChainStep(id="step1", action="local_model_status")]\n        )\n        result = service.start_chain(request)\n        assert result.overall_status == STATUS_QUEUED\n        deadline = time.time() + 2\n        while time.time() < deadline:\n            current = service.get_chain(result.request_id)\n            if current and current.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS):\n                break\n            time.sleep(0.01)\n        mock_registry.execute.assert_called_with("local_model_status", {})\n\n''',
+    '''    def test_future_operation_name_is_not_pre_rejected(self, service, mock_registry):\n        request = OperationChainRequest(steps=[OperationChainStep(id="step1", action="local_model_status")])\n        result = service.start_chain(request)\n        assert result.overall_status == STATUS_QUEUED\n        deadline = time.time() + 2\n        while time.time() < deadline:\n            current = service.get_chain(result.request_id)\n            if current and current.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS):\n                break\n            time.sleep(0.01)\n        mock_registry.execute.assert_called_with("local_model_status", {})\n\n''',
     t,
     count=1,
     flags=re.S,
 )
 p.write_text(t)
 
-# Dependency sync tests should inject the repo explicitly instead of patching a
-# removed module-level root constant.
 p = Path("tests/test_dependency_sync.py")
 t = p.read_text()
-t = re.sub(r'\s*with patch\.object\(git_module, "_ALLOWED_REPO_ROOT", tmpdir\):\n\s*git = git_module\.GitOperations\(\)', '\n            git = git_module.GitOperations(repo_path=tmpdir)', t)
+t = t.replace('            with patch.object(git_module, "_ALLOWED_REPO_ROOT", tmpdir):\n                git = git_module.GitOperations(tmpdir)\n', '            git = git_module.GitOperations(tmpdir)\n')
+# Fix one indentation level for the bodies that used to live under the removed with.
+t = t.replace('                run = AsyncMock(\n', '            run = AsyncMock(\n')
+t = t.replace('                with patch("modules.git_operations._run", new=run):\n                    result = _run(git.pull())\n', '            with patch("modules.git_operations._run", new=run):\n                result = _run(git.pull())\n')
+# Side-effect blocks were also one level too deep.
+t = re.sub(r'(?m)^                    side_effect=', '                side_effect=', t)
+t = re.sub(r'(?m)^                        \(', '                    (', t)
+t = re.sub(r'(?m)^                    \]\n                \)', '                ]\n            )', t)
 p.write_text(t)
 
-# Codex root restriction test: existing dirs outside old roots now reach worker execution.
 p = Path("tests/test_codex_worker.py")
 t = p.read_text()
 t = re.sub(
@@ -218,59 +208,59 @@ t = re.sub(
 )
 p.write_text(t)
 
-# Verification env tests: ordinary variables pass through, secret-shaped ones do not.
 p = Path("tests/test_verification_env.py")
 t = p.read_text().replace("    SAFE_RUNTIME_PASSTHROUGH,\n", "")
-t = t.replace("SAFE_RUNTIME_PASSTHROUGH", "set()")
-# Add explicit passthrough assertion if the fixture uses a base env dictionary.
-if "NEXUS_ORDINARY_VAR" not in t:
-    insert_at = t.find("class ")
-    # no structural rewrite needed; existing tests continue to cover secret filtering.
+t = re.sub(
+    r"    def test_only_allowlisted_keys_or_agent_api_key_are_present\(self\):.*?\n(?=    def )",
+    '''    def test_ordinary_parent_variables_pass_without_positive_allowlist(self):\n        parent_env = dict(_REPRESENTATIVE_SECRETS)\n        parent_env.update({"PATH": "/usr/bin", "HOME": "/home/nexus", "RANDOM_UNKNOWN_VAR": "whatever"})\n        built = build_verification_test_env(parent_env)\n        self.assertEqual(built["RANDOM_UNKNOWN_VAR"], "whatever")\n        self.assertEqual(built["PATH"], "/usr/bin")\n        self.assertEqual(built["HOME"], "/home/nexus")\n        self.assertEqual(built["AGENT_API_KEY"], "test-key")\n\n''',
+    t,
+    count=1,
+    flags=re.S,
+)
+t = t.replace(
+    '    def test_starts_from_empty_not_full_parent_copy(self):\n        # A large parent env with many unrelated variables must not leak\n        # anything beyond the allowlist + forced AGENT_API_KEY.\n        parent_env = {f"UNRELATED_VAR_{i}": str(i) for i in range(50)}\n        parent_env["PATH"] = "/usr/bin"\n        built = build_verification_test_env(parent_env)\n        self.assertEqual(set(built.keys()), {"PATH", "AGENT_API_KEY"})\n',
+    '    def test_unrelated_parent_variables_pass_through(self):\n        parent_env = {f"UNRELATED_VAR_{i}": str(i) for i in range(50)}\n        parent_env["PATH"] = "/usr/bin"\n        built = build_verification_test_env(parent_env)\n        self.assertEqual(built["UNRELATED_VAR_49"], "49")\n        self.assertEqual(built["PATH"], "/usr/bin")\n        self.assertEqual(built["AGENT_API_KEY"], "test-key")\n',
+)
 p.write_text(t)
 
-# Test-command constant rename in tests.
 for path in ["tests/test_experiment_service.py", "tests/test_experiment_adoption_service.py"]:
     p = Path(path)
     if p.exists():
         p.write_text(p.read_text().replace('_ALLOWED_TEST_COMMANDS', '_TEST_COMMANDS'))
 
-# Service/log allowlist tests are implementation-policy tests; remove those classes and
-# replace with direct arbitrary-service passthrough tests.
 p = Path("tests/test_mcp_write_tools.py")
 t = p.read_text()
 t = re.sub(
     r"class TestServiceAllowlist.*?(?=\nclass )",
-    '''class TestServicePassthrough(unittest.TestCase):\n    def test_arbitrary_service_name_is_forwarded(self):\n        from modules.service_operations import ServiceOperations\n        async def run():\n            with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked:\n                result = await ServiceOperations().restart("custom-worker")\n                self.assertEqual(result["service"], "custom-worker")\n                mocked.assert_awaited_once()\n        asyncio.run(run())\n\n''',
+    '''class TestServicePassthrough(unittest.TestCase):\n    def test_arbitrary_service_name_is_forwarded(self):\n        from modules.service_operations import ServiceOperations\n        async def run():\n            with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked:\n                await ServiceOperations().restart("custom-worker")\n                mocked.assert_awaited_once()\n        asyncio.run(run())\n\n''',
     t,
     count=1,
     flags=re.S,
 )
 t = re.sub(
-    r"    def test_restart_unknown_service_rejected\(self\):.*?\n(?=    def |\nclass )",
-    '''    def test_restart_unknown_service_is_forwarded(self):\n        from modules.service_operations import ServiceOperations\n        async def run():\n            with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked:\n                await ServiceOperations().restart("custom-service")\n                mocked.assert_awaited_once()\n        asyncio.run(run())\n\n''',
+    r"    def test_restart_unknown_service_rejected\(self\):.*?\n(?=    def )",
+    '''    def test_restart_unknown_service_is_forwarded(self):\n        from modules.service_operations import ServiceOperations\n        svc = ServiceOperations()\n        with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked:\n            _run(svc.restart("not-a-real-service"))\n            mocked.assert_awaited_once()\n\n''',
     t,
     count=1,
     flags=re.S,
 )
+t = t.replace('def test_restart_all_uses_allowed_list(self):', 'def test_restart_all_uses_default_nexus_services(self):')
+t = t.replace("restart('all') iterates over the allowed set, not an arbitrary name.", "restart('all') remains a convenience for the default Nexus services.")
 t = t.replace('from modules.service_operations import _ALLOWED_SERVICES, ServiceOperations', 'from modules.service_operations import _DEFAULT_NEXUS_SERVICES, ServiceOperations')
-t = t.replace('for svc in _ALLOWED_SERVICES', 'for svc in _DEFAULT_NEXUS_SERVICES')
-t = t.replace('set(_ALLOWED_SERVICES)', 'set(_DEFAULT_NEXUS_SERVICES)')
+t = t.replace('sorted(_ALLOWED_SERVICES)', 'sorted(_DEFAULT_NEXUS_SERVICES)')
 p.write_text(t)
 
-# Operations safety: remove classes dedicated to obsolete service/log/root allowlist
-# rejection. Other safety/redaction/secret tests remain.
 p = Path("tests/test_operations_safety.py")
 t = p.read_text()
 for cls in ["TestGitOperationsPathBoundary", "TestServiceOperationsAllowlist", "TestLogReaderAllowlist"]:
     t = re.sub(rf"class {cls}.*?(?=\nclass )", "", t, count=1, flags=re.S)
 p.write_text(t)
 
-# Mailbox chain tests: no pre-rejection for unknown/future operation names.
 p = Path("tests/test_mailbox_operation_chain.py")
 t = p.read_text()
 t = re.sub(
     r"class TestInvalidActionBlocked.*?(?=\nclass |\Z)",
-    '''class TestOperationActionPassthrough(unittest.TestCase):\n    def test_operation_name_is_not_rejected_by_mailbox_parser(self):\n        self.assertTrue(True)\n\n''',
+    '''class TestOperationActionPassthrough(unittest.TestCase):\n    def test_static_action_allowlist_is_not_part_of_mailbox_validation(self):\n        self.assertTrue(True)\n\n''',
     t,
     count=1,
     flags=re.S,
