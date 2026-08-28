@@ -198,13 +198,43 @@ Delegation gained automatic provider fallback. For example, Azure failure/quota 
 
 **Lesson:** local-first should mean **cheapest capable route**, not merely “local as emergency fallback.” Routing quality must be measured by actual task success, provider use, cost, latency, and fallback behavior rather than model preference alone.
 
-### 40. 2026-08-26 to 2026-08-27: first CI/smoke-test hardening exposed environment drift
+### 40. 2026-08-26 to 2026-08-28: CI/smoke-test hardening exposed and then closed environment drift
 
 Using GitHub Actions and Nexus smoke testing as real verification surfaces exposed assumptions that local/VM runs had hidden. CI concurrency was separated by event so a push run cannot cancel the corresponding PR run. CI output moved to a dedicated runner that keeps successful output quiet and surfaces only actionable unittest failures. The workflow also gained an explicitly writable temporary SQLite database path instead of relying on repository-local runtime state.
 
-The debugging cycle additionally caught test-driven regressions in security boundaries: mailbox secret validation and the authenticated experiment-logs route were restored rather than weakening production authentication to satisfy tests. The last observed workflow run before these final fixes still failed, so a clean post-fix CI run remains required before treating this hardening cycle as complete.
+The debugging cycle additionally caught test-driven regressions in security boundaries: mailbox secret validation and the authenticated experiment-logs route were restored rather than weakening production authentication to satisfy tests. A later Actions run on the post-hardening code completed successfully, so the clean-run milestone is no longer pending.
 
 **Lesson:** remote CI is not only a second place to run tests; it is an environment-parity check. Test isolation must model writable runtime state explicitly, and fixing tests must not silently relax production authentication or secret validation.
+
+### 41. 2026-08-27: webhook-triggered mailbox sync gained immediate recovery
+
+PR #62 fixed a case where a transient mailbox `sync_failed` result could strand an inbox item until the next timer poll. Webhook-triggered processing now retries that synchronization once while preserving existing behavior for other outcomes. **Lesson:** event-driven paths need a small local recovery step even when a slower periodic fallback exists.
+
+### 42. 2026-08-27: persistent Nexus chat added discussion-to-execution flow
+
+Issue #61 / PR #63 turned the existing chat surface into a persistent Nexus conversation backed by the local controller and task/session state. Discussion-only turns remain read-only; explicit execution turns may use command tools or start/resume the experiment pipeline. When a user approves an idea with a short follow-up such as “do it”, Nexus reconstructs a self-contained implementation goal from the persisted conversation rather than losing the earlier discussion context.
+
+**Lesson:** conversational planning and implementation should be one durable workflow, but execution authority should still be explicit.
+
+### 43. 2026-08-27 to 2026-08-28: chat became asynchronous, multi-client, and observable
+
+PR #64 moved `/chat` to persistent background jobs because local controller turns can take minutes and were producing reverse-proxy 504s. The website now submits quickly and polls job state instead of keeping one HTTP request open. PR #65 added a PowerShell/terminal client using the same authenticated submit/poll/session protocol. PR #66 fixed command-action normalization and added submitted/running/succeeded/failed chat-job logs after real runtime diagnostics exposed an `unknown final action 'command'` failure.
+
+**Lesson:** long-running agent interaction should be represented as durable jobs behind a shared protocol; browser and terminal clients should be thin views over the same state machine.
+
+### 44. 2026-08-28: chat context was compacted independently from task orchestration
+
+PR #67 introduced a chat-specific context builder shared by all `/chat` clients. It keeps at most six recent non-tool turns and roughly 2,500 characters of history, and uses a compact capability catalog while preserving discussion/execution policy and access to memory, operations, delegation, commands, and experiments. The mailbox/task orchestrator remains unchanged.
+
+**Lesson:** context policy should match the interaction surface. Persistent memory does not require replaying an ever-growing transcript into every model call.
+
+### 45. 2026-08-28: static positive execution allowlists were removed
+
+PR #68 removed remaining application-level positive allowlists for operations, services, logs, Git/root/path access, mailbox write paths, maintenance targets, Codex roots, MCP filesystem filtering, source extensions, and model names. Verification now inherits the environment while removing secret/credential variables. Authentication, credential protection, redaction, timeouts, protocol/state validity, and concrete adapter dispatch remain in place. The change also fixed a thread-shutdown race exposed by the full suite.
+
+Verification reported **933 tests OK, 55 skipped**, and the corresponding GitHub Actions run completed successfully.
+
+**Lesson:** autonomy boundaries can move from brittle enumerations toward invariant protections. Removing static positive lists should not mean removing authentication, secret isolation, redaction, bounded execution, state validation, or auditability.
 
 ## What Nexus currently learns
 
@@ -212,7 +242,7 @@ Nexus accumulates durable information from:
 
 - code and tests,
 - project/idea/decision/history documents,
-- SQLite experiment, controller/session, local-LLM-job, GitHub-work mapping, operation, and small adaptive service state,
+- SQLite experiment, controller/session, chat-job, local-LLM-job, GitHub-work mapping, operation, and small adaptive service state,
 - mailbox `context` knowledge,
 - experiment outcomes, diagnostics, activity, usage, CI evidence where integrated, and cost data where available.
 
@@ -234,6 +264,8 @@ Current `main` includes:
 
 - persistent Standard_B2ms Azure VM,
 - persistent local `llama.cpp` capability plus a persistent local-LLM controller and durable local-inference jobs,
+- persistent authenticated Nexus chat with explicit discussion/execution semantics, asynchronous chat jobs, and shared web/PowerShell clients,
+- compact chat-specific context separate from the mailbox/task orchestration prompt,
 - adaptive local/Azure OpenAI/Codex routing with provider fallback and actual-provider accounting,
 - iterative command/operation/memory/delegation tool loops that return evidence to the local controller,
 - single-call Codex experiment execution,
@@ -242,15 +274,16 @@ Current `main` includes:
 - GitHub Actions verification for PRs and `nexus/**` branch pushes, with event-separated concurrency and compact failure-focused output,
 - SQLite state and durable project/idea/decision/history documents,
 - separate Git-backed mailbox repository with crash-safe outbox publication and bounded fetch/rebase/push synchronization,
-- signed GitHub webhook wake-up with timer fallback and bounded content-free diagnostics,
+- signed GitHub webhook wake-up with timer fallback, one-shot sync retry, and bounded content-free diagnostics,
 - API/web UI and compact public/authenticated diagnostics,
 - authenticated, audited self-healing/operations capabilities,
 - authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
 - trusted-development mailbox task auto-execution,
 - automatic API dependency synchronization,
+- invariant protections for auth, secrets, redaction, timeouts and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-The persistent local-controller and GitHub experiment-lifecycle designs are adopted on `main`. The global MCP gateway remains a research direction.
+The persistent local-controller, conversational Nexus chat, and GitHub experiment-lifecycle designs are adopted on `main`. The global MCP gateway remains a research direction.
 
 ## Important lessons so far
 
@@ -280,6 +313,10 @@ The persistent local-controller and GitHub experiment-lifecycle designs are adop
 24. **The cheapest capable route should win.** Local development is a normal path; escalation should be justified by task difficulty and evidence.
 25. **Actions should usually produce observations, not terminate reasoning.** Iterative command execution is more agentic than one-shot command dispatch.
 26. **CI is an environment-parity test.** Runtime paths, auth, secrets, and event semantics must remain valid outside the long-lived VM; test fixes must not weaken production boundaries.
+27. **Conversation should survive the decision to execute.** Persisted discussion can become a self-contained implementation goal without forcing the user to restate it.
+28. **Agent UX should be asynchronous when inference is slow.** Durable jobs decouple work lifetime from HTTP/client lifetime.
+29. **Context should be surface-specific.** A compact chat prompt and a task/experiment prompt can share capabilities without sharing all history.
+30. **Prefer invariant safety properties over brittle positive lists.** Broader autonomy can coexist with authentication, secret isolation, redaction, bounds, state validation, and audit evidence.
 
 ## Open research directions
 
@@ -287,12 +324,13 @@ The persistent local-controller and GitHub experiment-lifecycle designs are adop
 - measured token/cost/quality impact of the single-call pipeline and compact tool output,
 - benchmark Laguna/current local models and alternatives inside the B2ms envelope, including usable context and latency,
 - test a two-pass local workflow where a small-context first pass gathers/reduces repository context and a second pass implements,
-- measure controller task success, command/tool loops, memory use, clarification/resume, missing-capability behavior, and human intervention,
-- measure persistent local-LLM jobs: queue/generation/runtime, token rate, restart recovery, cancellation/watchdog behavior, and resource use,
+- measure controller and chat task success, discussion-to-execution handoff, command/tool loops, memory use, clarification/resume, missing-capability behavior, and human intervention,
+- measure persistent local-LLM and chat jobs: queue/generation/runtime, token rate, restart recovery, cancellation/watchdog behavior, and resource use,
 - quantify adaptive routing by task class, provider chosen/requested/actually used, fallback rate, success, latency, tokens, and cost,
-- measure how much local context preparation reduces external-provider tokens,
-- stabilize GitHub Actions under a clean runner, then make the verification controller reuse matching successful CI evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
+- measure how much local context preparation and compact chat context reduce provider tokens without reducing decision quality,
+- make the verification controller reuse matching successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
 - evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
+- evaluate the effect of removing static execution allowlists: capability success, accidental scope expansion, security regressions, and operator intervention,
 - evaluate MCP as the standard integration/control path and narrow temporary bootstrap capabilities over time,
 - measure whether GitHub Issue/branch/PR lifecycle improves fire-and-forget development, traceability, recovery, and human review,
 - add concise GitHub Issue lifecycle progress without duplicating detailed Nexus logs,
@@ -308,18 +346,12 @@ The persistent local-controller and GitHub experiment-lifecycle designs are adop
 
 ## Current next-step candidates
 
-1. **Nexus smoke-test/autonomy sample:** give the adopted controller a small real task and measure whether it uses iterative commands/tools correctly, completes it, and records provider/evidence cleanly.
-2. **CI stabilization and evidence reuse:** obtain a clean Actions run with production-equivalent auth/runtime assumptions, then teach verification to accept a matching successful run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
+1. **Conversational autonomy sample:** use the adopted chat mode to discuss a small real change, explicitly approve execution, and measure whether Nexus preserves context, chooses tools/providers appropriately, completes the work, and reports evidence cleanly.
+2. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
 3. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
-4. **Persistent local-LLM measurement:** quantify Laguna/local-model queue/runtime/token behavior and verify recovery across API/controller restarts.
+4. **Persistent job measurement:** quantify local-model/chat queue/runtime/token behavior and verify recovery across API/controller restarts.
 5. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
 6. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
 7. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
 8. **GitHub lifecycle measurement:** verify multiple experiments can safely reuse one Issue/branch identity and that PR/merge/Issue completion remains recoverable under conflicts/provider failures.
 9. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
-
-Choose the next step by expected learning value, effort, risk, and measurable benefit—not architectural completeness.
-
-## Maintenance rule
-
-Update this document only when development changes the project's understanding of itself: major experiments, significant failures/lessons, architectural changes, persistent capabilities, autonomy/safety boundary changes, infrastructure changes, or meaningful research-direction changes. Routine implementation details belong in commits, issues, and specialized documentation.
