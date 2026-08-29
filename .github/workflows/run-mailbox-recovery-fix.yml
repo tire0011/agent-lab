@@ -12,6 +12,7 @@ permissions:
 jobs:
   patch-branch:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,42 +20,31 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-      - name: Install API dependencies
-        run: python -m pip install -r requirements-api.txt
-      - name: Apply patch
-        run: python scripts/apply_mailbox_recovery_fix.py
-      - name: Focused tests
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Apply focused patches
+        run: |
+          python scripts/apply_mailbox_recovery_fix.py
+          python scripts/apply_mailbox_recovery_compat_fix.py
+      - name: Focused regression tests
         env:
           AGENT_API_KEY: test-key
-        run: python -m unittest tests.test_mailbox_poll_runner tests.test_mailbox_operation_chain -q
-      - name: Full tests
-        id: full
+          AGENT_DB_PATH: ${{ runner.temp }}/nexus-test/agent.db
+        run: python -m unittest tests.test_mailbox_poll_runner tests.test_mailbox_operation_chain tests.test_mailbox_webhook_sync_failure -q
+      - name: Full project tests
         env:
           AGENT_API_KEY: test-key
-        run: |
-          set +e
-          python -m unittest discover -s tests -q > full-suite.log 2>&1
-          code=$?
-          tail -n 200 full-suite.log
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          exit 0
-      - name: Capture failure on fix branch
-        if: steps.full.outputs.code != '0'
-        run: |
-          tail -n 200 full-suite.log > full-suite-failure.log
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f full-suite-failure.log
-          git commit -m "Capture mailbox recovery full-suite failure"
-          git push origin HEAD:fix/mailbox-rejected-chain-recovery
-          exit 1
+          AGENT_DB_PATH: ${{ runner.temp }}/nexus-test/agent.db
+        run: python scripts/run_tests_ci.py
       - name: Commit fixed branch
-        if: steps.full.outputs.code == '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          rm scripts/apply_mailbox_recovery_fix.py .github/workflows/apply-mailbox-recovery-fix.yml
-          git add modules/operation_chain_service.py modules/mailbox_poll_runner.py tests/test_mailbox_poll_runner.py tests/test_mailbox_operation_chain.py scripts/apply_mailbox_recovery_fix.py .github/workflows/apply-mailbox-recovery-fix.yml
+          rm -f scripts/apply_mailbox_recovery_fix.py scripts/apply_mailbox_recovery_compat_fix.py .github/workflows/apply-mailbox-recovery-fix.yml full-suite-failure.log
+          git add modules/operation_chain_service.py modules/mailbox_poll_runner.py tests/test_mailbox_poll_runner.py tests/test_mailbox_operation_chain.py
+          git add -u scripts .github/workflows full-suite-failure.log || true
           git commit -m "Fix rejected chain mailbox recovery"
           git push origin HEAD:fix/mailbox-rejected-chain-recovery
