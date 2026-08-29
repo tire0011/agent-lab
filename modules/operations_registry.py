@@ -147,8 +147,10 @@ class OperationsRegistry:
     def _build_specs(self) -> dict[str, OperationSpec]:
         limit10 = OperationArgSpec("limit", "integer", "Maximale Anzahl Zeilen/Einträge.", default=10, minimum=1, maximum=100)
         limit50 = OperationArgSpec("limit", "integer", "Maximale Anzahl Zeilen/Einträge.", default=50, minimum=1, maximum=500)
+        limit20 = OperationArgSpec("limit", "integer", "Maximale Anzahl Prozesse.", default=20, minimum=1, maximum=200)
         experiment_id = OperationArgSpec("experiment_id", "string", "Experiment-ID oder eindeutiges Präfix.", required=True)
         adoption_id = OperationArgSpec("adoption_id", "string", "Adoption-ID.", required=True)
+        service = OperationArgSpec("service", "string", "systemd-Unit-Name (Standard: agent-api).", default=_DEFAULT_SERVICE_NAME)
         return {
             "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts."),
             "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50]),
@@ -161,8 +163,9 @@ class OperationsRegistry:
             "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo."),
             "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers."),
             "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers."),
-            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für den API-Service.", [limit50]),
-            "service_status": OperationSpec("service_status", "systemctl-Status des API-Service."),
+            "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20]),
+            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50]),
+            "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service]),
             "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id]),
             "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme."),
             "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox."),
@@ -195,6 +198,14 @@ class OperationsRegistry:
         if value < 1 or value > maximum:
             raise OperationValidationError(f"limit muss zwischen 1 und {maximum} liegen.")
         return value
+
+    def _service(self, args: dict[str, Any]) -> str:
+        value = args.get("service")
+        if value is None:
+            return self.service_name
+        if not isinstance(value, str) or not value.strip():
+            raise OperationValidationError("service muss ein nicht-leerer Text sein.")
+        return value.strip()
 
     def _experiment(self, args: dict[str, Any]):
         experiment_id = args.get("experiment_id")
@@ -334,9 +345,18 @@ class OperationsRegistry:
                 error_summary=sanitized_reason(str(exc)),
             )
 
+    def _op_process_status(self, args: dict[str, Any]) -> OperationResult:
+        limit = self._limit(args, default=20, maximum=200)
+        result = self._run_command(["ps", "-eo", "pid,ppid,pmem,rss,comm", "--sort=-rss"], timeout=15)
+        result.operation = "process_status"
+        if result.success and result.output_lines:
+            header, *rows = result.output_lines
+            result.output_lines = [header] + rows[:limit]
+        return result
+
     def _op_service_status(self, args: dict[str, Any]) -> OperationResult:
-        del args
-        result = self._run_command(["systemctl", "status", self.service_name, "--no-pager", "-n", "0"], timeout=15)
+        service = self._service(args)
+        result = self._run_command(["systemctl", "status", service, "--no-pager", "-n", "0"], timeout=15)
         result.operation = "service_status"
         return result
 
@@ -392,8 +412,9 @@ class OperationsRegistry:
         )
 
     def _op_service_logs(self, args: dict[str, Any]) -> OperationResult:
+        service = self._service(args)
         limit = self._limit(args, default=50, maximum=500)
-        result = self._run_command(["journalctl", "-u", self.service_name, "-n", str(limit), "--no-pager"], timeout=20)
+        result = self._run_command(["journalctl", "-u", service, "-n", str(limit), "--no-pager"], timeout=20)
         result.operation = "service_logs"
         return result
 

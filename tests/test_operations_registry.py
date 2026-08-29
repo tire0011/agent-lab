@@ -97,9 +97,8 @@ class OperationsRegistryTests(unittest.TestCase):
         self.assertIn("service_logs", names)
         self.assertIn("mailbox_status", names)
         self.assertIn("local_model_status", names)
+        self.assertIn("process_status", names)
         self.assertNotIn("experiment adopt", names)
-
-    def test_execution_uses_implemented_handler_not_catalog_membership(self):
         self.registry._specs.pop("git_status")
         result = self.registry.execute("git_status", {})
         self.assertTrue(result.success)
@@ -269,6 +268,178 @@ class OperationsRegistryTests(unittest.TestCase):
         serialized = json.dumps(logs.output_lines)
         self.assertNotIn("secret", serialized)
         self.assertNotIn("/agent", serialized)
+
+    def test_process_status_sorts_by_rss_and_applies_limit(self):
+        ps_output = (
+            "  PID  PPID %MEM   RSS COMMAND\n"
+            "  200     1  5.0 50000 python3\n"
+            "  201     1  2.0 20000 nginx\n"
+            "  202     1  1.0 10000 sshd\n"
+            "    1     0  0.1  1000 systemd\n"
+        )
+        runner = MagicMock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=ps_output, stderr=""
+        ))
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-process-status.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("process_status", {"limit": 2})
+
+        self.assertTrue(result.success)
+        runner.assert_called_once_with(
+            ["ps", "-eo", "pid,ppid,pmem,rss,comm", "--sort=-rss"],
+            cwd=None,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+        )
+        # header + only the first 2 data rows (already sorted by ps --sort=-rss)
+        self.assertEqual(len(result.output_lines), 3)
+        self.assertIn("COMMAND", result.output_lines[0])
+        self.assertIn("python3", result.output_lines[1])
+        self.assertIn("nginx", result.output_lines[2])
+        self.assertNotIn("sshd", "\n".join(result.output_lines))
+
+    def test_process_status_defaults_limit_to_twenty(self):
+        header = "  PID  PPID %MEM   RSS COMMAND\n"
+        rows = "".join(f"  {100 + i}     1  0.1  {5000 - i} proc{i}\n" for i in range(30))
+        runner = MagicMock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=header + rows, stderr=""
+        ))
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-process-status-default.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("process_status", {})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.output_lines), 21)  # header + 20 rows
+
+    def test_service_status_defaults_to_agent_api(self):
+        runner = MagicMock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Active: active (running)", stderr=""
+        ))
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-service-status-default.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("service_status", {})
+
+        self.assertTrue(result.success)
+        runner.assert_called_once_with(
+            ["systemctl", "status", "agent-api", "--no-pager", "-n", "0"],
+            cwd=None,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+        )
+
+    def test_service_status_accepts_arbitrary_service(self):
+        runner = MagicMock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Active: active (running)", stderr=""
+        ))
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-service-status-llama.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("service_status", {"service": "llama-server"})
+
+        self.assertTrue(result.success)
+        runner.assert_called_once_with(
+            ["systemctl", "status", "llama-server", "--no-pager", "-n", "0"],
+            cwd=None,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+        )
+
+    def test_service_logs_defaults_to_agent_api(self):
+        runner = MagicMock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="log line", stderr=""
+        ))
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-service-logs-default.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("service_logs", {"limit": 40})
+
+        self.assertTrue(result.success)
+        runner.assert_called_once_with(
+            ["journalctl", "-u", "agent-api", "-n", "40", "--no-pager"],
+            cwd=None,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            shell=False,
+        )
+
+    def test_service_logs_accepts_arbitrary_service(self):
+        runner = MagicMock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="llama log line", stderr=""
+        ))
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-service-logs-llama.db"),
+            repo_root=str(self.repo),
+            subprocess_runner=runner,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        result = registry.execute("service_logs", {"service": "llama-server", "limit": 40})
+
+        self.assertTrue(result.success)
+        runner.assert_called_once_with(
+            ["journalctl", "-u", "llama-server", "-n", "40", "--no-pager"],
+            cwd=None,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            shell=False,
+        )
+
+    def test_service_status_rejects_invalid_service_type(self):
+        registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=str(Path(self.tmp.name) / "agent-service-status-invalid.db"),
+            repo_root=str(self.repo),
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(registry.close)
+
+        with self.assertRaises(OperationValidationError):
+            registry.execute("service_status", {"service": ""})
+        with self.assertRaises(OperationValidationError):
+            registry.execute("service_status", {"service": 123})
 
     def test_service_command_timeout_is_clean_error(self):
         def timeout_runner(*args, **kwargs):
