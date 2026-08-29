@@ -1,3 +1,4 @@
+# Temporary one-shot patch script; removed automatically after successful verification.
 from pathlib import Path
 
 
@@ -29,7 +30,6 @@ replace_once(
     '''            processor.retry_pending_git_commits()\n            try:\n                outbox_prefix = (\n                    mailbox_config.outbox_dir\n                    .relative_to(mailbox_config.mailbox_repo_path)\n                    .as_posix()\n                    .rstrip(\"/\")\n                    + \"/\"\n                )\n            except ValueError:\n                outbox_prefix = \"\"\n            ignored_untracked = (outbox_prefix,) if outbox_prefix else ()\n            if not _worktree_safe_for_mailbox_sync(\n                mailbox_module,\n                mailbox_config.mailbox_repo_path,\n                ignored_untracked,\n            ):\n                result = MailboxPollRunResult(status=\"dirty_worktree\")\n            elif not _sync_mailbox_repo(\n                mailbox_module,\n                mailbox_config.mailbox_repo_path,\n                ignored_untracked_prefixes=ignored_untracked,\n            ):\n''',
 )
 
-# Make the helper importable by the focused unittest module.
 replace_once(
     "tests/test_mailbox_poll_runner.py",
     '''    _finalize_terminal_validation_errors,\n    _sync_mailbox_repo,\n    run_mailbox_poll_once,\n)\n''',
