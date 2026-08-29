@@ -58,6 +58,42 @@ def process_command(
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")
+
+    if conn is None and db_msg_id == 0:
+        started = time.time()
+        completed = subprocess.run(
+            ["/bin/bash", "-lc", command],
+            cwd=str(repo_path),
+            env=_command_environment(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        duration = max(0.0, time.time() - started)
+        stdout = _bounded_redacted(completed.stdout)
+        stderr = _bounded_redacted(completed.stderr)
+        return (
+            "\n".join(
+                [
+                    f"**Exit code:** {completed.returncode}",
+                    f"**Duration:** {duration:.3f}s",
+                    "",
+                    "### stdout",
+                    "",
+                    "```text",
+                    stdout,
+                    "```",
+                    "",
+                    "### stderr",
+                    "",
+                    "```text",
+                    stderr,
+                    "```",
+                ]
+            ),
+            None,
+        )
+
     from modules.mailbox import _DEFERRED_PROCESSING
 
     state_root = Path(os.environ.get(
