@@ -17,9 +17,33 @@ from modules.local_llm_jobs import (
 
 
 class _SlowClient:
-    async def complete(self, *, prompt, temperature, max_tokens):
-        del temperature, max_tokens
+    async def complete(
+        self,
+        *,
+        prompt,
+        temperature,
+        max_tokens,
+        response_format=None,
+    ):
+        del temperature, max_tokens, response_format
         time.sleep(0.05)
+        return "reply:" + prompt
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.response_formats = []
+
+    async def complete(
+        self,
+        *,
+        prompt,
+        temperature,
+        max_tokens,
+        response_format=None,
+    ):
+        del temperature, max_tokens
+        self.response_formats.append(response_format)
         return "reply:" + prompt
 
 
@@ -29,8 +53,15 @@ class _FailingClient:
     def __init__(self, exc: Exception) -> None:
         self._exc = exc
 
-    async def complete(self, *, prompt, temperature, max_tokens):
-        del prompt, temperature, max_tokens
+    async def complete(
+        self,
+        *,
+        prompt,
+        temperature,
+        max_tokens,
+        response_format=None,
+    ):
+        del prompt, temperature, max_tokens, response_format
         raise self._exc
 
 
@@ -57,6 +88,39 @@ class LocalLlmJobServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(job.session_id, "session-1")
                 self.assertIsNotNone(job.started_at)
                 self.assertIsNotNone(job.finished_at)
+            finally:
+                service.close()
+
+    async def test_structured_response_format_is_persisted_and_forwarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _RecordingClient()
+            service = LocalLlmJobService(
+                db_path=str(Path(tmp) / "jobs.db"),
+                llama_client=client,
+                poll_interval=0.01,
+            )
+            response_format = {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {"type": {"type": "string"}},
+                },
+            }
+            try:
+                job_id = service.submit(
+                    "return JSON",
+                    response_format=response_format,
+                )
+                result = await service.wait(job_id)
+                stored = service._conn.execute(
+                    "SELECT response_format FROM local_llm_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()["response_format"]
+
+                self.assertEqual(result, "reply:return JSON")
+                self.assertEqual(client.response_formats, [response_format])
+                self.assertIn('"json_schema"', stored)
             finally:
                 service.close()
 
