@@ -262,6 +262,18 @@ The incomplete-action repair was committed directly by Nexus on `main` (`3ceaa95
 
 **Open question:** the direct-main path should be measured against the GitHub Issue/branch/PR lifecycle so autonomous emergency/self-repair remains observable and recoverable rather than becoming an undocumented bypass.
 
+### 50. 2026-08-29: mailbox commands became deferred asynchronous work
+
+Immediately after the controller self-repair, Nexus committed `83728ccc...` on `main` to stop coupling trusted mailbox commands to a synchronous subprocess timeout. Command execution now writes per-message process state/output, marks the mailbox message as `deferred` while the process is alive, and lets later polls collect the exit code and bounded/redacted output. The change also removes the mailbox-specific self-service restart rejection, so long-running or service-disrupting development commands can survive the request that launched them.
+
+**Lesson:** the same durability rule that applies to slow LLM inference also applies to shell work: long-running execution should have explicit persistent state and be resumed/polled rather than being classified as failure merely because one request or poll ended.
+
+### 51. 2026-08-29: comment/docstring context cost became a measured experiment
+
+Issue #74 defines a focused experiment to test whether redundant production-code comments and docstrings consume meaningful LLM context and maintenance effort. The experiment starts with a few comment-heavy modules, records reproducible before/after counts and approximate comment/docstring token or character cost, changes no intended runtime behavior, runs the full suite, and preserves architectural rationale/invariants while removing text that merely restates code.
+
+**Open question:** whether leaner source documentation measurably reduces Nexus context consumption without harming readability or losing design knowledge. If successful, the result should become a lightweight code-generation guideline rather than a broad one-time cleanup.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -300,14 +312,14 @@ Current `main` includes:
 - GitHub-backed outer work lifecycle using reusable Issues, `nexus/**` branches, PRs, merge, and Issue completion,
 - GitHub Actions verification for PRs and `nexus/**` branch pushes, with event-separated concurrency and compact failure-focused output,
 - SQLite state and durable project/idea/decision/history documents,
-- separate Git-backed mailbox repository with crash-safe outbox publication, rejected-chain recovery, and bounded fetch/rebase/push synchronization,
+- separate Git-backed mailbox repository with crash-safe outbox publication, rejected-chain recovery, bounded fetch/rebase/push synchronization, and deferred asynchronous trusted command execution,
 - signed GitHub webhook wake-up with timer fallback, one-shot sync retry, and bounded content-free diagnostics,
 - API/web UI and compact public/authenticated diagnostics,
 - authenticated, audited self-healing/operations capabilities including local-model, service, log, and process inspection,
 - authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
 - trusted-development mailbox task auto-execution,
 - automatic API dependency synchronization,
-- invariant protections for auth, secrets, redaction, timeouts and state validity rather than broad static positive execution allowlists,
+- invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
 The persistent local-controller, conversational Nexus chat, and GitHub experiment-lifecycle designs are adopted on `main`. The global MCP gateway remains a research direction.
@@ -347,6 +359,7 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 31. **Persist intent before publication on every terminal path.** Rejected/error results need the same crash-recovery semantics as successful work.
 32. **Structured output has two layers.** Grammar/schema constraints reduce malformed JSON; semantic validation and bounded repair are still required for incomplete decisions.
 33. **Runtime probes find policy drift.** A migration is not complete just because broad code search and tests say an allowlist is gone.
+34. **Long-running shell work also needs durable state.** Deferred execution and polling are more robust than tying command lifetime to one mailbox-processing request.
 
 ## Open research directions
 
@@ -358,6 +371,7 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 - measure persistent local-LLM and chat jobs: queue/generation/runtime, token rate, restart recovery, cancellation/watchdog behavior, and resource use,
 - quantify adaptive routing by task class, provider chosen/requested/actually used, fallback rate, success, latency, tokens, and cost,
 - measure how much local context preparation and compact chat context reduce provider tokens without reducing decision quality,
+- measure whether removing/shortening redundant comments and docstrings reduces source-context tokens without harming readability or losing architectural rationale (Issue #74),
 - make the verification controller reuse matching successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
 - evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
 - evaluate the effect of removing static execution allowlists: capability success, accidental scope expansion, security regressions, hidden secondary gates, and operator intervention,
@@ -386,3 +400,4 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 7. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
 8. **GitHub lifecycle measurement:** verify multiple experiments can safely reuse one Issue/branch identity and that PR/merge/Issue completion remains recoverable under conflicts/provider failures.
 9. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
+10. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare measured comment/docstring context reduction against readability and unchanged test behavior.
