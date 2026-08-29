@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import queue
@@ -146,6 +147,7 @@ class LocalLlmJobService:
                 prompt TEXT NOT NULL,
                 temperature REAL NOT NULL,
                 max_tokens INTEGER NOT NULL,
+                response_format TEXT,
                 session_id TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
@@ -155,6 +157,14 @@ class LocalLlmJobService:
             )
             """
         )
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(local_llm_jobs)")
+        }
+        if "response_format" not in columns:
+            self._conn.execute(
+                "ALTER TABLE local_llm_jobs ADD COLUMN response_format TEXT"
+            )
         # A process restart cannot keep an in-flight HTTP request alive. Make
         # that state explicit rather than leaving an immortal `running` row.
         self._conn.execute(
@@ -187,16 +197,31 @@ class LocalLlmJobService:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         session_id: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         job_id = uuid.uuid4().hex
+        serialized_response_format = (
+            json.dumps(response_format, separators=(",", ":"))
+            if response_format is not None
+            else None
+        )
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO local_llm_jobs
-                    (id, status, prompt, temperature, max_tokens, session_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, status, prompt, temperature, max_tokens, response_format, session_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, STATUS_QUEUED, prompt, float(temperature), int(max_tokens), session_id, _now()),
+                (
+                    job_id,
+                    STATUS_QUEUED,
+                    prompt,
+                    float(temperature),
+                    int(max_tokens),
+                    serialized_response_format,
+                    session_id,
+                    _now(),
+                ),
             )
             self._conn.commit()
         self._queue.put(job_id)
@@ -233,7 +258,7 @@ class LocalLlmJobService:
     def _run(self, job_id: str) -> None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT prompt,temperature,max_tokens,session_id,status FROM local_llm_jobs WHERE id = ?",
+                "SELECT prompt,temperature,max_tokens,response_format,session_id,status FROM local_llm_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if row is None or row["status"] != STATUS_QUEUED:
@@ -252,11 +277,17 @@ class LocalLlmJobService:
         )
         started = time.perf_counter()
         try:
+            completion_options: dict[str, Any] = {}
+            if row["response_format"]:
+                completion_options["response_format"] = json.loads(
+                    str(row["response_format"])
+                )
             result = asyncio.run(
                 self.llama.complete(
                     prompt=str(row["prompt"]),
                     temperature=float(row["temperature"]),
                     max_tokens=max_tokens,
+                    **completion_options,
                 )
             )
         except Exception as exc:  # noqa: BLE001
