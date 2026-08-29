@@ -6,6 +6,7 @@ on:
       - fix/mailbox-rejected-chain-recovery
     paths:
       - scripts/apply_mailbox_recovery_fix.py
+      - .github/workflows/apply-mailbox-recovery-fix.yml
 
 permissions:
   contents: write
