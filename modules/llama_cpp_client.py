@@ -146,6 +146,7 @@ class LlamaCppClient:
         system: str = "",
         temperature: float = 0.0,
         max_tokens: int = 1024,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         """Convenience wrapper that returns the assistant's reply as a string."""
         messages: list[dict[str, str]] = []
@@ -153,8 +154,14 @@ class LlamaCppClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        completion_options: dict[str, Any] = {}
+        if response_format is not None:
+            completion_options["response_format"] = response_format
         data = await self.chat_completion(
-            messages, temperature=temperature, max_tokens=max_tokens
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **completion_options,
         )
 
         try:
