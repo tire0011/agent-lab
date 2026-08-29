@@ -614,3 +614,65 @@ class OperationResponse(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     duration_ms: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Runtime observability models (issue #76)
+# ---------------------------------------------------------------------------
+
+
+class RuntimeLastTask(BaseModel):
+    """Bounded summary of the most recently finished task, if any."""
+
+    task_id: str | None = None
+    experiment_id: str | None = None
+    trace_id: str | None = None
+    result: str | None = None
+    ended_at: str | None = None
+    error: str | None = None
+
+
+class RuntimeStatusResponse(BaseModel):
+    """``GET /api/runtime/status`` - what Nexus is doing right now.
+
+    Deliberately small and cheap to compute (explicit in-memory state, never
+    derived by parsing log files) so an LLM or a human can poll it on every
+    turn without cost.
+    """
+
+    status: str
+    task_id: str | None = None
+    experiment_id: str | None = None
+    trace_id: str | None = None
+    phase: str | None = None
+    operation: str | None = None
+    worker: str | None = None
+    model: str | None = None
+    started_at: str | None = None
+    task_duration_seconds: float | None = None
+    operation_duration_seconds: float | None = None
+    last_heartbeat_seconds_ago: float | None = None
+    healthy: bool | None = None
+    last_task: RuntimeLastTask | None = None
+
+
+class RuntimeTraceOperation(BaseModel):
+    name: str
+    span_id: str
+    parent_span_id: str | None = None
+    phase: str | None = None
+    status: str
+    duration_ms: int
+    error: str | None = None
+
+
+class RuntimeTraceResponse(BaseModel):
+    """``GET /api/runtime/trace`` - bounded recent-operation history.
+
+    Small and intentionally not a replacement for the full JSONL logs: just
+    enough for an LLM to understand how execution reached its current
+    state.
+    """
+
+    trace_id: str | None = None
+    operations: list[RuntimeTraceOperation] = Field(default_factory=list)

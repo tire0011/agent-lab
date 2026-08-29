@@ -40,6 +40,7 @@ from modules.experiment_service import ExperimentNotFoundError, ExperimentServic
 from modules.operations_registry import OperationValidationError, OperationsRegistry
 from modules.operation_chain_service import OperationChainService
 from modules import redaction
+from modules import runtime_observability
 from modules.run_store import DEFAULT_DB_PATH, calculate_estimated_cost, get_applicable_price
 from models import (
     DiagnosticActivityResponse,
@@ -86,6 +87,8 @@ from models import (
     ProblemsResponse,
     PublicActivityResponse,
     PublicExperimentSummary,
+    RuntimeStatusResponse,
+    RuntimeTraceResponse,
     ServiceRestartRequest,
     SetConfigRequest,
     StatusResponse,
@@ -380,6 +383,30 @@ def health():
 def secure_health(x_api_key: str | None = Header(default=None)):
     authorize(x_api_key)
     return {"status": "ok", "auth": "ok"}
+
+
+@app.get("/api/runtime/status", response_model=RuntimeStatusResponse, response_model_exclude_none=True)
+def runtime_status(x_api_key: str | None = Header(default=None)) -> RuntimeStatusResponse:
+    """What Nexus is doing right now (issue #76).
+
+    Cheap, deterministic, explicit in-memory state - never derived by
+    parsing log files - intended as the primary way an LLM/automation asks
+    "is Nexus doing anything, and what exactly".
+    """
+    authorize(x_api_key)
+    return RuntimeStatusResponse(**runtime_observability.snapshot())
+
+
+@app.get("/api/runtime/trace", response_model=RuntimeTraceResponse)
+def runtime_trace(x_api_key: str | None = Header(default=None)) -> RuntimeTraceResponse:
+    """Bounded recent-operation history for the current/last trace (issue #76).
+
+    Small and intentionally not a replacement for the full experiment JSONL
+    logs - just enough for an LLM to understand how execution reached its
+    current state.
+    """
+    authorize(x_api_key)
+    return RuntimeTraceResponse(**runtime_observability.trace_snapshot())
 
 
 @app.get("/status", response_model=StatusResponse)

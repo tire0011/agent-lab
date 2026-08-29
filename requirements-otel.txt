@@ -1,0 +1,8 @@
+# Optional: OpenTelemetry OTLP export for runtime observability (issue #76).
+#
+# Not required for Nexus to run — modules/otel_adapter.py degrades to a
+# silent no-op when these packages are not installed. Install this file
+# only on hosts where OTLP export to an external backend (e.g. Grafana
+# Cloud) is desired. See OBSERVABILITY.md for setup.
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0

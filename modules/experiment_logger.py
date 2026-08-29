@@ -42,6 +42,16 @@ from modules import redaction
 
 logger = logging.getLogger("nexus.experiment")
 
+
+def _current_trace_context() -> dict[str, Any] | None:
+    """Lazily imported so a circular import can never break logging itself."""
+    try:
+        from modules import runtime_observability
+
+        return runtime_observability.current_context()
+    except Exception:  # noqa: BLE001 - logging must never crash the pipeline
+        return None
+
 DEFAULT_LOG_DIR = "state/experiment-logs"
 
 # Per-entry bounds. Generous enough to stay diagnostically useful, small
@@ -313,6 +323,14 @@ class ExperimentLogger:
         }
         if self.mailbox_task_id:
             entry["mailbox_task_id"] = self.mailbox_task_id
+        # Correlate with the runtime-observability trace/span (issue #76),
+        # if one is currently active for this thread. Never raises and
+        # never overrides an explicitly-passed value in ``extra``.
+        trace_ctx = _current_trace_context()
+        if trace_ctx:
+            for key in ("trace_id", "span_id", "parent_span_id", "operation"):
+                if key not in extra and trace_ctx.get(key) is not None:
+                    entry[key] = trace_ctx[key]
         if duration_ms is not None:
             entry["duration_ms"] = int(duration_ms)
         if command is not None:

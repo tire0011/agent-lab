@@ -68,6 +68,7 @@ from modules.experiment_evaluation import (
 )
 from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
+from modules import runtime_observability
 from modules.run_store import DEFAULT_DB_PATH, get_setting, init_db, insert_activity, list_activity, set_setting
 from modules.verification_runner import run_verification_test
 
@@ -2078,8 +2079,17 @@ class ExperimentService:
                 f"{current.status!r} (only {STATUS_QUEUED!r} experiments can run)"
             )
 
+        trace_id = runtime_observability.start_task(
+            task_id=self.mailbox_task_id_for_experiment(experiment_id) or experiment_id,
+            experiment_id=experiment_id,
+            worker="nexus",
+            phase="implementation",
+        )
+        elog.info("pipeline", "trace_started", "Runtime trace started for this experiment", trace_id=trace_id)
         try:
-            return self._run_pipeline(experiment_id)
+            result = self._run_pipeline(experiment_id)
+            runtime_observability.end_task(result=result.status, error=result.error)
+            return result
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
             elog.error(
                 "pipeline", "unhandled_exception",
@@ -2092,6 +2102,7 @@ class ExperimentService:
                 ended_at=_utcnow_iso(),
                 error=f"unhandled exception in experiment pipeline: {exc}",
             )
+            runtime_observability.end_task(result=STATUS_FAILED, error=str(exc))
             return self.get_experiment(experiment_id)
 
     def _run_pipeline(self, experiment_id: str) -> Experiment:
@@ -2136,14 +2147,15 @@ class ExperimentService:
             f"Creating isolated git worktree at branch {branch_name}",
         )
         try:
-            Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
-            create_proc = _run_git(
-                ["worktree", "add", "-b", branch_name, worktree_path, "HEAD"],
-                cwd=self.repo_root,
-                timeout=60,
-                elog=elog,
-                phase="implementation",
-            )
+            with runtime_observability.operation("git.worktree_add", phase="implementation"):
+                Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
+                create_proc = _run_git(
+                    ["worktree", "add", "-b", branch_name, worktree_path, "HEAD"],
+                    cwd=self.repo_root,
+                    timeout=60,
+                    elog=elog,
+                    phase="implementation",
+                )
             if create_proc.returncode != 0:
                 self._force_status(
                     experiment_id, STATUS_FAILED,
@@ -2190,14 +2202,17 @@ class ExperimentService:
             self, "_implementation_timeout_seconds", _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
         )
 
-        implementation_result: CodexResult = worker.run(
-            task=implementation_prompt,
-            working_dir=worktree_path,
-            sandbox="workspace-write",
-            timeout_seconds=implementation_timeout,
-            experiment_logger=elog,
-            phase="implementation",
-        )
+        with runtime_observability.operation(
+            "llm.generate", phase="implementation", model=getattr(worker, "model", None)
+        ):
+            implementation_result: CodexResult = worker.run(
+                task=implementation_prompt,
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=implementation_timeout,
+                experiment_logger=elog,
+                phase="implementation",
+            )
 
         if implementation_result.timed_out:
             self._force_status(
@@ -2242,41 +2257,43 @@ class ExperimentService:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
         try:
-            status_proc = _run_git(
-                ["status", "--short", "--untracked-files=all"],
-                cwd=worktree_path, elog=elog, phase="verifying",
-            )
-            with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
-                index_env = dict(os.environ)
-                index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
-                read_tree_proc = _run_git(
-                    ["read-tree", "HEAD"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying"
+            with runtime_observability.operation("git.status", phase="verifying"):
+                status_proc = _run_git(
+                    ["status", "--short", "--untracked-files=all"],
+                    cwd=worktree_path, elog=elog, phase="verifying",
                 )
-                add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying")
-                if read_tree_proc.returncode != 0 or add_proc.returncode != 0:
-                    failed_proc = read_tree_proc if read_tree_proc.returncode != 0 else add_proc
-                    raise subprocess.CalledProcessError(
-                        failed_proc.returncode,
-                        failed_proc.args,
-                        output=failed_proc.stdout,
-                        stderr=failed_proc.stderr,
+            with runtime_observability.operation("git.diff", phase="verifying"):
+                with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
+                    index_env = dict(os.environ)
+                    index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
+                    read_tree_proc = _run_git(
+                        ["read-tree", "HEAD"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying"
                     )
-                stat_proc = _run_git(
-                    ["diff", "--cached", "--stat", "HEAD"],
-                    cwd=worktree_path,
-                    env=index_env,
-                    elog=elog, phase="verifying",
-                )
-                diff_proc = _run_git(
-                    ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env,
-                    elog=elog, phase="verifying",
-                )
-                check_proc = _run_git(
-                    ["diff", "--cached", "--check", "HEAD"],
-                    cwd=worktree_path,
-                    env=index_env,
-                    elog=elog, phase="verifying",
-                )
+                    add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying")
+                    if read_tree_proc.returncode != 0 or add_proc.returncode != 0:
+                        failed_proc = read_tree_proc if read_tree_proc.returncode != 0 else add_proc
+                        raise subprocess.CalledProcessError(
+                            failed_proc.returncode,
+                            failed_proc.args,
+                            output=failed_proc.stdout,
+                            stderr=failed_proc.stderr,
+                        )
+                    stat_proc = _run_git(
+                        ["diff", "--cached", "--stat", "HEAD"],
+                        cwd=worktree_path,
+                        env=index_env,
+                        elog=elog, phase="verifying",
+                    )
+                    diff_proc = _run_git(
+                        ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env,
+                        elog=elog, phase="verifying",
+                    )
+                    check_proc = _run_git(
+                        ["diff", "--cached", "--check", "HEAD"],
+                        cwd=worktree_path,
+                        env=index_env,
+                        elog=elog, phase="verifying",
+                    )
         except (OSError, subprocess.SubprocessError) as exc:
             elog.error(
                 "verifying", "verification_git_exception",
@@ -2328,11 +2345,13 @@ class ExperimentService:
             command=test_command, cwd=worktree_path,
             timeout_seconds=test_timeout_seconds,
         )
-        test_run = run_verification_test(
-            test_command,
-            cwd=worktree_path,
-            timeout_seconds=test_timeout_seconds,
-        )
+        test_run = None
+        with runtime_observability.operation("tests.run", phase="verifying"):
+            test_run = run_verification_test(
+                test_command,
+                cwd=worktree_path,
+                timeout_seconds=test_timeout_seconds,
+            )
         test_exit_code = test_run.exit_code
         test_output = test_run.output
         test_timed_out = test_run.timed_out

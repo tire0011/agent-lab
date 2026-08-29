@@ -279,6 +279,18 @@ file contents; stack traces with internal paths; or unrestricted/raw
 command output. The website's Diagnostics card and
 `./scripts/nexus-logs.ps1` both display this same model.
 
+## Nexus runtime observability API
+
+`GET /api/runtime/status` (authenticated) returns a small, cheap,
+explicit-state snapshot of what Nexus is doing right now (idle, or the
+current task/phase/operation, task/operation durations, and heartbeat
+health). `GET /api/runtime/trace` (authenticated) returns a bounded recent
+history of hierarchical operations (spans) for the current/last trace.
+Existing per-experiment JSONL logs are tagged with matching
+`trace_id`/`span_id`/`parent_span_id` fields, and traces can optionally be
+exported via OpenTelemetry OTLP to an external backend (e.g. Grafana
+Cloud) — see `OBSERVABILITY.md` for setup and manual verification steps.
+
 ## Security
 
 - Never commit credentials, API keys, private keys, or tokens.
@@ -302,6 +314,7 @@ command output. The website's Diagnostics card and
 - `DECISIONS.md` - decision log
 - `COSTS.md` - budget and cost tracking policy
 - `OPERATIONS.md` - operational runbook
+- `OBSERVABILITY.md` - runtime observability (tracing, heartbeat, status API, Grafana Cloud setup)
 
 ## API CLI client
 
