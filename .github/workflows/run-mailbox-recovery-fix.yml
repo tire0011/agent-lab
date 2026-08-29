@@ -29,10 +29,28 @@ jobs:
           AGENT_API_KEY: test-key
         run: python -m unittest tests.test_mailbox_poll_runner tests.test_mailbox_operation_chain -q
       - name: Full tests
+        id: full
         env:
           AGENT_API_KEY: test-key
-        run: python -m unittest discover -s tests -q
+        run: |
+          set +e
+          python -m unittest discover -s tests -q > full-suite.log 2>&1
+          code=$?
+          tail -n 200 full-suite.log
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Capture failure on fix branch
+        if: steps.full.outputs.code != '0'
+        run: |
+          tail -n 200 full-suite.log > full-suite-failure.log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f full-suite-failure.log
+          git commit -m "Capture mailbox recovery full-suite failure"
+          git push origin HEAD:fix/mailbox-rejected-chain-recovery
+          exit 1
       - name: Commit fixed branch
+        if: steps.full.outputs.code == '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
