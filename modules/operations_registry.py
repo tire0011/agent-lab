@@ -7,6 +7,8 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,15 +120,16 @@ class OperationsRegistry:
         return [self._specs[name] for name in sorted(self._specs)]
 
     def execute(self, operation: str, args: dict[str, Any] | None = None, *, caller: str = "authenticated caller") -> OperationResult:
-        if operation not in self._specs:
-            raise OperationValidationError("Operation ist nicht erlaubt.")
         params = dict(args or {})
         started = time.perf_counter()
         try:
-            # Canonical operation names use underscores (e.g. "git_status") and map
-            # 1:1 to "_op_<name>" handler methods; this is the single source of
-            # truth shared by the catalog, the API, and OperationChainService.
-            handler = getattr(self, f"_op_{operation}")
+            # Executability is defined by an implemented handler, not by the
+            # metadata catalog.  This avoids a second positive allowlist that can
+            # silently block operations which are already implemented elsewhere.
+            # Unknown names still fail safely because no handler exists.
+            handler = getattr(self, f"_op_{operation}", None)
+            if handler is None or not callable(handler):
+                raise OperationValidationError(f"Unbekannte Operation: {operation}")
             result = handler(params)
         except OperationValidationError:
             raise
@@ -157,6 +160,7 @@ class OperationsRegistry:
             "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen."),
             "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo."),
             "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers."),
+            "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers."),
             "service_logs": OperationSpec("service_logs", "journalctl-Auszug für den API-Service.", [limit50]),
             "service_status": OperationSpec("service_status", "systemctl-Status des API-Service."),
             "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id]),
@@ -288,6 +292,47 @@ class OperationsRegistry:
             for entry in entries
         ]
         return OperationResult("experiment_logs", True, lines, 0)
+
+    def _op_local_model_status(self, args: dict[str, Any]) -> OperationResult:
+        if args:
+            raise OperationValidationError("local_model_status akzeptiert keine Argumente.")
+        started = time.perf_counter()
+        base_url = (
+            os.getenv("LOCAL_MODEL_URL")
+            or os.getenv("LLAMA_CPP_BASE_URL")
+            or "http://127.0.0.1:8080/v1"
+        ).rstrip("/")
+        try:
+            request = urllib.request.Request(f"{base_url}/models", method="GET")
+            with urllib.request.urlopen(request, timeout=15) as response:
+                body = response.read(4000).decode("utf-8", errors="replace")
+                status = getattr(response, "status", 200)
+            lines = bounded_lines(redact(body), max_lines=40)
+            return OperationResult(
+                operation="local_model_status",
+                success=200 <= int(status) < 300,
+                output_lines=[f"http_status: {status}", *lines],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                exit_code=0 if 200 <= int(status) < 300 else int(status),
+                error_summary=None if 200 <= int(status) < 300 else f"local model HTTP {status}",
+            )
+        except urllib.error.HTTPError as exc:
+            return OperationResult(
+                operation="local_model_status",
+                success=False,
+                output_lines=[],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                exit_code=exc.code,
+                error_summary=f"local model HTTP {exc.code}",
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return OperationResult(
+                operation="local_model_status",
+                success=False,
+                output_lines=[],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_summary=sanitized_reason(str(exc)),
+            )
 
     def _op_service_status(self, args: dict[str, Any]) -> OperationResult:
         del args

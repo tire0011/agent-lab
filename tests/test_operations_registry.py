@@ -90,13 +90,35 @@ class OperationsRegistryTests(unittest.TestCase):
         )
         self.addCleanup(self.registry.close)
 
-    def test_catalog_lists_allowlisted_operations(self):
+    def test_catalog_lists_available_operations(self):
         catalog = self.registry.catalog()
         names = {item.name for item in catalog}
         self.assertIn("git_status", names)
         self.assertIn("service_logs", names)
         self.assertIn("mailbox_status", names)
+        self.assertIn("local_model_status", names)
         self.assertNotIn("experiment adopt", names)
+
+    def test_execution_uses_implemented_handler_not_catalog_membership(self):
+        self.registry._specs.pop("git_status")
+        result = self.registry.execute("git_status", {})
+        self.assertTrue(result.success)
+
+    def test_local_model_status_handler_returns_models_response(self):
+        class FakeResponse:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def read(self, limit):
+                return b'{"data":[{"id":"local-test-model"}]}'
+
+        from unittest.mock import patch
+        with patch("modules.operations_registry.urllib.request.urlopen", return_value=FakeResponse()):
+            result = self.registry.execute("local_model_status", {})
+        self.assertTrue(result.success)
+        self.assertIn("local-test-model", "\n".join(result.output_lines))
 
     def test_mailbox_status_uses_fixed_units_and_redacts_bounded_output(self):
         calls = []
