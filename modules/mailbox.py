@@ -31,6 +31,8 @@ MAX_FILE_SIZE = 65536  # 64 KB
 MAX_RETRY = 3
 STATUS_DONE = "done"
 STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
+STATUS_DEFERRED = "deferred"
+_DEFERRED_PROCESSING = object()
 SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain"}
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
@@ -904,10 +906,16 @@ class MailboxProcessor:
 
         # Upsert DB record as processing
         if existing:
-            self.conn.execute(
-                "UPDATE mailbox_messages SET status='processing', retry_count=retry_count+1 WHERE id=?",
-                (existing["id"],),
-            )
+            if existing["status"] == STATUS_DEFERRED:
+                self.conn.execute(
+                    "UPDATE mailbox_messages SET status='processing' WHERE id=?",
+                    (existing["id"],),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE mailbox_messages SET status='processing', retry_count=retry_count+1 WHERE id=?",
+                    (existing["id"],),
+                )
             db_msg_id = existing["id"]
         else:
             cur = self.conn.execute(
@@ -933,7 +941,15 @@ class MailboxProcessor:
                 )
             else:
                 processor = _PROCESSORS[msg.msg_type]
-                result_body, idea_id = processor(msg, self._code_repo_path, self.conn, db_msg_id)
+                processor_result = processor(msg, self._code_repo_path, self.conn, db_msg_id)
+                if processor_result is _DEFERRED_PROCESSING:
+                    self.conn.execute(
+                        "UPDATE mailbox_messages SET status=? WHERE id=?",
+                        (STATUS_DEFERRED, db_msg_id),
+                    )
+                    self.conn.commit()
+                    return {"file": rel, "status": "pending", "type": msg.msg_type}
+                result_body, idea_id = processor_result
         except Exception as exc:
             logger.exception("Error processing %s", file_path)
             self._record_failure(file_path, str(exc), {"id": db_msg_id})

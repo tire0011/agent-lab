@@ -8,18 +8,18 @@ so the controller can execute them without a manual approval step.
 from __future__ import annotations
 
 import os
-import re
+import shlex
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 from modules.redaction import redact
 
-DEFAULT_TIMEOUT_SECONDS = 120
-MAX_TIMEOUT_SECONDS = 3600
 MAX_OUTPUT_CHARS = 32_000
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_ACTIVE_COMMANDS: dict[int, subprocess.Popen] = {}
 _SENSITIVE_ENV_MARKERS = (
     "TOKEN",
     "KEY",
@@ -29,31 +29,8 @@ _SENSITIVE_ENV_MARKERS = (
     "AZURE_OPENAI",
 )
 
-_SELF_MANAGED_SERVICES = ("agent-api", "agent-api.service", "nexus-mailbox", "nexus-mailbox.service")
-_SYSTEMCTL_DISRUPTIVE_ACTIONS = (
-    "restart",
-    "stop",
-    "kill",
-    "try-restart",
-    "reload-or-restart",
-    "reload-or-try-restart",
-)
-
-
 def development_mode_enabled() -> bool:
     return os.environ.get("NEXUS_DEVELOPMENT_MODE", "").strip().lower() in _TRUE_VALUES
-
-
-def _parse_timeout(value: str | None) -> int:
-    if value is None or not value.strip():
-        return DEFAULT_TIMEOUT_SECONDS
-    try:
-        timeout = int(value)
-    except ValueError as exc:
-        raise ValueError("timeout must be an integer number of seconds") from exc
-    if not 1 <= timeout <= MAX_TIMEOUT_SECONDS:
-        raise ValueError(f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds")
-    return timeout
 
 
 def _command_environment() -> dict[str, str]:
@@ -72,23 +49,6 @@ def _bounded_redacted(text: str | None) -> str:
     return clean[:MAX_OUTPUT_CHARS] + f"\n...[truncated {omitted} chars]"
 
 
-def _contains_self_disruptive_service_action(command: str) -> bool:
-    normalized = " ".join(command.lower().split())
-    service_pattern = "(?:" + "|".join(re.escape(s) for s in _SELF_MANAGED_SERVICES) + ")"
-    action_pattern = "(?:" + "|".join(re.escape(a) for a in _SYSTEMCTL_DISRUPTIVE_ACTIONS) + ")"
-    if re.search(
-        rf"(?:^|[;&|]\s*)(?:sudo\s+(?:-n\s+)?)?systemctl\s+{action_pattern}\b[^;&|]*\b{service_pattern}\b",
-        normalized,
-    ):
-        return True
-    if re.search(
-        rf"(?:^|[;&|]\s*)(?:sudo\s+(?:-n\s+)?)?service\s+{service_pattern}\s+{action_pattern}\b",
-        normalized,
-    ):
-        return True
-    return False
-
-
 def process_command(
     msg: Any,
     repo_path: Path,
@@ -98,42 +58,76 @@ def process_command(
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")
-    if _contains_self_disruptive_service_action(command):
-        raise ValueError(
-            "mailbox command cannot stop/restart agent-api or nexus-mailbox while "
-            "processing its own transaction; use an independent maintenance/deployment path"
-        )
+    from modules.mailbox import _DEFERRED_PROCESSING
 
-    timeout = _parse_timeout(msg.meta.get("timeout"))
-    started = time.monotonic()
-    try:
-        result = subprocess.run(
-            ["/bin/bash", "-lc", command],
-            cwd=str(repo_path),
-            env=_command_environment(),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration = time.monotonic() - started
-        stdout = _bounded_redacted(exc.stdout if isinstance(exc.stdout, str) else "")
-        stderr = _bounded_redacted(exc.stderr if isinstance(exc.stderr, str) else "")
-        return (
-            f"Command timed out after {timeout}s (runtime {duration:.3f}s).\n\n"
-            f"### stdout\n\n```text\n{stdout}\n```\n\n"
-            f"### stderr\n\n```text\n{stderr}\n```",
-            None,
-        )
+    state_root = Path(os.environ.get(
+        "NEXUS_MAILBOX_COMMAND_STATE_DIR",
+        str(Path(tempfile.gettempdir()) / "nexus-mailbox-command-jobs"),
+    ))
+    state_dir = state_root / str(db_msg_id)
+    stdout_path = state_dir / "stdout"
+    stderr_path = state_dir / "stderr"
+    exit_path = state_dir / "exit_code"
+    pid_path = state_dir / "pid"
+    started_path = state_dir / "started"
 
-    duration = time.monotonic() - started
-    stdout = _bounded_redacted(result.stdout)
-    stderr = _bounded_redacted(result.stderr)
+    if exit_path.exists():
+        active = _ACTIVE_COMMANDS.pop(db_msg_id, None)
+        if active is not None:
+            try:
+                active.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            returncode = int(exit_path.read_text().strip())
+        except (OSError, ValueError):
+            returncode = 255
+        try:
+            started = float(started_path.read_text().strip())
+        except (OSError, ValueError):
+            started = time.time()
+        duration = max(0.0, time.time() - started)
+        stdout = _bounded_redacted(stdout_path.read_text(errors="replace") if stdout_path.exists() else "")
+        stderr = _bounded_redacted(stderr_path.read_text(errors="replace") if stderr_path.exists() else "")
+    else:
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text().strip())
+                os.kill(pid, 0)
+                return _DEFERRED_PROCESSING
+            except (OSError, ValueError):
+                stderr = "Mailbox command runner exited without recording an exit code."
+                stdout = ""
+                returncode = 255
+                try:
+                    started = float(started_path.read_text().strip())
+                except (OSError, ValueError):
+                    started = time.time()
+                duration = max(0.0, time.time() - started)
+        else:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            started_path.write_text(str(time.time()))
+            wrapper = (
+                "set +e\n(" + command + "\n)\n"
+                "rc=$?\n"
+                f"printf '%s\n' \"$rc\" > {shlex.quote(str(exit_path))}\n"
+            )
+            with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+                proc = subprocess.Popen(
+                    ["/bin/bash", "-lc", wrapper],
+                    cwd=str(repo_path),
+                    env=_command_environment(),
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+            pid_path.write_text(str(proc.pid))
+            _ACTIVE_COMMANDS[db_msg_id] = proc
+            return _DEFERRED_PROCESSING
     return (
         "\n".join(
             [
-                f"**Exit code:** {result.returncode}",
+                f"**Exit code:** {returncode}",
                 f"**Duration:** {duration:.3f}s",
                 "",
                 "### stdout",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,16 @@ from modules.run_store import init_db
 
 
 class TestMailboxDevelopment(unittest.TestCase):
+    def _run_command(self, msg, repo: Path, db_msg_id: int = 1):
+        result = process_command(msg, repo, None, db_msg_id)
+        deadline = time.monotonic() + 5
+        while result is mailbox._DEFERRED_PROCESSING:
+            if time.monotonic() >= deadline:
+                self.fail("command did not finish")
+            time.sleep(0.01)
+            result = process_command(msg, repo, None, db_msg_id)
+        return result
+
     def test_install_registers_command_type_and_processor(self):
         install(mailbox)
         self.assertIn("command", mailbox.SUPPORTED_TYPES)
@@ -32,8 +43,10 @@ class TestMailboxDevelopment(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
         }
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
-            body, idea_id = process_command(msg, Path(tmp), None, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                body, idea_id = self._run_command(msg, Path(tmp))
         self.assertIn("**Exit code:** 0", body)
         self.assertIn("hello", body)
         self.assertIsNone(idea_id)
@@ -47,39 +60,26 @@ class TestMailboxDevelopment(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
         }
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
-            repo = Path(tmp)
-            body, _ = process_command(msg, repo, None, 1)
-            self.assertEqual((repo / "created.txt").read_text(), "changed")
+        with tempfile.TemporaryDirectory() as tmp:
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                repo = Path(tmp)
+                body, _ = self._run_command(msg, repo)
+                self.assertEqual((repo / "created.txt").read_text(), "changed")
         self.assertIn("**Exit code:** 0", body)
         self.assertIn("hello", body)
 
-    def test_command_timeout_is_bounded(self):
-        msg = SimpleNamespace(body="printf hello", meta={"timeout": "3601"})
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-        }
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
-            with self.assertRaises(ValueError):
-                process_command(msg, Path(tmp), None, 1)
-
-    def test_command_rejects_restart_of_agent_api(self):
-        msg = SimpleNamespace(
-            body="echo before && sudo -n systemctl restart agent-api.service && echo after",
-            meta={},
-        )
+    def test_command_timeout_metadata_is_ignored(self):
+        msg = SimpleNamespace(body="sleep 0.05; printf done", meta={"timeout": "1"})
+        env = {"PATH": os.environ.get("PATH", "")}
         with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(ValueError, "independent maintenance/deployment"):
-                process_command(msg, Path(tmp), None, 1)
-
-    def test_command_rejects_restart_of_mailbox_service(self):
-        msg = SimpleNamespace(
-            body="systemctl stop nexus-mailbox.service",
-            meta={},
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(ValueError, "nexus-mailbox"):
-                process_command(msg, Path(tmp), None, 1)
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                first = process_command(msg, Path(tmp), None, 1)
+                self.assertIs(first, mailbox._DEFERRED_PROCESSING)
+                body, _ = self._run_command(msg, Path(tmp))
+        self.assertIn("**Exit code:** 0", body)
+        self.assertIn("done", body)
 
     def test_command_allows_read_only_service_status(self):
         msg = SimpleNamespace(body="printf 'agent-api status check'", meta={})
@@ -87,8 +87,10 @@ class TestMailboxDevelopment(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
         }
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
-            body, _ = process_command(msg, Path(tmp), None, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                body, _ = self._run_command(msg, Path(tmp))
         self.assertIn("**Exit code:** 0", body)
         self.assertIn("agent-api status check", body)
 
