@@ -774,3 +774,48 @@ class TestFullInboxEndToEndWithBareRepo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRejectedChainPublishRecovery(unittest.TestCase):
+    def test_rejected_chain_persists_publish_state_before_writing_outbox(self):
+        from modules.mailbox_config import MailboxConfig
+        from modules.outbox_publisher import PUBLISH_WRITTEN
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            code_repo = root / "code"
+            mailbox_repo = root / "mailbox"
+            code_repo.mkdir()
+            mailbox_repo.mkdir()
+            (mailbox_repo / "inbox").mkdir()
+            (mailbox_repo / "outbox").mkdir()
+            db_path = str(root / "agent.db")
+            cfg = MailboxConfig.from_paths(code_repo, mailbox_repo)
+            registry = Mock()
+            registry._specs = {}
+            service = OperationChainService(
+                db_path=db_path,
+                operations_registry=registry,
+                mailbox_config=cfg,
+            )
+            try:
+                request = OperationChainRequest(
+                    request_id="rejected-publish-regression",
+                    steps=[
+                        OperationChainStep(id="dup", action="git_status"),
+                        OperationChainStep(id="dup", action="git_log"),
+                    ],
+                )
+                result = service.start_chain(request)
+                self.assertEqual(result.overall_status, STATUS_REJECTED)
+                row = service._conn.execute(
+                    "SELECT status, outbox_file, publish_status FROM operation_chains WHERE request_id = ?",
+                    (request.request_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], STATUS_REJECTED)
+                self.assertTrue(row[1].startswith("outbox/"))
+                self.assertEqual(row[2], PUBLISH_WRITTEN)
+                self.assertTrue((mailbox_repo / row[1]).is_file())
+            finally:
+                service.close()

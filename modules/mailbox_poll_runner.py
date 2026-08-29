@@ -135,10 +135,53 @@ def _finalize_terminal_validation_errors(
     return results
 
 
-def _sync_mailbox_repo(mailbox_module: Any, repo_path: Path, max_attempts: int = 3) -> bool:
+def _worktree_safe_for_mailbox_sync(
+    mailbox_module: Any,
+    repo_path: Path,
+    ignored_untracked_prefixes: tuple[str, ...] = (),
+) -> bool:
+    """Return whether mailbox Git operations can proceed safely.
+
+    Untracked files below explicitly supplied machine-managed prefixes (normally
+    the outbox directory) are tolerated.  The publisher commits exact pathspecs,
+    so these files cannot be swept into unrelated commits.  Staged changes,
+    modified tracked files, and untracked files elsewhere remain blocking.
+    """
+    status = mailbox_module._git(["status", "--porcelain"], repo_path, check=False)
+    if status.returncode != 0:
+        return False
+
+    prefixes = tuple(prefix.rstrip("/") + "/" for prefix in ignored_untracked_prefixes)
+    for entry in status.stdout.splitlines():
+        if not entry.strip():
+            continue
+        if entry.startswith("?? "):
+            path = entry[3:].strip('\"')
+            if any(path.startswith(prefix) for prefix in prefixes):
+                continue
+        return False
+    return True
+
+
+def _sync_mailbox_repo(
+    mailbox_module: Any,
+    repo_path: Path,
+    max_attempts: int = 3,
+    ignored_untracked_prefixes: tuple[str, ...] = (),
+) -> bool:
     """Synchronize append-oriented mailbox commits without discarding local work."""
     run_name = threading.current_thread().name
-    if not mailbox_module.git_is_clean(repo_path):
+    # Preserve the original direct helper contract when no machine-managed
+    # untracked paths need to be tolerated.  The mailbox poller passes the
+    # configured outbox prefix explicitly; legacy/direct callers continue to
+    # use git_is_clean(), which also keeps their retry behavior unchanged.
+    if ignored_untracked_prefixes:
+        worktree_safe = _worktree_safe_for_mailbox_sync(
+            mailbox_module, repo_path, ignored_untracked_prefixes
+        )
+    else:
+        worktree_safe = mailbox_module.git_is_clean(repo_path)
+    if not worktree_safe:
         logger.warning("Mailbox sync refused run=%s reason=dirty_worktree", run_name)
         return False
 
@@ -252,11 +295,27 @@ def run_mailbox_poll_once(
             publisher.publish_pending()
             task_publisher.publish_pending()
             processor.retry_pending_git_commits()
-            if not processor.ensure_clean_worktree():
+            try:
+                outbox_prefix = (
+                    mailbox_config.outbox_dir
+                    .relative_to(mailbox_config.mailbox_repo_path)
+                    .as_posix()
+                    .rstrip("/")
+                    + "/"
+                )
+            except ValueError:
+                outbox_prefix = ""
+            ignored_untracked = (outbox_prefix,) if outbox_prefix else ()
+            if not _worktree_safe_for_mailbox_sync(
+                mailbox_module,
+                mailbox_config.mailbox_repo_path,
+                ignored_untracked,
+            ):
                 result = MailboxPollRunResult(status="dirty_worktree")
             elif not _sync_mailbox_repo(
                 mailbox_module,
                 mailbox_config.mailbox_repo_path,
+                ignored_untracked_prefixes=ignored_untracked,
             ):
                 result = MailboxPollRunResult(status="sync_failed")
             else:
