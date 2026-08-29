@@ -48,6 +48,31 @@ _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
     "codex_readonly": ("codex_readonly", "azure_openai", "local_worker"),
 }
 
+_ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["tool", "action"]},
+            "tool": {"type": "string"},
+            "operation": {"type": "string"},
+            "args": {"type": "object", "additionalProperties": True},
+            "query": {"type": "string"},
+            "limit": {"type": "integer"},
+            "provider": {"type": "string"},
+            "task": {"type": "string"},
+            "context": {"type": "string"},
+            "command": {"type": "string"},
+            "action": {"type": "string"},
+            "experiment_id": {"type": ["string", "null"]},
+            "message": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["type"],
+        "additionalProperties": False,
+    },
+}
+
 
 @dataclass(slots=True)
 class TaskDecision:
@@ -173,20 +198,32 @@ class NexusTaskOrchestrator:
                 "llm_provider selected provider=local role=controller session_id=%s reason=persistent_controller",
                 session.id,
             )
-            job_id = self.llm_jobs.submit(
+            raw = await self._controller_completion(
                 prompt,
-                temperature=0.0,
-                max_tokens=550,
                 session_id=session.id,
+                max_tokens=550,
             )
-            self.task_store.set_status(session.id, "waiting_for_llm")
             try:
-                raw = await self.llm_jobs.wait(job_id)
-            except LocalLlmJobError as exc:
-                self.task_store.set_status(session.id, "active")
-                raise TaskOrchestratorError(f"local LLM job failed: {exc}") from exc
-            self.task_store.set_status(session.id, "active")
-            decision = self._parse(raw)
+                decision = self._parse(raw)
+            except TaskOrchestratorError as first_error:
+                logger.warning(
+                    "controller JSON invalid session_id=%s; requesting one correction: %s",
+                    session.id,
+                    str(first_error).splitlines()[0][:500],
+                )
+                correction_prompt = self._json_correction_prompt(raw, first_error)
+                corrected_raw = await self._controller_completion(
+                    correction_prompt,
+                    session_id=session.id,
+                    max_tokens=650,
+                )
+                try:
+                    decision = self._parse(corrected_raw)
+                except TaskOrchestratorError as correction_error:
+                    raise TaskOrchestratorError(
+                        "controller returned invalid JSON and its single correction "
+                        f"retry also failed: {correction_error}"
+                    ) from correction_error
             # Small local models occasionally emit the command capability with
             # the final-action envelope (``action: command``) even though the
             # prompt explicitly defines commands as tools. Treat that shape as
@@ -249,6 +286,43 @@ class NexusTaskOrchestrator:
         )
         self._persist_final(session.id, task, result)
         return result
+
+    async def _controller_completion(
+        self,
+        prompt: str,
+        *,
+        session_id: str,
+        max_tokens: int,
+    ) -> str:
+        job_id = self.llm_jobs.submit(
+            prompt,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            session_id=session_id,
+            response_format=_ORCHESTRATOR_RESPONSE_FORMAT,
+        )
+        self.task_store.set_status(session_id, "waiting_for_llm")
+        try:
+            return await self.llm_jobs.wait(job_id)
+        except LocalLlmJobError as exc:
+            raise TaskOrchestratorError(f"local LLM job failed: {exc}") from exc
+        finally:
+            self.task_store.set_status(session_id, "active")
+
+    @staticmethod
+    def _json_correction_prompt(
+        raw: str,
+        error: TaskOrchestratorError,
+    ) -> str:
+        return (
+            "Your previous Nexus controller response was not valid JSON. "
+            "Correct syntax only and preserve the intended next step. "
+            "Return exactly one JSON object with no Markdown or prose.\n\n"
+            f"VALIDATION ERROR:\n{str(error)[:1000]}\n\n"
+            f"REQUIRED JSON SCHEMA:\n"
+            f"{json.dumps(_ORCHESTRATOR_RESPONSE_FORMAT['schema'], separators=(',', ':'))}\n\n"
+            f"INVALID RESPONSE:\n{raw[:6000]}"
+        )
 
     def _capabilities(self) -> list[dict[str, Any]]:
         operations = [spec.to_dict() for spec in self.operations_registry.catalog()]
