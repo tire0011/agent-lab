@@ -17,6 +17,7 @@ from modules.mailbox_config import MailboxConfig
 from modules.mailbox_poll_runner import (
     _finalize_terminal_validation_errors,
     _sync_mailbox_repo,
+    _worktree_safe_for_mailbox_sync,
     run_mailbox_poll_once,
 )
 
@@ -236,6 +237,45 @@ class MailboxSyncTests(unittest.TestCase):
             self.assertEqual(
                 _git(local, "rev-list", "--left-right", "--count", "HEAD...@{u}").stdout.strip(),
                 "0\t0",
+            )
+
+
+class MailboxDirtyRecoveryTests(unittest.TestCase):
+    def test_untracked_outbox_file_does_not_block_mailbox_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+            _configure_git(repo)
+            (repo / "outbox").mkdir()
+            (repo / "inbox").mkdir()
+            (repo / "README.md").write_text("seed\n", encoding="utf-8")
+            _git(repo, "add", "README.md")
+            _git(repo, "commit", "-m", "seed")
+            orphan = repo / "outbox" / "orphan.md"
+            orphan.write_text("result\n", encoding="utf-8")
+
+            self.assertTrue(
+                _worktree_safe_for_mailbox_sync(
+                    mailbox_module, repo, ("outbox/",)
+                )
+            )
+            self.assertTrue(orphan.exists())
+
+    def test_untracked_file_outside_outbox_still_blocks_mailbox_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+            _configure_git(repo)
+            (repo / "outbox").mkdir()
+            (repo / "README.md").write_text("seed\n", encoding="utf-8")
+            _git(repo, "add", "README.md")
+            _git(repo, "commit", "-m", "seed")
+            (repo / "unexpected.txt").write_text("local work\n", encoding="utf-8")
+
+            self.assertFalse(
+                _worktree_safe_for_mailbox_sync(
+                    mailbox_module, repo, ("outbox/",)
+                )
             )
 
 

@@ -136,6 +136,30 @@ class OperationChainService:
                 steps_successful=0,
                 steps_failed=0,
             )
+            # Rejected chains still need a persistent row before the outbox
+            # publish lifecycle is recorded.  Previously _store_result() and
+            # _write_outbox_result() only issued UPDATE statements against a
+            # row that did not exist yet, leaving an untracked outbox file with
+            # no DB publish state and permanently blocking later mailbox polls.
+            with self._lock:
+                chain_id = uuid.uuid4().hex
+                now = _now_iso()
+                self._conn.execute(
+                    """
+                    INSERT INTO operation_chains
+                        (id, request_id, status, created_at, request_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chain_id,
+                        request.request_id,
+                        STATUS_REJECTED,
+                        result.created_at,
+                        request.model_dump_json(),
+                        now,
+                    ),
+                )
+                self._conn.commit()
             self._store_result(result)
             self._write_outbox_result(request.request_id, result)
             return result
