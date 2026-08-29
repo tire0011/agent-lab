@@ -162,6 +162,17 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_missing_final_action_is_corrected_once(self):
+        client = _Client(['{\"type\":\"action\"}', '{\"type\":\"action\",\"action\":\"answer\",\"message\":\"done\",\"reason\":\"corrected\"}'])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run('Answer locally')
+            self.assertEqual(result.action, ACTION_ANSWER)
+            self.assertEqual(len(client.prompts), 2)
+            self.assertIn('action response requires action', client.prompts[1])
+        finally:
+            orchestrator.close()
+
     def test_registered_operation_name_is_accepted_as_direct_tool_alias(self):
         client = _Client([
             '{"type":"tool","tool":"experiment_show","args":{"experiment_id":"bd9720b2"},'

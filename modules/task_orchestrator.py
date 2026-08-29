@@ -396,6 +396,13 @@ Rules:
             raise TaskOrchestratorError(str(exc)) from exc
         if not isinstance(data, dict):
             raise TaskOrchestratorError("orchestrator response must be a JSON object")
+        response_type = str(data.get("type", "")).strip().lower()
+        if response_type == "tool" and not str(data.get("tool", "")).strip():
+            raise TaskOrchestratorError("tool response requires tool")
+        if response_type == "action" and not str(data.get("action", "")).strip():
+            raise TaskOrchestratorError("action response requires action")
+        if response_type not in {"tool", "action"}:
+            raise TaskOrchestratorError(f"unknown response type {response_type!r}")
         return data
 
     async def _execute_tool(self, decision: dict[str, Any]) -> dict[str, Any]:
