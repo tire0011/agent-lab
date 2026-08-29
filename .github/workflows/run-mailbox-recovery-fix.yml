@@ -1,0 +1,42 @@
+name: Run mailbox recovery fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/run-mailbox-recovery-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/mailbox-rejected-chain-recovery
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install API dependencies
+        run: python -m pip install -r requirements-api.txt
+      - name: Apply patch
+        run: python scripts/apply_mailbox_recovery_fix.py
+      - name: Focused tests
+        env:
+          AGENT_API_KEY: test-key
+        run: python -m unittest tests.test_mailbox_poll_runner tests.test_mailbox_operation_chain -q
+      - name: Full tests
+        env:
+          AGENT_API_KEY: test-key
+        run: python -m unittest discover -s tests -q
+      - name: Commit fixed branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm scripts/apply_mailbox_recovery_fix.py .github/workflows/apply-mailbox-recovery-fix.yml
+          git add modules/operation_chain_service.py modules/mailbox_poll_runner.py tests/test_mailbox_poll_runner.py tests/test_mailbox_operation_chain.py scripts/apply_mailbox_recovery_fix.py .github/workflows/apply-mailbox-recovery-fix.yml
+          git commit -m "Fix rejected chain mailbox recovery"
+          git push origin HEAD:fix/mailbox-rejected-chain-recovery
