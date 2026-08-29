@@ -175,6 +175,39 @@ async def test_complete_returns_string():
     assert result == "Answer text"
 
 
+
+@pytest.mark.asyncio
+async def test_complete_forwards_structured_response_format():
+    response_data = {"choices": [{"message": {"content": "{\"type\":\"answer\"}"}}]}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = response_data
+    response_format = {
+        "type": "json_schema",
+        "schema": {
+            "type": "object",
+            "properties": {"type": {"type": "string"}},
+            "required": ["type"],
+        },
+    }
+
+    with patch("modules.llama_cpp_client.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value = mock_client
+
+        result = await make_client().complete(
+            "Return a decision",
+            response_format=response_format,
+        )
+
+    assert result == '{"type":"answer"}'
+    payload = mock_client.post.await_args.kwargs["json"]
+    assert payload["response_format"] == response_format
+
+
 # ── is_available ──────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

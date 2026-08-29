@@ -13,7 +13,15 @@ class _Client:
         self.responses = list(responses)
         self.prompts = []
 
-    async def complete(self, *, prompt, temperature, max_tokens):
+    async def complete(
+        self,
+        *,
+        prompt,
+        temperature,
+        max_tokens,
+        response_format=None,
+    ):
+        del response_format
         self.prompts.append(prompt)
         return self.responses.pop(0)
 
