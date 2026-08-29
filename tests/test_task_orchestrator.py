@@ -13,6 +13,7 @@ from modules.task_orchestrator import (
     ACTION_MISSING_CAPABILITY,
     ACTION_RESUME_EXPERIMENT,
     NexusTaskOrchestrator,
+    TaskOrchestratorError,
 )
 
 
@@ -20,9 +21,18 @@ class _Client:
     def __init__(self, responses):
         self.responses = list(responses)
         self.prompts = []
+        self.response_formats = []
 
-    async def complete(self, *, prompt, temperature, max_tokens):
+    async def complete(
+        self,
+        *,
+        prompt,
+        temperature,
+        max_tokens,
+        response_format=None,
+    ):
         self.prompts.append(prompt)
+        self.response_formats.append(response_format)
         return self.responses.pop(0)
 
 
@@ -265,6 +275,50 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(second.session_id, first.session_id)
         self.assertIn("Optimize for cost", client.prompts[1])
         self.assertIn("Improve model routing", client.prompts[1])
+
+    def test_invalid_json_escape_gets_one_schema_constrained_correction(self):
+        client = _Client([
+            r'''{"type":"tool","tool":"command","command":"echo Don\'t stop","reason":"implement"}''',
+            '{"type":"tool","tool":"command","command":"printf repaired",'
+            '"reason":"corrected syntax"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"Implemented.","reason":"command succeeded"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\nrepaired\n", None),
+            ) as command_mock:
+                result = orchestrator.run("Implement the change")
+
+            self.assertEqual(result.action, ACTION_ANSWER)
+            command_mock.assert_called_once()
+            self.assertIn("printf repaired", command_mock.call_args.args[0].body)
+            self.assertIn("not valid JSON", client.prompts[1])
+            self.assertEqual(len(client.prompts), 3)
+            self.assertTrue(
+                all(item and item["type"] == "json_schema" for item in client.response_formats)
+            )
+        finally:
+            orchestrator.close()
+
+    def test_invalid_json_after_single_correction_raises_clear_error(self):
+        client = _Client([
+            r'''{"type":"tool","tool":"command","command":"echo Don\'t stop"}''',
+            "{still invalid}",
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            with self.assertRaisesRegex(
+                TaskOrchestratorError,
+                "single correction retry also failed",
+            ):
+                orchestrator.run("Implement the change")
+            self.assertEqual(len(client.prompts), 2)
+        finally:
+            orchestrator.close()
 
     def test_missing_capability_is_valid_final_decision(self):
         client = _Client([
