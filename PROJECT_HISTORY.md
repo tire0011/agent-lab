@@ -236,6 +236,32 @@ Verification reported **933 tests OK, 55 skipped**, and the corresponding GitHub
 
 **Lesson:** autonomy boundaries can move from brittle enumerations toward invariant protections. Removing static positive lists should not mean removing authentication, secret isolation, redaction, bounded execution, state validation, or auditability.
 
+### 46. 2026-08-29: rejected operation-chain publication became recoverable
+
+PR #69 fixed a mailbox deadlock where a rejected operation chain could write an untracked outbox result before persistent publish state existed. Rejected chains are now persisted before publication, and polling may recover when the only dirty files are machine-managed untracked outbox entries; staged/tracked changes or unrelated untracked files still block synchronization. Verification reported **51 focused tests OK** and **936 full-suite tests OK, 55 skipped**.
+
+**Lesson:** durable publication intent must exist before externally visible result files, including rejection/error paths.
+
+### 47. 2026-08-29: the residual operations allowlist was removed and diagnostics broadened
+
+Runtime testing found one remaining positive gate in `OperationsRegistry` despite the broader PR #68 cleanup. PR #70 switched execution to implemented handler dispatch, so known `_op_<name>` handlers execute without a separate registry allowlist while unknown operations still fail when no handler exists; `local_model_status` became a normal bounded/redacted operation. PR #72 then allowed service status/log inspection for arbitrary requested services without adding a positive service list and added bounded `process_status` diagnostics sorted by memory use. Its full suite reported **944 tests OK, 55 skipped**.
+
+**Lesson:** broad policy migrations need runtime probes for hidden secondary gates; capability discovery and execution policy should not silently diverge.
+
+### 48. 2026-08-29: controller structured-output failures gained bounded repair
+
+A real chat request exposed malformed controller JSON (`\\'` in a string), which previously aborted the turn before tool execution. PR #73 now passes a JSON schema through the persistent local-LLM job queue, persists/migrates the structured response format, constrains controller completions to the Nexus decision envelope, and permits exactly one syntax-correction completion before failing clearly.
+
+A later runtime request exposed a second class of failure: syntactically valid but incomplete output such as an action object with no action name, surfacing as `unknown final action ''`. Nexus subsequently committed semantic response validation so missing tool/action fields also enter the same one-shot correction path.
+
+**Lesson:** structured agent output needs both grammar/schema constraints and semantic validation; bounded self-repair is preferable to either blindly executing malformed intent or terminating on the first model formatting mistake.
+
+### 49. 2026-08-29: Nexus performed a direct controller reliability fix
+
+The incomplete-action repair was committed directly by Nexus on `main` (`3ceaa95e...`) together with a regression test that verifies one correction turn produces a valid final answer. This is a small but concrete example of Nexus modifying its own controller after a real conversational failure rather than only through an externally prepared PR.
+
+**Open question:** the direct-main path should be measured against the GitHub Issue/branch/PR lifecycle so autonomous emergency/self-repair remains observable and recoverable rather than becoming an undocumented bypass.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -266,6 +292,7 @@ Current `main` includes:
 - persistent local `llama.cpp` capability plus a persistent local-LLM controller and durable local-inference jobs,
 - persistent authenticated Nexus chat with explicit discussion/execution semantics, asynchronous chat jobs, and shared web/PowerShell clients,
 - compact chat-specific context separate from the mailbox/task orchestration prompt,
+- structured controller decisions with schema-constrained generation plus one bounded syntax/semantic repair attempt,
 - adaptive local/Azure OpenAI/Codex routing with provider fallback and actual-provider accounting,
 - iterative command/operation/memory/delegation tool loops that return evidence to the local controller,
 - single-call Codex experiment execution,
@@ -273,10 +300,10 @@ Current `main` includes:
 - GitHub-backed outer work lifecycle using reusable Issues, `nexus/**` branches, PRs, merge, and Issue completion,
 - GitHub Actions verification for PRs and `nexus/**` branch pushes, with event-separated concurrency and compact failure-focused output,
 - SQLite state and durable project/idea/decision/history documents,
-- separate Git-backed mailbox repository with crash-safe outbox publication and bounded fetch/rebase/push synchronization,
+- separate Git-backed mailbox repository with crash-safe outbox publication, rejected-chain recovery, and bounded fetch/rebase/push synchronization,
 - signed GitHub webhook wake-up with timer fallback, one-shot sync retry, and bounded content-free diagnostics,
 - API/web UI and compact public/authenticated diagnostics,
-- authenticated, audited self-healing/operations capabilities,
+- authenticated, audited self-healing/operations capabilities including local-model, service, log, and process inspection,
 - authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
 - trusted-development mailbox task auto-execution,
 - automatic API dependency synchronization,
@@ -317,6 +344,9 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 28. **Agent UX should be asynchronous when inference is slow.** Durable jobs decouple work lifetime from HTTP/client lifetime.
 29. **Context should be surface-specific.** A compact chat prompt and a task/experiment prompt can share capabilities without sharing all history.
 30. **Prefer invariant safety properties over brittle positive lists.** Broader autonomy can coexist with authentication, secret isolation, redaction, bounds, state validation, and audit evidence.
+31. **Persist intent before publication on every terminal path.** Rejected/error results need the same crash-recovery semantics as successful work.
+32. **Structured output has two layers.** Grammar/schema constraints reduce malformed JSON; semantic validation and bounded repair are still required for incomplete decisions.
+33. **Runtime probes find policy drift.** A migration is not complete just because broad code search and tests say an allowlist is gone.
 
 ## Open research directions
 
@@ -324,15 +354,16 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 - measured token/cost/quality impact of the single-call pipeline and compact tool output,
 - benchmark Laguna/current local models and alternatives inside the B2ms envelope, including usable context and latency,
 - test a two-pass local workflow where a small-context first pass gathers/reduces repository context and a second pass implements,
-- measure controller and chat task success, discussion-to-execution handoff, command/tool loops, memory use, clarification/resume, missing-capability behavior, and human intervention,
+- measure controller and chat task success, discussion-to-execution handoff, command/tool loops, memory use, clarification/resume, missing-capability behavior, structured-output repair rate, and human intervention,
 - measure persistent local-LLM and chat jobs: queue/generation/runtime, token rate, restart recovery, cancellation/watchdog behavior, and resource use,
 - quantify adaptive routing by task class, provider chosen/requested/actually used, fallback rate, success, latency, tokens, and cost,
 - measure how much local context preparation and compact chat context reduce provider tokens without reducing decision quality,
 - make the verification controller reuse matching successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
 - evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
-- evaluate the effect of removing static execution allowlists: capability success, accidental scope expansion, security regressions, and operator intervention,
+- evaluate the effect of removing static execution allowlists: capability success, accidental scope expansion, security regressions, hidden secondary gates, and operator intervention,
 - evaluate MCP as the standard integration/control path and narrow temporary bootstrap capabilities over time,
 - measure whether GitHub Issue/branch/PR lifecycle improves fire-and-forget development, traceability, recovery, and human review,
+- compare Nexus direct self-repair on `main` with the normal Issue/branch/PR lifecycle and define when, if ever, direct repair is justified,
 - add concise GitHub Issue lifecycle progress without duplicating detailed Nexus logs,
 - prototype the global MCP gateway with only 2-3 tools and measure routing accuracy, schema-token reduction, latency, total cost, and failures,
 - investigate missing-capability detection and structured issue creation before any automatic tool generation,
@@ -346,7 +377,7 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 
 ## Current next-step candidates
 
-1. **Conversational autonomy sample:** use the adopted chat mode to discuss a small real change, explicitly approve execution, and measure whether Nexus preserves context, chooses tools/providers appropriately, completes the work, and reports evidence cleanly.
+1. **Conversational autonomy rerun:** repeat the real chat implementation request that exposed malformed/incomplete controller output and measure whether schema constraints plus bounded repair now let Nexus preserve context, choose tools/providers, complete the work, and report evidence cleanly.
 2. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
 3. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
 4. **Persistent job measurement:** quantify local-model/chat queue/runtime/token behavior and verify recovery across API/controller restarts.
