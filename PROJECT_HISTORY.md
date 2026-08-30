@@ -274,6 +274,12 @@ Issue #74 defines a focused experiment to test whether redundant production-code
 
 **Open question:** whether leaner source documentation measurably reduces Nexus context consumption without harming readability or losing design knowledge. If successful, the result should become a lightweight code-generation guideline rather than a broad one-time cleanup.
 
+### 52. 2026-08-29: internal orchestrator command execution was restored after async mailbox migration
+
+The deferred mailbox-command change exposed a call-site mismatch: internal orchestrator commands invoke the same command adapter without a persisted mailbox database connection/message ID, so they cannot enter the deferred state machine. Commit `be7d5809...` restored a synchronous execution path specifically for those state-less internal calls while retaining bounded/redacted output, duration, and exit-code reporting. Commit `5739db85...` added a regression test proving an internal command executes and returns its result without deferred state.
+
+**Lesson:** making external work durable must not assume every caller has durable state. Shared adapters may need distinct execution semantics for persistent transport-driven work versus internal synchronous orchestration.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -312,7 +318,7 @@ Current `main` includes:
 - GitHub-backed outer work lifecycle using reusable Issues, `nexus/**` branches, PRs, merge, and Issue completion,
 - GitHub Actions verification for PRs and `nexus/**` branch pushes, with event-separated concurrency and compact failure-focused output,
 - SQLite state and durable project/idea/decision/history documents,
-- separate Git-backed mailbox repository with crash-safe outbox publication, rejected-chain recovery, bounded fetch/rebase/push synchronization, and deferred asynchronous trusted command execution,
+- separate Git-backed mailbox repository with crash-safe outbox publication, rejected-chain recovery, bounded fetch/rebase/push synchronization, deferred asynchronous trusted command execution, and a synchronous internal-orchestrator compatibility path when no mailbox state exists,
 - signed GitHub webhook wake-up with timer fallback, one-shot sync retry, and bounded content-free diagnostics,
 - API/web UI and compact public/authenticated diagnostics,
 - authenticated, audited self-healing/operations capabilities including local-model, service, log, and process inspection,
@@ -360,6 +366,7 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 32. **Structured output has two layers.** Grammar/schema constraints reduce malformed JSON; semantic validation and bounded repair are still required for incomplete decisions.
 33. **Runtime probes find policy drift.** A migration is not complete just because broad code search and tests say an allowlist is gone.
 34. **Long-running shell work also needs durable state.** Deferred execution and polling are more robust than tying command lifetime to one mailbox-processing request.
+35. **Durability semantics are call-site dependent.** External mailbox work can require persistence and polling while state-less internal orchestration may still need a synchronous result.
 
 ## Open research directions
 
