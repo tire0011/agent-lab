@@ -250,7 +250,7 @@ Runtime testing found one remaining positive gate in `OperationsRegistry` despit
 
 ### 48. 2026-08-29: controller structured-output failures gained bounded repair
 
-A real chat request exposed malformed controller JSON (`\\'` in a string), which previously aborted the turn before tool execution. PR #73 now passes a JSON schema through the persistent local-LLM job queue, persists/migrates the structured response format, constrains controller completions to the Nexus decision envelope, and permits exactly one syntax-correction completion before failing clearly.
+A real chat request exposed malformed controller JSON (`\\\\'` in a string), which previously aborted the turn before tool execution. PR #73 now passes a JSON schema through the persistent local-LLM job queue, persists/migrates the structured response format, constrains controller completions to the Nexus decision envelope, and permits exactly one syntax-correction completion before failing clearly.
 
 A later runtime request exposed a second class of failure: syntactically valid but incomplete output such as an action object with no action name, surfacing as `unknown final action ''`. Nexus subsequently committed semantic response validation so missing tool/action fields also enter the same one-shot correction path.
 
@@ -279,6 +279,24 @@ Issue #74 defines a focused experiment to test whether redundant production-code
 The deferred mailbox-command change exposed a call-site mismatch: internal orchestrator commands invoke the same command adapter without a persisted mailbox database connection/message ID, so they cannot enter the deferred state machine. Commit `be7d5809...` restored a synchronous execution path specifically for those state-less internal calls while retaining bounded/redacted output, duration, and exit-code reporting. Commit `5739db85...` added a regression test proving an internal command executes and returns its result without deferred state.
 
 **Lesson:** making external work durable must not assume every caller has durable state. Shared adapters may need distinct execution semantics for persistent transport-driven work versus internal synchronous orchestration.
+
+### 53. 2026-08-29: mailbox request/response correlation became a UI design target
+
+Issue #75 records that normal Inbox/Outbox messages are already correlated internally through the inbox database record's `outbox_file` and the Outbox message's `source` metadata. The proposed web UI should therefore group a request and its response as one conversation-style card, keep pending requests visible, support a small chronological response/status timeline where needed, and avoid inventing a second correlation ID unless the existing relationship proves insufficient.
+
+This is intentionally a presentation/API change rather than a mailbox-processing redesign, and is meant to provide a natural path from the current Inbox/Outbox view toward persistent Nexus conversation history.
+
+**Lesson:** before adding protocol identifiers, reuse durable relationships already present in the transport/state model; better presentation can unlock conversational UX without changing delivery semantics.
+
+### 54. 2026-08-29 to 2026-08-30: runtime observability became an explicit architecture layer
+
+Issue #76 / open PR #77 introduces lightweight runtime observability so humans and LLMs can answer "what is Nexus doing right now?" without parsing historical logs. The proposed implementation adds a thread-safe explicit runtime state with current task/experiment, phase, operation, durations, heartbeat/health and bounded hierarchical operation history; meaningful pipeline operations carry trace/span relationships, and existing `ExperimentLogger` JSONL events gain trace metadata rather than being replaced.
+
+The PR also adds authenticated `GET /api/runtime/status` and `GET /api/runtime/trace` endpoints plus optional vendor-neutral OpenTelemetry OTLP export. Grafana Cloud is the first external backend target, but no collector, Grafana stack, database or Docker service should run on the B2ms VM; telemetry export must remain optional and failures must not stop Nexus. PR #77 reports **27 runtime-observability tests, 6 status-API tests, and 980 full-suite tests passing** with and without the optional OpenTelemetry packages. Real Grafana Cloud end-to-end verification was still pending, and deployment work was wiring OTEL configuration through the existing systemd environment-file path rather than hard-coding configuration in the service unit.
+
+PR #77 remains open/not adopted on `main` as of 2026-08-30.
+
+**Lesson:** post-mortem logs and current-state observability solve different problems. Long local inference and deferred work need explicit liveness/phase state and heartbeat evidence, while external telemetry should be an optional export of that evidence rather than a new runtime dependency.
 
 ## What Nexus currently learns
 
@@ -328,7 +346,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-The persistent local-controller, conversational Nexus chat, and GitHub experiment-lifecycle designs are adopted on `main`. The global MCP gateway remains a research direction.
+The persistent local-controller, conversational Nexus chat, and GitHub experiment-lifecycle designs are adopted on `main`. Conversation-style Inbox/Outbox rendering (Issue #75) and the runtime-observability/OpenTelemetry implementation (PR #77) remain open work; the global MCP gateway remains a research direction.
 
 ## Important lessons so far
 
@@ -367,6 +385,7 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 33. **Runtime probes find policy drift.** A migration is not complete just because broad code search and tests say an allowlist is gone.
 34. **Long-running shell work also needs durable state.** Deferred execution and polling are more robust than tying command lifetime to one mailbox-processing request.
 35. **Durability semantics are call-site dependent.** External mailbox work can require persistence and polling while state-less internal orchestration may still need a synchronous result.
+36. **Current-state observability is distinct from logging.** Explicit phase/operation/heartbeat state answers liveness questions cheaply; detailed logs and external tracing remain evidence for deeper diagnosis.
 
 ## Open research directions
 
@@ -379,6 +398,8 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 - quantify adaptive routing by task class, provider chosen/requested/actually used, fallback rate, success, latency, tokens, and cost,
 - measure how much local context preparation and compact chat context reduce provider tokens without reducing decision quality,
 - measure whether removing/shortening redundant comments and docstrings reduces source-context tokens without harming readability or losing architectural rationale (Issue #74),
+- validate conversation-style mailbox rendering against linked, pending and multi-response cases without changing mailbox delivery semantics (Issue #75),
+- validate PR #77 on the real VM and Grafana Cloud: heartbeat/liveness accuracy during slow local inference and commands, trace usefulness for humans/LLMs, OTLP failure isolation, and resource overhead,
 - make the verification controller reuse matching successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
 - evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
 - evaluate the effect of removing static execution allowlists: capability success, accidental scope expansion, security regressions, hidden secondary gates, and operator intervention,
@@ -398,13 +419,14 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 
 ## Current next-step candidates
 
-1. **Conversational autonomy rerun:** repeat the real chat implementation request that exposed malformed/incomplete controller output and measure whether schema constraints plus bounded repair now let Nexus preserve context, choose tools/providers, complete the work, and report evidence cleanly.
-2. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
-3. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
-4. **Persistent job measurement:** quantify local-model/chat queue/runtime/token behavior and verify recovery across API/controller restarts.
-5. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
-6. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
-7. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
-8. **GitHub lifecycle measurement:** verify multiple experiments can safely reuse one Issue/branch identity and that PR/merge/Issue completion remains recoverable under conflicts/provider failures.
-9. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
-10. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare measured comment/docstring context reduction against readability and unchanged test behavior.
+1. **Runtime observability validation:** complete the real-VM/Grafana Cloud test for PR #77 and verify status/heartbeat/trace behavior during a deliberately slow local-LLM or command operation before adoption.
+2. **Conversational autonomy rerun:** repeat the real chat implementation request that exposed malformed/incomplete controller output and measure whether schema constraints plus bounded repair now let Nexus preserve context, choose tools/providers, complete the work, and report evidence cleanly.
+3. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
+4. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
+5. **Persistent job measurement:** quantify local-model/chat queue/runtime/token behavior and verify recovery across API/controller restarts.
+6. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
+7. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
+8. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
+9. **GitHub lifecycle measurement:** verify multiple experiments can safely reuse one Issue/branch identity and that PR/merge/Issue completion remains recoverable under conflicts/provider failures.
+10. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
+11. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare measured comment/docstring context reduction against readability and unchanged test behavior.
