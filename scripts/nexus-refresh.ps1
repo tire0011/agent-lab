@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param()
+param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RestArgs = @()
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -19,7 +22,7 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Nexus was updated, but MCP write mode could not be enabled.'
 }
 
-& (Join-Path $PSScriptRoot 'nexus-restart.ps1') @args
+& (Join-Path $PSScriptRoot 'nexus-restart.ps1') @RestArgs
 if ($LASTEXITCODE -ne 0) {
     throw 'Nexus was updated, but the restart failed.'
 }
