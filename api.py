@@ -271,6 +271,9 @@ async def lifespan(app: FastAPI):
         # Never restarts execution and never starts a Codex process.
         _resolve_codex_service().mark_interrupted_tasks_failed()
         mts = _resolve_mailbox_task_service()
+        readiness = getattr(mts.github_work_tracking, "readiness_error", lambda: None)()
+        if isinstance(readiness, str) and readiness:
+            _logger.error("Nexus implementation lifecycle is blocked: %s", readiness)
         mts.recover_after_restart()
         _resolve_experiment_adoption_service().recover_after_restart()
         _resolve_operation_chain_service().recover_after_restart()

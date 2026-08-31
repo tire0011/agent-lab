@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -72,6 +73,7 @@ class GitHubWorkRef:
     source_id: str | None = None
     experiment_id: str | None = None
     pr_number: int | None = None
+    checkpoint_sha: str | None = None
 
 
 class GitHubWorkTrackingError(RuntimeError):
@@ -113,6 +115,24 @@ class GitHubWorkTrackingService:
     @property
     def configured(self) -> bool:
         return bool(self.repository and (self.token or self._transport))
+
+    def readiness_error(self) -> str | None:
+        missing: list[str] = []
+        if not self.repository:
+            missing.append("GITHUB_REPOSITORY")
+        if not (self.token or self._transport):
+            missing.append("GITHUB_TOKEN/GH_TOKEN")
+        if not missing:
+            return None
+        return (
+            "GitHub lifecycle is required for Nexus implementation work. "
+            f"Configure {', '.join(missing)} before starting or resuming implementation."
+        )
+
+    def require_lifecycle_ready(self) -> None:
+        message = self.readiness_error()
+        if message:
+            raise GitHubWorkTrackingError(message)
 
     def close(self) -> None:
         self._conn.close()
@@ -156,16 +176,23 @@ class GitHubWorkTrackingService:
                     issue_title TEXT NOT NULL,
                     branch_name TEXT NOT NULL,
                     pr_number INTEGER,
+                    checkpoint_sha TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(github_experiment_links)")
+            }
+            if "checkpoint_sha" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE github_experiment_links ADD COLUMN checkpoint_sha TEXT"
+                )
 
-    def ensure_for_source(self, source) -> GitHubWorkRef | None:
-        if not self.configured:
-            logger.info("GitHub work tracking is not configured; leaving Nexus lifecycle unchanged")
-            return None
+    def ensure_for_source(self, source) -> GitHubWorkRef:
+        self.require_lifecycle_ready()
 
         source_type = str(getattr(source, "source_type", "task") or "task")
         source_id_raw = getattr(source, "source_id", None)
@@ -218,6 +245,7 @@ class GitHubWorkTrackingService:
             source_id=ref.source_id,
             experiment_id=experiment_id,
             pr_number=ref.pr_number,
+            checkpoint_sha=ref.checkpoint_sha,
         )
         if bound.source_id is not None:
             self._persist_source(bound)
@@ -236,12 +264,42 @@ class GitHubWorkTrackingService:
                 branch_name=str(row["branch_name"]),
                 experiment_id=str(row["experiment_id"]),
                 pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
+                checkpoint_sha=str(row["checkpoint_sha"]) if row["checkpoint_sha"] else None,
             )
         legacy = self._conn.execute(
             "SELECT * FROM github_work_links WHERE experiment_id = ? LIMIT 1",
             (experiment_id,),
         ).fetchone()
         return self._source_row_to_ref(legacy) if legacy is not None else None
+
+    def ensure_for_experiment(self, experiment_id: str) -> GitHubWorkRef:
+        self.require_lifecycle_ready()
+        ref = self.for_experiment(experiment_id)
+        if ref is None:
+            raise GitHubWorkTrackingError(
+                f"experiment {experiment_id} has no persisted GitHub Issue/branch link"
+            )
+        self._ensure_branch(ref.branch_name)
+        return ref
+
+    def recover_experiment(self, experiment) -> GitHubWorkRef:
+        """Bind a legacy experiment without allocating a new worktree."""
+        self.require_lifecycle_ready()
+        existing = self.for_experiment(str(experiment.id))
+        if existing is not None:
+            self._ensure_branch(existing.branch_name)
+            return existing
+        source = type(
+            "RecoveredExperimentSource",
+            (),
+            {
+                "source_type": "experiment_recovery",
+                "source_id": str(experiment.id),
+                "title": f"Recover Nexus experiment {str(experiment.id)[:8]}",
+                "content": str(experiment.goal),
+            },
+        )()
+        return self.bind_experiment(self.ensure_for_source(source), str(experiment.id))
 
     def ensure_pull_request(
         self,
@@ -251,8 +309,7 @@ class GitHubWorkTrackingService:
         body: str,
         draft: bool = False,
     ) -> GitHubWorkRef:
-        if not self.configured:
-            raise GitHubWorkTrackingError("GitHub work tracking is not configured")
+        self.require_lifecycle_ready()
         owner = self.repository.split("/", 1)[0]
         query = urllib.parse.urlencode(
             {
@@ -283,6 +340,179 @@ class GitHubWorkTrackingService:
             self._persist_experiment(ref)
         return ref
 
+    def checkpoint_experiment(self, experiment_id: str, worktree_path: str) -> GitHubWorkRef:
+        """Publish intended worktree changes without changing its HEAD or index."""
+        ref = self.ensure_for_experiment(experiment_id)
+        status = self._git(
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=worktree_path,
+        ).stdout
+        changed_paths = self._status_paths(status)
+        publishable = [path for path in changed_paths if self._publishable_path(path)]
+        if not publishable:
+            excluded = sorted(set(changed_paths) - set(publishable))
+            detail = f"; excluded runtime paths: {', '.join(excluded[:10])}" if excluded else ""
+            raise GitHubWorkTrackingError(
+                "implementation produced no publishable source/test/documentation changes" + detail
+            )
+
+        remote_sha = self._remote_branch_sha(ref.branch_name)
+        worktree_head = self._git(["rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
+        if ref.checkpoint_sha != remote_sha:
+            ancestor = self._git(
+                ["merge-base", "--is-ancestor", worktree_head, remote_sha],
+                cwd=worktree_path,
+                check=False,
+            )
+            if ancestor.returncode != 0:
+                raise GitHubWorkTrackingError(
+                    "Issue branch no longer descends from the experiment worktree; manual reconciliation required"
+                )
+            upstream_paths = set(
+                self._git(
+                    ["diff", "--name-only", f"{worktree_head}..{remote_sha}"],
+                    cwd=worktree_path,
+                ).stdout.splitlines()
+            )
+            overlap = sorted(upstream_paths.intersection(publishable))
+            if overlap:
+                raise GitHubWorkTrackingError(
+                    "Issue branch changed the same files as the worktree: " + ", ".join(overlap[:20])
+                )
+
+        with tempfile.TemporaryDirectory(prefix="nexus-checkpoint-index-") as temp_dir:
+            env = dict(os.environ)
+            env["GIT_INDEX_FILE"] = str(Path(temp_dir) / "index")
+            self._git(["read-tree", remote_sha], cwd=worktree_path, env=env)
+            self._git(["add", "-A", "--", *publishable], cwd=worktree_path, env=env)
+            tree_sha = self._git(["write-tree"], cwd=worktree_path, env=env).stdout.strip()
+        remote_tree = self._git(
+            ["rev-parse", f"{remote_sha}^{{tree}}"], cwd=worktree_path
+        ).stdout.strip()
+        checkpoint_sha = remote_sha
+        if tree_sha != remote_tree:
+            checkpoint_sha = self._git(
+                [
+                    "commit-tree",
+                    tree_sha,
+                    "-p",
+                    remote_sha,
+                    "-m",
+                    f"WIP: Nexus experiment {experiment_id[:8]}",
+                ],
+                cwd=worktree_path,
+            ).stdout.strip()
+            self._git(
+                ["push", "origin", f"{checkpoint_sha}:refs/heads/{ref.branch_name}"],
+                cwd=worktree_path,
+            )
+        ref.checkpoint_sha = checkpoint_sha
+        self._persist_experiment(ref)
+        ref = self.ensure_pull_request(
+            ref,
+            title=f"WIP: {ref.issue_title}",
+            body=(
+                f"Tracks #{ref.issue_number}\n\n"
+                f"Nexus experiment: `{experiment_id}`\n\n"
+                "Implementation checkpoint published. Verification is pending.\n\n"
+                f"Changed files: {', '.join(publishable[:30])}"
+            ),
+            draft=True,
+        )
+        return ref
+
+    def record_verification(
+        self,
+        experiment_id: str,
+        *,
+        status: str,
+        command: list[str] | None,
+        exit_code: int | None,
+        error: str | None,
+        output: str | None,
+    ) -> None:
+        ref = self.ensure_for_experiment(experiment_id)
+        if ref.pr_number is None:
+            return
+        command_text = " ".join(command or []) or "(not run)"
+        body = (
+            f"Tracks #{ref.issue_number}\n\n"
+            f"Nexus experiment: `{experiment_id}`\n\n"
+            f"Verification status: `{status}`\n\n"
+            f"Command: `{command_text[:1000]}`\n\n"
+            f"Exit code: `{exit_code if exit_code is not None else 'none'}`\n\n"
+            f"Error: {(error or 'none')[:2000]}\n\n"
+            "```text\n"
+            f"{(output or '')[-6000:]}\n"
+            "```"
+        )
+        self._request(
+            "PATCH",
+            f"/repos/{self.repository}/pulls/{ref.pr_number}",
+            {"body": body[:64000]},
+        )
+
+    def publish_final_tree(
+        self,
+        ref: GitHubWorkRef,
+        *,
+        integrated_commit_sha: str,
+        worktree_path: str,
+        experiment_id: str,
+    ) -> str:
+        """Append the verified integration tree to the existing checkpoint history."""
+        self.require_lifecycle_ready()
+        remote_sha = self._remote_branch_sha(ref.branch_name)
+        final_tree = self._git(
+            ["rev-parse", f"{integrated_commit_sha}^{{tree}}"], cwd=worktree_path
+        ).stdout.strip()
+        remote_tree = self._git(
+            ["rev-parse", f"{remote_sha}^{{tree}}"], cwd=worktree_path
+        ).stdout.strip()
+        final_sha = remote_sha
+        if final_tree != remote_tree:
+            final_sha = self._git(
+                [
+                    "commit-tree",
+                    final_tree,
+                    "-p",
+                    remote_sha,
+                    "-m",
+                    f"Finalize Nexus experiment {experiment_id[:8]}",
+                ],
+                cwd=worktree_path,
+            ).stdout.strip()
+            self._git(
+                ["push", "origin", f"{final_sha}:refs/heads/{ref.branch_name}"],
+                cwd=worktree_path,
+            )
+        ref.checkpoint_sha = final_sha
+        self._persist_experiment(ref)
+        return final_sha
+
+    def mark_pull_request_ready(self, ref: GitHubWorkRef) -> None:
+        if ref.pr_number is None:
+            raise GitHubWorkTrackingError("cannot mark missing pull request ready")
+        pull = self._request(
+            "GET", f"/repos/{self.repository}/pulls/{ref.pr_number}"
+        )
+        if not bool(pull.get("draft")):
+            return
+        node_id = str(pull.get("node_id") or "")
+        if not node_id:
+            raise GitHubWorkTrackingError("GitHub pull request node id is missing")
+        self._request(
+            "POST",
+            "/graphql",
+            {
+                "query": (
+                    "mutation($id:ID!){markPullRequestReadyForReview(" 
+                    "input:{pullRequestId:$id}){pullRequest{number isDraft}}}"
+                ),
+                "variables": {"id": node_id},
+            },
+        )
+
     def merge_and_complete(self, ref: GitHubWorkRef, *, expected_head_sha: str | None = None) -> str:
         if ref.pr_number is None:
             raise GitHubWorkTrackingError("cannot merge work without a pull request")
@@ -302,6 +532,81 @@ class GitHubWorkTrackingService:
             {"state": "closed", "state_reason": "completed"},
         )
         return str(result.get("sha") or expected_head_sha or "")
+
+    def _remote_branch_sha(self, branch_name: str) -> str:
+        quoted = urllib.parse.quote(branch_name, safe="")
+        result = self._request("GET", f"/repos/{self.repository}/git/ref/heads/{quoted}")
+        sha = str(((result.get("object") or {}).get("sha") or "")).strip()
+        if not sha:
+            raise GitHubWorkTrackingError(f"could not resolve Issue branch {branch_name}")
+        return sha
+
+    @staticmethod
+    def _status_paths(raw: str) -> list[str]:
+        parts = raw.split("\0")
+        paths: list[str] = []
+        index = 0
+        while index < len(parts):
+            record = parts[index]
+            index += 1
+            if not record:
+                continue
+            if len(record) < 4:
+                raise GitHubWorkTrackingError("invalid git status record")
+            code = record[:2]
+            paths.append(record[3:])
+            if "R" in code or "C" in code:
+                if index < len(parts) and parts[index]:
+                    paths.append(parts[index])
+                index += 1
+        return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def _publishable_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lstrip("./")
+        blocked = (
+            "communication/",
+            "state/",
+            "logs/",
+            ".git/",
+            ".venv/",
+            "__pycache__/",
+        )
+        name = Path(normalized).name.lower()
+        secret_name = (
+            name == ".env"
+            or name.startswith(".env.")
+            or name.endswith((".pem", ".key", ".p12", ".pfx"))
+        )
+        return (
+            bool(normalized)
+            and not normalized.startswith(blocked)
+            and not normalized.endswith(".pyc")
+            and not secret_name
+        )
+
+    @staticmethod
+    def _git(
+        args: list[str],
+        *,
+        cwd: str,
+        env: dict[str, str] | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+        if check and proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[:2000]
+            raise GitHubWorkTrackingError(f"git {' '.join(args[:2])} failed: {detail}")
+        return proc
 
     def _issue_title(self, title: str, content: str) -> str:
         if title:
@@ -420,13 +725,14 @@ class GitHubWorkTrackingService:
                 """
                 INSERT INTO github_experiment_links (
                     experiment_id, issue_number, issue_title, branch_name,
-                    pr_number, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    pr_number, checkpoint_sha, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(experiment_id) DO UPDATE SET
                     issue_number=excluded.issue_number,
                     issue_title=excluded.issue_title,
                     branch_name=excluded.branch_name,
                     pr_number=COALESCE(excluded.pr_number, github_experiment_links.pr_number),
+                    checkpoint_sha=COALESCE(excluded.checkpoint_sha, github_experiment_links.checkpoint_sha),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -435,6 +741,7 @@ class GitHubWorkTrackingService:
                     ref.issue_title,
                     ref.branch_name,
                     ref.pr_number,
+                    ref.checkpoint_sha,
                     now,
                     now,
                 ),

@@ -4,9 +4,11 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from modules.experiment_resume import resume_experiment
+from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
@@ -125,12 +127,17 @@ class NexusChatService:
         orchestrator_factory: Callable[..., NexusTaskOrchestrator] = _ChatOrchestrator,
         background_starter: Callable[[str, Callable[[], None]], None] | None = None,
         resume_runner: Callable[[Any, str], Any] = resume_experiment,
+        github_work_tracking: GitHubWorkTrackingService | None = None,
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
         self.orchestrator_factory = orchestrator_factory
         self.background_starter = background_starter or self._start_background
         self.resume_runner = resume_runner
+        self.github_work_tracking = github_work_tracking or GitHubWorkTrackingService(
+            db_path=str(getattr(experiment_service, "db_path", "/agent/state/agent.db")),
+            repo_root=str(getattr(operations_registry, "repo_root", "/agent")),
+        )
 
     def handle(self, message: str, *, session_id: str | None = None) -> NexusChatResult:
         text = (message or "").strip()
@@ -161,10 +168,22 @@ class NexusChatService:
 
             if decision.action == ACTION_NEW_EXPERIMENT:
                 goal = self._implementation_goal(orchestrator, decision, text)
+                work_ref = self.github_work_tracking.ensure_for_source(
+                    SimpleNamespace(
+                        source_type="chat",
+                        source_id=decision.session_id,
+                        title="Nexus chat",
+                        content=goal,
+                    )
+                )
                 experiment = self.experiment_service.create_experiment(goal)
+                self.github_work_tracking.bind_experiment(work_ref, experiment.id)
                 self.background_starter(
                     experiment.id,
-                    lambda: self.experiment_service.run_experiment(experiment.id),
+                    lambda: self.experiment_service.run_experiment(
+                        experiment.id,
+                        github_work_tracking=self.github_work_tracking,
+                    ),
                 )
                 return NexusChatResult(
                     reply=decision.message or "Ich habe die vereinbarte Änderung als Experiment gestartet.",
@@ -178,9 +197,14 @@ class NexusChatService:
                 if not decision.experiment_id:
                     raise TaskOrchestratorError("resume_experiment requires experiment_id")
                 experiment = self.experiment_service.resolve_experiment(decision.experiment_id)
+                self.github_work_tracking.recover_experiment(experiment)
                 self.background_starter(
                     experiment.id,
-                    lambda: self.resume_runner(self.experiment_service, experiment.id),
+                    lambda: self.resume_runner(
+                        self.experiment_service,
+                        experiment.id,
+                        github_work_tracking=self.github_work_tracking,
+                    ),
                 )
                 return NexusChatResult(
                     reply=decision.message or "Ich setze das bestehende Experiment fort.",

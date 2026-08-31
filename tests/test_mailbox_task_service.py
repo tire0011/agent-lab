@@ -7,9 +7,11 @@ import sqlite3
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from modules.run_store import init_db
+from modules.github_work_tracking import GitHubWorkTrackingError
 from modules.mailbox.task_service import (
     ApprovalNotFoundError,
     ApprovalStateError,
@@ -38,6 +40,8 @@ def _make_exp(id="exp1", status="queued", test_exit_code=None, diff_stat=None, e
     exp.test_exit_code = test_exit_code
     exp.diff_stat = diff_stat
     exp.error = error
+    exp.test_command = None
+    exp.test_output = None
     return exp
 
 
@@ -56,7 +60,12 @@ class _FixedOrchestrator:
         return None
 
 
-def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -> MailboxTaskService:
+def _make_service(
+    tmp_path: Path,
+    exp_service=None,
+    orchestrator_factory=None,
+    github_work_tracking=None,
+) -> MailboxTaskService:
     db_path = str(tmp_path / "test.db")
     conn = init_db(db_path)
     conn.execute(
@@ -69,6 +78,14 @@ def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -
     operations_registry = MagicMock() if exp_service is not None else None
     if operations_registry is not None:
         operations_registry.catalog.return_value = []
+    github = github_work_tracking or MagicMock()
+    github.ensure_for_source.return_value = SimpleNamespace(
+        issue_number=42, branch_name="nexus/42-mailbox"
+    )
+    github.bind_experiment.side_effect = lambda ref, experiment_id: ref
+    github.recover_experiment.return_value = SimpleNamespace(
+        issue_number=42, branch_name="nexus/42-mailbox"
+    )
     return MailboxTaskService(
         db_path=db_path,
         experiment_service=exp_service,
@@ -76,6 +93,7 @@ def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -
         repo_path=str(tmp_path),
         operations_registry=operations_registry,
         orchestrator_factory=orchestrator_factory or _FixedOrchestrator,
+        github_work_tracking=github,
     )
 
 
@@ -247,6 +265,31 @@ class TestSubmitApproved(unittest.TestCase):
         svc.submit_approved()
         svc.submit_approved()
         es.create_experiment.assert_called_once()
+
+    def test_missing_github_configuration_blocks_before_experiment_creation(self):
+        exp = _make_exp(id="expBLOCK", status="queued")
+        es = self._make_exp_service(exp)
+        github = MagicMock()
+        github.ensure_for_source.side_effect = GitHubWorkTrackingError(
+            "Configure GITHUB_TOKEN/GH_TOKEN"
+        )
+        svc = _make_service(
+            self.tmp,
+            exp_service=es,
+            github_work_tracking=github,
+        )
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(
+            msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z"
+        )
+        svc.approve(approval.id)
+
+        svc.submit_approved()
+
+        es.create_experiment.assert_not_called()
+        updated = svc.get(approval.id)
+        self.assertEqual(updated.status, _STATUS_NEEDS_REVIEW)
+        self.assertIn("GitHub lifecycle blocked", updated.result_summary)
 
     def test_resume_decision_reuses_existing_experiment(self):
         existing_id = "bd9720b26ec74f15a2693e5641adf141"

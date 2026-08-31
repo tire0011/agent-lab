@@ -14,7 +14,12 @@ _VERIFICATION_RESUMABLE = {"verifying", "timed_out", "needs_review"}
 _UNSAFE_TO_GUESS = {"selecting", "implementing", "failed", "rejected"}
 
 
-def resume_experiment(experiment_service, experiment_id: str):
+def resume_experiment(
+    experiment_service,
+    experiment_id: str,
+    *,
+    github_work_tracking=None,
+):
     """Continue a persisted experiment from a safe, explicit lifecycle stage.
 
     - queued: start the normal pipeline using the SAME experiment id;
@@ -31,7 +36,11 @@ def resume_experiment(experiment_service, experiment_id: str):
         return experiment
 
     if experiment.status == STATUS_QUEUED:
-        return experiment_service.run_experiment(experiment.id)
+        if github_work_tracking is None:
+            return experiment_service.run_experiment(experiment.id)
+        return experiment_service.run_experiment(
+            experiment.id, github_work_tracking=github_work_tracking
+        )
 
     if experiment.status in _UNSAFE_TO_GUESS:
         raise ExperimentNotRunnableError(
@@ -56,4 +65,13 @@ def resume_experiment(experiment_service, experiment_id: str):
         f"Resuming experiment {experiment.id}; reusing existing worktree and verification state",
     )
     experiment_service._force_status(experiment.id, STATUS_VERIFYING)
-    return experiment_service._verify(experiment.id, experiment.worktree_path, elog)
+    if github_work_tracking is None:
+        return experiment_service._verify(
+            experiment.id, experiment.worktree_path, elog
+        )
+    return experiment_service._verify(
+        experiment.id,
+        experiment.worktree_path,
+        elog,
+        github_work_tracking=github_work_tracking,
+    )

@@ -34,6 +34,18 @@ For API auth in `api.py`:
 - `AGENT_API_KEY`
 - `AGENT_GITHUB_WEBHOOK_SECRET` (only required when using `POST /mailbox/webhook/github`)
 
+For the mandatory Nexus implementation lifecycle, `/etc/agent-lab/agent.env`
+must also provide:
+
+- `GITHUB_REPOSITORY=tire0011/agent-lab`
+- `GITHUB_TOKEN=<fine-grained token>` with write access to Issues, Contents and
+  Pull requests. The token value must never be logged.
+
+Both `agent-api.service` and `nexus-mailbox.service` already load this shared
+environment file. Missing configuration blocks only implementation/resume work;
+the API and read-only operations remain available and log an actionable startup
+error.
+
 ## Service behavior
 
 - Public health endpoint: `GET /health`
