@@ -2,6 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 import importlib
+import importlib.util
 import os
 from pathlib import Path
 
@@ -38,6 +39,11 @@ class RunStoreTests(unittest.TestCase):
         self.assertIn("model_prices", tables)
         self.assertIn("tool_calls", tables)
         self.assertIn("knowledge", tables)
+
+    def test_public_api_uses_split_package_modules(self):
+        self.assertTrue(hasattr(run_store, "init_db"))
+        self.assertIsNotNone(importlib.util.find_spec("modules.run_store.schema"))
+        self.assertIsNotNone(importlib.util.find_spec("modules.run_store.records"))
 
     def test_storing_run_persists_row(self):
         conn = self._init_db()
@@ -192,12 +198,14 @@ class RunStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             custom_db = Path(tmp) / "external" / "agent.db"
             old_env = os.environ.get("AGENT_DB_PATH")
+            conn = None
             os.environ["AGENT_DB_PATH"] = str(custom_db)
             try:
                 reloaded = importlib.reload(run_store)
                 conn = reloaded.init_db()
-                self.connections.append(conn)
             finally:
+                if conn is not None:
+                    conn.close()
                 if old_env is None:
                     os.environ.pop("AGENT_DB_PATH", None)
                 else:
@@ -217,13 +225,15 @@ class RunStoreTests(unittest.TestCase):
 
             original_legacy = run_store.LEGACY_DB_PATH
             original_default = run_store.DEFAULT_DB_PATH
+            conn = None
             run_store.LEGACY_DB_PATH = str(legacy_db)
             run_store.DEFAULT_DB_PATH = str(target_db)
             try:
                 conn = run_store.init_db(str(target_db))
-                self.connections.append(conn)
                 row = conn.execute("SELECT v FROM migrate_check").fetchone()
             finally:
+                if conn is not None:
+                    conn.close()
                 run_store.LEGACY_DB_PATH = original_legacy
                 run_store.DEFAULT_DB_PATH = original_default
 

@@ -616,7 +616,7 @@ def _build_final_response(result: OrchestratorResult) -> str:
 
 # ── SQLite helpers ────────────────────────────────────────────────────────────
 # Note: the router_decisions, provider_usage, and model_consultations tables
-# are created by modules/run_store.py (_migrate_router_tables). The orchestrator
+# are created by modules/run_store/schema.py (_migrate_router_tables). The orchestrator
 # relies on run_store.init_db() having been called before use.
 
 

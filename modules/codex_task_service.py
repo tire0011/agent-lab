@@ -1,7 +1,7 @@
 """Persistent Codex coding-task lifecycle built on the existing SQLite store.
 
 ``CodexTaskService`` records coding tasks in the same SQLite database used by
-``modules/run_store.py`` (table ``codex_tasks``), executes them through the
+``modules/run_store/`` package (table ``codex_tasks``), executes them through the
 existing ``CodexWorker`` (never duplicated), and persists their final state.
 
 Scope of this step (implemented; see ARCHITECTURE.md "3) API surface" and

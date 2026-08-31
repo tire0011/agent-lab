@@ -13,7 +13,7 @@
   - `modules/run_log.py` — writes JSON run artifacts to `state/runs/`
   - `modules/cli_output.py` — CLI print helpers for cost/run summaries
   - `modules/cost_monitor.py` — `AzureCostMonitor`/`AzureCostSnapshot` (Azure Cost Management)
-  - `modules/run_store.py` — SQLite-backed run/tool-call/price persistence
+  - `modules/run_store/` — SQLite-backed persistence package: schema and additive migrations, plus run/tool-call/price/activity/settings helpers
 - Execution model: CLI task runner
 - Model backend: Azure OpenAI via OpenAI SDK client configured with Azure base URL
 - Agent framework: OpenAI Agents SDK (`Agent`, `Runner`)
