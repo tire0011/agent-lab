@@ -91,7 +91,7 @@ def _finalize_terminal_validation_errors(
         )
         outbox_name = mailbox_module._outbox_filename(synthetic_msg, processed_at)
         outbox_path = processor.outbox / outbox_name
-        safe_error = mailbox_module._redact(error)[:500]
+        safe_error = mailbox_module.redact(error)[:500]
         outbox_content = mailbox_module._build_outbox_content(
             synthetic_msg,
             "rejected",

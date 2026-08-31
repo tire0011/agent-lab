@@ -1005,8 +1005,8 @@ class TestPushErrorRedaction(unittest.TestCase):
             fake_result.stderr = error_text
 
             with patch.object(
-                _logging.getLogger("modules.mailbox"), "warning"
-            ) as mock_warn, patch("modules.mailbox._git", return_value=fake_result):
+                _logging.getLogger("modules.mailbox.core"), "warning"
+            ) as mock_warn, patch("modules.mailbox.core._git", return_value=fake_result):
                 _mailbox.git_push(self.repo)
 
             self.assertTrue(mock_warn.called, "git_push should call logger.warning on failure")
@@ -1046,8 +1046,8 @@ class TestPushErrorRedaction(unittest.TestCase):
             fake_result.stderr = error_text
 
             with patch.object(
-                _logging.getLogger("modules.mailbox"), "debug"
-            ) as mock_debug, patch("modules.mailbox._git", return_value=fake_result):
+                _logging.getLogger("modules.mailbox.core"), "debug"
+            ) as mock_debug, patch("modules.mailbox.core._git", return_value=fake_result):
                 _mailbox.git_push(self.repo)
 
             self.assertTrue(mock_debug.called, "git_push should call logger.debug with redacted detail")

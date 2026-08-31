@@ -334,14 +334,20 @@ def git_push(repo_path: Path) -> bool:
 
 
 def redact(value: str) -> str:
-    """Best-effort masking for common secrets and file paths."""
+    """Best-effort masking for common secrets, remote URLs and file paths."""
+    remote_url_patterns = [
+        r"(?:https?|ssh)://\S+",
+        r"git@\S+",
+    ]
+    masked = value
+    for expr in remote_url_patterns:
+        masked = re.sub(expr, "[REMOTE]", masked)
     blocked = [
         r"sk-[A-Za-z0-9]+",
         r"(AZURE_[A-Z_]+\s*=\s*)\S+",
         r"(API_KEY\s*=\s*)\S+",
         r"/agent/[^\s]+",
     ]
-    masked = value
     for expr in blocked:
         masked = re.sub(expr, "[redacted]", masked)
     return masked
