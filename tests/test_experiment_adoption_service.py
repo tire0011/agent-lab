@@ -10,7 +10,9 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from modules.experiment_adoption_service import (
     STATUS_ADOPTED,
@@ -24,6 +26,7 @@ from modules.experiment_adoption_service import (
     ExperimentAdoptionService,
 )
 from modules.experiment_service import ExperimentService
+from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 
 
 def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -36,8 +39,124 @@ def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProces
     )
 
 
+class GitHubLifecycleTransport:
+    def __init__(self, *, origin: Path, workspace: Path, merge_should_fail: str | None = None):
+        self.origin = origin
+        self.workspace = workspace
+        self.merge_should_fail = merge_should_fail
+        self.issues: dict[int, dict[str, object]] = {}
+        self.next_issue = 42
+        self.refs = {"main": "main-sha"}
+        self.pulls: list[dict[str, object]] = []
+        self.calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def __call__(self, method, path, payload):
+        self.calls.append((method, path, payload))
+
+        if method == "GET" and path.startswith("/search/issues?"):
+            query = parse_qs(urlsplit(path).query).get("q", [""])[0]
+            wanted = ""
+            if '"' in query:
+                wanted = query.split('"', 1)[1].rsplit('"', 1)[0]
+            items = [
+                dict(issue)
+                for issue in self.issues.values()
+                if issue.get("state") == "open" and issue.get("title") == wanted
+            ]
+            return {"items": items}
+
+        if method == "POST" and path == "/repos/tire0011/agent-lab/issues":
+            number = self.next_issue
+            self.next_issue += 1
+            issue = {"number": number, "title": payload["title"], "state": "open"}
+            self.issues[number] = issue
+            return dict(issue)
+
+        if method == "GET" and path.startswith("/repos/tire0011/agent-lab/issues/"):
+            number = int(path.rsplit("/", 1)[1])
+            return dict(self.issues[number])
+
+        if method == "PATCH" and path.startswith("/repos/tire0011/agent-lab/issues/"):
+            number = int(path.rsplit("/", 1)[1])
+            self.issues[number].update(payload or {})
+            return dict(self.issues[number])
+
+        if method == "GET" and "/git/ref/heads/" in path:
+            branch = unquote(path.split("/git/ref/heads/", 1)[1])
+            if branch not in self.refs:
+                raise GitHubWorkTrackingError("GitHub HTTP 404: not found")
+            return {"object": {"sha": self.refs[branch]}}
+
+        if method == "POST" and path == "/repos/tire0011/agent-lab/git/refs":
+            branch = payload["ref"].removeprefix("refs/heads/")
+            self.refs[branch] = payload["sha"]
+            return {"ref": payload["ref"], "object": {"sha": payload["sha"]}}
+
+        if method == "GET" and path.startswith("/repos/tire0011/agent-lab/pulls?"):
+            params = parse_qs(urlsplit(path).query)
+            head = params.get("head", [None])[0]
+            base = params.get("base", [None])[0]
+            return [
+                dict(pr)
+                for pr in self.pulls
+                if pr.get("state") == "open"
+                and (head is None or f"tire0011:{pr['head']}" == head)
+                and (base is None or pr.get("base") == base)
+            ]
+
+        if method == "POST" and path == "/repos/tire0011/agent-lab/pulls":
+            pr = {
+                "number": len(self.pulls) + 100,
+                "state": "open",
+                "head": payload["head"],
+                "base": payload["base"],
+                "title": payload["title"],
+                "body": payload["body"],
+                "draft": payload.get("draft", False),
+            }
+            self.pulls.append(pr)
+            return dict(pr)
+
+        if method == "PUT" and path.endswith("/merge"):
+            number = int(path.split("/pulls/", 1)[1].split("/", 1)[0])
+            pr = next((item for item in self.pulls if item["number"] == number), None)
+            if pr is None:
+                raise AssertionError(f"unknown PR {number}")
+            if self.merge_should_fail:
+                return {"merged": False, "message": self.merge_should_fail}
+            sha = self._merge_branch(str(pr["head"]))
+            pr["state"] = "closed"
+            return {"merged": True, "sha": sha}
+
+        raise AssertionError(f"unexpected GitHub call: {method} {path} {payload}")
+
+    def _merge_branch(self, branch_name: str) -> str:
+        if self.workspace.exists():
+            git(self.workspace, "fetch", "origin")
+        else:
+            git(self.workspace.parent, "clone", str(self.origin), str(self.workspace))
+            git(self.workspace, "config", "user.email", "test@example.com")
+            git(self.workspace, "config", "user.name", "Test User")
+        git(self.workspace, "fetch", "origin", branch_name, "main")
+        git(self.workspace, "checkout", "-B", "main", "origin/main")
+        git(self.workspace, "reset", "--hard", "origin/main")
+        git(self.workspace, "clean", "-fd")
+        merge_proc = git(self.workspace, "merge", "--squash", f"origin/{branch_name}", check=False)
+        if merge_proc.returncode != 0:
+            raise GitHubWorkTrackingError(
+                merge_proc.stderr.strip() or merge_proc.stdout.strip() or "merge failed"
+            )
+        status = git(self.workspace, "status", "--porcelain").stdout.strip()
+        if status:
+            git(self.workspace, "commit", "-m", f"Merge {branch_name}")
+            git(self.workspace, "push", "origin", "HEAD:main")
+        sha = git(self.workspace, "rev-parse", "HEAD").stdout.strip()
+        self.refs["main"] = sha
+        return sha
+
+
 class AdoptionRepoFixture:
-    def __init__(self) -> None:
+    def __init__(self, *, github_configured: bool = True, merge_should_fail: str | None = None) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.repo = root / "repo"
@@ -79,16 +198,39 @@ class AdoptionRepoFixture:
             test_python_executable=sys.executable,
             experiment_log_dir=str(self.logs),
         )
+        self.github_api = GitHubLifecycleTransport(
+            origin=self.origin,
+            workspace=root / "github-merge-workspace",
+            merge_should_fail=merge_should_fail,
+        )
+        self.github_seed_tracking = GitHubWorkTrackingService(
+            db_path=self.db_path,
+            repo_root=str(self.repo),
+            repository="tire0011/agent-lab",
+            transport=self.github_api,
+        )
+        if github_configured:
+            self.github_work_tracking = self.github_seed_tracking
+        else:
+            self.github_work_tracking = GitHubWorkTrackingService(
+                db_path=self.db_path,
+                repo_root=str(self.repo),
+                repository="tire0011/agent-lab",
+            )
         self.adoption_service = ExperimentAdoptionService(
             experiment_service=self.experiment_service,
             db_path=self.db_path,
             repo_root=str(self.repo),
             worktrees_root=str(self.worktrees),
             lock_path=self.lock_path,
+            github_work_tracking=self.github_work_tracking,
         )
 
     def close(self) -> None:
         self.adoption_service.close()
+        if self.github_work_tracking is not self.github_seed_tracking:
+            self.github_work_tracking.close()
+        self.github_seed_tracking.close()
         self.experiment_service.close()
         self.tmp.cleanup()
 
@@ -101,6 +243,7 @@ class AdoptionRepoFixture:
         quality_outcome: str = "pass",
         mutate: dict[str, str] | None = None,
         extra_untracked: dict[str, str] | None = None,
+        link_github: bool = True,
     ) -> str:
         worktree = self.worktrees / f"exp-{experiment_id[:8]}"
         git(self.repo, "worktree", "add", "-b", f"exp-{experiment_id[:8]}", str(worktree), "HEAD")
@@ -158,6 +301,16 @@ class AdoptionRepoFixture:
                     json.dumps(quality),
                 ),
             )
+        if link_github:
+            ref = self.github_seed_tracking.ensure_for_source(
+                SimpleNamespace(
+                    source_type="task",
+                    source_id=experiment_id,
+                    title=f"Adoptable change {experiment_id[:8]}",
+                    content="Implement something small.",
+                )
+            )
+            self.github_seed_tracking.bind_experiment(ref, experiment_id)
         return experiment_id
 
     def wait_terminal(self, experiment_id: str, timeout: float = 10.0):
@@ -203,6 +356,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         self.assertIn("FEATURE = True", remote_files)
         push_commands = [cmd for cmd in recorded if cmd[:2] == ["push", "origin"]]
         self.assertEqual(len(push_commands), 1)
+        self.assertEqual(push_commands[0][2], "HEAD:refs/heads/nexus/42-adoptable-change-aaaaaaaa")
         self.assertNotIn("--force", push_commands[0])
         self.assertNotIn("-f", push_commands[0])
         self.assertNotIn("--force-with-lease", push_commands[0])
@@ -361,34 +515,38 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
         self.assertIn("Qualitäts-Gate", adoption.reason)
 
-    def test_remote_main_changes_during_push_sets_needs_review(self):
+    def test_missing_github_configuration_keeps_work_for_review_without_pushing_main(self):
+        fx = AdoptionRepoFixture(github_configured=False)
+        self.addCleanup(fx.close)
         experiment_id = "e1" * 16
-        self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
-        original_run_git = __import__("modules.experiment_adoption_service", fromlist=["_run_git"])._run_git
-        triggered = {"done": False}
+        fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+        before = git(fx.repo, "rev-parse", "origin/main").stdout.strip()
 
-        def side_effect(args, **kwargs):
-            if args[:2] == ["push", "origin"] and not triggered["done"]:
-                triggered["done"] = True
-                other = Path(self.fx.tmp.name) / "other"
-                git(other.parent, "clone", str(self.fx.origin), str(other))
-                git(other, "config", "user.email", "other@example.com")
-                git(other, "config", "user.name", "Other User")
-                git(other, "checkout", "main")
-                (other / "remote_change.txt").write_text("remote\n", encoding="utf-8")
-                git(other, "add", "remote_change.txt")
-                git(other, "commit", "-m", "remote")
-                git(other, "push", "origin", "main")
-            return original_run_git(args, **kwargs)
+        fx.adoption_service.start_adoption(experiment_id)
+        adoption = fx.wait_terminal(experiment_id)
+        after = git(fx.repo, "rev-parse", "origin/main").stdout.strip()
 
-        with patch("modules.experiment_adoption_service._run_git", side_effect=side_effect):
-            self.fx.adoption_service.start_adoption(experiment_id)
-            adoption = self.fx.wait_terminal(experiment_id)
         self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
-        self.assertIn("origin/main", adoption.reason)
+        self.assertEqual(before, after)
+        self.assertIn("GitHub-Work-Tracking ist nicht konfiguriert", adoption.reason)
+        self.assertIn("Issue-Branch nexus/42-adoptable-change-e1e1e1e1", adoption.reason)
+        self.assertTrue(Path(adoption.diagnostic_worktree_path).exists())
+
+    def test_github_merge_failure_sets_needs_review(self):
+        fx = AdoptionRepoFixture(merge_should_fail="simulated merge failure")
+        self.addCleanup(fx.close)
+        experiment_id = "f1" * 16
+        fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+
+        fx.adoption_service.start_adoption(experiment_id)
+        adoption = fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
+        self.assertIn("GitHub PR konnte nicht automatisch abgeschlossen werden", adoption.reason)
+        self.assertIn("simulated merge failure", adoption.reason)
 
     def test_recover_after_restart_marks_interrupted(self):
-        experiment_id = "f1" * 16
+        experiment_id = "91" * 16
         with sqlite3.connect(self.fx.db_path) as conn:
             conn.execute(
                 """
@@ -404,6 +562,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
             repo_root=str(self.fx.repo),
             worktrees_root=str(self.fx.worktrees),
             lock_path=self.fx.lock_path,
+            github_work_tracking=self.fx.github_work_tracking,
         )
         self.addCleanup(restarted.close)
         marked = restarted.recover_after_restart()

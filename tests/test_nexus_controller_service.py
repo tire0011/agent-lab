@@ -7,8 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from models import Idea
+from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.nexus_controller_service import NexusControllerService
-from modules.task_orchestrator import ACTION_NEW_EXPERIMENT, TaskDecision
+from modules.task_orchestrator import ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, TaskDecision
 
 
 class NexusControllerServiceTests(unittest.TestCase):
@@ -21,10 +22,33 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.orchestrator.operations_registry = SimpleNamespace(repo_root=Path(self.tmp.name))
         self.orchestrator.task_store = MagicMock()
         self.orchestrator.task_store.history.return_value = []
-        self.service = NexusControllerService(self.orchestrator)
+        self.github_work_tracking = MagicMock()
+        self.github_work_tracking.configured = True
+        self.github_work_tracking.ensure_for_source.return_value = SimpleNamespace(
+            issue_number=42,
+            branch_name="nexus/42-controller-test",
+        )
+        self.github_work_tracking.bind_experiment.side_effect = (
+            lambda ref, experiment_id: SimpleNamespace(
+                issue_number=ref.issue_number,
+                branch_name=ref.branch_name,
+                experiment_id=experiment_id,
+            )
+        )
+        self.github_work_tracking.ensure_for_experiment.return_value = SimpleNamespace(
+            issue_number=42,
+            branch_name="nexus/42-controller-test",
+            experiment_id="exp-existing",
+        )
+        self.service = NexusControllerService(
+            self.orchestrator,
+            github_work_tracking=self.github_work_tracking,
+        )
 
     def tearDown(self):
-        self.service.github_work_tracking.close()
+        close = getattr(self.service.github_work_tracking, "close", None)
+        if close:
+            close()
         self.tmp.cleanup()
 
     def test_issue_is_passed_to_same_controller_with_source_identity(self):
@@ -60,8 +84,92 @@ class NexusControllerServiceTests(unittest.TestCase):
 
         self.service.handle_task("Implement the requested feature", source_id="task-1")
 
+        self.github_work_tracking.ensure_for_source.assert_called_once()
+        self.github_work_tracking.bind_experiment.assert_called_once()
         self.orchestrator.experiment_service.create_experiment.assert_called_once_with(
             "Implement the requested feature"
+        )
+
+    def test_missing_github_configuration_blocks_new_experiment_before_creation(self):
+        actual_tracking = GitHubWorkTrackingService(
+            db_path=str(Path(self.tmp.name) / "missing-github.db"),
+            repo_root=self.tmp.name,
+        )
+        service = NexusControllerService(
+            self.orchestrator,
+            github_work_tracking=actual_tracking,
+        )
+        self.addCleanup(actual_tracking.close)
+        self.orchestrator.run.return_value = TaskDecision(
+            action=ACTION_NEW_EXPERIMENT,
+            session_id="session-1",
+        )
+
+        with self.assertRaises(GitHubWorkTrackingError) as ctx:
+            service.handle_task("Implement the requested feature", source_id="task-1")
+
+        self.assertIn("GITHUB_REPOSITORY", str(ctx.exception))
+        self.assertIn("GITHUB_TOKEN/GH_TOKEN", str(ctx.exception))
+        self.orchestrator.experiment_service.create_experiment.assert_not_called()
+        self.orchestrator.task_store.append_event.assert_any_call(
+            "session-1",
+            role="tool",
+            kind="github_work_tracking_unavailable",
+            content=str(ctx.exception),
+        )
+
+    def test_missing_github_configuration_blocks_linked_resume(self):
+        actual_tracking = GitHubWorkTrackingService(
+            db_path=str(Path(self.tmp.name) / "resume-github.db"),
+            repo_root=self.tmp.name,
+            repository="tire0011/agent-lab",
+            transport=lambda method, path, payload: (
+                {"items": []}
+                if method == "GET" and path.startswith("/search/issues?")
+                else {"number": 55, "title": "Resume lifecycle", "state": "open"}
+                if method == "POST" and path == "/repos/tire0011/agent-lab/issues"
+                else {"object": {"sha": "main-sha"}}
+                if method == "GET" and "/git/ref/heads/" in path
+                else {"ref": payload["ref"], "object": {"sha": payload["sha"]}}
+                if method == "POST" and path == "/repos/tire0011/agent-lab/git/refs"
+                else (_ for _ in ()).throw(AssertionError(f"unexpected {method} {path}"))
+            ),
+        )
+        ref = actual_tracking.ensure_for_source(
+            SimpleNamespace(
+                source_type="task",
+                source_id="session-1",
+                title="Resume lifecycle",
+                content="Resume lifecycle",
+            )
+        )
+        actual_tracking.bind_experiment(ref, "exp-linked")
+        actual_tracking.close()
+
+        unconfigured_tracking = GitHubWorkTrackingService(
+            db_path=str(Path(self.tmp.name) / "resume-github.db"),
+            repo_root=self.tmp.name,
+            repository="tire0011/agent-lab",
+        )
+        service = NexusControllerService(
+            self.orchestrator,
+            github_work_tracking=unconfigured_tracking,
+        )
+        self.addCleanup(unconfigured_tracking.close)
+        self.orchestrator.continue_session.return_value = TaskDecision(
+            action=ACTION_RESUME_EXPERIMENT,
+            session_id="session-1",
+            experiment_id="exp-linked",
+        )
+
+        with self.assertRaises(GitHubWorkTrackingError):
+            service.reply("session-1", "Continue the linked experiment")
+
+        self.orchestrator.task_store.append_event.assert_any_call(
+            "session-1",
+            role="tool",
+            kind="github_work_tracking_unavailable",
+            content=unittest.mock.ANY,
         )
 
     def test_reply_new_experiment_uses_original_input_and_followup(self):

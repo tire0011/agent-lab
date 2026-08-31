@@ -114,6 +114,25 @@ class GitHubWorkTrackingService:
     def configured(self) -> bool:
         return bool(self.repository and (self.token or self._transport))
 
+    def readiness_error(self) -> str | None:
+        missing: list[str] = []
+        if not self.repository:
+            missing.append("GITHUB_REPOSITORY")
+        if not (self.token or self._transport):
+            missing.append("GITHUB_TOKEN/GH_TOKEN")
+        if not missing:
+            return None
+        missing_text = ", ".join(missing)
+        return (
+            "GitHub lifecycle is required for Nexus implementation work before any experiment starts. "
+            f"Configure {missing_text}; issue/branch/PR operations remain blocked until then."
+        )
+
+    def require_lifecycle_ready(self) -> None:
+        message = self.readiness_error()
+        if message is not None:
+            raise GitHubWorkTrackingError(message)
+
     def close(self) -> None:
         self._conn.close()
 
@@ -162,10 +181,8 @@ class GitHubWorkTrackingService:
                 """
             )
 
-    def ensure_for_source(self, source) -> GitHubWorkRef | None:
-        if not self.configured:
-            logger.info("GitHub work tracking is not configured; leaving Nexus lifecycle unchanged")
-            return None
+    def ensure_for_source(self, source) -> GitHubWorkRef:
+        self.require_lifecycle_ready()
 
         source_type = str(getattr(source, "source_type", "task") or "task")
         source_id_raw = getattr(source, "source_id", None)
@@ -243,6 +260,14 @@ class GitHubWorkTrackingService:
         ).fetchone()
         return self._source_row_to_ref(legacy) if legacy is not None else None
 
+    def ensure_for_experiment(self, experiment_id: str) -> GitHubWorkRef | None:
+        ref = self.for_experiment(experiment_id)
+        if ref is None:
+            return None
+        self.require_lifecycle_ready()
+        self._ensure_branch(ref.branch_name)
+        return ref
+
     def ensure_pull_request(
         self,
         ref: GitHubWorkRef,
@@ -251,8 +276,7 @@ class GitHubWorkTrackingService:
         body: str,
         draft: bool = False,
     ) -> GitHubWorkRef:
-        if not self.configured:
-            raise GitHubWorkTrackingError("GitHub work tracking is not configured")
+        self.require_lifecycle_ready()
         owner = self.repository.split("/", 1)[0]
         query = urllib.parse.urlencode(
             {

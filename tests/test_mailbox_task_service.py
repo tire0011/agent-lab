@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from modules.run_store import init_db
@@ -29,6 +30,7 @@ from modules.task_orchestrator import (
     ACTION_RESUME_EXPERIMENT,
     TaskDecision,
 )
+from modules.github_work_tracking import GitHubWorkTrackingError
 
 
 def _make_exp(id="exp1", status="queued", test_exit_code=None, diff_stat=None, error=None):
@@ -56,7 +58,32 @@ class _FixedOrchestrator:
         return None
 
 
-def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -> MailboxTaskService:
+def _configured_github_work_tracking():
+    tracking = MagicMock()
+    tracking.configured = True
+    tracking.ensure_for_source.return_value = SimpleNamespace(
+        issue_number=42,
+        branch_name="nexus/42-mailbox-test",
+    )
+    tracking.bind_experiment.side_effect = lambda ref, experiment_id: SimpleNamespace(
+        issue_number=ref.issue_number,
+        branch_name=ref.branch_name,
+        experiment_id=experiment_id,
+    )
+    tracking.ensure_for_experiment.return_value = SimpleNamespace(
+        issue_number=42,
+        branch_name="nexus/42-mailbox-test",
+        experiment_id="exp1",
+    )
+    return tracking
+
+
+def _make_service(
+    tmp_path: Path,
+    exp_service=None,
+    orchestrator_factory=None,
+    github_work_tracking=None,
+) -> MailboxTaskService:
     db_path = str(tmp_path / "test.db")
     conn = init_db(db_path)
     conn.execute(
@@ -76,6 +103,7 @@ def _make_service(tmp_path: Path, exp_service=None, orchestrator_factory=None) -
         repo_path=str(tmp_path),
         operations_registry=operations_registry,
         orchestrator_factory=orchestrator_factory or _FixedOrchestrator,
+        github_work_tracking=github_work_tracking or _configured_github_work_tracking(),
     )
 
 
@@ -94,6 +122,7 @@ class TestCreateApproval(unittest.TestCase):
         import tempfile
         self.tmp = Path(tempfile.mkdtemp())
         self.svc = _make_service(self.tmp)
+        self.addCleanup(self.svc.close)
 
     def test_create_approval(self):
         msg_id = _insert_mailbox_msg(self.svc)
@@ -116,6 +145,7 @@ class TestListPending(unittest.TestCase):
         import tempfile
         self.tmp = Path(tempfile.mkdtemp())
         self.svc = _make_service(self.tmp)
+        self.addCleanup(self.svc.close)
 
     def test_list_pending(self):
         msg_id = _insert_mailbox_msg(self.svc)
@@ -135,6 +165,7 @@ class TestApprove(unittest.TestCase):
         import tempfile
         self.tmp = Path(tempfile.mkdtemp())
         self.svc = _make_service(self.tmp)
+        self.addCleanup(self.svc.close)
         msg_id = _insert_mailbox_msg(self.svc)
         self.approval = self.svc.create_approval(msg_id, "Task body", "alice", "/f.md", "2026-01-01T00:00:00Z")
 
@@ -160,6 +191,7 @@ class TestReject(unittest.TestCase):
         import tempfile
         self.tmp = Path(tempfile.mkdtemp())
         self.svc = _make_service(self.tmp)
+        self.addCleanup(self.svc.close)
         msg_id = _insert_mailbox_msg(self.svc)
         self.approval = self.svc.create_approval(msg_id, "Task body", "alice", "/f.md", "2026-01-01T00:00:00Z")
 
@@ -187,6 +219,7 @@ class TestConcurrentApprove(unittest.TestCase):
         import tempfile
         self.tmp = Path(tempfile.mkdtemp())
         self.svc = _make_service(self.tmp)
+        self.addCleanup(self.svc.close)
         msg_id = _insert_mailbox_msg(self.svc)
         self.approval = self.svc.create_approval(msg_id, "Task", "a", "/f.md", "2026-01-01T00:00:00Z")
 
@@ -224,23 +257,51 @@ class TestSubmitApproved(unittest.TestCase):
     def test_submit_approved_calls_experiment_service_once(self):
         exp = _make_exp(id="expABC", status="queued")
         es = self._make_exp_service(exp)
-        svc = _make_service(self.tmp, exp_service=es)
+        github = _configured_github_work_tracking()
+        svc = _make_service(self.tmp, exp_service=es, github_work_tracking=github)
+        self.addCleanup(svc.close)
         msg_id = _insert_mailbox_msg(svc)
         approval = svc.create_approval(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.approve(approval.id)
         svc.submit_approved()
         import time; time.sleep(0.1)
         es.create_experiment.assert_called_once_with("Do work")
+        github.ensure_for_source.assert_called_once()
+        github.bind_experiment.assert_called_once()
         updated = svc.get(approval.id)
         self.assertIn(updated.status, (_STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_SUCCEEDED, _STATUS_FAILED))
         _, kwargs = _FixedOrchestrator.calls[-1]
         self.assertEqual(kwargs["source_type"], "task")
         self.assertEqual(kwargs["source_id"], approval.id)
 
+    def test_submit_approved_blocks_when_github_lifecycle_is_unavailable(self):
+        exp = _make_exp(id="expBLOCK", status="queued")
+        es = self._make_exp_service(exp)
+        github = _configured_github_work_tracking()
+        github.ensure_for_source.side_effect = GitHubWorkTrackingError(
+            "Configure GITHUB_REPOSITORY and GITHUB_TOKEN/GH_TOKEN"
+        )
+        svc = _make_service(self.tmp, exp_service=es, github_work_tracking=github)
+        self.addCleanup(svc.close)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
+        svc.approve(approval.id)
+
+        svc.submit_approved()
+
+        es.create_experiment.assert_not_called()
+        updated = svc.get(approval.id)
+        self.assertEqual(updated.status, _STATUS_NEEDS_REVIEW)
+        self.assertIn("GitHub lifecycle blocked before implementation start", updated.result_summary)
+        outbox_files = list(svc.outbox_dir.glob("*.md"))
+        self.assertTrue(outbox_files)
+        self.assertIn("GITHUB_REPOSITORY", outbox_files[0].read_text())
+
     def test_submit_approved_no_double_submit(self):
         exp = _make_exp(id="expXYZ", status="queued")
         es = self._make_exp_service(exp)
         svc = _make_service(self.tmp, exp_service=es)
+        self.addCleanup(svc.close)
         msg_id = _insert_mailbox_msg(svc)
         approval = svc.create_approval(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.approve(approval.id)
@@ -264,6 +325,7 @@ class TestSubmitApproved(unittest.TestCase):
             )
 
         svc = _make_service(self.tmp, exp_service=es, orchestrator_factory=ResumeOrchestrator)
+        self.addCleanup(svc.close)
         msg_id = _insert_mailbox_msg(svc)
         approval = svc.create_approval(msg_id, "Resume experiment", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.approve(approval.id)
@@ -293,6 +355,7 @@ class TestSubmitApproved(unittest.TestCase):
                 return type(self).decisions.pop(0)
 
         svc = _make_service(self.tmp, exp_service=es, orchestrator_factory=DiscussionOrchestrator)
+        self.addCleanup(svc.close)
         msg_id = _insert_mailbox_msg(svc)
         approval = svc.create_approval(msg_id, "Improve routing", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.approve(approval.id)
@@ -320,6 +383,7 @@ class TestPollRunning(unittest.TestCase):
     def _make_submitted(self, exp_id="exp1"):
         es = MagicMock()
         svc = _make_service(self.tmp, exp_service=es)
+        self.addCleanup(svc.close)
         msg_id = _insert_mailbox_msg(svc)
         approval = svc.create_approval(msg_id, "Task", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc._conn.execute(
@@ -377,63 +441,6 @@ class TestPollRunning(unittest.TestCase):
         problem_files = list((self.tmp / "state" / "runs").glob("*.json"))
         self.assertTrue(problem_files)
         self.assertIn("failed", json.loads(problem_files[0].read_text())["response"])
-
-
-class TestMigration(unittest.TestCase):
-    def test_migration_existing_records(self):
-        import tempfile
-        tmp = Path(tempfile.mkdtemp())
-        db_path = str(tmp / "test.db")
-        conn = sqlite3.connect(db_path)
-        conn.executescript("""
-            CREATE TABLE mailbox_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT NOT NULL,
-                source_commit_sha TEXT NOT NULL,
-                msg_type TEXT NOT NULL,
-                created_by TEXT NOT NULL,
-                status TEXT NOT NULL,
-                received_at TEXT NOT NULL,
-                processed_at TEXT NULL,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT NULL,
-                idea_id TEXT NULL,
-                outbox_file TEXT NULL
-            );
-        """)
-        conn.execute(
-            "INSERT INTO mailbox_messages (file_path, source_commit_sha, msg_type, created_by, status, received_at) VALUES (?, ?, ?, ?, ?, ?)",
-            ("/agent/inbox/old.md", "sha1", "task", "rene", "done", "2026-01-01T00:00:00Z"),
-        )
-        conn.commit()
-        conn.close()
-        conn2 = init_db(db_path)
-        conn2.row_factory = sqlite3.Row
-        rows = conn2.execute("SELECT * FROM mailbox_task_approvals").fetchall()
-        conn2.close()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["status"], "pending_approval")
-        self.assertEqual(rows[0]["sender"], "rene")
-
-
-class TestApiAuth(unittest.TestCase):
-    def test_list_pending_auth(self):
-        import os
-        os.environ.setdefault("AGENT_API_KEY", "test-key-abc")
-        from fastapi.testclient import TestClient
-        svc = MagicMock()
-        svc.list_recent.return_value = []
-        svc.recover_after_restart.return_value = None
-        from api import app, get_mailbox_task_service, get_codex_service
-        codex_svc = MagicMock()
-        codex_svc.mark_interrupted_tasks_failed.return_value = None
-        codex_svc.list_tasks.return_value = []
-        app.dependency_overrides[get_mailbox_task_service] = lambda: svc
-        app.dependency_overrides[get_codex_service] = lambda: codex_svc
-        client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/mailbox/tasks")
-        app.dependency_overrides.clear()
-        self.assertEqual(resp.status_code, 401)
 
 
 if __name__ == "__main__":

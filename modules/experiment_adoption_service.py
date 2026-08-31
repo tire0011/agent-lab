@@ -162,10 +162,9 @@ def _safe_list(values: list[str] | None, *, limit: int = 100) -> list[str]:
 class ExperimentAdoptionService:
     """Persisted, exactly-once experiment adoption state machine.
 
-    When GitHub work tracking is configured, adoption publishes only to the
-    Issue-linked branch, opens/reuses a PR and merges that PR. Direct pushes to
-    main are retained only as a compatibility fallback for installations that
-    have no GitHub API/CLI credentials configured yet.
+    Adoption publishes only through the mandatory GitHub lifecycle: push the
+    Issue-linked branch, open/reuse a PR and merge that PR. Direct pushes to
+    main are intentionally not allowed.
     """
 
     def __init__(
@@ -788,113 +787,100 @@ class ExperimentAdoptionService:
             integrated_commit_sha = self._git_stdout(["rev-parse", "HEAD"], str(integration_path), elog).strip() or None
 
             published_sha = integrated_commit_sha
-            if self.github_work_tracking.configured:
-                work_ref = self.github_work_tracking.for_experiment(experiment_id)
-                if work_ref is None:
-                    keep_integration = True
-                    return self._finish_review(
-                        experiment_id,
-                        reason="Für das Experiment fehlt die persistierte GitHub-Issue-Zuordnung.",
-                        actual_files=actual_files,
-                        expected_files=expected_files,
-                        test_exit_code=test_exit_code,
-                        test_output=bounded_test_output,
-                        experiment_commit_sha=experiment_commit_sha,
-                        integrated_commit_sha=integrated_commit_sha,
-                        diagnostic_worktree_path=str(integration_path),
-                        elog=elog,
-                    )
-
-                push_proc = _run_git(
-                    ["push", "origin", f"HEAD:{work_ref.branch_name}"],
-                    cwd=str(integration_path),
-                    timeout=120,
+            work_ref = self.github_work_tracking.for_experiment(experiment_id)
+            if work_ref is None:
+                keep_integration = True
+                return self._finish_review(
+                    experiment_id,
+                    reason="Für das Experiment fehlt die persistierte GitHub-Issue-Zuordnung.",
+                    actual_files=actual_files,
+                    expected_files=expected_files,
+                    test_exit_code=test_exit_code,
+                    test_output=bounded_test_output,
+                    experiment_commit_sha=experiment_commit_sha,
+                    integrated_commit_sha=integrated_commit_sha,
+                    diagnostic_worktree_path=str(integration_path),
                     elog=elog,
-                    phase="adoption",
                 )
-                if push_proc.returncode != 0:
-                    keep_integration = True
-                    return self._finish_review(
-                        experiment_id,
-                        reason="Der Push auf den Issue-Branch ist fehlgeschlagen; main wurde nicht verändert.",
-                        actual_files=actual_files,
-                        expected_files=expected_files,
-                        test_exit_code=test_exit_code,
-                        test_output=bounded_test_output,
-                        experiment_commit_sha=experiment_commit_sha,
-                        integrated_commit_sha=integrated_commit_sha,
-                        diagnostic_worktree_path=str(integration_path),
-                        elog=elog,
-                    )
-
-                plan_title = ""
-                if isinstance(experiment.plan, dict):
-                    plan_title = str(experiment.plan.get("title") or "")
-                pr_title = _collapse_summary(plan_title or experiment.goal, max_chars=200)
-                pr_body = (
-                    f"Fixes #{work_ref.issue_number}\n\n"
-                    f"Nexus experiment: `{experiment_id}`\n\n"
-                    f"Goal: {_collapse_summary(experiment.goal, max_chars=1000)}\n\n"
-                    f"Verification: integration tests passed (exit code {test_exit_code}); "
-                    "deterministic quality gate passed.\n\n"
-                    f"Changed files: {', '.join(actual_files[:30]) or '(none)'}"
-                )
-                try:
-                    work_ref = self.github_work_tracking.ensure_pull_request(
-                        work_ref,
-                        title=pr_title,
-                        body=pr_body,
-                        draft=False,
-                    )
-                    published_sha = self.github_work_tracking.merge_and_complete(
-                        work_ref,
-                        expected_head_sha=integrated_commit_sha,
-                    ) or integrated_commit_sha
-                except GitHubWorkTrackingError as exc:
-                    keep_integration = True
-                    return self._finish_review(
-                        experiment_id,
-                        reason=f"GitHub PR konnte nicht automatisch abgeschlossen werden: {exc}",
-                        actual_files=actual_files,
-                        expected_files=expected_files,
-                        test_exit_code=test_exit_code,
-                        test_output=bounded_test_output,
-                        experiment_commit_sha=experiment_commit_sha,
-                        integrated_commit_sha=integrated_commit_sha,
-                        diagnostic_worktree_path=str(integration_path),
-                        elog=elog,
-                    )
-            else:
-                # Compatibility for existing installations/tests until GitHub
-                # credentials are configured. Once configured, the branch/PR
-                # path above is mandatory and direct main pushes are bypassed.
-                push_proc = _run_git(
-                    ["push", "origin", f"HEAD:{_DEFAULT_TARGET_BRANCH}"],
-                    cwd=str(integration_path),
-                    timeout=120,
+            try:
+                self.github_work_tracking.require_lifecycle_ready()
+            except GitHubWorkTrackingError as exc:
+                keep_integration = True
+                return self._finish_review(
+                    experiment_id,
+                    reason=(
+                        "GitHub-Work-Tracking ist nicht konfiguriert; Veröffentlichung nur über den "
+                        f"Issue-Branch {work_ref.branch_name} und einen PR zu Issue #{work_ref.issue_number} möglich: {exc}"
+                    ),
+                    actual_files=actual_files,
+                    expected_files=expected_files,
+                    test_exit_code=test_exit_code,
+                    test_output=bounded_test_output,
+                    experiment_commit_sha=experiment_commit_sha,
+                    integrated_commit_sha=integrated_commit_sha,
+                    diagnostic_worktree_path=str(integration_path),
                     elog=elog,
-                    phase="adoption",
                 )
-                if push_proc.returncode != 0:
-                    keep_integration = True
-                    combined_push = f"{push_proc.stdout}\n{push_proc.stderr}".lower()
-                    reason = (
-                        "origin/main hat sich geändert, manuelle Prüfung nötig."
-                        if "rejected" in combined_push or "non-fast-forward" in combined_push
-                        else "Der Push nach origin/main ist fehlgeschlagen."
-                    )
-                    return self._finish_review(
-                        experiment_id,
-                        reason=reason,
-                        actual_files=actual_files,
-                        expected_files=expected_files,
-                        test_exit_code=test_exit_code,
-                        test_output=bounded_test_output,
-                        experiment_commit_sha=experiment_commit_sha,
-                        integrated_commit_sha=integrated_commit_sha,
-                        diagnostic_worktree_path=str(integration_path),
-                        elog=elog,
-                    )
+
+            push_proc = _run_git(
+                ["push", "origin", f"HEAD:refs/heads/{work_ref.branch_name}"],
+                cwd=str(integration_path),
+                timeout=120,
+                elog=elog,
+                phase="adoption",
+            )
+            if push_proc.returncode != 0:
+                keep_integration = True
+                return self._finish_review(
+                    experiment_id,
+                    reason="Der Push auf den Issue-Branch ist fehlgeschlagen; main wurde nicht verändert.",
+                    actual_files=actual_files,
+                    expected_files=expected_files,
+                    test_exit_code=test_exit_code,
+                    test_output=bounded_test_output,
+                    experiment_commit_sha=experiment_commit_sha,
+                    integrated_commit_sha=integrated_commit_sha,
+                    diagnostic_worktree_path=str(integration_path),
+                    elog=elog,
+                )
+
+            plan_title = ""
+            if isinstance(experiment.plan, dict):
+                plan_title = str(experiment.plan.get("title") or "")
+            pr_title = _collapse_summary(plan_title or experiment.goal, max_chars=200)
+            pr_body = (
+                f"Fixes #{work_ref.issue_number}\n\n"
+                f"Nexus experiment: `{experiment_id}`\n\n"
+                f"Goal: {_collapse_summary(experiment.goal, max_chars=1000)}\n\n"
+                f"Verification: integration tests passed (exit code {test_exit_code}); "
+                "deterministic quality gate passed.\n\n"
+                f"Changed files: {', '.join(actual_files[:30]) or '(none)'}"
+            )
+            try:
+                work_ref = self.github_work_tracking.ensure_pull_request(
+                    work_ref,
+                    title=pr_title,
+                    body=pr_body,
+                    draft=False,
+                )
+                published_sha = self.github_work_tracking.merge_and_complete(
+                    work_ref,
+                    expected_head_sha=integrated_commit_sha,
+                ) or integrated_commit_sha
+            except GitHubWorkTrackingError as exc:
+                keep_integration = True
+                return self._finish_review(
+                    experiment_id,
+                    reason=f"GitHub PR konnte nicht automatisch abgeschlossen werden: {exc}",
+                    actual_files=actual_files,
+                    expected_files=expected_files,
+                    test_exit_code=test_exit_code,
+                    test_output=bounded_test_output,
+                    experiment_commit_sha=experiment_commit_sha,
+                    integrated_commit_sha=integrated_commit_sha,
+                    diagnostic_worktree_path=str(integration_path),
+                    elog=elog,
+                )
 
             # Pull the now-merged main before attempting the local fast-forward.
             _run_git(

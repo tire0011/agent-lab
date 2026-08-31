@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
 from modules.experiment_resume import resume_experiment
+from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.mailbox_development import process_command
 from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -113,6 +114,7 @@ class MailboxTaskService:
         mailbox_config: Any | None = None,
         operations_registry: Any | None = None,
         orchestrator_factory: Any | None = None,
+        github_work_tracking: GitHubWorkTrackingService | None = None,
     ) -> None:
         self.db_path = db_path
         self.experiment_service = experiment_service
@@ -143,6 +145,10 @@ class MailboxTaskService:
         self.operations_registry = operations_registry
         self._owns_operations_registry = owns_registry
         self._orchestrator_factory = orchestrator_factory or NexusTaskOrchestrator
+        self.github_work_tracking = github_work_tracking or GitHubWorkTrackingService(
+            db_path=db_path,
+            repo_root=str(self.repo_path),
+        )
 
     def close(self) -> None:
         if self._owns_operations_registry and self.operations_registry is not None:
@@ -152,6 +158,12 @@ class MailboxTaskService:
                     close()
                 except Exception:
                     logger.exception("mailbox_task: failed closing operations registry")
+        close_tracking = getattr(self.github_work_tracking, "close", None)
+        if close_tracking:
+            try:
+                close_tracking()
+            except Exception:
+                logger.exception("mailbox_task: failed closing GitHub work tracking")
         self._conn.close()
 
     # ------------------------------------------------------------------
@@ -407,6 +419,23 @@ class MailboxTaskService:
         # Re-read task_body so clarification follow-ups accumulated by
         # continue_discussion are included in the implementation goal.
         current_approval = self.get(approval.id)
+        try:
+            work_ref = self.github_work_tracking.ensure_for_source(
+                SimpleNamespace(
+                    source_type="task",
+                    source_id=approval.id,
+                    title=f"Mailbox task {approval.id[:8]}",
+                    content=current_approval.task_body,
+                )
+            )
+        except GitHubWorkTrackingError as exc:
+            self._complete_without_experiment(
+                approval,
+                _STATUS_NEEDS_REVIEW,
+                f"GitHub lifecycle blocked before implementation start: {exc}",
+                error=str(exc),
+            )
+            return
         with self._lock:
             current = self._conn.execute(
                 "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
@@ -414,6 +443,7 @@ class MailboxTaskService:
             if current is None or current["status"] != _STATUS_APPROVED:
                 return
             experiment = self.experiment_service.create_experiment(current_approval.task_body)
+            work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
                    WHERE id=? AND status=?""",
@@ -423,6 +453,13 @@ class MailboxTaskService:
         if not updated:
             logger.warning("mailbox_task: lost race after creating experiment %s", experiment.id)
             return
+        logger.info(
+            "mailbox_task: approval=%s linked issue=%s branch=%s experiment=%s",
+            approval.id[:8],
+            work_ref.issue_number,
+            work_ref.branch_name,
+            experiment.id,
+        )
         self._start_thread(
             experiment.id,
             lambda: self.experiment_service.run_experiment(experiment.id),
@@ -441,6 +478,16 @@ class MailboxTaskService:
             )
             return
         experiment = self.experiment_service.resolve_experiment(decision.experiment_id)
+        try:
+            work_ref = self.github_work_tracking.ensure_for_experiment(experiment.id)
+        except GitHubWorkTrackingError as exc:
+            self._complete_without_experiment(
+                approval,
+                _STATUS_NEEDS_REVIEW,
+                f"GitHub lifecycle blocked before experiment resume: {exc}",
+                error=str(exc),
+            )
+            return
         with self._lock:
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
@@ -450,6 +497,20 @@ class MailboxTaskService:
             self._conn.commit()
         if not updated:
             return
+        if work_ref is None:
+            logger.info(
+                "mailbox_task: approval=%s resuming legacy experiment without GitHub link %s",
+                approval.id[:8],
+                experiment.id,
+            )
+        else:
+            logger.info(
+                "mailbox_task: approval=%s resuming issue=%s branch=%s experiment=%s",
+                approval.id[:8],
+                work_ref.issue_number,
+                work_ref.branch_name,
+                experiment.id,
+            )
         self._start_thread(
             experiment.id,
             lambda: resume_experiment(self.experiment_service, experiment.id),

@@ -109,6 +109,27 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         finally:
             service.close()
 
+    def test_unconfigured_service_raises_actionable_error_before_creating_issue(self):
+        service = GitHubWorkTrackingService(
+            db_path=str(Path(self.tmp.name) / "unconfigured.db"),
+            repo_root=self.tmp.name,
+        )
+        try:
+            with self.assertRaises(GitHubWorkTrackingError) as ctx:
+                service.ensure_for_source(
+                    SimpleNamespace(
+                        source_type="task",
+                        source_id="task-1",
+                        title="Add durable tracking",
+                        content="Add durable tracking before implementation.",
+                    )
+                )
+        finally:
+            service.close()
+
+        self.assertIn("GITHUB_REPOSITORY", str(ctx.exception))
+        self.assertIn("GITHUB_TOKEN/GH_TOKEN", str(ctx.exception))
+
     def test_existing_issue_is_reused_and_two_experiments_keep_same_work_identity(self):
         source = SimpleNamespace(
             source_type="issue",

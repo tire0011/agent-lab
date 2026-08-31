@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from types import SimpleNamespace
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from modules.experiment_resume import resume_experiment
+from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
@@ -125,12 +127,17 @@ class NexusChatService:
         orchestrator_factory: Callable[..., NexusTaskOrchestrator] = _ChatOrchestrator,
         background_starter: Callable[[str, Callable[[], None]], None] | None = None,
         resume_runner: Callable[[Any, str], Any] = resume_experiment,
+        github_work_tracking: GitHubWorkTrackingService | None = None,
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
         self.orchestrator_factory = orchestrator_factory
         self.background_starter = background_starter or self._start_background
         self.resume_runner = resume_runner
+        self.github_work_tracking = github_work_tracking or GitHubWorkTrackingService(
+            db_path=str(getattr(experiment_service, "db_path", "/agent/state/agent.db")),
+            repo_root=str(getattr(operations_registry, "repo_root", "/agent")),
+        )
 
     def handle(self, message: str, *, session_id: str | None = None) -> NexusChatResult:
         text = (message or "").strip()
@@ -161,7 +168,20 @@ class NexusChatService:
 
             if decision.action == ACTION_NEW_EXPERIMENT:
                 goal = self._implementation_goal(orchestrator, decision, text)
+                try:
+                    work_ref = self.github_work_tracking.ensure_for_source(
+                        SimpleNamespace(
+                            source_type="chat",
+                            source_id=decision.session_id,
+                            title="Nexus chat",
+                            content=goal,
+                        )
+                    )
+                except GitHubWorkTrackingError as exc:
+                    logger.warning("nexus_chat: GitHub lifecycle unavailable for session %s: %s", decision.session_id, exc)
+                    raise
                 experiment = self.experiment_service.create_experiment(goal)
+                self.github_work_tracking.bind_experiment(work_ref, experiment.id)
                 self.background_starter(
                     experiment.id,
                     lambda: self.experiment_service.run_experiment(experiment.id),
@@ -178,6 +198,11 @@ class NexusChatService:
                 if not decision.experiment_id:
                     raise TaskOrchestratorError("resume_experiment requires experiment_id")
                 experiment = self.experiment_service.resolve_experiment(decision.experiment_id)
+                try:
+                    self.github_work_tracking.ensure_for_experiment(experiment.id)
+                except GitHubWorkTrackingError as exc:
+                    logger.warning("nexus_chat: GitHub lifecycle unavailable while resuming %s: %s", experiment.id, exc)
+                    raise
                 self.background_starter(
                     experiment.id,
                     lambda: self.resume_runner(self.experiment_service, experiment.id),
