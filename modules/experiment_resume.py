@@ -36,9 +36,10 @@ def resume_experiment(
         return experiment
 
     if experiment.status == STATUS_QUEUED:
+        if github_work_tracking is None:
+            return experiment_service.run_experiment(experiment.id)
         return experiment_service.run_experiment(
-            experiment.id,
-            github_work_tracking=github_work_tracking,
+            experiment.id, github_work_tracking=github_work_tracking
         )
 
     if experiment.status in _UNSAFE_TO_GUESS:
@@ -64,6 +65,10 @@ def resume_experiment(
         f"Resuming experiment {experiment.id}; reusing existing worktree and verification state",
     )
     experiment_service._force_status(experiment.id, STATUS_VERIFYING)
+    if github_work_tracking is None:
+        return experiment_service._verify(
+            experiment.id, experiment.worktree_path, elog
+        )
     return experiment_service._verify(
         experiment.id,
         experiment.worktree_path,
