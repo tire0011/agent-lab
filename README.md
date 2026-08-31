@@ -103,6 +103,10 @@ CLI runner):
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
 - Optional for GitHub mailbox webhook: `AGENT_GITHUB_WEBHOOK_SECRET=<value>`
+- Required for Nexus implementation tasks: `GITHUB_REPOSITORY=owner/repository`
+  and `GITHUB_TOKEN=<fine-grained token with Issues, Contents and Pull requests write access>`.
+  Without them the API remains available for read-only work, but implementation
+  fails before an experiment starts.
 - Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests -q`
 
 ## MCP endpoint quick start
