@@ -37,7 +37,14 @@ from .core import (
     read_inbox_preview,
     redact,
 )
-from .processing import MailboxProcessor, _PROCESSORS
+from .processing import (
+    MailboxProcessor,
+    _CHAIN_ACCEPTED,
+    _ChainError,
+    _parse_operation_chain_body,
+    _process_operation_chain,
+    _PROCESSORS,
+)
 
 __all__ = [
     "MAX_FILE_SIZE",
@@ -51,6 +58,8 @@ __all__ = [
     "MailboxMessage",
     "MailboxProcessor",
     "SUPPORTED_TYPES",
+    "_CHAIN_ACCEPTED",
+    "_ChainError",
     "_DEFERRED_PROCESSING",
     "_atomic_write",
     "_build_outbox_content",
@@ -58,6 +67,8 @@ __all__ = [
     "_has_secret",
     "_now_iso",
     "_outbox_filename",
+    "_parse_operation_chain_body",
+    "_process_operation_chain",
     "_PROCESSORS",
     "git_add_and_commit",
     "git_current_commit",
