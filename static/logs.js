@@ -252,4 +252,3 @@ logsElements.mailboxTaskInput.addEventListener("input", () => {
   clearTimeout(logsElements.mailboxTaskInput._debounce);
   logsElements.mailboxTaskInput._debounce = setTimeout(loadLogs, 400);
 });
-setInterval(loadLogs, 10000);
