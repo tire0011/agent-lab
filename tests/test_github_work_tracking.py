@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,9 +67,18 @@ class FakeGitHub:
                 "state": "open",
                 "head": payload["head"],
                 "base": payload["base"],
+                "draft": bool(payload.get("draft")),
             }
             self.pulls.append(pr)
             return dict(pr)
+
+        if method == "PATCH" and "/pulls/" in path:
+            number = int(path.rsplit("/", 1)[1])
+            for pr in self.pulls:
+                if pr["number"] == number:
+                    pr.update(payload or {})
+                    return dict(pr)
+            raise AssertionError(f"unknown PR {number}")
 
         if method == "PUT" and path.endswith("/merge"):
             number = int(path.split("/pulls/", 1)[1].split("/", 1)[0])
@@ -108,6 +118,89 @@ class GitHubWorkTrackingTests(unittest.TestCase):
             self.assertTrue(nested_db.exists())
         finally:
             service.close()
+
+    def test_unconfigured_service_blocks_before_creating_issue(self):
+        service = GitHubWorkTrackingService(
+            db_path=str(Path(self.tmp.name) / "unconfigured.db"),
+            repo_root=self.tmp.name,
+            repository="tire0011/agent-lab",
+        )
+        try:
+            with self.assertRaises(GitHubWorkTrackingError) as ctx:
+                service.ensure_for_source(
+                    SimpleNamespace(
+                        source_type="task",
+                        source_id="blocked",
+                        title="Blocked",
+                        content="Do not start",
+                    )
+                )
+            self.assertIn("GITHUB_TOKEN/GH_TOKEN", str(ctx.exception))
+        finally:
+            service.close()
+
+    def test_legacy_recovery_reuses_experiment_identity(self):
+        experiment = SimpleNamespace(id="legacy-exp", goal="Recover this change")
+
+        first = self.service.recover_experiment(experiment)
+        second = self.service.recover_experiment(experiment)
+
+        self.assertEqual(first.issue_number, second.issue_number)
+        self.assertEqual(first.branch_name, second.branch_name)
+        self.assertEqual(self.service.for_experiment("legacy-exp").branch_name, first.branch_name)
+
+    def test_checkpoint_pushes_publishable_files_and_preserves_worktree(self):
+        repo = Path(self.tmp.name) / "repo"
+        remote = Path(self.tmp.name) / "remote.git"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Nexus Test"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "nexus@example.test"], cwd=repo, check=True)
+        (repo / "feature.py").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "add", "feature.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=repo, check=True, capture_output=True)
+        self.fake.refs["main"] = head
+
+        ref = self.service.bind_experiment(
+            self.service.ensure_for_source(
+                SimpleNamespace(
+                    source_type="task", source_id="checkpoint", title="Checkpoint", content="Checkpoint"
+                )
+            ),
+            "checkpoint-exp",
+        )
+        (repo / "feature.py").write_text("after\n", encoding="utf-8")
+        (repo / "communication").mkdir()
+        (repo / "communication" / "runtime.md").write_text("runtime\n", encoding="utf-8")
+
+        published = self.service.checkpoint_experiment("checkpoint-exp", str(repo))
+
+        self.assertEqual(published.pr_number, 100)
+        self.assertTrue(self.fake.pulls[0]["draft"])
+        remote_text = subprocess.run(
+            ["git", f"--git-dir={remote}", "show", f"{ref.branch_name}:feature.py"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(remote_text, "after\n")
+        missing_runtime = subprocess.run(
+            ["git", f"--git-dir={remote}", "cat-file", "-e", f"{ref.branch_name}:communication/runtime.md"],
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(missing_runtime.returncode, 0)
+        status = subprocess.run(
+            ["git", "status", "--short"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout
+        self.assertIn("feature.py", status)
+        self.assertIn("communication/", status)
 
     def test_existing_issue_is_reused_and_two_experiments_keep_same_work_identity(self):
         source = SimpleNamespace(
@@ -169,6 +262,37 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         stored = self.service.for_experiment("exp-merge")
         self.assertEqual(stored.pr_number, 100)
         self.assertEqual(stored.branch_name, "nexus/42-github-lifecycle")
+
+    def test_failed_verification_is_written_to_existing_draft_pr(self):
+        source = SimpleNamespace(
+            source_type="issue",
+            source_id="42",
+            title="GitHub lifecycle",
+            content="GitHub Issue #42: GitHub lifecycle",
+        )
+        ref = self.service.bind_experiment(
+            self.service.ensure_for_source(source), "exp-failed"
+        )
+        self.service.ensure_pull_request(
+            ref,
+            title="WIP lifecycle",
+            body="Verification pending",
+            draft=True,
+        )
+
+        self.service.record_verification(
+            "exp-failed",
+            status="failed",
+            command=["python", "-m", "unittest"],
+            exit_code=1,
+            error="tests failed (exit code 1)",
+            output="FAILED test_example",
+        )
+
+        body = self.fake.pulls[0]["body"]
+        self.assertIn("python -m unittest", body)
+        self.assertIn("Exit code: `1`", body)
+        self.assertIn("FAILED test_example", body)
 
 
 if __name__ == "__main__":
