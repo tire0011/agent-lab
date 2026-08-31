@@ -218,13 +218,13 @@ class WebClientTests(ApiTestsBase):
         self.assertTrue(response.headers["content-type"].startswith("text/css"))
 
     def test_javascript_is_reachable(self):
-        response = self.client.get("/static/app.js")
+        response = self.client.get("/static/utils.js")
         self.assertEqual(response.status_code, 200)
         self.assertIn("javascript", response.headers["content-type"])
         self.assertIn("textContent", response.text)
 
     def test_experiment_detail_shows_full_id_and_copy_control(self):
-        javascript = self.client.get("/static/app.js").text
+        javascript = self.client.get("/static/tasks.js").text
         detail_block = javascript.split("async function showExperimentDetail(experimentId)", 1)[1].split(
             "taskElements.loadButton.addEventListener", 1
         )[0]
@@ -234,9 +234,9 @@ class WebClientTests(ApiTestsBase):
         self.assertNotIn("fullExperimentId.slice(0, 8)", detail_block)
 
     def test_public_experiment_detail_fetch_path_is_preserved(self):
-        javascript = self.client.get("/static/app.js").text
+        javascript = self.client.get("/static/tasks.js").text
         fetch_block = javascript.split("async function fetchExperimentSummary(experimentId)", 1)[1].split(
-            "async function copyTextToClipboard", 1
+            "async function renderTaskApprovals(tasks)", 1
         )[0]
         self.assertIn(
             "const path = state.apiKey ? `/experiments/${experimentId}` : `/experiments/${experimentId}/public`;",
@@ -256,7 +256,7 @@ class WebClientTests(ApiTestsBase):
         self.assertIn("Zuletzt erfolgreich aktualisiert:", html)
 
     def test_logs_refresh_uses_rendered_arrays_and_shared_load_function(self):
-        javascript = self.client.get("/static/app.js").text
+        javascript = self.client.get("/static/logs.js").text
         self.assertIn("const visibleCount = renderedEntries.length;", javascript)
         self.assertIn("renderExperimentLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
         self.assertIn("renderLogsFromActivity(activity);\n      updateLogsSuccessStatus(activity);", javascript)
@@ -265,7 +265,7 @@ class WebClientTests(ApiTestsBase):
         self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
 
     def test_logs_success_timestamp_is_not_updated_in_error_paths(self):
-        javascript = self.client.get("/static/app.js").text
+        javascript = self.client.get("/static/logs.js").text
         load_logs = javascript.split("async function loadLogs()", 1)[1].split(
             'logsElements.refreshButton.addEventListener("click", loadLogs)', 1
         )[0]
@@ -275,7 +275,7 @@ class WebClientTests(ApiTestsBase):
             self.assertNotIn("updateLogsSuccessStatus", catch_body)
 
     def test_logs_error_paths_reset_visible_count_but_not_timestamp(self):
-        javascript = self.client.get("/static/app.js").text
+        javascript = self.client.get("/static/logs.js").text
         self.assertIn(
             "function updateLogsErrorStatus() {\n"
             "  logsElements.visibleCount.textContent = \"0\";\n"
@@ -636,7 +636,10 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
 
     def test_web_assets_contain_operations_tab_and_no_innerhtml(self):
         html = self.client.get("/").text
-        js = self.client.get("/static/app.js").text
+        js = "\n".join([
+            self.client.get(f"/static/{name}").text
+            for name in ["utils.js", "api-key.js", "tab-nav.js", "overview.js", "chat.js", "tasks.js", "mailbox.js", "operations.js", "chain-editor.js", "logs.js", "app.js"]
+        ])
         self.assertIn('data-tab="operations"', html)
         self.assertIn('id="tab-operations"', html)
         self.assertIn("loadOperationsCatalog", js)

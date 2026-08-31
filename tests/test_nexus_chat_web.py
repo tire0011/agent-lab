@@ -4,7 +4,7 @@ from pathlib import Path
 
 class NexusChatWebTests(unittest.TestCase):
     def test_web_chat_sends_auth_and_persists_session(self):
-        javascript = Path("static/app.js").read_text(encoding="utf-8")
+        javascript = "\n".join(p.read_text(encoding="utf-8") for p in sorted(Path("static").glob("*.js")))
         self.assertIn('const CHAT_SESSION_STORAGE_KEY = "nexusChatSessionId";', javascript)
         self.assertIn('headers: authHeaders()', javascript)
         self.assertIn('session_id: state.chatSessionId', javascript)

@@ -616,7 +616,8 @@ class TestInboxAndApiUseSameService(unittest.TestCase):
 
 class TestChainEditorJS(unittest.TestCase):
     def _read_app_js(self) -> str:
-        return (Path(__file__).parent.parent / "static" / "app.js").read_text()
+        static_dir = Path(__file__).parent.parent / "static"
+        return "\n".join(p.read_text(encoding="utf-8") for p in sorted(static_dir.glob("*.js")))
 
     def test_uses_catalog_endpoint(self):
         src = self._read_app_js()
@@ -664,10 +665,11 @@ class TestChainEditorJS(unittest.TestCase):
         self.assertIn("resultCopyButton", src)
 
     def test_node_syntax_check(self):
-        app_js = Path(__file__).parent.parent / "static" / "app.js"
-        result = subprocess.run(["node", "--check", str(app_js)], capture_output=True, text=True)
-        if result.returncode != 0:
-            self.fail(f"JS syntax error:\n{result.stderr}")
+        static_dir = Path(__file__).parent.parent / "static"
+        for js_file in sorted(static_dir.glob("*.js")):
+            result = subprocess.run(["node", "--check", str(js_file)], capture_output=True, text=True)
+            if result.returncode != 0:
+                self.fail(f"JS syntax error in {js_file.name}:\n{result.stderr}")
 
     def test_mobile_viewport_in_html(self):
         html = (Path(__file__).parent.parent / "static" / "index.html").read_text()

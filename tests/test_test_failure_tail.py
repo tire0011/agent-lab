@@ -276,12 +276,12 @@ class ExperimentShowOperationTailTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class UITextContentSafetyTests(unittest.TestCase):
-    """Verify that ``static/app.js`` uses only ``textContent`` for failure tail."""
+    """Verify that static UI scripts use only ``textContent`` for failure tail."""
 
     def _load_js(self):
         import pathlib
-        path = pathlib.Path(__file__).parent.parent / "static" / "app.js"
-        return path.read_text(encoding="utf-8")
+        static_dir = pathlib.Path(__file__).parent.parent / "static"
+        return "\n".join(p.read_text(encoding="utf-8") for p in sorted(static_dir.glob("*.js")))
 
     def test_test_failure_section_uses_textcontent_not_innerhtml(self):
         js = self._load_js()
