@@ -122,9 +122,6 @@ function activateTab(name) {
   if (name === "logs") {
     loadLogsExperimentOptions();
     loadLogs();
-    startLogsAutoRefresh();
-  } else {
-    stopLogsAutoRefresh();
   }
 }
 
@@ -1327,19 +1324,6 @@ const logsElements = {
   lastSuccessfulRefresh: document.querySelector("#logs-last-successful-refresh"),
   autoRefreshState: document.querySelector("#logs-auto-refresh-state"),
 };
-
-let logsAutoRefreshTimer = null;
-
-function startLogsAutoRefresh() {
-  if (logsAutoRefreshTimer) return;
-  logsAutoRefreshTimer = setInterval(loadLogs, 10000);
-}
-
-function stopLogsAutoRefresh() {
-  if (!logsAutoRefreshTimer) return;
-  clearInterval(logsAutoRefreshTimer);
-  logsAutoRefreshTimer = null;
-}
 
 function updateLogsErrorStatus() {
   logsElements.visibleCount.textContent = "0";
