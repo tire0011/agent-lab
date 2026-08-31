@@ -1,0 +1,1 @@
+pwsh ".\nexus-refresh.ps1"
