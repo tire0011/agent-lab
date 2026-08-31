@@ -2,6 +2,9 @@
 
 Experimental project for distributed self-improving LLM agents under strict budget constraints.
 
+Repository development and verification conventions are documented in
+[`CODING_GUIDELINES.md`](CODING_GUIDELINES.md).
+
 ## Mailbox
 
 Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed mailbox communication. GitHub push events affecting `inbox/` trigger immediate processing through `POST /mailbox/webhook/github`; the systemd timer remains as a one-minute fallback.
