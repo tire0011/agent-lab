@@ -160,7 +160,7 @@ Experiment verification and adoption/integration verification now use the same i
 
 ### 35. 2026-08-25: manual mailbox task approval removed
 
-Mailbox task messages are now immediately handed to the existing worker/controller; the UI approval affordance was removed. Existing timeout, output, redaction, environment, persistence, experiment isolation, and self-disruption protections remain. **Lesson:** approval gates can be useful scaffolding, but stronger evidence and recovery mechanisms can replace redundant manual clicks in a trusted channel.
+Mailbox task messages are now immediately handed to the existing worker/controller; the UI approval affordance was removed. Existing timeout, output, redaction, environment, persistence, experiment isolation, and self-disruption protections remain. **Lesson:** approval gates can be useful scaffolding, but stronger evidence and recovery mechanisms can replace redundant manual steps in a trusted channel.
 
 ### 36. 2026-08-25: GitHub Actions became a reusable verification surface
 
@@ -288,15 +288,47 @@ This is intentionally a presentation/API change rather than a mailbox-processing
 
 **Lesson:** before adding protocol identifiers, reuse durable relationships already present in the transport/state model; better presentation can unlock conversational UX without changing delivery semantics.
 
-### 54. 2026-08-29 to 2026-08-30: runtime observability became an explicit architecture layer
+### 54. 2026-08-29 to 2026-08-31: runtime observability experiment was not adopted
 
-Issue #76 / open PR #77 introduces lightweight runtime observability so humans and LLMs can answer "what is Nexus doing right now?" without parsing historical logs. The proposed implementation adds a thread-safe explicit runtime state with current task/experiment, phase, operation, durations, heartbeat/health and bounded hierarchical operation history; meaningful pipeline operations carry trace/span relationships, and existing `ExperimentLogger` JSONL events gain trace metadata rather than being replaced.
+Issue #76 / PR #77 explored explicit runtime state, heartbeat/liveness, trace/span relationships, authenticated runtime status/trace endpoints, and optional OpenTelemetry OTLP export. The implementation was technically viable and reported **27 runtime-observability tests, 6 status-API tests, and 980 full-suite tests passing**. A real Grafana Cloud trial then showed that the external tracing workflow was too cumbersome and visually noisy for the current project needs.
 
-The PR also adds authenticated `GET /api/runtime/status` and `GET /api/runtime/trace` endpoints plus optional vendor-neutral OpenTelemetry OTLP export. Grafana Cloud is the first external backend target, but no collector, Grafana stack, database or Docker service should run on the B2ms VM; telemetry export must remain optional and failures must not stop Nexus. PR #77 reports **27 runtime-observability tests, 6 status-API tests, and 980 full-suite tests passing** with and without the optional OpenTelemetry packages. Real Grafana Cloud end-to-end verification was still pending, and deployment work was wiring OTEL configuration through the existing systemd environment-file path rather than hard-coding configuration in the service unit.
+PR #77 was therefore closed **without merge** on 2026-08-31, and Issue #76 was removed. The project keeps the underlying lesson—current-state/liveness evidence is useful—but does not adopt Grafana/OpenTelemetry as a required or default architecture layer.
 
-PR #77 remains open/not adopted on `main` as of 2026-08-30.
+**Lesson:** observability must reduce operator effort, not merely produce more telemetry. A technically correct tracing stack can still be the wrong operational interface for a small autonomous lab.
 
-**Lesson:** post-mortem logs and current-state observability solve different problems. Long local inference and deferred work need explicit liveness/phase state and heartbeat evidence, while external telemetry should be an optional export of that evidence rather than a new runtime dependency.
+### 55. 2026-08-31: a real `--version` smoke test exposed the optional GitHub lifecycle
+
+A deliberately small Nexus feature task implemented a CLI `--version` path and produced meaningful source/test/documentation changes. Focused verification succeeded (`agent.py --version` returned `0.2.0`; **58 relevant tests passed**), but the task still ended as `tests=fail`, the changes existed only in the VM worktree, and no Issue/remote branch/PR had been created because GitHub work tracking was silently unconfigured. Failure output also lacked the exact failing command/exit code.
+
+Issue #78 converted this into a lifecycle invariant rather than a one-off deployment bug: implementation work must not start unless GitHub lifecycle readiness is available, and failed or reviewable work must remain externally inspectable.
+
+**Lesson:** a workflow documented as mandatory is not mandatory if runtime configuration can silently bypass it. Small end-to-end feature tasks are high-value architecture tests because they expose gaps that unit-level capability checks miss.
+
+### 56. 2026-08-31: GitHub lifecycle became mandatory and WIP-visible
+
+PR #81 completed Issue #78. Nexus must now resolve/create the Issue and Issue-linked branch before implementation, persist source/Issue/branch/experiment identity, checkpoint intended WIP changes to the remote branch, create/reuse a Draft PR before verification completes, and preserve that branch/PR/worktree when verification fails or requires review. Resume paths reuse the same identities.
+
+The direct-`main` adoption compatibility fallback was removed: successful implementation completion now requires the Issue-linked PR path. Missing GitHub readiness blocks implementation with an actionable error while read-only operations remain usable. Local verification included **8 focused GitHub-work-tracking tests** plus Python compile checks; full repository CI was required for merge.
+
+This resolves the earlier open question created by the direct controller self-repair: normal Nexus implementation/self-repair should be observable through Issue -> branch -> PR -> merge rather than silently writing `main`.
+
+**Lesson:** durable autonomous work needs visible intermediate state, not only a final commit. WIP checkpoints and Draft PRs turn failures into resumable evidence instead of lost VM-local state.
+
+### 57. 2026-08-31: large modules were split and compatibility regressions became explicit test data
+
+The codebase underwent several structural cleanups: the browser `static/app.js` was split into feature-specific modules, the mailbox implementation became a `modules/mailbox/` package, the run store became a package, and PR #87 split the roughly **2,570-line** `experiment_service.py` into focused models/parsing/policy/prompts/git/text/service modules while preserving the public import surface.
+
+These refactors also demonstrated a recurring risk: package and frontend splits can leave stale imports, monkey-patch targets, redaction assumptions, and UI tests behind. PR #82 fixed those regressions and restored **949 tests OK, 55 skipped**. PR #87 reported its focused suites passing; its full run had one unrelated pre-existing WebClient test failure, and the stale logs auto-refresh assertion was corrected in the branch before merge.
+
+**Lesson:** modularity helps Nexus navigate and modify the codebase, but behavior-preserving refactors still need compatibility façades and regression tests around import surfaces, patch points, redaction, and browser behavior.
+
+### 58. 2026-08-31: logging UX shifted toward manual, unified, failure-focused inspection
+
+Real smoke-test debugging showed that the Logs tab was not a trustworthy end-to-end view: “all experiments” used activity summaries rather than the structured experiment logs, and large failed verification entries buried the real traceback under INFO noise from successful fixture experiments.
+
+Issue #84 defines a unified authenticated structured log feed across mailbox intake, orchestration, implementation, GitHub lifecycle, verification, adoption and recovery, with **manual refresh only**—no polling/SSE—and correlation before an experiment ID exists. Issue #86 extends this with one collapsed summary row per log entry, backend detail loading only on expansion, page-level detail caching, and failure-focused test diagnostics. Verification subprocesses should suppress `nexus.experiment` INFO mirroring from successful fixture code while preserving WARNING/ERROR output and the real experiment's durable JSONL log.
+
+**Lesson:** logging quality is signal-to-noise, not log volume. Successful tests should stay quiet; failures should surface the failing test, traceback and summary immediately, while detailed evidence remains available on demand.
 
 ## What Nexus currently learns
 
@@ -333,11 +365,12 @@ Current `main` includes:
 - iterative command/operation/memory/delegation tool loops that return evidence to the local controller,
 - single-call Codex experiment execution,
 - worktree-isolated experiments with quality gating, shared real-tool verification/adoption runner, distinct timeout state, and persisted adaptive verification timeout,
-- GitHub-backed outer work lifecycle using reusable Issues, `nexus/**` branches, PRs, merge, and Issue completion,
+- mandatory GitHub-backed implementation lifecycle using reusable Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion; no silent local-only/direct-`main` implementation fallback,
 - GitHub Actions verification for PRs and `nexus/**` branch pushes, with event-separated concurrency and compact failure-focused output,
 - SQLite state and durable project/idea/decision/history documents,
 - separate Git-backed mailbox repository with crash-safe outbox publication, rejected-chain recovery, bounded fetch/rebase/push synchronization, deferred asynchronous trusted command execution, and a synchronous internal-orchestrator compatibility path when no mailbox state exists,
 - signed GitHub webhook wake-up with timer fallback, one-shot sync retry, and bounded content-free diagnostics,
+- modularized mailbox, run-store, experiment-service and browser-client code with compatibility façades where needed,
 - API/web UI and compact public/authenticated diagnostics,
 - authenticated, audited self-healing/operations capabilities including local-model, service, log, and process inspection,
 - authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
@@ -346,7 +379,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-The persistent local-controller, conversational Nexus chat, and GitHub experiment-lifecycle designs are adopted on `main`. Conversation-style Inbox/Outbox rendering (Issue #75) and the runtime-observability/OpenTelemetry implementation (PR #77) remain open work; the global MCP gateway remains a research direction.
+The persistent local-controller, conversational Nexus chat, and mandatory GitHub implementation lifecycle are adopted on `main`. Conversation-style Inbox/Outbox rendering (Issue #75), the unified/collapsed log feed (Issues #84/#86), CI-evidence reuse, and the global MCP gateway remain open work/research. The Grafana/OpenTelemetry PR #77 experiment was closed without adoption.
 
 ## Important lessons so far
 
@@ -385,7 +418,12 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 33. **Runtime probes find policy drift.** A migration is not complete just because broad code search and tests say an allowlist is gone.
 34. **Long-running shell work also needs durable state.** Deferred execution and polling are more robust than tying command lifetime to one mailbox-processing request.
 35. **Durability semantics are call-site dependent.** External mailbox work can require persistence and polling while state-less internal orchestration may still need a synchronous result.
-36. **Current-state observability is distinct from logging.** Explicit phase/operation/heartbeat state answers liveness questions cheaply; detailed logs and external tracing remain evidence for deeper diagnosis.
+36. **Current-state observability is distinct from logging.** Explicit state can answer liveness questions cheaply, but an external tracing stack is only worthwhile if it improves operator comprehension.
+37. **Operational simplicity is an architecture criterion.** More telemetry is not automatically better observability; reject tooling that adds more navigation/maintenance than insight.
+38. **Lifecycle invariants must fail closed before implementation.** Mandatory GitHub state cannot be a best-effort optional adapter.
+39. **Visible intermediate work is part of durability.** WIP commits and Draft PRs preserve inspectable evidence before final verification succeeds.
+40. **Behavior-preserving refactors still change integration surfaces.** Imports, monkey-patch targets, redaction helpers and frontend timing assumptions need explicit compatibility coverage.
+41. **Logs should optimize for diagnosis, not completeness-at-a-glance.** Keep success quiet, surface failure signal first, and load detailed evidence on demand.
 
 ## Open research directions
 
@@ -399,13 +437,13 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 - measure how much local context preparation and compact chat context reduce provider tokens without reducing decision quality,
 - measure whether removing/shortening redundant comments and docstrings reduces source-context tokens without harming readability or losing architectural rationale (Issue #74),
 - validate conversation-style mailbox rendering against linked, pending and multi-response cases without changing mailbox delivery semantics (Issue #75),
-- validate PR #77 on the real VM and Grafana Cloud: heartbeat/liveness accuracy during slow local inference and commands, trace usefulness for humans/LLMs, OTLP failure isolation, and resource overhead,
+- implement and validate the unified/collapsed log feed from Issues #84/#86, including manual refresh, pre-experiment correlation, lazy detail loading, and failure-focused verification output,
+- revisit lightweight in-product liveness/status only if structured logs still cannot answer whether Nexus is progressing; external OTLP/Grafana is not a default direction,
 - make the verification controller reuse matching successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
 - evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
 - evaluate the effect of removing static execution allowlists: capability success, accidental scope expansion, security regressions, hidden secondary gates, and operator intervention,
 - evaluate MCP as the standard integration/control path and narrow temporary bootstrap capabilities over time,
-- measure whether GitHub Issue/branch/PR lifecycle improves fire-and-forget development, traceability, recovery, and human review,
-- compare Nexus direct self-repair on `main` with the normal Issue/branch/PR lifecycle and define when, if ever, direct repair is justified,
+- measure whether the now-mandatory GitHub Issue/branch/checkpoint/Draft-PR lifecycle improves fire-and-forget development, traceability, recovery, and human review,
 - add concise GitHub Issue lifecycle progress without duplicating detailed Nexus logs,
 - prototype the global MCP gateway with only 2-3 tools and measure routing accuracy, schema-token reduction, latency, total cost, and failures,
 - investigate missing-capability detection and structured issue creation before any automatic tool generation,
@@ -419,7 +457,7 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 
 ## Current next-step candidates
 
-1. **Runtime observability validation:** complete the real-VM/Grafana Cloud test for PR #77 and verify status/heartbeat/trace behavior during a deliberately slow local-LLM or command operation before adoption.
+1. **Unified failure-focused logs:** implement Issues #84/#86 so one manual refresh shows the complete structured task path, while collapsed rows and lazy details keep failures readable and verification subprocesses suppress successful-test INFO noise.
 2. **Conversational autonomy rerun:** repeat the real chat implementation request that exposed malformed/incomplete controller output and measure whether schema constraints plus bounded repair now let Nexus preserve context, choose tools/providers, complete the work, and report evidence cleanly.
 3. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
 4. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
@@ -427,6 +465,6 @@ The persistent local-controller, conversational Nexus chat, and GitHub experimen
 6. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
 7. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
 8. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
-9. **GitHub lifecycle measurement:** verify multiple experiments can safely reuse one Issue/branch identity and that PR/merge/Issue completion remains recoverable under conflicts/provider failures.
+9. **Mandatory GitHub lifecycle measurement:** verify multiple experiments safely reuse one Issue/branch/PR identity, failed verification preserves inspectable WIP, and resume/merge/Issue completion remain recoverable under conflicts/provider failures.
 10. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
 11. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare measured comment/docstring context reduction against readability and unchanged test behavior.
