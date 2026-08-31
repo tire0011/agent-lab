@@ -35,7 +35,10 @@ attempt end to end:
      none applies, the experiment becomes ``needs_review`` instead of being
      scored as successful.
 
-No commit, push, merge, or deployment is ever performed by this service.
+When invoked by a Nexus implementation entry point, the service asks the
+mandatory GitHub lifecycle to publish a WIP checkpoint and Draft PR before
+verification. The experiment worktree itself remains uncommitted and no merge
+or deployment is performed here.
 Reuses ``modules.codex_worker.CodexWorker`` for both phases (no duplicated
 subprocess/worker logic) and the existing SQLite store from
 ``modules.run_store`` (additive ``experiments`` table).
@@ -2046,7 +2049,7 @@ class ExperimentService:
     # run_experiment — the whole pipeline, single entry point
     # ------------------------------------------------------------------
 
-    def run_experiment(self, experiment_id: str) -> Experiment:
+    def run_experiment(self, experiment_id: str, github_work_tracking: Any | None = None) -> Experiment:
         experiment = self.get_experiment(experiment_id)  # raises if missing
         elog = self.get_experiment_logger(experiment_id)
 
@@ -2079,7 +2082,7 @@ class ExperimentService:
             )
 
         try:
-            return self._run_pipeline(experiment_id)
+            return self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
             elog.error(
                 "pipeline", "unhandled_exception",
@@ -2094,7 +2097,7 @@ class ExperimentService:
             )
             return self.get_experiment(experiment_id)
 
-    def _run_pipeline(self, experiment_id: str) -> Experiment:
+    def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
         """Single-call implementation pipeline.
 
         Phases (in order):
@@ -2104,7 +2107,9 @@ class ExperimentService:
              implements the goal directly inside the worktree.
           4. Verification — git diff + tests + deterministic quality gate.
 
-        No commit, push, merge, or deployment is ever performed here.
+        The injected GitHub lifecycle publishes a checkpoint through a
+        temporary index before verification; it never changes this worktree's
+        HEAD/index and never merges or deploys from this service.
         Reuses ``modules.codex_worker.CodexWorker`` (no duplicated
         subprocess/worker logic) and the existing SQLite store.
         """
@@ -2200,6 +2205,9 @@ class ExperimentService:
         )
 
         if implementation_result.timed_out:
+            checkpoint_error = self._checkpoint_interrupted_work(
+                experiment_id, worktree_path, github_work_tracking, elog
+            )
             self._force_status(
                 experiment_id, STATUS_TIMED_OUT,
                 ended_at=_utcnow_iso(),
@@ -2208,11 +2216,14 @@ class ExperimentService:
                 implementation_runtime_ms=implementation_result.runtime_ms,
                 implementation_usage_json=json.dumps(implementation_result.usage)
                 if implementation_result.usage else None,
-                error="implementation phase timed out",
+                error="implementation phase timed out" + checkpoint_error,
             )
             return self.get_experiment(experiment_id)
 
         if implementation_result.error:
+            checkpoint_error = self._checkpoint_interrupted_work(
+                experiment_id, worktree_path, github_work_tracking, elog
+            )
             self._force_status(
                 experiment_id, STATUS_FAILED,
                 ended_at=_utcnow_iso(),
@@ -2221,7 +2232,7 @@ class ExperimentService:
                 implementation_runtime_ms=implementation_result.runtime_ms,
                 implementation_usage_json=json.dumps(implementation_result.usage)
                 if implementation_result.usage else None,
-                error=implementation_result.error,
+                error=implementation_result.error + checkpoint_error,
             )
             return self.get_experiment(experiment_id)
 
@@ -2236,11 +2247,68 @@ class ExperimentService:
 
         # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
-        return self._verify(experiment_id, worktree_path, elog)
+        return self._verify(
+            experiment_id,
+            worktree_path,
+            elog,
+            github_work_tracking=github_work_tracking,
+        )
 
-    def _verify(self, experiment_id: str, worktree_path: str, elog: ExperimentLogger | None = None) -> Experiment:
+    def _checkpoint_interrupted_work(
+        self,
+        experiment_id: str,
+        worktree_path: str,
+        github_work_tracking: Any | None,
+        elog: ExperimentLogger,
+    ) -> str:
+        if github_work_tracking is None:
+            return ""
+        try:
+            github_work_tracking.checkpoint_experiment(experiment_id, worktree_path)
+            elog.info(
+                "implementation", "github_checkpoint_published",
+                "Published interrupted implementation checkpoint to Draft PR",
+            )
+            return ""
+        except Exception as exc:  # noqa: BLE001 - preserve original terminal state
+            elog.error(
+                "implementation", "github_checkpoint_failed",
+                "Could not publish interrupted implementation checkpoint", exc=exc,
+            )
+            return f"; GitHub checkpoint failed: {str(exc)[:1000]}"
+
+    def _verify(
+        self,
+        experiment_id: str,
+        worktree_path: str,
+        elog: ExperimentLogger | None = None,
+        *,
+        github_work_tracking: Any | None = None,
+    ) -> Experiment:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
+        if github_work_tracking is not None:
+            try:
+                ref = github_work_tracking.checkpoint_experiment(
+                    experiment_id, worktree_path
+                )
+                elog.info(
+                    "verifying", "github_checkpoint_published",
+                    f"Checkpoint published to {ref.branch_name} before verification",
+                )
+            except Exception as exc:  # noqa: BLE001 - never verify invisible work
+                elog.error(
+                    "verifying", "github_checkpoint_failed",
+                    "Verification blocked because the implementation checkpoint is not visible in GitHub",
+                    exc=exc,
+                )
+                self._force_status(
+                    experiment_id,
+                    STATUS_NEEDS_REVIEW,
+                    ended_at=_utcnow_iso(),
+                    error=f"GitHub checkpoint failed before verification: {str(exc)[:2000]}",
+                )
+                return self.get_experiment(experiment_id)
         try:
             status_proc = _run_git(
                 ["status", "--short", "--untracked-files=all"],
@@ -2448,6 +2516,32 @@ class ExperimentService:
             error=error,
             quality_evaluation_json=json.dumps(quality_evaluation) if quality_evaluation is not None else None,
         )
+        if github_work_tracking is not None:
+            try:
+                github_work_tracking.record_verification(
+                    experiment_id,
+                    status=final_status,
+                    command=test_command,
+                    exit_code=test_exit_code,
+                    error=error,
+                    output=test_output_capped,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep work and require review
+                elog.error(
+                    "verifying", "github_verification_update_failed",
+                    "Verification completed but the Draft PR diagnostics could not be updated",
+                    exc=exc,
+                )
+                current = self.get_experiment(experiment_id)
+                combined_error = (
+                    f"{current.error}; " if current.error else ""
+                ) + f"GitHub verification update failed: {str(exc)[:1000]}"
+                self._force_status(
+                    experiment_id,
+                    STATUS_NEEDS_REVIEW,
+                    ended_at=_utcnow_iso(),
+                    error=combined_error,
+                )
         return self.get_experiment(experiment_id)
 
     # ------------------------------------------------------------------
