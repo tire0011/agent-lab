@@ -219,6 +219,7 @@ class AdoptionRepoFixture:
             workspace=root / "github-merge-workspace",
             merge_should_fail=merge_should_fail,
         )
+        self.github_api.refs["main"] = git(self.repo, "rev-parse", "HEAD").stdout.strip()
         self.github_seed_tracking = GitHubWorkTrackingService(
             db_path=self.db_path,
             repo_root=str(self.repo),
@@ -545,7 +546,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
 
         self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
         self.assertEqual(before, after)
-        self.assertIn("GitHub-Work-Tracking ist nicht konfiguriert", adoption.reason)
+        self.assertIn("GitHub lifecycle blocked before adoption", adoption.reason)
         self.assertIn("Issue-Branch nexus/42-adoptable-change-e1e1e1e1", adoption.reason)
         self.assertTrue(Path(adoption.diagnostic_worktree_path).exists())
 
