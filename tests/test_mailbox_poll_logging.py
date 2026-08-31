@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from modules.mailbox_poll_runner import _safe_result_summary
+from modules.mailbox.poll_runner import _safe_result_summary
 
 
 class MailboxPollLoggingTests(unittest.TestCase):

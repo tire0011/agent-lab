@@ -16,6 +16,7 @@ from .core import (
     STATUS_DONE_PENDING_COMMIT,
     MailboxLock,
     MailboxMessage,
+    SUPPORTED_TYPES,
     _DEFERRED_PROCESSING,
     _atomic_write,
     _build_outbox_content,
@@ -36,7 +37,7 @@ from .core import (
     read_inbox_preview,
     redact,
 )
-from .processing import MailboxProcessor
+from .processing import MailboxProcessor, _PROCESSORS
 
 __all__ = [
     "MAX_FILE_SIZE",
@@ -49,6 +50,7 @@ __all__ = [
     "MailboxLock",
     "MailboxMessage",
     "MailboxProcessor",
+    "SUPPORTED_TYPES",
     "_DEFERRED_PROCESSING",
     "_atomic_write",
     "_build_outbox_content",
@@ -56,6 +58,7 @@ __all__ = [
     "_has_secret",
     "_now_iso",
     "_outbox_filename",
+    "_PROCESSORS",
     "git_add_and_commit",
     "git_current_commit",
     "git_dirty_entries",

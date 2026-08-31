@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from modules.mailbox_config import MailboxConfig
+from .config import MailboxConfig
 
 
 logger = logging.getLogger(__name__)
@@ -237,7 +237,7 @@ def run_mailbox_poll_once(
     from modules.experiment_service import ExperimentService
     from modules import mailbox as mailbox_module
     from modules.mailbox import MailboxLock, MailboxProcessor
-    from modules.mailbox_development import install as install_mailbox_development
+    from .development import install as install_mailbox_development
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry

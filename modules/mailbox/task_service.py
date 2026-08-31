@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
 from modules.experiment_resume import resume_experiment
-from modules.mailbox_development import process_command
+from .development import process_command
 from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 from modules.run_store import DEFAULT_DB_PATH, init_db
 from modules.task_orchestrator import (

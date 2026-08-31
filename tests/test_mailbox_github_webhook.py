@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import unittest
 
-from modules.mailbox_github_webhook import has_inbox_changes, is_ping_event, verify_signature
+from modules.mailbox.github_webhook import has_inbox_changes, is_ping_event, verify_signature
 
 
 class MailboxGithubWebhookModuleTests(unittest.TestCase):

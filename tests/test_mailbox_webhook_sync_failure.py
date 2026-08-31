@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from modules.mailbox_poll_runner import _sync_mailbox_repo
+from modules.mailbox.poll_runner import _sync_mailbox_repo
 
 
 class MailboxSyncFailureRegressionTests(unittest.TestCase):

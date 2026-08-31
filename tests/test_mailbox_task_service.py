@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from modules.run_store import init_db
-from modules.mailbox_task_service import (
+from modules.mailbox.task_service import (
     ApprovalNotFoundError,
     ApprovalStateError,
     MailboxTaskService,

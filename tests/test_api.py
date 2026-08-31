@@ -20,7 +20,7 @@ from api import (
     get_mailbox_task_service,
     get_operations_service,
 )
-from modules.mailbox_poll_runner import MailboxPollRunResult
+from modules.mailbox.poll_runner import MailboxPollRunResult
 
 
 def _mock_codex_service():

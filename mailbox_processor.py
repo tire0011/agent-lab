@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-from modules.mailbox_poll_runner import run_mailbox_poll_once
+from modules.mailbox.poll_runner import run_mailbox_poll_once
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH
 
@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    from modules.mailbox_config import MailboxConfig
+    from modules.mailbox.config import MailboxConfig
 
     mailbox_config = MailboxConfig.from_paths(code_repo_path, mailbox_repo_path)
     result = run_mailbox_poll_once(

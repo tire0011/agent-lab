@@ -19,14 +19,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from modules.mailbox_config import MailboxConfig
+from modules.mailbox.config import MailboxConfig
 from modules.mailbox import (
     MailboxProcessor,
     git_is_clean,
 )
 from modules.operation_chain_publisher import OperationChainPublisher
 from modules.operation_chain_service import OperationChainService
-from modules.mailbox_task_service import MailboxTaskService
+from modules.mailbox.task_service import MailboxTaskService
 from modules.run_store import init_db
 
 

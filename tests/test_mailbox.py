@@ -25,7 +25,7 @@ from modules.mailbox import (
     parse_front_matter,
 )
 from modules.run_store import init_db
-from modules.mailbox_poll_runner import MailboxPollRunResult
+from modules.mailbox.poll_runner import MailboxPollRunResult
 
 
 def _make_repo(tmp: Path) -> Path:

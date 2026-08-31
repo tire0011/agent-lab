@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
-from modules.mailbox_development import process_command
+from modules.mailbox.development import process_command
 from modules.nexus_sources import NexusSource, idea_source, issue_source, task_source
 from modules.run_store import DEFAULT_DB_PATH
 from modules.task_orchestrator import (

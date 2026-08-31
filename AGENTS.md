@@ -35,7 +35,7 @@ Primary objective: learn how far the system can improve itself safely and measur
   - public `GET /health`
   - authenticated `GET /secure-health` via `AGENT_API_KEY`
   - authenticated `GET/POST /mailbox/tasks/{id}/approve|reject` — task approval bridge
-- Mailbox task approval bridge implemented: `modules/mailbox_task_service.py`
+- Mailbox task approval bridge implemented: `modules/mailbox/task_service.py`
   - `task` mailbox messages create `pending_approval` records; human approves/rejects via API/Web UI
   - On approval, `ExperimentService` runs the task in a background daemon thread
   - State machine: `pending_approval → approved → submitted → running → succeeded/failed/needs_review`

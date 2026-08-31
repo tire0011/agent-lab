@@ -601,12 +601,12 @@ class TestInboxAndApiUseSameService(unittest.TestCase):
         import mailbox_processor
 
         mp_src = inspect.getsource(mailbox_processor)
-        self.assertIn("from modules.mailbox_poll_runner import run_mailbox_poll_once", mp_src)
+        self.assertIn("from modules.mailbox.poll_runner import run_mailbox_poll_once", mp_src)
         self.assertIn("result = run_mailbox_poll_once(", mp_src)
 
         # Read api.py source directly without importing (avoids env var requirement)
         api_src = (Path(__file__).parent.parent / "api.py").read_text()
-        self.assertIn("from modules.mailbox_poll_runner import run_mailbox_poll_once", api_src)
+        self.assertIn("from modules.mailbox.poll_runner import run_mailbox_poll_once", api_src)
         self.assertIn("result = run_mailbox_poll_once(", api_src)
 
 
@@ -780,7 +780,7 @@ if __name__ == "__main__":
 
 class TestRejectedChainPublishRecovery(unittest.TestCase):
     def test_rejected_chain_persists_publish_state_before_writing_outbox(self):
-        from modules.mailbox_config import MailboxConfig
+        from modules.mailbox.config import MailboxConfig
         from modules.outbox_publisher import PUBLISH_WRITTEN
 
         with tempfile.TemporaryDirectory() as tmp:

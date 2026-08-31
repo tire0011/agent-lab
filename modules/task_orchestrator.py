@@ -19,7 +19,7 @@ from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
 from modules.local_llm_jobs import LocalLlmJobError, LocalLlmJobService
-from modules.mailbox_development import process_command
+from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
 from modules.nexus_task_store import NexusTaskStore

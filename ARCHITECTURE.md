@@ -93,7 +93,7 @@
 
 ### 7) Mailbox task approval bridge
 
-- Module: `modules/mailbox_task_service.py`
+- Module: `modules/mailbox/task_service.py`
 - Table: `mailbox_task_approvals` in SQLite
 - State machine: `pending_approval → approved → submitted → running → succeeded / failed / needs_review`
 - Human operators approve/reject via authenticated API (`POST /mailbox/tasks/{id}/approve`) or Web UI

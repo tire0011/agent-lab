@@ -30,7 +30,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from modules.mailbox_config import MailboxConfig
+from modules.mailbox.config import MailboxConfig
 from modules.mailbox import git_is_clean
 from modules.outbox_publisher import (
     PUBLISH_COMMITTED,

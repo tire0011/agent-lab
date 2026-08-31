@@ -8,13 +8,13 @@ from unittest.mock import patch
 
 import modules.experiment_service as experiment_service_module
 import modules.mailbox as mailbox_module
-import modules.mailbox_poll_runner as mailbox_poll_runner_module
+import modules.mailbox.poll_runner as mailbox_poll_runner_module
 import modules.operation_chain_publisher as operation_chain_publisher_module
 import modules.operation_chain_service as operation_chain_service_module
 import modules.operations_registry as operations_registry_module
 import modules.outbox_publisher as outbox_publisher_module
-from modules.mailbox_config import MailboxConfig
-from modules.mailbox_poll_runner import (
+from modules.mailbox.config import MailboxConfig
+from modules.mailbox.poll_runner import (
     _finalize_terminal_validation_errors,
     _sync_mailbox_repo,
     _worktree_safe_for_mailbox_sync,

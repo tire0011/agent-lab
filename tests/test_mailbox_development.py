@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from modules import mailbox
-from modules.mailbox_development import development_mode_enabled, install, process_command
+from modules.mailbox.development import development_mode_enabled, install, process_command
 from modules.run_store import init_db
 
 

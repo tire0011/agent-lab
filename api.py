@@ -23,10 +23,10 @@ from modules.codex_task_service import (
     TaskNotFoundError,
     TaskNotRunnableError,
 )
-from modules.mailbox_config import MailboxConfig
-from modules.mailbox_github_webhook import has_inbox_changes, is_ping_event, verify_signature
-from modules.mailbox_poll_runner import run_mailbox_poll_once
-from modules.mailbox_task_service import (
+from modules.mailbox.config import MailboxConfig
+from modules.mailbox.github_webhook import has_inbox_changes, is_ping_event, verify_signature
+from modules.mailbox.poll_runner import run_mailbox_poll_once
+from modules.mailbox.task_service import (
     ApprovalNotFoundError,
     ApprovalStateError,
     MailboxTaskService,

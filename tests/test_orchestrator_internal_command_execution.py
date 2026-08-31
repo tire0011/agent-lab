@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from modules.mailbox_development import process_command
+from modules.mailbox.development import process_command
 
 
 class InternalOrchestratorCommandExecutionTests(unittest.TestCase):

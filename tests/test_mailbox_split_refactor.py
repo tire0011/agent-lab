@@ -12,6 +12,8 @@ class MailboxSplitRefactorTests(unittest.TestCase):
         self.assertTrue(hasattr(mailbox, "parse_front_matter"))
         self.assertTrue(hasattr(mailbox, "git_is_clean"))
         self.assertTrue(hasattr(mailbox, "_git"))
+        self.assertTrue(hasattr(mailbox, "SUPPORTED_TYPES"))
+        self.assertTrue(hasattr(mailbox, "_PROCESSORS"))
         self.assertIsNotNone(importlib.util.find_spec("modules.mailbox.core"))
         self.assertIsNotNone(importlib.util.find_spec("modules.mailbox.processing"))
 
