@@ -261,7 +261,7 @@ class WebClientTests(ApiTestsBase):
         self.assertIn("renderExperimentLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
         self.assertIn("renderLogsFromActivity(activity);\n      updateLogsSuccessStatus(activity);", javascript)
         self.assertIn("renderLogsFromDiagnostics(experiments);\n    updateLogsSuccessStatus(experiments);", javascript)
-        self.assertIn('setInterval(loadLogs, 10000)', javascript)
+        self.assertNotIn("setInterval(loadLogs", javascript)
         self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
 
     def test_logs_success_timestamp_is_not_updated_in_error_paths(self):
