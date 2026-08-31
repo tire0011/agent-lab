@@ -547,7 +547,8 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
         self.assertEqual(before, after)
         self.assertIn("GitHub lifecycle blocked before adoption", adoption.reason)
-        self.assertTrue(Path(adoption.diagnostic_worktree_path).exists())
+        experiment = fx.experiment_service.get_experiment(experiment_id)
+        self.assertTrue(Path(experiment.worktree_path).exists())
 
     def test_github_merge_failure_sets_needs_review(self):
         fx = AdoptionRepoFixture(merge_should_fail="simulated merge failure")
