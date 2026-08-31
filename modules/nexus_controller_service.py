@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from modules.experiment_resume import resume_experiment
-from modules.github_work_tracking import GitHubWorkTrackingService
+from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.mailbox.development import process_command
 from modules.nexus_sources import NexusSource, idea_source, issue_source, task_source
 from modules.run_store import DEFAULT_DB_PATH
@@ -27,7 +27,7 @@ class NexusControllerService:
     primitive. Tool calls performed during reasoning still happen inside the
     orchestrator and always return control to the local model first.
 
-    GitHub work tracking is an outer lifecycle concern: when configured, a
+    GitHub work tracking is the mandatory outer lifecycle: a
     durable Issue and human-readable remote branch are resolved/created before
     a new implementation experiment starts. The isolated experiment worktree
     remains an internal execution detail.
@@ -133,25 +133,29 @@ class NexusControllerService:
         source: NexusSource | None = None,
     ) -> None:
         if decision.action == ACTION_NEW_EXPERIMENT:
-            work_ref = None
-            if source is not None:
-                work_ref = self.github_work_tracking.ensure_for_source(source)
-            elif self.github_work_tracking.configured:
-                work_ref = self.github_work_tracking.ensure_for_source(
-                    task_source(source_content, source_id=decision.session_id)
+            lifecycle_source = source or task_source(
+                source_content,
+                source_id=decision.session_id,
+                title="Nexus controller task",
+            )
+            try:
+                work_ref = self.github_work_tracking.ensure_for_source(lifecycle_source)
+            except GitHubWorkTrackingError as exc:
+                self._record_execution(
+                    decision, "github_work_tracking_unavailable", str(exc)
                 )
+                raise
 
             experiment = self.experiment_service.create_experiment(source_content)
-            if work_ref is not None:
-                work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
-                self._record_execution(
-                    decision,
-                    "github_work_linked",
-                    (
-                        f"issue=#{work_ref.issue_number} "
-                        f"branch={work_ref.branch_name} experiment_id={experiment.id}"
-                    ),
-                )
+            work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
+            self._record_execution(
+                decision,
+                "github_work_linked",
+                (
+                    f"issue=#{work_ref.issue_number} "
+                    f"branch={work_ref.branch_name} experiment_id={experiment.id}"
+                ),
+            )
             self._record_execution(
                 decision,
                 "experiment_started",
@@ -159,7 +163,10 @@ class NexusControllerService:
             )
             self._start_experiment_thread(
                 experiment.id,
-                lambda: self.experiment_service.run_experiment(experiment.id),
+                lambda: self.experiment_service.run_experiment(
+                    experiment.id,
+                    github_work_tracking=self.github_work_tracking,
+                ),
             )
             return
 
@@ -167,6 +174,19 @@ class NexusControllerService:
             if not decision.experiment_id:
                 raise RuntimeError("resume decision has no experiment id")
             experiment_id = decision.experiment_id
+            experiment = self.experiment_service.resolve_experiment(experiment_id)
+            try:
+                work_ref = self.github_work_tracking.recover_experiment(experiment)
+            except GitHubWorkTrackingError as exc:
+                self._record_execution(
+                    decision, "github_work_tracking_unavailable", str(exc)
+                )
+                raise
+            self._record_execution(
+                decision,
+                "github_work_linked",
+                f"issue=#{work_ref.issue_number} branch={work_ref.branch_name} experiment_id={experiment_id}",
+            )
             self._record_execution(
                 decision,
                 "experiment_resume_started",
@@ -174,7 +194,11 @@ class NexusControllerService:
             )
             self._start_experiment_thread(
                 experiment_id,
-                lambda: resume_experiment(self.experiment_service, experiment_id),
+                lambda: resume_experiment(
+                    self.experiment_service,
+                    experiment_id,
+                    github_work_tracking=self.github_work_tracking,
+                ),
             )
             return
 
