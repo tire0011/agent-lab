@@ -538,6 +538,13 @@ class TaskLoggerPreExperimentTests(unittest.TestCase):
         merged = read_experiment_logs(self.log_dir, "exp-42")
         self.assertEqual([e["event"] for e in merged], ["implementation_started"])
 
+    def test_read_experiment_logs_rejects_unsafe_experiment_id(self):
+        ExperimentLogger("exp-42", log_dir=self.log_dir).info(
+            "implementation", "implementation_started", "starting"
+        )
+        self.assertEqual(read_experiment_logs(self.log_dir, "../../etc/passwd"), [])
+        self.assertEqual(read_experiment_logs(self.log_dir, ""), [])
+
 
 class MalformedEntryValidationTests(unittest.TestCase):
     """Gap 3: a syntactically-valid JSON object missing a required field or

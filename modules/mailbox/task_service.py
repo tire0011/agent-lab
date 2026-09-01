@@ -754,17 +754,18 @@ class MailboxTaskService:
         error: str | None = None,
     ) -> None:
         with self._lock:
-            self._conn.execute(
+            updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals
                    SET status=?, result_summary=?, error=?, updated_at=? WHERE id=?""",
                 (status, summary[:8000], _safe_error(error), _now_iso(), approval.id),
-            )
+            ).rowcount
             self._conn.commit()
-        self._task_logger(approval.id).warning(
-            "queued", "task_completed_without_experiment",
-            f"mailbox task completed without an experiment (status={status})",
-        )
-        self._write_result_outbox(approval, status, summary, None)
+        if updated:
+            self._task_logger(approval.id).warning(
+                "queued", "task_completed_without_experiment",
+                f"mailbox task completed without an experiment (status={status})",
+            )
+            self._write_result_outbox(approval, status, summary, None)
 
     @staticmethod
     def _make_result_summary(exp: Any) -> str:

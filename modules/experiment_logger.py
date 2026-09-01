@@ -650,8 +650,13 @@ def read_experiment_logs(
     *mailbox_task_id* must already be resolved/validated server-side (e.g.
     via ``ExperimentService.mailbox_task_id_for_experiment``), never taken
     directly from unvalidated request input, since it is used to build a
-    second file path.
+    second file path. *experiment_id* is defense-in-depth validated against
+    the same safe-id pattern before being used to build a path; an unsafe
+    value yields an empty result rather than touching the filesystem.
     """
+    if not _SAFE_ID_RE.fullmatch(experiment_id or ""):
+        return []
+
     directory = Path(log_dir)
     paths = [directory / f"{experiment_id}.jsonl"]
     if mailbox_task_id and _SAFE_ID_RE.fullmatch(mailbox_task_id):
