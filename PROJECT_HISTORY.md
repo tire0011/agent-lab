@@ -330,6 +330,16 @@ Issue #84 defines a unified authenticated structured log feed across mailbox int
 
 **Lesson:** logging quality is signal-to-noise, not log volume. Successful tests should stay quiet; failures should surface the failing test, traceback and summary immediately, while detailed evidence remains available on demand.
 
+### 59. 2026-09-01: unified log aggregation merged, but real chat testing exposed a deeper cross-service gap
+
+PR #88 merged the first concrete part of Issue #84. The default Logs view now reads authenticated `GET /logs`, which merges structured experiment and mailbox/task JSONL entries into one chronological feed with bounded scanning, filtering, defensive sanitization, malformed-line skipping, manual refresh, and pagination/load-older behavior. The PR's GitHub Actions `unittest` check completed successfully.
+
+A real Nexus chat run immediately showed that aggregation of existing experiment/task files was still not equivalent to **application-wide logging**: a chat failure occurring before experiment creation produced no entry in the Logs tab because chat/API/worker code still used ordinary Python logging. Issue #84 was therefore reopened rather than treating PR #88 as complete.
+
+Draft PR #89 is the follow-up architecture change: central structured logging for API, agent, mailbox, CLI and worker entrypoints; `INFO+` by default with opt-in `DEBUG`/`TRACE`; pre-experiment correlation via chat `job_id`/`session_id` and transient mailbox IDs; explicit log-storage errors; and reuse of existing redaction/truncation boundaries. Its current `unittest` and Copilot checks pass, but it remains open and is not yet adopted on `main`.
+
+**Lesson:** a unified reader is not a unified logging system. Observability must begin at work submission and process boundaries, before an experiment ID exists, or the failures most useful for diagnosis can remain invisible.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -372,6 +382,7 @@ Current `main` includes:
 - signed GitHub webhook wake-up with timer fallback, one-shot sync retry, and bounded content-free diagnostics,
 - modularized mailbox, run-store, experiment-service and browser-client code with compatibility façades where needed,
 - API/web UI and compact public/authenticated diagnostics,
+- authenticated unified `/logs` aggregation across persisted experiment and mailbox/task logs, with manual refresh and bounded/paginated reading,
 - authenticated, audited self-healing/operations capabilities including local-model, service, log, and process inspection,
 - authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
 - trusted-development mailbox task auto-execution,
@@ -379,7 +390,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-The persistent local-controller, conversational Nexus chat, and mandatory GitHub implementation lifecycle are adopted on `main`. Conversation-style Inbox/Outbox rendering (Issue #75), the unified/collapsed log feed (Issues #84/#86), CI-evidence reuse, and the global MCP gateway remain open work/research. The Grafana/OpenTelemetry PR #77 experiment was closed without adoption.
+The persistent local-controller, conversational Nexus chat, mandatory GitHub implementation lifecycle, and first-stage unified log aggregation are adopted on `main`. Application-wide structured logging before experiment creation remains open in PR #89; conversation-style Inbox/Outbox rendering (Issue #75), collapsed/lazy log details (Issue #86), CI-evidence reuse, and the global MCP gateway remain open work/research. The Grafana/OpenTelemetry PR #77 experiment was closed without adoption.
 
 ## Important lessons so far
 
@@ -424,6 +435,7 @@ The persistent local-controller, conversational Nexus chat, and mandatory GitHub
 39. **Visible intermediate work is part of durability.** WIP commits and Draft PRs preserve inspectable evidence before final verification succeeds.
 40. **Behavior-preserving refactors still change integration surfaces.** Imports, monkey-patch targets, redaction helpers and frontend timing assumptions need explicit compatibility coverage.
 41. **Logs should optimize for diagnosis, not completeness-at-a-glance.** Keep success quiet, surface failure signal first, and load detailed evidence on demand.
+42. **Aggregation is not instrumentation.** A unified viewer cannot show failures that were never emitted into the structured log path; correlation must exist from submission through terminal state.
 
 ## Open research directions
 
@@ -437,7 +449,8 @@ The persistent local-controller, conversational Nexus chat, and mandatory GitHub
 - measure how much local context preparation and compact chat context reduce provider tokens without reducing decision quality,
 - measure whether removing/shortening redundant comments and docstrings reduces source-context tokens without harming readability or losing architectural rationale (Issue #74),
 - validate conversation-style mailbox rendering against linked, pending and multi-response cases without changing mailbox delivery semantics (Issue #75),
-- implement and validate the unified/collapsed log feed from Issues #84/#86, including manual refresh, pre-experiment correlation, lazy detail loading, and failure-focused verification output,
+- finish and validate application-wide structured logging from Issue #84 / PR #89, then implement Issue #86 collapsed/lazy details and failure-focused verification output,
+- measure whether submission-time `job_id`/`session_id`/mailbox correlation actually makes pre-experiment failures diagnosable without external tracing,
 - revisit lightweight in-product liveness/status only if structured logs still cannot answer whether Nexus is progressing; external OTLP/Grafana is not a default direction,
 - make the verification controller reuse matching successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
 - evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
@@ -457,14 +470,15 @@ The persistent local-controller, conversational Nexus chat, and mandatory GitHub
 
 ## Current next-step candidates
 
-1. **Unified failure-focused logs:** implement Issues #84/#86 so one manual refresh shows the complete structured task path, while collapsed rows and lazy details keep failures readable and verification subprocesses suppress successful-test INFO noise.
-2. **Conversational autonomy rerun:** repeat the real chat implementation request that exposed malformed/incomplete controller output and measure whether schema constraints plus bounded repair now let Nexus preserve context, choose tools/providers, complete the work, and report evidence cleanly.
-3. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
-4. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
-5. **Persistent job measurement:** quantify local-model/chat queue/runtime/token behavior and verify recovery across API/controller restarts.
-6. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
-7. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
-8. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
-9. **Mandatory GitHub lifecycle measurement:** verify multiple experiments safely reuse one Issue/branch/PR identity, failed verification preserves inspectable WIP, and resume/merge/Issue completion remain recoverable under conflicts/provider failures.
-10. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
-11. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare measured comment/docstring context reduction against readability and unchanged test behavior.
+1. **Complete cross-service structured logging:** finish/review PR #89 so chat, API, workers, mailbox and experiments all enter the same bounded structured feed from submission onward; rerun the chat failure smoke test before closing Issue #84.
+2. **Collapsed/failure-focused log UX:** implement Issue #86 after the data path is complete, keeping manual refresh while loading details only on demand and suppressing successful-test INFO noise.
+3. **Conversational autonomy rerun:** repeat the real chat implementation request that exposed malformed/incomplete controller output and measure whether schema constraints plus bounded repair now let Nexus preserve context, choose tools/providers, complete the work, and report evidence cleanly.
+4. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
+5. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
+6. **Persistent job measurement:** quantify local-model/chat queue/runtime/token behavior and verify recovery across API/controller restarts.
+7. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
+8. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
+9. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
+10. **Mandatory GitHub lifecycle measurement:** verify multiple experiments safely reuse one Issue/branch/PR identity, failed verification preserves inspectable WIP, and resume/merge/Issue completion remain recoverable under conflicts/provider failures.
+11. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
+12. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare measured comment/docstring context reduction against readability and unchanged test behavior.
