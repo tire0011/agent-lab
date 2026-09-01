@@ -225,6 +225,7 @@ class _ProcessorTestBase(unittest.TestCase):
             repo_path=self.repo,
             db_path=self.db_path,
             dry_run=True,  # no network git operations in tests
+            task_log_dir=self.repo / "state" / "experiment-logs",
         )
 
     def tearDown(self):

@@ -1,10 +1,8 @@
-"""Centralized, structured, per-experiment logging for Nexus.
+"""Centralized structured JSONL logging for Nexus.
 
-Every experiment gets exactly one durable, append-only JSONL log at
-``state/experiment-logs/<experiment_id>.jsonl``. Each line is one complete,
-self-contained JSON object describing a single event anywhere in the
-Mailbox -> Approval -> ExperimentService -> Codex/Git/test pipeline, so a
-single file makes an entire task/experiment run understandable end to end.
+Experiments, pre-approval mailbox messages, chat jobs, and system records use
+separate durable files under ``state/experiment-logs`` and are merged by the
+read path into one chronological feed.
 
 Design goals (see AGENTS.md / the logging task for the full spec):
   * Reuse the *existing* central redaction helpers (``modules.redaction``)
@@ -17,11 +15,8 @@ Design goals (see AGENTS.md / the logging task for the full spec):
   * Bounded: single messages/outputs are truncated, and each experiment's
     log file has a hard size ceiling; both cases are flagged explicitly
     (``truncated: true``) rather than silently dropping data.
-  * The same important events are *also* emitted through the stdlib
-    ``logging`` module (already wired to journald via each entrypoint's
-    existing ``logging.basicConfig``/uvicorn setup) — this module never
-    replaces that, it complements it with the durable structured detail
-    that is too large for a syslog line.
+  * Important events are also emitted through stdlib ``logging``, configured
+    consistently for every entrypoint by ``modules.logging_config``.
   * A failure inside this module (disk full, permission error, …) must
     never propagate to the caller: the actual experiment/mailbox pipeline
     must keep running unaffected.

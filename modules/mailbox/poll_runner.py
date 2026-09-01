@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from modules.experiment_logger import DEFAULT_LOG_DIR
 from .config import MailboxConfig
 
 
@@ -282,6 +283,7 @@ def run_mailbox_poll_once(
             dry_run=dry_run,
             operation_chain_service=chain_service,
             mailbox_config=mailbox_config,
+            task_log_dir=getattr(experiment_service, "experiment_log_dir", DEFAULT_LOG_DIR),
         )
         publisher = OperationChainPublisher(
             db_path=db_path,

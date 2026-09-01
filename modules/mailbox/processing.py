@@ -313,6 +313,7 @@ class MailboxProcessor:
         dry_run: bool = False,
         operation_chain_service: Any = None,
         mailbox_config: Any = None,
+        task_log_dir: str | Path = DEFAULT_LOG_DIR,
     ) -> None:
         if mailbox_config is not None:
             self._mailbox_repo_path: Path = mailbox_config.mailbox_repo_path
@@ -333,6 +334,7 @@ class MailboxProcessor:
         self.db_path = db_path
         self.dry_run = dry_run
         self.operation_chain_service = operation_chain_service
+        self.task_log_dir = Path(task_log_dir)
         self._conn: sqlite3.Connection | None = None
 
     @property
@@ -441,7 +443,7 @@ class MailboxProcessor:
         rel = str(file_path.relative_to(self._mailbox_repo_path))
         task_log = get_task_logger(
             _transient_mailbox_task_id(rel),
-            log_dir=self._code_repo_path / DEFAULT_LOG_DIR,
+            log_dir=self.task_log_dir,
         )
         task_log.info(
             "mailbox",
