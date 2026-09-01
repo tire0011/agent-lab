@@ -243,6 +243,26 @@ class UnifiedLogsApiTests(unittest.TestCase):
         second_events = [e["event"] for e in second["entries"]]
         self.assertEqual(len(set(first_events) & set(second_events)), 0)
 
+    def test_repeated_pagination_reproduces_every_entry_exactly_once(self):
+        # Walking `next_cursor` until it is exhausted must reproduce the
+        # complete, chronologically-ordered feed with no gaps at page
+        # boundaries and no duplicates.
+        self._write_logs()
+        full = self.client.get("/logs?limit=500", headers={"x-api-key": "test-key"}).json()
+        expected_events = [e["event"] for e in full["entries"]]
+        self.assertGreaterEqual(len(expected_events), 5)
+
+        collected: list[str] = []
+        cursor = None
+        for _ in range(20):
+            url = "/logs?limit=2" + (f"&cursor={cursor}" if cursor else "")
+            page = self.client.get(url, headers={"x-api-key": "test-key"}).json()
+            collected = [e["event"] for e in page["entries"]] + collected
+            cursor = page["next_cursor"]
+            if not cursor:
+                break
+        self.assertEqual(collected, expected_events)
+
 
 if __name__ == "__main__":
     unittest.main()

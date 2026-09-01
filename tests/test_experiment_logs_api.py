@@ -206,6 +206,30 @@ class ExperimentLogsApiTests(unittest.TestCase):
         second_events = [e["event"] for e in second["entries"]]
         self.assertEqual(len(set(first_events) & set(second_events)), 0)
 
+    def test_repeated_pagination_reproduces_every_entry_exactly_once(self):
+        # Several of these entries share an identical timestamp (no sleep
+        # between writes in _write_logs): the page boundary must still be
+        # gap-free and duplicate-free when walked end to end.
+        self._write_logs()
+        full = self.client.get(
+            f"/experiments/{self.experiment.id}/logs?limit=500", headers={"x-api-key": "test-key"}
+        ).json()
+        expected_events = [e["event"] for e in full["entries"]]
+        self.assertGreaterEqual(len(expected_events), 5)
+
+        collected: list[str] = []
+        cursor = None
+        for _ in range(20):
+            url = f"/experiments/{self.experiment.id}/logs?limit=2" + (
+                f"&cursor={cursor}" if cursor else ""
+            )
+            page = self.client.get(url, headers={"x-api-key": "test-key"}).json()
+            collected = [e["event"] for e in page["entries"]] + collected
+            cursor = page["next_cursor"]
+            if not cursor:
+                break
+        self.assertEqual(collected, expected_events)
+
     def test_malformed_entry_does_not_fail_the_whole_response(self):
         self._write_logs()
         with open(

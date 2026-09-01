@@ -21,6 +21,8 @@ from modules.experiment_logger import (
     MAX_STDOUT_CHARS,
     ExperimentLogger,
     _bounded_head_tail_text,
+    decode_log_cursor,
+    encode_log_cursor,
     get_task_logger,
     read_all_log_entries,
     read_experiment_logs,
@@ -666,9 +668,31 @@ class BoundedReadAndCursorTests(unittest.TestCase):
             time.sleep(0.002)
 
         all_entries = read_all_log_entries(self.log_dir)
-        cursor = all_entries[2]["timestamp"]
+        cursor = encode_log_cursor(all_entries[2])
         earlier = read_all_log_entries(self.log_dir, before=cursor)
         self.assertEqual([e["event"] for e in earlier], ["e0", "e1"])
+
+    def test_legacy_or_malformed_cursor_is_treated_as_no_cursor(self):
+        # A bare ISO timestamp (the pre-fix cursor format) or garbage
+        # string must never fail the request - just behave as if no
+        # cursor were given, matching an empty/legacy bookmarked URL.
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        elog.info("p", "e0", "msg")
+        self.assertIsNone(decode_log_cursor("2026-01-01T00:00:00Z"))
+        self.assertIsNone(decode_log_cursor("not-base64-json!!"))
+        entries = read_all_log_entries(self.log_dir, before="2026-01-01T00:00:00Z")
+        self.assertEqual([e["event"] for e in entries], ["e0"])
+
+    def _fetch_page(self, *, limit: int, cursor: str | None = None):
+        """Mirror the API layer's pagination contract: fetch ``limit + 1``
+        chronological entries, keep the newest ``limit``, and cursor off
+        the oldest entry actually kept (never the extra look-ahead one)."""
+        fetched = read_all_log_entries(self.log_dir, limit=limit + 1, before=cursor)
+        if len(fetched) <= limit:
+            return fetched, None
+        page = fetched[-limit:] if limit > 0 else []
+        next_cursor = encode_log_cursor(page[0]) if page else None
+        return page, next_cursor
 
     def test_pagination_via_cursor_produces_no_duplicates(self):
         elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
@@ -676,13 +700,74 @@ class BoundedReadAndCursorTests(unittest.TestCase):
             elog.info("p", f"e{i}", "msg")
             time.sleep(0.002)
 
-        first_page = read_all_log_entries(self.log_dir, limit=3)
+        first_page, cursor = self._fetch_page(limit=3)
         self.assertEqual([e["event"] for e in first_page], ["e3", "e4", "e5"])
-        cursor = first_page[0]["timestamp"]
-        second_page = read_all_log_entries(self.log_dir, limit=3, before=cursor)
+        self.assertIsNotNone(cursor)
+        second_page, next_cursor = self._fetch_page(limit=3, cursor=cursor)
         self.assertEqual([e["event"] for e in second_page], ["e0", "e1", "e2"])
-        seen = {e["event"] for e in first_page} | {e["event"] for e in second_page}
-        self.assertEqual(len(seen), 6)
+        self.assertIsNone(next_cursor)
+        seen = [e["event"] for e in second_page] + [e["event"] for e in first_page]
+        self.assertEqual(seen, ["e0", "e1", "e2", "e3", "e4", "e5"])
+        self.assertEqual(len(set(seen)), 6)
+
+    def test_pagination_across_many_boundaries_reproduces_every_entry_once(self):
+        # Concatenating every page (walking `next_cursor` until exhausted)
+        # must reproduce the complete, deduplicated source exactly once -
+        # regardless of how the boundary happens to fall.
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        for i in range(17):
+            elog.info("p", f"e{i}", "msg")
+            time.sleep(0.002)
+
+        collected: list[str] = []
+        cursor = None
+        for _ in range(50):
+            page, cursor = self._fetch_page(limit=4, cursor=cursor)
+            collected = [e["event"] for e in page] + collected
+            if cursor is None:
+                break
+        self.assertEqual(collected, [f"e{i}" for i in range(17)])
+
+    def test_pagination_breaks_ties_between_entries_sharing_a_timestamp(self):
+        # Several entries written back-to-back can legitimately share the
+        # exact same millisecond timestamp; the tie-breaker must still
+        # give a stable, gap-free, duplicate-free page boundary.
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        for i in range(9):
+            elog.info("p", f"e{i}", "msg")  # no sleep: identical timestamps likely
+
+        collected: list[str] = []
+        cursor = None
+        for _ in range(50):
+            page, cursor = self._fetch_page(limit=2, cursor=cursor)
+            collected = [e["event"] for e in page] + collected
+            if cursor is None:
+                break
+        self.assertEqual(collected, [f"e{i}" for i in range(9)])
+
+    def test_pagination_reaches_history_older_than_the_tail_window(self):
+        # The default (no-cursor) read only inspects the trailing
+        # DEFAULT_UNIFIED_TAIL_BYTES of each file; once a cursor is
+        # supplied (an explicit "load older" step), older entries beyond
+        # that window must still be reachable, never permanently hidden.
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        for i in range(400):
+            elog.info("p", f"e{i}", "x" * 200)
+
+        tiny_tail_bytes = 500
+        first = read_all_log_entries(self.log_dir, tail_bytes=tiny_tail_bytes, limit=5)
+        self.assertNotIn("e0", [e["event"] for e in first])
+
+        oldest_visible = first[0]
+        cursor = encode_log_cursor(oldest_visible)
+        # Supplying a cursor - an explicit "load older" step - escapes the
+        # tail bound automatically (even though the caller still passes
+        # the same small tail_bytes), reaching all the way back to the
+        # very first entry instead of returning nothing.
+        older = read_all_log_entries(
+            self.log_dir, tail_bytes=tiny_tail_bytes, before=cursor, limit=1000,
+        )
+        self.assertIn("e0", [e["event"] for e in older])
 
 
 if __name__ == "__main__":

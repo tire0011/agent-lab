@@ -859,10 +859,7 @@ def get_experiment_logs(
         # same as a missing file.
         raw_entries = []
 
-    next_cursor: str | None = None
-    if len(raw_entries) > limit:
-        next_cursor = str(raw_entries[0].get("timestamp") or "") or None
-        raw_entries = raw_entries[1:]
+    raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
 
     entries: list[ExperimentLogEntry] = []
     for raw in raw_entries:
@@ -939,10 +936,7 @@ def get_unified_logs(
         # directory/file is reported as "no entries yet", never a 500.
         raw_entries = []
 
-    next_cursor: str | None = None
-    if len(raw_entries) > limit:
-        next_cursor = str(raw_entries[0].get("timestamp") or "") or None
-        raw_entries = raw_entries[1:]
+    raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
 
     entries: list[ExperimentLogEntry] = []
     for raw in raw_entries:
@@ -1058,6 +1052,29 @@ def _test_summary(experiment) -> str | None:
 def _mailbox_task_id(service: ExperimentService, experiment_id: str) -> str | None:
     lookup = getattr(service, "mailbox_task_id_for_experiment", None)
     return lookup(experiment_id) if lookup else None
+
+
+def _paginate_log_entries(
+    raw_entries: list[dict[str, Any]], limit: int
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Split a *raw_entries* list fetched with ``limit + 1`` into exactly
+    ``limit`` entries to return plus the ``next_cursor`` for the
+    following (older) page, if any.
+
+    ``raw_entries`` must be chronological (oldest first), which is what
+    every ``read_*`` function in ``modules.experiment_logger`` returns.
+    The page boundary is anchored to the oldest entry actually *returned*
+    on this page - not the extra look-ahead entry used only to detect
+    whether more data remains - and encoded as an opaque cursor (see
+    ``encode_log_cursor``) rather than a bare timestamp, so that entries
+    sharing an identical timestamp at a page boundary are never skipped
+    or duplicated across successive manual "load older" calls.
+    """
+    if len(raw_entries) <= limit:
+        return raw_entries, None
+    page = raw_entries[-limit:] if limit > 0 else []
+    next_cursor = experiment_logger_module.encode_log_cursor(page[0]) if page else None
+    return page, next_cursor
 
 
 def _public_experiment_usage(experiment) -> dict[str, int | None] | None:

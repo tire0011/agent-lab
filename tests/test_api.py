@@ -259,7 +259,8 @@ class WebClientTests(ApiTestsBase):
         javascript = self.client.get("/static/logs.js").text
         self.assertIn("const visibleCount = renderedEntries.length;", javascript)
         self.assertIn("renderExperimentLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
-        self.assertIn('await requestJson(`/logs?${params.toString()}`, { headers: authHeaders() });', javascript)
+        self.assertIn('const baseUrl = `/logs?${params.toString()}`;', javascript)
+        self.assertIn("await requestJson(baseUrl, { headers: authHeaders() });", javascript)
         self.assertIn("renderLogsFromDiagnostics(experiments);\n    updateLogsSuccessStatus(experiments);", javascript)
         self.assertNotIn("setInterval(loadLogs", javascript)
         self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)

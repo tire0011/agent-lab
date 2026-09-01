@@ -29,6 +29,7 @@ Design goals (see AGENTS.md / the logging task for the full spec):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -571,7 +572,21 @@ def read_log_entries(
     measure independent of the write-path redaction. When *tail_bytes* is
     given, only that many trailing bytes of the file are read (bounded
     I/O for callers scanning many files at once); *before*, if given,
-    drops entries at or after that ISO-8601 timestamp (cursor pagination).
+    drops entries whose ``timestamp`` string sorts at or after it (a
+    plain string-timestamp cursor - callers that must page correctly
+    across entries sharing a timestamp, or across several files, use the
+    opaque ``encode_log_cursor``/``decode_log_cursor`` pair together with
+    ``_entry_sort_key`` instead; see ``read_experiment_logs`` and
+    ``read_all_log_entries``).
+
+    Each returned entry also carries two internal-only keys, ``_source``
+    (the file's name) and ``_rseq`` (its distance from the newest parsed
+    line in *this* read, 0 = newest): a stable tie-breaker so that two
+    entries sharing an identical ``timestamp`` - whether in the same file
+    or different files - still have a well-defined, reproducible order
+    across separate reads/pages. Both keys are stripped by the API layer
+    before a response model is built and are otherwise harmless (an
+    unknown key is ignored by the allowlisted Pydantic models).
     """
     path = Path(log_path)
     if not path.exists():
@@ -591,6 +606,17 @@ def read_log_entries(
         if not _is_well_formed_entry(entry):
             continue
         entries.append(_resanitize_entry(entry))
+
+    # Attach the tie-breaker *before* any filtering below, so it reflects
+    # each entry's stable position in the file rather than its position
+    # in a level/phase-filtered subset (which could otherwise differ
+    # between two requests using different filters against the same
+    # underlying file/window).
+    source_name = path.name
+    total = len(entries)
+    for index, entry in enumerate(entries):
+        entry["_source"] = source_name
+        entry["_rseq"] = total - 1 - index
 
     if level:
         level_upper = level.upper()
@@ -626,6 +652,68 @@ def _resanitize_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, str, int]:
+    """Total, reproducible chronological order for one entry.
+
+    Primary key is the ISO-8601 ``timestamp`` string (missing timestamps
+    sort last via the ``\uffff`` sentinel). Ties - two entries with an
+    identical timestamp, whether from the same file or different files -
+    are broken by ``experiment_id`` (entries recorded before an
+    experiment id exists - e.g. mailbox intake - carry no ``experiment_id``
+    and therefore sort first, matching the real task path where those
+    events happen earlier), then by ``_source`` (file name) for
+    determinism across two different files sharing both a timestamp and
+    an ``experiment_id``, and finally by ``-_rseq`` so that, within one
+    file, the entry appended *earlier* (further from the end, i.e. a
+    larger ``_rseq``) always sorts first. The ``_source``/``_rseq``
+    fields are attached by ``read_log_entries``; an entry missing them
+    (e.g. a hand-built dict in a test) is treated as the newest possible
+    entry for its file/timestamp so it never silently masks real data.
+    """
+    timestamp = str(entry.get("timestamp") or "\uffff")
+    experiment_id = str(entry.get("experiment_id") or "")
+    source = str(entry.get("_source") or "")
+    rseq = entry.get("_rseq")
+    rseq = rseq if isinstance(rseq, int) and not isinstance(rseq, bool) else 0
+    return (timestamp, experiment_id, source, -rseq)
+
+
+def encode_log_cursor(entry: dict[str, Any]) -> str:
+    """Opaque, URL-safe pagination cursor anchored to one entry.
+
+    Encodes the same ``(timestamp, experiment_id, source, rseq)``
+    quadruple used by ``_entry_sort_key`` so a follow-up call can resume
+    *exactly* after this entry - no earlier, no later - even when several
+    entries share an identical timestamp. Never a bare timestamp string:
+    that alone cannot disambiguate ties and previously caused entries to
+    be skipped or duplicated at a page boundary.
+    """
+    timestamp = str(entry.get("timestamp") or "")
+    experiment_id = str(entry.get("experiment_id") or "")
+    source = str(entry.get("_source") or "")
+    rseq = entry.get("_rseq")
+    rseq = rseq if isinstance(rseq, int) and not isinstance(rseq, bool) else 0
+    payload = json.dumps([timestamp, experiment_id, source, rseq], separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def decode_log_cursor(cursor: str) -> tuple[str, str, str, int] | None:
+    """Inverse of ``encode_log_cursor``; ``None`` for anything else (an
+    empty/legacy/corrupt cursor is treated as "no cursor" - restart from
+    the newest entries - rather than failing the whole request)."""
+    try:
+        payload = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        decoded = json.loads(payload)
+        timestamp, experiment_id, source, rseq = decoded
+        if not isinstance(timestamp, str) or not isinstance(experiment_id, str) or not isinstance(source, str):
+            return None
+        if not isinstance(rseq, int) or isinstance(rseq, bool):
+            return None
+        return (timestamp, experiment_id, source, -rseq)
+    except Exception:
+        return None
+
+
 # Hard ceiling on how many per-experiment JSONL files a single unified-feed
 # read will open, newest-modified first. Bounds worst-case I/O for the
 # "Alle Experimente" view regardless of how many experiments have ever run.
@@ -653,6 +741,10 @@ def read_experiment_logs(
     second file path. *experiment_id* is defense-in-depth validated against
     the same safe-id pattern before being used to build a path; an unsafe
     value yields an empty result rather than touching the filesystem.
+
+    *before*, if given, is an opaque cursor from ``encode_log_cursor``
+    (see ``read_all_log_entries`` for why a bare timestamp cannot page
+    correctly); an unrecognized/legacy cursor is treated as "no cursor".
     """
     if not _SAFE_ID_RE.fullmatch(experiment_id or ""):
         return []
@@ -665,11 +757,17 @@ def read_experiment_logs(
     entries: list[dict[str, Any]] = []
     for path in paths:
         try:
-            entries.extend(read_log_entries(path, level=level, phase=phase, before=before))
+            entries.extend(read_log_entries(path, level=level, phase=phase))
         except Exception:  # noqa: BLE001 - one bad file must not break the view
             continue
 
-    entries.sort(key=lambda e: (str(e.get("timestamp") or "\uffff"), str(e.get("experiment_id") or "")))
+    entries.sort(key=_entry_sort_key)
+
+    if before:
+        cursor_key = decode_log_cursor(before)
+        if cursor_key is not None:
+            entries = [e for e in entries if _entry_sort_key(e) < cursor_key]
+
     if limit is not None and limit >= 0 and len(entries) > limit:
         entries = entries[-limit:]
     return entries
@@ -702,12 +800,27 @@ def read_all_log_entries(
     When *experiment_id* is given, only that experiment (merged with its
     correlated task log, via ``read_experiment_logs``) is read. Otherwise,
     every file under *log_dir* is scanned, bounded by *max_files*
-    (newest-modified first) and a per-file *tail_bytes* read cap so one
-    manual refresh cannot read unbounded historical data (the dedicated
-    single-experiment view is unaffected: pass ``tail_bytes=None`` there).
-    *before* (an ISO-8601 timestamp) drops entries at or after that point,
-    for cursor-based pagination; *limit* then keeps the most recent
-    remaining entries, still chronological.
+    (newest-modified first).
+
+    *before*, if given, must be an opaque cursor produced by
+    ``encode_log_cursor`` for a previously-returned entry (an
+    unrecognized/legacy cursor - e.g. a bare timestamp - is treated as
+    "no cursor", restarting from the newest entries, rather than failing
+    the request). A plain timestamp cannot disambiguate two entries that
+    share it, which previously caused the entry exactly at a page
+    boundary to be silently dropped forever.
+
+    The very first ("no cursor") request only reads the last *tail_bytes*
+    of each file - bounded I/O for the common "just refresh and see the
+    latest" case. As soon as a caller pages further back (*before* is a
+    valid cursor), each candidate file is read in full instead: an
+    explicit, comparatively rare "load older" action may cost more I/O
+    than the default view, but only reading a bounded tail can never
+    reach entries older than that window, however far back the cursor
+    points (this was the *"pagination can never reach entries before the
+    current tail"* case) - correctness beats bounding I/O once the
+    operator has explicitly asked to go back further. *max_files* still
+    caps how many distinct experiments/tasks are scanned either way.
     """
     directory = Path(log_dir)
     if not directory.exists():
@@ -719,6 +832,9 @@ def read_all_log_entries(
             mailbox_task_id=mailbox_task_id,
             level=level, phase=phase, limit=limit, before=before,
         )
+
+    cursor_key: tuple[str, str, str, int] | None = decode_log_cursor(before) if before else None
+    effective_tail_bytes = None if cursor_key is not None else tail_bytes
 
     try:
         candidates = [p for p in directory.glob("*.jsonl") if p.is_file()]
@@ -736,7 +852,7 @@ def read_all_log_entries(
     for path in paths:
         try:
             entries.extend(
-                read_log_entries(path, level=level, phase=phase, before=before, tail_bytes=tail_bytes)
+                read_log_entries(path, level=level, phase=phase, tail_bytes=effective_tail_bytes)
             )
         except Exception:  # noqa: BLE001 - one bad file must not break the feed
             continue
@@ -747,7 +863,10 @@ def read_all_log_entries(
     # Missing timestamps (should not occur in practice - every write path
     # always sets one) sort last rather than first, so a malformed entry
     # can never mask genuinely older/newer ones at the top of the feed.
-    entries.sort(key=lambda e: (str(e.get("timestamp") or "\uffff"), str(e.get("experiment_id") or "")))
+    entries.sort(key=_entry_sort_key)
+
+    if cursor_key is not None:
+        entries = [e for e in entries if _entry_sort_key(e) < cursor_key]
 
     if limit is not None and limit >= 0 and len(entries) > limit:
         entries = entries[-limit:]
