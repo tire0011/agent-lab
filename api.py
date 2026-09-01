@@ -95,6 +95,7 @@ from modules.operations_executor import OperationsExecutor
 from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
 from modules.redaction import sanitized_reason as _sanitized_reason
 from modules import experiment_logger as experiment_logger_module
+from modules.logging_config import configure_logging
 from modules.maintenance_service import (
     MaintenanceAuthError,
     MaintenanceDisabledError,
@@ -104,6 +105,7 @@ from modules.maintenance_service import (
 from nexus_mcp import create_mcp_mount
 
 _PROCESS_START_TIME = time.time()
+configure_logging()
 _logger = logging.getLogger(__name__)
 _MCP_MOUNT = create_mcp_mount()
 
@@ -259,6 +261,13 @@ def _resolve_operation_chain_service() -> OperationChainService:
     if override is not None:
         return override()
     return get_operation_chain_service()
+
+
+def _resolve_nexus_chat_job_service() -> NexusChatJobService:
+    override = app.dependency_overrides.get(get_nexus_chat_job_service)
+    if override is not None:
+        return override()
+    return get_nexus_chat_job_service()
 
 
 @lru_cache(maxsize=1)
@@ -422,9 +431,9 @@ def create_idea(
 def chat(
     request: ChatRequest,
     x_api_key: str | None = Header(default=None),
-    service: NexusChatJobService = Depends(get_nexus_chat_job_service),
 ) -> ChatJobResponse:
     authorize(x_api_key)
+    service = _resolve_nexus_chat_job_service()
     try:
         job = service.submit(request.message, session_id=request.session_id)
     except ValueError as exc:
@@ -436,9 +445,9 @@ def chat(
 def get_chat_job(
     job_id: str,
     x_api_key: str | None = Header(default=None),
-    service: NexusChatJobService = Depends(get_nexus_chat_job_service),
 ) -> ChatJobResponse:
     authorize(x_api_key)
+    service = _resolve_nexus_chat_job_service()
     job = service.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="chat job not found")
@@ -853,11 +862,9 @@ def get_experiment_logs(
             mailbox_task_id=mailbox_task_id, level=level, phase=phase,
             limit=limit + 1, before=cursor,
         )
-    except Exception:
-        # Reading/parsing the log must never surface as a 500 to the
-        # operator - an unreadable log is reported as "no entries yet",
-        # same as a missing file.
-        raw_entries = []
+    except OSError as exc:
+        _logger.error("experiment log read failed: %s", _sanitized_reason(str(exc)))
+        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
 
@@ -880,6 +887,8 @@ def get_unified_logs(
     phase: str | None = Query(default=None),
     experiment_id: str | None = Query(default=None),
     mailbox_task_id: str | None = Query(default=None),
+    job_id: str | None = Query(default=None),
+    session_id: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
@@ -926,15 +935,16 @@ def get_unified_logs(
             service.experiment_log_dir,
             experiment_id=resolved_experiment_id,
             mailbox_task_id=resolved_mailbox_task_id,
+            job_id=job_id,
+            session_id=session_id,
             level=level,
             phase=phase,
             limit=limit + 1,
             before=cursor,
         )
-    except Exception:
-        # Same contract as the single-experiment view: an unreadable log
-        # directory/file is reported as "no entries yet", never a 500.
-        raw_entries = []
+    except OSError as exc:
+        _logger.error("unified log read failed: %s", _sanitized_reason(str(exc)))
+        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
 

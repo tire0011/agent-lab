@@ -563,6 +563,9 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from modules.logging_config import configure_logging
+
+    configure_logging()
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
 

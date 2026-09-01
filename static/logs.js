@@ -11,6 +11,8 @@ const logsElements = {
   levelSelect: document.querySelector("#logs-level-select"),
   phaseSelect: document.querySelector("#logs-phase-select"),
   mailboxTaskInput: document.querySelector("#logs-mailbox-task-input"),
+  jobInput: document.querySelector("#logs-job-input"),
+  sessionInput: document.querySelector("#logs-session-input"),
   content: document.querySelector("#logs-content"),
   count: document.querySelector("#logs-count"),
   visibleCount: document.querySelector("#logs-visible-count"),
@@ -103,7 +105,8 @@ function renderExperimentLogEntries(entries) {
     const hasDetails = Boolean(
       entry.command || entry.cwd || entry.duration_ms !== null && entry.duration_ms !== undefined ||
       entry.exit_code !== null && entry.exit_code !== undefined || entry.stdout || entry.stderr ||
-      entry.exception_type || entry.exception_message || entry.stacktrace
+      entry.exception_type || entry.exception_message || entry.stacktrace ||
+      entry.job_id || entry.session_id
     );
 
     const head = document.createElement(hasDetails ? "button" : "div");
@@ -161,6 +164,8 @@ function renderExperimentLogEntries(entries) {
       addDetail("Exception", entry.exception_type);
       addDetail("Exception-Meldung", entry.exception_message);
       addDetail("Stacktrace", entry.stacktrace);
+      addDetail("Chat-Job-ID", entry.job_id);
+      addDetail("Session-ID", entry.session_id);
 
       head.addEventListener("click", () => {
         detailWrap.hidden = !detailWrap.hidden;
@@ -228,6 +233,8 @@ async function loadLogs() {
   const level = logsElements.levelSelect ? logsElements.levelSelect.value.trim() : "";
   const phase = logsElements.phaseSelect ? logsElements.phaseSelect.value.trim() : "";
   const mailboxTaskId = logsElements.mailboxTaskInput.value.trim();
+  const jobId = logsElements.jobInput ? logsElements.jobInput.value.trim() : "";
+  const sessionId = logsElements.sessionInput ? logsElements.sessionInput.value.trim() : "";
   logsElements.content.textContent = "Wird geladen …";
   hideLoadOlderButton();
 
@@ -265,6 +272,8 @@ async function loadLogs() {
     if (level) params.set("level", level);
     if (phase) params.set("phase", phase);
     if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
+    if (jobId) params.set("job_id", jobId);
+    if (sessionId) params.set("session_id", sessionId);
     const baseUrl = `/logs?${params.toString()}`;
     try {
       const data = await requestJson(baseUrl, { headers: authHeaders() });
@@ -307,3 +316,10 @@ logsElements.mailboxTaskInput.addEventListener("input", () => {
   clearTimeout(logsElements.mailboxTaskInput._debounce);
   logsElements.mailboxTaskInput._debounce = setTimeout(loadLogs, 400);
 });
+for (const input of [logsElements.jobInput, logsElements.sessionInput]) {
+  if (!input) continue;
+  input.addEventListener("input", () => {
+    clearTimeout(input._debounce);
+    input._debounce = setTimeout(loadLogs, 400);
+  });
+}

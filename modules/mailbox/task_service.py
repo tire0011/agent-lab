@@ -381,6 +381,7 @@ class MailboxTaskService:
                 source_type="task",
                 source_id=approval.id,
                 title=f"Mailbox task {approval.id[:8]}",
+                task_logger=self._task_logger(approval.id),
             )
         except Exception as exc:
             logger.exception("mailbox_task: local orchestrator failed for %s", approval.id)

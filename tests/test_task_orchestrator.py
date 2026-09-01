@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from modules.nexus_delegation import DelegationResult
+from modules.experiment_logger import get_task_logger, read_log_entries
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
@@ -161,6 +162,28 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertEqual(row["session_id"], result.session_id)
         finally:
             orchestrator.close()
+
+    def test_final_route_reasoning_is_written_to_task_log(self):
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"existing state already answers the request"}',
+        ])
+        task_log = get_task_logger("mailbox-17", log_dir=self.tmp.name)
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run(
+                "Answer locally",
+                source_id="mailbox-17",
+                task_logger=task_log,
+            )
+        finally:
+            orchestrator.close()
+
+        entries = read_log_entries(task_log.path)
+        decision = next(entry for entry in entries if entry["event"] == "route_selected")
+        self.assertEqual(decision["mailbox_task_id"], "mailbox-17")
+        self.assertEqual(decision["action"], result.action)
+        self.assertEqual(decision["reason"], "existing state already answers the request")
 
     def test_missing_final_action_is_corrected_once(self):
         client = _Client(['{\"type\":\"action\"}', '{\"type\":\"action\",\"action\":\"answer\",\"message\":\"done\",\"reason\":\"corrected\"}'])

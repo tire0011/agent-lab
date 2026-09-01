@@ -10,13 +10,11 @@ import sys
 from pathlib import Path
 
 from modules.mailbox.poll_runner import run_mailbox_poll_once
+from modules.logging_config import configure_logging
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+configure_logging()
 logger = logging.getLogger("mailbox_processor")
 
 

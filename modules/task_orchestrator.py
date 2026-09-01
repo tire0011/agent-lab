@@ -141,6 +141,7 @@ class NexusTaskOrchestrator:
         source_id: str | None = None,
         title: str | None = None,
         session_id: str | None = None,
+        task_logger: Any | None = None,
     ) -> TaskDecision:
         return asyncio.run(
             self.run_async(
@@ -149,10 +150,17 @@ class NexusTaskOrchestrator:
                 source_id=source_id,
                 title=title,
                 session_id=session_id,
+                task_logger=task_logger,
             )
         )
 
-    def continue_session(self, session_id: str, user_message: str) -> TaskDecision:
+    def continue_session(
+        self,
+        session_id: str,
+        user_message: str,
+        *,
+        task_logger: Any | None = None,
+    ) -> TaskDecision:
         session = self.task_store.get(session_id)
         if session is None:
             raise TaskOrchestratorError(f"unknown Nexus task session {session_id!r}")
@@ -162,6 +170,7 @@ class NexusTaskOrchestrator:
             source_id=session.source_id,
             title=session.title,
             session_id=session.id,
+            task_logger=task_logger,
         )
 
     async def run_async(
@@ -172,6 +181,7 @@ class NexusTaskOrchestrator:
         source_id: str | None = None,
         title: str | None = None,
         session_id: str | None = None,
+        task_logger: Any | None = None,
     ) -> TaskDecision:
         if not task or not task.strip():
             raise TaskOrchestratorError("task must not be empty")
@@ -233,6 +243,18 @@ class NexusTaskOrchestrator:
                 decision["type"] = "tool"
                 decision["tool"] = ACTION_COMMAND
             if decision.get("type") == "tool":
+                if task_logger is not None:
+                    task_logger.info(
+                        "orchestration",
+                        "tool_selected",
+                        (
+                            "orchestrator selected intermediate tool "
+                            f"{decision.get('tool', '')}: {decision.get('reason', '')}"
+                        ),
+                        tool=str(decision.get("tool", "")),
+                        reason=str(decision.get("reason", "")),
+                        session_id=session.id,
+                    )
                 observation = await self._execute_tool(decision)
                 observations.append(observation)
                 self.task_store.append_event(
@@ -274,6 +296,15 @@ class NexusTaskOrchestrator:
                 observations=observations,
                 session_id=session.id,
             )
+            if task_logger is not None:
+                task_logger.info(
+                    "orchestration",
+                    "route_selected",
+                    f"orchestrator selected route {result.action}: {result.reason}",
+                    action=result.action,
+                    reason=result.reason,
+                    session_id=session.id,
+                )
             self._persist_final(session.id, task, result)
             return result
 
@@ -284,6 +315,15 @@ class NexusTaskOrchestrator:
             observations=observations,
             session_id=session.id,
         )
+        if task_logger is not None:
+            task_logger.warning(
+                "orchestration",
+                "route_selected",
+                "orchestrator requested clarification after reaching its decision-step limit",
+                action=result.action,
+                reason=result.reason,
+                session_id=session.id,
+            )
         self._persist_final(session.id, task, result)
         return result
 

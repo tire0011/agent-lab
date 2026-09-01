@@ -51,6 +51,8 @@ DEFAULT_LOG_DIR = "state/experiment-logs"
 # listing/glob naturally covers both families of JSONL log for the
 # unified log feed.
 TASK_LOG_PREFIX = "task-"
+CHAT_LOG_PREFIX = "chat-"
+SYSTEM_LOG_KEY = "system"
 
 # Any id used to build a log file path (an experiment id or a mailbox
 # task/approval id) must match this allowlist. Both are produced
@@ -196,13 +198,24 @@ class ExperimentLogger:
         self,
         experiment_id: str | None,
         mailbox_task_id: str | None = None,
+        job_id: str | None = None,
+        session_id: str | None = None,
         log_dir: str | Path = DEFAULT_LOG_DIR,
         max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+        *,
+        _system: bool = False,
+        _mirror: bool = True,
     ) -> None:
         if experiment_id:
             if not _SAFE_ID_RE.fullmatch(experiment_id):
                 raise ValueError(f"unsafe experiment_id for log path: {experiment_id!r}")
             key = experiment_id
+        elif job_id:
+            if not _SAFE_ID_RE.fullmatch(job_id):
+                raise ValueError(f"unsafe job_id for log path: {job_id!r}")
+            key = f"{CHAT_LOG_PREFIX}{job_id}"
+        elif _system:
+            key = SYSTEM_LOG_KEY
         else:
             if not mailbox_task_id or not _SAFE_ID_RE.fullmatch(mailbox_task_id):
                 raise ValueError(
@@ -212,10 +225,13 @@ class ExperimentLogger:
             key = f"{TASK_LOG_PREFIX}{mailbox_task_id}"
         self.experiment_id = experiment_id
         self.mailbox_task_id = mailbox_task_id
+        self.job_id = redaction.redact(job_id) if job_id else None
+        self.session_id = redaction.redact(session_id) if session_id else None
         self._dir = Path(log_dir)
         self._path = self._dir / f"{key}.jsonl"
         self._max_bytes = max_bytes
         self._limit_notice_written = False
+        self._mirror = _mirror
 
     @property
     def path(self) -> Path:
@@ -225,6 +241,10 @@ class ExperimentLogger:
         """Attach a mailbox task id discovered after this logger was created."""
         if mailbox_task_id:
             self.mailbox_task_id = mailbox_task_id
+
+    def bind_session_id(self, session_id: str | None) -> None:
+        if session_id:
+            self.session_id = redaction.redact(session_id)
 
     # ------------------------------------------------------------------
     # Convenience level methods
@@ -350,6 +370,10 @@ class ExperimentLogger:
         }
         if self.mailbox_task_id:
             entry["mailbox_task_id"] = self.mailbox_task_id
+        if self.job_id:
+            entry["job_id"] = self.job_id
+        if self.session_id:
+            entry["session_id"] = self.session_id
         if duration_ms is not None:
             entry["duration_ms"] = int(duration_ms)
         if command is not None:
@@ -400,7 +424,8 @@ class ExperimentLogger:
             entry["truncated"] = True
 
         self._append(entry)
-        self._mirror_to_journald(level, phase, event, message)
+        if self._mirror:
+            self._mirror_to_journald(level, phase, event, message)
 
     def _append(self, entry: dict[str, Any]) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -475,6 +500,36 @@ def get_task_logger(
     return ExperimentLogger(None, mailbox_task_id=mailbox_task_id, log_dir=log_dir, max_bytes=max_bytes)
 
 
+def get_chat_logger(
+    job_id: str,
+    session_id: str | None = None,
+    log_dir: str | Path = DEFAULT_LOG_DIR,
+    max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+) -> "ExperimentLogger":
+    """Durable structured logger for a chat job before an experiment exists."""
+    return ExperimentLogger(
+        None,
+        job_id=job_id,
+        session_id=session_id,
+        log_dir=log_dir,
+        max_bytes=max_bytes,
+    )
+
+
+def get_system_logger(
+    log_dir: str | Path = DEFAULT_LOG_DIR,
+    max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+) -> "ExperimentLogger":
+    """Structured sink used by the centralized stdlib logging handler."""
+    return ExperimentLogger(
+        None,
+        log_dir=log_dir,
+        max_bytes=max_bytes,
+        _system=True,
+        _mirror=False,
+    )
+
+
 def _format_stacktrace(exc: BaseException) -> str:
     """Bounded, redacted stack trace text (last frames only)."""
     lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
@@ -522,7 +577,7 @@ def _tail_read_lines(path: Path, tail_bytes: int | None) -> list[str]:
 
 _REQUIRED_STRING_FIELDS = ("timestamp", "level", "logger", "phase", "event")
 _OPTIONAL_STRING_FIELDS = (
-    "message", "experiment_id", "mailbox_task_id", "command", "cwd",
+    "message", "experiment_id", "mailbox_task_id", "job_id", "session_id", "command", "cwd",
     "stdout", "stderr", "exception_type", "exception_message", "stacktrace",
 )
 _OPTIONAL_INT_FIELDS = ("duration_ms", "exit_code")
@@ -560,6 +615,8 @@ def read_log_entries(
     *,
     level: str | None = None,
     phase: str | None = None,
+    job_id: str | None = None,
+    session_id: str | None = None,
     limit: int | None = None,
     before: str | None = None,
     tail_bytes: int | None = None,
@@ -623,6 +680,10 @@ def read_log_entries(
         entries = [e for e in entries if e.get("level") == level_upper]
     if phase:
         entries = [e for e in entries if e.get("phase") == phase]
+    if job_id:
+        entries = [e for e in entries if e.get("job_id") == job_id]
+    if session_id:
+        entries = [e for e in entries if e.get("session_id") == session_id]
     if before:
         entries = [e for e in entries if str(e.get("timestamp") or "\uffff") < before]
 
@@ -640,6 +701,8 @@ _STRING_FIELDS_TO_REDACT = (
     "stderr",
     "exception_message",
     "stacktrace",
+    "job_id",
+    "session_id",
 )
 
 
@@ -750,16 +813,15 @@ def read_experiment_logs(
         return []
 
     directory = Path(log_dir)
+    if not directory.is_dir():
+        raise OSError(f"log directory is unavailable: {directory}")
     paths = [directory / f"{experiment_id}.jsonl"]
     if mailbox_task_id and _SAFE_ID_RE.fullmatch(mailbox_task_id):
         paths.append(directory / f"{TASK_LOG_PREFIX}{mailbox_task_id}.jsonl")
 
     entries: list[dict[str, Any]] = []
     for path in paths:
-        try:
-            entries.extend(read_log_entries(path, level=level, phase=phase))
-        except Exception:  # noqa: BLE001 - one bad file must not break the view
-            continue
+        entries.extend(read_log_entries(path, level=level, phase=phase))
 
     entries.sort(key=_entry_sort_key)
 
@@ -780,6 +842,8 @@ def read_all_log_entries(
     mailbox_task_id: str | None = None,
     level: str | None = None,
     phase: str | None = None,
+    job_id: str | None = None,
+    session_id: str | None = None,
     limit: int | None = None,
     before: str | None = None,
     max_files: int = DEFAULT_MAX_LOG_FILES,
@@ -823,39 +887,46 @@ def read_all_log_entries(
     caps how many distinct experiments/tasks are scanned either way.
     """
     directory = Path(log_dir)
-    if not directory.exists():
-        return []
+    if not directory.is_dir():
+        raise OSError(f"log directory is unavailable: {directory}")
 
     if experiment_id:
-        return read_experiment_logs(
+        entries = read_experiment_logs(
             directory, experiment_id,
             mailbox_task_id=mailbox_task_id,
-            level=level, phase=phase, limit=limit, before=before,
+            level=level, phase=phase,
+            limit=None if (job_id or session_id) else limit,
+            before=before,
         )
+        if job_id:
+            entries = [entry for entry in entries if entry.get("job_id") == job_id]
+        if session_id:
+            entries = [entry for entry in entries if entry.get("session_id") == session_id]
+        if limit is not None and limit >= 0 and len(entries) > limit:
+            entries = entries[-limit:]
+        return entries
 
     cursor_key: tuple[str, str, str, int] | None = decode_log_cursor(before) if before else None
     effective_tail_bytes = None if cursor_key is not None else tail_bytes
 
-    try:
-        candidates = [p for p in directory.glob("*.jsonl") if p.is_file()]
-    except OSError:
-        candidates = []
-    try:
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        pass
+    candidates = [p for p in directory.glob("*.jsonl") if p.is_file()]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     if max_files is not None and max_files >= 0:
         candidates = candidates[:max_files]
     paths = candidates
 
     entries: list[dict[str, Any]] = []
     for path in paths:
-        try:
-            entries.extend(
-                read_log_entries(path, level=level, phase=phase, tail_bytes=effective_tail_bytes)
+        entries.extend(
+            read_log_entries(
+                path,
+                level=level,
+                phase=phase,
+                job_id=job_id,
+                session_id=session_id,
+                tail_bytes=effective_tail_bytes,
             )
-        except Exception:  # noqa: BLE001 - one bad file must not break the feed
-            continue
+        )
 
     if mailbox_task_id:
         entries = [e for e in entries if e.get("mailbox_task_id") == mailbox_task_id]
