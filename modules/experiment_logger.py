@@ -554,7 +554,10 @@ def read_all_log_entries(
     if mailbox_task_id:
         entries = [e for e in entries if e.get("mailbox_task_id") == mailbox_task_id]
 
-    entries.sort(key=lambda e: (str(e.get("timestamp") or ""), str(e.get("experiment_id") or "")))
+    # Missing timestamps (should not occur in practice - every write path
+    # always sets one) sort last rather than first, so a malformed entry
+    # can never mask genuinely older/newer ones at the top of the feed.
+    entries.sort(key=lambda e: (str(e.get("timestamp") or "\uffff"), str(e.get("experiment_id") or "")))
 
     if limit is not None and limit >= 0 and len(entries) > limit:
         entries = entries[-limit:]
