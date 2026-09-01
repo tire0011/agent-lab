@@ -72,22 +72,6 @@ function renderLogsFromDiagnostics(entries) {
   });
 }
 
-function renderLogsFromActivity(entries) {
-  renderCardList(logsElements.content, entries, "Keine Log-Einträge gefunden.", (li, item) => {
-    addTitle(li, `${item.phase} · ${item.timestamp}`);
-    const details = [];
-    if (item.test_command && item.test_command.length) details.push(item.test_command.join(" "));
-    if (item.test_exit_code !== null && item.test_exit_code !== undefined) details.push(`Exit-Code ${item.test_exit_code}`);
-    if (item.changed_files.length) details.push(`Dateien: ${item.changed_files.join(", ")}`);
-    if (item.rejection_reason) details.push(item.rejection_reason);
-    if (item.policy_rule) details.push(`Regel: ${item.policy_rule}`);
-    addMetaLine(li, details.join(" · "));
-    for (const line of item.test_output_lines || []) {
-      addMetaLine(li, line);
-    }
-  });
-}
-
 // One structured JSONL entry from GET /experiments/{id}/logs, rendered as
 // a collapsible card. Every value is written via textContent only.
 function renderExperimentLogEntries(entries) {
@@ -213,14 +197,20 @@ async function loadLogs() {
     }
   }
 
+  // Default "Alle Experimente" view: the unified, chronological feed of
+  // real structured log entries across every experiment - not the
+  // lifecycle/status summaries from /activity - so a running/new
+  // experiment is visible on refresh without knowing its id up front.
   if (state.apiKey) {
     try {
-      const params = new URLSearchParams({ limit: "50" });
+      const params = new URLSearchParams({ limit: "500" });
+      if (level) params.set("level", level);
+      if (phase) params.set("phase", phase);
       if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
-      const data = await requestJson(`/activity?${params.toString()}`, { headers: authHeaders() });
-      const activity = data.activity || [];
-      renderLogsFromActivity(activity);
-      updateLogsSuccessStatus(activity);
+      const data = await requestJson(`/logs?${params.toString()}`, { headers: authHeaders() });
+      const entries = data.entries || [];
+      renderExperimentLogEntries(entries);
+      updateLogsSuccessStatus(entries);
       return;
     } catch (error) {
       logsElements.count.textContent = "!";

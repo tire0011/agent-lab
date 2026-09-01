@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from modules.experiment_logger import (
     MAX_STDOUT_CHARS,
     ExperimentLogger,
     _bounded_head_tail_text,
+    read_all_log_entries,
     read_log_entries,
     sanitize_command,
 )
@@ -365,6 +367,102 @@ class ExperimentLoggerReadPathTests(unittest.TestCase):
 
     def test_default_log_dir_is_plain_relative_path(self):
         self.assertEqual(DEFAULT_LOG_DIR, "state/experiment-logs")
+
+
+class ReadAllLogEntriesTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmpdir.name)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_missing_dir_returns_empty_list(self):
+        entries = read_all_log_entries(self.log_dir / "does-not-exist")
+        self.assertEqual(entries, [])
+
+    def test_merges_multiple_experiments_chronologically(self):
+        elog_a = ExperimentLogger("exp-a", mailbox_task_id="task-a", log_dir=self.log_dir)
+        elog_b = ExperimentLogger("exp-b", mailbox_task_id="task-b", log_dir=self.log_dir)
+        elog_a.info("queued", "task_bound", "experiment a queued")
+        time.sleep(0.005)
+        elog_b.info("queued", "task_bound", "experiment b queued")
+        time.sleep(0.005)
+        elog_a.info("implementation", "implementation_started", "experiment a implementing")
+        time.sleep(0.005)
+        elog_b.info("verifying", "verification_started", "experiment b verifying")
+
+        entries = read_all_log_entries(self.log_dir)
+        self.assertEqual(len(entries), 4)
+        # Entries interleave in write order across both files, not grouped
+        # by experiment - a real chronological merge, not a concatenation.
+        experiment_order = [e["experiment_id"] for e in entries]
+        self.assertEqual(experiment_order, ["exp-a", "exp-b", "exp-a", "exp-b"])
+
+    def test_filters_by_experiment_id_reads_only_that_file(self):
+        ExperimentLogger("exp-a", log_dir=self.log_dir).info("p", "e1", "a message")
+        ExperimentLogger("exp-b", log_dir=self.log_dir).info("p", "e2", "b message")
+
+        entries = read_all_log_entries(self.log_dir, experiment_id="exp-a")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["experiment_id"], "exp-a")
+
+    def test_filters_by_mailbox_task_id_across_files(self):
+        ExperimentLogger("exp-a", mailbox_task_id="task-1", log_dir=self.log_dir).info(
+            "p", "e1", "a message"
+        )
+        ExperimentLogger("exp-b", mailbox_task_id="task-2", log_dir=self.log_dir).info(
+            "p", "e2", "b message"
+        )
+
+        entries = read_all_log_entries(self.log_dir, mailbox_task_id="task-2")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["experiment_id"], "exp-b")
+        self.assertEqual(entries[0]["mailbox_task_id"], "task-2")
+
+    def test_filters_by_level_and_phase_across_files(self):
+        elog_a = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        elog_b = ExperimentLogger("exp-b", log_dir=self.log_dir)
+        elog_a.info("research", "started", "ok")
+        elog_a.error("verifying", "tests_failed", "boom")
+        elog_b.warning("verifying", "diff_check_issue", "issue")
+
+        only_errors = read_all_log_entries(self.log_dir, level="ERROR")
+        self.assertEqual(len(only_errors), 1)
+        self.assertEqual(only_errors[0]["event"], "tests_failed")
+
+        only_verifying = read_all_log_entries(self.log_dir, phase="verifying")
+        self.assertEqual(len(only_verifying), 2)
+
+    def test_respects_limit_keeping_most_recent_across_files(self):
+        elog_a = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        elog_b = ExperimentLogger("exp-b", log_dir=self.log_dir)
+        for i in range(3):
+            elog_a.info("p", f"a{i}", f"message {i}")
+            time.sleep(0.005)
+            elog_b.info("p", f"b{i}", f"message {i}")
+            time.sleep(0.005)
+
+        limited = read_all_log_entries(self.log_dir, limit=2)
+        self.assertEqual(len(limited), 2)
+        self.assertEqual([e["event"] for e in limited], ["a2", "b2"])
+
+    def test_malformed_line_in_one_file_does_not_break_the_feed(self):
+        elog_a = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        elog_a.info("p", "good", "fine")
+        with open(self.log_dir / "exp-corrupt.jsonl", "a", encoding="utf-8") as fh:
+            fh.write("{not valid json\n")
+
+        entries = read_all_log_entries(self.log_dir)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["event"], "good")
+
+    def test_redacts_secrets_across_all_files(self):
+        secret = "abcdef0123456789abcdef0123456789"
+        ExperimentLogger("exp-a", log_dir=self.log_dir).error(
+            "verifying", "tests_failed", "boom", stderr=f"token={secret}"
+        )
+        entries = read_all_log_entries(self.log_dir)
+        serialized = json.dumps(entries)
+        self.assertNotIn(secret, serialized)
 
 
 if __name__ == "__main__":
