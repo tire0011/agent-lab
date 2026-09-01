@@ -36,9 +36,11 @@ class ExperimentLogsApiTests(unittest.TestCase):
 
         self.service = MagicMock()
         self.service.resolve_experiment.side_effect = self._resolve_experiment
+        self.service.experiment_log_dir = self.log_dir
         self.service.experiment_log_path.side_effect = (
             lambda experiment_id: self.log_dir / f"{experiment_id}.jsonl"
         )
+        self.service.mailbox_task_id_for_experiment.return_value = None
 
         codex = MagicMock()
         mailbox = MagicMock()
@@ -168,6 +170,59 @@ class ExperimentLogsApiTests(unittest.TestCase):
             "exception_message", "stacktrace", "truncated",
         }
         self.assertEqual(set(entry.keys()), expected_fields)
+
+    def test_merges_correlated_mailbox_task_log(self):
+        # Gap 1: selecting one experiment must show the same complete
+        # task path as the unified feed, including events recorded before
+        # the experiment id existed.
+        from modules.experiment_logger import get_task_logger
+
+        self.service.mailbox_task_id_for_experiment.return_value = "task-99"
+        get_task_logger("task-99", log_dir=self.log_dir).info(
+            "mailbox", "task_received", "mailbox task received"
+        )
+        self._write_logs()
+        response = self.client.get(
+            f"/experiments/{self.experiment.id}/logs", headers={"x-api-key": "test-key"}
+        )
+        body = response.json()
+        events = [e["event"] for e in body["entries"]]
+        self.assertEqual(events[0], "task_received")
+        self.assertIsNone(body["entries"][0]["experiment_id"])
+
+    def test_cursor_pagination_returns_older_entries_without_duplicates(self):
+        self._write_logs()
+        first = self.client.get(
+            f"/experiments/{self.experiment.id}/logs?limit=2", headers={"x-api-key": "test-key"}
+        ).json()
+        self.assertEqual(len(first["entries"]), 2)
+        self.assertIsNotNone(first["next_cursor"])
+
+        second = self.client.get(
+            f"/experiments/{self.experiment.id}/logs?limit=2&cursor={first['next_cursor']}",
+            headers={"x-api-key": "test-key"},
+        ).json()
+        first_events = [e["event"] for e in first["entries"]]
+        second_events = [e["event"] for e in second["entries"]]
+        self.assertEqual(len(set(first_events) & set(second_events)), 0)
+
+    def test_malformed_entry_does_not_fail_the_whole_response(self):
+        self._write_logs()
+        with open(
+            self.log_dir / f"{self.experiment.id}.jsonl", "a", encoding="utf-8"
+        ) as fh:
+            fh.write(json.dumps({
+                "timestamp": "2026-01-01T00:00:10Z", "level": "INFO",
+                "logger": "nexus.experiment", "experiment_id": self.experiment.id,
+                "event": "missing_phase_field",
+            }) + "\n")
+
+        response = self.client.get(
+            f"/experiments/{self.experiment.id}/logs", headers={"x-api-key": "test-key"}
+        )
+        self.assertEqual(response.status_code, 200)
+        events = [e["event"] for e in response.json()["entries"]]
+        self.assertNotIn("missing_phase_field", events)
 
 
 if __name__ == "__main__":

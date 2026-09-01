@@ -825,13 +825,15 @@ def get_experiment_logs(
     x_api_key: str | None = Header(default=None),
     level: str | None = Query(default=None),
     phase: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=EXPERIMENT_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENT_LOGS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentLogsResponse:
     """Single, chronological, structured view of one experiment's complete
     task/experiment run - mailbox approval through research, selection,
     implementation, verification, and cleanup - reusing the same durable
-    JSONL log written by ``modules.experiment_logger``.
+    JSONL log written by ``modules.experiment_logger``, merged with its
+    correlated mailbox task's pre-experiment-id log entries if any.
     """
     authorize(x_api_key)
     try:
@@ -842,10 +844,14 @@ def get_experiment_logs(
     if level is not None and level.upper() not in _LOG_LEVELS:
         raise HTTPException(status_code=400, detail="invalid level filter")
 
-    log_path = service.experiment_log_path(experiment.id)
+    mailbox_task_id = _mailbox_task_id(service, experiment.id)
     try:
-        raw_entries = experiment_logger_module.read_log_entries(
-            log_path, level=level, phase=phase, limit=limit,
+        # Fetch one extra entry to detect whether an older page remains,
+        # without re-scanning already-returned entries on the next call.
+        raw_entries = experiment_logger_module.read_experiment_logs(
+            service.experiment_log_dir, experiment.id,
+            mailbox_task_id=mailbox_task_id, level=level, phase=phase,
+            limit=limit + 1, before=cursor,
         )
     except Exception:
         # Reading/parsing the log must never surface as a 500 to the
@@ -853,8 +859,21 @@ def get_experiment_logs(
         # same as a missing file.
         raw_entries = []
 
-    entries = [ExperimentLogEntry(**entry) for entry in raw_entries]
-    return ExperimentLogsResponse(count=len(entries), experiment_id=experiment.id, entries=entries)
+    next_cursor: str | None = None
+    if len(raw_entries) > limit:
+        next_cursor = str(raw_entries[0].get("timestamp") or "") or None
+        raw_entries = raw_entries[1:]
+
+    entries: list[ExperimentLogEntry] = []
+    for raw in raw_entries:
+        try:
+            entries.append(ExperimentLogEntry(**raw))
+        except Exception:
+            # A malformed entry must not fail the whole response.
+            continue
+    return ExperimentLogsResponse(
+        count=len(entries), experiment_id=experiment.id, entries=entries, next_cursor=next_cursor,
+    )
 
 
 @app.get("/logs", response_model=UnifiedLogsResponse)
@@ -864,20 +883,25 @@ def get_unified_logs(
     phase: str | None = Query(default=None),
     experiment_id: str | None = Query(default=None),
     mailbox_task_id: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> UnifiedLogsResponse:
-    """Single, chronological, structured view *across every experiment*.
+    """Single, chronological, structured view *across every experiment and
+    every pre-experiment mailbox task*.
 
     Backs the Logs tab's default "Alle Experimente" feed: unlike
     ``/activity`` (lifecycle/status summaries only), this returns the real
     structured JSONL entries written by ``modules.experiment_logger`` -
     mailbox intake, queueing, implementation, verification, GitHub
     lifecycle, adoption, and failures/timeouts - merged in chronological
-    order from every ``<experiment_log_dir>/<experiment_id>.jsonl`` file.
-    A running/new experiment is included as soon as it has written any log
-    line, with no dependency on the public diagnostics list or a terminal
-    status.
+    order from every ``<experiment_log_dir>/*.jsonl`` file, including
+    ``task-<mailbox_task_id>.jsonl`` files that hold events recorded
+    before an experiment id existed. A running/new experiment is included
+    as soon as it has written any log line, with no dependency on the
+    public diagnostics list or a terminal status. Bounded reads and
+    cursor-based pagination (see *cursor*/*next_cursor*) keep one manual
+    refresh from re-scanning unbounded historical data.
     """
     authorize(x_api_key)
 
@@ -891,22 +915,43 @@ def get_unified_logs(
         except ExperimentNotFoundError:
             return UnifiedLogsResponse(count=0, entries=[])
 
+    resolved_mailbox_task_id = mailbox_task_id
+    if resolved_experiment_id and not resolved_mailbox_task_id:
+        # Correlate the experiment with its mailbox task log automatically,
+        # same as the single-experiment endpoint, so filtering the unified
+        # feed down to one experiment shows the same complete task path.
+        resolved_mailbox_task_id = _mailbox_task_id(service, resolved_experiment_id)
+
     try:
+        # Fetch one extra entry to detect whether an older page remains,
+        # without re-scanning already-returned entries on the next call.
         raw_entries = experiment_logger_module.read_all_log_entries(
             service.experiment_log_dir,
             experiment_id=resolved_experiment_id,
-            mailbox_task_id=mailbox_task_id,
+            mailbox_task_id=resolved_mailbox_task_id,
             level=level,
             phase=phase,
-            limit=limit,
+            limit=limit + 1,
+            before=cursor,
         )
     except Exception:
         # Same contract as the single-experiment view: an unreadable log
         # directory/file is reported as "no entries yet", never a 500.
         raw_entries = []
 
-    entries = [ExperimentLogEntry(**entry) for entry in raw_entries]
-    return UnifiedLogsResponse(count=len(entries), entries=entries)
+    next_cursor: str | None = None
+    if len(raw_entries) > limit:
+        next_cursor = str(raw_entries[0].get("timestamp") or "") or None
+        raw_entries = raw_entries[1:]
+
+    entries: list[ExperimentLogEntry] = []
+    for raw in raw_entries:
+        try:
+            entries.append(ExperimentLogEntry(**raw))
+        except Exception:
+            # A malformed entry must not fail the whole response.
+            continue
+    return UnifiedLogsResponse(count=len(entries), entries=entries, next_cursor=next_cursor)
 
 
 @app.post("/experiments/{experiment_id}/adopt", response_model=ExperimentAdoptionStatus, status_code=202)

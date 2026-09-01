@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
+from modules.experiment_logger import DEFAULT_LOG_DIR, get_task_logger
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
@@ -115,9 +116,11 @@ class MailboxTaskService:
         operations_registry: Any | None = None,
         orchestrator_factory: Any | None = None,
         github_work_tracking: GitHubWorkTrackingService | None = None,
+        task_log_dir: str | Path | None = None,
     ) -> None:
         self.db_path = db_path
         self.experiment_service = experiment_service
+        self._task_log_dir = task_log_dir
         if mailbox_config is not None:
             self.outbox_dir = Path(mailbox_config.outbox_dir)
             self.repo_path = Path(mailbox_config.code_repo_path)
@@ -166,6 +169,24 @@ class MailboxTaskService:
                 logger.exception("mailbox_task: failed closing GitHub work tracking")
         self._conn.close()
 
+    def _task_logger(self, approval_id: str):
+        """Durable, pre-experiment structured logger for one mailbox task.
+
+        Records intake/approval/rejection/queueing/orchestration events -
+        everything before (and, for tasks that never create one, instead
+        of) an experiment id existing - so the unified Logs feed shows the
+        complete task path from the moment a task arrives. Never raises:
+        a logging failure must not interrupt task processing.
+        """
+        log_dir: str | Path = DEFAULT_LOG_DIR
+        if self._task_log_dir is not None:
+            log_dir = self._task_log_dir
+        elif self.experiment_service is not None:
+            candidate = getattr(self.experiment_service, "experiment_log_dir", None)
+            if isinstance(candidate, (str, Path)):
+                log_dir = candidate
+        return get_task_logger(approval_id, log_dir=log_dir)
+
     # ------------------------------------------------------------------
     # CRUD / approval state
     # ------------------------------------------------------------------
@@ -208,6 +229,10 @@ class MailboxTaskService:
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
+        self._task_logger(approval_id).info(
+            "mailbox", "task_received",
+            "mailbox task received, pending approval",
+        )
         return _row_to_approval(row)
 
     def get(self, approval_id: str) -> MailboxTaskApproval:
@@ -254,6 +279,7 @@ class MailboxTaskService:
                 (_STATUS_APPROVED, now, now, approval_id, _STATUS_PENDING),
             )
             self._conn.commit()
+        self._task_logger(approval_id).info("mailbox", "task_approved", "mailbox task approved")
         return self.get(approval_id)
 
     def reject(self, approval_id: str, reason: str) -> MailboxTaskApproval:
@@ -278,6 +304,9 @@ class MailboxTaskService:
                 (_STATUS_REJECTED, now, reason, now, approval_id, _STATUS_PENDING),
             )
             self._conn.commit()
+        self._task_logger(approval_id).warning(
+            "mailbox", "task_rejected", "mailbox task rejected", reason=reason,
+        )
         return self.get(approval_id)
 
     # ------------------------------------------------------------------
@@ -419,6 +448,8 @@ class MailboxTaskService:
         # Re-read task_body so clarification follow-ups accumulated by
         # continue_discussion are included in the implementation goal.
         current_approval = self.get(approval.id)
+        task_log = self._task_logger(approval.id)
+        task_log.info("queued", "github_work_tracking_started", "starting GitHub work tracking")
         try:
             work_ref = self.github_work_tracking.ensure_for_source(
                 SimpleNamespace(
@@ -429,6 +460,10 @@ class MailboxTaskService:
                 )
             )
         except GitHubWorkTrackingError as exc:
+            task_log.error(
+                "queued", "github_work_tracking_failed",
+                "GitHub lifecycle blocked before implementation start", exc=exc,
+            )
             self._complete_without_experiment(
                 approval,
                 _STATUS_NEEDS_REVIEW,
@@ -453,6 +488,14 @@ class MailboxTaskService:
         if not updated:
             logger.warning("mailbox_task: lost race after creating experiment %s", experiment.id)
             return
+        # Correlating event: this is the moment the pre-experiment task
+        # log and the experiment's own log become joinable, so the
+        # unified feed can follow one task from mailbox intake through to
+        # this new experiment id.
+        task_log.info(
+            "queued", "experiment_created", "experiment created for mailbox task",
+            experiment_id=experiment.id,
+        )
         self._start_thread(
             experiment.id,
             lambda: self.experiment_service.run_experiment(
@@ -466,6 +509,7 @@ class MailboxTaskService:
         approval: MailboxTaskApproval,
         decision: TaskDecision,
     ) -> None:
+        task_log = self._task_logger(approval.id)
         if not decision.experiment_id:
             self._complete_without_experiment(
                 approval,
@@ -474,9 +518,18 @@ class MailboxTaskService:
             )
             return
         experiment = self.experiment_service.resolve_experiment(decision.experiment_id)
+        task_log.info(
+            "queued", "resume_started", "resuming existing experiment",
+            experiment_id=experiment.id,
+        )
         try:
             self.github_work_tracking.recover_experiment(experiment)
         except GitHubWorkTrackingError as exc:
+            task_log.error(
+                "queued", "resume_failed",
+                "GitHub lifecycle blocked before experiment resume", exc=exc,
+                experiment_id=experiment.id,
+            )
             self._complete_without_experiment(
                 approval,
                 _STATUS_NEEDS_REVIEW,
@@ -596,6 +649,13 @@ class MailboxTaskService:
 
     def recover_after_restart(self) -> None:
         with self._lock:
+            interrupted_ids = [
+                str(r["id"])
+                for r in self._conn.execute(
+                    "SELECT id FROM mailbox_task_approvals WHERE status=? AND experiment_id IS NULL",
+                    (_STATUS_RUNNING,),
+                ).fetchall()
+            ]
             self._conn.execute(
                 """UPDATE mailbox_task_approvals
                    SET status=?, error=?, updated_at=?
@@ -608,6 +668,11 @@ class MailboxTaskService:
                 ),
             )
             self._conn.commit()
+        for approval_id in interrupted_ids:
+            self._task_logger(approval_id).warning(
+                "mailbox", "task_interrupted_by_restart",
+                "non-experiment task interrupted by restart; marked needs_review",
+            )
         self.poll_running()
 
     # ------------------------------------------------------------------
@@ -637,8 +702,18 @@ class MailboxTaskService:
                 ),
             )
             self._conn.commit()
+        task_log = self._task_logger(approval.id)
         if new_status in (_STATUS_FAILED, _STATUS_NEEDS_REVIEW):
+            task_log.warning(
+                "queued", "task_completed", f"mailbox task reached terminal status {new_status}",
+                experiment_id=getattr(exp, "id", None),
+            )
             self._write_problem(approval, new_status, summary, exp)
+        else:
+            task_log.info(
+                "queued", "task_completed", f"mailbox task reached terminal status {new_status}",
+                experiment_id=getattr(exp, "id", None),
+            )
 
     def _complete_without_experiment(
         self,
@@ -664,6 +739,10 @@ class MailboxTaskService:
             ).rowcount
             self._conn.commit()
         if updated:
+            self._task_logger(approval.id).warning(
+                "queued", "task_completed_without_experiment",
+                f"mailbox task completed without an experiment (status={status})",
+            )
             self._write_result_outbox(approval, status, summary, None)
 
     def _complete_claimed_without_experiment(
@@ -681,6 +760,10 @@ class MailboxTaskService:
                 (status, summary[:8000], _safe_error(error), _now_iso(), approval.id),
             )
             self._conn.commit()
+        self._task_logger(approval.id).warning(
+            "queued", "task_completed_without_experiment",
+            f"mailbox task completed without an experiment (status={status})",
+        )
         self._write_result_outbox(approval, status, summary, None)
 
     @staticmethod

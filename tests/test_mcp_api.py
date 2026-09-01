@@ -380,8 +380,8 @@ class McpApiTests(unittest.TestCase):
     def test_experiment_logs_tool_reuses_existing_route_logic(self):
         experiment = SimpleNamespace(id="exp-123", status="failed")
         self.experiment.resolve_experiment.return_value = experiment
-        log_path = Path(self.temp_dir.name) / "exp-123.jsonl"
-        self.experiment.experiment_log_path.return_value = log_path
+        self.experiment.experiment_log_dir = self.temp_dir.name
+        self.experiment.mailbox_task_id_for_experiment.return_value = None
 
         entries = [
             {
@@ -407,7 +407,9 @@ class McpApiTests(unittest.TestCase):
         ]
 
         self._initialize_mcp()
-        with patch.object(api.experiment_logger_module, "read_log_entries", return_value=entries) as read_logs:
+        with patch.object(
+            api.experiment_logger_module, "read_experiment_logs", return_value=entries
+        ) as read_logs:
             response = self._mcp_post(
                 {
                     "jsonrpc": "2.0",
@@ -429,7 +431,10 @@ class McpApiTests(unittest.TestCase):
         self.assertEqual(body["count"], 1)
         self.assertEqual(body["experiment_id"], "exp-123")
         self.assertEqual(body["entries"][0]["event"], "tests_failed")
-        read_logs.assert_called_once_with(log_path, level="ERROR", phase="verifying", limit=2)
+        read_logs.assert_called_once_with(
+            self.temp_dir.name, "exp-123",
+            mailbox_task_id=None, level="ERROR", phase="verifying", limit=3, before=None,
+        )
         self.experiment.resolve_experiment.assert_called_once_with("exp-123")
 
 

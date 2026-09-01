@@ -21,7 +21,9 @@ from modules.experiment_logger import (
     MAX_STDOUT_CHARS,
     ExperimentLogger,
     _bounded_head_tail_text,
+    get_task_logger,
     read_all_log_entries,
+    read_experiment_logs,
     read_log_entries,
     sanitize_command,
 )
@@ -463,6 +465,217 @@ class ReadAllLogEntriesTests(unittest.TestCase):
         entries = read_all_log_entries(self.log_dir)
         serialized = json.dumps(entries)
         self.assertNotIn(secret, serialized)
+
+
+class TaskLoggerPreExperimentTests(unittest.TestCase):
+    """Gap 1: mailbox intake/queueing events must be durable and visible
+    before any experiment id exists, and later correlatable once one is
+    created."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmpdir.name)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_get_task_logger_writes_to_task_prefixed_file(self):
+        task_log = get_task_logger("mailbox-task-1", log_dir=self.log_dir)
+        task_log.info("mailbox", "task_received", "task received")
+        self.assertEqual(task_log.path, self.log_dir / "task-mailbox-task-1.jsonl")
+        entries = _read_lines(task_log.path)
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0]["experiment_id"])
+        self.assertEqual(entries[0]["mailbox_task_id"], "mailbox-task-1")
+
+    def test_experiment_logger_requires_experiment_id_or_mailbox_task_id(self):
+        with self.assertRaises(ValueError):
+            ExperimentLogger(None, log_dir=self.log_dir)
+
+    def test_experiment_logger_rejects_unsafe_ids(self):
+        with self.assertRaises(ValueError):
+            ExperimentLogger("../../etc/passwd", log_dir=self.log_dir)
+        with self.assertRaises(ValueError):
+            get_task_logger("../../etc/passwd", log_dir=self.log_dir)
+
+    def test_task_log_entries_are_visible_before_an_experiment_exists(self):
+        get_task_logger("task-9", log_dir=self.log_dir).info(
+            "mailbox", "task_received", "task received"
+        )
+        entries = read_all_log_entries(self.log_dir)
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0]["experiment_id"])
+        self.assertEqual(entries[0]["mailbox_task_id"], "task-9")
+
+    def test_experiment_created_event_correlates_task_with_new_experiment(self):
+        task_log = get_task_logger("task-9", log_dir=self.log_dir)
+        task_log.info("mailbox", "task_received", "task received")
+        task_log.info("queued", "experiment_created", "experiment created", experiment_id="exp-42")
+
+        entries = read_all_log_entries(self.log_dir)
+        self.assertEqual(len(entries), 2)
+        self.assertIsNone(entries[0]["experiment_id"])
+        self.assertEqual(entries[1]["experiment_id"], "exp-42")
+        self.assertEqual(entries[1]["mailbox_task_id"], "task-9")
+
+    def test_read_experiment_logs_merges_experiment_with_its_task_log(self):
+        get_task_logger("task-9", log_dir=self.log_dir).info(
+            "mailbox", "task_received", "task received"
+        )
+        time.sleep(0.005)
+        ExperimentLogger("exp-42", mailbox_task_id="task-9", log_dir=self.log_dir).info(
+            "implementation", "implementation_started", "starting"
+        )
+
+        merged = read_experiment_logs(self.log_dir, "exp-42", mailbox_task_id="task-9")
+        self.assertEqual([e["event"] for e in merged], ["task_received", "implementation_started"])
+
+    def test_read_experiment_logs_without_mailbox_task_id_reads_only_experiment_file(self):
+        get_task_logger("task-9", log_dir=self.log_dir).info(
+            "mailbox", "task_received", "task received"
+        )
+        ExperimentLogger("exp-42", log_dir=self.log_dir).info(
+            "implementation", "implementation_started", "starting"
+        )
+        merged = read_experiment_logs(self.log_dir, "exp-42")
+        self.assertEqual([e["event"] for e in merged], ["implementation_started"])
+
+
+class MalformedEntryValidationTests(unittest.TestCase):
+    """Gap 3: a syntactically-valid JSON object missing a required field or
+    with the wrong type for a field must be skipped, not surfaced as an
+    unhandled error further up the stack."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmpdir.name)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def _write_raw_lines(self, path: Path, lines: list[str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+
+    def test_entry_missing_required_field_is_skipped(self):
+        path = self.log_dir / "exp-a.jsonl"
+        good = json.dumps({
+            "timestamp": "2026-01-01T00:00:00Z", "level": "INFO", "logger": "nexus.experiment",
+            "experiment_id": "exp-a", "phase": "p", "event": "good",
+        })
+        # Missing "phase" - a syntactically valid JSON object, but not a
+        # well-formed log entry.
+        missing_field = json.dumps({
+            "timestamp": "2026-01-01T00:00:01Z", "level": "INFO", "logger": "nexus.experiment",
+            "experiment_id": "exp-a", "event": "bad",
+        })
+        self._write_raw_lines(path, [good, missing_field])
+
+        entries = read_log_entries(path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["event"], "good")
+
+    def test_entry_with_wrong_field_type_is_skipped(self):
+        path = self.log_dir / "exp-a.jsonl"
+        good = json.dumps({
+            "timestamp": "2026-01-01T00:00:00Z", "level": "INFO", "logger": "nexus.experiment",
+            "experiment_id": "exp-a", "phase": "p", "event": "good",
+        })
+        # exit_code must be an int, not a string.
+        wrong_type = json.dumps({
+            "timestamp": "2026-01-01T00:00:01Z", "level": "INFO", "logger": "nexus.experiment",
+            "experiment_id": "exp-a", "phase": "p", "event": "bad", "exit_code": "not-a-number",
+        })
+        self._write_raw_lines(path, [good, wrong_type])
+
+        entries = read_log_entries(path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["event"], "good")
+
+    def test_entry_with_null_experiment_id_is_accepted(self):
+        # Pre-experiment task-log entries legitimately have no experiment_id.
+        path = self.log_dir / "task-1.jsonl"
+        entry = json.dumps({
+            "timestamp": "2026-01-01T00:00:00Z", "level": "INFO", "logger": "nexus.experiment",
+            "experiment_id": None, "mailbox_task_id": "task-1", "phase": "mailbox", "event": "task_received",
+        })
+        self._write_raw_lines(path, [entry])
+        entries = read_log_entries(path)
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0]["experiment_id"])
+
+    def test_malformed_entry_does_not_break_unified_feed(self):
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        elog.info("p", "good", "fine")
+        bad = json.dumps({
+            "timestamp": "2026-01-01T00:00:01Z", "level": "INFO", "logger": "nexus.experiment",
+            "experiment_id": "exp-a", "event": "missing_phase",
+        })
+        with open(elog.path, "a", encoding="utf-8") as fh:
+            fh.write(bad + "\n")
+
+        entries = read_all_log_entries(self.log_dir)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["event"], "good")
+
+
+class BoundedReadAndCursorTests(unittest.TestCase):
+    """Gap 2: the unified multi-file scan must not read unbounded data per
+    file, and cursor-based pagination must not re-scan already-seen data."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmpdir.name)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_tail_bytes_reads_only_the_trailing_window(self):
+        path = self.log_dir / "big.jsonl"
+        lines = []
+        for i in range(200):
+            lines.append(json.dumps({
+                "timestamp": f"2026-01-01T00:{i:02d}:00Z", "level": "INFO",
+                "logger": "nexus.experiment", "experiment_id": "exp-big",
+                "phase": "p", "event": f"e{i}",
+            }))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        entries = read_log_entries(path, tail_bytes=200)
+        self.assertGreater(len(entries), 0)
+        self.assertLess(len(entries), 200)
+        # Only the newest events survive a small tail window.
+        self.assertEqual(entries[-1]["event"], "e199")
+
+    def test_unified_feed_applies_a_default_tail_bound_per_file(self):
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        for i in range(50):
+            elog.info("p", f"e{i}", "x" * 2000)
+
+        full = read_log_entries(elog.path)
+        bounded = read_all_log_entries(self.log_dir, tail_bytes=500)
+        self.assertLess(len(bounded), len(full))
+
+    def test_before_cursor_excludes_entries_at_or_after_the_cursor(self):
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        for i in range(5):
+            elog.info("p", f"e{i}", "msg")
+            time.sleep(0.002)
+
+        all_entries = read_all_log_entries(self.log_dir)
+        cursor = all_entries[2]["timestamp"]
+        earlier = read_all_log_entries(self.log_dir, before=cursor)
+        self.assertEqual([e["event"] for e in earlier], ["e0", "e1"])
+
+    def test_pagination_via_cursor_produces_no_duplicates(self):
+        elog = ExperimentLogger("exp-a", log_dir=self.log_dir)
+        for i in range(6):
+            elog.info("p", f"e{i}", "msg")
+            time.sleep(0.002)
+
+        first_page = read_all_log_entries(self.log_dir, limit=3)
+        self.assertEqual([e["event"] for e in first_page], ["e3", "e4", "e5"])
+        cursor = first_page[0]["timestamp"]
+        second_page = read_all_log_entries(self.log_dir, limit=3, before=cursor)
+        self.assertEqual([e["event"] for e in second_page], ["e0", "e1", "e2"])
+        seen = {e["event"] for e in first_page} | {e["event"] for e in second_page}
+        self.assertEqual(len(seen), 6)
 
 
 if __name__ == "__main__":
