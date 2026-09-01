@@ -6,6 +6,7 @@
 
 const logsElements = {
   refreshButton: document.querySelector("#logs-refresh-button"),
+  loadOlderButton: document.querySelector("#logs-load-older-button"),
   experimentSelect: document.querySelector("#logs-experiment-select"),
   levelSelect: document.querySelector("#logs-level-select"),
   phaseSelect: document.querySelector("#logs-phase-select"),
@@ -15,6 +16,18 @@ const logsElements = {
   visibleCount: document.querySelector("#logs-visible-count"),
   lastSuccessfulRefresh: document.querySelector("#logs-last-successful-refresh"),
   autoRefreshState: document.querySelector("#logs-auto-refresh-state"),
+};
+
+// Accumulated state for the currently displayed page(s): which URL to
+// re-request for "Ältere laden" (same base path/filters as the last
+// manual refresh), the entries collected so far (oldest first, exactly
+// as returned/merged from the API - no client-side re-sorting), and the
+// cursor for the next older page, if any. Reset on every manual refresh;
+// never touched by any automatic/background process.
+const logsPaginationState = {
+  baseUrl: null,
+  entries: [],
+  nextCursor: null,
 };
 
 function updateLogsErrorStatus() {
@@ -68,22 +81,6 @@ function renderLogsFromDiagnostics(entries) {
     addMetaLine(li, details.join(" · "));
     for (const message of item.diagnostic_messages || []) {
       addMetaLine(li, message);
-    }
-  });
-}
-
-function renderLogsFromActivity(entries) {
-  renderCardList(logsElements.content, entries, "Keine Log-Einträge gefunden.", (li, item) => {
-    addTitle(li, `${item.phase} · ${item.timestamp}`);
-    const details = [];
-    if (item.test_command && item.test_command.length) details.push(item.test_command.join(" "));
-    if (item.test_exit_code !== null && item.test_exit_code !== undefined) details.push(`Exit-Code ${item.test_exit_code}`);
-    if (item.changed_files.length) details.push(`Dateien: ${item.changed_files.join(", ")}`);
-    if (item.rejection_reason) details.push(item.rejection_reason);
-    if (item.policy_rule) details.push(`Regel: ${item.policy_rule}`);
-    addMetaLine(li, details.join(" · "));
-    for (const line of item.test_output_lines || []) {
-      addMetaLine(li, line);
     }
   });
 }
@@ -184,26 +181,72 @@ function renderExperimentLogEntries(entries) {
   logsElements.content.append(list);
 }
 
+function hideLoadOlderButton() {
+  logsPaginationState.baseUrl = null;
+  logsPaginationState.entries = [];
+  logsPaginationState.nextCursor = null;
+  if (logsElements.loadOlderButton) {
+    logsElements.loadOlderButton.hidden = true;
+    logsElements.loadOlderButton.disabled = false;
+    logsElements.loadOlderButton.textContent = "Ältere laden";
+  }
+}
+
+function updateLoadOlderButton() {
+  if (!logsElements.loadOlderButton) return;
+  logsElements.loadOlderButton.hidden = !logsPaginationState.nextCursor;
+}
+
+// Manual-only pagination: fetches exactly one older page using the same
+// endpoint/filters as the last manual refresh, plus the cursor it
+// returned, then prepends the (chronologically older) results to what is
+// already shown. Never triggered automatically - only by this button.
+async function loadOlderLogs() {
+  if (!logsPaginationState.baseUrl || !logsPaginationState.nextCursor) return;
+  const separator = logsPaginationState.baseUrl.includes("?") ? "&" : "?";
+  const url = `${logsPaginationState.baseUrl}${separator}cursor=${encodeURIComponent(logsPaginationState.nextCursor)}`;
+  logsElements.loadOlderButton.disabled = true;
+  logsElements.loadOlderButton.textContent = "Lädt …";
+  try {
+    const data = await requestJson(url, { headers: authHeaders() });
+    const olderEntries = data.entries || [];
+    logsPaginationState.entries = [...olderEntries, ...logsPaginationState.entries];
+    logsPaginationState.nextCursor = data.next_cursor || null;
+    renderExperimentLogEntries(logsPaginationState.entries);
+    updateLogsSuccessStatus(logsPaginationState.entries);
+  } catch (error) {
+    showError(logsElements.content, error.message);
+  } finally {
+    logsElements.loadOlderButton.disabled = false;
+    logsElements.loadOlderButton.textContent = "Ältere laden";
+    updateLoadOlderButton();
+  }
+}
+
 async function loadLogs() {
   const experimentId = logsElements.experimentSelect.value.trim();
   const level = logsElements.levelSelect ? logsElements.levelSelect.value.trim() : "";
   const phase = logsElements.phaseSelect ? logsElements.phaseSelect.value.trim() : "";
   const mailboxTaskId = logsElements.mailboxTaskInput.value.trim();
   logsElements.content.textContent = "Wird geladen …";
+  hideLoadOlderButton();
 
   // A specific experiment is selected: use the dedicated, complete
   // per-experiment JSONL log view (chronological, all internal phases).
   if (state.apiKey && experimentId) {
+    const params = new URLSearchParams({ limit: "500" });
+    if (level) params.set("level", level);
+    if (phase) params.set("phase", phase);
+    const baseUrl = `/experiments/${encodeURIComponent(experimentId)}/logs?${params.toString()}`;
     try {
-      const params = new URLSearchParams({ limit: "500" });
-      if (level) params.set("level", level);
-      if (phase) params.set("phase", phase);
-      const data = await requestJson(`/experiments/${encodeURIComponent(experimentId)}/logs?${params.toString()}`, {
-        headers: authHeaders(),
-      });
+      const data = await requestJson(baseUrl, { headers: authHeaders() });
       const entries = data.entries || [];
+      logsPaginationState.baseUrl = baseUrl;
+      logsPaginationState.entries = entries;
+      logsPaginationState.nextCursor = data.next_cursor || null;
       renderExperimentLogEntries(entries);
       updateLogsSuccessStatus(entries);
+      updateLoadOlderButton();
       return;
     } catch (error) {
       logsElements.count.textContent = "!";
@@ -213,14 +256,25 @@ async function loadLogs() {
     }
   }
 
+  // Default "Alle Experimente" view: the unified, chronological feed of
+  // real structured log entries across every experiment - not the
+  // lifecycle/status summaries from /activity - so a running/new
+  // experiment is visible on refresh without knowing its id up front.
   if (state.apiKey) {
+    const params = new URLSearchParams({ limit: "500" });
+    if (level) params.set("level", level);
+    if (phase) params.set("phase", phase);
+    if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
+    const baseUrl = `/logs?${params.toString()}`;
     try {
-      const params = new URLSearchParams({ limit: "50" });
-      if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
-      const data = await requestJson(`/activity?${params.toString()}`, { headers: authHeaders() });
-      const activity = data.activity || [];
-      renderLogsFromActivity(activity);
-      updateLogsSuccessStatus(activity);
+      const data = await requestJson(baseUrl, { headers: authHeaders() });
+      const entries = data.entries || [];
+      logsPaginationState.baseUrl = baseUrl;
+      logsPaginationState.entries = entries;
+      logsPaginationState.nextCursor = data.next_cursor || null;
+      renderExperimentLogEntries(entries);
+      updateLogsSuccessStatus(entries);
+      updateLoadOlderButton();
       return;
     } catch (error) {
       logsElements.count.textContent = "!";
@@ -245,6 +299,7 @@ async function loadLogs() {
 }
 
 logsElements.refreshButton.addEventListener("click", loadLogs);
+if (logsElements.loadOlderButton) logsElements.loadOlderButton.addEventListener("click", loadOlderLogs);
 logsElements.experimentSelect.addEventListener("change", loadLogs);
 if (logsElements.levelSelect) logsElements.levelSelect.addEventListener("change", loadLogs);
 if (logsElements.phaseSelect) logsElements.phaseSelect.addEventListener("change", loadLogs);

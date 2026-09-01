@@ -259,10 +259,19 @@ class WebClientTests(ApiTestsBase):
         javascript = self.client.get("/static/logs.js").text
         self.assertIn("const visibleCount = renderedEntries.length;", javascript)
         self.assertIn("renderExperimentLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
-        self.assertIn("renderLogsFromActivity(activity);\n      updateLogsSuccessStatus(activity);", javascript)
+        self.assertIn('const baseUrl = `/logs?${params.toString()}`;', javascript)
+        self.assertIn("await requestJson(baseUrl, { headers: authHeaders() });", javascript)
         self.assertIn("renderLogsFromDiagnostics(experiments);\n    updateLogsSuccessStatus(experiments);", javascript)
         self.assertNotIn("setInterval(loadLogs", javascript)
         self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
+
+    def test_logs_default_view_uses_unified_feed_not_activity_summaries(self):
+        """The default "Alle Experimente" view must show real structured
+        log entries (GET /logs) rather than lifecycle/status summaries
+        (GET /activity)."""
+        javascript = self.client.get("/static/logs.js").text
+        self.assertNotIn("/activity?", javascript)
+        self.assertNotIn("renderLogsFromActivity", javascript)
 
     def test_logs_success_timestamp_is_not_updated_in_error_paths(self):
         javascript = self.client.get("/static/logs.js").text

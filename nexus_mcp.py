@@ -351,6 +351,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         limit: int | None = None,
         level: str | None = None,
         phase: str | None = None,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         nexus_api = _api()
         limit = nexus_api.EXPERIMENT_LOGS_DEFAULT_LIMIT if limit is None else limit
@@ -361,6 +362,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             x_api_key=_internal_api_key(),
             level=level,
             phase=phase,
+            cursor=cursor,
             limit=limit,
             service=nexus_api._resolve_experiment_service(),
         )

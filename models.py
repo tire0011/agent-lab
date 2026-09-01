@@ -482,7 +482,7 @@ class ExperimentLogEntry(BaseModel):
     level: str
     logger: str
     message: str | None = None
-    experiment_id: str
+    experiment_id: str | None = None
     mailbox_task_id: str | None = None
     phase: str
     event: str
@@ -502,6 +502,19 @@ class ExperimentLogsResponse(BaseModel):
     count: int
     experiment_id: str
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class UnifiedLogsResponse(BaseModel):
+    """Chronological structured log entries across every experiment.
+
+    Backs the Logs tab's default "Alle Experimente" view; entries use the
+    same explicit allowlist as ``ExperimentLogsResponse``.
+    """
+
+    count: int
+    entries: list[ExperimentLogEntry] = Field(default_factory=list)
+    next_cursor: str | None = None
 
 
 # ---------------------------------------------------------------------------

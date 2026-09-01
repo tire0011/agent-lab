@@ -94,6 +94,7 @@ def _make_service(
         operations_registry=operations_registry,
         orchestrator_factory=orchestrator_factory or _FixedOrchestrator,
         github_work_tracking=github,
+        task_log_dir=str(tmp_path / "experiment-logs"),
     )
 
 
@@ -237,6 +238,7 @@ class TestSubmitApproved(unittest.TestCase):
         es.create_experiment.return_value = exp
         es.get_experiment.return_value = exp
         es.run_experiment.return_value = exp
+        es.experiment_log_dir = str(self.tmp / "experiment-logs")
         return es
 
     def test_submit_approved_calls_experiment_service_once(self):
@@ -477,6 +479,90 @@ class TestApiAuth(unittest.TestCase):
         resp = client.get("/mailbox/tasks")
         app.dependency_overrides.clear()
         self.assertEqual(resp.status_code, 401)
+
+
+class TestTaskLogging(unittest.TestCase):
+    """Gap 1: mailbox intake, approval/rejection, and queueing/experiment
+    creation must produce durable structured log entries visible in the
+    unified Logs feed before an experiment id exists, and correlatable
+    with it once one is created."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _read_task_log(self, svc: MailboxTaskService, approval_id: str) -> list[dict]:
+        path = Path(svc._task_logger(approval_id).path)
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_create_approval_logs_task_received(self):
+        svc = _make_service(self.tmp)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(msg_id, "Do something", "alice", "/f.md", "2026-01-01T00:00:00Z")
+        entries = self._read_task_log(svc, approval.id)
+        events = [(e["phase"], e["event"]) for e in entries]
+        self.assertIn(("mailbox", "task_received"), events)
+        self.assertIsNone(entries[0]["experiment_id"])
+
+    def test_approve_and_reject_are_logged(self):
+        svc = _make_service(self.tmp)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(msg_id, "Do something", "alice", "/f.md", "2026-01-01T00:00:00Z")
+        svc.approve(approval.id)
+        events = [(e["phase"], e["event"]) for e in self._read_task_log(svc, approval.id)]
+        self.assertIn(("mailbox", "task_approved"), events)
+
+        msg_id2 = _insert_mailbox_msg(svc)
+        approval2 = svc.create_approval(msg_id2, "Do other thing", "bob", "/g.md", "2026-01-01T00:00:00Z")
+        svc.reject(approval2.id, "Not needed")
+        events2 = [(e["phase"], e["event"]) for e in self._read_task_log(svc, approval2.id)]
+        self.assertIn(("mailbox", "task_rejected"), events2)
+
+    def test_experiment_creation_correlates_task_log_with_experiment_id(self):
+        exp = _make_exp(id="expLOG", status="queued")
+        es = MagicMock()
+        es.create_experiment.return_value = exp
+        es.get_experiment.return_value = exp
+        es.run_experiment.return_value = exp
+        es.experiment_log_dir = str(self.tmp / "experiment-logs")
+        svc = _make_service(self.tmp, exp_service=es)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
+        svc.approve(approval.id)
+        svc.submit_approved()
+        import time
+        time.sleep(0.1)
+
+        entries = self._read_task_log(svc, approval.id)
+        correlating = [e for e in entries if e["event"] == "experiment_created"]
+        self.assertEqual(len(correlating), 1)
+        self.assertEqual(correlating[0]["experiment_id"], "expLOG")
+        # Every earlier event (intake, approval, GitHub tracking start) has
+        # no experiment_id yet - the whole point of the pre-experiment log.
+        earlier = [e for e in entries if e["event"] != "experiment_created"]
+        self.assertTrue(earlier)
+        self.assertTrue(all(e["experiment_id"] is None for e in earlier))
+
+    def test_github_failure_before_experiment_creation_is_logged(self):
+        exp = _make_exp(id="expBLOCK", status="queued")
+        es = MagicMock()
+        es.create_experiment.return_value = exp
+        es.experiment_log_dir = str(self.tmp / "experiment-logs")
+        github = MagicMock()
+        github.ensure_for_source.side_effect = GitHubWorkTrackingError("Configure GITHUB_TOKEN")
+        svc = _make_service(self.tmp, exp_service=es, github_work_tracking=github)
+        msg_id = _insert_mailbox_msg(svc)
+        approval = svc.create_approval(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
+        svc.approve(approval.id)
+        svc.submit_approved()
+
+        entries = self._read_task_log(svc, approval.id)
+        events = [(e["level"], e["event"]) for e in entries]
+        self.assertIn(("ERROR", "github_work_tracking_failed"), events)
+        es.create_experiment.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -29,9 +29,11 @@ Design goals (see AGENTS.md / the logging task for the full spec):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import re
 import threading
 import traceback
 from datetime import datetime, timezone
@@ -43,6 +45,19 @@ from modules import redaction
 logger = logging.getLogger("nexus.experiment")
 
 DEFAULT_LOG_DIR = "state/experiment-logs"
+
+# Prefix used for the durable, pre-experiment mailbox task log file
+# (``<log_dir>/task-<mailbox_task_id>.jsonl``), so a single directory
+# listing/glob naturally covers both families of JSONL log for the
+# unified log feed.
+TASK_LOG_PREFIX = "task-"
+
+# Any id used to build a log file path (an experiment id or a mailbox
+# task/approval id) must match this allowlist. Both are produced
+# internally as ``uuid.uuid4().hex``, but this guards defensively against
+# a corrupted/legacy record or a future caller passing something
+# unexpected straight through to a filesystem path.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 # Per-entry bounds. Generous enough to stay diagnostically useful, small
 # enough that one bad loop cannot blow up the log file on its own (the
@@ -159,24 +174,46 @@ def sanitize_command(command: list[str] | str | None) -> str | None:
 
 
 class ExperimentLogger:
-    """Append-only structured JSONL logger for exactly one experiment.
+    """Append-only structured JSONL logger for one experiment, or for a
+    mailbox task's pre-experiment events before any experiment exists.
 
-    Not shared global state: callers construct one per experiment (cheap;
-    holds only a path and small config), but concurrent instances pointing
-    at the same file are safe because the per-path lock is process-global.
+    Not shared global state: callers construct one per experiment/task
+    (cheap; holds only a path and small config), but concurrent instances
+    pointing at the same file are safe because the per-path lock is
+    process-global.
+
+    When *experiment_id* is given, entries are written to
+    ``<log_dir>/<experiment_id>.jsonl`` exactly as before. When it is
+    ``None`` (mailbox intake, queueing/orchestration, or a task that never
+    reaches an experiment), *mailbox_task_id* is required and entries go
+    to ``<log_dir>/task-<mailbox_task_id>.jsonl`` instead, still readable
+    through the same ``read_log_entries``/``read_all_log_entries`` path -
+    this is what lets the unified Logs feed show pre-experiment-id events
+    at all, correlated onward via ``mailbox_task_id``.
     """
 
     def __init__(
         self,
-        experiment_id: str,
+        experiment_id: str | None,
         mailbox_task_id: str | None = None,
         log_dir: str | Path = DEFAULT_LOG_DIR,
         max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
     ) -> None:
+        if experiment_id:
+            if not _SAFE_ID_RE.fullmatch(experiment_id):
+                raise ValueError(f"unsafe experiment_id for log path: {experiment_id!r}")
+            key = experiment_id
+        else:
+            if not mailbox_task_id or not _SAFE_ID_RE.fullmatch(mailbox_task_id):
+                raise ValueError(
+                    "ExperimentLogger requires an experiment_id, or a valid "
+                    "mailbox_task_id when no experiment_id is known yet"
+                )
+            key = f"{TASK_LOG_PREFIX}{mailbox_task_id}"
         self.experiment_id = experiment_id
         self.mailbox_task_id = mailbox_task_id
         self._dir = Path(log_dir)
-        self._path = self._dir / f"{experiment_id}.jsonl"
+        self._path = self._dir / f"{key}.jsonl"
         self._max_bytes = max_bytes
         self._limit_notice_written = False
 
@@ -418,6 +455,26 @@ class ExperimentLogger:
         )
 
 
+def get_task_logger(
+    mailbox_task_id: str,
+    log_dir: str | Path = DEFAULT_LOG_DIR,
+    max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+) -> "ExperimentLogger":
+    """Durable structured logger for one mailbox task's pre-experiment
+    events (intake, approval/rejection, queueing/orchestration, GitHub
+    lifecycle preparation) - before any experiment id exists, and even
+    for tasks that never create one (answered/rejected/needs review).
+
+    Writes to ``<log_dir>/task-<mailbox_task_id>.jsonl``; the same file
+    keeps receiving events after an experiment is created (e.g. the
+    ``experiment_created`` binding event), while the experiment's own
+    subsequent pipeline events go to its own ``<experiment_id>.jsonl``
+    via ``ExperimentLogger``/``ExperimentService.get_experiment_logger``.
+    Both are merged chronologically by ``read_all_log_entries``.
+    """
+    return ExperimentLogger(None, mailbox_task_id=mailbox_task_id, log_dir=log_dir, max_bytes=max_bytes)
+
+
 def _format_stacktrace(exc: BaseException) -> str:
     """Bounded, redacted stack trace text (last frames only)."""
     lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
@@ -430,42 +487,144 @@ def _format_stacktrace(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Per-file byte cap applied only when scanning *many* files at once (the
+# unified "Alle Experimente" feed). The per-experiment file itself is
+# already capped at DEFAULT_MAX_LOG_FILE_BYTES (5 MB) by the writer, but
+# multiplied across ``DEFAULT_MAX_LOG_FILES`` (500) that would still mean
+# a single manual refresh could read on the order of gigabytes. Only the
+# most recent slice of each file is read for that feed; a single-file,
+# single-experiment read (``read_log_entries`` used directly, or the
+# unified feed filtered to one ``experiment_id``) is unaffected and still
+# reads the complete (already-bounded) file.
+DEFAULT_UNIFIED_TAIL_BYTES = 256 * 1024  # 256 KiB per file
+
+
+def _tail_read_lines(path: Path, tail_bytes: int | None) -> list[str]:
+    """Return *path*'s lines, optionally reading only the last *tail_bytes*
+    bytes. A partial first line produced by seeking mid-file is dropped
+    rather than risking a corrupt/incomplete JSON object."""
+    if tail_bytes is None:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.readlines()
+
+    with open(path, "rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        if size > tail_bytes:
+            fh.seek(size - tail_bytes)
+            data = fh.read()
+            newline_index = data.find(b"\n")
+            data = data[newline_index + 1 :] if newline_index != -1 else b""
+        else:
+            fh.seek(0)
+            data = fh.read()
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+_REQUIRED_STRING_FIELDS = ("timestamp", "level", "logger", "phase", "event")
+_OPTIONAL_STRING_FIELDS = (
+    "message", "experiment_id", "mailbox_task_id", "command", "cwd",
+    "stdout", "stderr", "exception_type", "exception_message", "stacktrace",
+)
+_OPTIONAL_INT_FIELDS = ("duration_ms", "exit_code")
+
+
+def _is_well_formed_entry(entry: dict[str, Any]) -> bool:
+    """Defensive schema check for one already-JSON-parsed log line.
+
+    A syntactically valid JSON object that is missing a required field or
+    has the wrong type for a field must be skipped *here* - the one place
+    shared by every reader - rather than surfacing as an unhandled
+    validation error once the API layer builds its response model, which
+    would otherwise fail the *entire* feed for one bad line.
+    """
+    for field in _REQUIRED_STRING_FIELDS:
+        value = entry.get(field)
+        if not isinstance(value, str) or not value:
+            return False
+    for field in _OPTIONAL_STRING_FIELDS:
+        value = entry.get(field)
+        if value is not None and not isinstance(value, str):
+            return False
+    for field in _OPTIONAL_INT_FIELDS:
+        value = entry.get(field)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            return False
+    truncated = entry.get("truncated")
+    if truncated is not None and not isinstance(truncated, bool):
+        return False
+    return True
+
+
 def read_log_entries(
     log_path: str | Path,
     *,
     level: str | None = None,
     phase: str | None = None,
     limit: int | None = None,
+    before: str | None = None,
+    tail_bytes: int | None = None,
 ) -> list[dict[str, Any]]:
     """Read one experiment's JSONL log, defensively re-sanitized, chronological.
 
-    Malformed lines (should not normally occur) are skipped rather than
-    raising. Every string field is redacted again on the way out: a
-    defense-in-depth measure independent of the write-path redaction.
+    Malformed lines (invalid JSON, a non-object, or an object missing a
+    required field/of the wrong type) are skipped rather than raising.
+    Every string field is redacted again on the way out: a defense-in-depth
+    measure independent of the write-path redaction. When *tail_bytes* is
+    given, only that many trailing bytes of the file are read (bounded
+    I/O for callers scanning many files at once); *before*, if given,
+    drops entries whose ``timestamp`` string sorts at or after it (a
+    plain string-timestamp cursor - callers that must page correctly
+    across entries sharing a timestamp, or across several files, use the
+    opaque ``encode_log_cursor``/``decode_log_cursor`` pair together with
+    ``_entry_sort_key`` instead; see ``read_experiment_logs`` and
+    ``read_all_log_entries``).
+
+    Each returned entry also carries two internal-only keys, ``_source``
+    (the file's name) and ``_rseq`` (its distance from the newest parsed
+    line in *this* read, 0 = newest): a stable tie-breaker so that two
+    entries sharing an identical ``timestamp`` - whether in the same file
+    or different files - still have a well-defined, reproducible order
+    across separate reads/pages. Both keys are stripped by the API layer
+    before a response model is built and are otherwise harmless (an
+    unknown key is ignored by the allowlisted Pydantic models).
     """
     path = Path(log_path)
     if not path.exists():
         return []
 
     entries: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw_line in fh:
-            raw_line = raw_line.strip()
-            if not raw_line:
-                continue
-            try:
-                entry = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(entry, dict):
-                continue
-            entries.append(_resanitize_entry(entry))
+    for raw_line in _tail_read_lines(path, tail_bytes):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            entry = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if not _is_well_formed_entry(entry):
+            continue
+        entries.append(_resanitize_entry(entry))
+
+    # Attach the tie-breaker *before* any filtering below, so it reflects
+    # each entry's stable position in the file rather than its position
+    # in a level/phase-filtered subset (which could otherwise differ
+    # between two requests using different filters against the same
+    # underlying file/window).
+    source_name = path.name
+    total = len(entries)
+    for index, entry in enumerate(entries):
+        entry["_source"] = source_name
+        entry["_rseq"] = total - 1 - index
 
     if level:
         level_upper = level.upper()
         entries = [e for e in entries if e.get("level") == level_upper]
     if phase:
         entries = [e for e in entries if e.get("phase") == phase]
+    if before:
+        entries = [e for e in entries if str(e.get("timestamp") or "\uffff") < before]
 
     if limit is not None and limit >= 0 and len(entries) > limit:
         # Keep the most recent *limit* entries, still in chronological order.
@@ -491,3 +650,225 @@ def _resanitize_entry(entry: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str):
             cleaned[field] = redaction.redact(value)
     return cleaned
+
+
+def _entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, str, int]:
+    """Total, reproducible chronological order for one entry.
+
+    Primary key is the ISO-8601 ``timestamp`` string (missing timestamps
+    sort last via the ``\uffff`` sentinel). Ties - two entries with an
+    identical timestamp, whether from the same file or different files -
+    are broken by ``experiment_id`` (entries recorded before an
+    experiment id exists - e.g. mailbox intake - carry no ``experiment_id``
+    and therefore sort first, matching the real task path where those
+    events happen earlier), then by ``_source`` (file name) for
+    determinism across two different files sharing both a timestamp and
+    an ``experiment_id``, and finally by ``-_rseq`` so that, within one
+    file, the entry appended *earlier* (further from the end, i.e. a
+    larger ``_rseq``) always sorts first. The ``_source``/``_rseq``
+    fields are attached by ``read_log_entries``; an entry missing them
+    (e.g. a hand-built dict in a test) is treated as the newest possible
+    entry for its file/timestamp so it never silently masks real data.
+    """
+    timestamp = str(entry.get("timestamp") or "\uffff")
+    experiment_id = str(entry.get("experiment_id") or "")
+    source = str(entry.get("_source") or "")
+    rseq = entry.get("_rseq")
+    rseq = rseq if isinstance(rseq, int) and not isinstance(rseq, bool) else 0
+    return (timestamp, experiment_id, source, -rseq)
+
+
+def encode_log_cursor(entry: dict[str, Any]) -> str:
+    """Opaque, URL-safe pagination cursor anchored to one entry.
+
+    Encodes the same ``(timestamp, experiment_id, source, rseq)``
+    quadruple used by ``_entry_sort_key`` so a follow-up call can resume
+    *exactly* after this entry - no earlier, no later - even when several
+    entries share an identical timestamp. Never a bare timestamp string:
+    that alone cannot disambiguate ties and previously caused entries to
+    be skipped or duplicated at a page boundary.
+    """
+    timestamp = str(entry.get("timestamp") or "")
+    experiment_id = str(entry.get("experiment_id") or "")
+    source = str(entry.get("_source") or "")
+    rseq = entry.get("_rseq")
+    rseq = rseq if isinstance(rseq, int) and not isinstance(rseq, bool) else 0
+    payload = json.dumps([timestamp, experiment_id, source, rseq], separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def decode_log_cursor(cursor: str) -> tuple[str, str, str, int] | None:
+    """Inverse of ``encode_log_cursor``; ``None`` for anything else (an
+    empty/legacy/corrupt cursor is treated as "no cursor" - restart from
+    the newest entries - rather than failing the whole request)."""
+    try:
+        payload = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        decoded = json.loads(payload)
+        timestamp, experiment_id, source, rseq = decoded
+        if not isinstance(timestamp, str) or not isinstance(experiment_id, str) or not isinstance(source, str):
+            return None
+        if not isinstance(rseq, int) or isinstance(rseq, bool):
+            return None
+        return (timestamp, experiment_id, source, -rseq)
+    except Exception:
+        return None
+
+
+# Hard ceiling on how many per-experiment JSONL files a single unified-feed
+# read will open, newest-modified first. Bounds worst-case I/O for the
+# "Alle Experimente" view regardless of how many experiments have ever run.
+DEFAULT_MAX_LOG_FILES = 500
+
+
+def read_experiment_logs(
+    log_dir: str | Path,
+    experiment_id: str,
+    *,
+    mailbox_task_id: str | None = None,
+    level: str | None = None,
+    phase: str | None = None,
+    limit: int | None = None,
+    before: str | None = None,
+) -> list[dict[str, Any]]:
+    """Chronological view of one experiment, merged with its correlated
+    mailbox task's pre-experiment log (mailbox intake, approval/rejection,
+    queueing/orchestration) when one exists, so selecting a single
+    experiment shows the same complete task path as the unified feed.
+
+    *mailbox_task_id* must already be resolved/validated server-side (e.g.
+    via ``ExperimentService.mailbox_task_id_for_experiment``), never taken
+    directly from unvalidated request input, since it is used to build a
+    second file path. *experiment_id* is defense-in-depth validated against
+    the same safe-id pattern before being used to build a path; an unsafe
+    value yields an empty result rather than touching the filesystem.
+
+    *before*, if given, is an opaque cursor from ``encode_log_cursor``
+    (see ``read_all_log_entries`` for why a bare timestamp cannot page
+    correctly); an unrecognized/legacy cursor is treated as "no cursor".
+    """
+    if not _SAFE_ID_RE.fullmatch(experiment_id or ""):
+        return []
+
+    directory = Path(log_dir)
+    paths = [directory / f"{experiment_id}.jsonl"]
+    if mailbox_task_id and _SAFE_ID_RE.fullmatch(mailbox_task_id):
+        paths.append(directory / f"{TASK_LOG_PREFIX}{mailbox_task_id}.jsonl")
+
+    entries: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            entries.extend(read_log_entries(path, level=level, phase=phase))
+        except Exception:  # noqa: BLE001 - one bad file must not break the view
+            continue
+
+    entries.sort(key=_entry_sort_key)
+
+    if before:
+        cursor_key = decode_log_cursor(before)
+        if cursor_key is not None:
+            entries = [e for e in entries if _entry_sort_key(e) < cursor_key]
+
+    if limit is not None and limit >= 0 and len(entries) > limit:
+        entries = entries[-limit:]
+    return entries
+
+
+def read_all_log_entries(
+    log_dir: str | Path,
+    *,
+    experiment_id: str | None = None,
+    mailbox_task_id: str | None = None,
+    level: str | None = None,
+    phase: str | None = None,
+    limit: int | None = None,
+    before: str | None = None,
+    max_files: int = DEFAULT_MAX_LOG_FILES,
+    tail_bytes: int | None = DEFAULT_UNIFIED_TAIL_BYTES,
+) -> list[dict[str, Any]]:
+    """Unified, chronological view across every experiment's (and every
+    pre-experiment mailbox task's) JSONL log.
+
+    Backs the Logs tab's default "Alle Experimente" feed: an operator must
+    be able to see a task's complete, real structured log entries (mailbox
+    intake through GitHub lifecycle/adoption) without first knowing or
+    selecting an experiment id. Reuses ``read_log_entries`` per file, so
+    the same defensive re-sanitization and malformed-line skipping apply
+    uniformly. Mailbox intake/queueing events recorded before an
+    experiment id exists live in ``task-<mailbox_task_id>.jsonl`` files
+    (see ``get_task_logger``), which this glob picks up automatically.
+
+    When *experiment_id* is given, only that experiment (merged with its
+    correlated task log, via ``read_experiment_logs``) is read. Otherwise,
+    every file under *log_dir* is scanned, bounded by *max_files*
+    (newest-modified first).
+
+    *before*, if given, must be an opaque cursor produced by
+    ``encode_log_cursor`` for a previously-returned entry (an
+    unrecognized/legacy cursor - e.g. a bare timestamp - is treated as
+    "no cursor", restarting from the newest entries, rather than failing
+    the request). A plain timestamp cannot disambiguate two entries that
+    share it, which previously caused the entry exactly at a page
+    boundary to be silently dropped forever.
+
+    The very first ("no cursor") request only reads the last *tail_bytes*
+    of each file - bounded I/O for the common "just refresh and see the
+    latest" case. As soon as a caller pages further back (*before* is a
+    valid cursor), each candidate file is read in full instead: an
+    explicit, comparatively rare "load older" action may cost more I/O
+    than the default view, but only reading a bounded tail can never
+    reach entries older than that window, however far back the cursor
+    points (this was the *"pagination can never reach entries before the
+    current tail"* case) - correctness beats bounding I/O once the
+    operator has explicitly asked to go back further. *max_files* still
+    caps how many distinct experiments/tasks are scanned either way.
+    """
+    directory = Path(log_dir)
+    if not directory.exists():
+        return []
+
+    if experiment_id:
+        return read_experiment_logs(
+            directory, experiment_id,
+            mailbox_task_id=mailbox_task_id,
+            level=level, phase=phase, limit=limit, before=before,
+        )
+
+    cursor_key: tuple[str, str, str, int] | None = decode_log_cursor(before) if before else None
+    effective_tail_bytes = None if cursor_key is not None else tail_bytes
+
+    try:
+        candidates = [p for p in directory.glob("*.jsonl") if p.is_file()]
+    except OSError:
+        candidates = []
+    try:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    if max_files is not None and max_files >= 0:
+        candidates = candidates[:max_files]
+    paths = candidates
+
+    entries: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            entries.extend(
+                read_log_entries(path, level=level, phase=phase, tail_bytes=effective_tail_bytes)
+            )
+        except Exception:  # noqa: BLE001 - one bad file must not break the feed
+            continue
+
+    if mailbox_task_id:
+        entries = [e for e in entries if e.get("mailbox_task_id") == mailbox_task_id]
+
+    # Missing timestamps (should not occur in practice - every write path
+    # always sets one) sort last rather than first, so a malformed entry
+    # can never mask genuinely older/newer ones at the top of the feed.
+    entries.sort(key=_entry_sort_key)
+
+    if cursor_key is not None:
+        entries = [e for e in entries if _entry_sort_key(e) < cursor_key]
+
+    if limit is not None and limit >= 0 and len(entries) > limit:
+        entries = entries[-limit:]
+
+    return entries
