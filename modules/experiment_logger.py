@@ -491,3 +491,72 @@ def _resanitize_entry(entry: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str):
             cleaned[field] = redaction.redact(value)
     return cleaned
+
+
+# Hard ceiling on how many per-experiment JSONL files a single unified-feed
+# read will open, newest-modified first. Bounds worst-case I/O for the
+# "Alle Experimente" view regardless of how many experiments have ever run.
+DEFAULT_MAX_LOG_FILES = 500
+
+
+def read_all_log_entries(
+    log_dir: str | Path,
+    *,
+    experiment_id: str | None = None,
+    mailbox_task_id: str | None = None,
+    level: str | None = None,
+    phase: str | None = None,
+    limit: int | None = None,
+    max_files: int = DEFAULT_MAX_LOG_FILES,
+) -> list[dict[str, Any]]:
+    """Unified, chronological view across every experiment's JSONL log.
+
+    Backs the Logs tab's default "Alle Experimente" feed: an operator must
+    be able to see a task's complete, real structured log entries (mailbox
+    intake through GitHub lifecycle/adoption) without first knowing or
+    selecting an experiment id. Reuses ``read_log_entries`` per file, so
+    the same defensive re-sanitization, malformed-line skipping, and
+    level/phase filtering apply uniformly.
+
+    When *experiment_id* is given, only that experiment's file is read
+    (equivalent to, but not a replacement for, the dedicated single
+    experiment endpoint). *mailbox_task_id* filters after reading, since
+    that correlation id lives inside each entry rather than in the file
+    name. Bounded by *max_files* (newest-modified first) and *limit*
+    (keeping only the most recent entries, still chronological).
+    """
+    directory = Path(log_dir)
+    if not directory.exists():
+        return []
+
+    if experiment_id:
+        paths = [directory / f"{experiment_id}.jsonl"]
+    else:
+        try:
+            candidates = [p for p in directory.glob("*.jsonl") if p.is_file()]
+        except OSError:
+            candidates = []
+        try:
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            pass
+        if max_files is not None and max_files >= 0:
+            candidates = candidates[:max_files]
+        paths = candidates
+
+    entries: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            entries.extend(read_log_entries(path, level=level, phase=phase))
+        except Exception:  # noqa: BLE001 - one bad file must not break the feed
+            continue
+
+    if mailbox_task_id:
+        entries = [e for e in entries if e.get("mailbox_task_id") == mailbox_task_id]
+
+    entries.sort(key=lambda e: (str(e.get("timestamp") or ""), str(e.get("experiment_id") or "")))
+
+    if limit is not None and limit >= 0 and len(entries) > limit:
+        entries = entries[-limit:]
+
+    return entries

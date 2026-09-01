@@ -504,6 +504,17 @@ class ExperimentLogsResponse(BaseModel):
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
 
 
+class UnifiedLogsResponse(BaseModel):
+    """Chronological structured log entries across every experiment.
+
+    Backs the Logs tab's default "Alle Experimente" view; entries use the
+    same explicit allowlist as ``ExperimentLogsResponse``.
+    """
+
+    count: int
+    entries: list[ExperimentLogEntry] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Operation Chain models
 # ---------------------------------------------------------------------------

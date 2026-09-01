@@ -54,6 +54,7 @@ from models import (
     ExperimentDetail,
     ExperimentLogEntry,
     ExperimentLogsResponse,
+    UnifiedLogsResponse,
     ExperimentsResponse,
     GitCommitPushRequest,
     HealthResponse,
@@ -129,6 +130,8 @@ EXPERIMENTS_DEFAULT_LIMIT = 20
 EXPERIMENTS_MAX_LIMIT = 100
 EXPERIMENT_LOGS_DEFAULT_LIMIT = 500
 EXPERIMENT_LOGS_MAX_LIMIT = 5000
+UNIFIED_LOGS_DEFAULT_LIMIT = 500
+UNIFIED_LOGS_MAX_LIMIT = 5000
 ACTIVITY_DEFAULT_LIMIT = 50
 ACTIVITY_MAX_LIMIT = 200
 OPERATION_CHAINS_DEFAULT_LIMIT = 20
@@ -852,6 +855,58 @@ def get_experiment_logs(
 
     entries = [ExperimentLogEntry(**entry) for entry in raw_entries]
     return ExperimentLogsResponse(count=len(entries), experiment_id=experiment.id, entries=entries)
+
+
+@app.get("/logs", response_model=UnifiedLogsResponse)
+def get_unified_logs(
+    x_api_key: str | None = Header(default=None),
+    level: str | None = Query(default=None),
+    phase: str | None = Query(default=None),
+    experiment_id: str | None = Query(default=None),
+    mailbox_task_id: str | None = Query(default=None),
+    limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> UnifiedLogsResponse:
+    """Single, chronological, structured view *across every experiment*.
+
+    Backs the Logs tab's default "Alle Experimente" feed: unlike
+    ``/activity`` (lifecycle/status summaries only), this returns the real
+    structured JSONL entries written by ``modules.experiment_logger`` -
+    mailbox intake, queueing, implementation, verification, GitHub
+    lifecycle, adoption, and failures/timeouts - merged in chronological
+    order from every ``<experiment_log_dir>/<experiment_id>.jsonl`` file.
+    A running/new experiment is included as soon as it has written any log
+    line, with no dependency on the public diagnostics list or a terminal
+    status.
+    """
+    authorize(x_api_key)
+
+    if level is not None and level.upper() not in _LOG_LEVELS:
+        raise HTTPException(status_code=400, detail="invalid level filter")
+
+    resolved_experiment_id = experiment_id
+    if experiment_id:
+        try:
+            resolved_experiment_id = service.resolve_experiment(experiment_id).id
+        except ExperimentNotFoundError:
+            return UnifiedLogsResponse(count=0, entries=[])
+
+    try:
+        raw_entries = experiment_logger_module.read_all_log_entries(
+            service.experiment_log_dir,
+            experiment_id=resolved_experiment_id,
+            mailbox_task_id=mailbox_task_id,
+            level=level,
+            phase=phase,
+            limit=limit,
+        )
+    except Exception:
+        # Same contract as the single-experiment view: an unreadable log
+        # directory/file is reported as "no entries yet", never a 500.
+        raw_entries = []
+
+    entries = [ExperimentLogEntry(**entry) for entry in raw_entries]
+    return UnifiedLogsResponse(count=len(entries), entries=entries)
 
 
 @app.post("/experiments/{experiment_id}/adopt", response_model=ExperimentAdoptionStatus, status_code=202)
