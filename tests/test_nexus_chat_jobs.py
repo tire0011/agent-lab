@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from modules.experiment_logger import read_all_log_entries
 from modules.nexus_chat_jobs import NexusChatJobService, STATUS_SUCCEEDED
 
 
@@ -32,9 +33,11 @@ class NexusChatJobServiceTests(unittest.TestCase):
         self.assertEqual(current.result.reply, "done")
 
     def test_job_lifecycle_is_logged(self):
-        service = NexusChatJobService(FakeChatService(), id_factory=lambda: "job-log")
-        self.addCleanup(service.close)
-        with self.assertLogs("modules.nexus_chat_jobs", level="INFO") as logs:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = NexusChatJobService(
+                FakeChatService(), id_factory=lambda: "job-log", log_dir=tmp
+            )
+            self.addCleanup(service.close)
             service.submit("hello", session_id="s-log")
             deadline = time.time() + 2
             while time.time() < deadline:
@@ -43,10 +46,11 @@ class NexusChatJobServiceTests(unittest.TestCase):
                     break
                 time.sleep(0.01)
 
-        combined = "\n".join(logs.output)
-        self.assertIn("nexus_chat_job submitted job_id=job-log", combined)
-        self.assertIn("nexus_chat_job running job_id=job-log", combined)
-        self.assertIn("nexus_chat_job succeeded job_id=job-log", combined)
+            entries = read_all_log_entries(tmp, job_id="job-log")
+            self.assertEqual(
+                [entry["event"] for entry in entries],
+                ["job_submitted", "job_running", "job_succeeded"],
+            )
 
     def test_failure_before_experiment_creation_is_structured(self):
         class FailingChatService(FakeChatService):
@@ -73,6 +77,15 @@ class NexusChatJobServiceTests(unittest.TestCase):
                 for line in (Path(tmp) / "chat-job-failed.jsonl").read_text().splitlines()
             ]
             self.assertIn("job_failed", [entry["event"] for entry in lines])
+            failures = [
+                entry
+                for entry in read_all_log_entries(tmp, job_id="job-failed")
+                if entry["level"] == "ERROR"
+            ]
+            self.assertEqual(
+                [entry["event"] for entry in failures],
+                ["job_failed"],
+            )
             self.assertTrue(all(entry["job_id"] == "job-failed" for entry in lines))
             self.assertTrue(all(entry.get("experiment_id") is None for entry in lines))
             self.assertNotIn(

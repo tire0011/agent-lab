@@ -63,6 +63,29 @@ class StructuredJsonlHandlerTests(unittest.TestCase):
                 ["INFO", "WARNING", "ERROR"],
             )
 
+    def test_system_log_rotates_and_keeps_accepting_new_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = StructuredJsonlHandler(
+                tmp,
+                max_bytes=700,
+                backup_count=2,
+            )
+            application_logger = logging.getLogger("modules.rollover")
+            application_logger.addHandler(handler)
+            application_logger.setLevel(logging.INFO)
+            application_logger.propagate = False
+            try:
+                for index in range(12):
+                    application_logger.info("rollover entry %d %s", index, "x" * 100)
+            finally:
+                application_logger.removeHandler(handler)
+                application_logger.propagate = True
+
+            self.assertTrue((Path(tmp) / "system-1.jsonl").exists())
+            entries = read_all_log_entries(Path(tmp))
+            self.assertEqual(entries[-1]["message"], f"rollover entry 11 {'x' * 100}")
+            self.assertLessEqual(len(list(Path(tmp).glob("system*.jsonl"))), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

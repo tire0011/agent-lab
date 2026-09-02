@@ -7,7 +7,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-from modules.experiment_logger import DEFAULT_LOG_DIR, get_system_logger
+from modules.experiment_logger import (
+    DEFAULT_LOG_DIR,
+    DEFAULT_MAX_LOG_FILE_BYTES,
+    DEFAULT_SYSTEM_LOG_BACKUP_COUNT,
+    get_system_logger,
+)
 
 DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _HANDLER_MARKER = "_nexus_central_handler"
@@ -24,9 +29,19 @@ def _configured_level() -> int:
 class StructuredJsonlHandler(logging.Handler):
     """Mirror application stdlib records into the unified JSONL feed."""
 
-    def __init__(self, log_dir: str | Path = DEFAULT_LOG_DIR) -> None:
+    def __init__(
+        self,
+        log_dir: str | Path = DEFAULT_LOG_DIR,
+        *,
+        max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+        backup_count: int = DEFAULT_SYSTEM_LOG_BACKUP_COUNT,
+    ) -> None:
         super().__init__(level=_configured_level())
-        self._structured = get_system_logger(log_dir=log_dir)
+        self._structured = get_system_logger(
+            log_dir=log_dir,
+            max_bytes=max_bytes,
+            backup_count=backup_count,
+        )
 
     def emit(self, record: logging.LogRecord) -> None:
         # ExperimentLogger already writes JSONL before mirroring to stdlib.

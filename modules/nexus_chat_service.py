@@ -253,15 +253,6 @@ class NexusChatService:
                 action=decision.action,
                 status=status,
             )
-        except Exception as exc:
-            if task_log is not None:
-                task_log.error(
-                    "chat",
-                    "request_failed",
-                    "chat request failed before completion",
-                    exc=exc,
-                )
-            raise
         finally:
             close = getattr(orchestrator, "close", None)
             if close:

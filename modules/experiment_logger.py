@@ -69,6 +69,7 @@ MAX_STACKTRACE_CHARS = 4000
 # entries are dropped (a single terminal marker entry is written once)
 # rather than growing without bound.
 DEFAULT_MAX_LOG_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+DEFAULT_SYSTEM_LOG_BACKUP_COUNT = 3
 
 _VALID_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 _LEVEL_TO_PY = {
@@ -200,6 +201,7 @@ class ExperimentLogger:
         *,
         _system: bool = False,
         _mirror: bool = True,
+        _rotate_backups: int = 0,
     ) -> None:
         if experiment_id:
             if not _SAFE_ID_RE.fullmatch(experiment_id):
@@ -227,6 +229,7 @@ class ExperimentLogger:
         self._max_bytes = max_bytes
         self._limit_notice_written = False
         self._mirror = _mirror
+        self._rotate_backups = max(0, _rotate_backups)
 
     @property
     def path(self) -> Path:
@@ -432,6 +435,14 @@ class ExperimentLogger:
             except FileNotFoundError:
                 current_size = 0
 
+            if (
+                self._rotate_backups
+                and current_size > 0
+                and current_size + len(line.encode("utf-8")) > self._max_bytes
+            ):
+                self._rotate()
+                current_size = 0
+
             if current_size >= self._max_bytes:
                 if not self._limit_notice_written:
                     notice = {
@@ -449,6 +460,17 @@ class ExperimentLogger:
                 return
 
             self._write_line(line)
+
+    def _rotate(self) -> None:
+        """Bound retained system logs while keeping the active file writable."""
+        oldest = self._dir / f"{SYSTEM_LOG_KEY}-{self._rotate_backups}.jsonl"
+        oldest.unlink(missing_ok=True)
+        for index in range(self._rotate_backups - 1, 0, -1):
+            source = self._dir / f"{SYSTEM_LOG_KEY}-{index}.jsonl"
+            if source.exists():
+                source.replace(self._dir / f"{SYSTEM_LOG_KEY}-{index + 1}.jsonl")
+        if self._path.exists():
+            self._path.replace(self._dir / f"{SYSTEM_LOG_KEY}-1.jsonl")
 
     def _write_line(self, line: str) -> None:
         # Open/append/flush/fsync per line: entries must survive a crash
@@ -514,6 +536,7 @@ def get_chat_logger(
 def get_system_logger(
     log_dir: str | Path = DEFAULT_LOG_DIR,
     max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+    backup_count: int = DEFAULT_SYSTEM_LOG_BACKUP_COUNT,
 ) -> "ExperimentLogger":
     """Structured sink used by the centralized stdlib logging handler."""
     return ExperimentLogger(
@@ -522,6 +545,7 @@ def get_system_logger(
         max_bytes=max_bytes,
         _system=True,
         _mirror=False,
+        _rotate_backups=backup_count,
     )
 
 

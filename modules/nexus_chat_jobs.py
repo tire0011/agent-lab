@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import queue
 import threading
 import uuid
@@ -9,8 +8,6 @@ from typing import Callable
 
 from modules.experiment_logger import DEFAULT_LOG_DIR, get_chat_logger
 from modules.nexus_chat_service import NexusChatResult, NexusChatService
-
-logger = logging.getLogger(__name__)
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -81,10 +78,6 @@ class NexusChatJobService:
         )
         with self._lock:
             self._jobs[job.id] = job
-        logger.info(
-            "nexus_chat_job submitted job_id=%s session_id=%s message_chars=%s",
-            job.id, session_id or "-", len(text),
-        )
         get_chat_logger(job.id, session_id=session_id, log_dir=self.log_dir).info(
             "chat", "job_submitted", "chat job submitted"
         )
@@ -121,25 +114,16 @@ class NexusChatJobService:
             message = job.message
             session_id = job.session_id
 
-        logger.info(
-            "nexus_chat_job running job_id=%s session_id=%s message_chars=%s",
-            job_id, session_id or "-", len(message),
-        )
         task_log = get_chat_logger(job_id, session_id=session_id, log_dir=self.log_dir)
         task_log.info("chat", "job_running", "chat job started")
         try:
             result = self.chat_service.handle(message, session_id=session_id, job_id=job_id)
         except Exception as exc:
-            logger.exception("nexus_chat_job failed job_id=%s", job_id)
             with self._lock:
                 job = self._jobs.get(job_id)
                 if job is not None:
                     job.status = STATUS_FAILED
                     job.error = f"{type(exc).__name__}: {exc}"
-            logger.error(
-                "nexus_chat_job failed job_id=%s session_id=%s error_type=%s",
-                job_id, session_id or "-", type(exc).__name__,
-            )
             task_log.error("chat", "job_failed", "chat job failed", exc=exc)
             return
 
@@ -149,10 +133,6 @@ class NexusChatJobService:
                 job.status = STATUS_SUCCEEDED
                 job.result = result
                 job.session_id = result.session_id
-        logger.info(
-            "nexus_chat_job succeeded job_id=%s session_id=%s action=%s experiment_id=%s",
-            job_id, result.session_id, result.action, result.experiment_id or "-",
-        )
         task_log.bind_session_id(result.session_id)
         task_log.info(
             "chat",
