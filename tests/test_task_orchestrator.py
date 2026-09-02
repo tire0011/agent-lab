@@ -444,6 +444,64 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_python_run_signature_distinguishes_working_directories(self):
+        for name in ("scripts", "tools"):
+            (self.registry.repo_root / name).mkdir(parents=True, exist_ok=True)
+        client = _Client([
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"scripts","reason":"run scripts tests"}',
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"tools","reason":"run tools tests"}',
+            '{"type":"action","action":"answer","message":"Both suites ran.","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\nOK", None),
+            ) as command_mock:
+                result = orchestrator.run("Run both test suites")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        # A different working directory is a materially different call and must
+        # not be rejected as a duplicate tool call.
+        self.assertEqual(command_mock.call_count, 2)
+        self.assertNotIn("event", result.observations[1])
+        self.assertEqual(
+            [str(call.args[1]) for call in command_mock.call_args_list],
+            [
+                str((self.registry.repo_root / "scripts").resolve()),
+                str((self.registry.repo_root / "tools").resolve()),
+            ],
+        )
+
+    def test_python_run_signature_still_blocks_an_identical_repeat(self):
+        (self.registry.repo_root / "scripts").mkdir(parents=True, exist_ok=True)
+        client = _Client([
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"scripts","reason":"run tests"}',
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"scripts","reason":"run the same tests again"}',
+            '{"type":"action","action":"answer","message":"Tests ran.","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\nOK", None),
+            ) as command_mock:
+                result = orchestrator.run("Run the tests")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(command_mock.call_count, 1)
+        self.assertEqual(result.observations[1]["event"], "duplicate_tool_call")
+
     def test_delegate_is_tool_and_local_controller_decides_after_result(self):
         delegation = _Delegation()
         client = _Client([

@@ -181,6 +181,43 @@ class CorrectedCommandTests(unittest.TestCase):
             )
         )
 
+    def test_compound_command_tail_is_preserved_verbatim(self):
+        for tail in (
+            "script.py && echo done",
+            "script.py | tee out.txt",
+            "script.py > out.txt 2>&1",
+            "script.py; echo done",
+            "-c 'print(\"a b\")'",
+        ):
+            with self.subTest(tail=tail):
+                mapping = corrected_command(
+                    f"python {tail}",
+                    missing_executable="python",
+                    interpreter="/opt/venv/bin/python",
+                )
+                assert mapping is not None
+                self.assertEqual(mapping[0], f"/opt/venv/bin/python {tail}")
+
+    def test_interpreter_with_spaces_is_quoted(self):
+        mapping = corrected_command(
+            "python script.py && echo done",
+            missing_executable="python",
+            interpreter="/opt/my venv/bin/python",
+        )
+        assert mapping is not None
+        self.assertEqual(mapping[0], "'/opt/my venv/bin/python' script.py && echo done")
+
+    def test_leading_token_that_is_not_a_plain_word_is_not_corrected(self):
+        for command in ('"python" script.py', "PYTHONPATH=. python script.py"):
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    corrected_command(
+                        command,
+                        missing_executable="python",
+                        interpreter="/opt/venv/bin/python",
+                    )
+                )
+
 
 class SanitizedCommandTests(unittest.TestCase):
     def test_secrets_are_scrubbed_but_interpreter_paths_survive(self):

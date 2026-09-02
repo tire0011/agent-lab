@@ -48,6 +48,10 @@ _PYTHON_ALIASES = ("python", "python3")
 _PIP_ALIASES = ("pip", "pip3")
 
 _EXIT_CODE_RE = re.compile(r"(?im)^[^\w]*exit[ _]code[^\w]*[:\s]\s*[^\w]*(\d+)")
+# A plain, unquoted leading executable token. Deliberately excludes quotes and
+# shell metacharacters so a correction can splice the replacement in without
+# reinterpreting the rest of the command line.
+_LEADING_TOKEN_RE = re.compile(r"^([\w./+@:-]+)(?=\s|$)")
 _NOT_FOUND_RE = re.compile(
     r"(?im)^(?:.*?:\s*)?(?:line\s+\d+:\s*)?([\w.\-/+]+):\s*(?:command\s+not\s+found|not\s+found)\s*$"
 )
@@ -184,35 +188,34 @@ def corrected_command(
 ) -> tuple[str, str] | None:
     """Return ``(corrected_command, mapping)`` for a known executable mapping.
 
-    Only the leading token of the command is remapped, and only when it is the
-    executable the shell could not resolve. Unknown executables return ``None``
-    so the caller can report a controlled missing-capability observation
-    instead of guessing.
+    Only the leading executable token is replaced; the remainder of the command
+    line is preserved verbatim, so shell operators (``&&``, ``|``, ``>``, ...),
+    quoting and redirection in the tail keep their original meaning. Unknown
+    executables, and commands whose leading token is not the unresolved
+    executable, return ``None`` so the caller can report a controlled
+    missing-capability observation instead of guessing.
     """
     command = (command or "").strip()
     if not command:
         return None
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
+    match = _LEADING_TOKEN_RE.match(command)
+    if match is None:
         return None
-    if not tokens:
-        return None
-    leading = tokens[0]
+    leading = match.group(1)
     if Path(leading).name != Path(missing_executable).name:
         return None
 
     name = Path(leading).name
     if name in _PYTHON_ALIASES:
-        replacement = [interpreter]
+        replacement = shlex.quote(interpreter)
         mapping = f"{name} -> configured python interpreter"
     elif name in _PIP_ALIASES:
-        replacement = [interpreter, "-m", "pip"]
+        replacement = f"{shlex.quote(interpreter)} -m pip"
         mapping = f"{name} -> configured python interpreter -m pip"
     else:
         return None
 
-    rebuilt = " ".join(shlex.quote(part) for part in [*replacement, *tokens[1:]])
+    rebuilt = replacement + command[match.end(1):]
     if rebuilt == command:
         return None
     return rebuilt, mapping

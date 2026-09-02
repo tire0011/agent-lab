@@ -522,8 +522,7 @@ Rules:
             return normalized
         return decision
 
-    @staticmethod
-    def _tool_identity(decision: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _tool_identity(self, decision: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         tool = str(decision.get("tool", "")).strip()
         if tool == "operation":
             return tool, {
@@ -545,10 +544,19 @@ Rules:
         if tool == ACTION_COMMAND:
             return tool, {"command": str(decision.get("command", "")).strip()}
         if tool == TOOL_PYTHON_RUN:
+            # The working directory changes module/script resolution, so two
+            # otherwise identical python_run calls in different directories are
+            # materially different calls and must not collapse into one
+            # duplicate-tool-call signature.
+            try:
+                cwd = str(self._resolve_cwd(decision.get("cwd")))
+            except TaskOrchestratorError:
+                cwd = str(decision.get("cwd", "")).strip()
             return tool, {
                 "script": str(decision.get("script", "")).strip(),
                 "module": str(decision.get("module", "")).strip(),
                 "argv": [str(item) for item in (decision.get("argv") or [])],
+                "cwd": cwd,
             }
         return tool, dict(decision.get("args") or {})
 
