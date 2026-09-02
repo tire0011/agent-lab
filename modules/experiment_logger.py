@@ -1,10 +1,8 @@
-"""Centralized, structured, per-experiment logging for Nexus.
+"""Centralized structured JSONL logging for Nexus.
 
-Every experiment gets exactly one durable, append-only JSONL log at
-``state/experiment-logs/<experiment_id>.jsonl``. Each line is one complete,
-self-contained JSON object describing a single event anywhere in the
-Mailbox -> Approval -> ExperimentService -> Codex/Git/test pipeline, so a
-single file makes an entire task/experiment run understandable end to end.
+Experiments, pre-approval mailbox messages, chat jobs, and system records use
+separate durable files under ``state/experiment-logs`` and are merged by the
+read path into one chronological feed.
 
 Design goals (see AGENTS.md / the logging task for the full spec):
   * Reuse the *existing* central redaction helpers (``modules.redaction``)
@@ -17,11 +15,8 @@ Design goals (see AGENTS.md / the logging task for the full spec):
   * Bounded: single messages/outputs are truncated, and each experiment's
     log file has a hard size ceiling; both cases are flagged explicitly
     (``truncated: true``) rather than silently dropping data.
-  * The same important events are *also* emitted through the stdlib
-    ``logging`` module (already wired to journald via each entrypoint's
-    existing ``logging.basicConfig``/uvicorn setup) — this module never
-    replaces that, it complements it with the durable structured detail
-    that is too large for a syslog line.
+  * Important events are also emitted through stdlib ``logging``, configured
+    consistently for every entrypoint by ``modules.logging_config``.
   * A failure inside this module (disk full, permission error, …) must
     never propagate to the caller: the actual experiment/mailbox pipeline
     must keep running unaffected.
@@ -36,11 +31,17 @@ import os
 import re
 import threading
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from modules import redaction
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development fallback
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger("nexus.experiment")
 
@@ -51,6 +52,8 @@ DEFAULT_LOG_DIR = "state/experiment-logs"
 # listing/glob naturally covers both families of JSONL log for the
 # unified log feed.
 TASK_LOG_PREFIX = "task-"
+CHAT_LOG_PREFIX = "chat-"
+SYSTEM_LOG_KEY = "system"
 
 # Any id used to build a log file path (an experiment id or a mailbox
 # task/approval id) must match this allowlist. Both are produced
@@ -72,6 +75,7 @@ MAX_STACKTRACE_CHARS = 4000
 # entries are dropped (a single terminal marker entry is written once)
 # rather than growing without bound.
 DEFAULT_MAX_LOG_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+DEFAULT_SYSTEM_LOG_BACKUP_COUNT = 3
 
 _VALID_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 _LEVEL_TO_PY = {
@@ -196,13 +200,25 @@ class ExperimentLogger:
         self,
         experiment_id: str | None,
         mailbox_task_id: str | None = None,
+        job_id: str | None = None,
+        session_id: str | None = None,
         log_dir: str | Path = DEFAULT_LOG_DIR,
         max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+        *,
+        _system: bool = False,
+        _mirror: bool = True,
+        _rotate_backups: int = 0,
     ) -> None:
         if experiment_id:
             if not _SAFE_ID_RE.fullmatch(experiment_id):
                 raise ValueError(f"unsafe experiment_id for log path: {experiment_id!r}")
             key = experiment_id
+        elif job_id:
+            if not _SAFE_ID_RE.fullmatch(job_id):
+                raise ValueError(f"unsafe job_id for log path: {job_id!r}")
+            key = f"{CHAT_LOG_PREFIX}{job_id}"
+        elif _system:
+            key = SYSTEM_LOG_KEY
         else:
             if not mailbox_task_id or not _SAFE_ID_RE.fullmatch(mailbox_task_id):
                 raise ValueError(
@@ -212,10 +228,14 @@ class ExperimentLogger:
             key = f"{TASK_LOG_PREFIX}{mailbox_task_id}"
         self.experiment_id = experiment_id
         self.mailbox_task_id = mailbox_task_id
+        self.job_id = redaction.redact(job_id) if job_id else None
+        self.session_id = redaction.redact(session_id) if session_id else None
         self._dir = Path(log_dir)
         self._path = self._dir / f"{key}.jsonl"
         self._max_bytes = max_bytes
         self._limit_notice_written = False
+        self._mirror = _mirror
+        self._rotate_backups = max(0, _rotate_backups)
 
     @property
     def path(self) -> Path:
@@ -225,6 +245,10 @@ class ExperimentLogger:
         """Attach a mailbox task id discovered after this logger was created."""
         if mailbox_task_id:
             self.mailbox_task_id = mailbox_task_id
+
+    def bind_session_id(self, session_id: str | None) -> None:
+        if session_id:
+            self.session_id = redaction.redact(session_id)
 
     # ------------------------------------------------------------------
     # Convenience level methods
@@ -350,6 +374,10 @@ class ExperimentLogger:
         }
         if self.mailbox_task_id:
             entry["mailbox_task_id"] = self.mailbox_task_id
+        if self.job_id:
+            entry["job_id"] = self.job_id
+        if self.session_id:
+            entry["session_id"] = self.session_id
         if duration_ms is not None:
             entry["duration_ms"] = int(duration_ms)
         if command is not None:
@@ -400,16 +428,25 @@ class ExperimentLogger:
             entry["truncated"] = True
 
         self._append(entry)
-        self._mirror_to_journald(level, phase, event, message)
+        if self._mirror:
+            self._mirror_to_journald(level, phase, event, message)
 
     def _append(self, entry: dict[str, Any]) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
         path_key = str(self._path)
         line = json.dumps(entry, ensure_ascii=False) + "\n"
-        with _lock_for(path_key):
+        with _lock_for(path_key), self._interprocess_lock():
             try:
                 current_size = self._path.stat().st_size
             except FileNotFoundError:
+                current_size = 0
+
+            if (
+                self._rotate_backups
+                and current_size > 0
+                and current_size + len(line.encode("utf-8")) > self._max_bytes
+            ):
+                self._rotate()
                 current_size = 0
 
             if current_size >= self._max_bytes:
@@ -429,6 +466,30 @@ class ExperimentLogger:
                 return
 
             self._write_line(line)
+
+    @contextmanager
+    def _interprocess_lock(self):
+        if not self._rotate_backups or fcntl is None:
+            yield
+            return
+        lock_path = self._dir / f".{SYSTEM_LOG_KEY}.lock"
+        with open(lock_path, "a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _rotate(self) -> None:
+        """Bound retained system logs while keeping the active file writable."""
+        oldest = self._dir / f"{SYSTEM_LOG_KEY}-{self._rotate_backups}.jsonl"
+        oldest.unlink(missing_ok=True)
+        for index in range(self._rotate_backups - 1, 0, -1):
+            source = self._dir / f"{SYSTEM_LOG_KEY}-{index}.jsonl"
+            if source.exists():
+                source.replace(self._dir / f"{SYSTEM_LOG_KEY}-{index + 1}.jsonl")
+        if self._path.exists():
+            self._path.replace(self._dir / f"{SYSTEM_LOG_KEY}-1.jsonl")
 
     def _write_line(self, line: str) -> None:
         # Open/append/flush/fsync per line: entries must survive a crash
@@ -473,6 +534,38 @@ def get_task_logger(
     Both are merged chronologically by ``read_all_log_entries``.
     """
     return ExperimentLogger(None, mailbox_task_id=mailbox_task_id, log_dir=log_dir, max_bytes=max_bytes)
+
+
+def get_chat_logger(
+    job_id: str,
+    session_id: str | None = None,
+    log_dir: str | Path = DEFAULT_LOG_DIR,
+    max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+) -> "ExperimentLogger":
+    """Durable structured logger for a chat job before an experiment exists."""
+    return ExperimentLogger(
+        None,
+        job_id=job_id,
+        session_id=session_id,
+        log_dir=log_dir,
+        max_bytes=max_bytes,
+    )
+
+
+def get_system_logger(
+    log_dir: str | Path = DEFAULT_LOG_DIR,
+    max_bytes: int = DEFAULT_MAX_LOG_FILE_BYTES,
+    backup_count: int = DEFAULT_SYSTEM_LOG_BACKUP_COUNT,
+) -> "ExperimentLogger":
+    """Structured sink used by the centralized stdlib logging handler."""
+    return ExperimentLogger(
+        None,
+        log_dir=log_dir,
+        max_bytes=max_bytes,
+        _system=True,
+        _mirror=False,
+        _rotate_backups=backup_count,
+    )
 
 
 def _format_stacktrace(exc: BaseException) -> str:
@@ -522,7 +615,7 @@ def _tail_read_lines(path: Path, tail_bytes: int | None) -> list[str]:
 
 _REQUIRED_STRING_FIELDS = ("timestamp", "level", "logger", "phase", "event")
 _OPTIONAL_STRING_FIELDS = (
-    "message", "experiment_id", "mailbox_task_id", "command", "cwd",
+    "message", "experiment_id", "mailbox_task_id", "job_id", "session_id", "command", "cwd",
     "stdout", "stderr", "exception_type", "exception_message", "stacktrace",
 )
 _OPTIONAL_INT_FIELDS = ("duration_ms", "exit_code")
@@ -560,6 +653,8 @@ def read_log_entries(
     *,
     level: str | None = None,
     phase: str | None = None,
+    job_id: str | None = None,
+    session_id: str | None = None,
     limit: int | None = None,
     before: str | None = None,
     tail_bytes: int | None = None,
@@ -623,6 +718,10 @@ def read_log_entries(
         entries = [e for e in entries if e.get("level") == level_upper]
     if phase:
         entries = [e for e in entries if e.get("phase") == phase]
+    if job_id:
+        entries = [e for e in entries if e.get("job_id") == job_id]
+    if session_id:
+        entries = [e for e in entries if e.get("session_id") == session_id]
     if before:
         entries = [e for e in entries if str(e.get("timestamp") or "\uffff") < before]
 
@@ -640,6 +739,8 @@ _STRING_FIELDS_TO_REDACT = (
     "stderr",
     "exception_message",
     "stacktrace",
+    "job_id",
+    "session_id",
 )
 
 
@@ -750,16 +851,15 @@ def read_experiment_logs(
         return []
 
     directory = Path(log_dir)
+    if not directory.is_dir():
+        raise OSError(f"log directory is unavailable: {directory}")
     paths = [directory / f"{experiment_id}.jsonl"]
     if mailbox_task_id and _SAFE_ID_RE.fullmatch(mailbox_task_id):
         paths.append(directory / f"{TASK_LOG_PREFIX}{mailbox_task_id}.jsonl")
 
     entries: list[dict[str, Any]] = []
     for path in paths:
-        try:
-            entries.extend(read_log_entries(path, level=level, phase=phase))
-        except Exception:  # noqa: BLE001 - one bad file must not break the view
-            continue
+        entries.extend(read_log_entries(path, level=level, phase=phase))
 
     entries.sort(key=_entry_sort_key)
 
@@ -780,6 +880,8 @@ def read_all_log_entries(
     mailbox_task_id: str | None = None,
     level: str | None = None,
     phase: str | None = None,
+    job_id: str | None = None,
+    session_id: str | None = None,
     limit: int | None = None,
     before: str | None = None,
     max_files: int = DEFAULT_MAX_LOG_FILES,
@@ -823,27 +925,37 @@ def read_all_log_entries(
     caps how many distinct experiments/tasks are scanned either way.
     """
     directory = Path(log_dir)
-    if not directory.exists():
-        return []
+    if not directory.is_dir():
+        raise OSError(f"log directory is unavailable: {directory}")
 
     if experiment_id:
-        return read_experiment_logs(
+        entries = read_experiment_logs(
             directory, experiment_id,
             mailbox_task_id=mailbox_task_id,
-            level=level, phase=phase, limit=limit, before=before,
+            level=level, phase=phase,
+            limit=None if (job_id or session_id) else limit,
+            before=before,
         )
+        if job_id:
+            entries = [entry for entry in entries if entry.get("job_id") == job_id]
+        if session_id:
+            entries = [entry for entry in entries if entry.get("session_id") == session_id]
+        if limit is not None and limit >= 0 and len(entries) > limit:
+            entries = entries[-limit:]
+        return entries
 
     cursor_key: tuple[str, str, str, int] | None = decode_log_cursor(before) if before else None
     effective_tail_bytes = None if cursor_key is not None else tail_bytes
 
-    try:
-        candidates = [p for p in directory.glob("*.jsonl") if p.is_file()]
-    except OSError:
-        candidates = []
-    try:
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        pass
+    candidates_with_mtime: list[tuple[float, Path]] = []
+    for path in directory.glob("*.jsonl"):
+        try:
+            if path.is_file():
+                candidates_with_mtime.append((path.stat().st_mtime, path))
+        except FileNotFoundError:
+            continue
+    candidates_with_mtime.sort(key=lambda item: item[0], reverse=True)
+    candidates = [path for _, path in candidates_with_mtime]
     if max_files is not None and max_files >= 0:
         candidates = candidates[:max_files]
     paths = candidates
@@ -852,9 +964,16 @@ def read_all_log_entries(
     for path in paths:
         try:
             entries.extend(
-                read_log_entries(path, level=level, phase=phase, tail_bytes=effective_tail_bytes)
+                read_log_entries(
+                    path,
+                    level=level,
+                    phase=phase,
+                    job_id=job_id,
+                    session_id=session_id,
+                    tail_bytes=effective_tail_bytes,
+                )
             )
-        except Exception:  # noqa: BLE001 - one bad file must not break the feed
+        except FileNotFoundError:
             continue
 
     if mailbox_task_id:

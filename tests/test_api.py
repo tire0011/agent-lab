@@ -255,6 +255,17 @@ class WebClientTests(ApiTestsBase):
         self.assertIn("Sichtbar:", html)
         self.assertIn("Zuletzt erfolgreich aktualisiert:", html)
 
+    def test_logs_render_and_filter_optional_chat_correlations(self):
+        html = self.client.get("/").text
+        javascript = self.client.get("/static/logs.js").text
+        self.assertIn('id="logs-job-input"', html)
+        self.assertIn('id="logs-session-input"', html)
+        self.assertIn('addDetail("Chat-Job-ID", entry.job_id)', javascript)
+        self.assertIn('addDetail("Session-ID", entry.session_id)', javascript)
+        self.assertIn('if (jobId) params.set("job_id", jobId)', javascript)
+        self.assertIn('if (sessionId) params.set("session_id", sessionId)', javascript)
+        self.assertNotIn("setInterval(loadLogs", javascript)
+
     def test_logs_refresh_uses_rendered_arrays_and_shared_load_function(self):
         javascript = self.client.get("/static/logs.js").text
         self.assertIn("const visibleCount = renderedEntries.length;", javascript)

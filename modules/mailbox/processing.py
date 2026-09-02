@@ -9,6 +9,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from modules.experiment_logger import DEFAULT_LOG_DIR, get_task_logger
+
 from .core import (
     MAX_RETRY,
     STATUS_DEFERRED,
@@ -30,6 +32,12 @@ from .core import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _transient_mailbox_task_id(relative_source: str) -> str:
+    """Stable, content-free correlation id available before parsing succeeds."""
+    digest = hashlib.sha256(relative_source.encode("utf-8", errors="replace")).hexdigest()[:32]
+    return f"mailbox-{digest}"
 
 
 def _process_idea(
@@ -305,6 +313,7 @@ class MailboxProcessor:
         dry_run: bool = False,
         operation_chain_service: Any = None,
         mailbox_config: Any = None,
+        task_log_dir: str | Path = DEFAULT_LOG_DIR,
     ) -> None:
         if mailbox_config is not None:
             self._mailbox_repo_path: Path = mailbox_config.mailbox_repo_path
@@ -325,6 +334,7 @@ class MailboxProcessor:
         self.db_path = db_path
         self.dry_run = dry_run
         self.operation_chain_service = operation_chain_service
+        self.task_log_dir = Path(task_log_dir)
         self._conn: sqlite3.Connection | None = None
 
     @property
@@ -431,6 +441,16 @@ class MailboxProcessor:
 
     def _process_file(self, file_path: Path) -> dict[str, Any]:
         rel = str(file_path.relative_to(self._mailbox_repo_path))
+        task_log = get_task_logger(
+            _transient_mailbox_task_id(rel),
+            log_dir=self.task_log_dir,
+        )
+        task_log.info(
+            "mailbox",
+            "message_received",
+            "mailbox message discovered",
+            source_file=file_path.name,
+        )
 
         existing = self._get_existing_record(file_path)
         if existing:
@@ -460,6 +480,13 @@ class MailboxProcessor:
             msg = MailboxMessage.load(file_path, self.inbox)
         except (ValueError, UnicodeDecodeError) as exc:
             self._record_failure(file_path, str(exc), existing)
+            task_log.warning(
+                "mailbox",
+                "message_rejected",
+                f"mailbox message rejected during validation: {exc}",
+                source_file=file_path.name,
+                validation_error=str(exc),
+            )
             return {"file": rel, "status": "failed", "error": str(exc)}
 
         commit_sha = git_current_commit(self._mailbox_repo_path)
@@ -518,6 +545,13 @@ class MailboxProcessor:
         except Exception as exc:
             logger.exception("Error processing %s", file_path)
             self._record_failure(file_path, str(exc), {"id": db_msg_id})
+            task_log.error(
+                "mailbox",
+                "message_processing_failed",
+                "mailbox message processing failed",
+                exc=exc,
+                source_file=file_path.name,
+            )
             return {"file": rel, "status": "failed", "error": str(exc)}
 
         processed_at = _now_iso()

@@ -21,7 +21,7 @@ os.environ.setdefault("AGENT_API_KEY", "test-key")
 from fastapi.testclient import TestClient
 
 import api
-from modules.experiment_logger import ExperimentLogger
+from modules.experiment_logger import ExperimentLogger, get_chat_logger
 from modules.experiment_service import ExperimentNotFoundError
 
 SECRET = "abcdef0123456789abcdef0123456789"
@@ -153,6 +153,23 @@ class UnifiedLogsApiTests(unittest.TestCase):
         self.assertEqual(body["count"], 2)
         self.assertTrue(all(e["mailbox_task_id"] == "task-bb" for e in body["entries"]))
 
+    def test_filters_by_chat_job_and_session_id(self):
+        get_chat_logger("job-a", session_id="session-a", log_dir=self.log_dir).error(
+            "chat", "job_failed", "chat failed"
+        )
+        get_chat_logger("job-b", session_id="session-b", log_dir=self.log_dir).info(
+            "chat", "job_succeeded", "chat completed"
+        )
+
+        by_job = self.client.get(
+            "/logs?job_id=job-a", headers={"x-api-key": "test-key"}
+        ).json()
+        by_session = self.client.get(
+            "/logs?session_id=session-b", headers={"x-api-key": "test-key"}
+        ).json()
+        self.assertEqual([entry["event"] for entry in by_job["entries"]], ["job_failed"])
+        self.assertEqual([entry["event"] for entry in by_session["entries"]], ["job_succeeded"])
+
     def test_filters_by_level(self):
         self._write_logs()
         response = self.client.get("/logs?level=ERROR", headers={"x-api-key": "test-key"})
@@ -192,11 +209,17 @@ class UnifiedLogsApiTests(unittest.TestCase):
         entry = response.json()["entries"][0]
         expected_fields = {
             "timestamp", "level", "logger", "message", "experiment_id",
-            "mailbox_task_id", "phase", "event", "duration_ms", "command",
+            "mailbox_task_id", "job_id", "session_id", "phase", "event", "duration_ms", "command",
             "cwd", "exit_code", "stdout", "stderr", "exception_type",
             "exception_message", "stacktrace", "truncated",
         }
         self.assertEqual(set(entry.keys()), expected_fields)
+
+    def test_missing_log_directory_is_distinct_from_empty_feed(self):
+        self.service.experiment_log_dir = self.log_dir / "missing"
+        response = self.client.get("/logs", headers={"x-api-key": "test-key"})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "log storage is unreadable")
 
     def test_pre_experiment_task_log_entries_appear_in_unified_feed(self):
         # Gap 1: mailbox intake/queueing events recorded before an

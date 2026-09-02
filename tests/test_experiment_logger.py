@@ -379,9 +379,26 @@ class ReadAllLogEntriesTests(unittest.TestCase):
         self.log_dir = Path(self._tmpdir.name)
         self.addCleanup(self._tmpdir.cleanup)
 
-    def test_missing_dir_returns_empty_list(self):
-        entries = read_all_log_entries(self.log_dir / "does-not-exist")
-        self.assertEqual(entries, [])
+    def test_missing_dir_is_reported_as_read_error(self):
+        with self.assertRaises(OSError):
+            read_all_log_entries(self.log_dir / "does-not-exist")
+
+    def test_chat_correlation_fields_are_optional_and_filterable(self):
+        from modules.experiment_logger import get_chat_logger
+
+        get_chat_logger("job-1", session_id="session-1", log_dir=self.log_dir).error(
+            "chat", "job_failed", "failed before experiment creation"
+        )
+        get_chat_logger("job-2", log_dir=self.log_dir).info(
+            "chat", "job_succeeded", "completed"
+        )
+
+        by_job = read_all_log_entries(self.log_dir, job_id="job-1")
+        by_session = read_all_log_entries(self.log_dir, session_id="session-1")
+        self.assertEqual([entry["event"] for entry in by_job], ["job_failed"])
+        self.assertEqual([entry["event"] for entry in by_session], ["job_failed"])
+        self.assertEqual(by_job[0]["job_id"], "job-1")
+        self.assertEqual(by_job[0]["session_id"], "session-1")
 
     def test_merges_multiple_experiments_chronologically(self):
         elog_a = ExperimentLogger("exp-a", mailbox_task_id="task-a", log_dir=self.log_dir)
@@ -421,6 +438,16 @@ class ReadAllLogEntriesTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["experiment_id"], "exp-b")
         self.assertEqual(entries[0]["mailbox_task_id"], "task-2")
+
+    def test_file_removed_during_rotation_is_skipped(self):
+        from unittest.mock import patch
+
+        ExperimentLogger("exp-a", log_dir=self.log_dir).info("p", "e1", "message")
+        with patch(
+            "modules.experiment_logger.read_log_entries",
+            side_effect=FileNotFoundError("rotated"),
+        ):
+            self.assertEqual(read_all_log_entries(self.log_dir), [])
 
     def test_filters_by_level_and_phase_across_files(self):
         elog_a = ExperimentLogger("exp-a", log_dir=self.log_dir)

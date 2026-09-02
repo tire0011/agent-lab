@@ -484,6 +484,8 @@ class ExperimentLogEntry(BaseModel):
     message: str | None = None
     experiment_id: str | None = None
     mailbox_task_id: str | None = None
+    job_id: str | None = None
+    session_id: str | None = None
     phase: str
     event: str
     duration_ms: int | None = None

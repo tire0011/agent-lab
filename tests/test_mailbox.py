@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -224,6 +225,7 @@ class _ProcessorTestBase(unittest.TestCase):
             repo_path=self.repo,
             db_path=self.db_path,
             dry_run=True,  # no network git operations in tests
+            task_log_dir=self.repo / "state" / "experiment-logs",
         )
 
     def tearDown(self):
@@ -246,6 +248,18 @@ class _ProcessorTestBase(unittest.TestCase):
 
 
 class TestIdeaProcessing(_ProcessorTestBase):
+    def test_validation_rejection_is_written_to_transient_task_log(self):
+        self._write("invalid.md", "not yaml front matter")
+
+        results = self.processor.process_inbox()
+
+        self.assertEqual(results[0]["status"], "failed")
+        log_files = list((self.repo / "state" / "experiment-logs").glob("task-mailbox-*.jsonl"))
+        self.assertEqual(len(log_files), 1)
+        entries = [json.loads(line) for line in log_files[0].read_text().splitlines()]
+        self.assertIn("message_rejected", [entry["event"] for entry in entries])
+        self.assertTrue(all(entry["experiment_id"] is None for entry in entries))
+
     def test_idea_appended_to_ideas_md(self):
         self._write("idea.md", "---\ntype: idea\ncreated_by: rene\n---\n\nLocal model action selection.")
         results = self.processor.process_inbox()

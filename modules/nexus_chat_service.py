@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from modules.experiment_logger import DEFAULT_LOG_DIR, get_chat_logger
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.task_orchestrator import (
@@ -139,10 +140,27 @@ class NexusChatService:
             repo_root=str(getattr(operations_registry, "repo_root", "/agent")),
         )
 
-    def handle(self, message: str, *, session_id: str | None = None) -> NexusChatResult:
+    def handle(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        job_id: str | None = None,
+    ) -> NexusChatResult:
         text = (message or "").strip()
         if not text:
             raise ValueError("message must not be empty")
+        task_log = (
+            get_chat_logger(
+                job_id,
+                session_id=session_id,
+                log_dir=getattr(self.experiment_service, "experiment_log_dir", DEFAULT_LOG_DIR),
+            )
+            if job_id
+            else None
+        )
+        if task_log is not None:
+            task_log.info("chat", "request_received", "chat request received")
         allow_mutation = is_execution_request(text)
         orchestrator = self.orchestrator_factory(
             operations_registry=self.operations_registry,
@@ -151,12 +169,26 @@ class NexusChatService:
         )
         try:
             if session_id:
-                decision = orchestrator.continue_session(session_id, text)
+                if task_log is None:
+                    decision = orchestrator.continue_session(session_id, text)
+                else:
+                    decision = orchestrator.continue_session(
+                        session_id,
+                        text,
+                        task_logger=task_log,
+                    )
             else:
-                decision = orchestrator.run(text, source_type="chat", title="Nexus chat")
+                decision = orchestrator.run(
+                    text,
+                    source_type="chat",
+                    title="Nexus chat",
+                    task_logger=task_log,
+                )
 
             if not decision.session_id:
                 raise TaskOrchestratorError("Nexus chat decision has no session_id")
+            if task_log is not None:
+                task_log.bind_session_id(decision.session_id)
 
             if not allow_mutation and decision.action in (ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT):
                 return NexusChatResult(

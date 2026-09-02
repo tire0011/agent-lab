@@ -94,6 +94,15 @@ class ExperimentLogsApiTests(unittest.TestCase):
         self.assertEqual(body["entries"], [])
         self.assertEqual(body["experiment_id"], self.experiment.id)
 
+    def test_missing_log_directory_returns_read_error(self):
+        self.service.experiment_log_dir = self.log_dir / "missing"
+        response = self.client.get(
+            f"/experiments/{self.experiment.id}/logs",
+            headers={"x-api-key": "test-key"},
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "log storage is unreadable")
+
     def test_returns_entries_chronologically(self):
         self._write_logs()
         response = self.client.get(
@@ -165,7 +174,7 @@ class ExperimentLogsApiTests(unittest.TestCase):
         entry = response.json()["entries"][0]
         expected_fields = {
             "timestamp", "level", "logger", "message", "experiment_id",
-            "mailbox_task_id", "phase", "event", "duration_ms", "command",
+            "mailbox_task_id", "job_id", "session_id", "phase", "event", "duration_ms", "command",
             "cwd", "exit_code", "stdout", "stderr", "exception_type",
             "exception_message", "stacktrace", "truncated",
         }

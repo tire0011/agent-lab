@@ -27,7 +27,11 @@ from modules.run_store import (
     insert_run,
     insert_tool_calls,
 )
+from modules.logging_config import configure_logging
 from modules.serialization import to_json_string
+
+
+configure_logging()
 
 
 def parse_args() -> argparse.Namespace:
