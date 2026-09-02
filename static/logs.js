@@ -72,21 +72,6 @@ async function loadLogsExperimentOptions() {
   }
 }
 
-function renderLogsFromDiagnostics(entries) {
-  renderCardList(logsElements.content, entries, "Keine Log-Einträge gefunden.", (li, item) => {
-    addTitle(li, `${item.phase} · Experiment ${item.id.slice(0, 8)}`);
-    const details = [item.created_at];
-    if (item.failure_summary) details.push(item.failure_summary);
-    if (item.test_command) details.push(item.test_command);
-    if (item.test_exit_code !== null && item.test_exit_code !== undefined) details.push(`Exit-Code ${item.test_exit_code}`);
-    if (item.changed_files.length) details.push(`Dateien: ${item.changed_files.join(", ")}`);
-    addMetaLine(li, details.join(" · "));
-    for (const message of item.diagnostic_messages || []) {
-      addMetaLine(li, message);
-    }
-  });
-}
-
 // One structured JSONL entry from GET /experiments/{id}/logs, rendered as
 // a collapsible card. Every value is written via textContent only.
 function renderExperimentLogEntries(entries) {
@@ -293,13 +278,26 @@ async function loadLogs() {
     }
   }
 
+  // No API key: unauthenticated fallback. Uses the same central,
+  // multi-source feed as the authenticated view (experiments + mailbox
+  // tasks + system), just re-shaped through the public allowlist
+  // (GET /logs/public) - no longer limited to per-experiment diagnostic
+  // summaries.
+  const params = new URLSearchParams({ limit: "100" });
+  if (level) params.set("level", level);
+  if (phase) params.set("phase", phase);
+  if (experimentId) params.set("experiment_id", experimentId);
+  if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
+  const baseUrl = `/logs/public?${params.toString()}`;
   try {
-    const data = await requestJson("/diagnostics/public?limit=50");
-    let experiments = data.experiments || [];
-    if (experimentId) experiments = experiments.filter((exp) => exp.id === experimentId);
-    if (mailboxTaskId) experiments = experiments.filter((exp) => exp.mailbox_task_id === mailboxTaskId);
-    renderLogsFromDiagnostics(experiments);
-    updateLogsSuccessStatus(experiments);
+    const data = await requestJson(baseUrl);
+    const entries = data.entries || [];
+    logsPaginationState.baseUrl = baseUrl;
+    logsPaginationState.entries = entries;
+    logsPaginationState.nextCursor = data.next_cursor || null;
+    renderExperimentLogEntries(entries);
+    updateLogsSuccessStatus(entries);
+    updateLoadOlderButton();
   } catch (error) {
     logsElements.count.textContent = "!";
     updateLogsErrorStatus();
