@@ -28,7 +28,7 @@ MODEL_FULL_PATH="${MODEL_FULL_PATH:-${MODEL_DIR}/${MODEL_FILE}}"
 # Nexus services on the VM run as the dedicated agent user by default.
 SERVICE_USER="${LOCAL_MODEL_SERVICE_USER:-agent}"
 
-# Standard_B2ms has 2 vCPUs; use a conservative default of 2 threads.
+# Nexus VM has 2 vCPUs; use a conservative default of 2 threads.
 N_THREADS="${LOCAL_MODEL_THREADS:-2}"
 # Context window (tokens).  8192 is conservative for a 7B Q4_K_M on 8 GB RAM.
 CTX_SIZE="${LOCAL_MODEL_CONTEXT:-8192}"
@@ -77,8 +77,7 @@ ExecStart=${LLAMA_SERVER_BIN} \\
     --port ${SERVER_PORT} \\
     --threads ${N_THREADS} \\
     --ctx-size ${CTX_SIZE} \\
-    --parallel ${N_PARALLEL} \\
-    --no-mmap
+    --parallel ${N_PARALLEL}
 Restart=on-failure
 RestartSec=15
 StandardOutput=journal
