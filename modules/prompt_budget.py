@@ -214,24 +214,27 @@ def compact_observations(
         fair_share = remaining if is_recent else min(remaining, max(500, budget_chars // n))
         if len(serialized) <= fair_share:
             result[index] = obs
-            remaining -= len(serialized)
+            remaining = max(0, remaining - len(serialized))
             continue
         if is_recent and remaining > 500:
             # Still compress the observation's largest text fields rather
             # than dropping it outright, since recent observations are the
-            # most likely to matter for the immediate next decision.
+            # most likely to matter for the immediate next decision. This is
+            # tracked separately from ``omitted``: the observation still
+            # carries real (if truncated) content, it is not reduced to a
+            # bare stub reference.
             compacted, truncated = _shrink(obs, remaining)
+            if truncated:
+                compacted["truncated"] = True
             serialized_compacted = json.dumps(compacted, separators=(",", ":"))
             result[index] = compacted
-            remaining -= len(serialized_compacted)
-            if truncated:
-                omitted.append(index)
+            remaining = max(0, remaining - len(serialized_compacted))
             continue
         stub = _stub(obs)
         serialized_stub = json.dumps(stub, separators=(",", ":"))
         result[index] = stub
         omitted.append(index)
-        remaining -= len(serialized_stub)
+        remaining = max(0, remaining - len(serialized_stub))
 
     return [item for item in result if item is not None], sorted(omitted)
 
