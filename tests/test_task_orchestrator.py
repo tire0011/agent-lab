@@ -262,6 +262,76 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("local model first", client.prompts[1])
         self.assertIn('"type":"idea"', client.prompts[0])
 
+    def test_identical_memory_search_executes_only_once(self):
+        memory = _Memory([{"content": "original result"}])
+        client = _Client([
+            '{"type":"tool","tool":"memory_search","query":"existing version",'
+            '"limit":6,"reason":"find prior work"}',
+            '{"type":"tool","tool":"memory_search","limit":6,'
+            '"query":"existing version","reason":"find prior work again"}',
+            '{"type":"action","action":"answer","message":"Stopped duplicate.",'
+            '"reason":"duplicate observation requires another path"}',
+        ])
+        orchestrator = self._orchestrator(client, memory=memory)
+        try:
+            result = orchestrator.run("Find the existing version implementation")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(memory.queries, [("existing version", 6)])
+        duplicate = result.observations[1]
+        self.assertEqual(duplicate["event"], "duplicate_tool_call")
+        self.assertNotIn("results", duplicate)
+
+    def test_a_b_a_tool_cycle_is_detected(self):
+        memory = _Memory([])
+        client = _Client([
+            '{"type":"tool","tool":"memory_search","query":"a","reason":"first"}',
+            '{"type":"tool","tool":"memory_search","query":"b","reason":"second"}',
+            '{"type":"tool","tool":"memory_search","query":"a","reason":"repeat first"}',
+            '{"type":"action","action":"clarification","message":"Need changed state.",'
+            '"reason":"cycle detected"}',
+        ])
+        orchestrator = self._orchestrator(client, memory=memory)
+        try:
+            result = orchestrator.run("Inspect memory")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(memory.queries, [("a", 6), ("b", 6)])
+        self.assertEqual(result.observations[2]["event"], "non_progressing_cycle")
+
+    def test_failed_command_repeat_is_blocked_but_different_recovery_runs(self):
+        client = _Client([
+            '{"type":"tool","tool":"command","command":"python agent.py --version",'
+            '"reason":"check version"}',
+            '{"type":"tool","tool":"command","command":"python agent.py --version",'
+            '"reason":"retry failed command"}',
+            '{"type":"tool","tool":"command","command":"python3 agent.py --version",'
+            '"reason":"use available interpreter"}',
+            '{"type":"action","action":"answer","message":"Recovered with python3.",'
+            '"reason":"different command succeeded"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                side_effect=[
+                    ("exit_code: 127\nstderr:\npython: not found", None),
+                    ("exit_code: 0\nstdout:\n0.2.0", None),
+                ],
+            ) as command_mock:
+                result = orchestrator.run("Print the Nexus version")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(command_mock.call_count, 2)
+        self.assertEqual(result.observations[1]["event"], "duplicate_tool_call")
+        self.assertIn("python3", command_mock.call_args.args[0].body)
+
     def test_delegate_is_tool_and_local_controller_decides_after_result(self):
         delegation = _Delegation()
         client = _Client([
