@@ -58,6 +58,16 @@ Available delegation providers currently include:
 
 Delegation is not a transfer of control. External models return observations to the local Nexus model. Prompts explicitly prefer local/cheap work first and reserve external models for cases where they add material value.
 
+### Commands and deterministic Python execution
+
+`command` executes one shell command through the trusted development command primitive. Arbitrary commands stay available, but the project's Python runtime is no longer an LLM guess:
+
+- `python_run` is a typed capability. The controller supplies a repository-relative `script` **or** an importable `module`, plus `argv` and an optional repository-relative `cwd`. Nexus resolves the interpreter itself, in this order: `NEXUS_PYTHON_EXECUTABLE`, the active virtualenv (`VIRTUAL_ENV`), the project virtualenv (`<repo>/.venv`), then `sys.executable`. No host-specific executable literal appears in the controller prompt.
+- Every command/`python_run` observation reports the effective working directory, the interpreter that was resolved and the sanitized command that ran.
+- Output whose exit code is 127 or that reports `command not found` is classified as a *command-resolution* failure. When a known mapping exists (`python`/`python3` → resolved interpreter, `pip`/`pip3` → interpreter `-m pip`), exactly one corrected retry is performed deterministically, without another LLM inference, and the observation carries a `command_resolution_retry` recovery record.
+- An unknown executable produces a compact `command_not_found` observation (missing executable, detail, guidance) instead of another guess. The controller must then choose a different capability or `missing_capability`; it must not repeat the command or re-run the same memory search. This observation is the hand-off point for a future global tool resolver (`find_tool(goal)`).
+- Original command, selected mapping, corrected command and outcome are logged as structured `command_resolution` / `python_run` log lines.
+
 ## Final actions
 
 The local model may choose:

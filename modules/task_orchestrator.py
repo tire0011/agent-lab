@@ -25,7 +25,7 @@ from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
 from modules.nexus_task_store import NexusTaskStore
-from modules.redaction import redact
+from modules.redaction import redact_secrets
 from modules.run_store import DEFAULT_DB_PATH
 from modules.runtime_execution import (
     RuntimeExecutionError,
@@ -702,7 +702,7 @@ Rules:
         interpreter = resolve_python_interpreter(self._repo_root())
         payload: dict[str, Any] = {
             "tool": tool,
-            "command": redact(command)[:2000],
+            "command": redact_secrets(command)[:2000],
             "cwd": str(working_directory),
             "interpreter": interpreter,
             "provider_used": "local",
@@ -725,7 +725,7 @@ Rules:
         if mapping is None:
             logger.warning(
                 "command_resolution original=%s missing_executable=%s mapping=none outcome=missing_capability",
-                redact(command)[:500],
+                redact_secrets(command)[:500],
                 failure.executable[:120],
             )
             return {
@@ -744,20 +744,20 @@ Rules:
         corrected, mapping_name = mapping
         logger.info(
             "command_resolution original=%s missing_executable=%s mapping=%s corrected=%s",
-            redact(command)[:500],
+            redact_secrets(command)[:500],
             failure.executable[:120],
             mapping_name,
-            redact(corrected)[:500],
+            redact_secrets(corrected)[:500],
         )
         retried, retry_error = self._run_command(corrected, working_directory)
         recovery = {
             "event": "command_resolution_retry",
-            "original_command": redact(command)[:2000],
+            "original_command": redact_secrets(command)[:2000],
             "missing_executable": failure.executable[:120],
             "mapping": mapping_name,
             "attempts": 2,
         }
-        payload = {**payload, "command": redact(corrected)[:2000], "recovery": recovery}
+        payload = {**payload, "command": redact_secrets(corrected)[:2000], "recovery": recovery}
         if retry_error is not None:
             logger.warning("command_resolution mapping=%s outcome=retry_error", mapping_name)
             return {**payload, "error": retry_error}
@@ -796,7 +796,7 @@ Rules:
         payload: dict[str, Any] = {
             "tool": TOOL_PYTHON_RUN,
             "target": plan.target[:500],
-            "command": redact(plan.command)[:2000],
+            "command": redact_secrets(plan.command)[:2000],
             "interpreter": plan.interpreter,
             "cwd": str(cwd),
             "provider_used": "local",

@@ -182,5 +182,17 @@ class CorrectedCommandTests(unittest.TestCase):
         )
 
 
+class SanitizedCommandTests(unittest.TestCase):
+    def test_secrets_are_scrubbed_but_interpreter_paths_survive(self):
+        from modules.redaction import redact, redact_secrets
+
+        command = "/opt/venv/bin/python agent.py --token=sk-abcdefghijklmnop"
+        sanitized = redact_secrets(command)
+        self.assertIn("/opt/venv/bin/python agent.py", sanitized)
+        self.assertNotIn("sk-abcdefghijklmnop", sanitized)
+        # The persisted/API redaction still removes absolute paths.
+        self.assertNotIn("/opt/venv/bin/python", redact(command))
+
+
 if __name__ == "__main__":
     unittest.main()
