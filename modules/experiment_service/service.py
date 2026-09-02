@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.experiment_evaluation import parse_git_status_short
-from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
+from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import (
     DEFAULT_DB_PATH,
@@ -177,7 +177,7 @@ class ExperimentService:
         experiment_log_dir:
             Directory holding one durable, append-only JSONL log per
             experiment (``<experiment_log_dir>/<experiment_id>.jsonl``),
-            written via ``modules.experiment_logger.ExperimentLogger``.
+            written via ``modules.central_logging.ExperimentLogger``.
             Defaults to ``<repo_root>/state/experiment-logs``.
         default_test_timeout_seconds:
             Starting timeout (seconds) for the verification test subprocess

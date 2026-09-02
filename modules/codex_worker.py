@@ -211,7 +211,7 @@ class CodexWorker:
             all existing callers, all of which operate inside the real
             repository or a git worktree).
         experiment_logger:
-            Optional ``modules.experiment_logger.ExperimentLogger`` (duck
+            Optional ``modules.central_logging.ExperimentLogger`` (duck
             typed here to avoid a hard import) used to record this call's
             start/outcome into the owning experiment's structured JSONL
             log. Defaults to ``None`` (no experiment-log entries; standalone

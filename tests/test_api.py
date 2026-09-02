@@ -272,7 +272,7 @@ class WebClientTests(ApiTestsBase):
         self.assertIn("renderExperimentLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
         self.assertIn('const baseUrl = `/logs?${params.toString()}`;', javascript)
         self.assertIn("await requestJson(baseUrl, { headers: authHeaders() });", javascript)
-        self.assertIn("renderLogsFromDiagnostics(experiments);\n    updateLogsSuccessStatus(experiments);", javascript)
+        self.assertIn("renderExperimentLogEntries(entries);\n    updateLogsSuccessStatus(entries);", javascript)
         self.assertNotIn("setInterval(loadLogs", javascript)
         self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
 

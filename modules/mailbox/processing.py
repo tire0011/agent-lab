@@ -9,7 +9,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from modules.experiment_logger import DEFAULT_LOG_DIR, get_task_logger
+from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 
 from .core import (
     MAX_RETRY,

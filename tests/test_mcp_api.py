@@ -195,7 +195,7 @@ class McpApiTests(unittest.TestCase):
 
     def test_experiment_logs_tool_rejects_limit_zero(self):
         self._initialize_mcp()
-        with patch.object(api.experiment_logger_module, "read_log_entries") as read_logs:
+        with patch.object(api.central_logging_module, "read_log_entries") as read_logs:
             response = self._mcp_post(
                 {
                     "jsonrpc": "2.0",
@@ -219,7 +219,7 @@ class McpApiTests(unittest.TestCase):
 
     def test_experiment_logs_tool_rejects_limit_above_maximum(self):
         self._initialize_mcp()
-        with patch.object(api.experiment_logger_module, "read_log_entries") as read_logs:
+        with patch.object(api.central_logging_module, "read_log_entries") as read_logs:
             response = self._mcp_post(
                 {
                     "jsonrpc": "2.0",
@@ -408,7 +408,7 @@ class McpApiTests(unittest.TestCase):
 
         self._initialize_mcp()
         with patch.object(
-            api.experiment_logger_module, "read_experiment_logs", return_value=entries
+            api.central_logging_module, "read_experiment_logs", return_value=entries
         ) as read_logs:
             response = self._mcp_post(
                 {

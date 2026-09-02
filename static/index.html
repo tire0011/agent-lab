@@ -222,6 +222,25 @@
           <div id="logs-content" class="list-state" aria-live="polite">Wird geladen …</div>
           <button id="logs-load-older-button" class="secondary" type="button" hidden>Ältere laden</button>
         </section>
+
+        <section class="card">
+          <div class="card-heading">
+            <h2>System-Logs (journalctl)</h2>
+            <button id="logs-journalctl-refresh-button" class="secondary" type="button">Aktualisieren</button>
+          </div>
+          <div class="logs-filters">
+            <label for="logs-journalctl-service-select">Service</label>
+            <select id="logs-journalctl-service-select">
+              <option value="">Alle Services</option>
+              <option value="agent-api">agent-api</option>
+              <option value="nexus-mailbox">nexus-mailbox</option>
+              <option value="llama-server">llama-server</option>
+            </select>
+            <label for="logs-journalctl-lines-input">Zeilen je Service</label>
+            <input id="logs-journalctl-lines-input" type="number" min="1" max="500" value="100" inputmode="numeric">
+          </div>
+          <div id="logs-journalctl-content" class="list-state" aria-live="polite">Erfordert einen API-Schlüssel.</div>
+        </section>
       </section>
 
 

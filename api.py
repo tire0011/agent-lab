@@ -87,6 +87,8 @@ from models import (
     ProblemsResponse,
     PublicActivityResponse,
     PublicExperimentSummary,
+    PublicLogEntry,
+    PublicUnifiedLogsResponse,
     ServiceRestartRequest,
     SetConfigRequest,
     StatusResponse,
@@ -94,7 +96,7 @@ from models import (
 from modules.operations_executor import OperationsExecutor
 from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
 from modules.redaction import sanitized_reason as _sanitized_reason
-from modules import experiment_logger as experiment_logger_module
+from modules import central_logging as central_logging_module
 from modules.logging_config import configure_logging
 from modules.maintenance_service import (
     MaintenanceAuthError,
@@ -841,7 +843,7 @@ def get_experiment_logs(
     """Single, chronological, structured view of one experiment's complete
     task/experiment run - mailbox approval through research, selection,
     implementation, verification, and cleanup - reusing the same durable
-    JSONL log written by ``modules.experiment_logger``, merged with its
+    JSONL log written by ``modules.central_logging``, merged with its
     correlated mailbox task's pre-experiment-id log entries if any.
     """
     authorize(x_api_key)
@@ -857,7 +859,7 @@ def get_experiment_logs(
     try:
         # Fetch one extra entry to detect whether an older page remains,
         # without re-scanning already-returned entries on the next call.
-        raw_entries = experiment_logger_module.read_experiment_logs(
+        raw_entries = central_logging_module.read_experiment_logs(
             service.experiment_log_dir, experiment.id,
             mailbox_task_id=mailbox_task_id, level=level, phase=phase,
             limit=limit + 1, before=cursor,
@@ -898,7 +900,7 @@ def get_unified_logs(
 
     Backs the Logs tab's default "Alle Experimente" feed: unlike
     ``/activity`` (lifecycle/status summaries only), this returns the real
-    structured JSONL entries written by ``modules.experiment_logger`` -
+    structured JSONL entries written by ``modules.central_logging`` -
     mailbox intake, queueing, implementation, verification, GitHub
     lifecycle, adoption, and failures/timeouts - merged in chronological
     order from every ``<experiment_log_dir>/*.jsonl`` file, including
@@ -931,7 +933,7 @@ def get_unified_logs(
     try:
         # Fetch one extra entry to detect whether an older page remains,
         # without re-scanning already-returned entries on the next call.
-        raw_entries = experiment_logger_module.read_all_log_entries(
+        raw_entries = central_logging_module.read_all_log_entries(
             service.experiment_log_dir,
             experiment_id=resolved_experiment_id,
             mailbox_task_id=resolved_mailbox_task_id,
@@ -1072,7 +1074,7 @@ def _paginate_log_entries(
     following (older) page, if any.
 
     ``raw_entries`` must be chronological (oldest first), which is what
-    every ``read_*`` function in ``modules.experiment_logger`` returns.
+    every ``read_*`` function in ``modules.central_logging`` returns.
     The page boundary is anchored to the oldest entry actually *returned*
     on this page - not the extra look-ahead entry used only to detect
     whether more data remains - and encoded as an opaque cursor (see
@@ -1083,7 +1085,7 @@ def _paginate_log_entries(
     if len(raw_entries) <= limit:
         return raw_entries, None
     page = raw_entries[-limit:] if limit > 0 else []
-    next_cursor = experiment_logger_module.encode_log_cursor(page[0]) if page else None
+    next_cursor = central_logging_module.encode_log_cursor(page[0]) if page else None
     return page, next_cursor
 
 
@@ -1232,6 +1234,9 @@ def list_activity(
 
 DIAGNOSTICS_DEFAULT_LIMIT = 10
 DIAGNOSTICS_MAX_LIMIT = 100
+
+PUBLIC_LOGS_DEFAULT_LIMIT = 100
+PUBLIC_LOGS_MAX_LIMIT = 500
 
 
 @lru_cache(maxsize=1)
@@ -1445,6 +1450,69 @@ def get_public_diagnostics(
         experiments=diagnostic_experiments,
         problems=list_problems(),
     )
+
+
+@app.get("/logs/public", response_model=PublicUnifiedLogsResponse)
+def get_public_unified_logs(
+    level: str | None = Query(default=None),
+    phase: str | None = Query(default=None),
+    experiment_id: str | None = Query(default=None),
+    mailbox_task_id: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=PUBLIC_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=PUBLIC_LOGS_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> PublicUnifiedLogsResponse:
+    """Unauthenticated equivalent of ``GET /logs``, for the Logs tab's
+    default view before an API key has been entered.
+
+    Reuses the same central multi-source read path (``read_all_log_entries``)
+    as the authenticated feed, so the unauthenticated fallback is no longer
+    limited to per-experiment diagnostic summaries - but every entry is
+    re-shaped through ``PublicLogEntry``'s strict allowlist, which drops
+    command/cwd/stdout/stderr/exception/stacktrace/job_id/session_id.
+    Only ``message`` (already redacted on both the write and read path -
+    see ``modules.redaction``) and coarse phase/event/level/timestamp/id
+    fields are exposed, matching what ``/diagnostics/public`` already
+    surfaces via ``diagnostic_messages``/``failure_summary``.
+    """
+    if level is not None and level.upper() not in _LOG_LEVELS:
+        raise HTTPException(status_code=400, detail="invalid level filter")
+
+    resolved_experiment_id = experiment_id
+    if experiment_id:
+        try:
+            resolved_experiment_id = service.resolve_experiment(experiment_id).id
+        except ExperimentNotFoundError:
+            return PublicUnifiedLogsResponse(count=0, entries=[])
+
+    resolved_mailbox_task_id = mailbox_task_id
+    if resolved_experiment_id and not resolved_mailbox_task_id:
+        resolved_mailbox_task_id = _mailbox_task_id(service, resolved_experiment_id)
+
+    try:
+        raw_entries = central_logging_module.read_all_log_entries(
+            service.experiment_log_dir,
+            experiment_id=resolved_experiment_id,
+            mailbox_task_id=resolved_mailbox_task_id,
+            level=level,
+            phase=phase,
+            limit=limit + 1,
+            before=cursor,
+        )
+    except OSError as exc:
+        _logger.error("public unified log read failed: %s", _sanitized_reason(str(exc)))
+        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
+
+    raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
+
+    entries: list[PublicLogEntry] = []
+    for raw in raw_entries:
+        try:
+            entries.append(PublicLogEntry(**raw))
+        except Exception:
+            # A malformed entry must not fail the whole response.
+            continue
+    return PublicUnifiedLogsResponse(count=len(entries), entries=entries, next_cursor=next_cursor)
 
 
 # ── Maintenance API ───────────────────────────────────────────────────────────

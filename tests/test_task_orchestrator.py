@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from modules.nexus_delegation import DelegationResult
-from modules.experiment_logger import get_task_logger, read_log_entries
+from modules.central_logging import get_task_logger, read_log_entries
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_CLARIFICATION,

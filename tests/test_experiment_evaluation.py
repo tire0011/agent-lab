@@ -617,7 +617,7 @@ class PipelineIntegrationTestCase(unittest.TestCase):
         )
         self.addCleanup(service.close)
 
-        from modules.experiment_logger import ExperimentLogger
+        from modules.central_logging import ExperimentLogger
 
         original_info = ExperimentLogger.info
 

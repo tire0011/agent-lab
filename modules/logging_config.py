@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from modules.experiment_logger import (
+from modules.central_logging import (
     DEFAULT_LOG_DIR,
     DEFAULT_MAX_LOG_FILE_BYTES,
     DEFAULT_SYSTEM_LOG_BACKUP_COUNT,

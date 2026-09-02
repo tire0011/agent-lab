@@ -519,6 +519,40 @@ class UnifiedLogsResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class PublicLogEntry(BaseModel):
+    """One structured log line, safe for the unauthenticated Logs tab.
+
+    A strict subset of ``ExperimentLogEntry``'s allowlist: never includes
+    command/cwd/stdout/stderr/exception/stacktrace/job_id/session_id, since
+    those may carry internal detail not meant for an unauthenticated
+    caller. ``message`` is still the write- and read-path redacted text
+    (see ``modules.redaction``), matching what ``/diagnostics/public``
+    already exposes via ``diagnostic_messages``/``failure_summary``.
+    """
+
+    timestamp: str
+    level: str
+    phase: str
+    event: str
+    message: str | None = None
+    experiment_id: str | None = None
+    mailbox_task_id: str | None = None
+    truncated: bool | None = None
+
+
+class PublicUnifiedLogsResponse(BaseModel):
+    """Public, unauthenticated equivalent of ``UnifiedLogsResponse``.
+
+    Backs the Logs tab's default view when no API key has been entered,
+    so the fallback is the same central multi-source feed (experiments,
+    mailbox tasks, system) rather than only per-experiment diagnostics.
+    """
+
+    count: int
+    entries: list[PublicLogEntry] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Operation Chain models
 # ---------------------------------------------------------------------------

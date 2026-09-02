@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from modules.experiment_logger import DEFAULT_LOG_DIR, get_chat_logger
+from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.task_orchestrator import (

@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
-from modules.experiment_logger import DEFAULT_LOG_DIR, get_task_logger
+from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command

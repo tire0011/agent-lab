@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable
 
-from modules.experiment_logger import DEFAULT_LOG_DIR, get_chat_logger
+from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
 from modules.nexus_chat_service import NexusChatResult, NexusChatService
 
 STATUS_QUEUED = "queued"

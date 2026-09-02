@@ -1,7 +1,7 @@
 """Focused tests for GET /experiments/{experiment_id}/logs.
 
 Uses a mocked ExperimentService (same pattern as test_activity_api.py) but
-writes real JSONL files via modules.experiment_logger so the read path,
+writes real JSONL files via modules.central_logging so the read path,
 filters, and secret-scrubbing are exercised end to end.
 """
 
@@ -20,7 +20,7 @@ os.environ.setdefault("AGENT_API_KEY", "test-key")
 from fastapi.testclient import TestClient
 
 import api
-from modules.experiment_logger import ExperimentLogger
+from modules.central_logging import ExperimentLogger
 from modules.experiment_service import ExperimentNotFoundError
 
 SECRET = "abcdef0123456789abcdef0123456789"
@@ -184,7 +184,7 @@ class ExperimentLogsApiTests(unittest.TestCase):
         # Gap 1: selecting one experiment must show the same complete
         # task path as the unified feed, including events recorded before
         # the experiment id existed.
-        from modules.experiment_logger import get_task_logger
+        from modules.central_logging import get_task_logger
 
         self.service.mailbox_task_id_for_experiment.return_value = "task-99"
         get_task_logger("task-99", log_dir=self.log_dir).info(
