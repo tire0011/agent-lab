@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from modules.experiment_logger import DEFAULT_LOG_DIR
+from modules.central_logging import DEFAULT_LOG_DIR
 from .config import MailboxConfig
 
 

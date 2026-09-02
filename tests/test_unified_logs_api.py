@@ -1,7 +1,7 @@
 """Focused tests for GET /logs, the unified "Alle Experimente" log feed.
 
 Uses a mocked ExperimentService (same pattern as test_experiment_logs_api.py)
-but writes real JSONL files via modules.experiment_logger so aggregation,
+but writes real JSONL files via modules.central_logging so aggregation,
 correlation, filtering, and secret-scrubbing are exercised end to end.
 """
 
@@ -21,7 +21,7 @@ os.environ.setdefault("AGENT_API_KEY", "test-key")
 from fastapi.testclient import TestClient
 
 import api
-from modules.experiment_logger import ExperimentLogger, get_chat_logger
+from modules.central_logging import ExperimentLogger, get_chat_logger
 from modules.experiment_service import ExperimentNotFoundError
 
 SECRET = "abcdef0123456789abcdef0123456789"
@@ -225,7 +225,7 @@ class UnifiedLogsApiTests(unittest.TestCase):
         # Gap 1: mailbox intake/queueing events recorded before an
         # experiment id exists must still show up, with experiment_id null
         # and correlatable via mailbox_task_id.
-        from modules.experiment_logger import get_task_logger
+        from modules.central_logging import get_task_logger
 
         get_task_logger("task-zz", log_dir=self.log_dir).info(
             "mailbox", "task_received", "mailbox task received"

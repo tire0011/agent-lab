@@ -2463,7 +2463,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         experiment = self.service.create_experiment(goal="g")
 
         with patch(
-            "modules.experiment_logger.ExperimentLogger._append",
+            "modules.central_logging.ExperimentLogger._append",
             side_effect=OSError("simulated disk failure"),
         ):
             result = self.service.run_experiment(experiment.id)

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from modules.experiment_logger import read_all_log_entries
+from modules.central_logging import read_all_log_entries
 from modules.nexus_chat_jobs import NexusChatJobService, STATUS_SUCCEEDED
 
 

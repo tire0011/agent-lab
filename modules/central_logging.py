@@ -331,7 +331,7 @@ class ExperimentLogger:
             self._log(level, phase, event, message, **extra)
         except Exception:  # noqa: BLE001 - logging must never crash the pipeline
             logger.exception(
-                "experiment_logger: failed to write log entry (experiment=%s phase=%s event=%s)",
+                "central_logging: failed to write log entry (experiment=%s phase=%s event=%s)",
                 self.experiment_id[:8] if self.experiment_id else "?",
                 phase,
                 event,

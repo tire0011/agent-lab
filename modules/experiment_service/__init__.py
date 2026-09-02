@@ -30,7 +30,7 @@ from modules.experiment_evaluation import (
     parse_git_status_short,
     validate_plan as validate_plan_completeness,
 )
-from modules.experiment_logger import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
+from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import (
     DEFAULT_DB_PATH,

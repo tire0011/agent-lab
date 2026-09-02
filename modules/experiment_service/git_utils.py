@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 import time
 
-from modules.experiment_logger import ExperimentLogger
+from modules.central_logging import ExperimentLogger
 
 
 # ---------------------------------------------------------------------------

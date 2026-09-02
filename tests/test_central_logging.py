@@ -1,4 +1,4 @@
-"""Focused unit tests for modules.experiment_logger.ExperimentLogger.
+"""Focused unit tests for modules.central_logging.ExperimentLogger.
 
 Covers the requirements from the centralized-logging task: JSONL format,
 log levels, experiment/mailbox-task-id correlation, immediate flush,
@@ -15,7 +15,7 @@ import time
 import unittest
 from pathlib import Path
 
-from modules.experiment_logger import (
+from modules.central_logging import (
     DEFAULT_LOG_DIR,
     MAX_STDERR_CHARS,
     MAX_STDOUT_CHARS,
@@ -384,7 +384,7 @@ class ReadAllLogEntriesTests(unittest.TestCase):
             read_all_log_entries(self.log_dir / "does-not-exist")
 
     def test_chat_correlation_fields_are_optional_and_filterable(self):
-        from modules.experiment_logger import get_chat_logger
+        from modules.central_logging import get_chat_logger
 
         get_chat_logger("job-1", session_id="session-1", log_dir=self.log_dir).error(
             "chat", "job_failed", "failed before experiment creation"
@@ -444,7 +444,7 @@ class ReadAllLogEntriesTests(unittest.TestCase):
 
         ExperimentLogger("exp-a", log_dir=self.log_dir).info("p", "e1", "message")
         with patch(
-            "modules.experiment_logger.read_log_entries",
+            "modules.central_logging.read_log_entries",
             side_effect=FileNotFoundError("rotated"),
         ):
             self.assertEqual(read_all_log_entries(self.log_dir), [])

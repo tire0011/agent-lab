@@ -94,7 +94,7 @@ from models import (
 from modules.operations_executor import OperationsExecutor
 from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
 from modules.redaction import sanitized_reason as _sanitized_reason
-from modules import experiment_logger as experiment_logger_module
+from modules import central_logging as central_logging_module
 from modules.logging_config import configure_logging
 from modules.maintenance_service import (
     MaintenanceAuthError,
@@ -841,7 +841,7 @@ def get_experiment_logs(
     """Single, chronological, structured view of one experiment's complete
     task/experiment run - mailbox approval through research, selection,
     implementation, verification, and cleanup - reusing the same durable
-    JSONL log written by ``modules.experiment_logger``, merged with its
+    JSONL log written by ``modules.central_logging``, merged with its
     correlated mailbox task's pre-experiment-id log entries if any.
     """
     authorize(x_api_key)
@@ -857,7 +857,7 @@ def get_experiment_logs(
     try:
         # Fetch one extra entry to detect whether an older page remains,
         # without re-scanning already-returned entries on the next call.
-        raw_entries = experiment_logger_module.read_experiment_logs(
+        raw_entries = central_logging_module.read_experiment_logs(
             service.experiment_log_dir, experiment.id,
             mailbox_task_id=mailbox_task_id, level=level, phase=phase,
             limit=limit + 1, before=cursor,
@@ -898,7 +898,7 @@ def get_unified_logs(
 
     Backs the Logs tab's default "Alle Experimente" feed: unlike
     ``/activity`` (lifecycle/status summaries only), this returns the real
-    structured JSONL entries written by ``modules.experiment_logger`` -
+    structured JSONL entries written by ``modules.central_logging`` -
     mailbox intake, queueing, implementation, verification, GitHub
     lifecycle, adoption, and failures/timeouts - merged in chronological
     order from every ``<experiment_log_dir>/*.jsonl`` file, including
@@ -931,7 +931,7 @@ def get_unified_logs(
     try:
         # Fetch one extra entry to detect whether an older page remains,
         # without re-scanning already-returned entries on the next call.
-        raw_entries = experiment_logger_module.read_all_log_entries(
+        raw_entries = central_logging_module.read_all_log_entries(
             service.experiment_log_dir,
             experiment_id=resolved_experiment_id,
             mailbox_task_id=resolved_mailbox_task_id,
@@ -1072,7 +1072,7 @@ def _paginate_log_entries(
     following (older) page, if any.
 
     ``raw_entries`` must be chronological (oldest first), which is what
-    every ``read_*`` function in ``modules.experiment_logger`` returns.
+    every ``read_*`` function in ``modules.central_logging`` returns.
     The page boundary is anchored to the oldest entry actually *returned*
     on this page - not the extra look-ahead entry used only to detect
     whether more data remains - and encoded as an opaque cursor (see
@@ -1083,7 +1083,7 @@ def _paginate_log_entries(
     if len(raw_entries) <= limit:
         return raw_entries, None
     page = raw_entries[-limit:] if limit > 0 else []
-    next_cursor = experiment_logger_module.encode_log_cursor(page[0]) if page else None
+    next_cursor = central_logging_module.encode_log_cursor(page[0]) if page else None
     return page, next_cursor
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import mailbox_processor
-from modules import experiment_logger as experiment_logger_module
+from modules import central_logging as central_logging_module
 from modules.mailbox import MailboxLock, MailboxProcessor
 from modules.redaction import bounded_lines, changed_file_names, redact, sanitized_reason, test_command_name, test_failure_tail as _test_failure_tail
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -295,7 +295,7 @@ class OperationsRegistry:
     def _op_experiment_logs(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)
         limit = self._limit(args, default=50, maximum=500)
-        entries = experiment_logger_module.read_log_entries(self.experiment_service.experiment_log_path(experiment.id), limit=limit)
+        entries = central_logging_module.read_log_entries(self.experiment_service.experiment_log_path(experiment.id), limit=limit)
         lines = [
             redact(
                 f"{entry.get('timestamp', '')} {entry.get('level', '')} {entry.get('phase', '')} {entry.get('event', '')} {entry.get('message', '')}"

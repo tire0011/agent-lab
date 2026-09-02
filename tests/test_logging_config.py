@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.experiment_logger import read_all_log_entries
+from modules.central_logging import read_all_log_entries
 from modules.logging_config import StructuredJsonlHandler
 
 
