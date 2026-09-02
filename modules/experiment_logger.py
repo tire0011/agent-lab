@@ -31,11 +31,17 @@ import os
 import re
 import threading
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from modules import redaction
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development fallback
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger("nexus.experiment")
 
@@ -429,7 +435,7 @@ class ExperimentLogger:
         self._dir.mkdir(parents=True, exist_ok=True)
         path_key = str(self._path)
         line = json.dumps(entry, ensure_ascii=False) + "\n"
-        with _lock_for(path_key):
+        with _lock_for(path_key), self._interprocess_lock():
             try:
                 current_size = self._path.stat().st_size
             except FileNotFoundError:
@@ -460,6 +466,19 @@ class ExperimentLogger:
                 return
 
             self._write_line(line)
+
+    @contextmanager
+    def _interprocess_lock(self):
+        if not self._rotate_backups or fcntl is None:
+            yield
+            return
+        lock_path = self._dir / f".{SYSTEM_LOG_KEY}.lock"
+        with open(lock_path, "a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _rotate(self) -> None:
         """Bound retained system logs while keeping the active file writable."""
@@ -928,24 +947,34 @@ def read_all_log_entries(
     cursor_key: tuple[str, str, str, int] | None = decode_log_cursor(before) if before else None
     effective_tail_bytes = None if cursor_key is not None else tail_bytes
 
-    candidates = [p for p in directory.glob("*.jsonl") if p.is_file()]
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates_with_mtime: list[tuple[float, Path]] = []
+    for path in directory.glob("*.jsonl"):
+        try:
+            if path.is_file():
+                candidates_with_mtime.append((path.stat().st_mtime, path))
+        except FileNotFoundError:
+            continue
+    candidates_with_mtime.sort(key=lambda item: item[0], reverse=True)
+    candidates = [path for _, path in candidates_with_mtime]
     if max_files is not None and max_files >= 0:
         candidates = candidates[:max_files]
     paths = candidates
 
     entries: list[dict[str, Any]] = []
     for path in paths:
-        entries.extend(
-            read_log_entries(
-                path,
-                level=level,
-                phase=phase,
-                job_id=job_id,
-                session_id=session_id,
-                tail_bytes=effective_tail_bytes,
+        try:
+            entries.extend(
+                read_log_entries(
+                    path,
+                    level=level,
+                    phase=phase,
+                    job_id=job_id,
+                    session_id=session_id,
+                    tail_bytes=effective_tail_bytes,
+                )
             )
-        )
+        except FileNotFoundError:
+            continue
 
     if mailbox_task_id:
         entries = [e for e in entries if e.get("mailbox_task_id") == mailbox_task_id]

@@ -8,3 +8,4 @@ state/mailbox.lock
 state/*.db
 state/*.db-*
 state/experiment-logs/*.jsonl
+state/experiment-logs/*.lock

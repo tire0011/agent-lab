@@ -439,6 +439,16 @@ class ReadAllLogEntriesTests(unittest.TestCase):
         self.assertEqual(entries[0]["experiment_id"], "exp-b")
         self.assertEqual(entries[0]["mailbox_task_id"], "task-2")
 
+    def test_file_removed_during_rotation_is_skipped(self):
+        from unittest.mock import patch
+
+        ExperimentLogger("exp-a", log_dir=self.log_dir).info("p", "e1", "message")
+        with patch(
+            "modules.experiment_logger.read_log_entries",
+            side_effect=FileNotFoundError("rotated"),
+        ):
+            self.assertEqual(read_all_log_entries(self.log_dir), [])
+
     def test_filters_by_level_and_phase_across_files(self):
         elog_a = ExperimentLogger("exp-a", log_dir=self.log_dir)
         elog_b = ExperimentLogger("exp-b", log_dir=self.log_dir)
