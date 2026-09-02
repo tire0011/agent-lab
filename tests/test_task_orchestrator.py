@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from modules.nexus_delegation import DelegationResult
+from modules.runtime_execution import resolve_python_interpreter
 from modules.central_logging import get_task_logger, read_log_entries
 from modules.task_orchestrator import (
     ACTION_ANSWER,
@@ -113,6 +114,9 @@ class TaskOrchestratorTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _interpreter(self) -> str:
+        return resolve_python_interpreter(self.registry.repo_root)
 
     def _orchestrator(self, client, *, service=None, memory=None, delegation=None):
         return NexusTaskOrchestrator(
@@ -304,14 +308,42 @@ class TaskOrchestratorTests(unittest.TestCase):
 
     def test_failed_command_repeat_is_blocked_but_different_recovery_runs(self):
         client = _Client([
+            '{"type":"tool","tool":"command","command":"cargo build",'
+            '"reason":"build the project"}',
+            '{"type":"tool","tool":"command","command":"cargo build",'
+            '"reason":"retry failed command"}',
+            '{"type":"tool","tool":"command","command":"make build",'
+            '"reason":"use available build tool"}',
+            '{"type":"action","action":"answer","message":"Recovered with make.",'
+            '"reason":"different command succeeded"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                side_effect=[
+                    ("exit_code: 127\nstderr:\ncargo: not found", None),
+                    ("exit_code: 0\nstdout:\nbuilt", None),
+                ],
+            ) as command_mock:
+                result = orchestrator.run("Build the project")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(command_mock.call_count, 2)
+        self.assertEqual(result.observations[0]["event"], "command_not_found")
+        self.assertEqual(result.observations[0]["missing_executable"], "cargo")
+        self.assertEqual(result.observations[1]["event"], "duplicate_tool_call")
+        self.assertIn("make", command_mock.call_args.args[0].body)
+
+    def test_command_not_found_performs_one_deterministic_retry(self):
+        client = _Client([
             '{"type":"tool","tool":"command","command":"python agent.py --version",'
             '"reason":"check version"}',
-            '{"type":"tool","tool":"command","command":"python agent.py --version",'
-            '"reason":"retry failed command"}',
-            '{"type":"tool","tool":"command","command":"python3 agent.py --version",'
-            '"reason":"use available interpreter"}',
-            '{"type":"action","action":"answer","message":"Recovered with python3.",'
-            '"reason":"different command succeeded"}',
+            '{"type":"action","action":"answer","message":"Version is 0.2.0.",'
+            '"reason":"corrected command succeeded"}',
         ])
         orchestrator = self._orchestrator(client)
         try:
@@ -328,9 +360,147 @@ class TaskOrchestratorTests(unittest.TestCase):
             orchestrator.close()
 
         self.assertEqual(result.action, ACTION_ANSWER)
+        # Exactly one corrected retry, and no further LLM inference for it.
         self.assertEqual(command_mock.call_count, 2)
+        self.assertEqual(len(client.prompts), 2)
+        observation = result.observations[0]
+        self.assertEqual(observation["recovery"]["event"], "command_resolution_retry")
+        self.assertEqual(observation["recovery"]["missing_executable"], "python")
+        self.assertEqual(observation["recovery"]["original_command"], "python agent.py --version")
+        self.assertEqual(observation["interpreter"], self._interpreter())
+        self.assertEqual(observation["cwd"], str(self.registry.repo_root))
+        retried = command_mock.call_args.args[0].body
+        self.assertTrue(retried.startswith(self._interpreter()))
+        self.assertIn("agent.py --version", retried)
+
+    def test_python_run_uses_the_resolved_interpreter_and_preserves_arguments(self):
+        client = _Client([
+            '{"type":"tool","tool":"python_run","script":"agent.py","argv":["--version"],'
+            '"reason":"check version deterministically"}',
+            '{"type":"action","action":"answer","message":"Version is 0.2.0.",'
+            '"reason":"version observed"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\n0.2.0", None),
+            ) as command_mock:
+                result = orchestrator.run("Print the Nexus version")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(command_mock.call_count, 1)
+        self.assertEqual(
+            command_mock.call_args.args[0].body,
+            f"{self._interpreter()} agent.py --version",
+        )
+        self.assertEqual(command_mock.call_args.args[1], self.registry.repo_root)
+        observation = result.observations[0]
+        self.assertEqual(observation["tool"], "python_run")
+        self.assertEqual(observation["interpreter"], self._interpreter())
+        self.assertEqual(observation["cwd"], str(self.registry.repo_root))
+        self.assertNotIn(self._interpreter(), client.prompts[0].split("OBSERVATIONS")[0])
+
+    def test_python_run_honours_a_repository_relative_working_directory(self):
+        (self.registry.repo_root / "scripts").mkdir(parents=True, exist_ok=True)
+        client = _Client([
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"scripts","reason":"run tests from scripts"}',
+            '{"type":"action","action":"answer","message":"Tests ran.","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\nOK", None),
+            ) as command_mock:
+                result = orchestrator.run("Run the tests")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(
+            command_mock.call_args.args[0].body,
+            f"{self._interpreter()} -m unittest discover",
+        )
+        self.assertEqual(
+            command_mock.call_args.args[1],
+            (self.registry.repo_root / "scripts").resolve(),
+        )
+
+    def test_python_run_rejects_a_working_directory_outside_the_repository(self):
+        client = _Client([
+            '{"type":"tool","tool":"python_run","script":"agent.py","cwd":"../elsewhere",'
+            '"reason":"escape"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            with self.assertRaises(TaskOrchestratorError):
+                orchestrator.run("Run outside the repository")
+        finally:
+            orchestrator.close()
+
+    def test_python_run_signature_distinguishes_working_directories(self):
+        for name in ("scripts", "tools"):
+            (self.registry.repo_root / name).mkdir(parents=True, exist_ok=True)
+        client = _Client([
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"scripts","reason":"run scripts tests"}',
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"tools","reason":"run tools tests"}',
+            '{"type":"action","action":"answer","message":"Both suites ran.","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\nOK", None),
+            ) as command_mock:
+                result = orchestrator.run("Run both test suites")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        # A different working directory is a materially different call and must
+        # not be rejected as a duplicate tool call.
+        self.assertEqual(command_mock.call_count, 2)
+        self.assertNotIn("event", result.observations[1])
+        self.assertEqual(
+            [str(call.args[1]) for call in command_mock.call_args_list],
+            [
+                str((self.registry.repo_root / "scripts").resolve()),
+                str((self.registry.repo_root / "tools").resolve()),
+            ],
+        )
+
+    def test_python_run_signature_still_blocks_an_identical_repeat(self):
+        (self.registry.repo_root / "scripts").mkdir(parents=True, exist_ok=True)
+        client = _Client([
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"scripts","reason":"run tests"}',
+            '{"type":"tool","tool":"python_run","module":"unittest","argv":["discover"],'
+            '"cwd":"scripts","reason":"run the same tests again"}',
+            '{"type":"action","action":"answer","message":"Tests ran.","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=("exit_code: 0\nstdout:\nOK", None),
+            ) as command_mock:
+                result = orchestrator.run("Run the tests")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(command_mock.call_count, 1)
         self.assertEqual(result.observations[1]["event"], "duplicate_tool_call")
-        self.assertIn("python3", command_mock.call_args.args[0].body)
 
     def test_delegate_is_tool_and_local_controller_decides_after_result(self):
         delegation = _Delegation()

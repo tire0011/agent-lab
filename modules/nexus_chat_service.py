@@ -17,6 +17,7 @@ from modules.task_orchestrator import (
     ACTION_MISSING_CAPABILITY,
     ACTION_NEW_EXPERIMENT,
     ACTION_RESUME_EXPERIMENT,
+    TOOL_PYTHON_RUN,
     NexusTaskOrchestrator,
     TaskDecision,
     TaskOrchestratorError,
@@ -57,7 +58,7 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
         capabilities = super()._capabilities()
         if self.allow_mutation:
             return capabilities
-        blocked = {ACTION_COMMAND, ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT}
+        blocked = {ACTION_COMMAND, TOOL_PYTHON_RUN, ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT}
         return [item for item in capabilities if item.get("name") not in blocked]
 
     def _compact_capabilities(self) -> list[dict[str, Any]]:
@@ -97,9 +98,11 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
         import json
         final_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
         policy = "Discussion only: use read-only tools when needed; do not mutate."
+        tool_names = ["operation", "memory_search", "delegate"]
         if self.allow_mutation:
             final_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
             policy = "Execution explicitly requested: mutating command/experiment actions are allowed when useful."
+            tool_names = [*tool_names, ACTION_COMMAND, TOOL_PYTHON_RUN]
         return "\n".join([
             "You are Nexus, the persistent local chat controller. Be concise and solve the current turn with the cheapest capable path.",
             "", "CURRENT INPUT:", current_input,
@@ -108,14 +111,15 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
             "", "OBSERVATIONS:", json.dumps(observations, separators=(",", ":")),
             "", "POLICY: " + policy,
             "Use memory/inspection only when it materially helps. Commands are tools, never final actions. After any tool result, decide again. Never invent tool results or IDs.",
-            'Tool JSON: {"type":"tool","tool":"operation|memory_search|delegate|command",...}',
+            'Tool JSON: {"type":"tool","tool":"' + "|".join(tool_names) + '",...}',
             'Final JSON: {"type":"action","action":"' + "|".join(final_actions) + '","experiment_id":null,"message":"...","reason":"..."}',
             "Return JSON only.",
         ])
 
     async def _execute_tool(self, decision: dict[str, Any]) -> dict[str, Any]:
-        if not self.allow_mutation and str(decision.get("tool", "")).strip() == ACTION_COMMAND:
-            return {"tool": ACTION_COMMAND, "error": "mutation blocked in discussion-only chat turn"}
+        tool = str(decision.get("tool", "")).strip()
+        if not self.allow_mutation and tool in {ACTION_COMMAND, TOOL_PYTHON_RUN}:
+            return {"tool": tool, "error": "mutation blocked in discussion-only chat turn"}
         return await super()._execute_tool(decision)
 
 

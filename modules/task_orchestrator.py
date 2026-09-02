@@ -25,12 +25,21 @@ from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
 from modules.nexus_task_store import NexusTaskStore
+from modules.redaction import redact_secrets
 from modules.run_store import DEFAULT_DB_PATH
+from modules.runtime_execution import (
+    RuntimeExecutionError,
+    build_python_command,
+    classify_command_failure,
+    corrected_command,
+    resolve_python_interpreter,
+)
 from modules.tool_loop_guard import PersistentToolLoopGuard
 
 ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_RESUME_EXPERIMENT = "resume_experiment"
 ACTION_COMMAND = "command"
+TOOL_PYTHON_RUN = "python_run"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
 ACTION_MISSING_CAPABILITY = "missing_capability"
@@ -66,6 +75,10 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
             "task": {"type": "string"},
             "context": {"type": "string"},
             "command": {"type": "string"},
+            "script": {"type": "string"},
+            "module": {"type": "string"},
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "cwd": {"type": "string"},
             "action": {"type": "string"},
             "experiment_id": {"type": ["string", "null"]},
             "message": {"type": "string"},
@@ -437,6 +450,7 @@ class NexusTaskOrchestrator:
             {"name": "memory_search", "description": "Search Nexus memory: structured knowledge, previous task/dialog history and project memory documents.", "arguments": {"query": "string", "limit": "1..10"}},
             {"name": "delegate", "description": "Ask another bounded LLM worker for analysis/research/review. Provider failures automatically fall back to another available model and control then returns to Nexus.", "providers": self.delegation.catalog(), "arguments": {"provider": "provider name", "task": "sub-problem", "context": "optional compact context"}},
             {"name": ACTION_COMMAND, "description": "Local development tool: execute one shell command through the trusted development command primitive, observe its real output, then keep control and decide again.", "arguments": {"command": "shell command"}},
+            {"name": TOOL_PYTHON_RUN, "description": "Run project Python deterministically: Nexus resolves its own interpreter, so never write an interpreter name or path yourself. Give either a repository-relative script or an importable module plus arguments.", "arguments": {"script": "repository-relative .py path", "module": "importable module name", "argv": "list of arguments"}},
             {"name": ACTION_NEW_EXPERIMENT, "description": "Codex development path: start a new isolated implementation experiment for large/complex repository changes."},
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
@@ -469,6 +483,7 @@ Tool calls:
 {{"type":"tool","tool":"memory_search","query":"...","limit":6,"reason":"..."}}
 {{"type":"tool","tool":"delegate","provider":"local_worker|codex_readonly|azure_openai","task":"bounded sub-problem","context":"optional","reason":"..."}}
 {{"type":"tool","tool":"command","command":"<shell command>","reason":"..."}}
+{{"type":"tool","tool":"python_run","script":"<repo-relative .py>","argv":["--version"],"reason":"..."}}
 Final action:
 {{"type":"action","action":"new_experiment|resume_experiment|answer|missing_capability|clarification","experiment_id":null,"message":"...","reason":"..."}}
 
@@ -486,6 +501,8 @@ Rules:
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
+- Use `python_run` for every Python execution; Nexus supplies the interpreter. Never write an interpreter name or path in a command.
+- When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply.
@@ -505,8 +522,7 @@ Rules:
             return normalized
         return decision
 
-    @staticmethod
-    def _tool_identity(decision: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def _tool_identity(self, decision: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         tool = str(decision.get("tool", "")).strip()
         if tool == "operation":
             return tool, {
@@ -527,6 +543,21 @@ Rules:
             }
         if tool == ACTION_COMMAND:
             return tool, {"command": str(decision.get("command", "")).strip()}
+        if tool == TOOL_PYTHON_RUN:
+            # The working directory changes module/script resolution, so two
+            # otherwise identical python_run calls in different directories are
+            # materially different calls and must not collapse into one
+            # duplicate-tool-call signature.
+            try:
+                cwd = str(self._resolve_cwd(decision.get("cwd")))
+            except TaskOrchestratorError:
+                cwd = str(decision.get("cwd", "")).strip()
+            return tool, {
+                "script": str(decision.get("script", "")).strip(),
+                "module": str(decision.get("module", "")).strip(),
+                "argv": [str(item) for item in (decision.get("argv") or [])],
+                "cwd": cwd,
+            }
         return tool, dict(decision.get("args") or {})
 
     def _state_token(self, current_input: str) -> str:
@@ -619,16 +650,9 @@ Rules:
                 str(decision.get("reason", ""))[:500],
                 len(command),
             )
-            try:
-                result, _ = process_command(
-                    SimpleNamespace(body=command, meta={}),
-                    Path(getattr(self.operations_registry, "repo_root", "/agent")),
-                    None,
-                    0,
-                )
-            except (OSError, ValueError) as exc:
-                return {"tool": ACTION_COMMAND, "command": command[:2000], "error": str(exc)[:4000]}
-            return {"tool": ACTION_COMMAND, "command": command[:2000], "result": result[:10000], "provider_used": "local"}
+            return self._run_command_with_recovery(command, tool=ACTION_COMMAND)
+        if tool == TOOL_PYTHON_RUN:
+            return self._execute_python_run(decision)
         if tool == "memory_search":
             query = str(decision.get("query", "")).strip()
             if not query:
@@ -651,6 +675,143 @@ Rules:
                 reason=str(decision.get("reason", "")),
             )
         raise TaskOrchestratorError(f"unknown tool {tool!r}")
+
+    def _repo_root(self) -> Path:
+        return Path(getattr(self.operations_registry, "repo_root", "/agent"))
+
+    def _resolve_cwd(self, raw: Any) -> Path:
+        repo_root = self._repo_root()
+        relative = str(raw or "").strip()
+        if not relative:
+            return repo_root
+        candidate = (repo_root / relative).resolve() if not Path(relative).is_absolute() else Path(relative).resolve()
+        root = repo_root.resolve()
+        if candidate != root and root not in candidate.parents:
+            raise TaskOrchestratorError("working directory must stay inside the repository")
+        return candidate
+
+    def _run_command(self, command: str, cwd: Path) -> tuple[str | None, str | None]:
+        try:
+            result, _ = process_command(SimpleNamespace(body=command, meta={}), cwd, None, 0)
+        except (OSError, ValueError) as exc:
+            return None, str(exc)[:4000]
+        return result, None
+
+    def _run_command_with_recovery(
+        self,
+        command: str,
+        *,
+        tool: str,
+        cwd: Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run one command and permit at most one deterministic corrected retry."""
+        working_directory = cwd or self._repo_root()
+        interpreter = resolve_python_interpreter(self._repo_root())
+        payload: dict[str, Any] = {
+            "tool": tool,
+            "command": redact_secrets(command)[:2000],
+            "cwd": str(working_directory),
+            "interpreter": interpreter,
+            "provider_used": "local",
+            **(extra or {}),
+        }
+
+        result, error = self._run_command(command, working_directory)
+        if error is not None:
+            return {**payload, "error": error}
+
+        failure = classify_command_failure(result)
+        if failure is None:
+            return {**payload, "result": result[:10000]}
+
+        mapping = corrected_command(
+            command,
+            missing_executable=failure.executable,
+            interpreter=interpreter,
+        )
+        if mapping is None:
+            logger.warning(
+                "command_resolution original=%s missing_executable=%s mapping=none outcome=missing_capability",
+                redact_secrets(command)[:500],
+                failure.executable[:120],
+            )
+            return {
+                **payload,
+                "event": "command_not_found",
+                "missing_executable": failure.executable[:120],
+                "detail": failure.detail,
+                "result": result[:4000],
+                "message": (
+                    "No known runtime mapping exists for this executable. Use python_run for Python, "
+                    "select another capability, or choose missing_capability. Do not repeat this command "
+                    "and do not repeat memory searches for it."
+                ),
+            }
+
+        corrected, mapping_name = mapping
+        logger.info(
+            "command_resolution original=%s missing_executable=%s mapping=%s corrected=%s",
+            redact_secrets(command)[:500],
+            failure.executable[:120],
+            mapping_name,
+            redact_secrets(corrected)[:500],
+        )
+        retried, retry_error = self._run_command(corrected, working_directory)
+        recovery = {
+            "event": "command_resolution_retry",
+            "original_command": redact_secrets(command)[:2000],
+            "missing_executable": failure.executable[:120],
+            "mapping": mapping_name,
+            "attempts": 2,
+        }
+        payload = {**payload, "command": redact_secrets(corrected)[:2000], "recovery": recovery}
+        if retry_error is not None:
+            logger.warning("command_resolution mapping=%s outcome=retry_error", mapping_name)
+            return {**payload, "error": retry_error}
+        logger.info(
+            "command_resolution mapping=%s outcome=%s",
+            mapping_name,
+            "unresolved" if classify_command_failure(retried) else "recovered",
+        )
+        return {**payload, "result": (retried or "")[:10000]}
+
+    def _execute_python_run(self, decision: dict[str, Any]) -> dict[str, Any]:
+        argv = decision.get("argv")
+        if argv is None and isinstance(decision.get("args"), list):
+            argv = decision.get("args")
+        if argv is not None and not isinstance(argv, list):
+            raise TaskOrchestratorError("python_run argv must be a list")
+        cwd = self._resolve_cwd(decision.get("cwd"))
+        try:
+            plan = build_python_command(
+                script=decision.get("script"),
+                module=decision.get("module"),
+                args=argv or (),
+                repo_root=self._repo_root(),
+            )
+        except RuntimeExecutionError as exc:
+            raise TaskOrchestratorError(str(exc)) from exc
+
+        logger.info(
+            "python_run target=%s argument_count=%s cwd=%s reason=%s",
+            plan.target[:200],
+            len(argv or []),
+            cwd,
+            str(decision.get("reason", ""))[:500],
+        )
+        result, error = self._run_command(plan.command, cwd)
+        payload: dict[str, Any] = {
+            "tool": TOOL_PYTHON_RUN,
+            "target": plan.target[:500],
+            "command": redact_secrets(plan.command)[:2000],
+            "interpreter": plan.interpreter,
+            "cwd": str(cwd),
+            "provider_used": "local",
+        }
+        if error is not None:
+            return {**payload, "error": error}
+        return {**payload, "result": (result or "")[:10000]}
 
     async def _delegate_with_fallback(
         self,

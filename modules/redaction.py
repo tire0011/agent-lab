@@ -40,15 +40,23 @@ _REMOTE_URL_PATTERN = re.compile(
 _PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
 
 
-def redact(text: str) -> str:
-    """Scrub secret-shaped substrings and absolute filesystem paths."""
+def redact_secrets(text: str) -> str:
+    """Scrub secret-shaped substrings while preserving filesystem paths.
+
+    Used where a path is the meaningful payload (for example the command a
+    trusted local runner actually executed, including its interpreter), and
+    where the value never reaches a persisted activity log or API response.
+    """
     text = _URL_CRED_PATTERN.sub("[REDACTED]", text)
     text = _REMOTE_URL_PATTERN.sub("[REMOTE]", text)
     text = _BEARER_PATTERN.sub("[REDACTED]", text)
     text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
-    text = _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
-    text = _PATH_PATTERN.sub("[PATH]", text)
-    return text
+    return _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
+
+
+def redact(text: str) -> str:
+    """Scrub secret-shaped substrings and absolute filesystem paths."""
+    return _PATH_PATTERN.sub("[PATH]", redact_secrets(text))
 
 
 def bounded_lines(raw: str | None, *, max_lines: int = 100, max_line_chars: int = 500) -> list[str]:
