@@ -20,6 +20,20 @@ const logsElements = {
   autoRefreshState: document.querySelector("#logs-auto-refresh-state"),
 };
 
+// Every systemd unit the Operations tab already knows how to manage
+// (see modules.service_operations._DEFAULT_NEXUS_SERVICES); "Alle
+// Services" tails each of these and merges the results, so the Logs
+// page can show every journalctl log without the operator picking one
+// service at a time.
+const JOURNALCTL_SERVICES = ["agent-api", "nexus-mailbox", "llama-server"];
+
+const journalctlElements = {
+  refreshButton: document.querySelector("#logs-journalctl-refresh-button"),
+  serviceSelect: document.querySelector("#logs-journalctl-service-select"),
+  linesInput: document.querySelector("#logs-journalctl-lines-input"),
+  content: document.querySelector("#logs-journalctl-content"),
+};
+
 // Accumulated state for the currently displayed page(s): which URL to
 // re-request for "Ältere laden" (same base path/filters as the last
 // manual refresh), the entries collected so far (oldest first, exactly
@@ -306,6 +320,7 @@ async function loadLogs() {
 }
 
 logsElements.refreshButton.addEventListener("click", loadLogs);
+logsElements.refreshButton.addEventListener("click", loadJournalctlLogs);
 if (logsElements.loadOlderButton) logsElements.loadOlderButton.addEventListener("click", loadOlderLogs);
 logsElements.experimentSelect.addEventListener("change", loadLogs);
 if (logsElements.levelSelect) logsElements.levelSelect.addEventListener("change", loadLogs);
@@ -321,3 +336,85 @@ for (const input of [logsElements.jobInput, logsElements.sessionInput]) {
     input._debounce = setTimeout(loadLogs, 400);
   });
 }
+
+// ---------------------------------------------------------------------------
+// System-Logs (journalctl) - separate data source (systemd, via
+// GET /operations/logs/tail), not the JSONL feed above, so it is loaded
+// and rendered independently.
+// ---------------------------------------------------------------------------
+
+// A raw "--output=short-iso" journalctl line starts with an ISO-8601
+// timestamp token followed by the rest of the line; splitting on the
+// first space keeps that timestamp sortable as plain text so entries
+// from multiple services can be merged chronologically.
+function parseJournalctlLine(service, rawLine) {
+  const separatorIndex = rawLine.indexOf(" ");
+  const timestamp = separatorIndex === -1 ? "" : rawLine.slice(0, separatorIndex);
+  return { service, timestamp, text: rawLine };
+}
+
+function renderJournalctlEntries(entries) {
+  journalctlElements.content.replaceChildren();
+  if (!entries.length) {
+    journalctlElements.content.textContent = "Keine Log-Einträge gefunden.";
+    return;
+  }
+  const list = document.createElement("ul");
+  list.className = "item-list";
+  for (const entry of entries) {
+    const li = document.createElement("li");
+    li.className = "log-entry";
+    const head = document.createElement("div");
+    head.className = "log-entry-head";
+
+    const service = document.createElement("span");
+    service.className = "log-entry-phase";
+    service.textContent = entry.service;
+    head.append(service);
+
+    const message = document.createElement("span");
+    message.className = "log-entry-message";
+    message.textContent = entry.text;
+    head.append(message);
+
+    li.append(head);
+    list.append(li);
+  }
+  journalctlElements.content.append(list);
+}
+
+async function loadJournalctlLogs() {
+  if (!journalctlElements.content) return;
+  if (!state.apiKey) {
+    journalctlElements.content.textContent = "Erfordert einen API-Schlüssel.";
+    return;
+  }
+  const selectedService = journalctlElements.serviceSelect ? journalctlElements.serviceSelect.value.trim() : "";
+  const services = selectedService ? [selectedService] : JOURNALCTL_SERVICES;
+  const lines = journalctlElements.linesInput && journalctlElements.linesInput.value.trim()
+    ? journalctlElements.linesInput.value.trim()
+    : "100";
+  journalctlElements.content.textContent = "Wird geladen …";
+  try {
+    const perService = await Promise.all(
+      services.map((service) =>
+        requestJson(
+          `/operations/logs/tail?service=${encodeURIComponent(service)}&lines=${encodeURIComponent(lines)}`,
+          { headers: authHeaders() },
+        ).then(
+          (data) => (data.data && data.data.lines ? data.data.lines : []).map((line) => parseJournalctlLine(service, line)),
+          // One service being unreachable (e.g. unknown unit) must not
+          // blank out the others when "Alle Services" is selected.
+          () => [],
+        )
+      ),
+    );
+    const merged = perService.flat().sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    renderJournalctlEntries(merged);
+  } catch (error) {
+    showError(journalctlElements.content, error.message);
+  }
+}
+
+if (journalctlElements.refreshButton) journalctlElements.refreshButton.addEventListener("click", loadJournalctlLogs);
+if (journalctlElements.serviceSelect) journalctlElements.serviceSelect.addEventListener("change", loadJournalctlLogs);

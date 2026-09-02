@@ -22,6 +22,7 @@ function activateTab(name) {
   if (name === "logs") {
     loadLogsExperimentOptions();
     loadLogs();
+    loadJournalctlLogs();
   }
 }
 
