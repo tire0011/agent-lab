@@ -8,9 +8,11 @@ then decide what Nexus should do next. Existing pipelines remain tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +26,7 @@ from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
 from modules.nexus_task_store import NexusTaskStore
 from modules.run_store import DEFAULT_DB_PATH
+from modules.tool_loop_guard import PersistentToolLoopGuard
 
 ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_RESUME_EXPERIMENT = "resume_experiment"
@@ -103,6 +106,9 @@ class NexusTaskOrchestrator:
         task_store: NexusTaskStore | None = None,
         llm_job_service: LocalLlmJobService | None = None,
         max_steps: int = 6,
+        max_total_steps: int | None = None,
+        max_identical_calls: int | None = None,
+        max_non_progressing_cycles: int | None = None,
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
@@ -111,6 +117,12 @@ class NexusTaskOrchestrator:
         self.llama = llama_client or LlamaCppClient(timeout=job_watchdog)
         self.max_steps = max(1, min(max_steps, 10))
         db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
+        self.loop_guard = PersistentToolLoopGuard(
+            db_path=db_path,
+            max_total_steps=max_total_steps or int(os.environ.get("NEXUS_ORCHESTRATOR_MAX_TOTAL_STEPS", "20")),
+            max_identical_calls=max_identical_calls or int(os.environ.get("NEXUS_ORCHESTRATOR_MAX_IDENTICAL_CALLS", "3")),
+            max_non_progressing_cycles=max_non_progressing_cycles or int(os.environ.get("NEXUS_ORCHESTRATOR_MAX_CYCLES", "2")),
+        )
         self.llm_jobs = llm_job_service or LocalLlmJobService(db_path=db_path, llama_client=self.llama)
         self._owns_llm_jobs = llm_job_service is None
         repo_root = str(getattr(operations_registry, "repo_root", "/agent"))
@@ -124,6 +136,7 @@ class NexusTaskOrchestrator:
         self._owns_delegation = delegation_service is None
 
     def close(self) -> None:
+        self.loop_guard.close()
         if self._owns_llm_jobs:
             self.llm_jobs.close()
         if self._owns_delegation:
@@ -202,6 +215,16 @@ class NexusTaskOrchestrator:
         observations: list[dict[str, Any]] = []
 
         for _ in range(self.max_steps):
+            state_token = self._state_token(task)
+            within_budget, step = self.loop_guard.claim_step(session.id, state_token)
+            if not within_budget:
+                return self._loop_limit_result(
+                    session.id,
+                    task,
+                    observations,
+                    f"persistent orchestration step limit reached ({step - 1})",
+                    task_logger,
+                )
             history = self.task_store.history(session.id, limit=18, max_chars=7000)
             prompt = self._prompt(session, task, history, observations)
             logger.info(
@@ -243,6 +266,7 @@ class NexusTaskOrchestrator:
                 decision["type"] = "tool"
                 decision["tool"] = ACTION_COMMAND
             if decision.get("type") == "tool":
+                decision = self._normalize_tool_decision(decision)
                 if task_logger is not None:
                     task_logger.info(
                         "orchestration",
@@ -255,7 +279,49 @@ class NexusTaskOrchestrator:
                         reason=str(decision.get("reason", "")),
                         session_id=session.id,
                     )
-                observation = await self._execute_tool(decision)
+                tool, arguments = self._tool_identity(decision)
+                check = self.loop_guard.check(
+                    session.id,
+                    tool,
+                    arguments,
+                    state_token=state_token,
+                    reason=str(decision.get("reason", "")),
+                )
+                if not check.allowed:
+                    observation = check.observation or {"event": "duplicate_tool_call"}
+                    logger.warning(
+                        "tool loop detected session_id=%s signature=%s previous_call_id=%s recovery=%s",
+                        session.id,
+                        check.signature,
+                        observation.get("previous_call_id"),
+                        observation.get("recovery"),
+                        extra={"session_id": session.id, "event": "tool_loop_detected"},
+                    )
+                    if task_logger is not None:
+                        task_logger.warning(
+                            "orchestration",
+                            str(observation.get("event", "duplicate_tool_call")),
+                            (
+                                f"tool loop detected signature={check.signature} "
+                                f"previous_call_id={observation.get('previous_call_id')} "
+                                f"recovery={observation.get('recovery')}"
+                            ),
+                            session_id=session.id,
+                            signature=check.signature,
+                            previous_call_id=str(observation.get("previous_call_id", "")),
+                            recovery=str(observation.get("recovery", "")),
+                        )
+                    if check.stop:
+                        return self._loop_limit_result(
+                            session.id,
+                            task,
+                            observations + [observation],
+                            f"tool loop limit reached after {observation.get('event')}",
+                            task_logger,
+                        )
+                else:
+                    observation = await self._execute_tool(decision)
+                    self.loop_guard.record_result(check.call_id, observation)
                 observations.append(observation)
                 self.task_store.append_event(
                     session.id,
@@ -425,8 +491,97 @@ Rules:
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply.
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed.
 - Never invent tool names, provider names, operation results or experiment IDs.
+- When an observation reports duplicate_tool_call, non_progressing_cycle or retry_reason_required, do not repeat it. Choose a materially different tool or a controlled final action.
 - Return JSON only.
 """
+
+    def _normalize_tool_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        tool = str(decision.get("tool", "")).strip()
+        available_operations = {spec.name for spec in self.operations_registry.catalog()}
+        if tool in available_operations:
+            normalized = dict(decision)
+            normalized["tool"] = "operation"
+            normalized["operation"] = tool
+            return normalized
+        return decision
+
+    @staticmethod
+    def _tool_identity(decision: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        tool = str(decision.get("tool", "")).strip()
+        if tool == "operation":
+            return tool, {
+                "operation": str(decision.get("operation", "")).strip(),
+                "args": decision.get("args") or {},
+            }
+        if tool == "memory_search":
+            try:
+                limit = int(decision.get("limit", 6))
+            except (TypeError, ValueError):
+                limit = 6
+            return tool, {"query": str(decision.get("query", "")).strip(), "limit": limit}
+        if tool == "delegate":
+            return tool, {
+                "provider": str(decision.get("provider", "")).strip(),
+                "task": str(decision.get("task", "")).strip(),
+                "context": str(decision.get("context", "")),
+            }
+        if tool == ACTION_COMMAND:
+            return tool, {"command": str(decision.get("command", "")).strip()}
+        return tool, dict(decision.get("args") or {})
+
+    def _state_token(self, current_input: str) -> str:
+        root = Path(getattr(self.operations_registry, "repo_root", "/agent"))
+        repo_state = "not-a-git-repository"
+        try:
+            completed = subprocess.run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if completed.returncode == 0 and head.returncode == 0:
+                repo_state = f"{head.stdout.strip()}\n{completed.stdout}"
+        except (OSError, subprocess.SubprocessError):
+            pass
+        payload = f"{current_input.strip()}\0{repo_state}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _loop_limit_result(
+        self,
+        session_id: str,
+        task: str,
+        observations: list[dict[str, Any]],
+        reason: str,
+        task_logger: Any | None,
+    ) -> TaskDecision:
+        result = TaskDecision(
+            action=ACTION_CLARIFICATION,
+            reason=reason,
+            message="Nexus stopped a non-progressing tool loop. Choose a different tool or provide changed state before retrying.",
+            observations=observations,
+            session_id=session_id,
+        )
+        if task_logger is not None:
+            task_logger.warning(
+                "orchestration",
+                "tool_loop_stopped",
+                reason,
+                action=result.action,
+                reason=reason,
+                session_id=session_id,
+            )
+        self._persist_final(session_id, task, result)
+        return result
 
     @staticmethod
     def _parse(raw: str) -> dict[str, Any]:
