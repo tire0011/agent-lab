@@ -22,7 +22,7 @@ The project deliberately avoids dependence on company/proprietary code. Improvem
 
 ### 1. Initial idea: a self-improving agent under a real budget
 
-The project began with the idea of an independent agent that can improve tools, context, memory, model selection, evaluation, orchestration, and eventually its own useful capabilities. Early investigation covered Azure credits, local/cloud models, cheap providers, MCP/RAG, quantization, and multi-agent approaches. A recurring conclusion was that continuous autonomy should not depend on expensive external API calls.
+The project began with the idea of an independent agent that can improve tools, context, memory, model selection, evaluation, orchestration, and eventually its own useful capabilities. Early investigation covered Azure credits, local/cloud models, MCP/RAG, quantization, and multi-agent approaches. A recurring conclusion was that continuous autonomy should not depend on expensive external API calls.
 
 ### 2. Azure VM as the persistent laboratory
 
@@ -42,303 +42,257 @@ FastAPI and a small web UI evolved into a remote operational surface for problem
 
 ### 6. Controlled coding through Codex
 
-Codex CLI became the first controlled implementation path. Important lessons were that read-only analysis and workspace-write implementation need different boundaries, task IDs/status must survive connection failures, and timeout/working-directory constraints must be enforced server-side.
+Codex CLI became the first controlled implementation path. Read-only analysis and workspace-write implementation need different boundaries; task IDs/status must survive connection failures; timeout/working-directory constraints belong server-side.
 
 ### 7. ExperimentService and measurable self-modification
 
-`ExperimentService` turned improvement ideas into isolated experiments with implementation, verification, and terminal states such as success, failure, rejection, timeout, or `needs_review`. Git worktrees isolate changes; verification uses bounded commands. The key conceptual step was separating **proposing a change** from **adopting a change**.
+`ExperimentService` turned improvement ideas into isolated experiments with implementation, verification, and terminal states such as success, failure, rejection, timeout, or `needs_review`. Git worktrees isolate changes. The key step was separating **proposing a change** from **adopting a change**.
 
 ### 8. Better selection and diagnostics
 
-Weak experiment selections led to tighter validation requiring meaningful affected files and implementation scope. Selection/reformat failures became visible through diagnostics instead of silently disappearing. **Lesson:** failures that cannot be explained cannot be systematically improved.
+Weak experiment selections led to tighter validation requiring meaningful affected files and implementation scope. Selection/reformat failures became visible instead of silently disappearing. **Lesson:** failures that cannot be explained cannot be systematically improved.
 
 ### 9. Human approval loop
 
-Mailbox tasks initially required a human approval gate before autonomous code modification. This was intentionally scaffolding, not permanent architecture; it was removed after the trusted development path gained stronger persistence, observability, verification, and recovery.
+Mailbox tasks initially required human approval before autonomous modification. This was scaffolding and was later removed after persistence, observability, verification, and recovery improved.
 
 ### 10. Git-backed Nexus mailbox
 
-A Git-backed inbox/outbox created a simple, human-readable, versioned protocol between humans, ChatGPT, Nexus, and future agents. It also exposed that communication commits have a different write pattern from source-code integration and can create Git contention.
+A Git-backed inbox/outbox created a human-readable, versioned protocol between humans, ChatGPT, Nexus, and future agents. It also exposed that communication commits and source-code integration have incompatible Git write patterns.
 
 ### 11. Public activity and diagnostics
 
-Sanitized activity/diagnostic APIs expose lifecycle timing, changed filenames, test state, bounded messages, usage, estimated cost where available, and deployment revision. Nexus should increasingly be evaluated by evidence of what it did, what it cost, and whether the outcome improved measurable behavior.
+Sanitized APIs expose lifecycle timing, changed filenames, test state, bounded messages, usage, estimated cost where available, and deployment revision. Nexus should increasingly be judged by evidence of what it did, what it cost, and whether behavior improved.
 
 ### 12. Operation chains
 
-The system moved from one-shot operations toward sequential operation chains. Integration conflicts when `origin/main` moved during adoption correctly produced `needs_review` rather than forcing a merge, validating conservative adoption behavior.
+The system moved from one-shot operations toward sequential chains. Integration conflicts when `origin/main` moved correctly produced `needs_review` rather than forcing a merge.
 
 ### 13. 2026-08-15: code/mailbox repository split
 
-`/agent` became the source repository and `/var/lib/nexus/mailbox-repo` the mailbox repository. Cross-repository regression coverage included an end-to-end two-repository mailbox test. **Lesson:** communication state and source-integration state should be isolated when their Git histories interfere.
+`/agent` became the source repository and `/var/lib/nexus/mailbox-repo` the mailbox repository. Cross-repository regression coverage included an end-to-end two-repository mailbox test. **Lesson:** isolate state types whose Git histories interfere.
 
 ### 14. 2026-08-15: crash-safe outbox publication
 
-Task and operation-chain results gained a persistent `OutboxPublisher` lifecycle (`pending_write -> written -> committing -> committed -> pushed`). Intent is persisted before atomic file write; publication is serialized; recovery retries unfinished work; recorded commit SHAs are reused for push retry. **Lesson:** writing an outbox file is not the same as reliably delivering it.
+`OutboxPublisher` gained a persistent lifecycle (`pending_write -> written -> committing -> committed -> pushed`), atomic write, serialized publication, recovery, and commit-SHA reuse. **Lesson:** writing a result is not the same as reliably delivering it.
 
 ### 15. 2026-08-15: event-driven mailbox wake-up
 
-A signed GitHub webhook adapter was merged for mailbox changes, sharing the same poll processor as the timer-based path. The timer remains a fallback. **Lesson:** event-driven wake-up can reduce latency without removing a simpler recovery path.
+A signed GitHub webhook adapter was merged while timer polling remained as fallback. **Lesson:** event-driven wake-up can reduce latency without removing a simpler recovery path.
 
 ### 16. 2026-08-16: single-call experiment pipeline
 
-The normal Codex experiment path was reduced from roughly **3-5 LLM calls to one implementation call**. The model investigates/plans/implements/tests within one call; safety checks remain before execution and verification remains after it. A regression showed that explicit tests-only goals need separate classification from ordinary implementation goals that accidentally change only tests.
+The normal Codex path was reduced from roughly **3-5 LLM calls to one implementation call**; real verification remains after model execution. A regression showed explicit tests-only goals need separate classification from accidental tests-only changes.
 
 ### 17. 2026-08-16: token-efficient verification
 
-Default `unittest` verification uses quiet mode (`-q`). Success keeps only useful summary output; failures retain a bounded/redacted tail. **Lesson:** tool output should be compact on success and preserve only actionable evidence on failure.
+Default `unittest` verification uses quiet mode. Success keeps only useful summary output; failures retain a bounded/redacted tail. **Lesson:** keep success quiet and failure evidence actionable.
 
 ### 18. 2026-08-17 to 2026-08-19: local-first routing developed and validated
 
-External-provider quota pressure strengthened the local-first design: keep one small local model continuously available for routing, context gathering, planning, and small/medium work; escalate only when justified. Execution is sequential so one model/provider is active at a time. PR #21 evolved through real-VM testing and adopted model-agnostic orchestration, deterministic context gathering, real verification, and provider accounting. The default became Qwen2.5-Coder-7B-Instruct Q4_K_M via `llama.cpp`, while the architecture remains model-agnostic.
+Quota pressure strengthened the local-first design. PR #21 adopted model-agnostic orchestration, deterministic context gathering, real verification, and provider accounting. Qwen2.5-Coder-7B-Instruct Q4_K_M via `llama.cpp` became the default local model, not a permanent architectural dependency.
 
 ### 19. 2026-08-18: B2ms resource envelope
 
-The Azure VM was resized to **Standard_B2ms: 2 vCPUs and 8 GiB RAM**. Conservative local-server defaults target roughly 8k context, one parallel slot, two CPU threads, and local-only binding. Real deployment exposed a missing OpenBLAS dependency (`pkg-config`), fixed before merge. **Lesson:** installation scripts must be validated on the actual target environment.
+The VM was then Standard_B2ms (**2 vCPU, 8 GiB RAM**) with conservative local-server defaults around 8k context, one slot, two CPU threads, and local-only binding. Deployment exposed a missing OpenBLAS dependency. **Lesson:** validate installation on the real target environment.
 
 ### 20. 2026-08-18: self-healing operations adopted
 
-PR #22 added authenticated `/operations/*` capabilities for bounded Git operations, service status/restart, log inspection, diagnostics/self-healing, local-model status/testing, and restricted configuration operations. Review tightened stale-lock cleanup, path/symlink boundaries, service allowlists, recursive redaction, and safety tests. **Lesson:** increasing autonomy should come with narrower, testable capabilities and auditability—not unrestricted shell access.
+PR #22 added authenticated Git/service/log/diagnostic/local-model operations. Review tightened stale-lock cleanup, path boundaries, redaction, and tests. **Lesson:** autonomy should be paired with testable boundaries and auditability.
 
 ### 21. 2026-08-19: local-first multi-provider orchestration adopted
 
-PR #21 merged a model-agnostic sequential pipeline: `Router -> Context Gatherer -> Planner -> Developer -> real-tool Verification -> Reviewer`. The local model is the default low-cost decision layer; Azure OpenAI and Codex are escalation providers when configured. The capability architecture was adopted, not a permanent model choice.
+PR #21 merged the sequential `Router -> Context Gatherer -> Planner -> Developer -> Verification -> Reviewer` pipeline with local default reasoning and Azure/Codex escalation.
 
 ### 22. 2026-08-20: read-only MCP HTTP adapter
 
-PR #27 added a Streamable HTTP MCP surface at `/mcp/`, reusing existing FastAPI/service logic and authentication. It exposes compact read-only inspection tools and deliberately avoids duplicating business logic.
+PR #27 added a Streamable HTTP MCP surface at `/mcp/`, reusing existing authenticated service logic.
 
 ### 23. 2026-08-20: bootstrap MCP write capabilities
 
-PR #29 added write-capable MCP bootstrap tools behind `MCP_WRITE_ENABLED=true`, including Git pull, service status/restart, bounded tests, experiment start, local-router execution, and a temporary bounded/redacted/audited shell tool.
+PR #29 added explicitly enabled Git/service/test/experiment/router/bootstrap shell tools behind the MCP surface.
 
 ### 24. 2026-08-20: dependency synchronization became automatic
 
-A deployment failure exposed stale Python dependencies after source updates. PR #32 added a reusable dependency-sync helper for `requirements-api.txt` and wired it into startup, refresh/deploy, and operations-driven Git pull paths. **Lesson:** source deployment and runtime dependency state are one operational concern.
+PR #32 made runtime dependency synchronization part of source update/startup/deployment. **Lesson:** source and runtime dependency state are one operational concern.
 
 ### 25. 2026-08-21: safety-policy false positive fixed
 
-An experiment was rejected because `output tokens` was interpreted as a credential action. Issue #33/PR #35 introduced a narrow context-specific exception for LLM token metrics while credential-qualified access/auth/API/bearer token actions remain rejected. **Lesson:** safety-policy quality includes false-positive measurement.
+Issue #33/PR #35 fixed `output tokens` being misread as credential access while retaining credential protections. **Lesson:** safety quality includes false-positive measurement.
 
 ### 26. 2026-08-21: trusted mailbox became a development command interface
 
-PR #34 added a mailbox `command` message type and PR #36 removed the development-mode execution gate for command messages in the trusted setup. Timeout/output/redaction/environment protections remain. **Lesson:** trusted-channel policy and command-content policy are separate choices.
+PRs #34/#36 added trusted command messages and removed the development-mode content gate while keeping timeout/output/redaction/environment boundaries.
 
 ### 27. 2026-08-21 to 2026-08-22: mailbox Git synchronization became self-healing
 
-PR #38 replaced a push-first/`pull --ff-only` deadlock with a bounded **fetch -> rebase onto upstream -> push** loop. The tree must be clean; push races retry; real conflicts abort safely; force-push/reset/discard are not used. A real-Git regression test verifies simultaneous local outbox and remote inbox commits survive and converge.
+PR #38 replaced push-first/`pull --ff-only` deadlock behavior with bounded **fetch -> rebase -> push** retries, aborting real conflicts safely without force-push/reset/discard.
 
 ### 28. 2026-08-22: verification timeout became a first-class outcome
 
-Issue #39 separated subprocess timeout from ordinary test failure. Nexus records a distinct `test_timeout` event and timed-out state instead of folding it into `needs_review`. **Lesson:** failure classes must remain distinguishable if the system should learn different responses.
+Issue #39 separated `test_timeout` from ordinary failure. **Lesson:** distinct failure classes enable distinct adaptation.
 
 ### 29. 2026-08-22: persisted adaptive verification timeout
 
-Issue #40 / PR #45 introduced a small evidence-driven adaptation: verification starts at 300 seconds and increases by 1.5 after `test_timeout`, capped at 1,800 seconds, persisted in SQLite and reused after restarts. Successful or ordinary failing tests do not increase it. The full suite reported **905 tests, OK**. **Lesson:** bounded parameter adaptation is already a real self-improvement loop.
+Issue #40/PR #45 starts verification at 300 s and multiplies by 1.5 after timeout, capped at 1,800 s and persisted in SQLite. Full suite: **905 tests OK**. This became the first small persisted self-adaptation loop.
 
 ### 30. 2026-08-22: GitHub and MCP control-plane directions
 
-Issues #41-#44 defined the next coordination layer: GitHub Issues as durable work state, experiment branches/PRs for review, concise issue progress, and a possible global MCP gateway where a cheap local LLM routes specialized tools while reducing tool-schema context. The global gateway remains a research direction and should first be tested with only 2-3 capabilities.
+Issues #41-#44 defined GitHub Issues as durable work state and proposed a global MCP gateway where a cheap local LLM routes specialized tools while reducing tool-schema context. The gateway remains experimental.
 
 ### 31. 2026-08-22 to 2026-08-24: persistent local-LLM controller adopted
 
-A resume request exposed that one-shot intent classification was not enough. Issue #46 / PR #48 moved Nexus to a bounded ReAct-style loop: the local model chooses a tool or final action, receives the real observation, and decides again. Durable SQLite sessions preserve source identity and discussion history. Tools include operations, bounded memory search, delegation, and experiment start/resume. Delegation returns observations rather than transferring task ownership. PR #48 was merged after focused real-VM validation; an end-to-end Laguna run used memory search and Git status and completed without creating an experiment.
-
-**Lesson:** routing is not control. If the local model is meant to be the agent, control should return to it after tool/delegate observations.
+Issue #46/PR #48 moved Nexus from one-shot routing to a bounded ReAct-style loop. Durable sessions preserve discussion/history; tools include operations, bounded memory search, delegation, and experiment start/resume. Delegation returns observations rather than transferring ownership. **Lesson:** routing is not control; control should return to the local agent after observations.
 
 ### 32. 2026-08-23 to 2026-08-24: long local inference became persistent work
 
-Real Laguna controller turns on B2ms took roughly **7.5 to 14 minutes**. A synchronous controller request exceeded transport timeouts even while `llama-server` remained healthy. Nexus therefore persists serialized local inference as SQLite jobs (`queued`, `running`, `succeeded`, `failed`, `cancelled`) and lets the owning task wait/resume from stored results. **Lesson:** slow local inference is normal work, not necessarily a hung request.
+Real local controller turns took roughly **7.5-14 minutes**. Nexus therefore persists serialized local inference as durable jobs. **Lesson:** slow inference is normal work, not necessarily a hung request.
 
 ### 33. 2026-08-24: mailbox observability and repository separation tightened
 
-PR #51 added focused, content-free diagnostics around webhook/timer mailbox polls. PR #52 removed the obsolete in-repo `communication/` mailbox after the separate mailbox repository became authoritative. **Lesson:** completed migrations should remove compatibility state that can mislead operators and agents.
+PR #51 added bounded mailbox poll diagnostics and PR #52 removed the obsolete in-repo mailbox after the separate repository became authoritative.
 
-### 34. 2026-08-25: experiment adoption and normal verification share one runner
+### 34. 2026-08-25: experiment adoption and verification share one runner
 
-Experiment verification and adoption/integration verification now use the same isolated runner, including persisted adaptive timeout, timeout classification, environment isolation, duration/output handling, and future-timeout adjustment. **Lesson:** duplicated verification implementations drift.
+Experiment and adoption verification now share timeout classification, environment isolation, duration/output handling, and adaptive timeout logic. **Lesson:** duplicated verification semantics drift.
 
 ### 35. 2026-08-25: manual mailbox task approval removed
 
-Mailbox task messages are now immediately handed to the existing worker/controller; the UI approval affordance was removed. Existing timeout, output, redaction, environment, persistence, experiment isolation, and self-disruption protections remain. **Lesson:** approval gates can be useful scaffolding, but stronger evidence and recovery mechanisms can replace redundant manual steps in a trusted channel.
+Mailbox tasks now enter the worker/controller immediately; redundant manual approval UI was removed while execution/recovery boundaries remained.
 
 ### 36. 2026-08-25: GitHub Actions became a reusable verification surface
 
-A repository test workflow was added for Python 3.12 using `python -m unittest discover -s tests -q`, with dependency caching, a 20-minute job timeout, read-only repository permissions, and concurrency cancellation. It runs for pull requests targeting `main`, manual dispatch, and pushes to `nexus/**` branches.
-
-This creates the basis for remote verification of Nexus-generated branches without requiring every test run to consume VM time. The desired next step is to let Nexus recognize successful GitHub verification and run the same tests locally only when remote evidence is absent or unusable.
-
-**Lesson:** verification can be distributed, but the evidence model should stay unified; CI success should be reusable proof rather than trigger redundant local work.
+A Python 3.12 `unittest` workflow runs for PRs, manual dispatch, and `nexus/**` pushes. The long-term goal is to reuse exact matching CI success instead of rerunning tests locally.
 
 ### 37. 2026-08-26: command execution became iterative controller work
 
-PR #53 promoted trusted `command` execution from a terminal controller action into a first-class tool in the Nexus loop. Command output is bounded/redacted, returned as an observation, and the local controller must decide again. Focused tests cover `command -> observation -> command -> observation -> answer`.
-
-This is a meaningful autonomy improvement: Nexus can now inspect repository/system state, react to what actually happened, issue a second command, and only then conclude instead of treating shell execution as the end of reasoning.
-
-**Lesson:** operational actions should usually return control to the agent; terminal actions are appropriate only when ownership genuinely transfers to another durable workflow.
+PR #53 made command execution a tool observation rather than a terminal action, enabling `command -> observation -> command -> answer` loops. **Lesson:** operational actions should normally return control to the agent.
 
 ### 38. 2026-08-26: GitHub became the outer experiment lifecycle
 
-PR #54 implemented issue/branch/PR identity as the durable human-readable lifecycle around Nexus's existing isolated worktrees:
-
-`Issue -> nexus/<issue>-<slug> branch -> Nexus experiment -> verified adoption -> PR -> merge to main -> Issue completed`
-
-Nexus reuses an explicit/exact Issue when possible, otherwise creates one; creates/reuses the Issue branch before implementation; preserves source-to-work and experiment-to-work mappings so multiple experiments can belong to one work item; creates/reuses a PR; and marks the Issue complete after successful merge. Internal `experiment/<uuid>` worktrees remain the isolated execution environment.
-
-When GitHub tracking is configured, adoption publishes to the Issue branch and only reaches `main` through the PR path. GitHub failures or merge conflicts become `needs_review` and leave `main` unchanged. The previous direct-main path remains only as compatibility fallback when GitHub tracking is not configured.
-
-**Lesson:** runtime experiment identity and human work identity solve different problems. Keeping both allows strong isolation internally while making long-running autonomous work understandable and auditable through standard GitHub objects.
+PR #54 established `Issue -> branch -> experiment -> verified adoption -> PR -> merge -> Issue completion` around internal isolated worktrees. Runtime experiment identity and human work identity are complementary.
 
 ### 39. 2026-08-26: adaptive provider routing with local development fallback
 
-PR #56 extended the existing agentic controller instead of adding a second routing architecture. The policy now treats the local model as a real development route for simple analysis and small changes through the iterative command loop; Azure OpenAI is preferred for harder reasoning/research and medium programming guidance; Codex experiments are reserved for large or broad repository implementation.
+PR #56 made local execution a normal route for simple work, Azure preferred for harder reasoning, and Codex for large implementation, with provider fallback and actual-provider accounting. **Lesson:** local-first means cheapest capable route.
 
-Delegation gained automatic provider fallback. For example, Azure failure/quota can fall back to local and then Codex when available. Provider selection, fallback, completion, and escalation reasons are logged, and observations persist both requested and actually used provider information.
+### 40. 2026-08-26 to 2026-08-28: CI/smoke-test hardening exposed environment drift
 
-**Lesson:** local-first should mean **cheapest capable route**, not merely “local as emergency fallback.” Routing quality must be measured by actual task success, provider use, cost, latency, and fallback behavior rather than model preference alone.
-
-### 40. 2026-08-26 to 2026-08-28: CI/smoke-test hardening exposed and then closed environment drift
-
-Using GitHub Actions and Nexus smoke testing as real verification surfaces exposed assumptions that local/VM runs had hidden. CI concurrency was separated by event so a push run cannot cancel the corresponding PR run. CI output moved to a dedicated runner that keeps successful output quiet and surfaces only actionable unittest failures. The workflow also gained an explicitly writable temporary SQLite database path instead of relying on repository-local runtime state.
-
-The debugging cycle additionally caught test-driven regressions in security boundaries: mailbox secret validation and the authenticated experiment-logs route were restored rather than weakening production authentication to satisfy tests. A later Actions run on the post-hardening code completed successfully, so the clean-run milestone is no longer pending.
-
-**Lesson:** remote CI is not only a second place to run tests; it is an environment-parity check. Test isolation must model writable runtime state explicitly, and fixing tests must not silently relax production authentication or secret validation.
+Actions testing exposed concurrency, output-noise, writable-runtime-state, authentication, and secret-validation assumptions hidden by the long-lived VM. Post-hardening CI succeeded. **Lesson:** CI is also an environment-parity test.
 
 ### 41. 2026-08-27: webhook-triggered mailbox sync gained immediate recovery
 
-PR #62 fixed a case where a transient mailbox `sync_failed` result could strand an inbox item until the next timer poll. Webhook-triggered processing now retries that synchronization once while preserving existing behavior for other outcomes. **Lesson:** event-driven paths need a small local recovery step even when a slower periodic fallback exists.
+PR #62 added one immediate retry for transient webhook `sync_failed` results while retaining timer fallback.
 
 ### 42. 2026-08-27: persistent Nexus chat added discussion-to-execution flow
 
-Issue #61 / PR #63 turned the existing chat surface into a persistent Nexus conversation backed by the local controller and task/session state. Discussion-only turns remain read-only; explicit execution turns may use command tools or start/resume the experiment pipeline. When a user approves an idea with a short follow-up such as “do it”, Nexus reconstructs a self-contained implementation goal from the persisted conversation rather than losing the earlier discussion context.
-
-**Lesson:** conversational planning and implementation should be one durable workflow, but execution authority should still be explicit.
+Issue #61/PR #63 introduced persistent chat backed by controller/session state. Read-only discussion remains distinct from explicit execution; short approval follow-ups can reconstruct an implementation goal from persisted discussion.
 
 ### 43. 2026-08-27 to 2026-08-28: chat became asynchronous, multi-client, and observable
 
-PR #64 moved `/chat` to persistent background jobs because local controller turns can take minutes and were producing reverse-proxy 504s. The website now submits quickly and polls job state instead of keeping one HTTP request open. PR #65 added a PowerShell/terminal client using the same authenticated submit/poll/session protocol. PR #66 fixed command-action normalization and added submitted/running/succeeded/failed chat-job logs after real runtime diagnostics exposed an `unknown final action 'command'` failure.
+PR #64 made chat durable asynchronous jobs to avoid reverse-proxy timeouts; PR #65 added a PowerShell client; PR #66 fixed command normalization and added chat-job logging after a real `unknown final action 'command'` failure.
 
-**Lesson:** long-running agent interaction should be represented as durable jobs behind a shared protocol; browser and terminal clients should be thin views over the same state machine.
+### 44. 2026-08-28: chat context was compacted independently
 
-### 44. 2026-08-28: chat context was compacted independently from task orchestration
-
-PR #67 introduced a chat-specific context builder shared by all `/chat` clients. It keeps at most six recent non-tool turns and roughly 2,500 characters of history, and uses a compact capability catalog while preserving discussion/execution policy and access to memory, operations, delegation, commands, and experiments. The mailbox/task orchestrator remains unchanged.
-
-**Lesson:** context policy should match the interaction surface. Persistent memory does not require replaying an ever-growing transcript into every model call.
+PR #67 introduced a chat-specific context builder: at most six recent non-tool turns and roughly 2,500 history characters plus a compact capability catalog. **Lesson:** context policy should match the interaction surface.
 
 ### 45. 2026-08-28: static positive execution allowlists were removed
 
-PR #68 removed remaining application-level positive allowlists for operations, services, logs, Git/root/path access, mailbox write paths, maintenance targets, Codex roots, MCP filesystem filtering, source extensions, and model names. Verification now inherits the environment while removing secret/credential variables. Authentication, credential protection, redaction, timeouts, protocol/state validity, and concrete adapter dispatch remain in place. The change also fixed a thread-shutdown race exposed by the full suite.
-
-Verification reported **933 tests OK, 55 skipped**, and the corresponding GitHub Actions run completed successfully.
-
-**Lesson:** autonomy boundaries can move from brittle enumerations toward invariant protections. Removing static positive lists should not mean removing authentication, secret isolation, redaction, bounded execution, state validation, or auditability.
+PR #68 removed remaining application-level positive allowlists while keeping authentication, credential protection, redaction, timeouts, protocol/state validity, and concrete adapter dispatch. Verification: **933 tests OK, 55 skipped** and successful Actions.
 
 ### 46. 2026-08-29: rejected operation-chain publication became recoverable
 
-PR #69 fixed a mailbox deadlock where a rejected operation chain could write an untracked outbox result before persistent publish state existed. Rejected chains are now persisted before publication, and polling may recover when the only dirty files are machine-managed untracked outbox entries; staged/tracked changes or unrelated untracked files still block synchronization. Verification reported **51 focused tests OK** and **936 full-suite tests OK, 55 skipped**.
+PR #69 persisted rejected chains before publication and safely recovered machine-managed untracked outbox entries. Verification: **51 focused tests** and **936 full-suite tests OK, 55 skipped**.
 
-**Lesson:** durable publication intent must exist before externally visible result files, including rejection/error paths.
+### 47. 2026-08-29: residual operations allowlists were removed and diagnostics broadened
 
-### 47. 2026-08-29: the residual operations allowlist was removed and diagnostics broadened
-
-Runtime testing found one remaining positive gate in `OperationsRegistry` despite the broader PR #68 cleanup. PR #70 switched execution to implemented handler dispatch, so known `_op_<name>` handlers execute without a separate registry allowlist while unknown operations still fail when no handler exists; `local_model_status` became a normal bounded/redacted operation. PR #72 then allowed service status/log inspection for arbitrary requested services without adding a positive service list and added bounded `process_status` diagnostics sorted by memory use. Its full suite reported **944 tests OK, 55 skipped**.
-
-**Lesson:** broad policy migrations need runtime probes for hidden secondary gates; capability discovery and execution policy should not silently diverge.
+PRs #70/#72 removed secondary operation/service positive gates, added normal local-model status and bounded memory-sorted process diagnostics. Full suite: **944 tests OK, 55 skipped**. **Lesson:** runtime probes find hidden policy drift.
 
 ### 48. 2026-08-29: controller structured-output failures gained bounded repair
 
-A real chat request exposed malformed controller JSON (`\\\\'` in a string), which previously aborted the turn before tool execution. PR #73 now passes a JSON schema through the persistent local-LLM job queue, persists/migrates the structured response format, constrains controller completions to the Nexus decision envelope, and permits exactly one syntax-correction completion before failing clearly.
+PR #73 added schema-constrained controller generation plus one syntax-repair completion. A later valid-but-incomplete action exposed the need for semantic validation too; Nexus added one-shot semantic correction. **Lesson:** grammar/schema and semantic validation are separate layers.
 
-A later runtime request exposed a second class of failure: syntactically valid but incomplete output such as an action object with no action name, surfacing as `unknown final action ''`. Nexus subsequently committed semantic response validation so missing tool/action fields also enter the same one-shot correction path.
+### 49. 2026-08-29: direct controller self-repair exposed a lifecycle question
 
-**Lesson:** structured agent output needs both grammar/schema constraints and semantic validation; bounded self-repair is preferable to either blindly executing malformed intent or terminating on the first model formatting mistake.
-
-### 49. 2026-08-29: Nexus performed a direct controller reliability fix
-
-The incomplete-action repair was committed directly by Nexus on `main` (`3ceaa95e...`) together with a regression test that verifies one correction turn produces a valid final answer. This is a small but concrete example of Nexus modifying its own controller after a real conversational failure rather than only through an externally prepared PR.
-
-**Open question:** the direct-main path should be measured against the GitHub Issue/branch/PR lifecycle so autonomous emergency/self-repair remains observable and recoverable rather than becoming an undocumented bypass.
+Nexus directly committed a semantic-response reliability fix with regression coverage. The later mandatory GitHub lifecycle work resolved this ambiguity: normal implementation/self-repair should remain Issue/branch/PR-visible rather than silently writing `main`.
 
 ### 50. 2026-08-29: mailbox commands became deferred asynchronous work
 
-Immediately after the controller self-repair, Nexus committed `83728ccc...` on `main` to stop coupling trusted mailbox commands to a synchronous subprocess timeout. Command execution now writes per-message process state/output, marks the mailbox message as `deferred` while the process is alive, and lets later polls collect the exit code and bounded/redacted output. The change also removes the mailbox-specific self-service restart rejection, so long-running or service-disrupting development commands can survive the request that launched them.
-
-**Lesson:** the same durability rule that applies to slow LLM inference also applies to shell work: long-running execution should have explicit persistent state and be resumed/polled rather than being classified as failure merely because one request or poll ended.
+Trusted mailbox commands gained persistent process state and deferred collection so long-running/service-disrupting shell work can survive the poll that launched it. **Lesson:** long shell work needs the same durable-job semantics as slow inference.
 
 ### 51. 2026-08-29: comment/docstring context cost became a measured experiment
 
-Issue #74 defines a focused experiment to test whether redundant production-code comments and docstrings consume meaningful LLM context and maintenance effort. The experiment starts with a few comment-heavy modules, records reproducible before/after counts and approximate comment/docstring token or character cost, changes no intended runtime behavior, runs the full suite, and preserves architectural rationale/invariants while removing text that merely restates code.
+Issue #74 proposes measuring whether redundant production comments/docstrings consume meaningful source context without improving comprehension. Architectural rationale/invariants should be preserved. This remains open research.
 
-**Open question:** whether leaner source documentation measurably reduces Nexus context consumption without harming readability or losing design knowledge. If successful, the result should become a lightweight code-generation guideline rather than a broad one-time cleanup.
+### 52. 2026-08-29: internal orchestrator command execution was restored
 
-### 52. 2026-08-29: internal orchestrator command execution was restored after async mailbox migration
+The async mailbox migration broke state-less internal command calls. A dedicated synchronous compatibility path plus regression test restored them. **Lesson:** persistence semantics depend on the caller; shared adapters may need persistent external and synchronous internal modes.
 
-The deferred mailbox-command change exposed a call-site mismatch: internal orchestrator commands invoke the same command adapter without a persisted mailbox database connection/message ID, so they cannot enter the deferred state machine. Commit `be7d5809...` restored a synchronous execution path specifically for those state-less internal calls while retaining bounded/redacted output, duration, and exit-code reporting. Commit `5739db85...` added a regression test proving an internal command executes and returns its result without deferred state.
+### 53. 2026-08-29: mailbox request/response correlation became a UI target
 
-**Lesson:** making external work durable must not assume every caller has durable state. Shared adapters may need distinct execution semantics for persistent transport-driven work versus internal synchronous orchestration.
-
-### 53. 2026-08-29: mailbox request/response correlation became a UI design target
-
-Issue #75 records that normal Inbox/Outbox messages are already correlated internally through the inbox database record's `outbox_file` and the Outbox message's `source` metadata. The proposed web UI should therefore group a request and its response as one conversation-style card, keep pending requests visible, support a small chronological response/status timeline where needed, and avoid inventing a second correlation ID unless the existing relationship proves insufficient.
-
-This is intentionally a presentation/API change rather than a mailbox-processing redesign, and is meant to provide a natural path from the current Inbox/Outbox view toward persistent Nexus conversation history.
-
-**Lesson:** before adding protocol identifiers, reuse durable relationships already present in the transport/state model; better presentation can unlock conversational UX without changing delivery semantics.
+Issue #75 records that inbox/outbox correlation already exists in durable state, so conversation-style rendering should reuse it rather than inventing another protocol ID.
 
 ### 54. 2026-08-29 to 2026-08-31: runtime observability experiment was not adopted
 
-Issue #76 / PR #77 explored explicit runtime state, heartbeat/liveness, trace/span relationships, authenticated runtime status/trace endpoints, and optional OpenTelemetry OTLP export. The implementation was technically viable and reported **27 runtime-observability tests, 6 status-API tests, and 980 full-suite tests passing**. A real Grafana Cloud trial then showed that the external tracing workflow was too cumbersome and visually noisy for the current project needs.
+Issue #76/PR #77 explored heartbeat/state/trace APIs and optional OpenTelemetry export. Although its tests passed, a real Grafana Cloud trial was too cumbersome/noisy; PR #77 was closed without merge. **Lesson:** observability must reduce operator effort, not merely produce telemetry.
 
-PR #77 was therefore closed **without merge** on 2026-08-31, and Issue #76 was removed. The project keeps the underlying lesson—current-state/liveness evidence is useful—but does not adopt Grafana/OpenTelemetry as a required or default architecture layer.
+### 55. 2026-08-31: a real `--version` smoke test exposed optional GitHub lifecycle
 
-**Lesson:** observability must reduce operator effort, not merely produce more telemetry. A technically correct tracing stack can still be the wrong operational interface for a small autonomous lab.
-
-### 55. 2026-08-31: a real `--version` smoke test exposed the optional GitHub lifecycle
-
-A deliberately small Nexus feature task implemented a CLI `--version` path and produced meaningful source/test/documentation changes. Focused verification succeeded (`agent.py --version` returned `0.2.0`; **58 relevant tests passed**), but the task still ended as `tests=fail`, the changes existed only in the VM worktree, and no Issue/remote branch/PR had been created because GitHub work tracking was silently unconfigured. Failure output also lacked the exact failing command/exit code.
-
-Issue #78 converted this into a lifecycle invariant rather than a one-off deployment bug: implementation work must not start unless GitHub lifecycle readiness is available, and failed or reviewable work must remain externally inspectable.
-
-**Lesson:** a workflow documented as mandatory is not mandatory if runtime configuration can silently bypass it. Small end-to-end feature tasks are high-value architecture tests because they expose gaps that unit-level capability checks miss.
+A small version feature passed focused verification but remained only in the VM worktree because GitHub tracking was silently unconfigured. Issue #78 converted GitHub readiness into a lifecycle invariant. **Lesson:** small end-to-end feature tasks expose architecture gaps unit tests miss.
 
 ### 56. 2026-08-31: GitHub lifecycle became mandatory and WIP-visible
 
-PR #81 completed Issue #78. Nexus must now resolve/create the Issue and Issue-linked branch before implementation, persist source/Issue/branch/experiment identity, checkpoint intended WIP changes to the remote branch, create/reuse a Draft PR before verification completes, and preserve that branch/PR/worktree when verification fails or requires review. Resume paths reuse the same identities.
+PR #81 requires Issue/branch identity before implementation, WIP checkpoints, a Draft PR before verification completes, preserved failed/reviewable work, and no silent direct-`main` fallback. **Lesson:** visible intermediate work is part of durability.
 
-The direct-`main` adoption compatibility fallback was removed: successful implementation completion now requires the Issue-linked PR path. Missing GitHub readiness blocks implementation with an actionable error while read-only operations remain usable. Local verification included **8 focused GitHub-work-tracking tests** plus Python compile checks; full repository CI was required for merge.
+### 57. 2026-08-31: large modules were split and compatibility regressions became test data
 
-This resolves the earlier open question created by the direct controller self-repair: normal Nexus implementation/self-repair should be observable through Issue -> branch -> PR -> merge rather than silently writing `main`.
-
-**Lesson:** durable autonomous work needs visible intermediate state, not only a final commit. WIP checkpoints and Draft PRs turn failures into resumable evidence instead of lost VM-local state.
-
-### 57. 2026-08-31: large modules were split and compatibility regressions became explicit test data
-
-The codebase underwent several structural cleanups: the browser `static/app.js` was split into feature-specific modules, the mailbox implementation became a `modules/mailbox/` package, the run store became a package, and PR #87 split the roughly **2,570-line** `experiment_service.py` into focused models/parsing/policy/prompts/git/text/service modules while preserving the public import surface.
-
-These refactors also demonstrated a recurring risk: package and frontend splits can leave stale imports, monkey-patch targets, redaction assumptions, and UI tests behind. PR #82 fixed those regressions and restored **949 tests OK, 55 skipped**. PR #87 reported its focused suites passing; its full run had one unrelated pre-existing WebClient test failure, and the stale logs auto-refresh assertion was corrected in the branch before merge.
-
-**Lesson:** modularity helps Nexus navigate and modify the codebase, but behavior-preserving refactors still need compatibility façades and regression tests around import surfaces, patch points, redaction, and browser behavior.
+Browser, mailbox, run-store, and experiment-service code were modularized. PR #82 repaired stale imports/patch targets/redaction/frontend polling and restored **949 tests OK, 55 skipped**; PR #87 split the ~2,570-line experiment service behind a compatibility façade. **Lesson:** behavior-preserving refactors still change integration surfaces.
 
 ### 58. 2026-08-31: logging UX shifted toward manual, unified, failure-focused inspection
 
-Real smoke-test debugging showed that the Logs tab was not a trustworthy end-to-end view: “all experiments” used activity summaries rather than the structured experiment logs, and large failed verification entries buried the real traceback under INFO noise from successful fixture experiments.
+Issues #84/#86 defined a manual-refresh unified structured feed, submission-time correlation, collapsed/lazy details, and failure-focused verification output. **Lesson:** logging quality is signal-to-noise, not volume.
 
-Issue #84 defines a unified authenticated structured log feed across mailbox intake, orchestration, implementation, GitHub lifecycle, verification, adoption and recovery, with **manual refresh only**—no polling/SSE—and correlation before an experiment ID exists. Issue #86 extends this with one collapsed summary row per log entry, backend detail loading only on expansion, page-level detail caching, and failure-focused test diagnostics. Verification subprocesses should suppress `nexus.experiment` INFO mirroring from successful fixture code while preserving WARNING/ERROR output and the real experiment's durable JSONL log.
+### 59. 2026-09-01: unified log aggregation merged but exposed a cross-service gap
 
-**Lesson:** logging quality is signal-to-noise, not log volume. Successful tests should stay quiet; failures should surface the failing test, traceback and summary immediately, while detailed evidence remains available on demand.
+PR #88 added authenticated `GET /logs` aggregation across persisted experiment/mailbox logs. Real chat testing showed failures before experiment creation were still invisible, proving a unified reader is not a unified logging system.
 
-### 59. 2026-09-01: unified log aggregation merged, but real chat testing exposed a deeper cross-service gap
+### 60. 2026-09-02: application-wide structured logging completed
 
-PR #88 merged the first concrete part of Issue #84. The default Logs view now reads authenticated `GET /logs`, which merges structured experiment and mailbox/task JSONL entries into one chronological feed with bounded scanning, filtering, defensive sanitization, malformed-line skipping, manual refresh, and pagination/load-older behavior. The PR's GitHub Actions `unittest` check completed successfully.
+PR #89 merged centralized structured logging across API, agent, mailbox, CLI, and workers, with `INFO+` default, optional deeper levels, chat `job_id`/`session_id` correlation, transient IDs for early mailbox rejection, and explicit log-storage errors. This closes the major pre-experiment visibility gap identified by the real chat failure.
 
-A real Nexus chat run immediately showed that aggregation of existing experiment/task files was still not equivalent to **application-wide logging**: a chat failure occurring before experiment creation produced no entry in the Logs tab because chat/API/worker code still used ordinary Python logging. Issue #84 was therefore reopened rather than treating PR #88 as complete.
+PR #94 then renamed the misleading `experiment_logger` module to `central_logging` and added a strictly allowlisted unauthenticated `GET /logs/public` view backed by the same multi-source feed rather than experiment-only diagnostics.
 
-Draft PR #89 is the follow-up architecture change: central structured logging for API, agent, mailbox, CLI and worker entrypoints; `INFO+` by default with opt-in `DEBUG`/`TRACE`; pre-experiment correlation via chat `job_id`/`session_id` and transient mailbox IDs; explicit log-storage errors; and reuse of existing redaction/truncation boundaries. Its current `unittest` and Copilot checks pass, but it remains open and is not yet adopted on `main`.
+**Lesson:** logging should be one emission path from submission through terminal state, with public/private views differing by exposure policy rather than by data source.
 
-**Lesson:** a unified reader is not a unified logging system. Observability must begin at work submission and process boundaries, before an experiment ID exists, or the failures most useful for diagnosis can remain invisible.
+### 61. 2026-09-02: duplicate tool-call loops gained persistent non-progress detection
+
+A real controller run repeatedly retried the same ineffective tools/commands until context and memory pressure became dangerous. Issue #92 / PR #95 introduced canonical tool signatures, persistent SQLite reservations/results, exact-duplicate and A→B→A cycle detection, configurable step/cycle limits, state-sensitive retries, and controlled clarification instead of unbounded looping. A retry after relevant state change requires an explicit reason. Full suite: **1050 tests OK, 55 skipped**.
+
+**Lesson:** an agent loop needs explicit progress semantics. Persistence alone can make a bad loop more durable; duplicate/cycle detection must survive service restarts and distinguish justified retries from repetition.
+
+### 62. 2026-09-02: VM memory resilience improved after local-model pressure
+
+The local-model workload exposed that the small Azure VM had no useful swap safety margin and that forcing non-mmap model loading made memory pressure less recoverable. PR #96 added an **8 GiB swap** setup on the Azure resource disk with per-boot recreation and low swappiness. PR #98 removed `--no-mmap`, restoring llama.cpp's default memory-mapped model loading so Linux can reclaim file-backed model pages under pressure.
+
+The historical B2ms measurement remains useful, but the current VM size should no longer be inferred from that old benchmark.
+
+**Lesson:** local-model reliability depends on host virtual-memory behavior as well as model/context size; avoid turning reclaimable model pages into unnecessarily pinned anonymous memory.
+
+### 63. 2026-09-02: runtime execution stopped depending on LLM interpreter guesses
+
+A smoke task failed because the controller guessed `python`, which was absent from PATH, then drifted into memory-search loops. PR #97 added deterministic Python interpreter resolution (`configured -> active venv -> project venv -> sys.executable -> python3`), a typed `python_run` tool, validated script/module/cwd arguments, and at most one deterministic command-not-found correction without another LLM call. Unknown executables now produce a compact `command_not_found` observation suitable for future tool discovery.
+
+**Lesson:** host/runtime facts that can be resolved deterministically should not consume model reasoning. Tool interfaces should encode stable runtime semantics instead of making the LLM guess machine-specific executable names.
+
+### 64. 2026-09-02: persistent-controller prompt growth was identified as an OOM root cause; fix remains under review
+
+A later real run showed that the controller resent the full accumulated task/history plus prior tool observations on every local-model turn, while some observations were also duplicated through persisted history. Prompt size therefore grew roughly quadratically and contributed to `llama-server` being OOM-killed.
+
+Draft PR #99 proposes a prompt-budget layer that treats model context and host available memory as independent limits, excludes the current run's already in-memory observations from persisted history, compacts oversized/older observations to durable event references, deduplicates nested memory-search content, logs budget/memory decisions, and escalates an over-budget turn to an external provider rather than risking the same local model. If no external provider is usable it returns controlled `missing_capability` instead of crashing.
+
+The PR is **not adopted yet**; its current Actions run requires attention. The underlying failure and design direction are durable even if the exact implementation changes during review.
+
+**Lesson:** context growth must be budgeted across turns, not only per individual tool result. Persisted memory, in-memory observations, model context, and host RAM are separate resources that can accidentally duplicate one another.
 
 ## What Nexus currently learns
 
@@ -346,11 +300,11 @@ Nexus accumulates durable information from:
 
 - code and tests,
 - project/idea/decision/history documents,
-- SQLite experiment, controller/session, chat-job, local-LLM-job, GitHub-work mapping, operation, and small adaptive service state,
+- SQLite experiment, controller/session, chat-job, local-LLM-job, GitHub-work mapping, operation, tool-loop, and adaptive service state,
 - mailbox `context` knowledge,
-- experiment outcomes, diagnostics, activity, usage, CI evidence where integrated, and cost data where available.
+- experiment outcomes, central structured logs, diagnostics, activity, usage, CI evidence where integrated, and cost data where available.
 
-It does **not automatically inherit the full reasoning history from ChatGPT conversations**. `PROJECT_HISTORY.md` preserves durable decisions, rejected alternatives, cost concerns, failures, and long-running research directions that would otherwise be lost.
+It does **not automatically inherit the full reasoning history from ChatGPT conversations**. `PROJECT_HISTORY.md` preserves durable decisions, rejected alternatives, failures, and research directions that would otherwise be lost.
 
 ## Recommended use as Nexus project memory
 
@@ -360,37 +314,37 @@ Do not inject this entire file into every model call. Compare at least:
 2. a short generated history summary,
 3. retrieval of only relevant history sections.
 
-Measure relevance of proposed ideas, duplicate work, consistency with previous decisions, token use, latency, and cost. Project memory should itself be an experiment.
+Measure relevance of proposed ideas, duplicate work, consistency with previous decisions, token use, latency, memory pressure, and cost. Project memory should itself be an experiment.
 
 ## Current architectural picture
 
 Current `main` includes:
 
-- persistent Standard_B2ms Azure VM,
-- persistent local `llama.cpp` capability plus a persistent local-LLM controller and durable local-inference jobs,
-- persistent authenticated Nexus chat with explicit discussion/execution semantics, asynchronous chat jobs, and shared web/PowerShell clients,
-- compact chat-specific context separate from the mailbox/task orchestration prompt,
-- structured controller decisions with schema-constrained generation plus one bounded syntax/semantic repair attempt,
+- a persistent small Azure VM with explicit swap support; the old Standard_B2ms measurement is historical rather than a statement of current SKU,
+- persistent local `llama.cpp` capability using mmap plus a persistent local-LLM controller and durable local-inference jobs,
+- persistent authenticated Nexus chat with explicit discussion/execution semantics, asynchronous jobs, and shared web/PowerShell clients,
+- compact chat-specific context separate from task orchestration,
+- schema-constrained controller decisions with one bounded syntax/semantic repair attempt,
 - adaptive local/Azure OpenAI/Codex routing with provider fallback and actual-provider accounting,
-- iterative command/operation/memory/delegation tool loops that return evidence to the local controller,
+- iterative command/operation/memory/delegation loops with persistent duplicate/cycle/non-progress detection,
+- deterministic typed Python execution and one bounded command-resolution retry,
 - single-call Codex experiment execution,
-- worktree-isolated experiments with quality gating, shared real-tool verification/adoption runner, distinct timeout state, and persisted adaptive verification timeout,
-- mandatory GitHub-backed implementation lifecycle using reusable Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion; no silent local-only/direct-`main` implementation fallback,
-- GitHub Actions verification for PRs and `nexus/**` branch pushes, with event-separated concurrency and compact failure-focused output,
+- worktree-isolated experiments with shared real-tool verification/adoption, distinct timeout state, and persisted adaptive timeout,
+- mandatory GitHub-backed implementation lifecycle using Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion,
+- GitHub Actions verification for PRs and `nexus/**` pushes,
 - SQLite state and durable project/idea/decision/history documents,
-- separate Git-backed mailbox repository with crash-safe outbox publication, rejected-chain recovery, bounded fetch/rebase/push synchronization, deferred asynchronous trusted command execution, and a synchronous internal-orchestrator compatibility path when no mailbox state exists,
-- signed GitHub webhook wake-up with timer fallback, one-shot sync retry, and bounded content-free diagnostics,
-- modularized mailbox, run-store, experiment-service and browser-client code with compatibility façades where needed,
-- API/web UI and compact public/authenticated diagnostics,
-- authenticated unified `/logs` aggregation across persisted experiment and mailbox/task logs, with manual refresh and bounded/paginated reading,
-- authenticated, audited self-healing/operations capabilities including local-model, service, log, and process inspection,
+- separate Git-backed mailbox repository with crash-safe publication, rejected-chain recovery, fetch/rebase/push synchronization, deferred trusted command execution, and synchronous internal-command compatibility,
+- signed webhook wake-up with timer fallback and bounded recovery diagnostics,
+- modularized mailbox, run-store, experiment-service, central-logging, and browser-client code,
+- application-wide central structured logging from work submission onward, with authenticated full `/logs` and allowlisted public `/logs/public` views,
+- authenticated audited operations for local model, services, logs, processes, Git, and diagnostics,
 - authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
 - trusted-development mailbox task auto-execution,
 - automatic API dependency synchronization,
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-The persistent local-controller, conversational Nexus chat, mandatory GitHub implementation lifecycle, and first-stage unified log aggregation are adopted on `main`. Application-wide structured logging before experiment creation remains open in PR #89; conversation-style Inbox/Outbox rendering (Issue #75), collapsed/lazy log details (Issue #86), CI-evidence reuse, and the global MCP gateway remain open work/research. The Grafana/OpenTelemetry PR #77 experiment was closed without adoption.
+Prompt budgeting/history compaction from PR #99 is still under review and is not part of adopted `main`. Conversation-style Inbox/Outbox rendering (Issue #75), collapsed/lazy log details (Issue #86), CI-evidence reuse, source-context hygiene (Issue #74), and the global MCP gateway remain open work/research. The Grafana/OpenTelemetry experiment remains rejected.
 
 ## Important lessons so far
 
@@ -399,86 +353,82 @@ The persistent local-controller, conversational Nexus chat, mandatory GitHub imp
 3. **Different state types may need different repositories.** Mailbox traffic and source integration had incompatible Git write patterns.
 4. **Communication needs delivery semantics.** Persistence, locking, retry, recovery, idempotence, and safe reconciliation matter.
 5. **Cheap reasoning matters.** Local/small models should handle work that does not justify an expensive provider.
-6. **Context is a resource.** Retrieve or compress relevant memory instead of blindly increasing context.
-7. **Failures are research data.** CLI mistakes, merge conflicts, deployment failures, rejected experiments, and timeouts should influence the next iteration.
-8. **Optimize orchestration before buying capacity.** Fewer LLM calls and quieter tools can reduce cost before changing models.
+6. **Context is a resource.** Retrieve, deduplicate, compact, and budget relevant memory instead of blindly increasing context.
+7. **Failures are research data.** CLI mistakes, loops, OOMs, merge conflicts, deployment failures, rejected experiments, and timeouts should influence the next iteration.
+8. **Optimize orchestration before buying capacity.** Fewer LLM calls, deterministic runtime resolution, quieter tools, and bounded context can reduce cost before changing models/VMs.
 9. **Real tools are the source of truth for verification.** LLMs may interpret evidence but should not invent pass/fail state.
-10. **Separate capability architecture from model identity.** The routing layer should survive model replacement.
-11. **Target-environment validation matters.** Deployment scripts can fail despite clean unit tests or static review.
-12. **Safety can enable more autonomy.** Narrow boundaries, redaction, liveness checks, and audit logs can support stronger capabilities.
-13. **Adapters should reuse domain logic.** MCP/API/GitHub surfaces should expose existing tested capabilities rather than fork behavior.
-14. **Deployment includes dependencies.** Pulling source without synchronizing runtime state is incomplete.
+10. **Separate capability architecture from model identity.** Routing should survive model replacement.
+11. **Target-environment validation matters.** Deployment scripts can fail despite clean unit tests.
+12. **Safety can enable more autonomy.** Authentication, secret isolation, redaction, liveness checks, bounds, and audit logs support broader execution.
+13. **Adapters should reuse domain logic.** MCP/API/GitHub/public views should expose existing tested logic rather than fork behavior.
+14. **Deployment includes dependencies and host memory behavior.** Source, packages, swap, mmap, and service configuration jointly determine runtime reliability.
 15. **Safety policies need precision, not only strictness.** False positives can block useful experiments.
-16. **Capability trust is layered.** A trusted development channel can allow broad commands while runtime/output/secrets remain bounded.
-17. **Failure taxonomy enables adaptation.** Different failures should drive different bounded responses.
-18. **Simple persisted adaptation counts.** Automatic timeout adjustment is already a self-improvement loop.
-19. **Routing is not control.** The controller should regain control after tool/delegate observations.
-20. **Long inference should be durable work.** Persist model jobs instead of coupling slow inference to one transport timeout.
-21. **Verification semantics should be shared.** Experiment, adoption, local and remote evidence should converge on one meaning of “verified.”
-22. **Approval gates are scaffolding, not architecture.** Stronger persistence, evidence, and recovery can replace redundant manual steps.
-23. **GitHub work identity and runtime experiment identity are complementary.** Human-readable Issues/branches/PRs need not replace isolated internal worktrees.
-24. **The cheapest capable route should win.** Local development is a normal path; escalation should be justified by task difficulty and evidence.
-25. **Actions should usually produce observations, not terminate reasoning.** Iterative command execution is more agentic than one-shot command dispatch.
-26. **CI is an environment-parity test.** Runtime paths, auth, secrets, and event semantics must remain valid outside the long-lived VM; test fixes must not weaken production boundaries.
-27. **Conversation should survive the decision to execute.** Persisted discussion can become a self-contained implementation goal without forcing the user to restate it.
-28. **Agent UX should be asynchronous when inference is slow.** Durable jobs decouple work lifetime from HTTP/client lifetime.
-29. **Context should be surface-specific.** A compact chat prompt and a task/experiment prompt can share capabilities without sharing all history.
-30. **Prefer invariant safety properties over brittle positive lists.** Broader autonomy can coexist with authentication, secret isolation, redaction, bounds, state validation, and audit evidence.
-31. **Persist intent before publication on every terminal path.** Rejected/error results need the same crash-recovery semantics as successful work.
-32. **Structured output has two layers.** Grammar/schema constraints reduce malformed JSON; semantic validation and bounded repair are still required for incomplete decisions.
-33. **Runtime probes find policy drift.** A migration is not complete just because broad code search and tests say an allowlist is gone.
-34. **Long-running shell work also needs durable state.** Deferred execution and polling are more robust than tying command lifetime to one mailbox-processing request.
-35. **Durability semantics are call-site dependent.** External mailbox work can require persistence and polling while state-less internal orchestration may still need a synchronous result.
-36. **Current-state observability is distinct from logging.** Explicit state can answer liveness questions cheaply, but an external tracing stack is only worthwhile if it improves operator comprehension.
-37. **Operational simplicity is an architecture criterion.** More telemetry is not automatically better observability; reject tooling that adds more navigation/maintenance than insight.
-38. **Lifecycle invariants must fail closed before implementation.** Mandatory GitHub state cannot be a best-effort optional adapter.
-39. **Visible intermediate work is part of durability.** WIP commits and Draft PRs preserve inspectable evidence before final verification succeeds.
-40. **Behavior-preserving refactors still change integration surfaces.** Imports, monkey-patch targets, redaction helpers and frontend timing assumptions need explicit compatibility coverage.
-41. **Logs should optimize for diagnosis, not completeness-at-a-glance.** Keep success quiet, surface failure signal first, and load detailed evidence on demand.
-42. **Aggregation is not instrumentation.** A unified viewer cannot show failures that were never emitted into the structured log path; correlation must exist from submission through terminal state.
+16. **Failure taxonomy enables adaptation.** Timeout, command-not-found, missing capability, duplicate loop, and ordinary failure should not collapse into one outcome.
+17. **Simple persisted adaptation counts.** Automatic timeout adjustment is already a self-improvement loop.
+18. **Routing is not control.** The controller should regain control after tool/delegate observations.
+19. **Long inference and shell work should be durable.** Work lifetime should not equal transport lifetime.
+20. **Verification semantics should be shared.** Local, adoption, and remote evidence should converge on one meaning of verified.
+21. **Approval gates are scaffolding, not architecture.** Stronger persistence/evidence/recovery can replace redundant manual steps.
+22. **GitHub work identity and runtime experiment identity are complementary.** Human-readable work tracking need not replace isolated internal worktrees.
+23. **The cheapest capable route should win.** Escalation should be justified by evidence.
+24. **Actions should usually produce observations, not terminate reasoning.** Iterative execution is more agentic than one-shot dispatch.
+25. **CI is an environment-parity test.** Runtime state/auth/event assumptions must remain valid outside the long-lived VM.
+26. **Conversation should survive the decision to execute.** Persisted discussion can become a self-contained implementation goal.
+27. **Context should be surface-specific and turn-budgeted.** Chat compaction alone does not prevent persistent-controller history/observation duplication.
+28. **Prefer invariant safety properties over brittle positive lists.** Broader autonomy can coexist with strong boundaries.
+29. **Persist intent before publication on every terminal path.** Rejected/error results need crash recovery too.
+30. **Structured output has grammar and semantic layers.** Both need bounded repair.
+31. **Runtime probes find policy drift.** Tests/code search alone may miss secondary gates.
+32. **Durability semantics are call-site dependent.** External persistent work and internal synchronous orchestration can legitimately differ.
+33. **Operational simplicity is an architecture criterion.** Reject observability stacks that add more burden than insight.
+34. **Lifecycle invariants must fail closed before implementation.** Mandatory GitHub state cannot be best-effort.
+35. **Visible intermediate work is part of durability.** WIP commits and Draft PRs preserve inspectable evidence.
+36. **Behavior-preserving refactors still change integration surfaces.** Compatibility coverage matters.
+37. **Logs should optimize for diagnosis.** Keep success quiet and detailed evidence available on demand.
+38. **Aggregation is not instrumentation.** Structured logging must start at submission/process boundaries.
+39. **Agent loops need progress invariants.** Durable state without duplicate/cycle detection can preserve failure indefinitely.
+40. **Deterministic host facts should be tools, not guesses.** Interpreter/runtime resolution is cheaper and more reliable outside the LLM.
+41. **Model context and host RAM are independent limits.** Both must be budgeted; duplicated persistent/in-memory context can create superlinear growth and OOM failure.
 
 ## Open research directions
 
-- project-memory retrieval from this history,
-- measured token/cost/quality impact of the single-call pipeline and compact tool output,
-- benchmark Laguna/current local models and alternatives inside the B2ms envelope, including usable context and latency,
-- test a two-pass local workflow where a small-context first pass gathers/reduces repository context and a second pass implements,
-- measure controller and chat task success, discussion-to-execution handoff, command/tool loops, memory use, clarification/resume, missing-capability behavior, structured-output repair rate, and human intervention,
-- measure persistent local-LLM and chat jobs: queue/generation/runtime, token rate, restart recovery, cancellation/watchdog behavior, and resource use,
-- quantify adaptive routing by task class, provider chosen/requested/actually used, fallback rate, success, latency, tokens, and cost,
-- measure how much local context preparation and compact chat context reduce provider tokens without reducing decision quality,
-- measure whether removing/shortening redundant comments and docstrings reduces source-context tokens without harming readability or losing architectural rationale (Issue #74),
-- validate conversation-style mailbox rendering against linked, pending and multi-response cases without changing mailbox delivery semantics (Issue #75),
-- finish and validate application-wide structured logging from Issue #84 / PR #89, then implement Issue #86 collapsed/lazy details and failure-focused verification output,
-- measure whether submission-time `job_id`/`session_id`/mailbox correlation actually makes pre-experiment failures diagnosable without external tracing,
-- revisit lightweight in-product liveness/status only if structured logs still cannot answer whether Nexus is progressing; external OTLP/Grafana is not a default direction,
-- make the verification controller reuse matching successful GitHub Actions evidence and run local tests only as fallback when remote evidence is missing, stale, failed, or unavailable,
-- evaluate whether self-healing operations materially reduce human intervention without increasing incidents,
-- evaluate the effect of removing static execution allowlists: capability success, accidental scope expansion, security regressions, hidden secondary gates, and operator intervention,
-- evaluate MCP as the standard integration/control path and narrow temporary bootstrap capabilities over time,
-- measure whether the now-mandatory GitHub Issue/branch/checkpoint/Draft-PR lifecycle improves fire-and-forget development, traceability, recovery, and human review,
+- project-memory retrieval from this history rather than full-file injection,
+- measured token/cost/quality impact of single-call execution and compact tool output,
+- benchmark current local models inside the actual VM memory envelope, including usable context, latency, mmap/swap behavior, and OOM margin,
+- test a two-pass local workflow where a first pass gathers/reduces repository context and a second implements,
+- measure controller/chat success, command/tool loops, duplicate/cycle prevention, clarification/resume, missing-capability behavior, structured-output repair rate, and human intervention,
+- measure local-LLM/chat job queue/runtime/token rate/restart recovery/resource use,
+- quantify adaptive routing by task class, actual provider, fallback, success, latency, tokens, and cost,
+- validate PR #99's context budgeting against the real OOM reproduction before adoption; measure prompt growth per turn, RAM, cache reuse, latency, and quality,
+- measure whether old observation compaction to durable event references still provides enough evidence for correct later decisions,
+- measure source-comment/docstring context reduction without losing architectural rationale (Issue #74),
+- validate conversation-style mailbox rendering against linked/pending/multi-response cases (Issue #75),
+- implement Issue #86 collapsed/lazy log details and failure-focused verification output on top of the now-central log path,
+- measure whether submission-time job/session/mailbox correlation makes failures diagnosable without external tracing,
+- make verification reuse matching successful GitHub Actions evidence and run local tests only as fallback,
+- evaluate whether self-healing operations and duplicate-loop prevention materially reduce human intervention,
+- evaluate MCP as the standard control path and narrow temporary bootstrap capabilities over time,
+- measure whether the mandatory GitHub lifecycle improves fire-and-forget development, traceability, recovery, and review,
 - add concise GitHub Issue lifecycle progress without duplicating detailed Nexus logs,
-- prototype the global MCP gateway with only 2-3 tools and measure routing accuracy, schema-token reduction, latency, total cost, and failures,
-- investigate missing-capability detection and structured issue creation before any automatic tool generation,
+- prototype the global MCP gateway with 2-3 tools and measure routing accuracy, schema-token reduction, latency, cost, and failures,
+- investigate `find_tool(goal)`/missing-capability detection and structured issue creation before automatic tool generation,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
 - agent-generated experiments for prompts/tools/context,
-- context compression/retrieval strategies,
-- quantization/fine-tuning where evidence justifies it,
-- multi-agent specialization only when measurable benefit exceeds complexity,
-- controlled exploration of useful products, services, public open-source work, and eventually partial cost recovery.
+- quantization/fine-tuning only where evidence justifies it,
+- multi-agent specialization only when benefit exceeds complexity.
 
 ## Current next-step candidates
 
-1. **Complete cross-service structured logging:** finish/review PR #89 so chat, API, workers, mailbox and experiments all enter the same bounded structured feed from submission onward; rerun the chat failure smoke test before closing Issue #84.
-2. **Collapsed/failure-focused log UX:** implement Issue #86 after the data path is complete, keeping manual refresh while loading details only on demand and suppressing successful-test INFO noise.
-3. **Conversational autonomy rerun:** repeat the real chat implementation request that exposed malformed/incomplete controller output and measure whether schema constraints plus bounded repair now let Nexus preserve context, choose tools/providers, complete the work, and report evidence cleanly.
-4. **CI evidence reuse:** teach verification to accept a matching successful Actions run for the exact branch/commit and use local tests only when that evidence is absent or unusable.
-5. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure local/Azure/Codex selection, fallbacks, task success, latency, tokens, cost, and human intervention.
-6. **Persistent job measurement:** quantify local-model/chat queue/runtime/token behavior and verify recovery across API/controller restarts.
-7. **Local-model/context benchmark:** compare current local candidates under identical B2ms limits and test two-pass context gathering versus simply increasing context.
-8. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost with the historical multi-stage path.
-9. **Project-memory experiment:** expose only relevant history to Nexus and measure whether idea selection becomes more relevant and less repetitive.
-10. **Mandatory GitHub lifecycle measurement:** verify multiple experiments safely reuse one Issue/branch/PR identity, failed verification preserves inspectable WIP, and resume/merge/Issue completion remain recoverable under conflicts/provider failures.
-11. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare directly against main-model tool selection.
-12. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare measured comment/docstring context reduction against readability and unchanged test behavior.
+1. **Prompt-budget/OOM validation:** finish/review PR #99 against the real failure mode; verify prompt growth becomes bounded and local OOM is avoided without losing task quality.
+2. **Collapsed/failure-focused log UX:** implement Issue #86 now that PRs #89/#94 provide one central data path.
+3. **Conversational autonomy rerun:** repeat the real feature request that exposed command/interpreter/tool-loop failures and measure whether PRs #95/#97 now let Nexus progress without repetition.
+4. **CI evidence reuse:** accept a matching successful Actions run for the exact branch/commit and use local tests only when evidence is absent/unusable.
+5. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
+6. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
+7. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
+8. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost.
+9. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
+10. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
+11. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare with direct tool selection.
+12. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
