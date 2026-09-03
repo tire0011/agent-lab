@@ -1,0 +1,83 @@
+{
+  "cases": [
+    {
+      "candidate_count": 4,
+      "expected_operation": "git_status",
+      "expected_status": "found",
+      "goal": "inspect whether the Nexus repository has local changes",
+      "id": "git-status",
+      "resolver_provider": "local",
+      "selected_operation": "git_status",
+      "selection_correctness": "correct",
+      "status": "found"
+    },
+    {
+      "candidate_count": 4,
+      "expected_operation": "git_log",
+      "expected_status": "found",
+      "goal": "show recent git commit history for the repository",
+      "id": "git-history",
+      "resolver_provider": "local",
+      "selected_operation": "git_log",
+      "selection_correctness": "correct",
+      "status": "found"
+    },
+    {
+      "candidate_count": 3,
+      "expected_operation": "memory",
+      "expected_status": "found",
+      "goal": "inspect host memory usage",
+      "id": "memory-usage",
+      "resolver_provider": "local",
+      "selected_operation": "memory",
+      "selection_correctness": "correct",
+      "status": "found"
+    },
+    {
+      "candidate_count": 4,
+      "expected_operation": "service_logs",
+      "expected_status": "found",
+      "goal": "show recent systemd journal logs for the API service",
+      "id": "service-logs",
+      "resolver_provider": "local",
+      "selected_operation": "service_logs",
+      "selection_correctness": "correct",
+      "status": "found"
+    },
+    {
+      "candidate_count": 5,
+      "expected_operation": "local_model_status",
+      "expected_status": "found",
+      "goal": "inspect local llama model server status",
+      "id": "local-model-status",
+      "resolver_provider": "local",
+      "selected_operation": "local_model_status",
+      "selection_correctness": "correct",
+      "status": "found"
+    },
+    {
+      "candidate_count": 0,
+      "expected_operation": null,
+      "expected_status": "not_found",
+      "goal": "inspect GPU utilization",
+      "id": "gpu-utilization",
+      "resolver_provider": null,
+      "selected_operation": null,
+      "selection_correctness": "correct",
+      "status": "not_found"
+    }
+  ],
+  "command": "python -m modules.tool_resolver_evaluation --mode deterministic --db-path /tmp/nexus-tool-resolver-eval.db --output docs/tool-resolver-evaluation.json",
+  "experiment": "operations_registry_find_tool_gateway",
+  "local_llm_command": "python -m modules.tool_resolver_evaluation --mode local-llm --db-path /tmp/nexus-tool-resolver-eval-local.db",
+  "mode": "deterministic",
+  "summary": {
+    "accuracy": 1.0,
+    "correct": 6,
+    "incorrect": 0,
+    "not_found_accuracy": 1.0,
+    "tool_selection_accuracy": 1.0,
+    "total_cases": 6,
+    "unavailable": 0
+  }
+}

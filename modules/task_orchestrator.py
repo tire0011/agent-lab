@@ -129,6 +129,25 @@ _TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = {
 _READ_ONLY_OPERATION_DENYLIST = {"inbox_refresh"}
 _MAX_RESOLVER_CANDIDATES = 5
 _TOOL_ACCURACY_UNKNOWN = "unknown"
+_TOOL_ACCURACY_CORRECT = "correct"
+_TOOL_ACCURACY_INCORRECT = "incorrect"
+_TOOL_SEARCH_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "check",
+    "for",
+    "has",
+    "inspect",
+    "need",
+    "needs",
+    "nexus",
+    "of",
+    "show",
+    "the",
+    "to",
+    "whether",
+}
 
 
 @dataclass(slots=True)
@@ -670,7 +689,10 @@ class NexusTaskOrchestrator:
 
     @staticmethod
     def _tokens(text: str) -> set[str]:
-        return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) > 1}
+        return {
+            token for token in re.findall(r"[a-z0-9]+", text.lower())
+            if len(token) > 1 and token not in _TOOL_SEARCH_STOP_WORDS
+        }
 
     def _read_only_operation_specs(self) -> list[Any]:
         return [
@@ -756,6 +778,30 @@ Rules:
 - If not_found, leave operation empty and list at most three related candidate names.
 """
 
+    @staticmethod
+    def _selection_correctness(
+        *,
+        status: str,
+        selected_operation: str | None,
+        expected_operation: str | None,
+        expected_status: str | None,
+    ) -> str:
+        if not expected_operation and not expected_status:
+            return _TOOL_ACCURACY_UNKNOWN
+        if expected_status == "not_found":
+            return (
+                _TOOL_ACCURACY_CORRECT
+                if status == "not_found" and not selected_operation
+                else _TOOL_ACCURACY_INCORRECT
+            )
+        if expected_operation:
+            return (
+                _TOOL_ACCURACY_CORRECT
+                if status == "found" and selected_operation == expected_operation
+                else _TOOL_ACCURACY_INCORRECT
+            )
+        return _TOOL_ACCURACY_UNKNOWN
+
     async def _resolve_find_tool(
         self,
         goal: str,
@@ -763,6 +809,8 @@ Rules:
         session_id: str,
         budget_plan: PromptBudgetPlan | None = None,
         task_logger: Any | None = None,
+        expected_operation: str | None = None,
+        expected_status: str | None = None,
     ) -> dict[str, Any]:
         del budget_plan  # resolver must recompute current memory before its own inference
         clean_goal = goal.strip()[:1000]
@@ -791,8 +839,14 @@ Rules:
                     "resolver_output_chars": 0,
                     "resolver_llm_calls": 0,
                     "selected_operation": None,
-                    "expected_operation": None,
-                    "selection_correctness": _TOOL_ACCURACY_UNKNOWN,
+                    "expected_operation": expected_operation,
+                    "expected_status": expected_status,
+                    "selection_correctness": self._selection_correctness(
+                        status="not_found",
+                        selected_operation=None,
+                        expected_operation=expected_operation,
+                        expected_status=expected_status,
+                    ),
                     "latency_ms": int((time.perf_counter() - started) * 1000),
                 },
             }
@@ -883,8 +937,14 @@ Rules:
                     "resolver_provider": provider_used,
                     "latency_ms": int((time.perf_counter() - started) * 1000),
                     "selected_operation": operation,
-                    "expected_operation": None,
-                    "selection_correctness": _TOOL_ACCURACY_UNKNOWN,
+                    "expected_operation": expected_operation,
+                    "expected_status": expected_status,
+                    "selection_correctness": self._selection_correctness(
+                        status="found",
+                        selected_operation=operation,
+                        expected_operation=expected_operation,
+                        expected_status=expected_status,
+                    ),
                 },
             }
         related = parsed.get("related_tools")
@@ -916,8 +976,14 @@ Rules:
                 "resolver_provider": provider_used,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
                 "selected_operation": operation or None,
-                "expected_operation": None,
-                "selection_correctness": _TOOL_ACCURACY_UNKNOWN,
+                "expected_operation": expected_operation,
+                "expected_status": expected_status,
+                "selection_correctness": self._selection_correctness(
+                    status=final_status,
+                    selected_operation=operation or None,
+                    expected_operation=expected_operation,
+                    expected_status=expected_status,
+                ),
             },
         }
 
