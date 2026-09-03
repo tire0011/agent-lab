@@ -925,27 +925,15 @@ def get_experiment_logs(
     )
 
 
-def _log_entry_sort_dt(entry: dict[str, Any]) -> datetime:
-    """Best-effort real chronological key for merging structured JSONL
-    entries (``...123Z``) with systemd journal entries (``+0000``-style
-    offsets, no fractional seconds) into one timeline. Falls back to the
-    oldest possible time for anything unparsable, so a malformed/missing
-    timestamp sorts first rather than raising or crashing the merge.
-    """
-    ts = entry.get("timestamp") or ""
-    text = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-# Per-service line count merged from each journalctl unit into the first
-# (cursor-less) page of GET /logs; bounded so one manual refresh cannot
-# turn into an unbounded read across three services.
+# Per-service line count merged from each journalctl unit into every
+# unfiltered-by-id page of GET /logs; bounded so one manual refresh (or
+# "load older" call) cannot turn into an unbounded read across three
+# services. ``modules.log_reader.LogReader.tail_journal_entries`` also
+# normalizes each journal entry's timestamp into the same string shape
+# structured entries use and attaches the same ``_source``/``_rseq`` tie
+# -break keys, so ``modules.central_logging.entry_sort_key``/
+# ``encode_log_cursor``/``decode_log_cursor`` can order and paginate
+# both kinds of entries together with no journal-specific logic here.
 _UNIFIED_LOGS_JOURNAL_LINES = 100
 
 
@@ -975,19 +963,23 @@ async def get_unified_logs(
     and failures/timeouts - merged in chronological order from every
     ``<experiment_log_dir>/*.jsonl`` file, including ``task-<mailbox_task_id>``
     files that hold events recorded before an experiment id existed. On
-    the default (cursor-less, unfiltered-by-id) page, this is additionally
-    merged with the ``agent-api``/``nexus-mailbox``/``llama-server``
-    systemd journals so the whole runtime is visible in one list without
-    picking an experiment or a log section first. Every entry carries a
-    coarse ``source`` (``mailbox``/``controller``/``experiment``/``chat``/
-    ``system``, or the journal's service name) usable as an optional
-    filter. A running/new experiment is included as soon as it has
-    written any log line, with no dependency on the public diagnostics
-    list or a terminal status. Bounded reads and cursor-based pagination
-    (see *cursor*/*next_cursor*) keep one manual refresh - and "load
-    older" - from re-scanning unbounded historical data; if a journal
-    source cannot be read, its failure is reported in ``source_errors``
-    rather than emptying the whole feed.
+    every unfiltered-by-id page (with or without a cursor), this is
+    additionally merged with the ``agent-api``/``nexus-mailbox``/
+    ``llama-server`` systemd journals so the whole runtime is visible in
+    one list without picking an experiment or a log section first, and
+    "load older" walks back into each journal's real history (via
+    ``--until``) rather than only ever re-reading the same fixed newest
+    window. Every entry carries a coarse ``source`` (``mailbox``/
+    ``controller``/``experiment``/``chat``/``system``, or the journal's
+    service name) usable as an optional filter. A running/new experiment
+    is included as soon as it has written any log line, with no
+    dependency on the public diagnostics list or a terminal status.
+    Bounded reads and one cursor-based pagination scheme spanning both
+    structured and journal entries (see *cursor*/*next_cursor*) keep one
+    manual refresh - and "load older" - from re-scanning unbounded
+    historical data while never re-showing (or permanently skipping) an
+    entry across pages; if a journal source cannot be read, its failure
+    is reported in ``source_errors`` rather than emptying the whole feed.
     """
     authorize(x_api_key)
 
@@ -1011,6 +1003,10 @@ async def get_unified_logs(
     try:
         # Fetch one extra entry to detect whether an older page remains,
         # without re-scanning already-returned entries on the next call.
+        # This is already a correct upper bound even after merging in
+        # journal entries below: the final page can never need more than
+        # `limit + 1` structured entries regardless of how many extra
+        # journal candidates are merged in alongside them.
         raw_entries = central_logging_module.read_all_log_entries(
             service.experiment_log_dir,
             experiment_id=resolved_experiment_id,
@@ -1026,25 +1022,37 @@ async def get_unified_logs(
         _logger.error("unified log read failed: %s", _sanitized_reason(str(exc)))
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
-    raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
     _apply_log_source(raw_entries)
 
-    # The journal is only merged into the true default view: the first
-    # page (no cursor - it has no pagination of its own) of the
-    # unfiltered-by-id feed, so filtering down to one experiment/task/job
-    # never mixes in unrelated systemd noise it cannot be correlated to.
+    # The journal is only merged into the unfiltered-by-id feed, so
+    # filtering down to one experiment/task/job never mixes in unrelated
+    # systemd noise it cannot be correlated to. Unlike the structured
+    # feed, it is merged on *every* such page (a cursor no longer opts
+    # it out) - otherwise a page beyond the first could never surface
+    # any journal entry at all, no matter how recent.
     source_errors: dict[str, str] | None = None
     merged_entries = raw_entries
     is_default_page = (
-        cursor is None and not resolved_experiment_id and not resolved_mailbox_task_id
+        not resolved_experiment_id and not resolved_mailbox_task_id
         and not job_id and not session_id
     )
     if include_journal and is_default_page:
+        journal_before: str | None = None
+        if cursor:
+            decoded_cursor = central_logging_module.decode_log_cursor(cursor)
+            # Reuses the cursor's own timestamp component as the journal
+            # page boundary; an unrecognized/legacy cursor simply omits
+            # `--until` (falls back to each service's newest window)
+            # rather than risking an incorrectly-scoped, possibly
+            # duplicate-producing query.
+            journal_before = decoded_cursor[0] if decoded_cursor else None
         journal_entries, errors = await log_reader.read_all_journal_entries(
-            lines=_UNIFIED_LOGS_JOURNAL_LINES,
+            lines=_UNIFIED_LOGS_JOURNAL_LINES, before=journal_before,
         )
         if level:
             journal_entries = [e for e in journal_entries if e.get("level") == level.upper()]
+        if phase:
+            journal_entries = [e for e in journal_entries if e.get("phase") == phase]
         merged_entries = raw_entries + journal_entries
         if errors:
             source_errors = errors
@@ -1061,7 +1069,13 @@ async def get_unified_logs(
             or needle in str(e.get("phase") or "").lower()
         ]
 
-    merged_entries.sort(key=_log_entry_sort_dt)
+    # One shared sort + cursor scheme (see `_UNIFIED_LOGS_JOURNAL_LINES`
+    # above) spans structured and journal entries alike, so the
+    # `next_cursor` returned below reflects the true oldest entry of the
+    # *merged* page - never just the structured feed's own boundary -
+    # and no entry is ever shown twice or skipped across pages.
+    merged_entries.sort(key=central_logging_module.entry_sort_key)
+    merged_entries, next_cursor = _paginate_log_entries(merged_entries, limit)
 
     entries: list[ExperimentLogEntry] = []
     for raw in merged_entries:

@@ -366,6 +366,83 @@ class UnifiedLogsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.log_reader.read_all_journal_entries.assert_not_awaited()
 
+    def test_phase_filter_excludes_journal_entries(self):
+        # Journal entries always carry phase="system" (see
+        # modules.log_reader.parse_journal_line); filtering by a
+        # different phase must exclude them from the merged feed, not
+        # just from the structured half of it.
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get(
+            "/logs?phase=implementation", headers={"x-api-key": "test-key"}
+        )
+        body = response.json()
+        self.assertTrue(all(e["source"] != "agent-api" for e in body["entries"]))
+        self.assertTrue(all(e["phase"] == "implementation" for e in body["entries"]))
+
+    def test_phase_filter_keeps_journal_entries_matching_system(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get("/logs?phase=system", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertEqual([e["event"] for e in body["entries"]], ["journal:agent-api"])
+
+    def test_journal_is_merged_on_a_paginated_page_too(self):
+        # Previously the journal was only ever merged into the very
+        # first (cursor-less) page - "load older" could never surface
+        # any journal entry, no matter how recent. It must now be
+        # merged on every unfiltered-by-id page.
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 0,
+            },
+        ], {}))
+        first = self.client.get("/logs?limit=2", headers={"x-api-key": "test-key"}).json()
+        self.assertIsNotNone(first["next_cursor"])
+        self.log_reader.read_all_journal_entries.reset_mock()
+
+        second = self.client.get(
+            f"/logs?limit=2&cursor={first['next_cursor']}", headers={"x-api-key": "test-key"}
+        ).json()
+        self.log_reader.read_all_journal_entries.assert_awaited_once()
+        events = [e["event"] for e in first["entries"]] + [e["event"] for e in second["entries"]]
+        # No duplicates across the two pages even though the same mocked
+        # journal entry is returned by the (mocked) reader on both calls:
+        # the cursor-derived `before` is expected to scope it out on the
+        # second page in a real LogReader; here we only assert the
+        # merged pagination itself never repeats a structured event.
+        structured_events = [e for e in events if e != "journal:agent-api"]
+        self.assertEqual(len(structured_events), len(set(structured_events)))
+
+    def test_journal_before_is_derived_from_cursor(self):
+        self._write_logs()
+        first = self.client.get("/logs?limit=1", headers={"x-api-key": "test-key"}).json()
+        self.assertIsNotNone(first["next_cursor"])
+        self.log_reader.read_all_journal_entries.reset_mock()
+
+        self.client.get(
+            f"/logs?limit=1&cursor={first['next_cursor']}", headers={"x-api-key": "test-key"}
+        )
+        self.log_reader.read_all_journal_entries.assert_awaited_once()
+        _, kwargs = self.log_reader.read_all_journal_entries.await_args
+        self.assertIsNotNone(kwargs.get("before"))
+
 
 if __name__ == "__main__":
     unittest.main()
