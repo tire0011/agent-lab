@@ -18,6 +18,7 @@ class FakeGitHub:
         self.next_issue = 43
         self.refs = {"main": "main-sha"}
         self.pulls = []
+        self.workflow_runs = []
         self.calls = []
 
     def __call__(self, method, path, payload):
@@ -60,6 +61,9 @@ class FakeGitHub:
 
         if method == "GET" and path.startswith("/repos/tire0011/agent-lab/pulls?"):
             return [dict(pr) for pr in self.pulls if pr.get("state") == "open"]
+
+        if method == "GET" and "/actions/workflows/" in path:
+            return {"workflow_runs": [dict(run) for run in self.workflow_runs]}
 
         if method == "POST" and path == "/repos/tire0011/agent-lab/pulls":
             pr = {
@@ -293,6 +297,104 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertIn("python -m unittest", body)
         self.assertIn("Exit code: `1`", body)
         self.assertIn("FAILED test_example", body)
+
+    def _bind_checkpoint(self, sha: str = "checkpoint-sha"):
+        ref = self.service.bind_experiment(
+            self.service.ensure_for_source(
+                SimpleNamespace(
+                    source_type="task",
+                    source_id=f"ci-{sha}",
+                    title="CI verification",
+                    content="Verify with CI",
+                )
+            ),
+            f"experiment-{sha}",
+        )
+        ref.checkpoint_sha = sha
+        self.service._persist_experiment(ref)
+        return ref
+
+    def test_exact_checkpoint_ci_success_is_authoritative(self):
+        ref = self._bind_checkpoint()
+        self.fake.workflow_runs = [
+            {
+                "id": 17,
+                "run_attempt": 1,
+                "head_sha": ref.checkpoint_sha,
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://github.example/runs/17",
+            }
+        ]
+
+        result = self.service.wait_for_ci(ref.experiment_id, poll_interval_seconds=0.01)
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.commit_sha, ref.checkpoint_sha)
+        self.assertEqual(result.run_id, 17)
+
+    def test_completed_ci_failure_is_authoritative(self):
+        ref = self._bind_checkpoint("failed-sha")
+        self.fake.workflow_runs = [
+            {
+                "id": 18,
+                "run_attempt": 1,
+                "head_sha": ref.checkpoint_sha,
+                "event": "push",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+
+        result = self.service.wait_for_ci(ref.experiment_id, poll_interval_seconds=0.01)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.conclusion, "failure")
+
+    def test_ci_result_for_different_commit_is_ignored(self):
+        ref = self._bind_checkpoint("wanted-sha")
+        self.fake.workflow_runs = [
+            {
+                "id": 19,
+                "run_attempt": 1,
+                "head_sha": "different-sha",
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+
+        result = self.service.wait_for_ci(
+            ref.experiment_id,
+            start_timeout_seconds=0,
+            poll_interval_seconds=0.01,
+        )
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("no matching", result.reason)
+
+    def test_incomplete_ci_uses_local_fallback(self):
+        ref = self._bind_checkpoint("queued-sha")
+        self.fake.workflow_runs = [
+            {
+                "id": 20,
+                "run_attempt": 1,
+                "head_sha": ref.checkpoint_sha,
+                "event": "push",
+                "status": "in_progress",
+                "conclusion": None,
+            }
+        ]
+
+        result = self.service.wait_for_ci(
+            ref.experiment_id,
+            completion_timeout_seconds=0,
+            poll_interval_seconds=0.01,
+        )
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.run_id, 20)
 
 
 if __name__ == "__main__":

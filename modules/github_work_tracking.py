@@ -7,6 +7,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_BASE = "https://api.github.com"
 _DEFAULT_TARGET_BRANCH = "main"
+_DEFAULT_CI_WORKFLOW = "tests.yml"
+_DEFAULT_CI_START_TIMEOUT_SECONDS = 90.0
+_DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS = 1500.0
+_DEFAULT_CI_POLL_INTERVAL_SECONDS = 10.0
 
 
 def _utcnow_iso() -> str:
@@ -74,6 +79,16 @@ class GitHubWorkRef:
     experiment_id: str | None = None
     pr_number: int | None = None
     checkpoint_sha: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubCIVerification:
+    status: str
+    commit_sha: str
+    conclusion: str | None = None
+    run_id: int | None = None
+    url: str | None = None
+    reason: str | None = None
 
 
 class GitHubWorkTrackingError(RuntimeError):
@@ -451,6 +466,86 @@ class GitHubWorkTrackingService:
             f"/repos/{self.repository}/pulls/{ref.pr_number}",
             {"body": body[:64000]},
         )
+
+    def wait_for_ci(
+        self,
+        experiment_id: str,
+        *,
+        workflow: str = _DEFAULT_CI_WORKFLOW,
+        start_timeout_seconds: float = _DEFAULT_CI_START_TIMEOUT_SECONDS,
+        completion_timeout_seconds: float = _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _DEFAULT_CI_POLL_INTERVAL_SECONDS,
+    ) -> GitHubCIVerification:
+        """Wait for the push workflow that verifies the exact checkpoint SHA."""
+        ref = self.ensure_for_experiment(experiment_id)
+        sha = (ref.checkpoint_sha or "").strip()
+        if not sha:
+            return GitHubCIVerification(
+                status="unavailable",
+                commit_sha="",
+                reason="experiment checkpoint SHA is missing",
+            )
+
+        started_deadline = time.monotonic() + max(0.0, start_timeout_seconds)
+        completion_deadline: float | None = None
+        encoded_workflow = urllib.parse.quote(workflow, safe="")
+        query = urllib.parse.urlencode(
+            {"head_sha": sha, "event": "push", "per_page": 20}
+        )
+        path = (
+            f"/repos/{self.repository}/actions/workflows/{encoded_workflow}/runs?{query}"
+        )
+
+        while True:
+            try:
+                response = self._request("GET", path)
+            except GitHubWorkTrackingError as exc:
+                return GitHubCIVerification(
+                    status="unavailable",
+                    commit_sha=sha,
+                    reason=f"GitHub Actions lookup failed: {str(exc)[:1000]}",
+                )
+
+            runs = [
+                run
+                for run in (response.get("workflow_runs") or [])
+                if str(run.get("head_sha") or "") == sha
+                and str(run.get("event") or "") == "push"
+            ]
+            runs.sort(
+                key=lambda run: (int(run.get("run_attempt") or 0), int(run.get("id") or 0)),
+                reverse=True,
+            )
+            run = runs[0] if runs else None
+            now = time.monotonic()
+            if run is not None:
+                if completion_deadline is None:
+                    completion_deadline = now + max(0.0, completion_timeout_seconds)
+                if str(run.get("status") or "").lower() == "completed":
+                    conclusion = str(run.get("conclusion") or "unknown").lower()
+                    return GitHubCIVerification(
+                        status="passed" if conclusion == "success" else "failed",
+                        commit_sha=sha,
+                        conclusion=conclusion,
+                        run_id=int(run["id"]) if run.get("id") is not None else None,
+                        url=str(run.get("html_url") or "") or None,
+                    )
+                if now >= completion_deadline:
+                    return GitHubCIVerification(
+                        status="unavailable",
+                        commit_sha=sha,
+                        run_id=int(run["id"]) if run.get("id") is not None else None,
+                        url=str(run.get("html_url") or "") or None,
+                        reason="matching GitHub Actions run did not complete within the bounded wait",
+                    )
+            elif now >= started_deadline:
+                return GitHubCIVerification(
+                    status="unavailable",
+                    commit_sha=sha,
+                    reason="no matching GitHub Actions push run started for the checkpoint SHA",
+                )
+
+            time.sleep(max(0.01, poll_interval_seconds))
 
     def publish_final_tree(
         self,

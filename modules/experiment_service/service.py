@@ -797,6 +797,43 @@ class ExperimentService:
                     error=f"GitHub checkpoint failed before verification: {str(exc)[:2000]}",
                 )
                 return self.get_experiment(experiment_id)
+
+        ci_verification = None
+        if github_work_tracking is not None:
+            elog.info(
+                "verifying", "github_ci_wait_started",
+                "Waiting for GitHub Actions verification of the exact checkpoint commit",
+                checkpoint_sha=ref.checkpoint_sha,
+            )
+            try:
+                ci_verification = github_work_tracking.wait_for_ci(experiment_id)
+            except Exception as exc:  # noqa: BLE001 - local verification is the fallback
+                elog.warning(
+                    "verifying", "github_ci_unavailable",
+                    "GitHub Actions verification lookup failed; using local fallback",
+                    reason=str(exc)[:1000],
+                )
+            else:
+                event = {
+                    "passed": "github_ci_passed",
+                    "failed": "github_ci_failed",
+                    "unavailable": "github_ci_unavailable",
+                }.get(ci_verification.status, "github_ci_unavailable")
+                level = {
+                    "passed": "info",
+                    "failed": "error",
+                }.get(ci_verification.status, "warning")
+                getattr(elog, level)(
+                    "verifying", event,
+                    "GitHub Actions verification completed"
+                    if ci_verification.status in {"passed", "failed"}
+                    else "GitHub Actions verification unavailable; using local fallback",
+                    checkpoint_sha=ci_verification.commit_sha,
+                    conclusion=ci_verification.conclusion,
+                    workflow_run_id=ci_verification.run_id,
+                    workflow_url=ci_verification.url,
+                    reason=ci_verification.reason,
+                )
         try:
             status_proc = _run_git(
                 ["status", "--short", "--untracked-files=all"],
@@ -862,7 +899,8 @@ class ExperimentService:
             else None
         )
 
-        if test_command is None or not (Path(worktree_path) / "tests").is_dir():
+        use_local_tests = ci_verification is None or ci_verification.status == "unavailable"
+        if use_local_tests and (test_command is None or not (Path(worktree_path) / "tests").is_dir()):
             elog.warning(
                 "verifying", "no_test_command",
                 "No safe test command could be determined for this worktree",
@@ -877,22 +915,40 @@ class ExperimentService:
             )
             return self.get_experiment(experiment_id)
 
-        test_timeout_seconds = self._get_test_timeout_seconds()
-        elog.info(
-            "verifying", "tests_started",
-            "Running verification test command",
-            command=test_command, cwd=worktree_path,
-            timeout_seconds=test_timeout_seconds,
-        )
-        test_run = run_verification_test(
-            test_command,
-            cwd=worktree_path,
-            timeout_seconds=test_timeout_seconds,
-        )
-        test_exit_code = test_run.exit_code
-        test_output = test_run.output
-        test_timed_out = test_run.timed_out
-        if test_run.timed_out:
+        test_timed_out = False
+        if not use_local_tests:
+            test_command = ["GitHub Actions", "tests.yml", ci_verification.commit_sha]
+            test_exit_code = 0 if ci_verification.status == "passed" else 1
+            test_output = (
+                f"GitHub Actions run {ci_verification.run_id or 'unknown'} "
+                f"for commit {ci_verification.commit_sha} completed with conclusion "
+                f"{ci_verification.conclusion or 'unknown'}."
+                + (f" {ci_verification.url}" if ci_verification.url else "")
+            )
+        else:
+            test_timeout_seconds = self._get_test_timeout_seconds()
+            elog.info(
+                "verifying", "local_tests_fallback_started",
+                "Running local verification because matching GitHub CI was unavailable",
+                command=test_command, cwd=worktree_path,
+                timeout_seconds=test_timeout_seconds,
+            )
+            elog.info(
+                "verifying", "tests_started",
+                "Running verification test command",
+                command=test_command, cwd=worktree_path,
+                timeout_seconds=test_timeout_seconds,
+            )
+            test_run = run_verification_test(
+                test_command,
+                cwd=worktree_path,
+                timeout_seconds=test_timeout_seconds,
+            )
+            test_exit_code = test_run.exit_code
+            test_output = test_run.output
+            test_timed_out = test_run.timed_out
+
+        if use_local_tests and test_run.timed_out:
             elog.log_process(
                 "verifying", "test_timeout",
                 "Test command timed out",
@@ -909,13 +965,13 @@ class ExperimentService:
                     previous_timeout_seconds=test_timeout_seconds,
                     new_timeout_seconds=next_timeout_seconds,
                 )
-        elif test_run.exception is not None:
+        elif use_local_tests and test_run.exception is not None:
             elog.error(
                 "verifying", "tests_exception",
                 "Exception while running test command", exc=test_run.exception,
                 command=sanitize_command(test_command), cwd=worktree_path,
             )
-        else:
+        elif use_local_tests:
             elog.log_process(
                 "verifying", "tests_completed",
                 f"Test command finished with exit code {test_exit_code}",
