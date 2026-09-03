@@ -12,7 +12,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +52,7 @@ from modules.tool_loop_guard import PersistentToolLoopGuard
 ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_RESUME_EXPERIMENT = "resume_experiment"
 ACTION_COMMAND = "command"
+TOOL_FIND_TOOL = "find_tool"
 TOOL_PYTHON_RUN = "python_run"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
@@ -85,6 +88,7 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
         "properties": {
             "type": {"type": "string", "enum": ["tool", "action"]},
             "tool": {"type": "string"},
+            "goal": {"type": "string"},
             "operation": {"type": "string"},
             "args": {"type": "object", "additionalProperties": True},
             "query": {"type": "string"},
@@ -106,6 +110,24 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
         "additionalProperties": False,
     },
 }
+
+_TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["found", "not_found"]},
+            "operation": {"type": "string"},
+            "reason": {"type": "string"},
+            "related_tools": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["status", "reason"],
+        "additionalProperties": False,
+    },
+}
+
+_READ_ONLY_OPERATION_DENYLIST = {"inbox_refresh"}
+_MAX_RESOLVER_CANDIDATES = 5
 
 
 @dataclass(slots=True)
@@ -409,7 +431,9 @@ class NexusTaskOrchestrator:
                             task_logger,
                         )
                 else:
-                    observation = await self._execute_tool(decision)
+                    execution_decision = dict(decision)
+                    execution_decision["session_id"] = session.id
+                    observation = await self._execute_tool(execution_decision)
                     self.loop_guard.record_result(check.call_id, observation)
                 # Persist the full raw observation so the durable event_id can
                 # later retrieve the complete tool result; only the
@@ -606,14 +630,252 @@ class NexusTaskOrchestrator:
             f"INVALID RESPONSE:\n{raw[:6000]}"
         )
 
-    def _capabilities(self) -> list[dict[str, Any]]:
-        operations = [spec.to_dict() for spec in self.operations_registry.catalog()]
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) > 1}
+
+    def _read_only_operation_specs(self) -> list[Any]:
         return [
-            {"name": "operation", "description": "Execute one existing Nexus inspection/operation and receive its real result before deciding again.", "operations": operations},
-            {"name": "memory_search", "description": "Search Nexus memory: structured knowledge, previous task/dialog history and project memory documents.", "arguments": {"query": "string", "limit": "1..10"}},
-            {"name": "delegate", "description": "Ask another bounded LLM worker for analysis/research/review. Provider failures automatically fall back to another available model and control then returns to Nexus.", "providers": self.delegation.catalog(), "arguments": {"provider": "provider name", "task": "sub-problem", "context": "optional compact context"}},
-            {"name": ACTION_COMMAND, "description": "Local development tool: execute one shell command through the trusted development command primitive, observe its real output, then keep control and decide again.", "arguments": {"command": "shell command"}},
-            {"name": TOOL_PYTHON_RUN, "description": "Run project Python deterministically: Nexus resolves its own interpreter, so never write an interpreter name or path yourself. Give either a repository-relative script or an importable module plus arguments.", "arguments": {"script": "repository-relative .py path", "module": "importable module name", "argv": "list of arguments"}},
+            spec for spec in self.operations_registry.catalog()
+            if spec.name not in _READ_ONLY_OPERATION_DENYLIST
+        ]
+
+    def _candidate_operations(self, goal: str) -> list[Any]:
+        goal_tokens = self._tokens(goal)
+        scored: list[tuple[int, str, Any]] = []
+        for spec in self._read_only_operation_specs():
+            tags = " ".join(str(tag) for tag in getattr(spec, "tags", []) or [])
+            haystack = f"{spec.name} {spec.description} {tags}"
+            haystack_tokens = self._tokens(haystack)
+            score = len(goal_tokens & haystack_tokens)
+            if spec.name.lower() in goal.lower():
+                score += 5
+            for token in goal_tokens:
+                if token and token in spec.name.lower():
+                    score += 2
+            if score > 0:
+                scored.append((score, spec.name, spec))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [spec for _, _, spec in scored[:_MAX_RESOLVER_CANDIDATES]]
+
+    def _resolver_prompt(self, goal: str, candidates: list[Any]) -> str:
+        candidate_summaries = [
+            {
+                "operation": spec.name,
+                "description": spec.description,
+                "arguments": [argument.to_dict() for argument in getattr(spec, "arguments", [])],
+                "tags": list(getattr(spec, "tags", []) or []),
+            }
+            for spec in candidates
+        ]
+        return f"""TOOL RESOLVER MODE.
+You are resolving exactly one requested Nexus capability against a small candidate list.
+Return exactly one JSON object. Do not plan the task. Do not implement missing tools.
+
+GOAL:
+{goal[:1000]}
+
+CANDIDATE READ-ONLY OPERATIONS:
+{json.dumps(candidate_summaries, separators=(',', ':'))}
+
+Rules:
+- Choose status "found" only when one candidate directly satisfies the goal.
+- Choose status "not_found" when none is suitable.
+- If found, set operation to the exact candidate operation name.
+- If not_found, leave operation empty and list at most three related candidate names.
+"""
+
+    async def _resolve_find_tool(self, goal: str, *, session_id: str) -> dict[str, Any]:
+        clean_goal = goal.strip()[:1000]
+        if not clean_goal:
+            raise TaskOrchestratorError("find_tool requires goal")
+        started = time.perf_counter()
+        legacy_catalog_schema_chars = len(json.dumps([spec.to_dict() for spec in self.operations_registry.catalog()], separators=(",", ":")))
+        candidates = self._candidate_operations(clean_goal)
+        if not candidates:
+            return {
+                "tool": TOOL_FIND_TOOL,
+                "status": "not_found",
+                "goal": clean_goal,
+                "reason": "No read-only OperationsRegistry candidate matched the requested capability.",
+                "related_tools": [],
+                "metrics": {
+                    "candidate_count": 0,
+                    "main_selected_schema_chars": 0,
+                    "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
+                    "resolver_input_chars": 0,
+                    "resolver_output_chars": 0,
+                    "resolver_llm_calls": 0,
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                },
+            }
+        prompt = self._resolver_prompt(clean_goal, candidates)
+        job_id = self.llm_jobs.submit(
+            prompt,
+            temperature=0.0,
+            max_tokens=250,
+            session_id=session_id,
+            response_format=_TOOL_RESOLVER_RESPONSE_FORMAT,
+        )
+        self.task_store.set_status(session_id, "waiting_for_tool_resolver")
+        try:
+            raw = await self.llm_jobs.wait(job_id)
+        except LocalLlmJobError as exc:
+            raw = json.dumps(
+                {
+                    "status": "not_found",
+                    "operation": "",
+                    "reason": f"Tool resolver LLM job failed: {str(exc)[:500]}",
+                    "related_tools": [spec.name for spec in candidates[:3]],
+                },
+                separators=(",", ":"),
+            )
+        finally:
+            self.task_store.set_status(session_id, "active")
+
+        candidate_by_name = {spec.name: spec for spec in candidates}
+        try:
+            parsed = extract_json(raw)
+        except LlamaCppClientError:
+            parsed = {
+                "status": "not_found",
+                "operation": "",
+                "reason": "Tool resolver returned invalid JSON.",
+                "related_tools": [spec.name for spec in candidates[:3]],
+            }
+        if not isinstance(parsed, dict):
+            parsed = {
+                "status": "not_found",
+                "operation": "",
+                "reason": "Tool resolver response was not a JSON object.",
+                "related_tools": [spec.name for spec in candidates[:3]],
+            }
+        status = str(parsed.get("status", "")).strip()
+        operation = str(parsed.get("operation", "")).strip()
+        reason = str(parsed.get("reason", "")).strip()[:1000] or "Tool resolver did not provide a reason."
+        resolver_output_chars = len(raw)
+        if status == "found" and operation in candidate_by_name:
+            selected = candidate_by_name[operation].to_dict()
+            return {
+                "tool": TOOL_FIND_TOOL,
+                "status": "found",
+                "goal": clean_goal,
+                "operation": selected,
+                "reason": reason,
+                "metrics": {
+                    "candidate_count": len(candidates),
+                    "main_selected_schema_chars": len(json.dumps(selected, separators=(",", ":"))),
+                    "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
+                    "resolver_input_chars": len(prompt),
+                    "resolver_output_chars": resolver_output_chars,
+                    "resolver_llm_calls": 1,
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                    "wrong_tool_selection": False,
+                },
+            }
+        related = parsed.get("related_tools")
+        if not isinstance(related, list):
+            related = [spec.name for spec in candidates[:3]]
+        related_tools = [
+            str(item) for item in related
+            if str(item) in candidate_by_name
+        ][:3]
+        return {
+            "tool": TOOL_FIND_TOOL,
+            "status": "not_found",
+            "goal": clean_goal,
+            "reason": (
+                reason
+                if status == "not_found"
+                else f"Resolver selected unavailable operation {operation!r}."
+            ),
+            "related_tools": related_tools,
+            "metrics": {
+                "candidate_count": len(candidates),
+                "main_selected_schema_chars": 0,
+                "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
+                "resolver_input_chars": len(prompt),
+                "resolver_output_chars": resolver_output_chars,
+                "resolver_llm_calls": 1,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "wrong_tool_selection": status == "found",
+            },
+        }
+
+    def _capabilities(self) -> list[dict[str, Any]]:
+        legacy_catalog_chars = len(
+            json.dumps(
+                [spec.to_dict() for spec in self.operations_registry.catalog()],
+                separators=(",", ":"),
+            )
+        )
+        return [
+            {
+                "name": TOOL_FIND_TOOL,
+                "description": (
+                    "Resolve one needed read-only Nexus operation by goal. Returns either "
+                    "one full operation schema or structured not_found; it never "
+                    "implements missing tools."
+                ),
+                "arguments": {"goal": "plain-language capability needed"},
+                "legacy_catalog_schema_chars": legacy_catalog_chars,
+            },
+            {
+                "name": "operation",
+                "description": (
+                    "Execute one read-only Nexus operation only after find_tool has "
+                    "returned that operation's schema in this session."
+                ),
+                "arguments": {
+                    "operation": "operation name from the latest find_tool result",
+                    "args": "object matching that schema",
+                },
+            },
+            {
+                "name": "memory_search",
+                "description": (
+                    "Search Nexus memory: structured knowledge, previous task/dialog "
+                    "history and project memory documents."
+                ),
+                "arguments": {"query": "string", "limit": "1..10"},
+            },
+            {
+                "name": "delegate",
+                "description": (
+                    "Ask another bounded LLM worker for analysis/research/review. "
+                    "Provider failures automatically fall back to another available "
+                    "model and control then returns to Nexus."
+                ),
+                "providers": self.delegation.catalog(),
+                "arguments": {
+                    "provider": "provider name",
+                    "task": "sub-problem",
+                    "context": "optional compact context",
+                },
+            },
+            {
+                "name": ACTION_COMMAND,
+                "description": (
+                    "Local development tool: execute one shell command through the "
+                    "trusted development command primitive, observe its real output, "
+                    "then keep control and decide again."
+                ),
+                "arguments": {"command": "shell command"},
+            },
+            {
+                "name": TOOL_PYTHON_RUN,
+                "description": (
+                    "Run project Python deterministically: Nexus resolves its own "
+                    "interpreter, so never write an interpreter name or path yourself. "
+                    "Give either a repository-relative script or an importable module "
+                    "plus arguments."
+                ),
+                "arguments": {
+                    "script": "repository-relative .py path",
+                    "module": "importable module name",
+                    "argv": "list of arguments",
+                },
+            },
             {"name": ACTION_NEW_EXPERIMENT, "description": "Codex development path: start a new isolated implementation experiment for large/complex repository changes."},
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
@@ -679,7 +941,8 @@ OBSERVATIONS FROM TOOLS USED IN THIS RUN:
 
 Choose exactly one next step.
 Tool calls:
-{{"type":"tool","tool":"operation","operation":"<catalog operation>","args":{{...}},"reason":"..."}}
+{{"type":"tool","tool":"find_tool","goal":"plain-language capability needed","reason":"..."}}
+{{"type":"tool","tool":"operation","operation":"<operation returned by find_tool>","args":{{...}},"reason":"..."}}
 {{"type":"tool","tool":"memory_search","query":"...","limit":6,"reason":"..."}}
 {{"type":"tool","tool":"delegate","provider":"local_worker|codex_readonly|azure_openai","task":"bounded sub-problem","context":"optional","reason":"..."}}
 {{"type":"tool","tool":"command","command":"<shell command>","reason":"..."}}
@@ -698,6 +961,7 @@ Model policy:
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
+- Use find_tool when you need an OperationsRegistry capability that has not already been resolved in this session; do not guess operation names.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
@@ -714,7 +978,7 @@ Rules:
 
     def _normalize_tool_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
         tool = str(decision.get("tool", "")).strip()
-        available_operations = {spec.name for spec in self.operations_registry.catalog()}
+        available_operations = {spec.name for spec in self._read_only_operation_specs()}
         if tool in available_operations:
             normalized = dict(decision)
             normalized["tool"] = "operation"
@@ -735,6 +999,8 @@ Rules:
             except (TypeError, ValueError):
                 limit = 6
             return tool, {"query": str(decision.get("query", "")).strip(), "limit": limit}
+        if tool == TOOL_FIND_TOOL:
+            return tool, {"goal": str(decision.get("goal", "")).strip()}
         if tool == "delegate":
             return tool, {
                 "provider": str(decision.get("provider", "")).strip(),
@@ -870,9 +1136,14 @@ Rules:
 
     async def _execute_tool(self, decision: dict[str, Any]) -> dict[str, Any]:
         tool = str(decision.get("tool", "")).strip()
+        if tool == TOOL_FIND_TOOL:
+            return await self._resolve_find_tool(
+                str(decision.get("goal", "")).strip(),
+                session_id=str(decision.get("session_id", "")),
+            )
         if tool == "operation":
             return self._execute_operation(decision)
-        available_operations = {spec.name for spec in self.operations_registry.catalog()}
+        available_operations = {spec.name for spec in self._read_only_operation_specs()}
         if tool in available_operations:
             normalized = dict(decision)
             normalized["tool"] = "operation"
@@ -1133,7 +1404,7 @@ Rules:
         args = decision.get("args") or {}
         if not isinstance(args, dict):
             raise TaskOrchestratorError("operation args must be an object")
-        available = {spec.name for spec in self.operations_registry.catalog()}
+        available = {spec.name for spec in self._read_only_operation_specs()}
         if operation not in available:
             raise TaskOrchestratorError(f"operation {operation!r} is not available")
         result = self.operations_registry.execute(operation, args, caller="local task orchestrator")

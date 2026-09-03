@@ -58,12 +58,14 @@ class OperationSpec:
     name: str
     description: str
     arguments: list[OperationArgSpec] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "operation": self.name,
             "description": self.description,
             "arguments": [argument.to_dict() for argument in self.arguments],
+            "tags": list(self.tags),
         }
 
 
@@ -152,24 +154,24 @@ class OperationsRegistry:
         adoption_id = OperationArgSpec("adoption_id", "string", "Adoption-ID.", required=True)
         service = OperationArgSpec("service", "string", "systemd-Unit-Name (Standard: agent-api).", default=_DEFAULT_SERVICE_NAME)
         return {
-            "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts."),
-            "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50]),
-            "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id]),
-            "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10]),
-            "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories."),
-            "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees."),
-            "help": OperationSpec("help", "Liste aller erlaubten Operationen."),
-            "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen."),
-            "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo."),
-            "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers."),
-            "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers."),
-            "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20]),
-            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50]),
-            "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service]),
-            "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id]),
-            "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme."),
-            "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox."),
-            "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox."),
+            "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts.", tags=["disk", "storage", "filesystem", "usage"]),
+            "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50], ["experiment", "logs", "jsonl", "history"]),
+            "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id], ["experiment", "status", "summary", "inspect"]),
+            "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"]),
+            "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"]),
+            "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"]),
+            "help": OperationSpec("help", "Liste aller erlaubten Operationen.", tags=["help", "catalog", "operations"]),
+            "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh", "write"]),
+            "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo.", tags=["memory", "ram", "host", "usage"]),
+            "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers.", tags=["mailbox", "status", "timer", "service"]),
+            "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers.", tags=["local model", "llama", "llm", "server", "models"]),
+            "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20], ["process", "memory", "rss", "host"]),
+            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50], ["service", "logs", "journalctl", "systemd"]),
+            "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service], ["service", "status", "systemd", "health"]),
+            "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id], ["adoption", "status", "summary", "inspect"]),
+            "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", tags=["problems", "errors", "failures", "issues"]),
+            "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox.", tags=["mailbox", "inbox", "status", "messages"]),
+            "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox.", tags=["mailbox", "outbox", "status", "messages"]),
         }
 
     def _audit(self, operation: str, args: dict[str, Any], result: OperationResult, *, caller: str) -> None:
