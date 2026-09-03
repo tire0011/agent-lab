@@ -15,15 +15,15 @@ tools, or arbitrary code, and never fabricates a general-purpose AI answer.
 from __future__ import annotations
 
 from data_sources import list_ideas, list_problems
+from nexus_version import VERSION
 
-API_VERSION = "0.2.0"
 COMPONENTS = ["health", "status", "problems", "ideas", "chat"]
 
 
 def build_status() -> dict:
     return {
         "agent_status": "idle",
-        "api_version": API_VERSION,
+        "api_version": VERSION,
         "components": COMPONENTS,
     }
 

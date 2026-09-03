@@ -6,6 +6,14 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from nexus_version import VERSION
+
+
+# Keep the smoke-test path independent of optional model and MCP dependencies.
+if __name__ == "__main__" and sys.argv[1:] == ["--version"]:
+    print(VERSION)
+    raise SystemExit(0)
+
 from agents import (
     Agent,
     Runner,
@@ -36,6 +44,7 @@ configure_logging()
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Azure OpenAI task runner")
+    parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("task", nargs="+", help="Task prompt to send")
     parser.add_argument(
         "--use-router",
