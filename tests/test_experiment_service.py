@@ -14,9 +14,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from modules.codex_worker import CodexResult
+from modules.verification_runner import run_verification_test
 
 _ORIGINAL_SUBPROCESS_RUN = subprocess.run
 from modules.experiment_service import (
@@ -2242,6 +2244,97 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         self.assertLess(events.index("implementation_started"), events.index("tests_passed"))
         for entry in entries:
             self.assertEqual(entry["experiment_id"], experiment.id)
+
+    def test_successful_github_ci_skips_local_test_suite(self):
+        github = MagicMock()
+        github.checkpoint_experiment.return_value = SimpleNamespace(
+            branch_name="nexus/103-ci",
+            checkpoint_sha="exact-checkpoint-sha",
+        )
+        github.wait_for_ci.return_value = SimpleNamespace(
+            status="passed",
+            commit_sha="exact-checkpoint-sha",
+            conclusion="success",
+            run_id=123,
+            url="https://github.example/runs/123",
+            reason=None,
+        )
+        experiment = self.service.create_experiment(goal="Add a small docstring test.")
+
+        with patch("modules.experiment_service.service.run_verification_test") as local_tests:
+            result = self.service.run_experiment(
+                experiment.id, github_work_tracking=github
+            )
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        local_tests.assert_not_called()
+        github.record_verification.assert_called_once()
+        self.assertEqual(
+            github.record_verification.call_args.kwargs["command"],
+            ["GitHub Actions", "tests.yml", "exact-checkpoint-sha"],
+        )
+
+        entries = self._read_log(experiment.id)
+        events = [entry["event"] for entry in entries]
+        self.assertIn("github_ci_passed", events)
+        self.assertNotIn("local_tests_fallback_started", events)
+
+    def test_failed_github_ci_skips_local_test_suite_and_fails(self):
+        github = MagicMock()
+        github.checkpoint_experiment.return_value = SimpleNamespace(
+            branch_name="nexus/103-ci",
+            checkpoint_sha="failed-checkpoint-sha",
+        )
+        github.wait_for_ci.return_value = SimpleNamespace(
+            status="failed",
+            commit_sha="failed-checkpoint-sha",
+            conclusion="failure",
+            run_id=124,
+            url="https://github.example/runs/124",
+            reason=None,
+        )
+        experiment = self.service.create_experiment(goal="Add a small docstring test.")
+
+        with patch("modules.experiment_service.service.run_verification_test") as local_tests:
+            result = self.service.run_experiment(
+                experiment.id, github_work_tracking=github
+            )
+
+        self.assertEqual(result.status, STATUS_FAILED)
+        local_tests.assert_not_called()
+        self.assertEqual(result.test_exit_code, 1)
+
+    def test_unavailable_github_ci_runs_local_fallback(self):
+        github = MagicMock()
+        github.checkpoint_experiment.return_value = SimpleNamespace(
+            branch_name="nexus/103-ci",
+            checkpoint_sha="fallback-checkpoint-sha",
+        )
+        github.wait_for_ci.return_value = SimpleNamespace(
+            status="unavailable",
+            commit_sha="fallback-checkpoint-sha",
+            conclusion=None,
+            run_id=None,
+            url=None,
+            reason="no matching workflow run",
+        )
+        experiment = self.service.create_experiment(goal="Add a small docstring test.")
+
+        with patch(
+            "modules.experiment_service.service.run_verification_test",
+            wraps=run_verification_test,
+        ) as local_tests:
+            result = self.service.run_experiment(
+                experiment.id, github_work_tracking=github
+            )
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        local_tests.assert_called_once()
+        entries = self._read_log(experiment.id)
+        self.assertIn(
+            "local_tests_fallback_started",
+            [entry["event"] for entry in entries],
+        )
 
     def test_test_failure_is_logged_as_error_with_context(self):
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
