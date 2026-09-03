@@ -44,13 +44,27 @@ def read_mem_available_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | Non
     Returns ``None`` when the file is missing/unreadable so callers can fall
     back to context-window-only budgeting instead of failing.
     """
+    return _read_meminfo_field(meminfo_path, "MemAvailable")
+
+
+def read_swap_free_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
+    """Best-effort read of ``SwapFree`` (kB) from ``/proc/meminfo``.
+
+    Low/absent swap is an additional low-memory signal: a host relying on
+    swap to absorb an inference spike is already close to OOM pressure even
+    if ``MemAvailable`` alone looks tolerable.
+    """
+    return _read_meminfo_field(meminfo_path, "SwapFree")
+
+
+def _read_meminfo_field(meminfo_path: str, field: str) -> int | None:
     path = Path(meminfo_path)
     try:
         if not path.is_file():
             return None
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             key, _, value = line.partition(":")
-            if key.strip() == "MemAvailable":
+            if key.strip() == field:
                 digits = "".join(ch for ch in value if ch.isdigit())
                 return int(digits) if digits else None
     except OSError:
@@ -66,6 +80,8 @@ class PromptBudgetPlan:
     reserved_output_tokens: int
     mem_available_kb: int | None
     mem_limit_kb: int
+    swap_free_kb: int | None
+    inference_headroom_kb: int
     context_budget_chars: int
     memory_budget_chars: int | None
     effective_budget_chars: int
@@ -83,6 +99,8 @@ class PromptBudgetPlan:
             "reserved_output_tokens": self.reserved_output_tokens,
             "mem_available_kb": self.mem_available_kb,
             "mem_limit_kb": self.mem_limit_kb,
+            "swap_free_kb": self.swap_free_kb,
+            "inference_headroom_kb": self.inference_headroom_kb,
             "context_budget_chars": self.context_budget_chars,
             "memory_budget_chars": self.memory_budget_chars,
             "effective_budget_chars": self.effective_budget_chars,
@@ -96,7 +114,10 @@ def compute_budget(
     model_context_tokens: int | None = None,
     reserved_output_tokens: int = 700,
     mem_available_kb: int | None = None,
+    swap_free_kb: int | None = None,
     mem_limit_mb: int | None = None,
+    inference_headroom_mb: int | None = None,
+    kb_per_input_token: int | None = None,
     chars_per_token: int = CHARS_PER_TOKEN,
 ) -> PromptBudgetPlan:
     """Compute a conservative effective prompt budget.
@@ -112,21 +133,39 @@ def compute_budget(
         mem_limit_mb = _env_int("NEXUS_LOCAL_MODEL_MEM_LIMIT_MB", 2048)
     mem_limit_kb = max(1, mem_limit_mb) * 1024
 
+    if inference_headroom_mb is None:
+        inference_headroom_mb = _env_int("NEXUS_LOCAL_MODEL_INFERENCE_HEADROOM_MB", 512)
+    inference_headroom_kb = max(0, inference_headroom_mb) * 1024
+
+    if kb_per_input_token is None:
+        kb_per_input_token = _env_int("NEXUS_LOCAL_MODEL_KB_PER_TOKEN", 8)
+    kb_per_input_token = max(1, kb_per_input_token)
+
     context_tokens_available = max(256, model_context_tokens - max(0, reserved_output_tokens))
     context_budget_chars = context_tokens_available * chars_per_token
 
     low_memory = False
     memory_budget_chars: int | None = None
     if mem_available_kb is not None:
-        # Very conservative: assume the configured memory ceiling is mostly
-        # consumed by model weights/KV cache and headroom, so only a small
-        # fraction of *actually free* host memory can safely be attributed to
-        # additional input tokens.
-        usable_kb = max(0, min(mem_available_kb, mem_limit_kb))
-        memory_tokens_available = usable_kb // 2  # ~2kB headroom per input token
-        memory_budget_chars = max(0, int(memory_tokens_available) * chars_per_token)
-        if mem_available_kb < mem_limit_kb * 0.25:
+        # ``mem_limit_kb`` is what the configured local model already needs
+        # just to run (weights + baseline KV cache). Anything below that
+        # requirement plus an additional safety headroom means the host
+        # cannot safely serve one more local inference call at all, no
+        # matter how small the resulting prompt is.
+        required_kb = mem_limit_kb + inference_headroom_kb
+        surplus_kb = mem_available_kb - required_kb
+        if surplus_kb <= 0:
             low_memory = True
+            memory_budget_chars = 0
+        else:
+            memory_tokens_available = surplus_kb // kb_per_input_token
+            memory_budget_chars = int(memory_tokens_available) * chars_per_token
+        if swap_free_kb is not None and swap_free_kb < inference_headroom_kb:
+            # Near-exhausted swap is itself a low-memory signal even when
+            # MemAvailable looks tolerable: an inference spike would have no
+            # cushion left to be absorbed by the kernel.
+            low_memory = True
+            memory_budget_chars = 0
 
     if memory_budget_chars is None:
         effective_budget_chars = context_budget_chars
@@ -135,11 +174,11 @@ def compute_budget(
     effective_budget_chars = max(500, effective_budget_chars)
 
     # The "safe local" budget is what may actually be sent to llama-server.
-    # It is deliberately not inflated back up when memory is unknown/tight,
-    # so a missing MemAvailable reading never silently permits an unsafe call.
-    safe_local_budget_chars = effective_budget_chars
-    if low_memory:
-        safe_local_budget_chars = min(safe_local_budget_chars, memory_budget_chars or safe_local_budget_chars)
+    # Below the low-memory threshold, no amount of prompt compaction makes
+    # another local call safe, so this collapses to zero and every turn is
+    # forced through the external/needs_review path instead of silently
+    # allowing a call that could OOM the host.
+    safe_local_budget_chars = 0 if low_memory else effective_budget_chars
 
     instructions_chars = int(effective_budget_chars * 0.12)
     tool_schema_chars = int(effective_budget_chars * 0.18)
@@ -155,6 +194,8 @@ def compute_budget(
         reserved_output_tokens=reserved_output_tokens,
         mem_available_kb=mem_available_kb,
         mem_limit_kb=mem_limit_kb,
+        swap_free_kb=swap_free_kb,
+        inference_headroom_kb=inference_headroom_kb,
         context_budget_chars=context_budget_chars,
         memory_budget_chars=memory_budget_chars,
         effective_budget_chars=effective_budget_chars,

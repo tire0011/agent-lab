@@ -17,6 +17,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Defensive ceiling only: bounds pathological/unbounded growth (e.g. a runaway
+# command) while still storing "complete" raw results for realistic tool
+# outputs, per the requirement that durable event_ids resolve to the full
+# result rather than a value the orchestrator already truncated before
+# persistence.
+MAX_EVENT_CONTENT_CHARS = 200_000
+
+
 @dataclass(slots=True)
 class NexusTaskSession:
     id: str
@@ -136,7 +144,7 @@ class NexusTaskStore:
                     session_id,
                     role[:32],
                     kind[:64],
-                    content[:16000],
+                    content[:MAX_EVENT_CONTENT_CHARS],
                     json.dumps(metadata or {}, separators=(",", ":")),
                     now,
                 ),

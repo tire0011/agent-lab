@@ -9,6 +9,7 @@ from modules.prompt_budget import (
     compute_budget,
     dedupe_nested_results,
     read_mem_available_kb,
+    read_swap_free_kb,
     truncate_text,
 )
 
@@ -36,6 +37,36 @@ class ComputeBudgetTests(unittest.TestCase):
         self.assertTrue(starved.low_memory)
         self.assertLess(starved.effective_budget_chars, generous.effective_budget_chars)
         self.assertLessEqual(starved.safe_local_budget_chars, starved.effective_budget_chars)
+        # The low-memory branch must actually shrink the safe local budget,
+        # not just re-apply the value effective_budget_chars already used.
+        self.assertEqual(starved.safe_local_budget_chars, 0)
+
+    def test_realistic_low_memory_range_blocks_local_calls(self):
+        # A host with only 100-500MB free is already dangerously low when
+        # the configured local model needs ~2048MB just to run; the old
+        # heuristic only tripped below ~15MB and let these values through
+        # with the full context budget still allowed.
+        for mem_available_kb in (100_000, 250_000, 500_000):
+            with self.subTest(mem_available_kb=mem_available_kb):
+                plan = compute_budget(
+                    model_context_tokens=8192,
+                    reserved_output_tokens=700,
+                    mem_available_kb=mem_available_kb,
+                    mem_limit_mb=2048,
+                )
+                self.assertTrue(plan.low_memory)
+                self.assertEqual(plan.safe_local_budget_chars, 0)
+
+    def test_low_swap_forces_low_memory_even_with_high_mem_available(self):
+        plan = compute_budget(
+            model_context_tokens=8192,
+            reserved_output_tokens=700,
+            mem_available_kb=8_000_000,
+            swap_free_kb=1024,
+            mem_limit_mb=2048,
+        )
+        self.assertTrue(plan.low_memory)
+        self.assertEqual(plan.safe_local_budget_chars, 0)
 
     def test_sections_sum_to_effective_budget(self):
         plan = compute_budget(model_context_tokens=8192, reserved_output_tokens=700, mem_available_kb=None)
@@ -63,6 +94,17 @@ class ReadMemAvailableTests(unittest.TestCase):
 
     def test_missing_file_returns_none(self):
         self.assertIsNone(read_mem_available_kb("/nonexistent/meminfo"))
+
+
+class ReadSwapFreeTests(unittest.TestCase):
+    def test_reads_kb_value_from_meminfo_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "meminfo"
+            path.write_text("MemAvailable:    4096 kB\nSwapTotal:  1000000 kB\nSwapFree:  250000 kB\n")
+            self.assertEqual(read_swap_free_kb(str(path)), 250000)
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(read_swap_free_kb("/nonexistent/meminfo"))
 
 
 class TruncateTextTests(unittest.TestCase):

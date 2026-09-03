@@ -32,6 +32,7 @@ from modules.prompt_budget import (
     compute_budget,
     dedupe_nested_results,
     read_mem_available_kb,
+    read_swap_free_kb,
     truncate_text,
 )
 from modules.redaction import redact_secrets
@@ -268,7 +269,10 @@ class NexusTaskOrchestrator:
                     f"persistent orchestration step limit reached ({step - 1})",
                     task_logger,
                 )
-            budget_plan = compute_budget(mem_available_kb=read_mem_available_kb())
+            budget_plan = compute_budget(
+                mem_available_kb=read_mem_available_kb(),
+                swap_free_kb=read_swap_free_kb(),
+            )
             history = self.task_store.history(
                 session.id,
                 limit=18,
@@ -321,11 +325,18 @@ class NexusTaskOrchestrator:
                     str(first_error).splitlines()[0][:500],
                 )
                 correction_prompt = self._json_correction_prompt(raw, first_error)
-                corrected_raw, _ = await self._controller_completion(
-                    correction_prompt,
-                    session_id=session.id,
-                    max_tokens=650,
-                )
+                try:
+                    corrected_raw, _ = await self._controller_completion(
+                        correction_prompt,
+                        session_id=session.id,
+                        max_tokens=650,
+                        budget_plan=budget_plan,
+                        task_logger=task_logger,
+                    )
+                except ControllerBudgetExceededError as exc:
+                    return self._budget_exceeded_result(
+                        session.id, task, observations, str(exc), task_logger
+                    )
                 try:
                     decision = self._parse(corrected_raw)
                 except TaskOrchestratorError as correction_error:
@@ -398,11 +409,14 @@ class NexusTaskOrchestrator:
                 else:
                     observation = await self._execute_tool(decision)
                     self.loop_guard.record_result(check.call_id, observation)
+                # Persist the full raw observation so the durable event_id can
+                # later retrieve the complete tool result; only the
+                # prompt-facing view (compact_observations) is truncated.
                 event_id = self.task_store.append_event(
                     session.id,
                     role="tool",
                     kind=str(observation.get("tool", "tool")),
-                    content=json.dumps(observation, separators=(",", ":"))[:10000],
+                    content=json.dumps(observation, separators=(",", ":")),
                     metadata={"reason": str(decision.get("reason", ""))[:1000]},
                 )
                 observation = dict(observation)
