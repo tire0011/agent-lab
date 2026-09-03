@@ -699,20 +699,17 @@ class NexusTaskOrchestrator:
     def _latest_operation_grant(self, session_id: str, operation: str) -> dict[str, Any] | None:
         if not session_id or not operation:
             return None
-        conn = getattr(self.task_store, "_conn", None)
-        lock = getattr(self.task_store, "_lock", None)
-        if conn is None or lock is None:
+        recent_events = getattr(self.task_store, "recent_events", None)
+        if not callable(recent_events):
             return None
-        with lock:
-            rows = conn.execute(
-                """SELECT id, content FROM nexus_task_events
-                   WHERE session_id=? AND role='tool' AND kind=?
-                   ORDER BY id DESC LIMIT 50""",
-                (session_id, TOOL_FIND_TOOL),
-            ).fetchall()
-        for row in rows:
+        for event in recent_events(
+            session_id,
+            role="tool",
+            kind=TOOL_FIND_TOOL,
+            limit=50,
+        ):
             try:
-                payload = json.loads(row["content"] or "{}")
+                payload = json.loads(event["content"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 continue
             if payload.get("status") != "found":
@@ -723,7 +720,7 @@ class NexusTaskOrchestrator:
             if str(schema.get("operation", "")).strip() != operation:
                 continue
             return {
-                "event_id": int(row["id"]),
+                "event_id": int(event["id"]),
                 "operation": operation,
                 "schema": schema,
             }
