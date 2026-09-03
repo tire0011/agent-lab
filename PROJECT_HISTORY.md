@@ -284,15 +284,33 @@ A smoke task failed because the controller guessed `python`, which was absent fr
 
 **Lesson:** host/runtime facts that can be resolved deterministically should not consume model reasoning. Tool interfaces should encode stable runtime semantics instead of making the LLM guess machine-specific executable names.
 
-### 64. 2026-09-02: persistent-controller prompt growth was identified as an OOM root cause; fix remains under review
+### 64. 2026-09-02 to 2026-09-03: persistent-controller prompt growth gained an adopted budget layer
 
-A later real run showed that the controller resent the full accumulated task/history plus prior tool observations on every local-model turn, while some observations were also duplicated through persisted history. Prompt size therefore grew roughly quadratically and contributed to `llama-server` being OOM-killed.
+A real run showed that the controller resent accumulated task/history and tool observations on every local-model turn, with some observations duplicated through persisted history. Prompt size grew roughly quadratically and contributed to `llama-server` being OOM-killed.
 
-Draft PR #99 proposes a prompt-budget layer that treats model context and host available memory as independent limits, excludes the current run's already in-memory observations from persisted history, compacts oversized/older observations to durable event references, deduplicates nested memory-search content, logs budget/memory decisions, and escalates an over-budget turn to an external provider rather than risking the same local model. If no external provider is usable it returns controlled `missing_capability` instead of crashing.
+PR #99 was merged on 2026-09-03. It now budgets local turns against both model context and host available memory, excludes current-run observations from persisted-history replay, compacts old/oversized observations to durable event references, deduplicates nested memory-search content, logs budget decisions, and escalates an over-budget turn to an external provider. If no external provider is usable, Nexus returns controlled `missing_capability` rather than risking another local OOM.
 
-The PR is **not adopted yet**; its current Actions run requires attention. The underlying failure and design direction are durable even if the exact implementation changes during review.
+**Lesson:** model context, persisted memory, in-memory observations, and host RAM are separate budgets; context must be bounded across turns rather than only per tool result.
 
-**Lesson:** context growth must be budgeted across turns, not only per individual tool result. Persisted memory, in-memory observations, model context, and host RAM are separate resources that can accidentally duplicate one another.
+### 65. 2026-09-03: the global tool-gateway idea became an implemented prototype
+
+Issue #44 / PR #100 merged an OperationsRegistry-backed `find_tool(goal)` gateway. The controller no longer needs the full operation catalog embedded in each prompt: it asks for a capability, a cheap local resolver considers at most five lexical candidates, and only one resolved read-only operation schema is returned. The prototype records legacy-catalog versus selected-schema size, resolver prompt/output size, LLM calls, latency, and wrong-tool-selection status.
+
+This is adopted as a prototype, not yet evidence that model-mediated discovery is better than direct tool exposure. **Lesson:** tool discovery can itself be a narrow capability with measurable token/latency/selection trade-offs.
+
+### 66. 2026-09-03: exact-commit GitHub CI became authoritative verification evidence
+
+A real version-task experiment exposed a verification bug: GitHub Actions passed **1,129 tests in about 66 seconds** for the checkpoint commit, but Nexus reran the full suite locally, hit the 450-second timeout, and incorrectly marked the experiment `timed_out`.
+
+Issue #103 / PR #104 fixed this by polling the `tests.yml` workflow for the exact checkpoint SHA. Completed CI success or failure is now authoritative; local isolated verification runs only when matching CI never starts, is unavailable, or does not finish within a bounded wait. The selected verification source and fallback reason are logged. PR verification reported **15 focused tests**, **1,057 full-suite tests passed, 55 skipped**, and successful Actions run #90.
+
+**Lesson:** duplicate verification can make a successful experiment fail; remote evidence is reusable only when it is tied to the exact commit.
+
+### 67. 2026-09-03: the logs UI still exposed experiment-era assumptions
+
+After central logging was deployed, operator testing showed the website still did not behave like an all-Nexus log view: the old experiment selector remained and journal/service logs were separated or missing from the main timeline. Issue #105 / draft PR #106 now targets one chronological source-aware timeline combining structured logs with bounded journal entries from Nexus services, with level/source/phase/text filters and expandable correlated details.
+
+PR #106 is **open and not adopted yet**. **Lesson:** central instrumentation is not sufficient if the operational UI still models logs around an obsolete subsystem boundary.
 
 ## What Nexus currently learns
 
@@ -322,14 +340,17 @@ Current `main` includes:
 
 - a persistent small Azure VM with explicit swap support; the old Standard_B2ms measurement is historical rather than a statement of current SKU,
 - persistent local `llama.cpp` capability using mmap plus a persistent local-LLM controller and durable local-inference jobs,
+- prompt budgeting/compaction across persistent controller turns with host-memory-aware external fallback,
 - persistent authenticated Nexus chat with explicit discussion/execution semantics, asynchronous jobs, and shared web/PowerShell clients,
 - compact chat-specific context separate from task orchestration,
 - schema-constrained controller decisions with one bounded syntax/semantic repair attempt,
 - adaptive local/Azure OpenAI/Codex routing with provider fallback and actual-provider accounting,
 - iterative command/operation/memory/delegation loops with persistent duplicate/cycle/non-progress detection,
 - deterministic typed Python execution and one bounded command-resolution retry,
+- prototype `find_tool(goal)` discovery that resolves one read-only OperationsRegistry schema instead of embedding the whole catalog,
 - single-call Codex experiment execution,
 - worktree-isolated experiments with shared real-tool verification/adoption, distinct timeout state, and persisted adaptive timeout,
+- exact-commit GitHub Actions evidence as authoritative verification with bounded local fallback,
 - mandatory GitHub-backed implementation lifecycle using Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion,
 - GitHub Actions verification for PRs and `nexus/**` pushes,
 - SQLite state and durable project/idea/decision/history documents,
@@ -344,7 +365,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-Prompt budgeting/history compaction from PR #99 is still under review and is not part of adopted `main`. Conversation-style Inbox/Outbox rendering (Issue #75), collapsed/lazy log details (Issue #86), CI-evidence reuse, source-context hygiene (Issue #74), and the global MCP gateway remain open work/research. The Grafana/OpenTelemetry experiment remains rejected.
+Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), unified source-aware log UI (Issue #105/PR #106), and measurement of the new tool gateway remain open work/research. The Grafana/OpenTelemetry experiment remains rejected.
 
 ## Important lessons so far
 
@@ -389,6 +410,9 @@ Prompt budgeting/history compaction from PR #99 is still under review and is not
 39. **Agent loops need progress invariants.** Durable state without duplicate/cycle detection can preserve failure indefinitely.
 40. **Deterministic host facts should be tools, not guesses.** Interpreter/runtime resolution is cheaper and more reliable outside the LLM.
 41. **Model context and host RAM are independent limits.** Both must be budgeted; duplicated persistent/in-memory context can create superlinear growth and OOM failure.
+42. **Exact-commit CI evidence should be reused, not duplicated.** Redundant local verification can turn a known-good checkpoint into a false timeout.
+43. **Tool catalogs can be retrieved on demand.** A narrow discovery interface may save context, but its routing quality and latency must be measured.
+44. **Operational UI boundaries must match runtime reality.** Central logs are still hard to use if the frontend remains experiment-centric.
 
 ## Open research directions
 
@@ -399,19 +423,19 @@ Prompt budgeting/history compaction from PR #99 is still under review and is not
 - measure controller/chat success, command/tool loops, duplicate/cycle prevention, clarification/resume, missing-capability behavior, structured-output repair rate, and human intervention,
 - measure local-LLM/chat job queue/runtime/token rate/restart recovery/resource use,
 - quantify adaptive routing by task class, actual provider, fallback, success, latency, tokens, and cost,
-- validate PR #99's context budgeting against the real OOM reproduction before adoption; measure prompt growth per turn, RAM, cache reuse, latency, and quality,
+- validate merged PR #99 against the original OOM reproduction; measure prompt growth per turn, RAM, cache reuse, latency, external-fallback rate, and task quality,
 - measure whether old observation compaction to durable event references still provides enough evidence for correct later decisions,
 - measure source-comment/docstring context reduction without losing architectural rationale (Issue #74),
 - validate conversation-style mailbox rendering against linked/pending/multi-response cases (Issue #75),
-- implement Issue #86 collapsed/lazy log details and failure-focused verification output on top of the now-central log path,
+- finish and validate Issue #105/PR #106 as a truly unified source-aware Nexus log timeline, including partial-source failures and error visibility,
 - measure whether submission-time job/session/mailbox correlation makes failures diagnosable without external tracing,
-- make verification reuse matching successful GitHub Actions evidence and run local tests only as fallback,
+- measure authoritative exact-SHA CI reuse: wait time, local fallback frequency, false timeout elimination, and end-to-end experiment latency,
 - evaluate whether self-healing operations and duplicate-loop prevention materially reduce human intervention,
 - evaluate MCP as the standard control path and narrow temporary bootstrap capabilities over time,
 - measure whether the mandatory GitHub lifecycle improves fire-and-forget development, traceability, recovery, and review,
 - add concise GitHub Issue lifecycle progress without duplicating detailed Nexus logs,
-- prototype the global MCP gateway with 2-3 tools and measure routing accuracy, schema-token reduction, latency, cost, and failures,
-- investigate `find_tool(goal)`/missing-capability detection and structured issue creation before automatic tool generation,
+- benchmark the merged `find_tool(goal)` prototype against direct catalog exposure: schema-token reduction, routing accuracy, resolver latency/calls, wrong-tool selection, and task success,
+- investigate missing-capability detection and structured issue creation before automatic tool generation,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
 - agent-generated experiments for prompts/tools/context,
@@ -420,15 +444,14 @@ Prompt budgeting/history compaction from PR #99 is still under review and is not
 
 ## Current next-step candidates
 
-1. **Prompt-budget/OOM validation:** finish/review PR #99 against the real failure mode; verify prompt growth becomes bounded and local OOM is avoided without losing task quality.
-2. **Collapsed/failure-focused log UX:** implement Issue #86 now that PRs #89/#94 provide one central data path.
-3. **Conversational autonomy rerun:** repeat the real feature request that exposed command/interpreter/tool-loop failures and measure whether PRs #95/#97 now let Nexus progress without repetition.
-4. **CI evidence reuse:** accept a matching successful Actions run for the exact branch/commit and use local tests only when evidence is absent/unusable.
+1. **Real post-OOM rerun:** repeat the feature task that previously caused prompt growth/tool looping and measure whether PRs #95/#97/#99 now finish without repetition or local OOM.
+2. **Unified Nexus log timeline:** finish/review PR #106 and verify that errors from API, mailbox, controller, experiment, chat, and llama-server can be followed in one chronological view.
+3. **Tool-gateway measurement:** compare `find_tool(goal)` with direct catalog exposure on representative operational tasks and quantify context reduction versus resolver cost/wrong selection.
+4. **Authoritative-CI measurement:** run several experiments and verify exact-SHA CI reuse removes duplicate local suites without accepting stale evidence.
 5. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
 6. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
 7. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
 8. **Single-call before/after measurement:** repeat a representative early experiment and compare quality, tokens, runtime, and cost.
 9. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
 10. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
-11. **Global MCP gateway experiment:** route 2-3 known tool types through the local model and compare with direct tool selection.
-12. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
+11. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
