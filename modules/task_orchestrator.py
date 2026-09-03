@@ -116,7 +116,7 @@ _TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = {
     "schema": {
         "type": "object",
         "properties": {
-            "status": {"type": "string", "enum": ["found", "not_found"]},
+            "status": {"type": "string", "enum": ["found", "not_found", "unavailable"]},
             "operation": {"type": "string"},
             "reason": {"type": "string"},
             "related_tools": {"type": "array", "items": {"type": "string"}},
@@ -764,6 +764,7 @@ Rules:
         budget_plan: PromptBudgetPlan | None = None,
         task_logger: Any | None = None,
     ) -> dict[str, Any]:
+        del budget_plan  # resolver must recompute current memory before its own inference
         clean_goal = goal.strip()[:1000]
         if not clean_goal:
             raise TaskOrchestratorError("find_tool requires goal")
@@ -796,21 +797,27 @@ Rules:
                 },
             }
         prompt = self._resolver_prompt(clean_goal, candidates)
+        resolver_budget_plan = compute_budget(
+            mem_available_kb=read_mem_available_kb(),
+            swap_free_kb=read_swap_free_kb(),
+            swap_total_kb=read_swap_total_kb(),
+        )
         try:
             raw, provider_used = await self._schema_completion(
                 prompt,
                 session_id=session_id,
                 max_tokens=250,
                 response_format=_TOOL_RESOLVER_RESPONSE_FORMAT,
-                budget_plan=budget_plan,
+                budget_plan=resolver_budget_plan,
                 waiting_status="waiting_for_tool_resolver",
                 role="tool_resolver",
                 task_logger=task_logger,
             )
+            resolver_unavailable = False
         except ControllerBudgetExceededError as exc:
             raw = json.dumps(
                 {
-                    "status": "not_found",
+                    "status": "unavailable",
                     "operation": "",
                     "reason": str(exc)[:500],
                     "related_tools": [spec.name for spec in candidates[:3]],
@@ -818,10 +825,11 @@ Rules:
                 separators=(",", ":"),
             )
             provider_used = "none"
+            resolver_unavailable = True
         except TaskOrchestratorError as exc:
             raw = json.dumps(
                 {
-                    "status": "not_found",
+                    "status": "unavailable",
                     "operation": "",
                     "reason": f"Tool resolver LLM job failed: {str(exc)[:500]}",
                     "related_tools": [spec.name for spec in candidates[:3]],
@@ -829,24 +837,27 @@ Rules:
                 separators=(",", ":"),
             )
             provider_used = "local"
+            resolver_unavailable = True
 
         candidate_by_name = {spec.name: spec for spec in candidates}
         try:
             parsed = extract_json(raw)
         except LlamaCppClientError:
             parsed = {
-                "status": "not_found",
+                "status": "unavailable",
                 "operation": "",
                 "reason": "Tool resolver returned invalid JSON.",
                 "related_tools": [spec.name for spec in candidates[:3]],
             }
+            resolver_unavailable = True
         if not isinstance(parsed, dict):
             parsed = {
-                "status": "not_found",
+                "status": "unavailable",
                 "operation": "",
                 "reason": "Tool resolver response was not a JSON object.",
                 "related_tools": [spec.name for spec in candidates[:3]],
             }
+            resolver_unavailable = True
         status = str(parsed.get("status", "")).strip()
         operation = str(parsed.get("operation", "")).strip()
         reason = str(parsed.get("reason", "")).strip()[:1000] or "Tool resolver did not provide a reason."
@@ -883,15 +894,17 @@ Rules:
             str(item) for item in related
             if str(item) in candidate_by_name
         ][:3]
+        final_status = "not_found" if status == "not_found" and not resolver_unavailable else "unavailable"
+        final_reason = (
+            reason
+            if final_status == "not_found" or resolver_unavailable
+            else f"Resolver selected unavailable operation {operation!r}."
+        )
         return {
             "tool": TOOL_FIND_TOOL,
-            "status": "not_found",
+            "status": final_status,
             "goal": clean_goal,
-            "reason": (
-                reason
-                if status == "not_found"
-                else f"Resolver selected unavailable operation {operation!r}."
-            ),
+            "reason": final_reason,
             "related_tools": related_tools,
             "metrics": {
                 "candidate_count": len(candidates),

@@ -1046,6 +1046,103 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("persistent controller", delegation.calls[0][1])
         self.assertIn("tool resolver", delegation.calls[1][1])
 
+    def test_find_tool_recomputes_budget_after_safe_controller_before_resolver(self):
+        class _ResolverDelegation:
+            def __init__(self):
+                self.calls = []
+
+            def catalog(self):
+                return [{"provider": "azure_openai", "description": "specialist", "writes_repo": False, "cost": "paid"}]
+
+            async def delegate(self, provider, task, *, context=""):
+                self.calls.append((provider, task, context))
+                return DelegationResult(
+                    provider=provider,
+                    success=True,
+                    content='{"status":"found","operation":"git_status","reason":"git_status reports changes"}',
+                    metadata={},
+                )
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        delegation = _ResolverDelegation()
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect repository changes",'
+            '"reason":"need git status"}',
+            '{"type":"action","action":"answer","message":"resolver used external fallback",'
+            '"reason":"resolver observation is sufficient"}',
+        ])
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        original_submit = orchestrator.llm_jobs.submit
+        orchestrator.llm_jobs.submit = MagicMock(side_effect=original_submit)
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                call_count = 0
+
+                def _safe_controller_then_unsafe_resolver(**kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    plan = real_compute_budget(**kwargs)
+                    if call_count == 2:
+                        plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _safe_controller_then_unsafe_resolver
+                result = orchestrator.run("Inspect repository changes")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(orchestrator.llm_jobs.submit.call_count, 2)
+        self.assertEqual(len(delegation.calls), 1)
+        self.assertIn("tool resolver", delegation.calls[0][1])
+        self.assertIn('"resolver_provider":"azure_openai"', client.prompts[1])
+
+    def test_resolver_capacity_failure_returns_unavailable_not_not_found(self):
+        class _EmptyDelegation:
+            def catalog(self):
+                return []
+
+            async def delegate(self, provider, task, *, context=""):
+                raise AssertionError("delegate should not be called with no providers")
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect repository changes",'
+            '"reason":"need git status"}',
+            '{"type":"action","action":"clarification","message":"Resolver capacity is unavailable.",'
+            '"reason":"resolver unavailable"}',
+        ])
+        orchestrator = self._orchestrator(client, delegation=_EmptyDelegation())
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                call_count = 0
+
+                def _safe_controller_then_unsafe_resolver(**kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    plan = real_compute_budget(**kwargs)
+                    if call_count == 2:
+                        plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _safe_controller_then_unsafe_resolver
+                result = orchestrator.run("Inspect repository changes")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_CLARIFICATION)
+        self.assertIn('"status":"unavailable"', client.prompts[1])
+        self.assertNotIn('"status":"not_found"', client.prompts[1])
+        self.assertIn('"resolver_llm_calls":0', client.prompts[1])
+
     def test_budget_exceeded_correction_retry_never_falls_back_to_local(self):
         """Regression for the JSON-correction retry bypassing budget safety.
 
