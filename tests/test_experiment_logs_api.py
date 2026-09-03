@@ -176,7 +176,7 @@ class ExperimentLogsApiTests(unittest.TestCase):
             "timestamp", "level", "logger", "message", "experiment_id",
             "mailbox_task_id", "job_id", "session_id", "phase", "event", "duration_ms", "command",
             "cwd", "exit_code", "stdout", "stderr", "exception_type",
-            "exception_message", "stacktrace", "truncated",
+            "exception_message", "stacktrace", "truncated", "source",
         }
         self.assertEqual(set(entry.keys()), expected_fields)
 

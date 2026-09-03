@@ -498,6 +498,7 @@ class ExperimentLogEntry(BaseModel):
     exception_message: str | None = None
     stacktrace: str | None = None
     truncated: bool | None = None
+    source: str = "experiment"
 
 
 class ExperimentLogsResponse(BaseModel):
@@ -508,15 +509,18 @@ class ExperimentLogsResponse(BaseModel):
 
 
 class UnifiedLogsResponse(BaseModel):
-    """Chronological structured log entries across every experiment.
+    """One chronological Nexus log timeline: structured JSONL entries
+    (experiments, mailbox tasks, chat jobs, system) merged with the
+    ``agent-api``/``nexus-mailbox``/``llama-server`` systemd journals.
 
-    Backs the Logs tab's default "Alle Experimente" view; entries use the
-    same explicit allowlist as ``ExperimentLogsResponse``.
+    Backs the Logs tab's default view; entries use the same explicit
+    allowlist as ``ExperimentLogsResponse``, plus ``source``.
     """
 
     count: int
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
     next_cursor: str | None = None
+    source_errors: dict[str, str] | None = None
 
 
 class PublicLogEntry(BaseModel):
@@ -538,6 +542,7 @@ class PublicLogEntry(BaseModel):
     experiment_id: str | None = None
     mailbox_task_id: str | None = None
     truncated: bool | None = None
+    source: str = "experiment"
 
 
 class PublicUnifiedLogsResponse(BaseModel):

@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
@@ -46,9 +46,16 @@ class UnifiedLogsApiTests(unittest.TestCase):
         codex = MagicMock()
         mailbox = MagicMock()
         mailbox.recover_after_restart.return_value = None
+        # A real LogReader would shell out to journalctl; tests instead
+        # control exactly what the merged journal feed returns, so
+        # structured-log assertions stay deterministic and independent of
+        # whatever systemd units happen to exist on the test host.
+        self.log_reader = MagicMock()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([], {}))
         api.app.dependency_overrides[api.get_experiment_service] = lambda: self.service
         api.app.dependency_overrides[api.get_codex_service] = lambda: codex
         api.app.dependency_overrides[api.get_mailbox_task_service] = lambda: mailbox
+        api.app.dependency_overrides[api.get_log_reader] = lambda: self.log_reader
         self.client = TestClient(api.app)
         self.addCleanup(api.app.dependency_overrides.clear)
 
@@ -211,7 +218,7 @@ class UnifiedLogsApiTests(unittest.TestCase):
             "timestamp", "level", "logger", "message", "experiment_id",
             "mailbox_task_id", "job_id", "session_id", "phase", "event", "duration_ms", "command",
             "cwd", "exit_code", "stdout", "stderr", "exception_type",
-            "exception_message", "stacktrace", "truncated",
+            "exception_message", "stacktrace", "truncated", "source",
         }
         self.assertEqual(set(entry.keys()), expected_fields)
 
@@ -285,6 +292,79 @@ class UnifiedLogsApiTests(unittest.TestCase):
             if not cursor:
                 break
         self.assertEqual(collected, expected_events)
+
+    def test_derives_source_grouping_from_phase(self):
+        self._write_logs()
+        response = self.client.get("/logs", headers={"x-api-key": "test-key"})
+        by_event = {e["event"]: e["source"] for e in response.json()["entries"]}
+        self.assertEqual(by_event["task_bound"], "mailbox")
+        self.assertEqual(by_event["implementation_started"], "experiment")
+        self.assertEqual(by_event["verification_started"], "experiment")
+
+    def test_merges_journal_entries_into_default_view(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00+0000", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get("/logs", headers={"x-api-key": "test-key"})
+        body = response.json()
+        sources = {e["source"] for e in body["entries"]}
+        self.assertIn("agent-api", sources)
+        events = [e["event"] for e in body["entries"]]
+        self.assertIn("journal:agent-api", events)
+
+    def test_journal_not_merged_when_filtering_by_experiment_id(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00+0000", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get(
+            f"/logs?experiment_id={'aa' * 16}", headers={"x-api-key": "test-key"}
+        )
+        sources = {e["source"] for e in response.json()["entries"]}
+        self.assertNotIn("agent-api", sources)
+        self.log_reader.read_all_journal_entries.assert_not_awaited()
+
+    def test_filters_by_source(self):
+        self._write_logs()
+        response = self.client.get("/logs?source=mailbox", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["entries"][0]["event"], "task_bound")
+
+    def test_filters_by_free_text_search(self):
+        self._write_logs()
+        response = self.client.get("/logs?search=codex_failed", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertEqual([e["event"] for e in body["entries"]], ["codex_failed"])
+
+    def test_reports_journal_source_errors_without_emptying_feed(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(
+            return_value=([], {"llama-server": "journalctl failed for llama-server (exit code 1)"})
+        )
+        response = self.client.get("/logs", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertGreater(body["count"], 0)
+        self.assertEqual(
+            body["source_errors"], {"llama-server": "journalctl failed for llama-server (exit code 1)"}
+        )
+
+    def test_include_journal_false_skips_journal_merge(self):
+        self._write_logs()
+        response = self.client.get(
+            "/logs?include_journal=false", headers={"x-api-key": "test-key"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.log_reader.read_all_journal_entries.assert_not_awaited()
 
 
 if __name__ == "__main__":

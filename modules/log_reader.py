@@ -21,7 +21,45 @@ _MAX_LINES = 500  # hard upper bound regardless of what caller requests
 _DEFAULT_LINES = 50
 
 # Simple pattern to identify log lines that contain an error/warning level.
-_ERROR_LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|EXCEPTION|Traceback|FAILED)\b", re.IGNORECASE)
+_ERROR_LEVEL_RE = re.compile(r"(ERROR|CRITICAL|EXCEPTION|Traceback|FAILED)", re.IGNORECASE)
+_WARNING_LEVEL_RE = re.compile(r"\b(WARNING|WARN)\b", re.IGNORECASE)
+
+# The systemd units the unified Logs timeline (GET /logs) merges in
+# alongside the structured JSONL feed, so the operator sees agent-api,
+# nexus-mailbox and llama-server journal messages in the same
+# chronological list without picking a service first.
+NEXUS_JOURNAL_SERVICES = ("agent-api", "nexus-mailbox", "llama-server")
+
+
+def parse_journal_line(service: str, line: str) -> dict | None:
+    """Normalize one already-redacted ``--output=short-iso`` journalctl
+    line for *service* into the same shape as a structured JSONL log
+    entry, so the unified Logs feed can merge and sort both kinds of
+    entries together. Returns ``None`` for a blank line.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    # "--output=short-iso" lines look like
+    # "2026-08-17T12:00:00+0000 host svc[1234]: message text".
+    parts = line.split(" ", 3)
+    timestamp = parts[0] if parts else ""
+    message = parts[-1] if len(parts) >= 4 else line
+    if _ERROR_LEVEL_RE.search(line):
+        level = "ERROR"
+    elif _WARNING_LEVEL_RE.search(line):
+        level = "WARNING"
+    else:
+        level = "INFO"
+    return {
+        "timestamp": timestamp,
+        "level": level,
+        "logger": "journalctl",
+        "phase": "system",
+        "event": f"journal:{service}",
+        "message": message,
+        "source": service,
+    }
 
 
 async def _run_journalctl(args: list[str], timeout: int = 15) -> tuple[int, str]:
@@ -50,6 +88,49 @@ class LogReader:
         )
         raw_lines = out.splitlines()
         return [redact(l) for l in raw_lines]
+
+    async def tail_journal_entries(self, service: str, lines: int = _DEFAULT_LINES) -> list[dict]:
+        """Return up to *lines* parsed, structured-shaped journal entries
+        for *service*, raising if the read failed (journalctl missing,
+        non-zero exit, or timeout) so a caller merging several sources can
+        report a per-source error instead of silently returning nothing.
+        """
+        lines = min(max(1, lines), _MAX_LINES)
+        returncode, out = await _run_journalctl(
+            ["-u", service, f"-n{lines}", "--no-pager", "--output=short-iso"],
+        )
+        if returncode != 0:
+            raise RuntimeError(f"journalctl failed for {service} (exit code {returncode})")
+        entries = []
+        for raw_line in out.splitlines():
+            entry = parse_journal_line(service, redact(raw_line))
+            if entry:
+                entries.append(entry)
+        return entries
+
+    async def read_all_journal_entries(
+        self, services: tuple[str, ...] = NEXUS_JOURNAL_SERVICES, lines: int = 100,
+    ) -> tuple[list[dict], dict[str, str]]:
+        """Fetch and merge journal entries for every service in *services*
+        concurrently. One service failing (unavailable journalctl, unknown
+        unit, timeout, ...) does not prevent the others from being
+        returned; failures are reported per service in the second element
+        of the returned tuple instead.
+        """
+        async def _one(service: str) -> tuple[str, list[dict], str | None]:
+            try:
+                return service, await self.tail_journal_entries(service, lines), None
+            except Exception as exc:  # noqa: BLE001 - reported per source, never raised
+                return service, [], str(exc)
+
+        results = await asyncio.gather(*(_one(service) for service in services))
+        entries: list[dict] = []
+        errors: dict[str, str] = {}
+        for service, service_entries, error in results:
+            entries.extend(service_entries)
+            if error:
+                errors[service] = error
+        return entries, errors
 
     async def get_error_logs(self, service: str, since_minutes: int = 60) -> list[dict]:
         """Return log lines at ERROR/CRITICAL level from the last *since_minutes* minutes."""

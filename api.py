@@ -93,6 +93,7 @@ from models import (
     SetConfigRequest,
     StatusResponse,
 )
+from modules.log_reader import LogReader
 from modules.operations_executor import OperationsExecutor
 from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
 from modules.redaction import sanitized_reason as _sanitized_reason
@@ -276,6 +277,18 @@ def _resolve_nexus_chat_job_service() -> NexusChatJobService:
 def get_operations_executor() -> OperationsExecutor:
     """Singleton OperationsExecutor for the process."""
     return OperationsExecutor()
+
+
+@lru_cache(maxsize=1)
+def get_log_reader() -> LogReader:
+    """Singleton LogReader for the process.
+
+    Reads the ``agent-api``/``nexus-mailbox``/``llama-server`` systemd
+    journals merged into ``GET /logs``. Overridable in tests via
+    ``app.dependency_overrides[get_log_reader]`` so a test never shells
+    out to the real ``journalctl`` binary.
+    """
+    return LogReader()
 
 
 @asynccontextmanager
@@ -829,6 +842,35 @@ def get_experiment(
 
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 
+# Coarse groupings of a structured JSONL entry's ``phase`` into the
+# ``source`` shown by the unified Logs timeline, independent of the
+# systemd journal sources (``agent-api``/``nexus-mailbox``/``llama-server``)
+# merged in by ``GET /logs``. Experiment id / mailbox task id / job id
+# remain available as optional detail/filter fields on every entry;
+# ``source`` is only the primary at-a-glance grouping.
+_MAILBOX_SOURCE_PHASES = {"mailbox", "queued"}
+_CONTROLLER_SOURCE_PHASES = {
+    "research", "selection", "selection_reformat_retry", "selection_policy_replan",
+}
+
+
+def _derive_log_source(phase: str | None) -> str:
+    if phase in _MAILBOX_SOURCE_PHASES:
+        return "mailbox"
+    if phase in _CONTROLLER_SOURCE_PHASES:
+        return "controller"
+    if phase == "chat":
+        return "chat"
+    if phase == "system":
+        return "system"
+    return "experiment"
+
+
+def _apply_log_source(raw_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for raw in raw_entries:
+        raw["source"] = _derive_log_source(raw.get("phase"))
+    return raw_entries
+
 
 @app.get("/experiments/{experiment_id}/logs", response_model=ExperimentLogsResponse)
 def get_experiment_logs(
@@ -869,6 +911,7 @@ def get_experiment_logs(
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
+    _apply_log_source(raw_entries)
 
     entries: list[ExperimentLogEntry] = []
     for raw in raw_entries:
@@ -882,34 +925,69 @@ def get_experiment_logs(
     )
 
 
+def _log_entry_sort_dt(entry: dict[str, Any]) -> datetime:
+    """Best-effort real chronological key for merging structured JSONL
+    entries (``...123Z``) with systemd journal entries (``+0000``-style
+    offsets, no fractional seconds) into one timeline. Falls back to the
+    oldest possible time for anything unparsable, so a malformed/missing
+    timestamp sorts first rather than raising or crashing the merge.
+    """
+    ts = entry.get("timestamp") or ""
+    text = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+# Per-service line count merged from each journalctl unit into the first
+# (cursor-less) page of GET /logs; bounded so one manual refresh cannot
+# turn into an unbounded read across three services.
+_UNIFIED_LOGS_JOURNAL_LINES = 100
+
+
 @app.get("/logs", response_model=UnifiedLogsResponse)
-def get_unified_logs(
+async def get_unified_logs(
     x_api_key: str | None = Header(default=None),
     level: str | None = Query(default=None),
     phase: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    search: str | None = Query(default=None),
     experiment_id: str | None = Query(default=None),
     mailbox_task_id: str | None = Query(default=None),
     job_id: str | None = Query(default=None),
     session_id: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
+    include_journal: bool = Query(default=True),
     service: ExperimentService = Depends(get_experiment_service),
+    log_reader: LogReader = Depends(get_log_reader),
 ) -> UnifiedLogsResponse:
-    """Single, chronological, structured view *across every experiment and
-    every pre-experiment mailbox task*.
+    """One complete, chronological Nexus log timeline.
 
-    Backs the Logs tab's default "Alle Experimente" feed: unlike
-    ``/activity`` (lifecycle/status summaries only), this returns the real
-    structured JSONL entries written by ``modules.central_logging`` -
-    mailbox intake, queueing, implementation, verification, GitHub
-    lifecycle, adoption, and failures/timeouts - merged in chronological
-    order from every ``<experiment_log_dir>/*.jsonl`` file, including
-    ``task-<mailbox_task_id>.jsonl`` files that hold events recorded
-    before an experiment id existed. A running/new experiment is included
-    as soon as it has written any log line, with no dependency on the
-    public diagnostics list or a terminal status. Bounded reads and
-    cursor-based pagination (see *cursor*/*next_cursor*) keep one manual
-    refresh from re-scanning unbounded historical data.
+    Unlike ``/activity`` (lifecycle/status summaries only), this returns
+    the real structured JSONL entries written by ``modules.central_logging``
+    - mailbox intake, queueing, research/selection (``controller``),
+    implementation, verification, GitHub lifecycle, adoption, chat jobs,
+    and failures/timeouts - merged in chronological order from every
+    ``<experiment_log_dir>/*.jsonl`` file, including ``task-<mailbox_task_id>``
+    files that hold events recorded before an experiment id existed. On
+    the default (cursor-less, unfiltered-by-id) page, this is additionally
+    merged with the ``agent-api``/``nexus-mailbox``/``llama-server``
+    systemd journals so the whole runtime is visible in one list without
+    picking an experiment or a log section first. Every entry carries a
+    coarse ``source`` (``mailbox``/``controller``/``experiment``/``chat``/
+    ``system``, or the journal's service name) usable as an optional
+    filter. A running/new experiment is included as soon as it has
+    written any log line, with no dependency on the public diagnostics
+    list or a terminal status. Bounded reads and cursor-based pagination
+    (see *cursor*/*next_cursor*) keep one manual refresh - and "load
+    older" - from re-scanning unbounded historical data; if a journal
+    source cannot be read, its failure is reported in ``source_errors``
+    rather than emptying the whole feed.
     """
     authorize(x_api_key)
 
@@ -949,15 +1027,52 @@ def get_unified_logs(
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
+    _apply_log_source(raw_entries)
+
+    # The journal is only merged into the true default view: the first
+    # page (no cursor - it has no pagination of its own) of the
+    # unfiltered-by-id feed, so filtering down to one experiment/task/job
+    # never mixes in unrelated systemd noise it cannot be correlated to.
+    source_errors: dict[str, str] | None = None
+    merged_entries = raw_entries
+    is_default_page = (
+        cursor is None and not resolved_experiment_id and not resolved_mailbox_task_id
+        and not job_id and not session_id
+    )
+    if include_journal and is_default_page:
+        journal_entries, errors = await log_reader.read_all_journal_entries(
+            lines=_UNIFIED_LOGS_JOURNAL_LINES,
+        )
+        if level:
+            journal_entries = [e for e in journal_entries if e.get("level") == level.upper()]
+        merged_entries = raw_entries + journal_entries
+        if errors:
+            source_errors = errors
+
+    if source:
+        wanted = source.strip().lower()
+        merged_entries = [e for e in merged_entries if str(e.get("source", "")).lower() == wanted]
+    if search and search.strip():
+        needle = search.strip().lower()
+        merged_entries = [
+            e for e in merged_entries
+            if needle in str(e.get("message") or "").lower()
+            or needle in str(e.get("event") or "").lower()
+            or needle in str(e.get("phase") or "").lower()
+        ]
+
+    merged_entries.sort(key=_log_entry_sort_dt)
 
     entries: list[ExperimentLogEntry] = []
-    for raw in raw_entries:
+    for raw in merged_entries:
         try:
             entries.append(ExperimentLogEntry(**raw))
         except Exception:
             # A malformed entry must not fail the whole response.
             continue
-    return UnifiedLogsResponse(count=len(entries), entries=entries, next_cursor=next_cursor)
+    return UnifiedLogsResponse(
+        count=len(entries), entries=entries, next_cursor=next_cursor, source_errors=source_errors,
+    )
 
 
 @app.post("/experiments/{experiment_id}/adopt", response_model=ExperimentAdoptionStatus, status_code=202)
@@ -1504,6 +1619,7 @@ def get_public_unified_logs(
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
+    _apply_log_source(raw_entries)
 
     entries: list[PublicLogEntry] = []
     for raw in raw_entries:
