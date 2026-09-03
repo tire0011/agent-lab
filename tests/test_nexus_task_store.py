@@ -37,6 +37,30 @@ class NexusTaskStoreEventIdTests(unittest.TestCase):
     def test_get_event_returns_none_for_unknown_id(self):
         self.assertIsNone(self.store.get_event(999999))
 
+    def test_recent_events_filters_raw_journal_events_newest_first(self):
+        session = self.store.get_or_create(source_type="task", source_id="t-recent")
+        other = self.store.get_or_create(source_type="task", source_id="t-other")
+        self.store.append_event(session.id, role="tool", kind="find_tool", content='{"old":true}')
+        self.store.append_event(other.id, role="tool", kind="find_tool", content='{"other":true}')
+        newest_id = self.store.append_event(
+            session.id,
+            role="tool",
+            kind="find_tool",
+            content='{"new":true}',
+            metadata={"reason": "grant"},
+        )
+        self.store.append_event(session.id, role="assistant", kind="answer", content="done")
+
+        events = self.store.recent_events(
+            session.id,
+            role="tool",
+            kind="find_tool",
+        )
+
+        self.assertEqual([event["content"] for event in events], ['{"new":true}', '{"old":true}'])
+        self.assertEqual(events[0]["id"], newest_id)
+        self.assertEqual(events[0]["metadata"], {"reason": "grant"})
+
     def test_history_with_max_event_id_excludes_later_events(self):
         session = self.store.get_or_create(source_type="task", source_id="t-3")
         anchor_id = self.store.append_event(session.id, role="user", kind="input", content="do work")

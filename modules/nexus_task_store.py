@@ -184,6 +184,53 @@ class NexusTaskStore:
             "created_at": row["created_at"],
         }
 
+    def recent_events(
+        self,
+        session_id: str,
+        *,
+        role: str | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return recent raw journal events for durable internal state lookups."""
+        limit = max(1, min(limit, 100))
+        conditions = ["session_id=?"]
+        params: list[Any] = [session_id]
+        if role is not None:
+            conditions.append("role=?")
+            params.append(role[:32])
+        if kind is not None:
+            conditions.append("kind=?")
+            params.append(kind[:64])
+        params.append(limit)
+        where_clause = " AND ".join(conditions)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT id, session_id, role, kind, content, metadata_json, created_at
+                    FROM nexus_task_events
+                    WHERE {where_clause}
+                    ORDER BY id DESC LIMIT ?""",
+                params,
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            events.append(
+                {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "role": row["role"],
+                    "kind": row["kind"],
+                    "content": row["content"],
+                    "metadata": metadata,
+                    "created_at": row["created_at"],
+                }
+            )
+        return events
+
     def history(
         self,
         session_id: str,

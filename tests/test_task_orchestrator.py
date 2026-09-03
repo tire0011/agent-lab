@@ -40,12 +40,16 @@ class _Client:
 
 class _Spec:
     name = "experiment_show"
+    description = "show experiment"
+    arguments = []
+    tags = ["experiment", "status"]
 
     def to_dict(self):
         return {
             "operation": "experiment_show",
             "description": "show experiment",
             "arguments": [{"name": "experiment_id", "type": "string", "required": True}],
+            "tags": list(self.tags),
         }
 
 
@@ -65,6 +69,50 @@ class _Registry:
                 "operation": operation,
                 "success": True,
                 "output_lines": ["id: bd9720b26ec74f15a2693e5641adf141", "status: verifying"],
+                "duration_ms": 1,
+                "exit_code": 0,
+                "error_summary": None,
+            }
+        )
+
+
+class _NamedSpec:
+    def __init__(self, name, description, *, tags=None, arguments=None):
+        self.name = name
+        self.description = description
+        self.tags = list(tags or [])
+        self.arguments = list(arguments or [])
+
+    def to_dict(self):
+        return {
+            "operation": self.name,
+            "description": self.description,
+            "arguments": [argument.to_dict() for argument in self.arguments],
+            "tags": list(self.tags),
+        }
+
+
+class _MultiRegistry:
+    def __init__(self, db_path: str, repo_root: str):
+        self.calls = []
+        self.db_path = db_path
+        self.repo_root = Path(repo_root)
+        self._specs = [
+            _NamedSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", tags=["experiment", "status"]),
+            _NamedSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes"]),
+            _NamedSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh"]),
+        ]
+
+    def catalog(self):
+        return list(self._specs)
+
+    def execute(self, operation, args, *, caller):
+        self.calls.append((operation, args, caller))
+        return SimpleNamespace(
+            to_dict=lambda: {
+                "operation": operation,
+                "success": True,
+                "output_lines": ["M README.md"],
                 "duration_ms": 1,
                 "exit_code": 0,
                 "error_summary": None,
@@ -132,6 +180,10 @@ class TaskOrchestratorTests(unittest.TestCase):
         service = MagicMock()
         service.resolve_experiment.return_value = experiment
         client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect experiment status",'
+            '"reason":"need experiment status"}',
+            '{"status":"found","operation":"experiment_show","reason":"experiment_show inspects experiments",'
+            '"related_tools":[]}',
             '{"type":"tool","tool":"operation","operation":"experiment_show",'
             '"args":{"experiment_id":"bd9720b2"},"reason":"inspect current state"}',
             '{"type":"action","action":"resume_experiment","experiment_id":"bd9720b2",'
@@ -147,7 +199,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_RESUME_EXPERIMENT)
         self.assertEqual(result.experiment_id, experiment.id)
         self.assertEqual(self.registry.calls[0][0], "experiment_show")
-        self.assertIn("status: verifying", client.prompts[1])
+        self.assertIn("status: verifying", client.prompts[-1])
         self.assertIsNotNone(result.session_id)
 
     def test_controller_inference_runs_through_persistent_job_service(self):
@@ -166,6 +218,150 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertEqual(row["session_id"], result.session_id)
         finally:
             orchestrator.close()
+
+    def test_controller_prompt_exposes_find_tool_instead_of_full_operation_catalog(self):
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"finished"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Answer locally")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertIn('"name":"find_tool"', client.prompts[0])
+        self.assertIn('"tool":"find_tool"', client.prompts[0])
+        self.assertNotIn('"operations":[', client.prompts[0])
+        self.assertNotIn('"operation":"experiment_show"', client.prompts[0])
+
+    def test_find_tool_resolves_single_schema_then_controller_executes_operation(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need a git inspection capability"}',
+            '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
+            '"related_tools":[]}',
+            '{"type":"tool","tool":"operation","operation":"git_status","args":{},'
+            '"reason":"use resolved operation"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"Repository has local changes.","reason":"git status result is sufficient"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(self.registry.calls[0][0], "git_status")
+        self.assertEqual(len(client.prompts), 4)
+        self.assertIn("TOOL RESOLVER MODE", client.prompts[1])
+        self.assertIn('"operation":"git_status"', client.prompts[1])
+        self.assertLessEqual(client.prompts[1].count('"operation":'), 5)
+        self.assertIn('"tool":"find_tool"', client.prompts[2])
+        self.assertIn('"status":"found"', client.prompts[2])
+        self.assertIn('"operation":"git_status"', client.prompts[2])
+        self.assertIn('"main_selected_schema_chars"', client.prompts[2])
+        self.assertIn('"legacy_catalog_schema_chars"', client.prompts[2])
+        self.assertIn('"selection_correctness":"unknown"', client.prompts[2])
+        self.assertIn('"grant_event_id"', client.prompts[3])
+
+    def test_guessed_operation_without_find_tool_grant_is_rejected(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"git_status","args":{},'
+            '"reason":"guess repository operation"}',
+            '{"type":"action","action":"missing_capability","experiment_id":null,'
+            '"message":"Operation was not granted.","reason":"operation_not_granted"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+        self.assertEqual(self.registry.calls, [])
+        self.assertIn('"error":"operation_not_granted"', client.prompts[1])
+
+    def test_find_tool_grant_survives_restart_for_same_session(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client1 = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect repository changes",'
+            '"reason":"need git status"}',
+            '{"status":"found","operation":"git_status","reason":"git_status reports changes",'
+            '"related_tools":[]}',
+            '{"type":"action","action":"clarification","experiment_id":null,'
+            '"message":"Ready to inspect after restart.","reason":"pause after grant"}',
+        ])
+        orchestrator1 = self._orchestrator(client1)
+        try:
+            first = orchestrator1.run("Prepare to inspect repository changes", source_id="grant-restart")
+        finally:
+            orchestrator1.close()
+
+        client2 = _Client([
+            '{"type":"tool","tool":"operation","operation":"git_status","args":{},'
+            '"reason":"use persisted grant"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"Repository inspected.","reason":"git status result is sufficient"}',
+        ])
+        orchestrator2 = self._orchestrator(client2)
+        try:
+            second = orchestrator2.run(
+                "Now inspect repository changes",
+                source_id="grant-restart",
+                session_id=first.session_id,
+            )
+        finally:
+            orchestrator2.close()
+
+        self.assertEqual(second.action, ACTION_ANSWER)
+        self.assertEqual(self.registry.calls[0][0], "git_status")
+        self.assertIn('"grant_event_id"', client2.prompts[1])
+
+    def test_find_tool_returns_not_found_without_implementing_missing_capability(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect GPU utilization",'
+            '"reason":"need GPU metrics"}',
+            '{"type":"action","action":"missing_capability","experiment_id":null,'
+            '"message":"No available tool exposes GPU metrics.","reason":"find_tool returned not_found"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Check GPU utilization")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn('"status":"not_found"', client.prompts[1])
+        self.assertIn("No read-only OperationsRegistry candidate matched", client.prompts[1])
+
+    def test_find_tool_does_not_expose_non_read_only_operations(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"trigger a mailbox refresh poll",'
+            '"reason":"need mailbox refresh"}',
+            '{"type":"action","action":"missing_capability","experiment_id":null,'
+            '"message":"Mailbox refresh is not available as a read-only operation.",'
+            '"reason":"find_tool returned not_found"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Refresh the mailbox")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn('"status":"not_found"', client.prompts[1])
+        self.assertNotIn("inbox_refresh", client.prompts[1])
 
     def test_final_route_reasoning_is_written_to_task_log(self):
         client = _Client([
@@ -200,21 +396,21 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
-    def test_registered_operation_name_is_accepted_as_direct_tool_alias(self):
+    def test_registered_operation_name_alias_without_grant_is_rejected(self):
         client = _Client([
             '{"type":"tool","tool":"experiment_show","args":{"experiment_id":"bd9720b2"},'
             '"reason":"inspect current state"}',
-            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
-            '"message":"Experiment inspected.","reason":"tool result is sufficient"}',
+            '{"type":"action","action":"missing_capability","experiment_id":null,"command":null,'
+            '"message":"Operation was not granted.","reason":"operation_not_granted"}',
         ])
 
         result = self._orchestrator(client).run("Inspect experiment bd9720b2")
 
-        self.assertEqual(result.action, ACTION_ANSWER)
-        self.assertEqual(self.registry.calls[0][0], "experiment_show")
-        self.assertEqual(self.registry.calls[0][1], {"experiment_id": "bd9720b2"})
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+        self.assertEqual(self.registry.calls, [])
         self.assertIn('"tool":"operation"', client.prompts[1])
         self.assertIn('"operation":"experiment_show"', client.prompts[1])
+        self.assertIn('"error":"operation_not_granted"', client.prompts[1])
 
     def test_command_action_envelope_is_normalized_to_tool(self):
         client = _Client([
@@ -617,6 +813,10 @@ class TaskOrchestratorTests(unittest.TestCase):
         making the prompt grow roughly quadratically with step count.
         """
         client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect experiment status",'
+            '"reason":"need experiment inspection"}',
+            '{"status":"found","operation":"experiment_show","reason":"experiment_show inspects experiments",'
+            '"related_tools":[]}',
             '{"type":"tool","tool":"operation","operation":"experiment_show",'
             '"args":{"experiment_id":"marker-alpha-unique-token"},"reason":"first inspection"}',
             '{"type":"tool","tool":"operation","operation":"experiment_show",'
@@ -723,6 +923,10 @@ class TaskOrchestratorTests(unittest.TestCase):
 
         registry.execute = _execute
         client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect experiment output",'
+            '"reason":"need experiment inspection"}',
+            '{"status":"found","operation":"experiment_show","reason":"experiment_show inspects experiments",'
+            '"related_tools":[]}',
             '{"type":"tool","tool":"operation","operation":"experiment_show",'
             '"args":{"experiment_id":"bd9720b26ec74f15a2693e5641adf141"},"reason":"inspect"}',
             '{"type":"action","action":"answer","message":"done","reason":"done"}',
@@ -788,6 +992,156 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.message, "handled externally")
         self.assertEqual(delegation.calls[0][0], "azure_openai")
         self.assertEqual(client.prompts, [])
+
+    def test_find_tool_resolver_budget_exceeded_uses_external_fallback_without_local_submit(self):
+        class _ResolverDelegation:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    '{"type":"tool","tool":"find_tool","goal":"inspect repository changes",'
+                    '"reason":"need git status"}',
+                    '{"status":"found","operation":"git_status","reason":"git_status reports changes",'
+                    '"related_tools":[]}',
+                    '{"type":"action","action":"answer","message":"resolved externally",'
+                    '"reason":"resolver observation is sufficient"}',
+                ]
+
+            def catalog(self):
+                return [{"provider": "azure_openai", "description": "specialist", "writes_repo": False, "cost": "paid"}]
+
+            async def delegate(self, provider, task, *, context=""):
+                self.calls.append((provider, task, context))
+                return DelegationResult(
+                    provider=provider,
+                    success=True,
+                    content=self.responses.pop(0),
+                    metadata={},
+                )
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        delegation = _ResolverDelegation()
+        client = _Client([])  # local llama-server must never be invoked
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                def _forces_fallback(**kwargs):
+                    plan = real_compute_budget(**kwargs)
+                    plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _forces_fallback
+                orchestrator.llm_jobs.submit = MagicMock(side_effect=AssertionError("local submit forbidden"))
+                result = orchestrator.run("Inspect repository changes without risking local OOM")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(client.prompts, [])
+        self.assertEqual(orchestrator.llm_jobs.submit.call_count, 0)
+        self.assertEqual(len(delegation.calls), 3)
+        self.assertIn("persistent controller", delegation.calls[0][1])
+        self.assertIn("tool resolver", delegation.calls[1][1])
+
+    def test_find_tool_recomputes_budget_after_safe_controller_before_resolver(self):
+        class _ResolverDelegation:
+            def __init__(self):
+                self.calls = []
+
+            def catalog(self):
+                return [{"provider": "azure_openai", "description": "specialist", "writes_repo": False, "cost": "paid"}]
+
+            async def delegate(self, provider, task, *, context=""):
+                self.calls.append((provider, task, context))
+                return DelegationResult(
+                    provider=provider,
+                    success=True,
+                    content='{"status":"found","operation":"git_status","reason":"git_status reports changes"}',
+                    metadata={},
+                )
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        delegation = _ResolverDelegation()
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect repository changes",'
+            '"reason":"need git status"}',
+            '{"type":"action","action":"answer","message":"resolver used external fallback",'
+            '"reason":"resolver observation is sufficient"}',
+        ])
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        original_submit = orchestrator.llm_jobs.submit
+        orchestrator.llm_jobs.submit = MagicMock(side_effect=original_submit)
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                call_count = 0
+
+                def _safe_controller_then_unsafe_resolver(**kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    plan = real_compute_budget(**kwargs)
+                    if call_count == 2:
+                        plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _safe_controller_then_unsafe_resolver
+                result = orchestrator.run("Inspect repository changes")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(orchestrator.llm_jobs.submit.call_count, 2)
+        self.assertEqual(len(delegation.calls), 1)
+        self.assertIn("tool resolver", delegation.calls[0][1])
+        self.assertIn('"resolver_provider":"azure_openai"', client.prompts[1])
+
+    def test_resolver_capacity_failure_returns_unavailable_not_not_found(self):
+        class _EmptyDelegation:
+            def catalog(self):
+                return []
+
+            async def delegate(self, provider, task, *, context=""):
+                raise AssertionError("delegate should not be called with no providers")
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect repository changes",'
+            '"reason":"need git status"}',
+            '{"type":"action","action":"clarification","message":"Resolver capacity is unavailable.",'
+            '"reason":"resolver unavailable"}',
+        ])
+        orchestrator = self._orchestrator(client, delegation=_EmptyDelegation())
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                call_count = 0
+
+                def _safe_controller_then_unsafe_resolver(**kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    plan = real_compute_budget(**kwargs)
+                    if call_count == 2:
+                        plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _safe_controller_then_unsafe_resolver
+                result = orchestrator.run("Inspect repository changes")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_CLARIFICATION)
+        self.assertIn('"status":"unavailable"', client.prompts[1])
+        self.assertNotIn('"status":"not_found"', client.prompts[1])
+        self.assertIn('"resolver_llm_calls":0', client.prompts[1])
 
     def test_budget_exceeded_correction_retry_never_falls_back_to_local(self):
         """Regression for the JSON-correction retry bypassing budget safety.
