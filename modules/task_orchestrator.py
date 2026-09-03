@@ -786,6 +786,8 @@ Rules:
         expected_operation: str | None,
         expected_status: str | None,
     ) -> str:
+        if status == "unavailable":
+            return _TOOL_ACCURACY_UNKNOWN
         if not expected_operation and not expected_status:
             return _TOOL_ACCURACY_UNKNOWN
         if expected_status == "not_found":
@@ -833,6 +835,7 @@ Rules:
                 "related_tools": [],
                 "metrics": {
                     "candidate_count": 0,
+                    "candidate_operations": [],
                     "main_selected_schema_chars": 0,
                     "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
                     "resolver_input_chars": 0,
@@ -927,6 +930,7 @@ Rules:
                 "reason": reason,
                 "metrics": {
                     "candidate_count": len(candidates),
+                    "candidate_operations": [spec.name for spec in candidates],
                     "main_selected_schema_chars": len(
                         json.dumps(selected, separators=(",", ":"))
                     ),
@@ -968,6 +972,7 @@ Rules:
             "related_tools": related_tools,
             "metrics": {
                 "candidate_count": len(candidates),
+                "candidate_operations": [spec.name for spec in candidates],
                 "main_selected_schema_chars": 0,
                 "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
                 "resolver_input_chars": len(prompt),

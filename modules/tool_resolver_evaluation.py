@@ -52,6 +52,11 @@ EVALUATION_CASES: tuple[ToolResolverEvalCase, ...] = (
         goal="inspect GPU utilization",
         expected_status="not_found",
     ),
+    ToolResolverEvalCase(
+        id="git-branch-protection",
+        goal="inspect git branch protection rules for the repository",
+        expected_status="not_found",
+    ),
 )
 
 _TOOL_SEARCH_STOP_WORDS = {
@@ -210,6 +215,13 @@ async def evaluate_tool_resolver(
                 else None
             )
             metrics = observation.get("metrics") or {}
+            candidate_count = metrics.get("candidate_count")
+            candidate_operations = list(metrics.get("candidate_operations") or [])
+            resolver_invoked = bool(
+                isinstance(candidate_count, int)
+                and candidate_count > 0
+                and metrics.get("resolver_llm_calls", 0)
+            )
             cases.append(
                 {
                     "id": case.id,
@@ -219,8 +231,24 @@ async def evaluate_tool_resolver(
                     "status": observation.get("status"),
                     "selected_operation": selected_operation,
                     "selection_correctness": metrics.get("selection_correctness"),
-                    "candidate_count": metrics.get("candidate_count"),
-                    "resolver_provider": metrics.get("resolver_provider"),
+                    "candidate_count": candidate_count,
+                    "candidate_operations": candidate_operations,
+                    "expected_operation_in_candidates": (
+                        case.expected_operation in candidate_operations
+                        if case.expected_operation else None
+                    ),
+                    "resolver_invoked": resolver_invoked,
+                    "resolver_provider": (
+                        "deterministic"
+                        if mode == "deterministic"
+                        else metrics.get("resolver_provider")
+                    ),
+                    "runtime_provider": (
+                        "local_job_queue_with_deterministic_client"
+                        if mode == "deterministic" and metrics.get("resolver_provider")
+                        else metrics.get("resolver_provider")
+                    ),
+                    "reason": observation.get("reason"),
                 }
             )
     finally:
@@ -230,17 +258,37 @@ async def evaluate_tool_resolver(
 
 
 def _summarize(*, mode: str, cases: list[dict[str, Any]]) -> dict[str, Any]:
-    correct = [
+    correctness_values = {"correct", "incorrect"}
+    evaluable = [
         case for case in cases
+        if case.get("selection_correctness") in correctness_values
+        and case.get("status") != "unavailable"
+    ]
+    correct = [
+        case for case in evaluable
         if case.get("selection_correctness") == "correct"
     ]
     incorrect = [
-        case for case in cases
+        case for case in evaluable
         if case.get("selection_correctness") == "incorrect"
     ]
     unavailable = [case for case in cases if case.get("status") == "unavailable"]
+    resolver_invoked = [case for case in cases if case.get("resolver_invoked")]
+    llm_evaluable = [
+        case for case in evaluable
+        if mode == "local-llm" and case.get("resolver_invoked")
+    ]
+    llm_correct = [
+        case for case in llm_evaluable
+        if case.get("selection_correctness") == "correct"
+    ]
+    llm_selection_accuracy = (
+        len(llm_correct) / len(llm_evaluable)
+        if llm_evaluable else None
+    )
+    accuracy_cases = llm_evaluable if mode == "local-llm" else []
     expected_not_found = [
-        case for case in cases
+        case for case in accuracy_cases
         if case.get("expected_status") == "not_found"
     ]
     correct_not_found = [
@@ -248,20 +296,38 @@ def _summarize(*, mode: str, cases: list[dict[str, Any]]) -> dict[str, Any]:
         if case.get("selection_correctness") == "correct"
     ]
     expected_found = [
-        case for case in cases
+        case for case in accuracy_cases
         if case.get("expected_status") == "found"
     ]
     correct_found = [
         case for case in expected_found
         if case.get("selection_correctness") == "correct"
     ]
+    candidate_expected_present = [
+        case for case in cases
+        if case.get("expected_operation")
+        and case.get("expected_operation_in_candidates")
+    ]
+    candidate_expected_total = [
+        case for case in cases
+        if case.get("expected_operation")
+    ]
+    negative_with_candidates = [
+        case for case in cases
+        if case.get("expected_status") == "not_found"
+        and int(case.get("candidate_count") or 0) > 0
+    ]
     total = len(cases)
     return {
         "experiment": "operations_registry_find_tool_gateway",
         "mode": mode,
         "command": (
-            "python -m modules.tool_resolver_evaluation --mode deterministic "
+            "python -m modules.tool_resolver_evaluation --mode all "
             "--db-path /tmp/nexus-tool-resolver-eval.db --output docs/tool-resolver-evaluation.json"
+        ),
+        "deterministic_candidate_command": (
+            "python -m modules.tool_resolver_evaluation --mode deterministic "
+            "--db-path /tmp/nexus-tool-resolver-eval.db"
         ),
         "local_llm_command": (
             "python -m modules.tool_resolver_evaluation --mode local-llm "
@@ -269,26 +335,70 @@ def _summarize(*, mode: str, cases: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "summary": {
             "total_cases": total,
+            "resolver_invoked_cases": len(resolver_invoked),
+            "evaluable_cases": len(evaluable),
             "correct": len(correct),
             "incorrect": len(incorrect),
             "unavailable": len(unavailable),
-            "accuracy": len(correct) / total if total else None,
+            "accuracy": (
+                llm_selection_accuracy if mode == "local-llm" else None
+            ),
             "tool_selection_accuracy": (
                 len(correct_found) / len(expected_found)
-                if expected_found else None
+                if mode == "local-llm" and expected_found else None
             ),
             "not_found_accuracy": (
                 len(correct_not_found) / len(expected_not_found)
-                if expected_not_found else None
+                if mode == "local-llm" and expected_not_found else None
             ),
+            "llm_selection_accuracy": llm_selection_accuracy,
+            "candidate_expected_present_cases": len(candidate_expected_present),
+            "candidate_expected_total_cases": len(candidate_expected_total),
+            "candidate_expected_present_rate": (
+                len(candidate_expected_present) / len(candidate_expected_total)
+                if candidate_expected_total else None
+            ),
+            "negative_cases_with_candidates": len(negative_with_candidates),
         },
         "cases": cases,
     }
 
 
+async def evaluate_all(*, repo_root: Path, db_path: Path) -> dict[str, Any]:
+    deterministic_db = db_path.with_name(f"{db_path.stem}-deterministic{db_path.suffix}")
+    local_llm_db = db_path.with_name(f"{db_path.stem}-local-llm{db_path.suffix}")
+    for path in (deterministic_db, local_llm_db):
+        if path.exists():
+            path.unlink()
+    deterministic = await evaluate_tool_resolver(
+        repo_root=repo_root,
+        db_path=deterministic_db,
+        mode="deterministic",
+    )
+    local_llm = await evaluate_tool_resolver(
+        repo_root=repo_root,
+        db_path=local_llm_db,
+        mode="local-llm",
+    )
+    return {
+        "experiment": "operations_registry_find_tool_gateway",
+        "mode": "all",
+        "command": (
+            "python -m modules.tool_resolver_evaluation --mode all "
+            "--db-path /tmp/nexus-tool-resolver-eval.db --output docs/tool-resolver-evaluation.json"
+        ),
+        "local_llm_evaluation": local_llm,
+        "deterministic_candidate_check": deterministic,
+        "notes": [
+            "deterministic_candidate_check uses a hand-coded resolver client and is not local LLM accuracy.",
+            "local_llm_evaluation is the only section that may report LLM selection accuracy; unavailable resolver calls are excluded from accuracy denominators.",
+        ],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate OperationsRegistry find_tool selection accuracy.")
-    parser.add_argument("--mode", choices=["deterministic", "local-llm"], default="deterministic")
+    parser.add_argument("--mode", choices=["deterministic", "local-llm", "all"], default="all")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--db-path", type=Path, default=Path(tempfile.gettempdir()) / "nexus-tool-resolver-eval.db")
     parser.add_argument("--output", type=Path)
@@ -296,13 +406,21 @@ def main() -> None:
 
     if args.db_path.exists():
         args.db_path.unlink()
-    result = asyncio.run(
-        evaluate_tool_resolver(
-            repo_root=args.repo_root,
-            db_path=args.db_path,
-            mode=args.mode,
+    if args.mode == "all":
+        result = asyncio.run(
+            evaluate_all(
+                repo_root=args.repo_root,
+                db_path=args.db_path,
+            )
         )
-    )
+    else:
+        result = asyncio.run(
+            evaluate_tool_resolver(
+                repo_root=args.repo_root,
+                db_path=args.db_path,
+                mode=args.mode,
+            )
+        )
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

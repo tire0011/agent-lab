@@ -1,83 +1,341 @@
 {
-  "cases": [
-    {
-      "candidate_count": 4,
-      "expected_operation": "git_status",
-      "expected_status": "found",
-      "goal": "inspect whether the Nexus repository has local changes",
-      "id": "git-status",
-      "resolver_provider": "local",
-      "selected_operation": "git_status",
-      "selection_correctness": "correct",
-      "status": "found"
-    },
-    {
-      "candidate_count": 4,
-      "expected_operation": "git_log",
-      "expected_status": "found",
-      "goal": "show recent git commit history for the repository",
-      "id": "git-history",
-      "resolver_provider": "local",
-      "selected_operation": "git_log",
-      "selection_correctness": "correct",
-      "status": "found"
-    },
-    {
-      "candidate_count": 3,
-      "expected_operation": "memory",
-      "expected_status": "found",
-      "goal": "inspect host memory usage",
-      "id": "memory-usage",
-      "resolver_provider": "local",
-      "selected_operation": "memory",
-      "selection_correctness": "correct",
-      "status": "found"
-    },
-    {
-      "candidate_count": 4,
-      "expected_operation": "service_logs",
-      "expected_status": "found",
-      "goal": "show recent systemd journal logs for the API service",
-      "id": "service-logs",
-      "resolver_provider": "local",
-      "selected_operation": "service_logs",
-      "selection_correctness": "correct",
-      "status": "found"
-    },
-    {
-      "candidate_count": 5,
-      "expected_operation": "local_model_status",
-      "expected_status": "found",
-      "goal": "inspect local llama model server status",
-      "id": "local-model-status",
-      "resolver_provider": "local",
-      "selected_operation": "local_model_status",
-      "selection_correctness": "correct",
-      "status": "found"
-    },
-    {
-      "candidate_count": 0,
-      "expected_operation": null,
-      "expected_status": "not_found",
-      "goal": "inspect GPU utilization",
-      "id": "gpu-utilization",
-      "resolver_provider": null,
-      "selected_operation": null,
-      "selection_correctness": "correct",
-      "status": "not_found"
+  "command": "python -m modules.tool_resolver_evaluation --mode all --db-path /tmp/nexus-tool-resolver-eval.db --output docs/tool-resolver-evaluation.json",
+  "deterministic_candidate_check": {
+    "cases": [
+      {
+        "candidate_count": 4,
+        "candidate_operations": [
+          "git_status",
+          "local_model_status",
+          "git_log",
+          "git_worktrees"
+        ],
+        "expected_operation": "git_status",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "inspect whether the Nexus repository has local changes",
+        "id": "git-status",
+        "reason": "Deterministic lexical evaluation resolver selected the strongest candidate.",
+        "resolver_invoked": true,
+        "resolver_provider": "deterministic",
+        "runtime_provider": "local_job_queue_with_deterministic_client",
+        "selected_operation": "git_status",
+        "selection_correctness": "correct",
+        "status": "found"
+      },
+      {
+        "candidate_count": 4,
+        "candidate_operations": [
+          "git_log",
+          "git_status",
+          "git_worktrees",
+          "experiment_logs"
+        ],
+        "expected_operation": "git_log",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "show recent git commit history for the repository",
+        "id": "git-history",
+        "reason": "Deterministic lexical evaluation resolver selected the strongest candidate.",
+        "resolver_invoked": true,
+        "resolver_provider": "deterministic",
+        "runtime_provider": "local_job_queue_with_deterministic_client",
+        "selected_operation": "git_log",
+        "selection_correctness": "correct",
+        "status": "found"
+      },
+      {
+        "candidate_count": 3,
+        "candidate_operations": [
+          "memory",
+          "process_status",
+          "disk"
+        ],
+        "expected_operation": "memory",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "inspect host memory usage",
+        "id": "memory-usage",
+        "reason": "Deterministic lexical evaluation resolver selected the strongest candidate.",
+        "resolver_invoked": true,
+        "resolver_provider": "deterministic",
+        "runtime_provider": "local_job_queue_with_deterministic_client",
+        "selected_operation": "memory",
+        "selection_correctness": "correct",
+        "status": "found"
+      },
+      {
+        "candidate_count": 4,
+        "candidate_operations": [
+          "service_logs",
+          "service_status",
+          "experiment_logs",
+          "mailbox_status"
+        ],
+        "expected_operation": "service_logs",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "show recent systemd journal logs for the API service",
+        "id": "service-logs",
+        "reason": "Deterministic lexical evaluation resolver selected the strongest candidate.",
+        "resolver_invoked": true,
+        "resolver_provider": "deterministic",
+        "runtime_provider": "local_job_queue_with_deterministic_client",
+        "selected_operation": "service_logs",
+        "selection_correctness": "correct",
+        "status": "found"
+      },
+      {
+        "candidate_count": 5,
+        "candidate_operations": [
+          "local_model_status",
+          "git_status",
+          "inbox_status",
+          "mailbox_status",
+          "outbox_status"
+        ],
+        "expected_operation": "local_model_status",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "inspect local llama model server status",
+        "id": "local-model-status",
+        "reason": "Deterministic lexical evaluation resolver selected the strongest candidate.",
+        "resolver_invoked": true,
+        "resolver_provider": "deterministic",
+        "runtime_provider": "local_job_queue_with_deterministic_client",
+        "selected_operation": "local_model_status",
+        "selection_correctness": "correct",
+        "status": "found"
+      },
+      {
+        "candidate_count": 0,
+        "candidate_operations": [],
+        "expected_operation": null,
+        "expected_operation_in_candidates": null,
+        "expected_status": "not_found",
+        "goal": "inspect GPU utilization",
+        "id": "gpu-utilization",
+        "reason": "No read-only OperationsRegistry candidate matched the requested capability.",
+        "resolver_invoked": false,
+        "resolver_provider": "deterministic",
+        "runtime_provider": null,
+        "selected_operation": null,
+        "selection_correctness": "correct",
+        "status": "not_found"
+      },
+      {
+        "candidate_count": 3,
+        "candidate_operations": [
+          "git_log",
+          "git_status",
+          "git_worktrees"
+        ],
+        "expected_operation": null,
+        "expected_operation_in_candidates": null,
+        "expected_status": "not_found",
+        "goal": "inspect git branch protection rules for the repository",
+        "id": "git-branch-protection",
+        "reason": "Deterministic lexical evaluation resolver selected the strongest candidate.",
+        "resolver_invoked": true,
+        "resolver_provider": "deterministic",
+        "runtime_provider": "local_job_queue_with_deterministic_client",
+        "selected_operation": "git_log",
+        "selection_correctness": "incorrect",
+        "status": "found"
+      }
+    ],
+    "command": "python -m modules.tool_resolver_evaluation --mode all --db-path /tmp/nexus-tool-resolver-eval.db --output docs/tool-resolver-evaluation.json",
+    "deterministic_candidate_command": "python -m modules.tool_resolver_evaluation --mode deterministic --db-path /tmp/nexus-tool-resolver-eval.db",
+    "experiment": "operations_registry_find_tool_gateway",
+    "local_llm_command": "python -m modules.tool_resolver_evaluation --mode local-llm --db-path /tmp/nexus-tool-resolver-eval-local.db",
+    "mode": "deterministic",
+    "summary": {
+      "accuracy": null,
+      "candidate_expected_present_cases": 5,
+      "candidate_expected_present_rate": 1.0,
+      "candidate_expected_total_cases": 5,
+      "correct": 6,
+      "evaluable_cases": 7,
+      "incorrect": 1,
+      "llm_selection_accuracy": null,
+      "negative_cases_with_candidates": 1,
+      "not_found_accuracy": null,
+      "resolver_invoked_cases": 6,
+      "tool_selection_accuracy": null,
+      "total_cases": 7,
+      "unavailable": 0
     }
-  ],
-  "command": "python -m modules.tool_resolver_evaluation --mode deterministic --db-path /tmp/nexus-tool-resolver-eval.db --output docs/tool-resolver-evaluation.json",
+  },
   "experiment": "operations_registry_find_tool_gateway",
-  "local_llm_command": "python -m modules.tool_resolver_evaluation --mode local-llm --db-path /tmp/nexus-tool-resolver-eval-local.db",
-  "mode": "deterministic",
-  "summary": {
-    "accuracy": 1.0,
-    "correct": 6,
-    "incorrect": 0,
-    "not_found_accuracy": 1.0,
-    "tool_selection_accuracy": 1.0,
-    "total_cases": 6,
-    "unavailable": 0
-  }
+  "local_llm_evaluation": {
+    "cases": [
+      {
+        "candidate_count": 4,
+        "candidate_operations": [
+          "git_status",
+          "local_model_status",
+          "git_log",
+          "git_worktrees"
+        ],
+        "expected_operation": "git_status",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "inspect whether the Nexus repository has local changes",
+        "id": "git-status",
+        "reason": "Tool resolver LLM job failed: local LLM job failed: ConnectError: All connection attempts failed",
+        "resolver_invoked": true,
+        "resolver_provider": "local",
+        "runtime_provider": "local",
+        "selected_operation": null,
+        "selection_correctness": "unknown",
+        "status": "unavailable"
+      },
+      {
+        "candidate_count": 4,
+        "candidate_operations": [
+          "git_log",
+          "git_status",
+          "git_worktrees",
+          "experiment_logs"
+        ],
+        "expected_operation": "git_log",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "show recent git commit history for the repository",
+        "id": "git-history",
+        "reason": "Tool resolver LLM job failed: local LLM job failed: ConnectError: All connection attempts failed",
+        "resolver_invoked": true,
+        "resolver_provider": "local",
+        "runtime_provider": "local",
+        "selected_operation": null,
+        "selection_correctness": "unknown",
+        "status": "unavailable"
+      },
+      {
+        "candidate_count": 3,
+        "candidate_operations": [
+          "memory",
+          "process_status",
+          "disk"
+        ],
+        "expected_operation": "memory",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "inspect host memory usage",
+        "id": "memory-usage",
+        "reason": "Tool resolver LLM job failed: local LLM job failed: ConnectError: All connection attempts failed",
+        "resolver_invoked": true,
+        "resolver_provider": "local",
+        "runtime_provider": "local",
+        "selected_operation": null,
+        "selection_correctness": "unknown",
+        "status": "unavailable"
+      },
+      {
+        "candidate_count": 4,
+        "candidate_operations": [
+          "service_logs",
+          "service_status",
+          "experiment_logs",
+          "mailbox_status"
+        ],
+        "expected_operation": "service_logs",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "show recent systemd journal logs for the API service",
+        "id": "service-logs",
+        "reason": "Tool resolver LLM job failed: local LLM job failed: ConnectError: All connection attempts failed",
+        "resolver_invoked": true,
+        "resolver_provider": "local",
+        "runtime_provider": "local",
+        "selected_operation": null,
+        "selection_correctness": "unknown",
+        "status": "unavailable"
+      },
+      {
+        "candidate_count": 5,
+        "candidate_operations": [
+          "local_model_status",
+          "git_status",
+          "inbox_status",
+          "mailbox_status",
+          "outbox_status"
+        ],
+        "expected_operation": "local_model_status",
+        "expected_operation_in_candidates": true,
+        "expected_status": "found",
+        "goal": "inspect local llama model server status",
+        "id": "local-model-status",
+        "reason": "Tool resolver LLM job failed: local LLM job failed: ConnectError: All connection attempts failed",
+        "resolver_invoked": true,
+        "resolver_provider": "local",
+        "runtime_provider": "local",
+        "selected_operation": null,
+        "selection_correctness": "unknown",
+        "status": "unavailable"
+      },
+      {
+        "candidate_count": 0,
+        "candidate_operations": [],
+        "expected_operation": null,
+        "expected_operation_in_candidates": null,
+        "expected_status": "not_found",
+        "goal": "inspect GPU utilization",
+        "id": "gpu-utilization",
+        "reason": "No read-only OperationsRegistry candidate matched the requested capability.",
+        "resolver_invoked": false,
+        "resolver_provider": null,
+        "runtime_provider": null,
+        "selected_operation": null,
+        "selection_correctness": "correct",
+        "status": "not_found"
+      },
+      {
+        "candidate_count": 3,
+        "candidate_operations": [
+          "git_log",
+          "git_status",
+          "git_worktrees"
+        ],
+        "expected_operation": null,
+        "expected_operation_in_candidates": null,
+        "expected_status": "not_found",
+        "goal": "inspect git branch protection rules for the repository",
+        "id": "git-branch-protection",
+        "reason": "Tool resolver LLM job failed: local LLM job failed: ConnectError: All connection attempts failed",
+        "resolver_invoked": true,
+        "resolver_provider": "local",
+        "runtime_provider": "local",
+        "selected_operation": null,
+        "selection_correctness": "unknown",
+        "status": "unavailable"
+      }
+    ],
+    "command": "python -m modules.tool_resolver_evaluation --mode all --db-path /tmp/nexus-tool-resolver-eval.db --output docs/tool-resolver-evaluation.json",
+    "deterministic_candidate_command": "python -m modules.tool_resolver_evaluation --mode deterministic --db-path /tmp/nexus-tool-resolver-eval.db",
+    "experiment": "operations_registry_find_tool_gateway",
+    "local_llm_command": "python -m modules.tool_resolver_evaluation --mode local-llm --db-path /tmp/nexus-tool-resolver-eval-local.db",
+    "mode": "local-llm",
+    "summary": {
+      "accuracy": null,
+      "candidate_expected_present_cases": 5,
+      "candidate_expected_present_rate": 1.0,
+      "candidate_expected_total_cases": 5,
+      "correct": 1,
+      "evaluable_cases": 1,
+      "incorrect": 0,
+      "llm_selection_accuracy": null,
+      "negative_cases_with_candidates": 1,
+      "not_found_accuracy": null,
+      "resolver_invoked_cases": 6,
+      "tool_selection_accuracy": null,
+      "total_cases": 7,
+      "unavailable": 6
+    }
+  },
+  "mode": "all",
+  "notes": [
+    "deterministic_candidate_check uses a hand-coded resolver client and is not local LLM accuracy.",
+    "local_llm_evaluation is the only section that may report LLM selection accuracy; unavailable resolver calls are excluded from accuracy denominators."
+  ]
 }
