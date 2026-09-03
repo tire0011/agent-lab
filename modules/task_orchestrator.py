@@ -25,6 +25,17 @@ from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
 from modules.nexus_task_store import NexusTaskStore
+from modules.prompt_budget import (
+    CHARS_PER_TOKEN,
+    PromptBudgetPlan,
+    compact_observations,
+    compute_budget,
+    dedupe_nested_results,
+    read_mem_available_kb,
+    read_swap_free_kb,
+    read_swap_total_kb,
+    truncate_text,
+)
 from modules.redaction import redact_secrets
 from modules.run_store import DEFAULT_DB_PATH
 from modules.runtime_execution import (
@@ -43,6 +54,13 @@ TOOL_PYTHON_RUN = "python_run"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
 ACTION_MISSING_CAPABILITY = "missing_capability"
+
+# Delegates the local controller may fall back to when its compacted prompt
+# still exceeds the safe local budget. ``local_worker`` is deliberately
+# excluded: it also calls the local llama-server and carries the same OOM
+# risk this fallback exists to avoid.
+_EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
+
 
 _FINAL_ACTIONS = {
     ACTION_NEW_EXPERIMENT,
@@ -103,6 +121,15 @@ class TaskDecision:
 
 class TaskOrchestratorError(RuntimeError):
     pass
+
+
+class ControllerBudgetExceededError(TaskOrchestratorError):
+    """Raised when a compacted controller prompt still exceeds the safe local
+    budget and no external provider is available/succeeds.
+
+    Callers must translate this into a controlled, non-crashing decision
+    (``missing_capability``/needs_review) rather than invoking llama-server.
+    """
 
 
 class NexusTaskOrchestrator:
@@ -218,7 +245,12 @@ class NexusTaskOrchestrator:
             session_id=session_id,
         )
         self.task_store.set_status(session.id, "active")
-        self.task_store.append_event(
+        # This event id anchors "prior" history: persisted history is never
+        # re-read past this point, since every tool observation produced by
+        # this run is already tracked (and budgeted) via ``observations``
+        # in-memory. Without this boundary, persisted history and in-memory
+        # observations duplicate each other and the prompt grows on every step.
+        run_start_event_id = self.task_store.append_event(
             session.id,
             role="user",
             kind="input",
@@ -238,17 +270,54 @@ class NexusTaskOrchestrator:
                     f"persistent orchestration step limit reached ({step - 1})",
                     task_logger,
                 )
-            history = self.task_store.history(session.id, limit=18, max_chars=7000)
-            prompt = self._prompt(session, task, history, observations)
+            budget_plan = compute_budget(
+                mem_available_kb=read_mem_available_kb(),
+                swap_free_kb=read_swap_free_kb(),
+                swap_total_kb=read_swap_total_kb(),
+            )
+            history = self.task_store.history(
+                session.id,
+                limit=18,
+                max_chars=budget_plan.history_chars,
+                max_event_id=run_start_event_id,
+            )
+            prompt, prompt_meta = self._build_prompt(session, task, history, observations, budget_plan)
+            logger.info(
+                "controller_prompt_budget session_id=%s prompt_chars=%s estimated_tokens=%s "
+                "history_events=%s observation_count=%s omitted_observations=%s %s",
+                session.id,
+                len(prompt),
+                len(prompt) // CHARS_PER_TOKEN,
+                len(history),
+                len(observations),
+                prompt_meta["omitted_observation_indices"],
+                budget_plan.as_log_fields(),
+            )
             logger.info(
                 "llm_provider selected provider=local role=controller session_id=%s reason=persistent_controller",
                 session.id,
             )
-            raw = await self._controller_completion(
-                prompt,
-                session_id=session.id,
-                max_tokens=550,
-            )
+            try:
+                raw, provider_used = await self._controller_completion(
+                    prompt,
+                    session_id=session.id,
+                    max_tokens=550,
+                    budget_plan=budget_plan,
+                    task_logger=task_logger,
+                )
+            except ControllerBudgetExceededError as exc:
+                return self._budget_exceeded_result(
+                    session.id, task, observations, str(exc), task_logger
+                )
+            if provider_used != "local":
+                logger.warning(
+                    "controller_external_fallback session_id=%s provider_used=%s prompt_chars=%s "
+                    "safe_local_budget_chars=%s",
+                    session.id,
+                    provider_used,
+                    len(prompt),
+                    budget_plan.safe_local_budget_chars,
+                )
             try:
                 decision = self._parse(raw)
             except TaskOrchestratorError as first_error:
@@ -258,11 +327,18 @@ class NexusTaskOrchestrator:
                     str(first_error).splitlines()[0][:500],
                 )
                 correction_prompt = self._json_correction_prompt(raw, first_error)
-                corrected_raw = await self._controller_completion(
-                    correction_prompt,
-                    session_id=session.id,
-                    max_tokens=650,
-                )
+                try:
+                    corrected_raw, _ = await self._controller_completion(
+                        correction_prompt,
+                        session_id=session.id,
+                        max_tokens=650,
+                        budget_plan=budget_plan,
+                        task_logger=task_logger,
+                    )
+                except ControllerBudgetExceededError as exc:
+                    return self._budget_exceeded_result(
+                        session.id, task, observations, str(exc), task_logger
+                    )
                 try:
                     decision = self._parse(corrected_raw)
                 except TaskOrchestratorError as correction_error:
@@ -335,14 +411,19 @@ class NexusTaskOrchestrator:
                 else:
                     observation = await self._execute_tool(decision)
                     self.loop_guard.record_result(check.call_id, observation)
-                observations.append(observation)
-                self.task_store.append_event(
+                # Persist the full raw observation so the durable event_id can
+                # later retrieve the complete tool result; only the
+                # prompt-facing view (compact_observations) is truncated.
+                event_id = self.task_store.append_event(
                     session.id,
                     role="tool",
                     kind=str(observation.get("tool", "tool")),
-                    content=json.dumps(observation, separators=(",", ":"))[:10000],
+                    content=json.dumps(observation, separators=(",", ":")),
                     metadata={"reason": str(decision.get("reason", ""))[:1000]},
                 )
+                observation = dict(observation)
+                observation["event_id"] = event_id
+                observations.append(observation)
                 continue
 
             action = str(decision.get("action", "")).strip().lower()
@@ -412,7 +493,34 @@ class NexusTaskOrchestrator:
         *,
         session_id: str,
         max_tokens: int,
-    ) -> str:
+        budget_plan: "PromptBudgetPlan | None" = None,
+        task_logger: Any | None = None,
+    ) -> tuple[str, str]:
+        """Run one controller completion.
+
+        Returns ``(raw_response, provider_used)``. When ``budget_plan`` shows
+        the compacted prompt still exceeds the safe local budget, llama-server
+        is never invoked; the compact package is delegated to an available
+        external provider instead so a persistent session cannot OOM the
+        local model host.
+        """
+        if budget_plan is not None and len(prompt) > budget_plan.safe_local_budget_chars:
+            logger.warning(
+                "controller_budget_exceeded session_id=%s prompt_chars=%s safe_local_budget_chars=%s "
+                "low_memory=%s mem_available_kb=%s",
+                session_id,
+                len(prompt),
+                budget_plan.safe_local_budget_chars,
+                budget_plan.low_memory,
+                budget_plan.mem_available_kb,
+            )
+            raw = await self._external_fallback_completion(
+                prompt,
+                session_id=session_id,
+                budget_plan=budget_plan,
+                task_logger=task_logger,
+            )
+            return raw
         job_id = self.llm_jobs.submit(
             prompt,
             temperature=0.0,
@@ -422,11 +530,66 @@ class NexusTaskOrchestrator:
         )
         self.task_store.set_status(session_id, "waiting_for_llm")
         try:
-            return await self.llm_jobs.wait(job_id)
+            return await self.llm_jobs.wait(job_id), "local"
         except LocalLlmJobError as exc:
             raise TaskOrchestratorError(f"local LLM job failed: {exc}") from exc
         finally:
             self.task_store.set_status(session_id, "active")
+
+    async def _external_fallback_completion(
+        self,
+        prompt: str,
+        *,
+        session_id: str,
+        budget_plan: "PromptBudgetPlan",
+        task_logger: Any | None,
+    ) -> tuple[str, str]:
+        """Delegate a compact, still-over-budget controller turn externally.
+
+        Never falls back to ``local_worker``: that delegate also calls the
+        same local llama-server and would carry the same OOM risk this
+        fallback exists to avoid.
+        """
+        available = {item["provider"] for item in self.delegation.catalog()}
+        candidates = [p for p in _EXTERNAL_FALLBACK_ORDER if p in available]
+        if not candidates:
+            raise ControllerBudgetExceededError(
+                "compact controller prompt still exceeds the safe local budget "
+                f"({len(prompt)} chars > {budget_plan.safe_local_budget_chars}) and no "
+                "external provider is configured; refusing to risk a local OOM"
+            )
+        task_text = (
+            "Continue as the Nexus persistent controller for this turn only. "
+            "Return exactly one JSON object matching the schema/instructions below; "
+            "no Markdown, no prose.\n\n" + prompt
+        )[:16000]
+        attempts: list[str] = []
+        for provider in candidates:
+            result = await self.delegation.delegate(provider, task_text, context="")
+            payload = result.to_dict()
+            attempts.append(provider)
+            if task_logger is not None:
+                task_logger.info(
+                    "orchestration",
+                    "controller_external_fallback",
+                    f"provider={provider} success={payload.get('success')}",
+                    session_id=session_id,
+                    provider=provider,
+                )
+            if payload.get("success"):
+                logger.info(
+                    "llm_provider completed provider=%s role=controller_fallback session_id=%s "
+                    "prompt_chars=%s safe_local_budget_chars=%s",
+                    provider,
+                    session_id,
+                    len(prompt),
+                    budget_plan.safe_local_budget_chars,
+                )
+                return str(payload.get("content", "")), provider
+        raise ControllerBudgetExceededError(
+            "compact controller prompt still exceeds the safe local budget and all "
+            f"external providers failed: {attempts}"
+        )
 
     @staticmethod
     def _json_correction_prompt(
@@ -457,6 +620,43 @@ class NexusTaskOrchestrator:
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
             {"name": ACTION_CLARIFICATION, "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory."},
         ]
+
+    def _build_prompt(
+        self,
+        session: Any,
+        current_input: str,
+        history: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        budget_plan: PromptBudgetPlan,
+    ) -> tuple[str, dict[str, Any]]:
+        """Compact observations/current input to fit ``budget_plan`` and render.
+
+        Prevents nested duplication (e.g. a ``memory_search`` observation
+        surfacing content already present in persisted history or in an
+        earlier observation of this same run) and deterministically bounds
+        any individually oversized observation before the next model call.
+        """
+        truncated_input, input_truncated = truncate_text(current_input, budget_plan.current_input_chars)
+        seen: set[str] = set()
+        for event in history:
+            content = str(event.get("content", "")).strip()[:400]
+            if content:
+                seen.add(content)
+        deduped_observations = dedupe_nested_results(observations, already_seen=seen)
+        compacted_observations, omitted_indices = compact_observations(
+            deduped_observations,
+            budget_chars=budget_plan.observation_chars,
+            keep_recent_full=2,
+        )
+        prompt = self._prompt(session, truncated_input, history, compacted_observations)
+        meta = {
+            "input_truncated": input_truncated,
+            "omitted_observation_indices": omitted_indices,
+            "deduped_observation_count": sum(
+                int(obs.get("deduped", 0)) for obs in deduped_observations if isinstance(obs, dict)
+            ),
+        }
+        return prompt, meta
 
     def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
         return f"""You are Nexus, the LOCAL persistent controller. You decide WHAT Nexus does next.
@@ -606,6 +806,43 @@ Rules:
             task_logger.warning(
                 "orchestration",
                 "tool_loop_stopped",
+                reason,
+                action=result.action,
+                reason=reason,
+                session_id=session_id,
+            )
+        self._persist_final(session_id, task, result)
+        return result
+
+    def _budget_exceeded_result(
+        self,
+        session_id: str,
+        task: str,
+        observations: list[dict[str, Any]],
+        reason: str,
+        task_logger: Any | None,
+    ) -> TaskDecision:
+        """Controlled, non-crashing outcome when no provider can safely take this turn.
+
+        The session and its full history/observations remain persisted so a
+        human can resolve capacity/configuration and resume; nothing required
+        to continue is silently discarded.
+        """
+        result = TaskDecision(
+            action=ACTION_MISSING_CAPABILITY,
+            reason=reason,
+            message=(
+                "Nexus could not safely take this controller turn: the compact "
+                "prompt still exceeds the safe local budget and no external "
+                "provider is available. This needs human review before retrying."
+            ),
+            observations=observations,
+            session_id=session_id,
+        )
+        if task_logger is not None:
+            task_logger.warning(
+                "orchestration",
+                "controller_budget_exceeded",
                 reason,
                 action=result.action,
                 reason=reason,

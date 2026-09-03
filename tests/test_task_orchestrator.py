@@ -608,6 +608,275 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(self.registry.calls, [])
         self.assertTrue(list((Path(self.tmp.name) / "state" / "requirements").glob("*.json")))
 
+    def test_persisted_history_does_not_duplicate_this_runs_own_observations(self):
+        """Regression test for unbounded prompt growth (agent-lab#91-style bug).
+
+        Before the fix, every tool observation of the current run was embedded
+        both via the fresh ``observations`` list AND via persisted history
+        (since history() re-read events this same run had just appended),
+        making the prompt grow roughly quadratically with step count.
+        """
+        client = _Client([
+            '{"type":"tool","tool":"operation","operation":"experiment_show",'
+            '"args":{"experiment_id":"marker-alpha-unique-token"},"reason":"first inspection"}',
+            '{"type":"tool","tool":"operation","operation":"experiment_show",'
+            '"args":{"experiment_id":"marker-beta-unique-token"},"reason":"second inspection"}',
+            '{"type":"action","action":"answer","message":"done","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            orchestrator.run("Inspect twice then answer")
+        finally:
+            orchestrator.close()
+
+        final_prompt = client.prompts[-1]
+        self.assertEqual(final_prompt.count("marker-alpha-unique-token"), 1)
+        self.assertEqual(final_prompt.count("marker-beta-unique-token"), 1)
+
+    def test_nested_memory_search_results_are_deduped_against_prior_history(self):
+        memory = _Memory([
+            {
+                "source": "task_history",
+                "kind": "operation",
+                "content": "Improve model routing",
+            },
+            {
+                "source": "project_document",
+                "document": "DECISIONS.md",
+                "content": "Fresh unseen decision content.",
+            },
+        ])
+        client = _Client([
+            '{"type":"tool","tool":"memory_search","query":"model routing",'
+            '"limit":6,"reason":"look for prior discussion"}',
+            '{"type":"action","action":"answer","message":"done","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client, memory=memory)
+        try:
+            orchestrator.run("Improve model routing")
+        finally:
+            orchestrator.close()
+
+        final_prompt = client.prompts[-1]
+        self.assertIn("Fresh unseen decision content.", final_prompt)
+        # Without dedup this token would appear a third time (again inside the
+        # memory_search observation), duplicating what CURRENT INPUT and the
+        # persisted history section already show verbatim.
+        self.assertEqual(final_prompt.count("Improve model routing"), 2)
+
+    def test_oversized_observation_is_truncated_and_referenced_by_event_id(self):
+        client = _Client([
+            '{"type":"tool","tool":"command","command":"cat huge_file.txt",'
+            '"reason":"inspect large output"}',
+            '{"type":"action","action":"answer","message":"done","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            from unittest.mock import patch
+
+            huge_output = "y" * 50000
+            with patch(
+                "modules.task_orchestrator.process_command",
+                return_value=(f"exit_code: 0\nstdout:\n{huge_output}", None),
+            ), patch(
+                "modules.task_orchestrator.compute_budget"
+            ) as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                def _tiny_budget(**kwargs):
+                    plan = real_compute_budget(**kwargs)
+                    plan.observation_chars = 200
+                    return plan
+
+                compute_budget_mock.side_effect = _tiny_budget
+                result = orchestrator.run("Read the huge file")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        final_prompt = client.prompts[-1]
+        self.assertNotIn(huge_output, final_prompt)
+        self.assertIn("event_id", final_prompt)
+
+    def test_full_raw_observation_is_persisted_even_when_prompt_is_compacted(self):
+        """A >10k tool result must remain fully retrievable by event_id (#91):
+
+        only the prompt-facing view may be compacted/truncated, the durable
+        copy stored via ``append_event``/``get_event`` must stay complete.
+        """
+        huge_line = "z" * 500
+        registry = self.registry
+
+        def _execute(operation, args, *, caller):
+            registry.calls.append((operation, args, caller))
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "operation": operation,
+                    "success": True,
+                    # 30 * 500 = 15000 chars, well over the old 10000-char cap.
+                    "output_lines": [huge_line] * 30,
+                    "duration_ms": 1,
+                    "exit_code": 0,
+                    "error_summary": None,
+                }
+            )
+
+        registry.execute = _execute
+        client = _Client([
+            '{"type":"tool","tool":"operation","operation":"experiment_show",'
+            '"args":{"experiment_id":"bd9720b26ec74f15a2693e5641adf141"},"reason":"inspect"}',
+            '{"type":"action","action":"answer","message":"done","reason":"done"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect experiment output")
+            self.assertEqual(result.action, ACTION_ANSWER)
+            row = orchestrator.task_store._conn.execute(
+                "SELECT id, content FROM nexus_task_events WHERE session_id=? AND kind='operation'"
+                " ORDER BY id DESC LIMIT 1",
+                (result.session_id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            # The row already stored in the events table must be complete...
+            self.assertGreater(len(row["content"]), 15000)
+            self.assertIn(huge_line, row["content"])
+            # ...and get_event() must return that same complete raw content.
+            full = orchestrator.task_store.get_event(row["id"])
+            self.assertEqual(full["content"], row["content"])
+            self.assertIn(huge_line, full["content"])
+        finally:
+            orchestrator.close()
+
+    def test_budget_exceeded_falls_back_to_external_provider(self):
+        class _JsonDelegation:
+            def __init__(self):
+                self.calls = []
+
+            def catalog(self):
+                return [{"provider": "azure_openai", "description": "specialist", "writes_repo": False, "cost": "paid"}]
+
+            async def delegate(self, provider, task, *, context=""):
+                self.calls.append((provider, task, context))
+                return DelegationResult(
+                    provider=provider,
+                    success=True,
+                    content='{"type":"action","action":"answer","message":"handled externally",'
+                    '"reason":"compact package delegated"}',
+                    metadata={},
+                )
+
+        delegation = _JsonDelegation()
+        client = _Client([])  # local llama-server must never be invoked
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                def _forces_fallback(**kwargs):
+                    plan = real_compute_budget(**kwargs)
+                    plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _forces_fallback
+                result = orchestrator.run("Answer without risking a local OOM")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "handled externally")
+        self.assertEqual(delegation.calls[0][0], "azure_openai")
+        self.assertEqual(client.prompts, [])
+
+    def test_budget_exceeded_correction_retry_never_falls_back_to_local(self):
+        """Regression for the JSON-correction retry bypassing budget safety.
+
+        When the main completion is routed externally because local
+        inference is unsafe, a malformed external response must have its
+        correction retry routed externally too - never straight back to
+        llama-server.
+        """
+        class _FlakyJsonDelegation:
+            def __init__(self):
+                self.calls = []
+
+            def catalog(self):
+                return [{"provider": "azure_openai", "description": "specialist", "writes_repo": False, "cost": "paid"}]
+
+            async def delegate(self, provider, task, *, context=""):
+                self.calls.append((provider, task, context))
+                if len(self.calls) == 1:
+                    return DelegationResult(
+                        provider=provider,
+                        success=True,
+                        content="not valid json at all",
+                        metadata={},
+                    )
+                return DelegationResult(
+                    provider=provider,
+                    success=True,
+                    content='{"type":"action","action":"answer","message":"handled externally",'
+                    '"reason":"corrected externally"}',
+                    metadata={},
+                )
+
+        delegation = _FlakyJsonDelegation()
+        client = _Client([])  # local llama-server must never be invoked, even on correction
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                def _forces_fallback(**kwargs):
+                    plan = real_compute_budget(**kwargs)
+                    plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _forces_fallback
+                result = orchestrator.run("Answer without risking a local OOM")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "handled externally")
+        self.assertEqual(len(delegation.calls), 2)
+        self.assertEqual(delegation.calls[0][0], "azure_openai")
+        self.assertEqual(delegation.calls[1][0], "azure_openai")
+        self.assertEqual(client.prompts, [])
+
+    def test_budget_exceeded_with_no_external_provider_is_a_controlled_missing_capability(self):
+        class _EmptyDelegation:
+            def catalog(self):
+                return []
+
+            async def delegate(self, provider, task, *, context=""):
+                raise AssertionError("delegate should not be called when no provider is available")
+
+        client = _Client([])
+        orchestrator = self._orchestrator(client, delegation=_EmptyDelegation())
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                def _forces_fallback(**kwargs):
+                    plan = real_compute_budget(**kwargs)
+                    plan.safe_local_budget_chars = 1
+                    return plan
+
+                compute_budget_mock.side_effect = _forces_fallback
+                result = orchestrator.run("Answer without risking a local OOM")
+
+            self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+            session = orchestrator.task_store.get(result.session_id)
+            self.assertEqual(session.status, "blocked_missing_capability")
+        finally:
+            orchestrator.close()
+
 
 if __name__ == "__main__":
     unittest.main()

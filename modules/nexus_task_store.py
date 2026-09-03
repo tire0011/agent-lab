@@ -17,6 +17,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Defensive ceiling only: bounds pathological/unbounded growth (e.g. a runaway
+# command) while still storing "complete" raw results for realistic tool
+# outputs, per the requirement that durable event_ids resolve to the full
+# result rather than a value the orchestrator already truncated before
+# persistence.
+MAX_EVENT_CONTENT_CHARS = 200_000
+
+
 @dataclass(slots=True)
 class NexusTaskSession:
     id: str
@@ -119,11 +127,16 @@ class NexusTaskStore:
         kind: str,
         content: str,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
-        """Persist the full bounded event; prompt history is compacted separately."""
+    ) -> int:
+        """Persist the full bounded event; prompt history is compacted separately.
+
+        Returns the durable event id so callers can reference the raw stored
+        content later (e.g. to compact an observation to a stub in a prompt
+        while still being able to retrieve the full result by id).
+        """
         now = _now()
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """INSERT INTO nexus_task_events
                    (session_id, role, kind, content, metadata_json, created_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
@@ -131,7 +144,7 @@ class NexusTaskStore:
                     session_id,
                     role[:32],
                     kind[:64],
-                    content[:16000],
+                    content[:MAX_EVENT_CONTENT_CHARS],
                     json.dumps(metadata or {}, separators=(",", ":")),
                     now,
                 ),
@@ -141,6 +154,35 @@ class NexusTaskStore:
                 (now, session_id),
             )
             self._conn.commit()
+            return int(cursor.lastrowid)
+
+    def get_event(self, event_id: int) -> dict[str, Any] | None:
+        """Fetch one full, raw event by its durable id.
+
+        Used to retrieve complete tool results that were compacted to a stub
+        reference in a prompt instead of being resent inline.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id, session_id, role, kind, content, metadata_json, created_at
+                   FROM nexus_task_events WHERE id=?""",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        return {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "role": row["role"],
+            "kind": row["kind"],
+            "content": row["content"],
+            "metadata": metadata,
+            "created_at": row["created_at"],
+        }
 
     def history(
         self,
@@ -148,21 +190,36 @@ class NexusTaskStore:
         *,
         limit: int = 24,
         max_chars: int = 9000,
+        max_event_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return recent history compact enough for a small local context window.
 
         Storage keeps larger event bodies. Only this prompt-facing view truncates
         individual events and stops once the aggregate character budget is hit.
+
+        ``max_event_id`` excludes any event with a strictly greater id. Callers
+        that already track the current run's own tool observations in memory
+        (see ``NexusTaskOrchestrator``) pass the id of the event that started
+        the current run so those in-memory observations are never duplicated
+        by also being re-read back out of persisted history.
         """
         limit = max(1, min(limit, 100))
         max_chars = max(1000, min(max_chars, 32000))
         with self._lock:
-            rows = self._conn.execute(
-                """SELECT role, kind, content, metadata_json, created_at
-                   FROM nexus_task_events WHERE session_id=?
-                   ORDER BY id DESC LIMIT ?""",
-                (session_id, limit),
-            ).fetchall()
+            if max_event_id is None:
+                rows = self._conn.execute(
+                    """SELECT role, kind, content, metadata_json, created_at
+                       FROM nexus_task_events WHERE session_id=?
+                       ORDER BY id DESC LIMIT ?""",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT role, kind, content, metadata_json, created_at
+                       FROM nexus_task_events WHERE session_id=? AND id<=?
+                       ORDER BY id DESC LIMIT ?""",
+                    (session_id, max_event_id, limit),
+                ).fetchall()
         newest_first: list[dict[str, Any]] = []
         used = 0
         for row in rows:
