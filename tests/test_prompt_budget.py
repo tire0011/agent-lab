@@ -10,6 +10,7 @@ from modules.prompt_budget import (
     dedupe_nested_results,
     read_mem_available_kb,
     read_swap_free_kb,
+    read_swap_total_kb,
     truncate_text,
 )
 
@@ -57,13 +58,47 @@ class ComputeBudgetTests(unittest.TestCase):
                 self.assertTrue(plan.low_memory)
                 self.assertEqual(plan.safe_local_budget_chars, 0)
 
-    def test_low_swap_forces_low_memory_even_with_high_mem_available(self):
+    def test_no_swap_configured_does_not_trigger_low_memory(self):
+        # /proc/meminfo always reports "SwapFree: 0" when no swap device is
+        # configured; that must not, by itself, make every no-swap host look
+        # low on memory even with abundant MemAvailable.
+        plan = compute_budget(
+            model_context_tokens=8192,
+            reserved_output_tokens=700,
+            mem_available_kb=8_000_000,
+            swap_free_kb=0,
+            swap_total_kb=0,
+            mem_limit_mb=2048,
+        )
+        self.assertFalse(plan.low_memory)
+        self.assertGreater(plan.safe_local_budget_chars, 0)
+
+    def test_low_swap_alone_does_not_trigger_low_memory_with_abundant_ram(self):
         plan = compute_budget(
             model_context_tokens=8192,
             reserved_output_tokens=700,
             mem_available_kb=8_000_000,
             swap_free_kb=1024,
+            swap_total_kb=1_000_000,
             mem_limit_mb=2048,
+        )
+        self.assertFalse(plan.low_memory)
+        self.assertGreater(plan.safe_local_budget_chars, 0)
+
+    def test_exhausted_swap_with_thin_ram_headroom_triggers_low_memory(self):
+        # Swap actually configured and nearly exhausted, combined with RAM
+        # headroom barely above the required footprint, is real pressure.
+        mem_limit_mb = 2048
+        inference_headroom_mb = 512
+        required_kb = mem_limit_mb * 1024 + inference_headroom_mb * 1024
+        plan = compute_budget(
+            model_context_tokens=8192,
+            reserved_output_tokens=700,
+            mem_available_kb=required_kb + 100_000,  # thin surplus over the required footprint
+            swap_free_kb=1024,
+            swap_total_kb=1_000_000,
+            mem_limit_mb=mem_limit_mb,
+            inference_headroom_mb=inference_headroom_mb,
         )
         self.assertTrue(plan.low_memory)
         self.assertEqual(plan.safe_local_budget_chars, 0)
@@ -105,6 +140,23 @@ class ReadSwapFreeTests(unittest.TestCase):
 
     def test_missing_file_returns_none(self):
         self.assertIsNone(read_swap_free_kb("/nonexistent/meminfo"))
+
+
+class ReadSwapTotalTests(unittest.TestCase):
+    def test_reads_kb_value_from_meminfo_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "meminfo"
+            path.write_text("MemAvailable:    4096 kB\nSwapTotal:  1000000 kB\nSwapFree:  250000 kB\n")
+            self.assertEqual(read_swap_total_kb(str(path)), 1000000)
+
+    def test_no_swap_configured_reads_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "meminfo"
+            path.write_text("MemAvailable:    4096 kB\nSwapTotal:       0 kB\nSwapFree:        0 kB\n")
+            self.assertEqual(read_swap_total_kb(str(path)), 0)
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(read_swap_total_kb("/nonexistent/meminfo"))
 
 
 class TruncateTextTests(unittest.TestCase):

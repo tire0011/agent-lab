@@ -33,6 +33,7 @@ from modules.prompt_budget import (
     dedupe_nested_results,
     read_mem_available_kb,
     read_swap_free_kb,
+    read_swap_total_kb,
     truncate_text,
 )
 from modules.redaction import redact_secrets
@@ -272,6 +273,7 @@ class NexusTaskOrchestrator:
             budget_plan = compute_budget(
                 mem_available_kb=read_mem_available_kb(),
                 swap_free_kb=read_swap_free_kb(),
+                swap_total_kb=read_swap_total_kb(),
             )
             history = self.task_store.history(
                 session.id,

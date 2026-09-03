@@ -52,9 +52,20 @@ def read_swap_free_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
 
     Low/absent swap is an additional low-memory signal: a host relying on
     swap to absorb an inference spike is already close to OOM pressure even
-    if ``MemAvailable`` alone looks tolerable.
+    if ``MemAvailable`` alone looks tolerable. Meaningful only when swap is
+    actually configured; see ``read_swap_total_kb``.
     """
     return _read_meminfo_field(meminfo_path, "SwapFree")
+
+
+def read_swap_total_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
+    """Best-effort read of ``SwapTotal`` (kB) from ``/proc/meminfo``.
+
+    A host without swap configured always reports ``SwapFree: 0``, which is
+    not itself a low-memory signal; callers must check ``SwapTotal > 0``
+    before treating a low ``SwapFree`` reading as pressure.
+    """
+    return _read_meminfo_field(meminfo_path, "SwapTotal")
 
 
 def _read_meminfo_field(meminfo_path: str, field: str) -> int | None:
@@ -81,6 +92,7 @@ class PromptBudgetPlan:
     mem_available_kb: int | None
     mem_limit_kb: int
     swap_free_kb: int | None
+    swap_total_kb: int | None
     inference_headroom_kb: int
     context_budget_chars: int
     memory_budget_chars: int | None
@@ -100,6 +112,7 @@ class PromptBudgetPlan:
             "mem_available_kb": self.mem_available_kb,
             "mem_limit_kb": self.mem_limit_kb,
             "swap_free_kb": self.swap_free_kb,
+            "swap_total_kb": self.swap_total_kb,
             "inference_headroom_kb": self.inference_headroom_kb,
             "context_budget_chars": self.context_budget_chars,
             "memory_budget_chars": self.memory_budget_chars,
@@ -115,6 +128,7 @@ def compute_budget(
     reserved_output_tokens: int = 700,
     mem_available_kb: int | None = None,
     swap_free_kb: int | None = None,
+    swap_total_kb: int | None = None,
     mem_limit_mb: int | None = None,
     inference_headroom_mb: int | None = None,
     kb_per_input_token: int | None = None,
@@ -160,12 +174,20 @@ def compute_budget(
         else:
             memory_tokens_available = surplus_kb // kb_per_input_token
             memory_budget_chars = int(memory_tokens_available) * chars_per_token
-        if swap_free_kb is not None and swap_free_kb < inference_headroom_kb:
-            # Near-exhausted swap is itself a low-memory signal even when
-            # MemAvailable looks tolerable: an inference spike would have no
-            # cushion left to be absorbed by the kernel.
+        # A host with no swap configured at all always reports
+        # ``SwapFree: 0``, which is not a low-memory signal by itself.
+        # Only treat exhausted swap as pressure when swap actually exists
+        # (``swap_total_kb > 0``) *and* RAM headroom is already thin, since
+        # a host with abundant MemAvailable doesn't need swap as a cushion.
+        swap_configured = swap_total_kb is not None and swap_total_kb > 0
+        ram_pressure = surplus_kb < inference_headroom_kb
+        if swap_configured and swap_free_kb is not None and swap_free_kb < inference_headroom_kb and ram_pressure:
+            # Near-exhausted swap alongside thin RAM headroom means an
+            # inference spike would have no cushion left to be absorbed by
+            # the kernel.
             low_memory = True
             memory_budget_chars = 0
+
 
     if memory_budget_chars is None:
         effective_budget_chars = context_budget_chars
@@ -195,6 +217,7 @@ def compute_budget(
         mem_available_kb=mem_available_kb,
         mem_limit_kb=mem_limit_kb,
         swap_free_kb=swap_free_kb,
+        swap_total_kb=swap_total_kb,
         inference_headroom_kb=inference_headroom_kb,
         context_budget_chars=context_budget_chars,
         memory_budget_chars=memory_budget_chars,
