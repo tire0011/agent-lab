@@ -139,10 +139,12 @@ _TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = {
     "schema": {
         "type": "object",
         "properties": {
-            "status": {"type": "string", "enum": ["found", "not_found", "unavailable"]},
+            "status": {"type": "string", "enum": ["found", "invalid_goal", "not_found", "unavailable"]},
             "operation": {"type": "string"},
             "reason": {"type": "string"},
             "related_tools": {"type": "array", "items": {"type": "string"}},
+            "error": {"type": "string"},
+            "guidance": {"type": "string"},
         },
         "required": ["status", "reason"],
         "additionalProperties": False,
@@ -759,6 +761,42 @@ class NexusTaskOrchestrator:
             }
         return None
 
+    @staticmethod
+    def _invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(goal or "").lower()).strip()
+        if not normalized:
+            return True, "The goal is empty or whitespace only.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+
+        placeholder_values = {
+            "plain language capability needed",
+            "plain-language capability needed",
+            "capability needed",
+            "example goal",
+            "placeholder goal",
+            "generic capability needed",
+            "replace with concrete capability",
+            "insert goal here",
+            "describe the operation you need",
+            "tool goal",
+        }
+        if normalized in placeholder_values:
+            return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+
+        if "plain language" in normalized or "plain-language" in normalized:
+            if "capability needed" in normalized or "goal" in normalized:
+                return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+        if "placeholder" in normalized or "example" in normalized:
+            if "goal" in normalized or "capability" in normalized or "request" in normalized:
+                return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+        if "capability needed" in normalized and ("plain" in normalized or "placeholder" in normalized or "example" in normalized):
+            return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+
+        generic_tokens = {"capability", "goal", "operation", "request", "tool", "task", "need", "needs"}
+        tokens = normalized.split()
+        if len(tokens) <= 2 and set(tokens) <= generic_tokens:
+            return True, "The goal is too generic to describe a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+        return False, None, None
+
     def _resolver_prompt(self, goal: str, candidates: list[Any]) -> str:
         candidate_summaries = [
             {
@@ -784,8 +822,10 @@ CANDIDATE READ-ONLY OPERATIONS:
 
 Rules:
 - Choose status "found" only when one candidate directly satisfies the goal.
+- Choose status "invalid_goal" when the goal is empty, generic, or clearly a placeholder/example rather than a concrete capability request.
 - Choose status "not_found" when none is suitable.
 - If found, set operation to the exact candidate operation name.
+- If invalid_goal, leave operation empty, set error and guidance, and do not treat it as a missing capability.
 - If not_found, leave operation empty and list at most three related candidate names.
 """
 
@@ -801,6 +841,12 @@ Rules:
             return _TOOL_ACCURACY_UNKNOWN
         if not expected_operation and not expected_status:
             return _TOOL_ACCURACY_UNKNOWN
+        if expected_status == "invalid_goal":
+            return (
+                _TOOL_ACCURACY_CORRECT
+                if status == "invalid_goal"
+                else _TOOL_ACCURACY_INCORRECT
+            )
         if expected_status == "not_found":
             return (
                 _TOOL_ACCURACY_CORRECT
@@ -827,8 +873,6 @@ Rules:
     ) -> dict[str, Any]:
         del budget_plan  # resolver must recompute current memory before its own inference
         clean_goal = goal.strip()[:1000]
-        if not clean_goal:
-            raise TaskOrchestratorError("find_tool requires goal")
         started = time.perf_counter()
         legacy_catalog_schema_chars = len(
             json.dumps(
@@ -836,6 +880,36 @@ Rules:
                 separators=(",", ":"),
             )
         )
+        invalid_goal, error, guidance = self._invalid_find_tool_goal(clean_goal)
+        if invalid_goal:
+            return {
+                "tool": TOOL_FIND_TOOL,
+                "status": "invalid_goal",
+                "goal": clean_goal,
+                "error": error,
+                "guidance": guidance,
+                "reason": error or "The goal is not a concrete capability request.",
+                "related_tools": [],
+                "metrics": {
+                    "candidate_count": 0,
+                    "candidate_operations": [],
+                    "main_selected_schema_chars": 0,
+                    "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
+                    "resolver_input_chars": 0,
+                    "resolver_output_chars": 0,
+                    "resolver_llm_calls": 0,
+                    "selected_operation": None,
+                    "expected_operation": expected_operation,
+                    "expected_status": expected_status,
+                    "selection_correctness": self._selection_correctness(
+                        status="invalid_goal",
+                        selected_operation=None,
+                        expected_operation=expected_operation,
+                        expected_status=expected_status,
+                    ),
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                },
+            }
         candidates = self._candidate_operations(clean_goal)
         if not candidates:
             return {
@@ -971,17 +1045,27 @@ Rules:
             str(item) for item in related
             if str(item) in candidate_by_name
         ][:3]
-        final_status = "not_found" if status == "not_found" and not resolver_unavailable else "unavailable"
-        final_reason = (
-            reason
-            if final_status == "not_found" or resolver_unavailable
-            else f"Resolver selected unavailable operation {operation!r}."
-        )
+        if status == "invalid_goal":
+            final_status = "invalid_goal"
+            final_reason = parsed.get("error") or reason or "The goal is not a concrete capability request."
+            final_guidance = parsed.get("guidance") or "Describe the operation you need, e.g. 'run a shell command in the repository'."
+            final_error = parsed.get("error") or final_reason
+        else:
+            final_status = "not_found" if status == "not_found" and not resolver_unavailable else "unavailable"
+            final_reason = (
+                reason
+                if final_status == "not_found" or resolver_unavailable
+                else f"Resolver selected unavailable operation {operation!r}."
+            )
+            final_guidance = "Describe the operation you need, e.g. 'run a shell command in the repository'."
+            final_error = None
         return {
             "tool": TOOL_FIND_TOOL,
             "status": final_status,
             "goal": clean_goal,
             "reason": final_reason,
+            "error": final_error,
+            "guidance": final_guidance,
             "related_tools": related_tools,
             "metrics": {
                 "candidate_count": len(candidates),
@@ -1017,10 +1101,10 @@ Rules:
                 "name": TOOL_FIND_TOOL,
                 "description": (
                     "Resolve one needed read-only Nexus operation by goal. Returns either "
-                    "one full operation schema or structured not_found; it never "
-                    "implements missing tools."
+                    "one full operation schema, invalid_goal for placeholder/generic requests, "
+                    "or structured not_found; it never implements missing tools."
                 ),
-                "arguments": {"goal": "plain-language capability needed"},
+                "arguments": {"goal": "concrete capability needed for the current task"},
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
             },
             {
@@ -1144,7 +1228,7 @@ OBSERVATIONS FROM TOOLS USED IN THIS RUN:
 
 Choose exactly one next step using ONE unambiguous `action` field.
 Tool discovery/execution:
-{{"action":"find_tool","goal":"plain-language capability needed","reason":"..."}}
+{{"action":"find_tool","goal":"run a shell command in the repository","reason":"I need to inspect the repository state"}}
 {{"action":"call_tool","tool":"<tool returned by find_tool>","arguments":{{...}},"reason":"..."}}
 Controller-native capabilities:
 {{"action":"memory_search","query":"...","limit":6,"reason":"..."}}
@@ -1155,6 +1239,7 @@ Final action:
 {{"action":"new_experiment|resume_experiment|answer|missing_capability|clarification","experiment_id":null,"message":"...","reason":"..."}}
 
 Model policy:
+- `goal` for `find_tool` must describe the concrete capability needed for the current task; it must not be a generic placeholder or copied verbatim from an example.
 - LOCAL is a real development path, not merely a fallback. For small/simple changes, inspect the repository and implement with the command tool directly when practical.
 - Prefer LOCAL for simple analysis, small fixes, inexpensive work, and whenever external providers are unavailable or quota/token limited.
 - Prefer `azure_openai` for research, difficult reasoning and medium programming work. Azure returns specialist guidance; Nexus keeps control and can apply the resulting implementation with local command tools.
