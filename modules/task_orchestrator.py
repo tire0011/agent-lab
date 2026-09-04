@@ -73,6 +73,15 @@ _FINAL_ACTIONS = {
     ACTION_MISSING_CAPABILITY,
 }
 
+_ORCHESTRATOR_TOOLS = {
+    TOOL_FIND_TOOL,
+    "operation",
+    "memory_search",
+    "delegate",
+    ACTION_COMMAND,
+    TOOL_PYTHON_RUN,
+}
+
 logger = logging.getLogger(__name__)
 
 _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
@@ -388,14 +397,14 @@ class NexusTaskOrchestrator:
                         "controller returned invalid JSON and its single correction "
                         f"retry also failed: {correction_error}"
                     ) from correction_error
-            # Small local models occasionally emit the command capability with
-            # the final-action envelope (``action: command``) even though the
-            # prompt explicitly defines commands as tools. Treat that shape as
-            # the command tool instead of failing the whole persistent task.
-            if decision.get("type") != "tool" and str(decision.get("action", "")).strip().lower() == ACTION_COMMAND:
+            # Small local models occasionally emit a tool with the final-action
+            # envelope even though the prompt explicitly defines it as a tool.
+            # Normalize that shape before final-action validation.
+            malformed_tool = str(decision.get("action", "")).strip().lower()
+            if decision.get("type") != "tool" and malformed_tool in _ORCHESTRATOR_TOOLS:
                 decision = dict(decision)
                 decision["type"] = "tool"
-                decision["tool"] = ACTION_COMMAND
+                decision["tool"] = malformed_tool
             if decision.get("type") == "tool":
                 decision = self._normalize_tool_decision(decision)
                 if task_logger is not None:
