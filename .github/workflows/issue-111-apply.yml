@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-test.txt
       - name: Apply migration
-        run: python scripts/apply_issue_111.py
+        run: python scripts/run_issue_111_migration.py
       - name: Run focused controller tests
         env:
           AGENT_API_KEY: test-key
@@ -31,7 +31,7 @@ jobs:
         run: python -m unittest tests.test_issue_111_controller_protocol tests.test_task_orchestrator_command_tool tests.test_task_orchestrator -q
       - name: Commit verified migration
         run: |
-          rm scripts/apply_issue_111.py .github/workflows/issue-111-apply.yml
+          rm -f scripts/apply_issue_111.py scripts/run_issue_111_migration.py .github/workflows/issue-111-apply.yml .issue111-trigger
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
