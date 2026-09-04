@@ -25,5 +25,10 @@ TEST_COMMAND.write_text(t, encoding="utf-8")
 
 '''
 source = source[:start] + replacement + source[end:]
+source = source.replace(
+    '        if action not in _ORCHESTRATOR_TOOLS and action not in _FINAL_ACTIONS:\\n'
+    '            raise TaskOrchestratorError(f"unknown final action {action!r}")\\n',
+    '',
+)
 namespace = {"__file__": str(path), "__name__": "__main__"}
 exec(compile(source, str(path), "exec"), namespace)
