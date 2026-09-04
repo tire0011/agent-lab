@@ -1037,18 +1037,30 @@ async def get_unified_logs(
         and not job_id and not session_id
     )
     if include_journal and is_default_page:
-        journal_before: str | None = None
-        if cursor:
-            decoded_cursor = central_logging_module.decode_log_cursor(cursor)
-            # Reuses the cursor's own timestamp component as the journal
-            # page boundary; an unrecognized/legacy cursor simply omits
-            # `--until` (falls back to each service's newest window)
-            # rather than risking an incorrectly-scoped, possibly
-            # duplicate-producing query.
-            journal_before = decoded_cursor[0] if decoded_cursor else None
+        decoded_cursor = central_logging_module.decode_log_cursor(cursor) if cursor else None
+        journal_before: str | None = decoded_cursor[0] if decoded_cursor else None
+        # Reuses the cursor's own timestamp component as the journal
+        # page boundary; an unrecognized/legacy cursor simply omits
+        # `--until` (falls back to each service's newest window)
+        # rather than risking an incorrectly-scoped, possibly
+        # duplicate-producing query.
         journal_entries, errors = await log_reader.read_all_journal_entries(
             lines=_UNIFIED_LOGS_JOURNAL_LINES, before=journal_before,
         )
+        if decoded_cursor is not None:
+            # `journalctl --until` only has second precision and is
+            # inclusive, so it can legitimately return an entry again
+            # that was already on the previous page (e.g. two journal
+            # lines within the same second straddling the cursor
+            # boundary). Re-apply the exact same strict, sub-second
+            # cursor comparison the structured feed already uses
+            # (`_entry_sort_key(e) < cursor_key` in
+            # ``central_logging.read_log_entries``) so correctness never
+            # depends on journalctl's coarser boundary semantics.
+            journal_entries = [
+                e for e in journal_entries
+                if central_logging_module.entry_sort_key(e) < decoded_cursor
+            ]
         if level:
             journal_entries = [e for e in journal_entries if e.get("level") == level.upper()]
         if phase:

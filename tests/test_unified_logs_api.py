@@ -443,6 +443,61 @@ class UnifiedLogsApiTests(unittest.TestCase):
         _, kwargs = self.log_reader.read_all_journal_entries.await_args
         self.assertIsNotNone(kwargs.get("before"))
 
+    def test_journal_entries_are_not_duplicated_across_pages_at_second_boundary(self):
+        # `journalctl --until` only has second precision and is
+        # inclusive, so a naive re-query at the page boundary can return
+        # the exact same journal line(s) again - most sharply when two
+        # journal records fall within the *same* whole second as the
+        # cursor. Simulate that real-world overlap by having the (mocked)
+        # LogReader return the identical 3-entry batch on every call,
+        # regardless of the `before` it was given, and assert the API
+        # layer's own strict cursor comparison still de-duplicates.
+        journal_batch = [
+            {
+                "timestamp": "2026-01-01T00:00:00.100Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "oldest", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 2,
+            },
+            {
+                "timestamp": "2026-01-01T00:00:00.500Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "same-second A", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 1,
+            },
+            {
+                "timestamp": "2026-01-01T00:00:00.900Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "same-second B (newest)", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 0,
+            },
+        ]
+        self.log_reader.read_all_journal_entries = AsyncMock(
+            return_value=(list(journal_batch), {})
+        )
+
+        first = self.client.get("/logs?limit=1", headers={"x-api-key": "test-key"}).json()
+        self.assertEqual([e["message"] for e in first["entries"]], ["same-second B (newest)"])
+        self.assertIsNotNone(first["next_cursor"])
+
+        second = self.client.get(
+            f"/logs?limit=1&cursor={first['next_cursor']}", headers={"x-api-key": "test-key"}
+        ).json()
+        self.assertEqual([e["message"] for e in second["entries"]], ["same-second A"])
+        self.assertIsNotNone(second["next_cursor"])
+
+        third = self.client.get(
+            f"/logs?limit=1&cursor={second['next_cursor']}", headers={"x-api-key": "test-key"}
+        ).json()
+        self.assertEqual([e["message"] for e in third["entries"]], ["oldest"])
+
+        all_messages = (
+            [e["message"] for e in first["entries"]]
+            + [e["message"] for e in second["entries"]]
+            + [e["message"] for e in third["entries"]]
+        )
+        self.assertEqual(len(all_messages), len(set(all_messages)))
+
 
 if __name__ == "__main__":
     unittest.main()
