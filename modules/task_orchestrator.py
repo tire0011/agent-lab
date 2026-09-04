@@ -53,6 +53,7 @@ ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_RESUME_EXPERIMENT = "resume_experiment"
 ACTION_COMMAND = "command"
 TOOL_FIND_TOOL = "find_tool"
+ACTION_CALL_TOOL = "call_tool"
 TOOL_PYTHON_RUN = "python_run"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
@@ -75,7 +76,7 @@ _FINAL_ACTIONS = {
 
 _ORCHESTRATOR_TOOLS = {
     TOOL_FIND_TOOL,
-    "operation",
+    ACTION_CALL_TOOL,
     "memory_search",
     "delegate",
     ACTION_COMMAND,
@@ -95,11 +96,25 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
     "schema": {
         "type": "object",
         "properties": {
-            "type": {"type": "string", "enum": ["tool", "action"]},
-            "tool": {"type": "string"},
+            "action": {
+                "type": "string",
+                "enum": [
+                    TOOL_FIND_TOOL,
+                    ACTION_CALL_TOOL,
+                    "memory_search",
+                    "delegate",
+                    ACTION_COMMAND,
+                    TOOL_PYTHON_RUN,
+                    ACTION_NEW_EXPERIMENT,
+                    ACTION_RESUME_EXPERIMENT,
+                    ACTION_ANSWER,
+                    ACTION_MISSING_CAPABILITY,
+                    ACTION_CLARIFICATION,
+                ],
+            },
             "goal": {"type": "string"},
-            "operation": {"type": "string"},
-            "args": {"type": "object", "additionalProperties": True},
+            "tool": {"type": "string"},
+            "arguments": {"type": "object", "additionalProperties": True},
             "query": {"type": "string"},
             "limit": {"type": "integer"},
             "provider": {"type": "string"},
@@ -110,12 +125,11 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
             "module": {"type": "string"},
             "argv": {"type": "array", "items": {"type": "string"}},
             "cwd": {"type": "string"},
-            "action": {"type": "string"},
             "experiment_id": {"type": ["string", "null"]},
             "message": {"type": "string"},
             "reason": {"type": "string"},
         },
-        "required": ["type"],
+        "required": ["action"],
         "additionalProperties": False,
     },
 }
@@ -397,29 +411,22 @@ class NexusTaskOrchestrator:
                         "controller returned invalid JSON and its single correction "
                         f"retry also failed: {correction_error}"
                     ) from correction_error
-            # Small local models occasionally emit a tool with the final-action
-            # envelope even though the prompt explicitly defines it as a tool.
-            # Normalize that shape before final-action validation.
-            malformed_tool = str(decision.get("action", "")).strip().lower()
-            if decision.get("type") != "tool" and malformed_tool in _ORCHESTRATOR_TOOLS:
-                decision = dict(decision)
-                decision["type"] = "tool"
-                decision["tool"] = malformed_tool
-            if decision.get("type") == "tool":
-                decision = self._normalize_tool_decision(decision)
+            action = str(decision.get("action", "")).strip().lower()
+            if action in _ORCHESTRATOR_TOOLS:
+                execution_decision = self._action_to_tool_decision(decision)
                 if task_logger is not None:
                     task_logger.info(
                         "orchestration",
                         "tool_selected",
                         (
-                            "orchestrator selected intermediate tool "
-                            f"{decision.get('tool', '')}: {decision.get('reason', '')}"
+                            "orchestrator selected intermediate action "
+                            f"{action}: {decision.get('reason', '')}"
                         ),
-                        tool=str(decision.get("tool", "")),
+                        tool=action,
                         reason=str(decision.get("reason", "")),
                         session_id=session.id,
                     )
-                tool, arguments = self._tool_identity(decision)
+                tool, arguments = self._tool_identity(execution_decision)
                 check = self.loop_guard.check(
                     session.id,
                     tool,
@@ -460,7 +467,6 @@ class NexusTaskOrchestrator:
                             task_logger,
                         )
                 else:
-                    execution_decision = dict(decision)
                     execution_decision["session_id"] = session.id
                     observation = await self._execute_tool(
                         execution_decision,
@@ -468,9 +474,6 @@ class NexusTaskOrchestrator:
                         task_logger=task_logger,
                     )
                     self.loop_guard.record_result(check.call_id, observation)
-                # Persist the full raw observation so the durable event_id can
-                # later retrieve the complete tool result; only the
-                # prompt-facing view (compact_observations) is truncated.
                 event_id = self.task_store.append_event(
                     session.id,
                     role="tool",
@@ -483,7 +486,6 @@ class NexusTaskOrchestrator:
                 observations.append(observation)
                 continue
 
-            action = str(decision.get("action", "")).strip().lower()
             if action not in _FINAL_ACTIONS:
                 raise TaskOrchestratorError(f"unknown final action {action!r}")
 
@@ -935,6 +937,8 @@ Rules:
                 "tool": TOOL_FIND_TOOL,
                 "status": "found",
                 "goal": clean_goal,
+                "resolved_tool": operation,
+                "arguments_schema": selected.get("arguments", []),
                 "operation": selected,
                 "reason": reason,
                 "metrics": {
@@ -1020,14 +1024,14 @@ Rules:
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
             },
             {
-                "name": "operation",
+                "name": ACTION_CALL_TOOL,
                 "description": (
-                    "Execute one read-only Nexus operation only after find_tool has "
-                    "returned that operation's schema in this session."
+                    "Invoke exactly one concrete read-only Nexus operation only after "
+                    "find_tool returned its schema in this persistent session."
                 ),
                 "arguments": {
-                    "operation": "operation name from the latest find_tool result",
-                    "args": "object matching that schema",
+                    "tool": "tool identifier returned by find_tool",
+                    "arguments": "object matching the returned argument schema",
                 },
             },
             {
@@ -1138,16 +1142,17 @@ AVAILABLE CAPABILITIES:
 OBSERVATIONS FROM TOOLS USED IN THIS RUN:
 {json.dumps(observations, separators=(',', ':'))}
 
-Choose exactly one next step.
-Tool calls:
-{{"type":"tool","tool":"find_tool","goal":"plain-language capability needed","reason":"..."}}
-{{"type":"tool","tool":"operation","operation":"<operation returned by find_tool>","args":{{...}},"reason":"..."}}
-{{"type":"tool","tool":"memory_search","query":"...","limit":6,"reason":"..."}}
-{{"type":"tool","tool":"delegate","provider":"local_worker|codex_readonly|azure_openai","task":"bounded sub-problem","context":"optional","reason":"..."}}
-{{"type":"tool","tool":"command","command":"<shell command>","reason":"..."}}
-{{"type":"tool","tool":"python_run","script":"<repo-relative .py>","argv":["--version"],"reason":"..."}}
+Choose exactly one next step using ONE unambiguous `action` field.
+Tool discovery/execution:
+{{"action":"find_tool","goal":"plain-language capability needed","reason":"..."}}
+{{"action":"call_tool","tool":"<tool returned by find_tool>","arguments":{{...}},"reason":"..."}}
+Controller-native capabilities:
+{{"action":"memory_search","query":"...","limit":6,"reason":"..."}}
+{{"action":"delegate","provider":"local_worker|codex_readonly|azure_openai","task":"bounded sub-problem","context":"optional","reason":"..."}}
+{{"action":"command","command":"<shell command>","reason":"..."}}
+{{"action":"python_run","script":"<repo-relative .py>","argv":["--version"],"reason":"..."}}
 Final action:
-{{"type":"action","action":"new_experiment|resume_experiment|answer|missing_capability|clarification","experiment_id":null,"message":"...","reason":"..."}}
+{{"action":"new_experiment|resume_experiment|answer|missing_capability|clarification","experiment_id":null,"message":"...","reason":"..."}}
 
 Model policy:
 - LOCAL is a real development path, not merely a fallback. For small/simple changes, inspect the repository and implement with the command tool directly when practical.
@@ -1160,7 +1165,7 @@ Model policy:
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
-- Use find_tool when you need an OperationsRegistry capability that has not already been resolved in this session; do not guess operation names.
+- Use find_tool when you need an OperationsRegistry capability that has not already been resolved in this session; then invoke only the returned identifier with call_tool. Never guess concrete tool names.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
@@ -1175,15 +1180,22 @@ Rules:
 - Return JSON only.
 """
 
-    def _normalize_tool_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
-        tool = str(decision.get("tool", "")).strip()
-        available_operations = {spec.name for spec in self._read_only_operation_specs()}
-        if tool in available_operations:
-            normalized = dict(decision)
+    def _action_to_tool_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        """Translate the action-only controller protocol to internal tool dispatch.
+
+        The outer LLM never needs the legacy type/tool/operation envelope. Native
+        controller capabilities remain internal actions; OperationsRegistry calls
+        always use find_tool -> call_tool.
+        """
+        action = str(decision.get("action", "")).strip().lower()
+        normalized = dict(decision)
+        if action == ACTION_CALL_TOOL:
             normalized["tool"] = "operation"
-            normalized["operation"] = tool
+            normalized["operation"] = str(decision.get("tool", "")).strip()
+            normalized["args"] = decision.get("arguments") or {}
             return normalized
-        return decision
+        normalized["tool"] = action
+        return normalized
 
     def _tool_identity(self, decision: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         tool = str(decision.get("tool", "")).strip()
@@ -1324,13 +1336,47 @@ Rules:
             raise TaskOrchestratorError(str(exc)) from exc
         if not isinstance(data, dict):
             raise TaskOrchestratorError("orchestrator response must be a JSON object")
+
+        # Temporary read compatibility for persisted tests/sessions created before
+        # issue #111. The controller schema and prompt no longer expose this shape.
         response_type = str(data.get("type", "")).strip().lower()
-        if response_type == "tool" and not str(data.get("tool", "")).strip():
-            raise TaskOrchestratorError("tool response requires tool")
-        if response_type == "action" and not str(data.get("action", "")).strip():
-            raise TaskOrchestratorError("action response requires action")
-        if response_type not in {"tool", "action"}:
+        if response_type in {"tool", "action"}:
+            legacy = dict(data)
+            legacy.pop("type", None)
+            if response_type == "tool":
+                legacy_tool = str(data.get("tool", "")).strip()
+                if not legacy_tool:
+                    raise TaskOrchestratorError("tool response requires tool")
+                if legacy_tool == "operation":
+                    legacy["action"] = ACTION_CALL_TOOL
+                    legacy["tool"] = str(data.get("operation", "")).strip()
+                    legacy["arguments"] = data.get("args") or {}
+                    legacy.pop("operation", None)
+                    legacy.pop("args", None)
+                elif legacy_tool in _ORCHESTRATOR_TOOLS:
+                    legacy["action"] = legacy_tool
+                else:
+                    legacy["action"] = ACTION_CALL_TOOL
+                    legacy["tool"] = legacy_tool
+                    legacy["arguments"] = data.get("args") or {}
+                    legacy.pop("args", None)
+            data = legacy
+        elif response_type:
             raise TaskOrchestratorError(f"unknown response type {response_type!r}")
+
+        action = str(data.get("action", "")).strip().lower()
+        if not action:
+            raise TaskOrchestratorError("action response requires action")
+        if action == TOOL_FIND_TOOL and not str(data.get("goal", "")).strip():
+            raise TaskOrchestratorError("find_tool requires goal")
+        if action == ACTION_CALL_TOOL:
+            if not str(data.get("tool", "")).strip():
+                raise TaskOrchestratorError("call_tool requires tool")
+            if "arguments" not in data:
+                raise TaskOrchestratorError("call_tool requires arguments")
+            if not isinstance(data.get("arguments"), dict):
+                raise TaskOrchestratorError("call_tool arguments must be an object")
+        data["action"] = action
         return data
 
     async def _execute_tool(

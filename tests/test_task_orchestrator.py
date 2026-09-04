@@ -232,7 +232,8 @@ class TaskOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertIn('"name":"find_tool"', client.prompts[0])
-        self.assertIn('"tool":"find_tool"', client.prompts[0])
+        self.assertIn('"action":"find_tool"', client.prompts[0])
+        self.assertNotIn('"type":"tool"', client.prompts[0])
         self.assertNotIn('"operations":[', client.prompts[0])
         self.assertNotIn('"operation":"experiment_show"', client.prompts[0])
 
