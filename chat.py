@@ -16,7 +16,10 @@ from __future__ import annotations
 
 from data_sources import list_ideas, list_problems
 
-API_VERSION = "0.2.0"
+from nexus_version import VERSION
+
+
+API_VERSION = VERSION
 COMPONENTS = ["health", "status", "problems", "ideas", "chat"]
 
 

@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 import data_sources
 import api
+from nexus_version import VERSION
 from api import (
     get_codex_service,
     get_experiment_adoption_service,
@@ -102,7 +103,7 @@ class HealthEndpointTests(ApiTestsBase):
     def test_health_returns_ok(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok"})
+        self.assertEqual(response.json(), {"status": "ok", "version": VERSION})
 
 
 class MailboxGithubWebhookTests(ApiTestsBase):
