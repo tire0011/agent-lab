@@ -170,14 +170,12 @@
       <section id="tab-logs" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-logs" hidden>
         <section class="card">
           <div class="card-heading">
-            <h2>Diagnose-Filter</h2>
+            <h2>Nexus-Log-Timeline</h2>
             <button id="logs-refresh-button" class="secondary" type="button">Aktualisieren</button>
           </div>
           <div class="logs-filters">
-            <label for="logs-experiment-select">Experiment</label>
-            <select id="logs-experiment-select">
-              <option value="">Alle Experimente</option>
-            </select>
+            <label for="logs-search-input">Suche</label>
+            <input id="logs-search-input" type="text" placeholder="Freitext in Nachricht/Ereignis">
             <label for="logs-level-select">Level</label>
             <select id="logs-level-select">
               <option value="">Alle Level</option>
@@ -185,6 +183,17 @@
               <option value="INFO">INFO</option>
               <option value="WARNING">WARNING</option>
               <option value="ERROR">ERROR</option>
+            </select>
+            <label for="logs-source-select">Quelle</label>
+            <select id="logs-source-select">
+              <option value="">Alle Quellen</option>
+              <option value="mailbox">mailbox</option>
+              <option value="controller">controller</option>
+              <option value="experiment">experiment</option>
+              <option value="chat">chat</option>
+              <option value="agent-api">agent-api</option>
+              <option value="nexus-mailbox">nexus-mailbox</option>
+              <option value="llama-server">llama-server</option>
             </select>
             <label for="logs-phase-select">Phase</label>
             <select id="logs-phase-select">
@@ -200,6 +209,8 @@
               <option value="cleanup">cleanup</option>
               <option value="pipeline">pipeline</option>
             </select>
+            <label for="logs-experiment-input">Experiment-ID</label>
+            <input id="logs-experiment-input" type="text" placeholder="optional">
             <label for="logs-mailbox-task-input">Mailbox-Task-ID</label>
             <input id="logs-mailbox-task-input" type="text" placeholder="z. B. 7ce03cf1…">
             <label for="logs-job-input">Chat-Job-ID</label>
@@ -212,6 +223,7 @@
             <span>Sichtbar: <strong id="logs-visible-count">0</strong></span>
             <span>Zuletzt erfolgreich aktualisiert: <time id="logs-last-successful-refresh">Noch nicht</time></span>
           </div>
+          <div id="logs-source-errors" class="list-state" aria-live="polite" hidden></div>
         </section>
 
         <section class="card">
@@ -221,25 +233,6 @@
           </div>
           <div id="logs-content" class="list-state" aria-live="polite">Wird geladen …</div>
           <button id="logs-load-older-button" class="secondary" type="button" hidden>Ältere laden</button>
-        </section>
-
-        <section class="card">
-          <div class="card-heading">
-            <h2>System-Logs (journalctl)</h2>
-            <button id="logs-journalctl-refresh-button" class="secondary" type="button">Aktualisieren</button>
-          </div>
-          <div class="logs-filters">
-            <label for="logs-journalctl-service-select">Service</label>
-            <select id="logs-journalctl-service-select">
-              <option value="">Alle Services</option>
-              <option value="agent-api">agent-api</option>
-              <option value="nexus-mailbox">nexus-mailbox</option>
-              <option value="llama-server">llama-server</option>
-            </select>
-            <label for="logs-journalctl-lines-input">Zeilen je Service</label>
-            <input id="logs-journalctl-lines-input" type="number" min="1" max="500" value="100" inputmode="numeric">
-          </div>
-          <div id="logs-journalctl-content" class="list-state" aria-live="polite">Erfordert einen API-Schlüssel.</div>
         </section>
       </section>
 

@@ -1,15 +1,21 @@
 "use strict";
 
 // ---------------------------------------------------------------------------
-// Logs
+// Logs - one complete, chronological Nexus log timeline (GET /logs), merging
+// structured JSONL entries (mailbox, controller, experiment, chat, system)
+// with the agent-api/nexus-mailbox/llama-server systemd journals. There is
+// no experiment selector: the default view already shows everything, with
+// experiment/mailbox-task/job/session ids kept only as optional filters.
 // ---------------------------------------------------------------------------
 
 const logsElements = {
   refreshButton: document.querySelector("#logs-refresh-button"),
   loadOlderButton: document.querySelector("#logs-load-older-button"),
-  experimentSelect: document.querySelector("#logs-experiment-select"),
+  searchInput: document.querySelector("#logs-search-input"),
   levelSelect: document.querySelector("#logs-level-select"),
+  sourceSelect: document.querySelector("#logs-source-select"),
   phaseSelect: document.querySelector("#logs-phase-select"),
+  experimentInput: document.querySelector("#logs-experiment-input"),
   mailboxTaskInput: document.querySelector("#logs-mailbox-task-input"),
   jobInput: document.querySelector("#logs-job-input"),
   sessionInput: document.querySelector("#logs-session-input"),
@@ -18,20 +24,7 @@ const logsElements = {
   visibleCount: document.querySelector("#logs-visible-count"),
   lastSuccessfulRefresh: document.querySelector("#logs-last-successful-refresh"),
   autoRefreshState: document.querySelector("#logs-auto-refresh-state"),
-};
-
-// Every systemd unit the Operations tab already knows how to manage
-// (see modules.service_operations._DEFAULT_NEXUS_SERVICES); "Alle
-// Services" tails each of these and merges the results, so the Logs
-// page can show every journalctl log without the operator picking one
-// service at a time.
-const JOURNALCTL_SERVICES = ["agent-api", "nexus-mailbox", "llama-server"];
-
-const journalctlElements = {
-  refreshButton: document.querySelector("#logs-journalctl-refresh-button"),
-  serviceSelect: document.querySelector("#logs-journalctl-service-select"),
-  linesInput: document.querySelector("#logs-journalctl-lines-input"),
-  content: document.querySelector("#logs-journalctl-content"),
+  sourceErrors: document.querySelector("#logs-source-errors"),
 };
 
 // Accumulated state for the currently displayed page(s): which URL to
@@ -62,33 +55,33 @@ function updateLogsSuccessStatus(renderedEntries) {
   }).format(refreshedAt);
 }
 
-async function loadLogsExperimentOptions() {
-  const previousValue = logsElements.experimentSelect.value;
-  try {
-    const data = await requestJson("/diagnostics/public?limit=50");
-    const experiments = data.experiments || [];
-    logsElements.experimentSelect.replaceChildren();
-    const allOption = document.createElement("option");
-    allOption.value = "";
-    allOption.textContent = "Alle Experimente";
-    logsElements.experimentSelect.append(allOption);
-    for (const exp of experiments) {
-      const option = document.createElement("option");
-      option.value = exp.id;
-      option.textContent = `${exp.phase} · ${exp.id.slice(0, 8)}`;
-      logsElements.experimentSelect.append(option);
-    }
-    if (experiments.some((exp) => exp.id === previousValue)) {
-      logsElements.experimentSelect.value = previousValue;
-    }
-  } catch {
-    // Leave the existing options in place; the log list itself will show the error.
+function renderLogSourceErrors(sourceErrors) {
+  if (!logsElements.sourceErrors) return;
+  const entries = sourceErrors ? Object.entries(sourceErrors) : [];
+  if (!entries.length) {
+    logsElements.sourceErrors.hidden = true;
+    logsElements.sourceErrors.replaceChildren();
+    return;
   }
+  logsElements.sourceErrors.hidden = false;
+  logsElements.sourceErrors.replaceChildren();
+  const summary = document.createElement("p");
+  summary.textContent = "Einzelne Quellen konnten nicht gelesen werden:";
+  logsElements.sourceErrors.append(summary);
+  const list = document.createElement("ul");
+  for (const [source, reason] of entries) {
+    const li = document.createElement("li");
+    li.textContent = `${source}: ${reason}`;
+    list.append(li);
+  }
+  logsElements.sourceErrors.append(list);
 }
 
-// One structured JSONL entry from GET /experiments/{id}/logs, rendered as
-// a collapsible card. Every value is written via textContent only.
-function renderExperimentLogEntries(entries) {
+// One merged log entry from GET /logs (structured JSONL or normalized
+// systemd journal line), rendered as a collapsible card in one common,
+// compact shape: time, level, source, message, with everything else as
+// expandable detail. Every value is written via textContent only.
+function renderLogEntries(entries) {
   logsElements.content.replaceChildren();
   if (!entries.length) {
     logsElements.content.textContent = "Keine Log-Einträge gefunden.";
@@ -105,7 +98,7 @@ function renderExperimentLogEntries(entries) {
       entry.command || entry.cwd || entry.duration_ms !== null && entry.duration_ms !== undefined ||
       entry.exit_code !== null && entry.exit_code !== undefined || entry.stdout || entry.stderr ||
       entry.exception_type || entry.exception_message || entry.stacktrace ||
-      entry.job_id || entry.session_id
+      entry.experiment_id || entry.mailbox_task_id || entry.job_id || entry.session_id
     );
 
     const head = document.createElement(hasDetails ? "button" : "div");
@@ -122,14 +115,14 @@ function renderExperimentLogEntries(entries) {
     time.textContent = entry.timestamp || "";
     head.append(time);
 
-    const phase = document.createElement("span");
-    phase.className = "log-entry-phase";
-    phase.textContent = entry.phase ? `${entry.phase} · ${entry.event || ""}` : entry.event || "";
-    head.append(phase);
+    const source = document.createElement("span");
+    source.className = "log-entry-phase";
+    source.textContent = entry.source || "experiment";
+    head.append(source);
 
     const message = document.createElement("span");
     message.className = "log-entry-message";
-    message.textContent = entry.message || "";
+    message.textContent = entry.message || entry.event || "";
     head.append(message);
 
     let details = null;
@@ -154,6 +147,12 @@ function renderExperimentLogEntries(entries) {
         dd.textContent = String(value);
         details.append(dt, dd);
       };
+      addDetail("Phase", entry.phase);
+      addDetail("Ereignis", entry.event);
+      addDetail("Experiment-ID", entry.experiment_id);
+      addDetail("Mailbox-Task-ID", entry.mailbox_task_id);
+      addDetail("Chat-Job-ID", entry.job_id);
+      addDetail("Session-ID", entry.session_id);
       addDetail("Command", entry.command);
       addDetail("Working Dir", entry.cwd);
       addDetail("Laufzeit (ms)", entry.duration_ms);
@@ -163,8 +162,6 @@ function renderExperimentLogEntries(entries) {
       addDetail("Exception", entry.exception_type);
       addDetail("Exception-Meldung", entry.exception_message);
       addDetail("Stacktrace", entry.stacktrace);
-      addDetail("Chat-Job-ID", entry.job_id);
-      addDetail("Session-ID", entry.session_id);
 
       head.addEventListener("click", () => {
         detailWrap.hidden = !detailWrap.hidden;
@@ -216,7 +213,7 @@ async function loadOlderLogs() {
     const olderEntries = data.entries || [];
     logsPaginationState.entries = [...olderEntries, ...logsPaginationState.entries];
     logsPaginationState.nextCursor = data.next_cursor || null;
-    renderExperimentLogEntries(logsPaginationState.entries);
+    renderLogEntries(logsPaginationState.entries);
     updateLogsSuccessStatus(logsPaginationState.entries);
   } catch (error) {
     showError(logsElements.content, error.message);
@@ -228,48 +225,30 @@ async function loadOlderLogs() {
 }
 
 async function loadLogs() {
-  const experimentId = logsElements.experimentSelect.value.trim();
   const level = logsElements.levelSelect ? logsElements.levelSelect.value.trim() : "";
+  const source = logsElements.sourceSelect ? logsElements.sourceSelect.value.trim() : "";
   const phase = logsElements.phaseSelect ? logsElements.phaseSelect.value.trim() : "";
+  const search = logsElements.searchInput ? logsElements.searchInput.value.trim() : "";
+  const experimentId = logsElements.experimentInput ? logsElements.experimentInput.value.trim() : "";
   const mailboxTaskId = logsElements.mailboxTaskInput.value.trim();
   const jobId = logsElements.jobInput ? logsElements.jobInput.value.trim() : "";
   const sessionId = logsElements.sessionInput ? logsElements.sessionInput.value.trim() : "";
   logsElements.content.textContent = "Wird geladen …";
   hideLoadOlderButton();
+  renderLogSourceErrors(null);
 
-  // A specific experiment is selected: use the dedicated, complete
-  // per-experiment JSONL log view (chronological, all internal phases).
-  if (state.apiKey && experimentId) {
-    const params = new URLSearchParams({ limit: "500" });
-    if (level) params.set("level", level);
-    if (phase) params.set("phase", phase);
-    const baseUrl = `/experiments/${encodeURIComponent(experimentId)}/logs?${params.toString()}`;
-    try {
-      const data = await requestJson(baseUrl, { headers: authHeaders() });
-      const entries = data.entries || [];
-      logsPaginationState.baseUrl = baseUrl;
-      logsPaginationState.entries = entries;
-      logsPaginationState.nextCursor = data.next_cursor || null;
-      renderExperimentLogEntries(entries);
-      updateLogsSuccessStatus(entries);
-      updateLoadOlderButton();
-      return;
-    } catch (error) {
-      logsElements.count.textContent = "!";
-      updateLogsErrorStatus();
-      showError(logsElements.content, error.message);
-      return;
-    }
-  }
-
-  // Default "Alle Experimente" view: the unified, chronological feed of
-  // real structured log entries across every experiment - not the
-  // lifecycle/status summaries from /activity - so a running/new
-  // experiment is visible on refresh without knowing its id up front.
+  // Default, authenticated view: one merged, chronological timeline -
+  // structured JSONL entries (mailbox/controller/experiment/chat/system)
+  // plus the agent-api/nexus-mailbox/llama-server journals - across
+  // everything, not the lifecycle/status summaries from /activity. A
+  // running/new experiment is visible on refresh without knowing its id.
   if (state.apiKey) {
     const params = new URLSearchParams({ limit: "500" });
     if (level) params.set("level", level);
+    if (source) params.set("source", source);
     if (phase) params.set("phase", phase);
+    if (search) params.set("search", search);
+    if (experimentId) params.set("experiment_id", experimentId);
     if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
     if (jobId) params.set("job_id", jobId);
     if (sessionId) params.set("session_id", sessionId);
@@ -280,9 +259,10 @@ async function loadLogs() {
       logsPaginationState.baseUrl = baseUrl;
       logsPaginationState.entries = entries;
       logsPaginationState.nextCursor = data.next_cursor || null;
-      renderExperimentLogEntries(entries);
+      renderLogEntries(entries);
       updateLogsSuccessStatus(entries);
       updateLoadOlderButton();
+      renderLogSourceErrors(data.source_errors);
       return;
     } catch (error) {
       logsElements.count.textContent = "!";
@@ -293,10 +273,10 @@ async function loadLogs() {
   }
 
   // No API key: unauthenticated fallback. Uses the same central,
-  // multi-source feed as the authenticated view (experiments + mailbox
-  // tasks + system), just re-shaped through the public allowlist
-  // (GET /logs/public) - no longer limited to per-experiment diagnostic
-  // summaries.
+  // multi-source structured feed (experiments + mailbox tasks + system) as
+  // the authenticated view, re-shaped through the public allowlist
+  // (GET /logs/public) - system journals are operator-only and are not
+  // included here.
   const params = new URLSearchParams({ limit: "100" });
   if (level) params.set("level", level);
   if (phase) params.set("phase", phase);
@@ -305,11 +285,19 @@ async function loadLogs() {
   const baseUrl = `/logs/public?${params.toString()}`;
   try {
     const data = await requestJson(baseUrl);
-    const entries = data.entries || [];
+    let entries = data.entries || [];
+    if (source) entries = entries.filter((entry) => entry.source === source);
+    if (search) {
+      const needle = search.toLowerCase();
+      entries = entries.filter((entry) =>
+        (entry.message || "").toLowerCase().includes(needle) ||
+        (entry.event || "").toLowerCase().includes(needle)
+      );
+    }
     logsPaginationState.baseUrl = baseUrl;
     logsPaginationState.entries = entries;
     logsPaginationState.nextCursor = data.next_cursor || null;
-    renderExperimentLogEntries(entries);
+    renderLogEntries(entries);
     updateLogsSuccessStatus(entries);
     updateLoadOlderButton();
   } catch (error) {
@@ -320,101 +308,18 @@ async function loadLogs() {
 }
 
 logsElements.refreshButton.addEventListener("click", loadLogs);
-logsElements.refreshButton.addEventListener("click", loadJournalctlLogs);
 if (logsElements.loadOlderButton) logsElements.loadOlderButton.addEventListener("click", loadOlderLogs);
-logsElements.experimentSelect.addEventListener("change", loadLogs);
 if (logsElements.levelSelect) logsElements.levelSelect.addEventListener("change", loadLogs);
+if (logsElements.sourceSelect) logsElements.sourceSelect.addEventListener("change", loadLogs);
 if (logsElements.phaseSelect) logsElements.phaseSelect.addEventListener("change", loadLogs);
 logsElements.mailboxTaskInput.addEventListener("input", () => {
   clearTimeout(logsElements.mailboxTaskInput._debounce);
   logsElements.mailboxTaskInput._debounce = setTimeout(loadLogs, 400);
 });
-for (const input of [logsElements.jobInput, logsElements.sessionInput]) {
+for (const input of [logsElements.searchInput, logsElements.experimentInput, logsElements.jobInput, logsElements.sessionInput]) {
   if (!input) continue;
   input.addEventListener("input", () => {
     clearTimeout(input._debounce);
     input._debounce = setTimeout(loadLogs, 400);
   });
 }
-
-// ---------------------------------------------------------------------------
-// System-Logs (journalctl) - separate data source (systemd, via
-// GET /operations/logs/tail), not the JSONL feed above, so it is loaded
-// and rendered independently.
-// ---------------------------------------------------------------------------
-
-// A raw "--output=short-iso" journalctl line starts with an ISO-8601
-// timestamp token followed by the rest of the line; splitting on the
-// first space keeps that timestamp sortable as plain text so entries
-// from multiple services can be merged chronologically.
-function parseJournalctlLine(service, rawLine) {
-  const separatorIndex = rawLine.indexOf(" ");
-  const timestamp = separatorIndex === -1 ? "" : rawLine.slice(0, separatorIndex);
-  return { service, timestamp, text: rawLine };
-}
-
-function renderJournalctlEntries(entries) {
-  journalctlElements.content.replaceChildren();
-  if (!entries.length) {
-    journalctlElements.content.textContent = "Keine Log-Einträge gefunden.";
-    return;
-  }
-  const list = document.createElement("ul");
-  list.className = "item-list";
-  for (const entry of entries) {
-    const li = document.createElement("li");
-    li.className = "log-entry";
-    const head = document.createElement("div");
-    head.className = "log-entry-head";
-
-    const service = document.createElement("span");
-    service.className = "log-entry-phase";
-    service.textContent = entry.service;
-    head.append(service);
-
-    const message = document.createElement("span");
-    message.className = "log-entry-message";
-    message.textContent = entry.text;
-    head.append(message);
-
-    li.append(head);
-    list.append(li);
-  }
-  journalctlElements.content.append(list);
-}
-
-async function loadJournalctlLogs() {
-  if (!journalctlElements.content) return;
-  if (!state.apiKey) {
-    journalctlElements.content.textContent = "Erfordert einen API-Schlüssel.";
-    return;
-  }
-  const selectedService = journalctlElements.serviceSelect ? journalctlElements.serviceSelect.value.trim() : "";
-  const services = selectedService ? [selectedService] : JOURNALCTL_SERVICES;
-  const lines = journalctlElements.linesInput && journalctlElements.linesInput.value.trim()
-    ? journalctlElements.linesInput.value.trim()
-    : "100";
-  journalctlElements.content.textContent = "Wird geladen …";
-  try {
-    const perService = await Promise.all(
-      services.map((service) =>
-        requestJson(
-          `/operations/logs/tail?service=${encodeURIComponent(service)}&lines=${encodeURIComponent(lines)}`,
-          { headers: authHeaders() },
-        ).then(
-          (data) => (data.data && data.data.lines ? data.data.lines : []).map((line) => parseJournalctlLine(service, line)),
-          // One service being unreachable (e.g. unknown unit) must not
-          // blank out the others when "Alle Services" is selected.
-          () => [],
-        )
-      ),
-    );
-    const merged = perService.flat().sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-    renderJournalctlEntries(merged);
-  } catch (error) {
-    showError(journalctlElements.content, error.message);
-  }
-}
-
-if (journalctlElements.refreshButton) journalctlElements.refreshButton.addEventListener("click", loadJournalctlLogs);
-if (journalctlElements.serviceSelect) journalctlElements.serviceSelect.addEventListener("change", loadJournalctlLogs);

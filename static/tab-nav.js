@@ -20,9 +20,7 @@ function activateTab(name) {
   if (name === "mailbox") loadMailboxMessages();
   if (name === "operations") loadOperationsCatalog();
   if (name === "logs") {
-    loadLogsExperimentOptions();
     loadLogs();
-    loadJournalctlLogs();
   }
 }
 

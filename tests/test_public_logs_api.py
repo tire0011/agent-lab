@@ -168,7 +168,7 @@ class PublicUnifiedLogsApiTests(unittest.TestCase):
         entry = response.json()["entries"][0]
         expected_fields = {
             "timestamp", "level", "phase", "event", "message",
-            "experiment_id", "mailbox_task_id", "truncated",
+            "experiment_id", "mailbox_task_id", "truncated", "source",
         }
         self.assertEqual(set(entry.keys()), expected_fields)
         serialized = json.dumps(response.json())

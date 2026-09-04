@@ -779,6 +779,19 @@ def _entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, str, int]:
     return (timestamp, experiment_id, source, -rseq)
 
 
+def entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, str, int]:
+    """Public alias of :func:`_entry_sort_key`.
+
+    ``GET /logs`` (``api.py``) merges non-structured entries (systemd
+    journal lines, normalized into this same shape by
+    ``modules.log_reader``) into the same timeline/pagination cursor as
+    structured JSONL entries and must sort/paginate both with the exact
+    same total order used here - reaching into a private helper from
+    another module would be worse than exposing this one intentionally.
+    """
+    return _entry_sort_key(entry)
+
+
 def encode_log_cursor(entry: dict[str, Any]) -> str:
     """Opaque, URL-safe pagination cursor anchored to one entry.
 

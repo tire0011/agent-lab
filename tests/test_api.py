@@ -269,27 +269,45 @@ class WebClientTests(ApiTestsBase):
     def test_logs_refresh_uses_rendered_arrays_and_shared_load_function(self):
         javascript = self.client.get("/static/logs.js").text
         self.assertIn("const visibleCount = renderedEntries.length;", javascript)
-        self.assertIn("renderExperimentLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
+        self.assertIn("renderLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
         self.assertIn('const baseUrl = `/logs?${params.toString()}`;', javascript)
         self.assertIn("await requestJson(baseUrl, { headers: authHeaders() });", javascript)
-        self.assertIn("renderExperimentLogEntries(entries);\n    updateLogsSuccessStatus(entries);", javascript)
+        self.assertIn("renderLogEntries(entries);\n    updateLogsSuccessStatus(entries);", javascript)
         self.assertNotIn("setInterval(loadLogs", javascript)
         self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
 
     def test_logs_default_view_uses_unified_feed_not_activity_summaries(self):
-        """The default "Alle Experimente" view must show real structured
+        """The default unified Nexus timeline must show real structured
         log entries (GET /logs) rather than lifecycle/status summaries
         (GET /activity)."""
         javascript = self.client.get("/static/logs.js").text
         self.assertNotIn("/activity?", javascript)
         self.assertNotIn("renderLogsFromActivity", javascript)
 
+    def test_logs_has_no_experiment_selector(self):
+        """Issue #105: the Logs tab must not require picking an experiment
+        or show "Alle Experimente" - experiment id is only an optional
+        filter input."""
+        html = self.client.get("/").text
+        self.assertNotIn("Alle Experimente", html)
+        self.assertNotIn('id="logs-experiment-select"', html)
+        self.assertIn('id="logs-experiment-input"', html)
+
+    def test_logs_has_no_separate_journalctl_section(self):
+        """Issue #105: journalctl/system logs are merged into the one
+        unified GET /logs timeline, not shown in a separate UI section."""
+        html = self.client.get("/").text
+        javascript = self.client.get("/static/logs.js").text
+        self.assertNotIn('id="logs-journalctl-content"', html)
+        self.assertNotIn("loadJournalctlLogs", javascript)
+        self.assertIn('id="logs-source-select"', html)
+
     def test_logs_success_timestamp_is_not_updated_in_error_paths(self):
         javascript = self.client.get("/static/logs.js").text
         load_logs = javascript.split("async function loadLogs()", 1)[1].split(
             'logsElements.refreshButton.addEventListener("click", loadLogs)', 1
         )[0]
-        self.assertEqual(load_logs.count("updateLogsSuccessStatus("), 3)
+        self.assertEqual(load_logs.count("updateLogsSuccessStatus("), 2)
         for error_path in load_logs.split("catch (error)")[1:]:
             catch_body = error_path.split("}", 1)[0]
             self.assertNotIn("updateLogsSuccessStatus", catch_body)
@@ -309,7 +327,7 @@ class WebClientTests(ApiTestsBase):
         load_logs = javascript.split("async function loadLogs()", 1)[1].split(
             'logsElements.refreshButton.addEventListener("click", loadLogs)', 1
         )[0]
-        self.assertEqual(load_logs.count("updateLogsErrorStatus()"), 3)
+        self.assertEqual(load_logs.count("updateLogsErrorStatus()"), 2)
         for error_path in load_logs.split("catch (error)")[1:]:
             catch_body = error_path.split("}", 1)[0]
             self.assertIn("updateLogsErrorStatus()", catch_body)

@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
@@ -46,9 +46,16 @@ class UnifiedLogsApiTests(unittest.TestCase):
         codex = MagicMock()
         mailbox = MagicMock()
         mailbox.recover_after_restart.return_value = None
+        # A real LogReader would shell out to journalctl; tests instead
+        # control exactly what the merged journal feed returns, so
+        # structured-log assertions stay deterministic and independent of
+        # whatever systemd units happen to exist on the test host.
+        self.log_reader = MagicMock()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([], {}))
         api.app.dependency_overrides[api.get_experiment_service] = lambda: self.service
         api.app.dependency_overrides[api.get_codex_service] = lambda: codex
         api.app.dependency_overrides[api.get_mailbox_task_service] = lambda: mailbox
+        api.app.dependency_overrides[api.get_log_reader] = lambda: self.log_reader
         self.client = TestClient(api.app)
         self.addCleanup(api.app.dependency_overrides.clear)
 
@@ -211,7 +218,7 @@ class UnifiedLogsApiTests(unittest.TestCase):
             "timestamp", "level", "logger", "message", "experiment_id",
             "mailbox_task_id", "job_id", "session_id", "phase", "event", "duration_ms", "command",
             "cwd", "exit_code", "stdout", "stderr", "exception_type",
-            "exception_message", "stacktrace", "truncated",
+            "exception_message", "stacktrace", "truncated", "source",
         }
         self.assertEqual(set(entry.keys()), expected_fields)
 
@@ -285,6 +292,211 @@ class UnifiedLogsApiTests(unittest.TestCase):
             if not cursor:
                 break
         self.assertEqual(collected, expected_events)
+
+    def test_derives_source_grouping_from_phase(self):
+        self._write_logs()
+        response = self.client.get("/logs", headers={"x-api-key": "test-key"})
+        by_event = {e["event"]: e["source"] for e in response.json()["entries"]}
+        self.assertEqual(by_event["task_bound"], "mailbox")
+        self.assertEqual(by_event["implementation_started"], "experiment")
+        self.assertEqual(by_event["verification_started"], "experiment")
+
+    def test_merges_journal_entries_into_default_view(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00+0000", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get("/logs", headers={"x-api-key": "test-key"})
+        body = response.json()
+        sources = {e["source"] for e in body["entries"]}
+        self.assertIn("agent-api", sources)
+        events = [e["event"] for e in body["entries"]]
+        self.assertIn("journal:agent-api", events)
+
+    def test_journal_not_merged_when_filtering_by_experiment_id(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00+0000", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get(
+            f"/logs?experiment_id={'aa' * 16}", headers={"x-api-key": "test-key"}
+        )
+        sources = {e["source"] for e in response.json()["entries"]}
+        self.assertNotIn("agent-api", sources)
+        self.log_reader.read_all_journal_entries.assert_not_awaited()
+
+    def test_filters_by_source(self):
+        self._write_logs()
+        response = self.client.get("/logs?source=mailbox", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["entries"][0]["event"], "task_bound")
+
+    def test_filters_by_free_text_search(self):
+        self._write_logs()
+        response = self.client.get("/logs?search=codex_failed", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertEqual([e["event"] for e in body["entries"]], ["codex_failed"])
+
+    def test_reports_journal_source_errors_without_emptying_feed(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(
+            return_value=([], {"llama-server": "journalctl failed for llama-server (exit code 1)"})
+        )
+        response = self.client.get("/logs", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertGreater(body["count"], 0)
+        self.assertEqual(
+            body["source_errors"], {"llama-server": "journalctl failed for llama-server (exit code 1)"}
+        )
+
+    def test_include_journal_false_skips_journal_merge(self):
+        self._write_logs()
+        response = self.client.get(
+            "/logs?include_journal=false", headers={"x-api-key": "test-key"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.log_reader.read_all_journal_entries.assert_not_awaited()
+
+    def test_phase_filter_excludes_journal_entries(self):
+        # Journal entries always carry phase="system" (see
+        # modules.log_reader.parse_journal_line); filtering by a
+        # different phase must exclude them from the merged feed, not
+        # just from the structured half of it.
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get(
+            "/logs?phase=implementation", headers={"x-api-key": "test-key"}
+        )
+        body = response.json()
+        self.assertTrue(all(e["source"] != "agent-api" for e in body["entries"]))
+        self.assertTrue(all(e["phase"] == "implementation" for e in body["entries"]))
+
+    def test_phase_filter_keeps_journal_entries_matching_system(self):
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+            },
+        ], {}))
+        response = self.client.get("/logs?phase=system", headers={"x-api-key": "test-key"})
+        body = response.json()
+        self.assertEqual([e["event"] for e in body["entries"]], ["journal:agent-api"])
+
+    def test_journal_is_merged_on_a_paginated_page_too(self):
+        # Previously the journal was only ever merged into the very
+        # first (cursor-less) page - "load older" could never surface
+        # any journal entry, no matter how recent. It must now be
+        # merged on every unfiltered-by-id page.
+        self._write_logs()
+        self.log_reader.read_all_journal_entries = AsyncMock(return_value=([
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "agent-api started", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 0,
+            },
+        ], {}))
+        first = self.client.get("/logs?limit=2", headers={"x-api-key": "test-key"}).json()
+        self.assertIsNotNone(first["next_cursor"])
+        self.log_reader.read_all_journal_entries.reset_mock()
+
+        second = self.client.get(
+            f"/logs?limit=2&cursor={first['next_cursor']}", headers={"x-api-key": "test-key"}
+        ).json()
+        self.log_reader.read_all_journal_entries.assert_awaited_once()
+        events = [e["event"] for e in first["entries"]] + [e["event"] for e in second["entries"]]
+        # No duplicates across the two pages even though the same mocked
+        # journal entry is returned by the (mocked) reader on both calls:
+        # the cursor-derived `before` is expected to scope it out on the
+        # second page in a real LogReader; here we only assert the
+        # merged pagination itself never repeats a structured event.
+        structured_events = [e for e in events if e != "journal:agent-api"]
+        self.assertEqual(len(structured_events), len(set(structured_events)))
+
+    def test_journal_before_is_derived_from_cursor(self):
+        self._write_logs()
+        first = self.client.get("/logs?limit=1", headers={"x-api-key": "test-key"}).json()
+        self.assertIsNotNone(first["next_cursor"])
+        self.log_reader.read_all_journal_entries.reset_mock()
+
+        self.client.get(
+            f"/logs?limit=1&cursor={first['next_cursor']}", headers={"x-api-key": "test-key"}
+        )
+        self.log_reader.read_all_journal_entries.assert_awaited_once()
+        _, kwargs = self.log_reader.read_all_journal_entries.await_args
+        self.assertIsNotNone(kwargs.get("before"))
+
+    def test_journal_entries_are_not_duplicated_across_pages_at_second_boundary(self):
+        # `journalctl --until` only has second precision and is
+        # inclusive, so a naive re-query at the page boundary can return
+        # the exact same journal line(s) again - most sharply when two
+        # journal records fall within the *same* whole second as the
+        # cursor. Simulate that real-world overlap by having the (mocked)
+        # LogReader return the identical 3-entry batch on every call,
+        # regardless of the `before` it was given, and assert the API
+        # layer's own strict cursor comparison still de-duplicates.
+        journal_batch = [
+            {
+                "timestamp": "2026-01-01T00:00:00.100Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "oldest", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 2,
+            },
+            {
+                "timestamp": "2026-01-01T00:00:00.500Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "same-second A", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 1,
+            },
+            {
+                "timestamp": "2026-01-01T00:00:00.900Z", "level": "INFO",
+                "logger": "journalctl", "phase": "system", "event": "journal:agent-api",
+                "message": "same-second B (newest)", "source": "agent-api",
+                "_source": "journal:agent-api", "_rseq": 0,
+            },
+        ]
+        self.log_reader.read_all_journal_entries = AsyncMock(
+            return_value=(list(journal_batch), {})
+        )
+
+        first = self.client.get("/logs?limit=1", headers={"x-api-key": "test-key"}).json()
+        self.assertEqual([e["message"] for e in first["entries"]], ["same-second B (newest)"])
+        self.assertIsNotNone(first["next_cursor"])
+
+        second = self.client.get(
+            f"/logs?limit=1&cursor={first['next_cursor']}", headers={"x-api-key": "test-key"}
+        ).json()
+        self.assertEqual([e["message"] for e in second["entries"]], ["same-second A"])
+        self.assertIsNotNone(second["next_cursor"])
+
+        third = self.client.get(
+            f"/logs?limit=1&cursor={second['next_cursor']}", headers={"x-api-key": "test-key"}
+        ).json()
+        self.assertEqual([e["message"] for e in third["entries"]], ["oldest"])
+
+        all_messages = (
+            [e["message"] for e in first["entries"]]
+            + [e["message"] for e in second["entries"]]
+            + [e["message"] for e in third["entries"]]
+        )
+        self.assertEqual(len(all_messages), len(set(all_messages)))
 
 
 if __name__ == "__main__":
