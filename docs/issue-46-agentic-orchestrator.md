@@ -15,6 +15,17 @@ Each source has a stable `source_type` and optional `source_id`. Nexus stores a 
 
 `NexusControllerService` is the generic code-level entry point. GitHub fetching stays outside the controller: `issue_source(...)` accepts issue data supplied by the official GitHub MCP or a future global MCP gateway. This keeps orchestration independent from one GitHub client implementation.
 
+## SQLite persistence
+
+The persistent controller state is stored in the Nexus SQLite database (on the deployed VM currently `/var/lib/nexus/agent.db`). The controller-specific tables are:
+
+- `nexus_task_sessions` — one durable controller session per task/discussion source. Important fields: `id`, `source_type`, `source_id`, `title`, `status`, `created_at`, `updated_at`.
+- `nexus_task_events` — ordered persistent conversation/controller journal for a session. Important fields: `id`, `session_id`, `role`, `kind`, `content`, `metadata_json`, `created_at`. This is the primary place to inspect model decisions, observations and discussion history for a session.
+- `nexus_tool_calls` — durable record of concrete tool invocations made by the controller. Important fields: `id`, `session_id`, `signature`, `tool`, `arguments_json`, `state_token`, `reason`, `status`, `result_ref`, `created_at`. The `signature` and `state_token` are used to distinguish materially different calls and support loop detection.
+- `nexus_orchestration_budgets` — bounded-loop counters per session/controller state. Important fields: `session_id`, `state_token`, `steps`, `duplicate_calls`, `cycles`. These counters are used to stop non-progressing orchestration loops rather than letting the local model repeat indefinitely.
+
+For debugging a stalled controller run, start with the session row in `nexus_task_sessions`, then read `nexus_task_events` ordered by `id`, inspect matching `nexus_tool_calls`, and finally check `nexus_orchestration_budgets` for duplicate/cycle limits. The table definitions are created and maintained by the Nexus task-store implementation; documentation should be updated when that schema changes.
+
 ## Control loop
 
 A bounded run follows this shape:
