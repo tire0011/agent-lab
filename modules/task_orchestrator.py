@@ -1104,7 +1104,7 @@ Rules:
                     "one full operation schema, invalid_goal for placeholder/generic requests, "
                     "or structured not_found; it never implements missing tools."
                 ),
-                "arguments": {"goal": "concrete capability needed for the current task"},
+                "arguments": {"goal": "run a shell command in the repository"},
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
             },
             {

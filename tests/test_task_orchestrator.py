@@ -245,8 +245,8 @@ class TaskOrchestratorTests(unittest.TestCase):
             '"reason":"need a git inspection capability"}',
             '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
             '"related_tools":[]}',
-            '{"type":"tool","tool":"operation","operation":"git_status","args":{},'
-            '"reason":"use resolved operation"}',
+            '{"action":"call_tool","tool":"git_status","arguments":{},'
+            '"reason":"use the operation returned by find_tool"}',
             '{"type":"action","action":"answer","experiment_id":null,'
             '"message":"Repository has local changes.","reason":"git status result is sufficient"}',
         ])
