@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -244,8 +245,8 @@ class TaskOrchestratorTests(unittest.TestCase):
             '"reason":"need a git inspection capability"}',
             '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
             '"related_tools":[]}',
-            '{"type":"tool","tool":"operation","operation":"git_status","args":{},'
-            '"reason":"use resolved operation"}',
+            '{"action":"call_tool","tool":"git_status","arguments":{},'
+            '"reason":"use the operation returned by find_tool"}',
             '{"type":"action","action":"answer","experiment_id":null,'
             '"message":"Repository has local changes.","reason":"git status result is sufficient"}',
         ])
@@ -322,6 +323,81 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(second.action, ACTION_ANSWER)
         self.assertEqual(self.registry.calls[0][0], "git_status")
         self.assertIn('"grant_event_id"', client2.prompts[1])
+
+    def test_find_tool_rejects_placeholder_goals_and_distinguishes_not_found(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        orchestrator = self._orchestrator(_Client([]))
+        try:
+            invalid = asyncio.run(
+                orchestrator._resolve_find_tool("plain-language capability needed", session_id="goal-check")
+            )
+            empty = asyncio.run(
+                orchestrator._resolve_find_tool("   ", session_id="goal-check-empty")
+            )
+            not_found = asyncio.run(
+                orchestrator._resolve_find_tool("inspect GPU utilization", session_id="goal-check-missing")
+            )
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(invalid["status"], "invalid_goal")
+        self.assertIn("placeholder", invalid["reason"])
+        self.assertIn("Describe the operation you need", invalid["guidance"])
+        self.assertEqual(empty["status"], "invalid_goal")
+        self.assertEqual(not_found["status"], "not_found")
+        self.assertEqual(not_found["related_tools"], [])
+
+    def test_find_tool_reformulates_after_invalid_goal_then_succeeds(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"plain-language capability needed",'
+            '"reason":"I need a generic placeholder goal"}',
+            '{"status":"invalid_goal","error":"The goal is a placeholder, not a concrete capability request.",'
+            '"guidance":"Describe the operation you need, e.g. \'run a shell command in the repository\'.",'
+            '"reason":"goal is placeholder"}',
+            '{"type":"tool","tool":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need a git inspection capability"}',
+            '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
+            '"related_tools":[]}',
+            '{"action":"call_tool","tool":"git_status","arguments":{},'
+            '"reason":"use the operation returned by find_tool"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"Repository inspected.","reason":"git status result is sufficient"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect repository changes")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(self.registry.calls[0][0], "git_status")
+        self.assertTrue(any("plain-language capability needed" in prompt for prompt in client.prompts))
+        self.assertTrue(any("inspect whether the repository has local changes" in prompt for prompt in client.prompts))
+
+    def test_repeated_invalid_goal_is_stopped_by_loop_protection(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"plain-language capability needed",'
+            '"reason":"generic placeholder"}',
+            '{"status":"invalid_goal","error":"The goal is a placeholder, not a concrete capability request.",'
+            '"guidance":"Describe the operation you need, e.g. \'run a shell command in the repository\'.",'
+            '"reason":"goal is placeholder"}',
+            '{"type":"tool","tool":"find_tool","goal":"plain-language capability needed",'
+            '"reason":"repeat placeholder"}',
+            '{"type":"action","action":"clarification","experiment_id":null,'
+            '"message":"Need a concrete capability before retrying.",'
+            '"reason":"non_progressing_cycle"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect repository state")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_CLARIFICATION)
+        self.assertIn(result.observations[-1]["event"], {"duplicate_tool_call", "non_progressing_cycle"})
+        self.assertEqual(self.registry.calls, [])
 
     def test_find_tool_returns_not_found_without_implementing_missing_capability(self):
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
