@@ -43,7 +43,7 @@ from .models import (
     _row_to_experiment,
 )
 from .policy import _check_goal_policy, _policy_rule_for_reason
-from .prompts import _build_direct_implementation_prompt
+from .prompts import _build_direct_implementation_prompt, _build_repair_implementation_prompt
 from .text_utils import _truncate_text, _utcnow_iso
 
 logger = logging.getLogger("modules.experiment_service")
@@ -70,6 +70,7 @@ _DEFAULT_RESEARCH_TIMEOUT_SECONDS = 120
 _DEFAULT_PLAN_TIMEOUT_SECONDS = 90
 _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 1200  # 20 minutes
+_DEFAULT_MAX_REPAIR_ITERATIONS = 2
 
 # Adaptive verification test timeout. The subprocess running the test
 # command starts out bounded by ``_DEFAULT_TEST_TIMEOUT_SECONDS``; each time
@@ -133,6 +134,7 @@ class ExperimentService:
         default_test_timeout_seconds: int = _DEFAULT_TEST_TIMEOUT_SECONDS,
         max_test_timeout_seconds: int = _MAX_TEST_TIMEOUT_SECONDS,
         test_timeout_backoff_factor: float = _TEST_TIMEOUT_BACKOFF_FACTOR,
+        max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
     ) -> None:
         """
         Parameters
@@ -210,6 +212,7 @@ class ExperimentService:
         self.default_test_timeout_seconds = default_test_timeout_seconds
         self.max_test_timeout_seconds = max_test_timeout_seconds
         self.test_timeout_backoff_factor = test_timeout_backoff_factor
+        self.max_repair_iterations = max(0, max_repair_iterations)
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
         # cleanliness is asserted directly, so the log directory must never
@@ -393,6 +396,34 @@ class ExperimentService:
                 entity_type="experiment",
                 entity_id=experiment_id,
             )
+
+    def list_verification_runs(self, experiment_id: str) -> list[dict[str, Any]]:
+        """Return every persisted verification attempt for an experiment."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT iteration, started_at, ended_at, status, commit_sha,
+                          command_json, exit_code, output, error,
+                          failure_fingerprint
+                   FROM verification_runs
+                   WHERE experiment_id = ?
+                   ORDER BY iteration""",
+                (experiment_id,),
+            ).fetchall()
+        return [
+            {
+                "iteration": row[0],
+                "started_at": row[1],
+                "ended_at": row[2],
+                "status": row[3],
+                "commit_sha": row[4],
+                "command": json.loads(row[5]) if row[5] else None,
+                "exit_code": row[6],
+                "output": row[7],
+                "error": row[8],
+                "failure_fingerprint": row[9],
+            }
+            for row in rows
+        ]
 
     def mailbox_task_id_for_experiment(self, experiment_id: str) -> str | None:
         """Return the approval id linked to an experiment, if any."""
@@ -735,12 +766,121 @@ class ExperimentService:
 
         # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
-        return self._verify(
+        result = self._verify(
             experiment_id,
             worktree_path,
             elog,
             github_work_tracking=github_work_tracking,
         )
+        return self._repair_failed_verification(
+            experiment_id, worktree_path, elog, result,
+            github_work_tracking=github_work_tracking,
+        )
+
+    def _record_verification_run(
+        self, experiment_id: str, iteration: int, status: str,
+        command: list[str] | None, exit_code: int | None, output: str | None,
+        error: str | None, commit_sha: str | None = None,
+    ) -> None:
+        import hashlib
+
+        fingerprint = hashlib.sha256(
+            f"{status}\n{exit_code}\n{error or ''}\n{output or ''}".encode()
+        ).hexdigest()
+        now = _utcnow_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO verification_runs
+                   (experiment_id, iteration, started_at, ended_at, status,
+                    commit_sha, command_json, exit_code, output, error,
+                    failure_fingerprint)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (experiment_id, iteration, now, now, status, commit_sha,
+                 json.dumps(command) if command else None, exit_code,
+                 output, error, fingerprint),
+            )
+
+    def _repair_failed_verification(
+        self, experiment_id: str, worktree_path: str, elog: ExperimentLogger,
+        result: Experiment, *, github_work_tracking: Any | None = None,
+    ) -> Experiment:
+        """Give actionable test failures a small number of focused repair attempts."""
+        if result.status != STATUS_FAILED or result.test_exit_code is None:
+            return result
+
+        for repair_iteration in range(1, self.max_repair_iterations + 1):
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT failure_fingerprint FROM verification_runs "
+                    "WHERE experiment_id = ? ORDER BY iteration",
+                    (experiment_id,),
+                ).fetchall()
+                previous_fingerprints = [row[0] for row in rows[:-1] if row[0]]
+            feedback = _truncate_text(
+                f"Verification status: {result.status}\n"
+                f"Exit code: {result.test_exit_code}\n"
+                f"Failure: {result.error or 'tests failed'}\n"
+                f"Output:\n{result.test_output or '(no output)'}",
+                12000,
+                label="verification feedback",
+            )
+            import hashlib
+            current_fingerprint = hashlib.sha256(
+                f"{result.status}\n{result.test_exit_code}\n{result.error or ''}\n"
+                f"{result.test_output or ''}".encode()
+            ).hexdigest()
+            if current_fingerprint in previous_fingerprints:
+                elog.warning(
+                    "verifying", "repair_repeated_failure",
+                    "Stopping repair loop because the verification failure repeated",
+                    iteration=repair_iteration,
+                )
+                break
+
+            self._force_status(experiment_id, STATUS_VERIFYING)
+            elog.warning(
+                "implementing", "repair_started",
+                f"Starting focused repair iteration {repair_iteration}/"
+                f"{self.max_repair_iterations}",
+                iteration=repair_iteration,
+            )
+            worker = self.worker_factory(worktree_path)
+            repair_result = worker.run(
+                task=_build_repair_implementation_prompt(result.goal, feedback),
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=getattr(
+                    self, "_implementation_timeout_seconds",
+                    _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
+                ),
+                experiment_logger=elog,
+                phase="implementation_repair",
+            )
+            if repair_result.timed_out or repair_result.error:
+                self._force_status(
+                    experiment_id,
+                    STATUS_TIMED_OUT if repair_result.timed_out else STATUS_FAILED,
+                    ended_at=_utcnow_iso(),
+                    error=repair_result.error or "repair phase timed out",
+                )
+                return self.get_experiment(experiment_id)
+
+            result = self._verify(
+                experiment_id, worktree_path, elog,
+                github_work_tracking=github_work_tracking,
+                repair_iteration=repair_iteration,
+            )
+            if result.status != STATUS_FAILED:
+                return result
+
+        final = self.get_experiment(experiment_id)
+        if final.status == STATUS_FAILED:
+            elog.error(
+                "verifying", "repair_exhausted",
+                "Verification remained failed after bounded repair attempts",
+                max_repair_iterations=self.max_repair_iterations,
+            )
+        return final
 
     def _checkpoint_interrupted_work(
         self,
@@ -772,6 +912,7 @@ class ExperimentService:
         elog: ExperimentLogger | None = None,
         *,
         github_work_tracking: Any | None = None,
+        repair_iteration: int = 0,
     ) -> Experiment:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
@@ -1001,7 +1142,13 @@ class ExperimentService:
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"
-            elog.error("verifying", "tests_failed", error, exit_code=test_exit_code)
+            elog.error(
+                "verifying",
+                "tests_failed" if repair_iteration == 0 else "tests_failed_repair",
+                error,
+                exit_code=test_exit_code,
+                iteration=repair_iteration,
+            )
         else:
             elog.info("verifying", "tests_passed", "Verification tests passed")
 
@@ -1050,6 +1197,21 @@ class ExperimentService:
                     "Exception while running deterministic quality evaluation", exc=exc,
                 )
 
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(iteration), -1) + 1 FROM verification_runs "
+                "WHERE experiment_id = ?", (experiment_id,)
+            ).fetchone()
+        self._record_verification_run(
+            experiment_id,
+            int(row[0]),
+            final_status,
+            test_command,
+            test_exit_code,
+            test_output_capped,
+            error,
+            (ci_verification.commit_sha if ci_verification is not None else None),
+        )
         self._force_status(
             experiment_id, final_status,
             ended_at=_utcnow_iso(),

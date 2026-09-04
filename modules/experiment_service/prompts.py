@@ -305,3 +305,30 @@ def _build_direct_implementation_prompt(goal: str) -> str:
     return _with_nexus_identity(
         _DIRECT_IMPLEMENTATION_PROMPT_TEMPLATE.replace("{goal}", goal)
     )
+
+
+_REPAIR_IMPLEMENTATION_PROMPT_TEMPLATE = """The previous implementation attempt for this task did not pass verification.
+Make a focused corrective change in this same repository working directory.
+
+Task: {goal}
+
+Verification feedback (bounded):
+---
+{feedback}
+---
+
+Instructions:
+1. Inspect the current implementation and the failure feedback.
+2. Fix the underlying code or test issue; do not undo working changes.
+3. Keep the change narrowly scoped to the task.
+4. Add or update tests when needed.
+5. Do not commit or push. Leave changes unstaged.
+
+Do not make infrastructure, deployment, credential, or unrelated changes.
+"""
+
+
+def _build_repair_implementation_prompt(goal: str, feedback: str) -> str:
+    return _with_nexus_identity(
+        _REPAIR_IMPLEMENTATION_PROMPT_TEMPLATE.format(goal=goal, feedback=feedback)
+    )

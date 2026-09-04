@@ -211,6 +211,25 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id);
 
+        CREATE TABLE IF NOT EXISTS verification_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL,
+            iteration INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            commit_sha TEXT NULL,
+            command_json TEXT NULL,
+            exit_code INTEGER NULL,
+            output TEXT NULL,
+            error TEXT NULL,
+            failure_fingerprint TEXT NULL,
+            FOREIGN KEY (experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_verification_runs_experiment
+            ON verification_runs(experiment_id, iteration);
+
         CREATE TABLE IF NOT EXISTS service_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -586,5 +605,4 @@ def _migrate_operation_log(conn: sqlite3.Connection) -> None:
             ON operation_log(operation);
         """
     )
-
 

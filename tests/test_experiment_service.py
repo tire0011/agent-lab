@@ -462,6 +462,52 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertRegex(output, r"(?m)^Ran \d+ tests? in ")
         self.assertNotRegex(output, r"(?m)^[.]+$")
 
+    def test_failed_verification_gets_bounded_repair_in_same_worktree(self):
+        (self.repo_root / "tests" / "test_placeholder.py").write_text(
+            "import unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_fail(self):\n"
+            "        self.assertTrue(False)\n"
+        )
+        subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo_root), "commit", "-q", "-m", "failing test"],
+            check=True,
+        )
+        calls = 0
+
+        def repairable_worker(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            worktree = Path(kwargs["working_dir"])
+            (worktree / "implementation.py").write_text('"""implemented."""\n')
+            if calls == 2:
+                (worktree / "tests" / "test_placeholder.py").write_text(
+                    "import unittest\n\n"
+                    "class T(unittest.TestCase):\n"
+                    "    def test_fixed(self):\n"
+                    "        self.assertTrue(True, 'fixed by repair iteration')\n"
+                )
+            return _make_result(sandbox="workspace-write")
+
+        self.implementation_worker.run.side_effect = repairable_worker
+        self.service.test_python_executable = sys.executable
+        experiment = self.service.create_experiment(goal="Fix the failing test.")
+        result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.assertEqual(calls, 2)
+        runs = self.service.list_verification_runs(experiment.id)
+        self.assertEqual([run["status"] for run in runs], [STATUS_FAILED, STATUS_SUCCEEDED])
+        self.assertEqual(
+            self.implementation_worker.run.call_args_list[1].kwargs["phase"],
+            "implementation_repair",
+        )
+        self.assertIn(
+            "tests failed",
+            self.implementation_worker.run.call_args_list[1].kwargs["task"],
+        )
+
     def test_default_test_command_uses_quiet_unittest_discover(self):
         self.service.test_python_executable = sys.executable
         experiment = self.service.create_experiment(goal="g")
