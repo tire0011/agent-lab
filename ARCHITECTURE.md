@@ -90,6 +90,21 @@
 - Git integration: commits outbox + IDEAS.md (idea type only), pushes to tracked branch
 - Lock: `state/mailbox.lock` via `fcntl.flock` prevents concurrent runs on the Ubuntu deployment; the implementation includes a Windows fallback for portable local checks
 - Deployment: systemd oneshot service + 1-minute timer (see `deploy/nexus-mailbox.{service,timer}`)
+- Command channel restart recovery (`modules/mailbox/development.py` +
+  `modules/mailbox/command_recovery.py`, Issue #123): the trusted `command`
+  message type runs the shell command as a detached background job so
+  Nexus-restarting commands (e.g. `refresh.sh`) survive across mailbox
+  polls. Before spawning, a local `git rev-parse HEAD` of the working
+  directory is persisted next to the job state. If a later poll finds the
+  runner's pid gone with no exit code recorded, it evaluates that baseline
+  against the current repo state (HEAD vs. upstream, clean tree) instead of
+  reporting a bare `Exit code: 255`: a clean HEAD matching upstream is a
+  verified success, a HEAD that moved but did not converge is a verified
+  failure, and anything without usable git evidence (non-git directory, no
+  baseline, unchanged HEAD) is reported as unknown. The verdict is persisted
+  to the job's exit-code/stderr files the first time it is computed, so a
+  further restart replays the same cached reply instead of re-deriving or
+  duplicating it.
 
 ### 7) Mailbox task approval bridge
 

@@ -7,6 +7,7 @@ so the controller can execute them without a manual approval step.
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import subprocess
@@ -16,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from modules.redaction import redact
+
+from .command_recovery import evaluate_interrupted_command, write_recovery_state
+
+logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 32_000
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -132,17 +137,41 @@ def process_command(
                 os.kill(pid, 0)
                 return _DEFERRED_PROCESSING
             except (OSError, ValueError):
-                stderr = "Mailbox command runner exited without recording an exit code."
-                stdout = ""
-                returncode = 255
                 try:
                     started = float(started_path.read_text().strip())
                 except (OSError, ValueError):
                     started = time.time()
                 duration = max(0.0, time.time() - started)
+
+                partial_stdout = stdout_path.read_text(errors="replace") if stdout_path.exists() else ""
+                partial_stderr = stderr_path.read_text(errors="replace") if stderr_path.exists() else ""
+
+                outcome = evaluate_interrupted_command(state_dir, repo_path)
+                returncode = {"succeeded": 0, "failed": 1, "unknown": 255}[outcome.status]
+                evidence_line = f"[restart recovery: {outcome.status}] {outcome.evidence}"
+                raw_stderr = (
+                    partial_stderr.rstrip("\n") + "\n" if partial_stderr.strip() else ""
+                ) + evidence_line
+
+                # Persist the recovered outcome once so a later poll (including
+                # one triggered by a second restart) reads this cached result
+                # via the exit_path branch above instead of re-deriving it —
+                # this is what keeps the eventual Outbox reply a single,
+                # idempotent publication.
+                try:
+                    exit_path.write_text(str(returncode))
+                    stderr_path.write_text(raw_stderr)
+                except OSError:
+                    logger.warning(
+                        "Failed to persist recovered mailbox command result in %s", state_dir
+                    )
+
+                stdout = _bounded_redacted(partial_stdout)
+                stderr = _bounded_redacted(raw_stderr)
         else:
             state_dir.mkdir(parents=True, exist_ok=True)
             started_path.write_text(str(time.time()))
+            write_recovery_state(state_dir, repo_path)
             wrapper = (
                 "set +e\n(" + command + "\n)\n"
                 "rc=$?\n"
