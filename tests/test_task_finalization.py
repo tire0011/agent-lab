@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from modules.experiment_adoption_service import (
+    STATUS_ADOPTED,
+    STATUS_NOT_STARTED,
+    STATUS_QUEUED,
+)
+from modules.mailbox.task_service import MailboxTaskService
+from modules.task_finalization import (
+    PHASE_MERGING,
+    PHASE_RESTART_REQUESTED,
+    PHASE_SUCCEEDED,
+    FinalizationResult,
+    TaskFinalizationCoordinator,
+)
+
+
+class _FakeAdoptionService:
+    def __init__(self, adoption):
+        self.adoption = adoption
+        self.starts = 0
+
+    def get(self, experiment_id):
+        return self.adoption
+
+    def start_adoption(self, experiment_id):
+        self.starts += 1
+        self.adoption.status = STATUS_QUEUED
+        return self.adoption
+
+
+class TaskFinalizationCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db_path = str(self.tmp / "nexus.db")
+        self.approval = SimpleNamespace(id="approval-1", task_body="Add --version and expose it in /health")
+        self.experiment = SimpleNamespace(id="experiment-1")
+
+    def _coordinator(self, adoption_service, **kwargs):
+        return TaskFinalizationCoordinator(
+            experiment_service=MagicMock(),
+            github_work_tracking=MagicMock(),
+            db_path=self.db_path,
+            repo_root=str(self.tmp),
+            adoption_service=adoption_service,
+            restart_runner=kwargs.pop("restart_runner", lambda services: None),
+            live_validator=kwargs.pop(
+                "live_validator", lambda approval, experiment: {"summary": "live ok"}
+            ),
+            **kwargs,
+        )
+
+    def test_verified_experiment_starts_existing_adoption_pipeline(self):
+        adoption = SimpleNamespace(
+            status=STATUS_NOT_STARTED,
+            reason=None,
+            integrated_commit_sha=None,
+            local_sync_pending=False,
+        )
+        fake = _FakeAdoptionService(adoption)
+        coordinator = self._coordinator(fake)
+        self.addCleanup(coordinator.close)
+
+        result = coordinator.advance(self.approval, self.experiment)
+
+        self.assertEqual(result.status, "running")
+        self.assertEqual(result.phase, PHASE_MERGING)
+        self.assertEqual(fake.starts, 1)
+        self.assertEqual(coordinator.get_phase(self.approval.id), PHASE_MERGING)
+
+    def test_adopted_change_requests_restart_before_live_success(self):
+        restart_calls = []
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(
+            _FakeAdoptionService(adoption),
+            restart_runner=lambda services: restart_calls.append(services),
+            process_started_at=time.time(),
+        )
+        self.addCleanup(coordinator.close)
+
+        result = coordinator.advance(self.approval, self.experiment)
+
+        self.assertEqual(result.status, "running")
+        self.assertEqual(result.phase, PHASE_RESTART_REQUESTED)
+        self.assertEqual(restart_calls, [["nexus-mailbox", "agent-api"]])
+
+    def test_restart_resume_runs_live_validation_and_finishes(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        fake = _FakeAdoptionService(adoption)
+        first = self._coordinator(
+            fake,
+            restart_runner=lambda services: None,
+            process_started_at=time.time(),
+        )
+        first_result = first.advance(self.approval, self.experiment)
+        self.assertEqual(first_result.phase, PHASE_RESTART_REQUESTED)
+        first.close()
+
+        live_calls = []
+        resumed = self._coordinator(
+            fake,
+            process_started_at=time.time() + 60,
+            live_validator=lambda approval, experiment: (
+                live_calls.append((approval.id, experiment.id))
+                or {"summary": "health and version match"}
+            ),
+        )
+        self.addCleanup(resumed.close)
+
+        result = resumed.advance(self.approval, self.experiment)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.phase, PHASE_SUCCEEDED)
+        self.assertEqual(live_calls, [(self.approval.id, self.experiment.id)])
+        self.assertEqual(resumed.get_phase(self.approval.id), PHASE_SUCCEEDED)
+
+
+class FinalizingMailboxTaskServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _service(self, result: FinalizationResult):
+        exp = MagicMock()
+        exp.id = "experiment-1"
+        exp.status = "succeeded"
+        exp.quality_evaluation = {"outcome": "pass"}
+        exp.test_command = ["python", "-m", "unittest"]
+        exp.test_exit_code = 0
+        exp.test_output = "ok"
+        exp.diff_stat = "1 file changed"
+        exp.error = None
+        exp_service = MagicMock()
+        exp_service.get_experiment.return_value = exp
+        coordinator = MagicMock()
+        coordinator.advance.return_value = result
+        github = MagicMock()
+        service = MailboxTaskService(
+            db_path=str(self.tmp / "task.db"),
+            experiment_service=exp_service,
+            outbox_dir=str(self.tmp / "outbox"),
+            repo_path=str(self.tmp),
+            operations_registry=MagicMock(),
+            github_work_tracking=github,
+            finalization_coordinator=coordinator,
+            task_log_dir=str(self.tmp / "logs"),
+        )
+        message = service._conn.execute(
+            """INSERT INTO mailbox_messages
+               (file_path, source_commit_sha, msg_type, created_by, status, received_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("/tmp/task.md", "abc", "task", "tester", "done", "2026-09-05T00:00:00Z"),
+        )
+        approval = service.create_approval(
+            message.lastrowid,
+            "Add --version and /health version",
+            "tester",
+            "/tmp/task.md",
+            "2026-09-05T00:00:00Z",
+        )
+        with service._conn:
+            service._conn.execute(
+                """UPDATE mailbox_task_approvals
+                   SET status=?, experiment_id=? WHERE id=?""",
+                ("running", exp.id, approval.id),
+            )
+        return service, coordinator, approval, exp
+
+    def test_verification_success_is_not_task_success_while_finalizing(self):
+        service, coordinator, approval, exp = self._service(
+            FinalizationResult("running", PHASE_MERGING, "adoption started")
+        )
+        self.addCleanup(service.close)
+
+        service.poll_running()
+
+        current = service.get(approval.id)
+        self.assertEqual(current.status, "running")
+        self.assertIn("finalization=merging", current.result_summary)
+        coordinator.advance.assert_called_once()
+        self.assertEqual(list((self.tmp / "outbox").glob("*.md")), [])
+
+    def test_task_succeeds_only_after_live_validation_result(self):
+        service, coordinator, approval, exp = self._service(
+            FinalizationResult("succeeded", PHASE_SUCCEEDED, "health and version match")
+        )
+        self.addCleanup(service.close)
+
+        service.poll_running()
+
+        current = service.get(approval.id)
+        self.assertEqual(current.status, "succeeded")
+        self.assertIn("finalization=succeeded", current.result_summary)
+        self.assertTrue(list((self.tmp / "outbox").glob("*.md")))
+
+
+if __name__ == "__main__":
+    unittest.main()
