@@ -15,17 +15,6 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
         super().__init__(*args, **kwargs)
         self.finalization_coordinator = finalization_coordinator
         self._owns_finalization_coordinator = finalization_coordinator is None
-        if self.finalization_coordinator is None and self.experiment_service is not None:
-            # Lazy import is important: ExperimentAdoptionService itself imports
-            # MailboxLock from the package facade while modules are bootstrapping.
-            from modules.task_finalization import TaskFinalizationCoordinator
-
-            self.finalization_coordinator = TaskFinalizationCoordinator(
-                experiment_service=self.experiment_service,
-                github_work_tracking=self.github_work_tracking,
-                db_path=self.db_path,
-                repo_root=str(self.repo_path),
-            )
 
     def close(self) -> None:
         if self._owns_finalization_coordinator and self.finalization_coordinator is not None:
@@ -67,14 +56,37 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
                 self._transition_terminal(approval, _base._STATUS_NEEDS_REVIEW, exp)
 
     def _advance_verified(self, approval: Any, exp: Any) -> None:
-        if self.finalization_coordinator is None:
-            self._transition_finalization_terminal(
-                approval,
-                exp,
-                _base._STATUS_NEEDS_REVIEW,
-                "verification passed, but autonomous finalization is unavailable",
-            )
+        # Old/non-development callers can still produce synthetic succeeded
+        # experiments without the deterministic quality record.  Only real
+        # verified development experiments enter the autonomous merge/deploy loop.
+        if not isinstance(getattr(exp, "quality_evaluation", None), dict):
+            self._transition_terminal(approval, _base._STATUS_SUCCEEDED, exp)
             return
+
+        if self.finalization_coordinator is None:
+            try:
+                # Lazy import avoids the ExperimentAdoptionService -> mailbox
+                # package bootstrap cycle and avoids constructing deployment
+                # machinery for tasks that never reach verification success.
+                from modules.task_finalization import TaskFinalizationCoordinator
+
+                self.finalization_coordinator = TaskFinalizationCoordinator(
+                    experiment_service=self.experiment_service,
+                    github_work_tracking=self.github_work_tracking,
+                    db_path=self.db_path,
+                    repo_root=str(self.repo_path),
+                )
+            except Exception as exc:
+                logger.exception("mailbox_task: could not initialize finalization coordinator")
+                self._transition_finalization_terminal(
+                    approval,
+                    exp,
+                    _base._STATUS_NEEDS_REVIEW,
+                    f"verification passed, but autonomous finalization could not start: "
+                    f"{_base._safe_error(str(exc)) or type(exc).__name__}",
+                )
+                return
+
         try:
             result = self.finalization_coordinator.advance(approval, exp)
         except Exception as exc:
