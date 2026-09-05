@@ -83,3 +83,10 @@ __all__ = [
     "read_inbox_preview",
     "redact",
 ]
+
+# Keep the historic ``modules.mailbox.task_service`` import surface while
+# extending its service with the persisted post-verification lifecycle.
+from .finalizing_task_service import install as _install_finalizing_task_service
+
+_install_finalizing_task_service()
+del _install_finalizing_task_service
