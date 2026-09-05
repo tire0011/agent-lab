@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from modules.task_finalization import FinalizationResult, TaskFinalizationCoordinator
 from . import task_service as _base
 
 logger = logging.getLogger(__name__)
@@ -17,6 +16,10 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
         self.finalization_coordinator = finalization_coordinator
         self._owns_finalization_coordinator = finalization_coordinator is None
         if self.finalization_coordinator is None and self.experiment_service is not None:
+            # Lazy import is important: ExperimentAdoptionService itself imports
+            # MailboxLock from the package facade while modules are bootstrapping.
+            from modules.task_finalization import TaskFinalizationCoordinator
+
             self.finalization_coordinator = TaskFinalizationCoordinator(
                 experiment_service=self.experiment_service,
                 github_work_tracking=self.github_work_tracking,
@@ -73,7 +76,7 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
             )
             return
         try:
-            result: FinalizationResult = self.finalization_coordinator.advance(approval, exp)
+            result = self.finalization_coordinator.advance(approval, exp)
         except Exception as exc:
             logger.exception("mailbox_task: finalization failed for %s", exp.id)
             self._transition_finalization_terminal(
