@@ -18,6 +18,16 @@ if ($Status.Count -gt 0) {
     throw 'Commit, stash, or remove the local changes before refreshing Nexus.'
 }
 
+git -C $RepoRoot fetch origin main
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not fetch origin/main.'
+}
+
+git -C $RepoRoot switch main
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not switch the Nexus checkout to main.'
+}
+
 git -C $RepoRoot pull --ff-only origin main
 if ($LASTEXITCODE -ne 0) {
     throw 'Nexus pull failed. No merge or reset was performed.'
