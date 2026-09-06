@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -13,6 +14,62 @@ from unittest.mock import patch
 from modules import mailbox
 from modules.mailbox.development import development_mode_enabled, install, process_command
 from modules.run_store import init_db
+
+
+def _make_repo_with_remote(tmp: Path) -> Path:
+    """Create a git repo at tmp/repo with an ``origin`` remote tracking master."""
+    remote = tmp / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    repo = tmp / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"], cwd=str(repo), check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), check=True, capture_output=True)
+    (repo / "README.md").write_text("# test\n")
+    subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)], cwd=str(repo), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "HEAD:master"], cwd=str(repo), check=True, capture_output=True
+    )
+    return repo
+
+
+def _reap_pid_file(pid_path: Path, timeout: float = 5.0) -> None:
+    """Wait for and reap the process recorded in *pid_path*.
+
+    In production each mailbox poll is a fresh OS process, so a detached
+    command runner that dies is immediately reaped by init and a later
+    ``os.kill(pid, 0)`` correctly reports it as gone. In this test the
+    *test process itself* is the runner's parent, so without an explicit
+    ``waitpid`` it would remain a zombie — still visible to ``kill(pid, 0)``
+    — for as long as the test process runs. This reproduces the production
+    condition instead of the test-harness artifact.
+    """
+    deadline = time.monotonic() + timeout
+    pid = None
+    while time.monotonic() < deadline:
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text().strip())
+                break
+            except ValueError:
+                pass
+        time.sleep(0.02)
+    assert pid is not None, "command runner never recorded a pid"
+
+    while time.monotonic() < deadline:
+        try:
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if reaped_pid == pid:
+            return
+        time.sleep(0.05)
 
 
 class TestMailboxDevelopment(unittest.TestCase):
@@ -93,6 +150,116 @@ class TestMailboxDevelopment(unittest.TestCase):
                 body, _ = self._run_command(msg, Path(tmp))
         self.assertIn("**Exit code:** 0", body)
         self.assertIn("agent-api status check", body)
+
+    def test_command_recovers_verified_success_when_worker_is_killed_before_exit_code(self):
+        """Regression test for Issue #123: a self-restarting command (like
+        ``refresh.sh``) whose runner is killed before it records an exit code
+        must be recovered as a verified success, not a misleading Exit code
+        255 — and a repeated poll must not re-derive or duplicate the reply.
+
+        The command declares ``recovery_services: none``, i.e. that reaching
+        a clean, converged git state *is* its complete expected state (per
+        the PR #124 review: git convergence alone is not sufficient proof
+        unless a command explicitly says so).
+        """
+        msg = SimpleNamespace(
+            body="git commit --allow-empty -m recovered && git push origin HEAD:master && kill -9 $$",
+            meta={"recovery_services": "none"},
+        )
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_with_remote(Path(tmp))
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                first = process_command(msg, repo, None, 1)
+                self.assertIs(first, mailbox._DEFERRED_PROCESSING)
+                _reap_pid_file(Path(tmp) / "jobs" / "1" / "pid")
+
+                deadline = time.monotonic() + 5
+                result = process_command(msg, repo, None, 1)
+                while result is mailbox._DEFERRED_PROCESSING:
+                    if time.monotonic() >= deadline:
+                        self.fail("worker was not observed as terminated")
+                    time.sleep(0.05)
+                    result = process_command(msg, repo, None, 1)
+                body, idea_id = result
+
+                # A second poll (simulating a further restart) must return the
+                # same cached exit code/stdout/stderr rather than recomputing
+                # or duplicating the recovery evidence (only the live-computed
+                # "Duration" line is expected to differ between polls).
+                second_body, _ = process_command(msg, repo, None, 1)
+
+        self.assertIn("**Exit code:** 0", body)
+        self.assertIn("restart recovery: succeeded", body)
+        self.assertIsNone(idea_id)
+
+        def _without_duration(text: str) -> str:
+            return "\n".join(line for line in text.splitlines() if not line.startswith("**Duration:**"))
+
+        self.assertEqual(_without_duration(body), _without_duration(second_body))
+
+    def test_command_recovery_is_unknown_not_success_without_declared_recovery_services(self):
+        """Review finding on PR #124: a command that never declares
+        recovery_services must not have git convergence alone promoted to
+        success — that only proves a git update step completed, not that a
+        multi-step command (e.g. a restart after the pull) finished.
+        """
+        msg = SimpleNamespace(
+            body="git commit --allow-empty -m recovered && git push origin HEAD:master && kill -9 $$",
+            meta={},
+        )
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_with_remote(Path(tmp))
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                first = process_command(msg, repo, None, 1)
+                self.assertIs(first, mailbox._DEFERRED_PROCESSING)
+                _reap_pid_file(Path(tmp) / "jobs" / "1" / "pid")
+
+                deadline = time.monotonic() + 5
+                result = process_command(msg, repo, None, 1)
+                while result is mailbox._DEFERRED_PROCESSING:
+                    if time.monotonic() >= deadline:
+                        self.fail("worker was not observed as terminated")
+                    time.sleep(0.05)
+                    result = process_command(msg, repo, None, 1)
+                body, _ = result
+
+        self.assertIn("**Exit code:** 255", body)
+        self.assertIn("restart recovery: unknown", body)
+        self.assertNotIn("restart recovery: succeeded", body)
+
+    def test_command_recovers_verified_failure_when_worker_is_killed_without_converging(self):
+        """A killed worker that changed the repo but never reached a clean
+        state matching its upstream must be reported as a real failure with
+        evidence, not silently treated as success.
+        """
+        msg = SimpleNamespace(
+            body="git commit --allow-empty -m unpushed && kill -9 $$",
+            meta={},
+        )
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_with_remote(Path(tmp))
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                first = process_command(msg, repo, None, 1)
+                self.assertIs(first, mailbox._DEFERRED_PROCESSING)
+                _reap_pid_file(Path(tmp) / "jobs" / "1" / "pid")
+
+                deadline = time.monotonic() + 5
+                result = process_command(msg, repo, None, 1)
+                while result is mailbox._DEFERRED_PROCESSING:
+                    if time.monotonic() >= deadline:
+                        self.fail("worker was not observed as terminated")
+                    time.sleep(0.05)
+                    result = process_command(msg, repo, None, 1)
+                body, _ = result
+
+        self.assertIn("**Exit code:** 1", body)
+        self.assertIn("restart recovery: failed", body)
 
     def test_task_is_approved_without_human_step(self):
         install(mailbox)
