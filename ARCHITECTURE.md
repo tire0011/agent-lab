@@ -95,16 +95,22 @@
   message type runs the shell command as a detached background job so
   Nexus-restarting commands (e.g. `refresh.sh`) survive across mailbox
   polls. Before spawning, a local `git rev-parse HEAD` of the working
-  directory is persisted next to the job state. If a later poll finds the
-  runner's pid gone with no exit code recorded, it evaluates that baseline
-  against the current repo state (HEAD vs. upstream, clean tree) instead of
-  reporting a bare `Exit code: 255`: a clean HEAD matching upstream is a
-  verified success, a HEAD that moved but did not converge is a verified
-  failure, and anything without usable git evidence (non-git directory, no
-  baseline, unchanged HEAD) is reported as unknown. The verdict is persisted
-  to the job's exit-code/stderr files the first time it is computed, so a
-  further restart replays the same cached reply instead of re-deriving or
-  duplicating it.
+  directory is persisted next to the job state, together with an optional
+  `recovery_services` front-matter field the message can use to declare
+  what "complete" means for it. If a later poll finds the runner's pid gone
+  with no exit code recorded, it evaluates that baseline against the
+  current repo state instead of reporting a bare `Exit code: 255`: a HEAD
+  that moved but never converges to a clean commit matching its upstream is
+  always a verified failure; git convergence by itself is reported as
+  unknown (proving only that a git update step ran, not that the rest of a
+  multi-step command such as a post-pull restart ever completed) unless the
+  message declared `recovery_services: none` (git convergence is its whole
+  expected state) or `recovery_services: svc-a, svc-b` (converged git *and*
+  every listed systemd unit active is success; converged git with any
+  listed unit inactive is a verified failure, not a false success). The
+  verdict is persisted to the job's exit-code/stderr files the first time it
+  is computed, so a further restart replays the same cached reply instead
+  of re-deriving or duplicating it.
 
 ### 7) Mailbox task approval bridge
 

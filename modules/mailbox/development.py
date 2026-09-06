@@ -18,7 +18,11 @@ from typing import Any
 
 from modules.redaction import redact
 
-from .command_recovery import evaluate_interrupted_command, write_recovery_state
+from .command_recovery import (
+    evaluate_interrupted_command,
+    parse_expected_services,
+    write_recovery_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +175,9 @@ def process_command(
         else:
             state_dir.mkdir(parents=True, exist_ok=True)
             started_path.write_text(str(time.time()))
-            write_recovery_state(state_dir, repo_path)
+            write_recovery_state(
+                state_dir, repo_path, parse_expected_services(msg.meta)
+            )
             wrapper = (
                 "set +e\n(" + command + "\n)\n"
                 "rc=$?\n"
