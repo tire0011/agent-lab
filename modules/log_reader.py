@@ -138,7 +138,11 @@ class LogReader:
         return [redact(l) for l in raw_lines]
 
     async def tail_journal_entries(
-        self, service: str, lines: int = _DEFAULT_LINES, before: str | None = None,
+        self,
+        service: str,
+        lines: int = _DEFAULT_LINES,
+        before: str | None = None,
+        search: str | None = None,
     ) -> list[dict]:
         """Return up to *lines* parsed, structured-shaped journal entries
         for *service*, raising if the read failed (journalctl missing,
@@ -168,6 +172,16 @@ class LogReader:
             until_value = _journal_until_value(before)
             if until_value:
                 args.append(f"--until={until_value}")
+        if search and search.strip():
+            # Push the search into journalctl itself, so the *whole*
+            # retained journal is searched and `-n` then keeps the newest
+            # matches - filtering the newest N lines here in Python
+            # instead would only ever find a match inside that window.
+            # The term is escaped: `--grep` is a regex, and an operator's
+            # free-text search (a path, a bracketed prefix, ...) must be
+            # matched literally rather than reinterpreted as a pattern.
+            args.append(f"--grep={re.escape(search.strip())}")
+            args.append("--case-sensitive=false")
         returncode, out = await _run_journalctl(args)
         if returncode != 0:
             raise RuntimeError(f"journalctl failed for {service} (exit code {returncode})")
@@ -187,6 +201,7 @@ class LogReader:
         services: tuple[str, ...] = NEXUS_JOURNAL_SERVICES,
         lines: int = 100,
         before: str | None = None,
+        search: str | None = None,
     ) -> tuple[list[dict], dict[str, str]]:
         """Fetch and merge journal entries for every service in *services*
         concurrently. One service failing (unavailable journalctl, unknown
@@ -197,7 +212,9 @@ class LogReader:
         """
         async def _one(service: str) -> tuple[str, list[dict], str | None]:
             try:
-                return service, await self.tail_journal_entries(service, lines, before=before), None
+                return service, await self.tail_journal_entries(
+                    service, lines, before=before, search=search,
+                ), None
             except Exception as exc:  # noqa: BLE001 - reported per source, never raised
                 return service, [], str(exc)
 

@@ -40,6 +40,27 @@
 - Endpoints:
   - `GET /health` (public)
   - `GET /secure-health` (requires `x-api-key` matching `AGENT_API_KEY`)
+  - `GET /logs` (no auth, see DECISIONS.md D-012) — one merged,
+    chronological timeline across every experiment/mailbox-task/chat log
+    plus the `agent-api`/`nexus-mailbox`/`llama-server` journals.
+    `search` is executed inside the read path (a bounded full scan of the
+    retained JSONL history, plus `journalctl --grep`), so it finds matches
+    anywhere in history rather than only within the page being displayed;
+    `truncated: true` reports that the scan hit its byte/file budget.
+    `level`/`phase`/`source`/`experiment_id`/`mailbox_task_id`/`job_id`/
+    `session_id` narrow the feed, and `cursor` pages further back.
+  - `GET /logs/public` — backwards-compatible alias of `GET /logs`,
+    returning the identical complete entries (the former reduced
+    allowlist is gone).
+  - `GET /logs/trace/{reference}` (no auth) — everything Nexus did for
+    one order. `reference` may be an inbox message filename, an
+    experiment id, a mailbox task id, a controller session or chat job
+    id, or any distinctive fragment; `modules/log_trace.py` finds the
+    entries that reference identifies, reads the correlation ids off
+    them, and expands until the whole chain (mailbox intake → approval →
+    controller → implementation → verification → result) is returned,
+    with a `summary` derived from those same entries. An unresolvable
+    reference returns `found: false`, not a 404.
   - `GET /status`, `GET /problems`, `GET /ideas`, `POST /chat` (read-only; consistent data via `data_sources.py`)
   - `POST /mcp/` (requires `x-api-key`) — mounted Streamable HTTP MCP adapter
     that reuses the existing API/service logic for read-only Nexus inspection

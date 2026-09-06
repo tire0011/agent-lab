@@ -54,6 +54,7 @@ from models import (
     ExperimentDetail,
     ExperimentLogEntry,
     ExperimentLogsResponse,
+    LogTraceResponse,
     UnifiedLogsResponse,
     ExperimentsResponse,
     GitCommitPushRequest,
@@ -98,6 +99,7 @@ from modules.operations_executor import OperationsExecutor
 from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApprovalOutboxPublisher
 from modules.redaction import sanitized_reason as _sanitized_reason
 from modules import central_logging as central_logging_module
+from modules import log_trace as log_trace_module
 from modules.logging_config import configure_logging
 from modules.maintenance_service import (
     MaintenanceAuthError,
@@ -939,7 +941,6 @@ _UNIFIED_LOGS_JOURNAL_LINES = 100
 
 @app.get("/logs", response_model=UnifiedLogsResponse)
 async def get_unified_logs(
-    x_api_key: str | None = Header(default=None),
     level: str | None = Query(default=None),
     phase: str | None = Query(default=None),
     source: str | None = Query(default=None),
@@ -981,8 +982,6 @@ async def get_unified_logs(
     entry across pages; if a journal source cannot be read, its failure
     is reported in ``source_errors`` rather than emptying the whole feed.
     """
-    authorize(x_api_key)
-
     if level is not None and level.upper() not in _LOG_LEVELS:
         raise HTTPException(status_code=400, detail="invalid level filter")
 
@@ -1007,7 +1006,7 @@ async def get_unified_logs(
         # journal entries below: the final page can never need more than
         # `limit + 1` structured entries regardless of how many extra
         # journal candidates are merged in alongside them.
-        raw_entries = central_logging_module.read_all_log_entries(
+        scan = central_logging_module.scan_log_entries(
             service.experiment_log_dir,
             experiment_id=resolved_experiment_id,
             mailbox_task_id=resolved_mailbox_task_id,
@@ -1015,6 +1014,7 @@ async def get_unified_logs(
             session_id=session_id,
             level=level,
             phase=phase,
+            search=search,
             limit=limit + 1,
             before=cursor,
         )
@@ -1022,6 +1022,7 @@ async def get_unified_logs(
         _logger.error("unified log read failed: %s", _sanitized_reason(str(exc)))
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
+    raw_entries = scan.entries
     _apply_log_source(raw_entries)
 
     # The journal is only merged into the unfiltered-by-id feed, so
@@ -1045,7 +1046,7 @@ async def get_unified_logs(
         # rather than risking an incorrectly-scoped, possibly
         # duplicate-producing query.
         journal_entries, errors = await log_reader.read_all_journal_entries(
-            lines=_UNIFIED_LOGS_JOURNAL_LINES, before=journal_before,
+            lines=_UNIFIED_LOGS_JOURNAL_LINES, before=journal_before, search=search,
         )
         if decoded_cursor is not None:
             # `journalctl --until` only has second precision and is
@@ -1072,14 +1073,11 @@ async def get_unified_logs(
     if source:
         wanted = source.strip().lower()
         merged_entries = [e for e in merged_entries if str(e.get("source", "")).lower() == wanted]
-    if search and search.strip():
-        needle = search.strip().lower()
-        merged_entries = [
-            e for e in merged_entries
-            if needle in str(e.get("message") or "").lower()
-            or needle in str(e.get("event") or "").lower()
-            or needle in str(e.get("phase") or "").lower()
-        ]
+    # `search` is deliberately *not* re-applied here: it is pushed down
+    # into both readers (the JSONL scan and `journalctl --grep`), so it
+    # searches the whole retained history. Filtering here as well would
+    # re-introduce the original bug's blind spot - matches would again be
+    # limited to whatever one page happened to contain.
 
     # One shared sort + cursor scheme (see `_UNIFIED_LOGS_JOURNAL_LINES`
     # above) spans structured and journal entries alike, so the
@@ -1097,7 +1095,58 @@ async def get_unified_logs(
             # A malformed entry must not fail the whole response.
             continue
     return UnifiedLogsResponse(
-        count=len(entries), entries=entries, next_cursor=next_cursor, source_errors=source_errors,
+        count=len(entries), entries=entries, next_cursor=next_cursor,
+        source_errors=source_errors, truncated=scan.truncated,
+    )
+
+
+@app.get("/logs/trace/{reference:path}", response_model=LogTraceResponse)
+def get_log_trace(
+    reference: str,
+    limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> LogTraceResponse:
+    """Everything Nexus did for one order, from any reference to it.
+
+    ``GET /logs`` answers "what happened recently"; this answers "Nexus
+    was given this - what did it actually do?". *reference* can be an
+    experiment id, a mailbox task id, a controller session or chat job
+    id, an inbox message filename, or any distinctive fragment (part of
+    an error, part of a command): the resolver finds whatever entries
+    that identifies, reads the correlation ids off them, and pulls in
+    everything sharing those ids, so the whole chain - mailbox intake,
+    approval, controller decisions, implementation, verification, result
+    - comes back from any single point in it.
+
+    An unresolvable reference returns ``found: false`` with an empty
+    timeline rather than a 404: "I looked and found nothing" is a useful
+    answer here, and is not the same as a broken route.
+    """
+    try:
+        trace = log_trace_module.resolve_trace(
+            service.experiment_log_dir, reference, limit=limit,
+        )
+    except OSError as exc:
+        _logger.error("log trace read failed: %s", _sanitized_reason(str(exc)))
+        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
+
+    raw_entries = _apply_log_source(trace.entries)
+    entries: list[ExperimentLogEntry] = []
+    for raw in raw_entries:
+        try:
+            entries.append(ExperimentLogEntry(**raw))
+        except Exception:
+            # A malformed entry must not fail the whole trace.
+            continue
+
+    return LogTraceResponse(
+        reference=reference,
+        found=trace.found,
+        correlation_ids=trace.correlation_ids,
+        summary=log_trace_module.summarize(raw_entries),
+        count=len(entries),
+        entries=entries,
+        truncated=trace.truncated,
     )
 
 
@@ -1593,68 +1642,46 @@ def get_public_diagnostics(
     )
 
 
-@app.get("/logs/public", response_model=PublicUnifiedLogsResponse)
-def get_public_unified_logs(
+@app.get("/logs/public", response_model=UnifiedLogsResponse)
+async def get_public_unified_logs(
     level: str | None = Query(default=None),
     phase: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    search: str | None = Query(default=None),
     experiment_id: str | None = Query(default=None),
     mailbox_task_id: str | None = Query(default=None),
+    job_id: str | None = Query(default=None),
+    session_id: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=PUBLIC_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=PUBLIC_LOGS_MAX_LIMIT),
+    limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
+    include_journal: bool = Query(default=True),
     service: ExperimentService = Depends(get_experiment_service),
-) -> PublicUnifiedLogsResponse:
-    """Unauthenticated equivalent of ``GET /logs``, for the Logs tab's
-    default view before an API key has been entered.
+    log_reader: LogReader = Depends(get_log_reader),
+) -> UnifiedLogsResponse:
+    """Backwards-compatible alias of ``GET /logs``.
 
-    Reuses the same central multi-source read path (``read_all_log_entries``)
-    as the authenticated feed, so the unauthenticated fallback is no longer
-    limited to per-experiment diagnostic summaries - but every entry is
-    re-shaped through ``PublicLogEntry``'s strict allowlist, which drops
-    command/cwd/stdout/stderr/exception/stacktrace/job_id/session_id.
-    Only ``message`` (already redacted on both the write and read path -
-    see ``modules.redaction``) and coarse phase/event/level/timestamp/id
-    fields are exposed, matching what ``/diagnostics/public`` already
-    surfaces via ``diagnostic_messages``/``failure_summary``.
+    Both routes now return the identical, complete timeline: reading logs
+    needs neither an API key nor a reduced allowlist (see DECISIONS.md
+    D-012 - this is a single-operator experiment VM, and analysis is the
+    point of the log surface). Kept as a separate path only so existing
+    clients and bookmarks continue to work; it delegates rather than
+    maintaining a second read implementation that could drift.
     """
-    if level is not None and level.upper() not in _LOG_LEVELS:
-        raise HTTPException(status_code=400, detail="invalid level filter")
-
-    resolved_experiment_id = experiment_id
-    if experiment_id:
-        try:
-            resolved_experiment_id = service.resolve_experiment(experiment_id).id
-        except ExperimentNotFoundError:
-            return PublicUnifiedLogsResponse(count=0, entries=[])
-
-    resolved_mailbox_task_id = mailbox_task_id
-    if resolved_experiment_id and not resolved_mailbox_task_id:
-        resolved_mailbox_task_id = _mailbox_task_id(service, resolved_experiment_id)
-
-    try:
-        raw_entries = central_logging_module.read_all_log_entries(
-            service.experiment_log_dir,
-            experiment_id=resolved_experiment_id,
-            mailbox_task_id=resolved_mailbox_task_id,
-            level=level,
-            phase=phase,
-            limit=limit + 1,
-            before=cursor,
-        )
-    except OSError as exc:
-        _logger.error("public unified log read failed: %s", _sanitized_reason(str(exc)))
-        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
-
-    raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
-    _apply_log_source(raw_entries)
-
-    entries: list[PublicLogEntry] = []
-    for raw in raw_entries:
-        try:
-            entries.append(PublicLogEntry(**raw))
-        except Exception:
-            # A malformed entry must not fail the whole response.
-            continue
-    return PublicUnifiedLogsResponse(count=len(entries), entries=entries, next_cursor=next_cursor)
+    return await get_unified_logs(
+        level=level,
+        phase=phase,
+        source=source,
+        search=search,
+        experiment_id=experiment_id,
+        mailbox_task_id=mailbox_task_id,
+        job_id=job_id,
+        session_id=session_id,
+        cursor=cursor,
+        limit=limit,
+        include_journal=include_journal,
+        service=service,
+        log_reader=log_reader,
+    )
 
 
 # ── Maintenance API ───────────────────────────────────────────────────────────

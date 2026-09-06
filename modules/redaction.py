@@ -14,7 +14,26 @@ internal paths, environment variables, prompts, or credentials.
 
 from __future__ import annotations
 
+import os
 import re
+
+# Credentials whose *literal value* is scrubbed wherever it appears, in
+# addition to the keyword/shape patterns below. The patterns only catch a
+# secret that is introduced by a recognizable keyword ("api_key=", "Bearer
+# ", "sk-..."); a bare value echoed on its own - by a shell command, a
+# config dump, a stack trace - would otherwise pass straight through.
+# That matters because the log surface is readable without an API key
+# (see DECISIONS.md D-012), so a leaked AGENT_API_KEY would hand a reader
+# the *write* endpoints, including shell-backed operations.
+_SECRET_ENV_VARS = (
+    "AGENT_API_KEY",
+    "AGENT_GITHUB_WEBHOOK_SECRET",
+    "GITHUB_TOKEN",
+    "AZURE_OPENAI_API_KEY",
+)
+# Short values are ignored: a 1-2 character secret would otherwise match
+# almost every line and destroy the logs' usefulness.
+_MIN_SECRET_VALUE_CHARS = 8
 
 _SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)(\s*[:=]\s*|\s+)\S+"
@@ -40,6 +59,20 @@ _REMOTE_URL_PATTERN = re.compile(
 _PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
 
 
+def redact_known_secret_values(text: str) -> str:
+    """Scrub the literal values of this process's configured credentials.
+
+    Complements the shape/keyword patterns: those need a recognizable
+    marker next to the secret, this one matches the value itself no
+    matter how it was printed.
+    """
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name, "").strip()
+        if len(value) >= _MIN_SECRET_VALUE_CHARS and value in text:
+            text = text.replace(value, "[REDACTED]")
+    return text
+
+
 def redact_secrets(text: str) -> str:
     """Scrub secret-shaped substrings while preserving filesystem paths.
 
@@ -47,6 +80,7 @@ def redact_secrets(text: str) -> str:
     trusted local runner actually executed, including its interpreter), and
     where the value never reaches a persisted activity log or API response.
     """
+    text = redact_known_secret_values(text)
     text = _URL_CRED_PATTERN.sub("[REDACTED]", text)
     text = _REMOTE_URL_PATTERN.sub("[REMOTE]", text)
     text = _BEARER_PATTERN.sub("[REDACTED]", text)

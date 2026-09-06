@@ -81,13 +81,27 @@ class UnifiedLogsApiTests(unittest.TestCase):
         time.sleep(0.005)
         elog_a.error("implementation", "codex_failed", "implementation raised")
 
-    def test_requires_api_key(self):
+    def test_readable_without_an_api_key(self):
+        """Reading logs is intentionally open (DECISIONS.md D-012): this is
+        a single-operator experiment VM and analysis is the whole point of
+        the log surface."""
         response = self.client.get("/logs")
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 200)
 
-    def test_rejects_wrong_api_key(self):
+    def test_readable_with_a_wrong_api_key(self):
         response = self.client.get("/logs", headers={"x-api-key": "wrong"})
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 200)
+
+    def test_opening_reads_did_not_open_writes(self):
+        """Opening the log surface must not have relaxed anything else:
+        write endpoints still require the API key."""
+        for method, path in (
+            ("post", "/experiments/exp-a/adopt"),
+            ("get", "/mailbox/tasks"),
+        ):
+            with self.subTest(path=path):
+                response = getattr(self.client, method)(path)
+                self.assertEqual(response.status_code, 401)
 
     def test_no_log_files_returns_empty_entries(self):
         response = self.client.get("/logs", headers={"x-api-key": "test-key"})

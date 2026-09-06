@@ -521,6 +521,10 @@ class UnifiedLogsResponse(BaseModel):
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
     next_cursor: str | None = None
     source_errors: dict[str, str] | None = None
+    # True when the scan stopped at its byte/file budget before reaching
+    # the oldest history, so a caller can say "there may be older matches"
+    # instead of presenting a partial search as an exhaustive one.
+    truncated: bool = False
 
 
 class PublicLogEntry(BaseModel):
@@ -543,6 +547,25 @@ class PublicLogEntry(BaseModel):
     mailbox_task_id: str | None = None
     truncated: bool | None = None
     source: str = "experiment"
+
+
+class LogTraceResponse(BaseModel):
+    """Everything Nexus did for one order, reconstructed from its logs.
+
+    ``reference`` echoes what was asked for; ``correlation_ids`` reports
+    which experiment/mailbox-task/session/job ids that reference turned
+    out to span, so an operator can see *why* these entries belong
+    together. ``summary`` is derived from ``entries`` alone, so it can
+    never contradict the timeline beneath it.
+    """
+
+    reference: str
+    found: bool
+    correlation_ids: dict[str, list[str]] = Field(default_factory=dict)
+    summary: dict[str, object] = Field(default_factory=dict)
+    count: int = 0
+    entries: list[ExperimentLogEntry] = Field(default_factory=list)
+    truncated: bool = False
 
 
 class PublicUnifiedLogsResponse(BaseModel):

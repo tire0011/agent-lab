@@ -25,6 +25,10 @@ const logsElements = {
   lastSuccessfulRefresh: document.querySelector("#logs-last-successful-refresh"),
   autoRefreshState: document.querySelector("#logs-auto-refresh-state"),
   sourceErrors: document.querySelector("#logs-source-errors"),
+  traceInput: document.querySelector("#logs-trace-input"),
+  traceButton: document.querySelector("#logs-trace-button"),
+  traceSummary: document.querySelector("#logs-trace-summary"),
+  truncationHint: document.querySelector("#logs-truncation-hint"),
 };
 
 // Accumulated state for the currently displayed page(s): which URL to
@@ -163,6 +167,22 @@ function renderLogEntries(entries) {
       addDetail("Exception-Meldung", entry.exception_message);
       addDetail("Stacktrace", entry.stacktrace);
 
+      // Jump straight from any entry to the full order it belongs to,
+      // so an operator never has to copy an id into a filter by hand.
+      const traceRef = entry.experiment_id || entry.mailbox_task_id
+        || entry.session_id || entry.job_id;
+      if (traceRef) {
+        const traceButton = document.createElement("button");
+        traceButton.type = "button";
+        traceButton.className = "secondary";
+        traceButton.textContent = "Auftrag verfolgen";
+        traceButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          loadTrace(traceRef);
+        });
+        detailWrap.append(traceButton);
+      }
+
       head.addEventListener("click", () => {
         detailWrap.hidden = !detailWrap.hidden;
         toggle.textContent = detailWrap.hidden ? "Details ▾" : "Details ▴";
@@ -236,70 +256,37 @@ async function loadLogs() {
   logsElements.content.textContent = "Wird geladen …";
   hideLoadOlderButton();
   renderLogSourceErrors(null);
+  renderLogsTruncationHint(false);
+  if (logsElements.traceSummary) logsElements.traceSummary.hidden = true;
 
-  // Default, authenticated view: one merged, chronological timeline -
-  // structured JSONL entries (mailbox/controller/experiment/chat/system)
-  // plus the agent-api/nexus-mailbox/llama-server journals - across
-  // everything, not the lifecycle/status summaries from /activity. A
-  // running/new experiment is visible on refresh without knowing its id.
-  if (state.apiKey) {
-    const params = new URLSearchParams({ limit: "500" });
-    if (level) params.set("level", level);
-    if (source) params.set("source", source);
-    if (phase) params.set("phase", phase);
-    if (search) params.set("search", search);
-    if (experimentId) params.set("experiment_id", experimentId);
-    if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
-    if (jobId) params.set("job_id", jobId);
-    if (sessionId) params.set("session_id", sessionId);
-    const baseUrl = `/logs?${params.toString()}`;
-    try {
-      const data = await requestJson(baseUrl, { headers: authHeaders() });
-      const entries = data.entries || [];
-      logsPaginationState.baseUrl = baseUrl;
-      logsPaginationState.entries = entries;
-      logsPaginationState.nextCursor = data.next_cursor || null;
-      renderLogEntries(entries);
-      updateLogsSuccessStatus(entries);
-      updateLoadOlderButton();
-      renderLogSourceErrors(data.source_errors);
-      return;
-    } catch (error) {
-      logsElements.count.textContent = "!";
-      updateLogsErrorStatus();
-      showError(logsElements.content, error.message);
-      return;
-    }
-  }
-
-  // No API key: unauthenticated fallback. Uses the same central,
-  // multi-source structured feed (experiments + mailbox tasks + system) as
-  // the authenticated view, re-shaped through the public allowlist
-  // (GET /logs/public) - system journals are operator-only and are not
-  // included here.
-  const params = new URLSearchParams({ limit: "100" });
+  // One merged, chronological timeline - structured JSONL entries
+  // (mailbox/controller/experiment/chat/system) plus the
+  // agent-api/nexus-mailbox/llama-server journals. Reading logs needs no
+  // API key (DECISIONS.md D-012), so there is a single code path here
+  // rather than a reduced unauthenticated fallback. `search` is handled
+  // server-side across the whole retained history, not by filtering the
+  // page that happens to be loaded.
+  const params = new URLSearchParams({ limit: "500" });
   if (level) params.set("level", level);
+  if (source) params.set("source", source);
   if (phase) params.set("phase", phase);
+  if (search) params.set("search", search);
   if (experimentId) params.set("experiment_id", experimentId);
   if (mailboxTaskId) params.set("mailbox_task_id", mailboxTaskId);
-  const baseUrl = `/logs/public?${params.toString()}`;
+  if (jobId) params.set("job_id", jobId);
+  if (sessionId) params.set("session_id", sessionId);
+  const baseUrl = `/logs?${params.toString()}`;
   try {
-    const data = await requestJson(baseUrl);
-    let entries = data.entries || [];
-    if (source) entries = entries.filter((entry) => entry.source === source);
-    if (search) {
-      const needle = search.toLowerCase();
-      entries = entries.filter((entry) =>
-        (entry.message || "").toLowerCase().includes(needle) ||
-        (entry.event || "").toLowerCase().includes(needle)
-      );
-    }
+    const data = await requestJson(baseUrl, { headers: authHeaders() });
+    const entries = data.entries || [];
     logsPaginationState.baseUrl = baseUrl;
     logsPaginationState.entries = entries;
     logsPaginationState.nextCursor = data.next_cursor || null;
     renderLogEntries(entries);
     updateLogsSuccessStatus(entries);
     updateLoadOlderButton();
+    renderLogSourceErrors(data.source_errors);
+    renderLogsTruncationHint(data.truncated);
   } catch (error) {
     logsElements.count.textContent = "!";
     updateLogsErrorStatus();
@@ -307,7 +294,94 @@ async function loadLogs() {
   }
 }
 
+// "Auftrag verfolgen": resolve any reference (inbox filename, experiment
+// id, mailbox task id, session/job id, or a remembered fragment) to the
+// complete chain of what Nexus did with it, and render the summary above
+// the timeline.
+async function loadTrace(reference) {
+  const value = (reference || "").trim();
+  if (!value) return;
+  if (logsElements.traceInput) logsElements.traceInput.value = value;
+  logsElements.content.textContent = "Wird geladen …";
+  hideLoadOlderButton();
+  renderLogSourceErrors(null);
+  renderLogsTruncationHint(false);
+  try {
+    const data = await requestJson(`/logs/trace/${encodeURI(value)}`, { headers: authHeaders() });
+    const entries = data.entries || [];
+    renderLogEntries(entries);
+    renderTraceSummary(data);
+    updateLogsSuccessStatus(entries);
+    renderLogsTruncationHint(data.truncated);
+  } catch (error) {
+    logsElements.count.textContent = "!";
+    updateLogsErrorStatus();
+    showError(logsElements.content, error.message);
+  }
+}
+
+function renderTraceSummary(data) {
+  if (!logsElements.traceSummary) return;
+  logsElements.traceSummary.replaceChildren();
+  if (!data || !data.found) {
+    logsElements.traceSummary.hidden = false;
+    logsElements.traceSummary.textContent =
+      `Kein Auftrag zu „${data ? data.reference : ""}" gefunden.`;
+    return;
+  }
+  const summary = data.summary || {};
+  const ids = data.correlation_ids || {};
+  const parts = [
+    `${summary.entry_count || 0} Einträge`,
+    `von ${summary.started_at || "?"} bis ${summary.ended_at || "?"}`,
+    `${summary.error_count || 0} Fehler`,
+    `zuletzt: ${summary.last_event || "?"}`,
+  ];
+  const idParts = [];
+  for (const [field, values] of Object.entries(ids)) {
+    if (values && values.length) idParts.push(`${field}=${values.join(", ")}`);
+  }
+
+  const line = document.createElement("p");
+  line.textContent = parts.join(" · ");
+  logsElements.traceSummary.append(line);
+  if (idParts.length) {
+    const idLine = document.createElement("p");
+    idLine.className = "muted";
+    idLine.textContent = idParts.join(" | ");
+    logsElements.traceSummary.append(idLine);
+  }
+  if ((summary.phases || []).length) {
+    const phaseLine = document.createElement("p");
+    phaseLine.className = "muted";
+    phaseLine.textContent = `Phasen: ${summary.phases.join(" → ")}`;
+    logsElements.traceSummary.append(phaseLine);
+  }
+  logsElements.traceSummary.hidden = false;
+}
+
+function renderLogsTruncationHint(truncated) {
+  if (!logsElements.truncationHint) return;
+  logsElements.truncationHint.hidden = !truncated;
+  logsElements.truncationHint.textContent = truncated
+    ? "Die Suche hat ihr Lesebudget erreicht - es können ältere Treffer existieren, die nicht gescannt wurden."
+    : "";
+}
+
 logsElements.refreshButton.addEventListener("click", loadLogs);
+if (logsElements.traceButton) {
+  logsElements.traceButton.addEventListener("click", () => {
+    loadTrace(logsElements.traceInput ? logsElements.traceInput.value : "");
+  });
+}
+if (logsElements.traceInput) {
+  logsElements.traceInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      loadTrace(logsElements.traceInput.value);
+    }
+  });
+}
 if (logsElements.loadOlderButton) logsElements.loadOlderButton.addEventListener("click", loadOlderLogs);
 if (logsElements.levelSelect) logsElements.levelSelect.addEventListener("change", loadLogs);
 if (logsElements.sourceSelect) logsElements.sourceSelect.addEventListener("change", loadLogs);

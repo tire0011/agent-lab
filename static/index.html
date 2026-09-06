@@ -173,9 +173,17 @@
             <h2>Nexus-Log-Timeline</h2>
             <button id="logs-refresh-button" class="secondary" type="button">Aktualisieren</button>
           </div>
+          <div class="logs-trace">
+            <label for="logs-trace-input">Auftrag verfolgen</label>
+            <input id="logs-trace-input" type="text"
+                   placeholder="Inbox-Dateiname, Experiment-/Task-/Session-ID oder Textfragment">
+            <button id="logs-trace-button" class="secondary" type="button">Verfolgen</button>
+          </div>
+          <div id="logs-trace-summary" class="list-state" aria-live="polite" hidden></div>
           <div class="logs-filters">
             <label for="logs-search-input">Suche</label>
-            <input id="logs-search-input" type="text" placeholder="Freitext in Nachricht/Ereignis">
+            <input id="logs-search-input" type="text"
+                   placeholder="Volltext über die gesamte Historie">
             <label for="logs-level-select">Level</label>
             <select id="logs-level-select">
               <option value="">Alle Level</option>
@@ -224,6 +232,7 @@
             <span>Zuletzt erfolgreich aktualisiert: <time id="logs-last-successful-refresh">Noch nicht</time></span>
           </div>
           <div id="logs-source-errors" class="list-state" aria-live="polite" hidden></div>
+          <div id="logs-truncation-hint" class="list-state" aria-live="polite" hidden></div>
         </section>
 
         <section class="card">

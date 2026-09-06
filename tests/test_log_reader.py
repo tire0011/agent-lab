@@ -54,7 +54,7 @@ class ReadAllJournalEntriesTests(unittest.TestCase):
     def test_merges_entries_from_every_service(self):
         reader = LogReader()
 
-        async def _fake_tail(service, lines=100, before=None):
+        async def _fake_tail(service, lines=100, before=None, search=None):
             return [parse_journal_line(service, f"2026-08-17T12:00:00+0000 host {service}: hi")]
 
         with patch.object(reader, "tail_journal_entries", side_effect=_fake_tail):
@@ -67,7 +67,7 @@ class ReadAllJournalEntriesTests(unittest.TestCase):
     def test_one_failing_service_does_not_drop_the_others(self):
         reader = LogReader()
 
-        async def _fake_tail(service, lines=100, before=None):
+        async def _fake_tail(service, lines=100, before=None, search=None):
             if service == "llama-server":
                 raise RuntimeError("journalctl failed for llama-server (exit code 1)")
             return [parse_journal_line(service, f"2026-08-17T12:00:00+0000 host {service}: hi")]
@@ -87,7 +87,7 @@ class ReadAllJournalEntriesTests(unittest.TestCase):
         reader = LogReader()
         seen_before = []
 
-        async def _fake_tail(service, lines=100, before=None):
+        async def _fake_tail(service, lines=100, before=None, search=None):
             seen_before.append(before)
             return []
 

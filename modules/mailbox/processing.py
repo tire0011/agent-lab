@@ -34,10 +34,19 @@ from .core import (
 logger = logging.getLogger(__name__)
 
 
-def _transient_mailbox_task_id(relative_source: str) -> str:
-    """Stable, content-free correlation id available before parsing succeeds."""
+def transient_mailbox_task_id(relative_source: str) -> str:
+    """Stable, content-free correlation id available before parsing succeeds.
+
+    Public because the log-trace read path (``modules.log_trace``) has to
+    derive the same id from an inbox filename to find a message's log
+    file - both sides must agree on one definition, not two.
+    """
     digest = hashlib.sha256(relative_source.encode("utf-8", errors="replace")).hexdigest()[:32]
     return f"mailbox-{digest}"
+
+
+# Backwards-compatible private alias for existing call sites/tests.
+_transient_mailbox_task_id = transient_mailbox_task_id
 
 
 def _process_idea(

@@ -32,6 +32,7 @@ import re
 import threading
 import traceback
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,12 @@ MAX_STACKTRACE_CHARS = 4000
 # rather than growing without bound.
 DEFAULT_MAX_LOG_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
 DEFAULT_SYSTEM_LOG_BACKUP_COUNT = 3
+
+# Rotation applies to every log file, not only the system one. Without
+# it, an experiment/task/chat log that hits DEFAULT_MAX_LOG_FILE_BYTES
+# stops recording (one notice entry, then nothing), so exactly the long
+# runs an operator most needs to inspect lose their tail.
+DEFAULT_LOG_BACKUP_COUNT = 3
 
 _VALID_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 _LEVEL_TO_PY = {
@@ -207,7 +214,7 @@ class ExperimentLogger:
         *,
         _system: bool = False,
         _mirror: bool = True,
-        _rotate_backups: int = 0,
+        _rotate_backups: int = DEFAULT_LOG_BACKUP_COUNT,
     ) -> None:
         if experiment_id:
             if not _SAFE_ID_RE.fullmatch(experiment_id):
@@ -231,6 +238,7 @@ class ExperimentLogger:
         self.job_id = redaction.redact(job_id) if job_id else None
         self.session_id = redaction.redact(session_id) if session_id else None
         self._dir = Path(log_dir)
+        self._key = key
         self._path = self._dir / f"{key}.jsonl"
         self._max_bytes = max_bytes
         self._limit_notice_written = False
@@ -472,7 +480,7 @@ class ExperimentLogger:
         if not self._rotate_backups or fcntl is None:
             yield
             return
-        lock_path = self._dir / f".{SYSTEM_LOG_KEY}.lock"
+        lock_path = self._dir / f".{self._key}.lock"
         with open(lock_path, "a", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
@@ -481,15 +489,24 @@ class ExperimentLogger:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _rotate(self) -> None:
-        """Bound retained system logs while keeping the active file writable."""
-        oldest = self._dir / f"{SYSTEM_LOG_KEY}-{self._rotate_backups}.jsonl"
+        """Bound retained logs while keeping the active file writable.
+
+        Rotates this logger's *own* file set (``<key>-1.jsonl`` ...
+        ``<key>-N.jsonl``), not just the system log's: without it an
+        experiment/task log that reaches ``max_bytes`` stops accepting
+        entries entirely, so the rest of that run - and anything an
+        operator later searches for in it - is simply never recorded.
+        Rotated files keep the ``.jsonl`` suffix and therefore stay part
+        of the unified read/search path.
+        """
+        oldest = self._dir / f"{self._key}-{self._rotate_backups}.jsonl"
         oldest.unlink(missing_ok=True)
         for index in range(self._rotate_backups - 1, 0, -1):
-            source = self._dir / f"{SYSTEM_LOG_KEY}-{index}.jsonl"
+            source = self._dir / f"{self._key}-{index}.jsonl"
             if source.exists():
-                source.replace(self._dir / f"{SYSTEM_LOG_KEY}-{index + 1}.jsonl")
+                source.replace(self._dir / f"{self._key}-{index + 1}.jsonl")
         if self._path.exists():
-            self._path.replace(self._dir / f"{SYSTEM_LOG_KEY}-1.jsonl")
+            self._path.replace(self._dir / f"{self._key}-1.jsonl")
 
     def _write_line(self, line: str) -> None:
         # Open/append/flush/fsync per line: entries must survive a crash
@@ -591,6 +608,15 @@ def _format_stacktrace(exc: BaseException) -> str:
 # reads the complete (already-bounded) file.
 DEFAULT_UNIFIED_TAIL_BYTES = 256 * 1024  # 256 KiB per file
 
+# A search switches the tail shortcut off and reads candidate files in
+# full (see ``scan_log_entries``), so it needs its own ceiling: enough to
+# cover the whole retained history in practice (each file is already
+# capped at ``DEFAULT_MAX_LOG_FILE_BYTES``), small enough that one query
+# cannot read unbounded data on the 1 GB VM. Files are visited
+# newest-modified first, so hitting this bound drops only the oldest
+# candidates - and the result is flagged ``truncated``.
+DEFAULT_SEARCH_SCAN_BUDGET_BYTES = 64 * 1024 * 1024  # 64 MiB per request
+
 
 def _tail_read_lines(path: Path, tail_bytes: int | None) -> list[str]:
     """Return *path*'s lines, optionally reading only the last *tail_bytes*
@@ -655,6 +681,7 @@ def read_log_entries(
     phase: str | None = None,
     job_id: str | None = None,
     session_id: str | None = None,
+    search: str | None = None,
     limit: int | None = None,
     before: str | None = None,
     tail_bytes: int | None = None,
@@ -722,6 +749,8 @@ def read_log_entries(
         entries = [e for e in entries if e.get("job_id") == job_id]
     if session_id:
         entries = [e for e in entries if e.get("session_id") == session_id]
+    if search:
+        entries = [e for e in entries if entry_matches_search(e, search)]
     if before:
         entries = [e for e in entries if str(e.get("timestamp") or "\uffff") < before]
 
@@ -742,6 +771,49 @@ _STRING_FIELDS_TO_REDACT = (
     "job_id",
     "session_id",
 )
+
+
+_SEARCHABLE_FIELDS = (
+    "message",
+    "event",
+    "phase",
+    "logger",
+    "command",
+    "cwd",
+    "stdout",
+    "stderr",
+    "exception_type",
+    "exception_message",
+    "stacktrace",
+    "experiment_id",
+    "mailbox_task_id",
+    "job_id",
+    "session_id",
+    "source",
+)
+
+
+def entry_matches_search(entry: dict[str, Any], search: str) -> bool:
+    """Case-insensitive substring match across one entry's text fields.
+
+    Matching deliberately spans identifiers (experiment/task/job/session)
+    and execution detail (command/cwd/stdout/stderr/exception) as well as
+    the message, so an operator can find a run by *any* fragment they
+    happen to remember - an id prefix, part of a command line, or a
+    phrase from an error - rather than only by message text.
+
+    Applied inside the read path (see ``read_log_entries``) rather than
+    on an already-paginated page, so a match older than the newest page
+    is actually found instead of silently returning nothing.
+    """
+    needle = search.strip().lower()
+    if not needle:
+        return True
+    for field in _SEARCHABLE_FIELDS:
+        value = entry.get(field)
+        if isinstance(value, str) and needle in value.lower():
+            return True
+    return False
 
 
 def _resanitize_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -841,6 +913,7 @@ def read_experiment_logs(
     mailbox_task_id: str | None = None,
     level: str | None = None,
     phase: str | None = None,
+    search: str | None = None,
     limit: int | None = None,
     before: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -872,7 +945,7 @@ def read_experiment_logs(
 
     entries: list[dict[str, Any]] = []
     for path in paths:
-        entries.extend(read_log_entries(path, level=level, phase=phase))
+        entries.extend(read_log_entries(path, level=level, phase=phase, search=search))
 
     entries.sort(key=_entry_sort_key)
 
@@ -886,7 +959,24 @@ def read_experiment_logs(
     return entries
 
 
-def read_all_log_entries(
+@dataclass(frozen=True)
+class LogScanResult:
+    """Entries from one unified read, plus how complete that read was.
+
+    ``truncated`` is True when the scan stopped early - because the
+    per-request byte budget ran out or ``max_files`` capped the candidate
+    list - so a caller can tell "no older matches exist" apart from "I
+    stopped looking", and say so instead of implying the history is
+    exhausted.
+    """
+
+    entries: list[dict[str, Any]]
+    truncated: bool = False
+    files_scanned: int = 0
+    bytes_scanned: int = 0
+
+
+def scan_log_entries(
     log_dir: str | Path,
     *,
     experiment_id: str | None = None,
@@ -895,13 +985,23 @@ def read_all_log_entries(
     phase: str | None = None,
     job_id: str | None = None,
     session_id: str | None = None,
+    search: str | None = None,
     limit: int | None = None,
     before: str | None = None,
     max_files: int = DEFAULT_MAX_LOG_FILES,
     tail_bytes: int | None = DEFAULT_UNIFIED_TAIL_BYTES,
-) -> list[dict[str, Any]]:
+    scan_budget_bytes: int | None = DEFAULT_SEARCH_SCAN_BUDGET_BYTES,
+) -> LogScanResult:
     """Unified, chronological view across every experiment's (and every
     pre-experiment mailbox task's) JSONL log.
+
+    When *search* is given, the newest-tail shortcut described below is
+    switched off and each candidate file is read in full, so a match
+    older than the default window is actually found rather than silently
+    missing. That whole-history scan is bounded by *scan_budget_bytes*
+    (and still by *max_files*); if either bound stops the scan early the
+    result is flagged ``truncated`` instead of being passed off as a
+    complete answer.
 
     Backs the Logs tab's default "Alle Experimente" feed: an operator must
     be able to see a task's complete, real structured log entries (mailbox
@@ -945,7 +1045,7 @@ def read_all_log_entries(
         entries = read_experiment_logs(
             directory, experiment_id,
             mailbox_task_id=mailbox_task_id,
-            level=level, phase=phase,
+            level=level, phase=phase, search=search,
             limit=None if (job_id or session_id) else limit,
             before=before,
         )
@@ -955,10 +1055,15 @@ def read_all_log_entries(
             entries = [entry for entry in entries if entry.get("session_id") == session_id]
         if limit is not None and limit >= 0 and len(entries) > limit:
             entries = entries[-limit:]
-        return entries
+        return LogScanResult(entries=entries, files_scanned=1)
 
     cursor_key: tuple[str, str, str, int] | None = decode_log_cursor(before) if before else None
-    effective_tail_bytes = None if cursor_key is not None else tail_bytes
+    searching = bool(search and search.strip())
+    # A search must be answered from the whole retained history: reading
+    # only each file's newest tail would report "no matches" for anything
+    # older than that window, which is indistinguishable from "no such
+    # entry ever existed".
+    effective_tail_bytes = None if (cursor_key is not None or searching) else tail_bytes
 
     candidates_with_mtime: list[tuple[float, Path]] = []
     for path in directory.glob("*.jsonl"):
@@ -969,12 +1074,30 @@ def read_all_log_entries(
             continue
     candidates_with_mtime.sort(key=lambda item: item[0], reverse=True)
     candidates = [path for _, path in candidates_with_mtime]
-    if max_files is not None and max_files >= 0:
+    truncated = False
+    if max_files is not None and max_files >= 0 and len(candidates) > max_files:
         candidates = candidates[:max_files]
+        truncated = True
     paths = candidates
 
     entries: list[dict[str, Any]] = []
+    bytes_scanned = 0
+    files_scanned = 0
     for path in paths:
+        if (
+            effective_tail_bytes is None
+            and scan_budget_bytes is not None
+            and bytes_scanned >= scan_budget_bytes
+        ):
+            # Budget spent. Files are visited newest-modified first, so
+            # what remains unscanned is strictly older than everything
+            # already collected.
+            truncated = True
+            break
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
         try:
             entries.extend(
                 read_log_entries(
@@ -983,11 +1106,14 @@ def read_all_log_entries(
                     phase=phase,
                     job_id=job_id,
                     session_id=session_id,
+                    search=search,
                     tail_bytes=effective_tail_bytes,
                 )
             )
         except FileNotFoundError:
             continue
+        files_scanned += 1
+        bytes_scanned += size if effective_tail_bytes is None else min(size, effective_tail_bytes)
 
     if mailbox_task_id:
         entries = [e for e in entries if e.get("mailbox_task_id") == mailbox_task_id]
@@ -1003,4 +1129,45 @@ def read_all_log_entries(
     if limit is not None and limit >= 0 and len(entries) > limit:
         entries = entries[-limit:]
 
-    return entries
+    return LogScanResult(
+        entries=entries,
+        truncated=truncated,
+        files_scanned=files_scanned,
+        bytes_scanned=bytes_scanned,
+    )
+
+
+def read_all_log_entries(
+    log_dir: str | Path,
+    *,
+    experiment_id: str | None = None,
+    mailbox_task_id: str | None = None,
+    level: str | None = None,
+    phase: str | None = None,
+    job_id: str | None = None,
+    session_id: str | None = None,
+    search: str | None = None,
+    limit: int | None = None,
+    before: str | None = None,
+    max_files: int = DEFAULT_MAX_LOG_FILES,
+    tail_bytes: int | None = DEFAULT_UNIFIED_TAIL_BYTES,
+) -> list[dict[str, Any]]:
+    """Entries-only view of :func:`scan_log_entries`.
+
+    Kept as the plain-list entry point for callers that do not need to
+    know whether the scan was complete.
+    """
+    return scan_log_entries(
+        log_dir,
+        experiment_id=experiment_id,
+        mailbox_task_id=mailbox_task_id,
+        level=level,
+        phase=phase,
+        job_id=job_id,
+        session_id=session_id,
+        search=search,
+        limit=limit,
+        before=before,
+        max_files=max_files,
+        tail_bytes=tail_bytes,
+    ).entries
