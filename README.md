@@ -240,6 +240,45 @@ A background `MailboxTaskWorker` daemon (10 s poll interval) calls
 serially (one VM, one budget). The Web UI Task Approvals card shows all records
 and provides Approve/Reject buttons when an API key is entered.
 
+## Nexus logs API
+
+Reading logs needs **no API key** (see `DECISIONS.md` D-012 — this is a
+single-operator experiment VM and analysis is the point of the log surface).
+Write endpoints are unaffected and still require `x-api-key`.
+
+`GET /logs` is one merged, chronological timeline: the structured JSONL entries
+(mailbox intake, controller decisions, implementation, verification, chat jobs)
+plus the `agent-api`/`nexus-mailbox`/`llama-server` journals.
+
+```bash
+# Full-text search across the whole retained history - message, event,
+# command, stdout/stderr, exception text and the correlation ids alike.
+curl -s "$BASE/logs?search=disk+quota+exceeded"
+
+# Narrow further; page back with the returned next_cursor.
+curl -s "$BASE/logs?level=ERROR&source=controller&limit=50"
+```
+
+`truncated: true` in the response means the scan stopped at its byte/file budget,
+so older matches may exist — it is never silently presented as an exhaustive result.
+
+`GET /logs/trace/{reference}` answers the other question: *Nexus was given this —
+what did it actually do?* The reference can be an inbox message filename, an
+experiment id, a mailbox task id, a controller session/chat job id, or just a
+fragment you remember. Nexus resolves whichever entries that identifies, reads the
+correlation ids off them, and returns the **whole** chain plus a summary:
+
+```bash
+curl -s "$BASE/logs/trace/inbox/20260906-1142-refresh-nexus-claude.md"
+curl -s "$BASE/logs/trace/exp-refresh-01"
+curl -s "$BASE/logs/trace/verification%20succeeded"
+```
+
+An unresolvable reference returns `found: false` with an empty timeline rather
+than a 404. The Logs tab exposes both: a free-text search box over the full
+history, and an "Auftrag verfolgen" field (plus a per-entry button) that renders
+the same trace with its summary.
+
 ## Nexus activity API
 
 `GET /activity/public` returns the latest 100 sanitized lifecycle events without

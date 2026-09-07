@@ -23,11 +23,13 @@ from modules.central_logging import (
     _bounded_head_tail_text,
     decode_log_cursor,
     encode_log_cursor,
+    entry_matches_search,
     get_task_logger,
     read_all_log_entries,
     read_experiment_logs,
     read_log_entries,
     sanitize_command,
+    scan_log_entries,
 )
 
 
@@ -215,8 +217,10 @@ class ExperimentLoggerSizeLimitTests(unittest.TestCase):
         self.assertTrue(entry.get("truncated"))
         self.assertLess(len(entry["message"]), 10000)
 
-    def test_file_size_ceiling_stops_further_writes_with_marker(self):
-        elog = ExperimentLogger("exp-cap", log_dir=self.log_dir, max_bytes=500)
+    def test_file_size_ceiling_stops_further_writes_with_marker_without_rotation(self):
+        elog = ExperimentLogger(
+            "exp-cap", log_dir=self.log_dir, max_bytes=500, _rotate_backups=0,
+        )
         for i in range(200):
             elog.info("p", f"e{i}", f"message number {i} padding padding padding")
 
@@ -227,6 +231,25 @@ class ExperimentLoggerSizeLimitTests(unittest.TestCase):
         self.assertEqual(len(markers), 1)
         self.assertEqual(markers[0]["level"], "WARNING")
         self.assertLess(elog.path.stat().st_size, 2000)
+
+    def test_experiment_log_rotates_instead_of_dropping_entries(self):
+        """Rotation is on by default for experiment/task logs: reaching the
+        ceiling must roll the file over and keep recording, not silently
+        stop (which used to lose the whole tail of a long run)."""
+        elog = ExperimentLogger("exp-rot", log_dir=self.log_dir, max_bytes=500)
+        for i in range(200):
+            elog.info("p", f"e{i}", f"message number {i} padding padding padding")
+
+        entries = _read_lines(elog.path)
+        self.assertEqual(
+            [e for e in entries if e["event"] == "log_size_limit_reached"], []
+        )
+        # The newest events survived rather than being suppressed ...
+        self.assertIn("e199", [e["event"] for e in entries])
+        # ... rotated history is retained, bounded, and still *.jsonl so
+        # the unified read/search path picks it up.
+        rotated = sorted(p.name for p in self.log_dir.glob("exp-rot-*.jsonl"))
+        self.assertEqual(rotated, ["exp-rot-1.jsonl", "exp-rot-2.jsonl", "exp-rot-3.jsonl"])
 
 
 class HeadTailTruncationTests(unittest.TestCase):
@@ -651,6 +674,83 @@ class MalformedEntryValidationTests(unittest.TestCase):
         entries = read_all_log_entries(self.log_dir)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["event"], "good")
+
+
+class HistorySearchTests(unittest.TestCase):
+    """A search must be answered from the whole retained history.
+
+    Previously ``search`` was applied by the API *after* one bounded,
+    newest-tail page had already been read, so a match older than that
+    window returned nothing at all - indistinguishable from "no such
+    entry exists".
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmpdir.name)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def _write_log(self, name: str, count: int, needle_at: int, needle: str) -> None:
+        lines = []
+        for i in range(count):
+            message = needle if i == needle_at else f"routine message {i} padding padding"
+            lines.append(json.dumps({
+                "timestamp": f"2026-01-01T00:{i:02d}:00.000Z", "level": "INFO",
+                "logger": "nexus.experiment", "experiment_id": name,
+                "phase": "p", "event": f"e{i}", "message": message,
+            }))
+        (self.log_dir / f"{name}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_search_finds_a_match_older_than_the_default_tail_window(self):
+        self._write_log("exp-old", count=60, needle_at=0, needle="deployment rolled back")
+
+        # The default tail window is far too small to contain the match ...
+        tail_only = read_all_log_entries(self.log_dir, tail_bytes=200)
+        self.assertNotIn(
+            "deployment rolled back", [e.get("message") for e in tail_only]
+        )
+        # ... but searching still finds it, because the search switches the
+        # tail shortcut off and scans the file in full.
+        found = read_all_log_entries(
+            self.log_dir, search="rolled back", tail_bytes=200,
+        )
+        self.assertEqual([e["event"] for e in found], ["e0"])
+
+    def test_search_matches_command_and_identifier_fields_too(self):
+        (self.log_dir / "exp-cmd.jsonl").write_text(json.dumps({
+            "timestamp": "2026-01-01T00:00:00.000Z", "level": "INFO",
+            "logger": "nexus.experiment", "experiment_id": "exp-cmd",
+            "phase": "p", "event": "ran", "message": "done",
+            "command": "bash ./refresh.sh", "session_id": "sess-abc123",
+        }) + "\n", encoding="utf-8")
+
+        self.assertEqual(len(read_all_log_entries(self.log_dir, search="refresh.sh")), 1)
+        self.assertEqual(len(read_all_log_entries(self.log_dir, search="sess-abc")), 1)
+        self.assertEqual(len(read_all_log_entries(self.log_dir, search="nothing here")), 0)
+
+    def test_search_is_case_insensitive(self):
+        self._write_log("exp-case", count=3, needle_at=1, needle="Verification FAILED")
+        self.assertEqual(len(read_all_log_entries(self.log_dir, search="verification failed")), 1)
+
+    def test_scan_reports_truncation_when_the_file_budget_is_spent(self):
+        for index in range(3):
+            self._write_log(f"exp-{index}", count=20, needle_at=0, needle="shared needle")
+
+        complete = scan_log_entries(self.log_dir, search="shared needle")
+        self.assertFalse(complete.truncated)
+        self.assertEqual(len(complete.entries), 3)
+
+        # A budget too small to cover every file must say so rather than
+        # presenting a partial answer as a complete one.
+        partial = scan_log_entries(self.log_dir, search="shared needle", scan_budget_bytes=1)
+        self.assertTrue(partial.truncated)
+        self.assertLess(len(partial.entries), 3)
+
+    def test_entry_matches_search_ignores_non_string_and_missing_fields(self):
+        self.assertFalse(entry_matches_search({"duration_ms": 12}, "12"))
+        self.assertTrue(entry_matches_search({"message": "hello"}, "ELL"))
+        # An empty/whitespace search is not a filter at all.
+        self.assertTrue(entry_matches_search({"message": "hello"}, "   "))
 
 
 class BoundedReadAndCursorTests(unittest.TestCase):

@@ -269,10 +269,15 @@ class WebClientTests(ApiTestsBase):
     def test_logs_refresh_uses_rendered_arrays_and_shared_load_function(self):
         javascript = self.client.get("/static/logs.js").text
         self.assertIn("const visibleCount = renderedEntries.length;", javascript)
-        self.assertIn("renderLogEntries(entries);\n      updateLogsSuccessStatus(entries);", javascript)
         self.assertIn('const baseUrl = `/logs?${params.toString()}`;', javascript)
         self.assertIn("await requestJson(baseUrl, { headers: authHeaders() });", javascript)
-        self.assertIn("renderLogEntries(entries);\n    updateLogsSuccessStatus(entries);", javascript)
+        # Rendering and the status update stay paired on the refresh path.
+        # Matched indentation-insensitively: reading logs no longer has a
+        # separate unauthenticated branch (DECISIONS.md D-012), so the
+        # single remaining code path sits one level less deep.
+        self.assertRegex(
+            javascript, r"renderLogEntries\(entries\);\s*\n\s*updateLogsSuccessStatus\(entries\);"
+        )
         self.assertNotIn("setInterval(loadLogs", javascript)
         self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
 

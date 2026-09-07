@@ -159,21 +159,28 @@ class PublicUnifiedLogsApiTests(unittest.TestCase):
         serialized = json.dumps(response.json())
         self.assertNotIn(SECRET, serialized)
 
-    def test_response_excludes_internal_fields(self):
-        # The public feed must never expose command/cwd/stdout/stderr/
-        # exception/stacktrace/job_id/session_id, unlike the authenticated
-        # /logs feed - only the coarse allowlisted fields.
+    def test_returns_the_same_complete_entries_as_the_authenticated_feed(self):
+        """The reduced allowlist is gone (DECISIONS.md D-012): analysis
+        needs the execution detail, so /logs/public is now an alias of
+        /logs rather than a stripped-down variant."""
         self._write_logs()
-        response = self.client.get("/logs/public")
-        entry = response.json()["entries"][0]
-        expected_fields = {
-            "timestamp", "level", "phase", "event", "message",
-            "experiment_id", "mailbox_task_id", "truncated", "source",
-        }
-        self.assertEqual(set(entry.keys()), expected_fields)
-        serialized = json.dumps(response.json())
-        for forbidden in ("stdout", "stderr", "stacktrace", "exception_type", "job_id", "session_id"):
-            self.assertNotIn(forbidden, serialized)
+        public = self.client.get("/logs/public").json()
+        authenticated = self.client.get("/logs").json()
+
+        self.assertEqual(
+            [e["event"] for e in public["entries"]],
+            [e["event"] for e in authenticated["entries"]],
+        )
+        entry_fields = set(public["entries"][0].keys())
+        for detail_field in ("command", "stdout", "stderr", "stacktrace", "session_id"):
+            self.assertIn(detail_field, entry_fields)
+
+    def test_response_still_redacts_secrets(self):
+        """Opening the surface must not weaken redaction: secret-shaped
+        content stays scrubbed on the read path."""
+        self._write_logs()
+        serialized = json.dumps(self.client.get("/logs/public").json())
+        self.assertNotIn(SECRET, serialized)
 
     def test_missing_log_directory_is_distinct_from_empty_feed(self):
         self.service.experiment_log_dir = self.log_dir / "missing"
