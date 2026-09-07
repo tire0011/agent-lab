@@ -297,6 +297,15 @@ def run_mailbox_poll_once(
             publisher.publish_pending()
             task_publisher.publish_pending()
             processor.retry_pending_git_commits()
+            # Prune only after pending commits have been retried: a file
+            # still needed to finalize one is protected, and retrying first
+            # lets those records reach `done` so they become prunable. The
+            # deletions are committed locally here and pushed by the sync
+            # below, rather than opening a second push path.
+            try:
+                processor.prune_old_messages()
+            except Exception as exc:  # noqa: BLE001 - never block the poll
+                logger.warning("Mailbox prune failed run=%s type=%s", run_name, type(exc).__name__)
             try:
                 outbox_prefix = (
                     mailbox_config.outbox_dir
