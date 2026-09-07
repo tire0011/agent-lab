@@ -44,6 +44,12 @@ _ACTIVE_STATUSES = {STATUS_QUEUED, STATUS_ADOPTING}
 _DEFAULT_TEST_TIMEOUT_SECONDS = 300
 _DEFAULT_GIT_TIMEOUT_SECONDS = 60
 _DEFAULT_TARGET_BRANCH = "main"
+
+# How often one adoption may be resumed across process restarts before it
+# is handed to a human. Restarts are expected (the refresh flow restarts
+# Nexus deliberately), but an adoption that keeps dying mid-pipeline is a
+# real problem and must not resume forever.
+_MAX_RECOVERY_ATTEMPTS = 3
 _DEFAULT_LOCK_PATH = "/var/lib/nexus/adoption.lock"
 
 
@@ -70,6 +76,7 @@ class ExperimentAdoption:
     reason: str | None = None
     local_sync_pending: bool = False
     diagnostic_worktree_path: str | None = None
+    recovery_attempts: int = 0
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -90,6 +97,7 @@ class ExperimentAdoption:
             "reason": self.reason,
             "local_sync_pending": self.local_sync_pending,
             "diagnostic_worktree_path": self.diagnostic_worktree_path,
+            "recovery_attempts": self.recovery_attempts,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -131,6 +139,9 @@ def _row_to_adoption(row: sqlite3.Row | None, experiment_id: str) -> ExperimentA
         reason=row["reason"],
         local_sync_pending=bool(row["local_sync_pending"]),
         diagnostic_worktree_path=row["diagnostic_worktree_path"],
+        recovery_attempts=(
+            int(row["recovery_attempts"] or 0) if "recovery_attempts" in row.keys() else 0
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -217,37 +228,193 @@ class ExperimentAdoptionService:
             thread.join(timeout)
 
     def recover_after_restart(self) -> list[str]:
-        ended_at = _utcnow_iso()
-        reason = (
-            "interrupted: adoption was still queued/adopting at service startup "
-            "(process restart or crash); no automatic recovery is implemented"
-        )
-        with self._lock, self._conn:
+        """Resume adoptions that a process restart interrupted mid-flight.
+
+        A restart is a resumable boundary, not a failure: Nexus restarts
+        itself as a normal part of the refresh/deploy flow, so an adoption
+        that was still ``queued``/``adopting`` when the process died must
+        be reconstructed from durable evidence rather than declared
+        ``interrupted`` (which the finalization coordinator then turned
+        into a misleading ``needs_review``).
+
+        For each interrupted adoption, in order of how much evidence it
+        takes to be sure:
+
+        1. **GitHub already shows the pull request merged** - the work
+           really finished and only the bookkeeping was lost. Record it as
+           ``adopted`` with the real merge commit; never merge again.
+        2. **Otherwise resume** the *same* adoption record (same adoption
+           id, experiment, issue, PR and branch) by re-running the
+           pipeline, which re-derives its state from git.
+        3. **Evidence is unavailable or the attempt budget is spent** ->
+           ``needs_review`` naming the actual obstacle.
+
+        Returns the experiment ids it acted on.
+        """
+        with self._lock:
             rows = self._conn.execute(
-                "SELECT experiment_id FROM experiment_adoptions WHERE status IN (?, ?)",
+                "SELECT * FROM experiment_adoptions WHERE status IN (?, ?) "
+                "ORDER BY created_at ASC, id ASC",
                 (STATUS_QUEUED, STATUS_ADOPTING),
             ).fetchall()
-            ids = [row["experiment_id"] for row in rows]
-            self._conn.executemany(
-                """
-                UPDATE experiment_adoptions
-                SET status = ?, ended_at = ?, reason = ?, updated_at = ?
-                WHERE experiment_id = ? AND status IN (?, ?)
-                """,
-                [
-                    (
-                        STATUS_INTERRUPTED,
-                        ended_at,
-                        sanitized_reason(reason),
-                        ended_at,
-                        experiment_id,
-                        STATUS_QUEUED,
-                        STATUS_ADOPTING,
-                    )
-                    for experiment_id in ids
-                ],
+
+        handled: list[str] = []
+        resumed_one = False
+        for row in rows:
+            experiment_id = row["experiment_id"]
+            handled.append(experiment_id)
+            try:
+                # Adoptions are serialized by design (start_adoption refuses
+                # a second one), so finding several interrupted at once is
+                # already an inconsistency. Recording an already-merged one
+                # is safe for any number of them, but only the oldest
+                # remaining record is actually resumed: running two
+                # pipelines would just have them fight over the adoption
+                # lock and fail each other.
+                resumed = self._recover_one(row, allow_resume=not resumed_one)
+                resumed_one = resumed_one or resumed
+            except Exception:  # noqa: BLE001 - one bad record must not block the rest
+                logger.exception("adoption recovery failed for %s", experiment_id)
+                self._set_status(
+                    experiment_id,
+                    STATUS_NEEDS_REVIEW,
+                    ended_at=_utcnow_iso(),
+                    reason=sanitized_reason(
+                        "recovery failed: the adoption state could not be reconstructed "
+                        "after a process restart"
+                    ),
+                    updated_at=_utcnow_iso(),
+                )
+        return handled
+
+    def _recover_one(self, row: sqlite3.Row, *, allow_resume: bool = True) -> bool:
+        """Recover one interrupted adoption. Returns whether it was resumed."""
+        experiment_id = row["experiment_id"]
+        adoption_id = row["id"]
+
+        merged_sha = self._merged_sha_for(experiment_id)
+        if merged_sha:
+            # The merge landed before the restart; finishing it again would
+            # be a duplicate. Persist what actually happened instead.
+            self._set_status(
+                experiment_id,
+                STATUS_ADOPTED,
+                ended_at=_utcnow_iso(),
+                integrated_commit_sha=merged_sha,
+                reason=sanitized_reason(
+                    "recovered after restart: the pull request was already merged"
+                ),
+                local_sync_pending=1,
+                updated_at=_utcnow_iso(),
             )
-        return ids
+            return False
+
+        blocker = self._recovery_blocker(experiment_id)
+        if blocker is not None:
+            # Genuinely unrecoverable: resuming would only fail again in a
+            # background thread, so say why now instead of producing a
+            # confusing "failed" a moment later.
+            self._set_status(
+                experiment_id,
+                STATUS_NEEDS_REVIEW,
+                ended_at=_utcnow_iso(),
+                reason=sanitized_reason(
+                    f"adoption cannot be resumed after the restart: {blocker}"
+                ),
+                updated_at=_utcnow_iso(),
+            )
+            return False
+
+        attempts = int(row["recovery_attempts"] or 0) if "recovery_attempts" in row.keys() else 0
+        if attempts >= _MAX_RECOVERY_ATTEMPTS:
+            self._set_status(
+                experiment_id,
+                STATUS_NEEDS_REVIEW,
+                ended_at=_utcnow_iso(),
+                reason=sanitized_reason(
+                    f"adoption did not complete after {attempts} restart "
+                    "recovery attempts; manual review required"
+                ),
+                updated_at=_utcnow_iso(),
+            )
+            return False
+
+        if not allow_resume:
+            self._set_status(
+                experiment_id,
+                STATUS_NEEDS_REVIEW,
+                ended_at=_utcnow_iso(),
+                reason=sanitized_reason(
+                    "another interrupted adoption is already being resumed; "
+                    "concurrent adoptions are not supported and this one needs review"
+                ),
+                updated_at=_utcnow_iso(),
+            )
+            return False
+
+        # Resume the same record: back to queued, then re-run the pipeline.
+        # The pipeline re-derives its state from git and from what this
+        # record already persisted, so no new experiment/issue/PR/adoption
+        # is created.
+        self._set_status(
+            experiment_id,
+            STATUS_QUEUED,
+            started_at=None,
+            ended_at=None,
+            reason=sanitized_reason(
+                "resuming adoption after a process restart "
+                f"(attempt {attempts + 1} of {_MAX_RECOVERY_ATTEMPTS})"
+            ),
+            recovery_attempts=attempts + 1,
+            updated_at=_utcnow_iso(),
+        )
+        thread = threading.Thread(
+            target=self._run_thread,
+            args=(adoption_id, experiment_id),
+            kwargs={"resume": True},
+            daemon=True,
+            name=f"adopt-resume-{experiment_id[:8]}",
+        )
+        self._threads[experiment_id] = thread
+        thread.start()
+        return True
+
+    def _recovery_blocker(self, experiment_id: str) -> str | None:
+        """Why this adoption cannot be resumed, or ``None`` if it can be.
+
+        Only reports obstacles that no amount of retrying can clear - the
+        experiment record or its worktree being gone. Transient problems
+        are deliberately *not* reported here: those are the ones a resume
+        is supposed to work through.
+        """
+        try:
+            experiment = self.experiment_service.get_experiment(experiment_id)
+        except Exception:  # noqa: BLE001 - any lookup failure is unrecoverable here
+            return "the experiment record is no longer available"
+        worktree_path = getattr(experiment, "worktree_path", "") or ""
+        if not worktree_path or not os.path.isdir(worktree_path):
+            return "the experiment worktree is no longer available"
+        return None
+
+    def _merged_sha_for(self, experiment_id: str) -> str | None:
+        """Ask GitHub whether this experiment's pull request is already merged.
+
+        Returns ``None`` when there is no pull request yet. A lookup that
+        *fails* also returns ``None`` so recovery falls through to a normal
+        resume - the pipeline re-checks the merge state itself before
+        merging, so an unreachable API here delays the answer rather than
+        risking a wrong one.
+        """
+        try:
+            work_ref = self.github_work_tracking.for_experiment(experiment_id)
+            if work_ref is None:
+                return None
+            return self.github_work_tracking.merged_commit_sha(work_ref)
+        except Exception:  # noqa: BLE001 - evidence is optional, never fatal
+            logger.warning(
+                "could not determine merge state for %s during recovery", experiment_id
+            )
+            return None
 
     def start_adoption(self, experiment_id: str) -> ExperimentAdoption:
         existing = self.get(experiment_id)
@@ -287,6 +454,7 @@ class ExperimentAdoptionService:
                     reason=NULL,
                     local_sync_pending=0,
                     diagnostic_worktree_path=NULL,
+                    recovery_attempts=0,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -310,9 +478,9 @@ class ExperimentAdoptionService:
         thread.start()
         return self.get(experiment_id)
 
-    def _run_thread(self, adoption_id: str, experiment_id: str) -> None:
+    def _run_thread(self, adoption_id: str, experiment_id: str, *, resume: bool = False) -> None:
         try:
-            self._run_adoption_pipeline(adoption_id, experiment_id)
+            self._run_adoption_pipeline(adoption_id, experiment_id, resume=resume)
         except Exception:  # noqa: BLE001
             logger.exception("experiment adoption %s failed unexpectedly", experiment_id)
             try:
@@ -376,6 +544,37 @@ class ExperimentAdoptionService:
                 ),
             )
         return self.get(experiment_id)
+
+    def _resumable_commit_sha(self, experiment_id: str) -> str | None:
+        """The experiment commit a previous attempt already created, if any.
+
+        Returns the persisted ``experiment_commit_sha`` only when the
+        experiment worktree's HEAD still *is* that commit. Anything else -
+        no recorded commit, a missing worktree, or a HEAD that has moved -
+        yields ``None`` so the caller falls back to the normal path rather
+        than resuming on an assumption.
+        """
+        record = self.get(experiment_id)
+        recorded = (record.experiment_commit_sha or "").strip()
+        if not recorded:
+            return None
+        try:
+            experiment = self.experiment_service.get_experiment(experiment_id)
+        except Exception:  # noqa: BLE001 - treated as "cannot resume"
+            return None
+        worktree_path = getattr(experiment, "worktree_path", "") or ""
+        if not worktree_path or not os.path.isdir(worktree_path):
+            return None
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if head.returncode != 0:
+            return None
+        return recorded if head.stdout.strip() == recorded else None
 
     def _validate_startable(self, experiment_id: str, *, persist_review: bool) -> dict[str, Any]:
         experiment = self.experiment_service.get_experiment(experiment_id)
@@ -528,7 +727,9 @@ class ExperimentAdoptionService:
         with self._lock, self._conn:
             self._conn.execute(query, values)
 
-    def _run_adoption_pipeline(self, adoption_id: str, experiment_id: str) -> ExperimentAdoption:
+    def _run_adoption_pipeline(
+        self, adoption_id: str, experiment_id: str, *, resume: bool = False
+    ) -> ExperimentAdoption:
         elog = self.experiment_service.get_experiment_logger(experiment_id)
         lock = MailboxLock(self.lock_path)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,63 +779,102 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            validation = self._validate_startable(experiment_id, persist_review=False)
-            experiment = validation["experiment"]
-            worktree_path = str(experiment.worktree_path)
-            snapshot = validation["snapshot"]
-            actual_files = validation["actual_files"]
-            expected_files = validation["expected_files"]
-            elog.debug(
-                "adoption",
-                "adoption_diff_captured",
-                "Captured experiment diff prior to commit",
-                changed_files=actual_files,
-                diff_stat=sanitized_reason(snapshot["diff_stat"], max_chars=1000),
-            )
-            if not actual_files:
-                return self._finish_failure(
-                    experiment_id,
-                    reason="Keine Änderungen zur Übernahme vorhanden.",
-                    actual_files=actual_files,
-                    expected_files=expected_files,
-                    elog=elog,
+            resumed_commit_sha = self._resumable_commit_sha(experiment_id) if resume else None
+            if resumed_commit_sha is not None:
+                # A previous attempt already committed the verified changes,
+                # so this worktree is now clean. Re-running the diff/commit
+                # steps would fail twice over - _validate_startable would
+                # see a worktree that no longer matches the stored
+                # verification diff, and `git commit` would find nothing to
+                # commit. Matching HEAD against the commit we recorded is
+                # the stronger check anyway: it proves this tree *is* the
+                # verified one rather than merely resembling it.
+                experiment = self.experiment_service.get_experiment(experiment_id)
+                worktree_path = str(experiment.worktree_path)
+                record = self.get(experiment_id)
+                actual_files = _safe_list(record.actual_files or [])
+                expected_files = _safe_list(record.expected_files or [])
+                experiment_commit_sha = resumed_commit_sha
+                commit_message = self._commit_message(
+                    experiment_id, experiment.goal, experiment.plan
                 )
-
-            _run_git(["reset", "HEAD", "--"], cwd=worktree_path, timeout=60, elog=elog, phase="adoption")
-            for rel_path in actual_files:
-                add_proc = _run_git(
-                    ["add", "--", rel_path],
-                    cwd=worktree_path,
-                    timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
-                    elog=elog,
-                    phase="adoption",
+                elog.info(
+                    "adoption",
+                    "adoption_resumed_from_commit",
+                    "Resuming adoption from the experiment commit created before the restart",
+                    experiment_commit_sha=experiment_commit_sha,
                 )
-                if add_proc.returncode != 0:
+            else:
+                validation = self._validate_startable(experiment_id, persist_review=False)
+                experiment = validation["experiment"]
+                worktree_path = str(experiment.worktree_path)
+                snapshot = validation["snapshot"]
+                actual_files = validation["actual_files"]
+                expected_files = validation["expected_files"]
+                elog.debug(
+                    "adoption",
+                    "adoption_diff_captured",
+                    "Captured experiment diff prior to commit",
+                    changed_files=actual_files,
+                    diff_stat=sanitized_reason(snapshot["diff_stat"], max_chars=1000),
+                )
+                if not actual_files:
                     return self._finish_failure(
                         experiment_id,
-                        reason=f"git add failed for {Path(rel_path).name}",
+                        reason="Keine Änderungen zur Übernahme vorhanden.",
                         actual_files=actual_files,
                         expected_files=expected_files,
                         elog=elog,
                     )
 
-            commit_message = self._commit_message(experiment_id, experiment.goal, experiment.plan)
-            commit_proc = _run_git(
-                ["commit", "--no-verify", "-m", commit_message],
-                cwd=worktree_path,
-                timeout=120,
-                elog=elog,
-                phase="adoption",
-            )
-            if commit_proc.returncode != 0:
-                return self._finish_failure(
-                    experiment_id,
-                    reason="Der Experiment-Commit konnte nicht erstellt werden.",
-                    actual_files=actual_files,
-                    expected_files=expected_files,
+                _run_git(["reset", "HEAD", "--"], cwd=worktree_path, timeout=60, elog=elog, phase="adoption")
+                for rel_path in actual_files:
+                    add_proc = _run_git(
+                        ["add", "--", rel_path],
+                        cwd=worktree_path,
+                        timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
+                        elog=elog,
+                        phase="adoption",
+                    )
+                    if add_proc.returncode != 0:
+                        return self._finish_failure(
+                            experiment_id,
+                            reason=f"git add failed for {Path(rel_path).name}",
+                            actual_files=actual_files,
+                            expected_files=expected_files,
+                            elog=elog,
+                        )
+
+                commit_message = self._commit_message(experiment_id, experiment.goal, experiment.plan)
+                commit_proc = _run_git(
+                    ["commit", "--no-verify", "-m", commit_message],
+                    cwd=worktree_path,
+                    timeout=120,
                     elog=elog,
+                    phase="adoption",
                 )
-            experiment_commit_sha = self._git_stdout(["rev-parse", "HEAD"], worktree_path, elog).strip() or None
+                if commit_proc.returncode != 0:
+                    return self._finish_failure(
+                        experiment_id,
+                        reason="Der Experiment-Commit konnte nicht erstellt werden.",
+                        actual_files=actual_files,
+                        expected_files=expected_files,
+                        elog=elog,
+                    )
+                experiment_commit_sha = self._git_stdout(["rev-parse", "HEAD"], worktree_path, elog).strip() or None
+                # Persist the commit the moment it exists, not only when the
+                # pipeline finishes: it is the evidence a restart-recovery
+                # run needs to know this step already happened. Persisting
+                # it only at the end would lose exactly the case recovery
+                # exists for.
+                self._set_status(
+                    experiment_id,
+                    STATUS_ADOPTING,
+                    experiment_commit_sha=experiment_commit_sha,
+                    actual_files_json=json.dumps(_safe_list(actual_files)),
+                    expected_files_json=json.dumps(_safe_list(expected_files)),
+                    updated_at=_utcnow_iso(),
+                )
 
             integration_path = self.worktrees_root / f"adopt-{experiment_id[:8]}-{uuid.uuid4().hex[:8]}"
             integration_path.parent.mkdir(parents=True, exist_ok=True)
