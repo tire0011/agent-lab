@@ -142,6 +142,11 @@ class GitHubLifecycleTransport:
                 return {"merged": False, "message": self.merge_should_fail}
             sha = self._merge_branch(str(pr["head"]))
             pr["state"] = "closed"
+            # Mirror what GitHub reports afterwards, so code that asks
+            # "was this already merged?" sees the same evidence it would
+            # see in production.
+            pr["merged"] = True
+            pr["merge_commit_sha"] = sha
             return {"merged": True, "sha": sha}
 
         raise AssertionError(f"unexpected GitHub call: {method} {path} {payload}")
@@ -563,17 +568,16 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         self.assertIn("GitHub PR konnte nicht automatisch abgeschlossen werden", adoption.reason)
         self.assertIn("simulated merge failure", adoption.reason)
 
-    def test_recover_after_restart_marks_interrupted(self):
-        experiment_id = "91" * 16
-        with sqlite3.connect(self.fx.db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO experiment_adoptions (
-                    id, experiment_id, status, created_at, updated_at, target_branch
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                ("row1", experiment_id, STATUS_ADOPTING, "2026-08-14T12:00:00Z", "2026-08-14T12:00:00Z", "main"),
-            )
+    # ------------------------------------------------------------------
+    # Restart recovery (Issue #125)
+    #
+    # A process restart is a normal, expected boundary - the refresh flow
+    # restarts Nexus deliberately - so an adoption caught mid-flight must
+    # be reconstructed from durable evidence, not declared interrupted.
+    # ------------------------------------------------------------------
+
+    def _restarted_service(self) -> ExperimentAdoptionService:
+        """A second service instance, standing in for the restarted process."""
         restarted = ExperimentAdoptionService(
             experiment_service=self.fx.experiment_service,
             db_path=self.fx.db_path,
@@ -583,9 +587,208 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
             github_work_tracking=self.fx.github_work_tracking,
         )
         self.addCleanup(restarted.close)
-        marked = restarted.recover_after_restart()
-        self.assertEqual(marked, [experiment_id])
-        self.assertEqual(restarted.get(experiment_id).status, STATUS_INTERRUPTED)
+        return restarted
+
+    def _force_status(self, experiment_id: str, status: str, **columns) -> None:
+        """Rewrite one adoption row, simulating what a crash left behind."""
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        clause = f", {assignments}" if assignments else ""
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                f"UPDATE experiment_adoptions SET status = ?{clause} WHERE experiment_id = ?",
+                [status, *columns.values(), experiment_id],
+            )
+
+    def _merge_calls(self) -> list[tuple]:
+        return [
+            call for call in self.fx.github_api.calls
+            if call[0] == "PUT" and call[1].endswith("/merge")
+        ]
+
+    def _wait_terminal_on(self, service, experiment_id: str, timeout: float = 20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            service.wait_for_thread(experiment_id, timeout=0.1)
+            adoption = service.get(experiment_id)
+            if adoption.status not in {STATUS_QUEUED, STATUS_ADOPTING}:
+                return adoption
+            time.sleep(0.05)
+        raise AssertionError(f"recovered adoption did not finish for {experiment_id}")
+
+    def test_restart_before_merge_resumes_and_merges_exactly_once(self):
+        experiment_id = "d1" * 16
+        self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+        # Adoption had started but nothing was committed or merged yet.
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO experiment_adoptions (
+                    id, experiment_id, status, created_at, updated_at, target_branch
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("row-resume", experiment_id, STATUS_ADOPTING,
+                 "2026-09-06T12:00:00Z", "2026-09-06T12:00:00Z", "main"),
+            )
+
+        restarted = self._restarted_service()
+        self.assertEqual(restarted.recover_after_restart(), [experiment_id])
+        adoption = self._wait_terminal_on(restarted, experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED)
+        self.assertEqual(len(self._merge_calls()), 1)
+        # The same adoption record was continued, not replaced.
+        self.assertEqual(adoption.id, "row-resume")
+        self.assertEqual(adoption.recovery_attempts, 1)
+
+    def test_restart_after_the_commit_resumes_without_recommitting(self):
+        """The worktree is already clean at this point, so the fresh-start
+        path would fail ("changes have altered since verification"). Resume
+        must continue from the recorded commit instead."""
+        experiment_id = "d2" * 16
+        self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+        experiment = self.fx.experiment_service.get_experiment(experiment_id)
+        worktree = str(experiment.worktree_path)
+        git(Path(worktree), "add", "--", "app.py")
+        git(Path(worktree), "commit", "--no-verify", "-m", "Nexus adoption commit")
+        committed_sha = git(Path(worktree), "rev-parse", "HEAD").stdout.strip()
+
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO experiment_adoptions (
+                    id, experiment_id, status, created_at, updated_at, target_branch,
+                    experiment_commit_sha, actual_files_json, expected_files_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("row-committed", experiment_id, STATUS_ADOPTING,
+                 "2026-09-06T12:00:00Z", "2026-09-06T12:00:00Z", "main",
+                 committed_sha, json.dumps(["app.py"]), json.dumps(["app.py"])),
+            )
+
+        restarted = self._restarted_service()
+        restarted.recover_after_restart()
+        adoption = self._wait_terminal_on(restarted, experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED)
+        self.assertEqual(adoption.experiment_commit_sha, committed_sha)
+        self.assertEqual(len(self._merge_calls()), 1)
+
+    def test_restart_after_merge_is_detected_and_never_merges_twice(self):
+        """The merge landed but the process died before persisting it."""
+        experiment_id = "d3" * 16
+        self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adopted = self.fx.wait_terminal(experiment_id)
+        self.assertEqual(adopted.status, STATUS_ADOPTED)
+        merges_before = len(self._merge_calls())
+        self.assertEqual(merges_before, 1)
+
+        # Rewind the bookkeeping only: GitHub still shows the PR merged.
+        self._force_status(experiment_id, STATUS_ADOPTING, integrated_commit_sha=None, ended_at=None)
+
+        restarted = self._restarted_service()
+        restarted.recover_after_restart()
+        adoption = restarted.get(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED)
+        self.assertEqual(len(self._merge_calls()), merges_before)
+        self.assertIn("already merged", adoption.reason or "")
+        self.assertTrue(adoption.integrated_commit_sha)
+
+    def test_repeated_recovery_of_a_merged_adoption_is_idempotent(self):
+        experiment_id = "d4" * 16
+        self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+        self.fx.adoption_service.start_adoption(experiment_id)
+        self.fx.wait_terminal(experiment_id)
+        merges_before = len(self._merge_calls())
+
+        for _ in range(3):
+            self._force_status(experiment_id, STATUS_ADOPTING)
+            restarted = self._restarted_service()
+            restarted.recover_after_restart()
+            self.assertEqual(restarted.get(experiment_id).status, STATUS_ADOPTED)
+
+        self.assertEqual(len(self._merge_calls()), merges_before)
+
+    def test_exhausted_recovery_attempts_become_needs_review(self):
+        experiment_id = "d5" * 16
+        self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO experiment_adoptions (
+                    id, experiment_id, status, created_at, updated_at, target_branch,
+                    recovery_attempts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("row-exhausted", experiment_id, STATUS_ADOPTING,
+                 "2026-09-06T12:00:00Z", "2026-09-06T12:00:00Z", "main", 3),
+            )
+
+        restarted = self._restarted_service()
+        restarted.recover_after_restart()
+        adoption = restarted.get(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
+        self.assertIn("recovery attempts", adoption.reason or "")
+        self.assertEqual(self._merge_calls(), [])
+
+    def test_only_one_interrupted_adoption_is_resumed_at_a_time(self):
+        """Adoptions are serialized by design, so two stuck records are an
+        inconsistency: resuming both would only make them fight over the
+        adoption lock and fail each other."""
+        first_id = "e1" * 16
+        second_id = "e2" * 16
+        self.fx.create_experiment(experiment_id=first_id, changed_files=["app.py"])
+        self.fx.create_experiment(experiment_id=second_id, changed_files=["app.py"])
+        with sqlite3.connect(self.fx.db_path) as conn:
+            for row_id, experiment_id, created in (
+                ("row-a", first_id, "2026-09-06T12:00:00Z"),
+                ("row-b", second_id, "2026-09-06T12:05:00Z"),
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO experiment_adoptions (
+                        id, experiment_id, status, created_at, updated_at, target_branch
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (row_id, experiment_id, STATUS_ADOPTING, created, created, "main"),
+                )
+
+        restarted = self._restarted_service()
+        restarted.recover_after_restart()
+        self._wait_terminal_on(restarted, first_id)
+
+        # The older record is resumed and completes; the newer one is
+        # explicitly handed to a human instead of racing it.
+        self.assertEqual(restarted.get(first_id).status, STATUS_ADOPTED)
+        second = restarted.get(second_id)
+        self.assertEqual(second.status, STATUS_NEEDS_REVIEW)
+        self.assertIn("concurrent adoptions", second.reason or "")
+
+    def test_unrecoverable_state_becomes_needs_review_not_interrupted(self):
+        """A restart alone is never a failure, but a vanished experiment is
+        genuinely unrecoverable and must say so."""
+        experiment_id = "91" * 16  # no experiment record exists for this id
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO experiment_adoptions (
+                    id, experiment_id, status, created_at, updated_at, target_branch
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("row1", experiment_id, STATUS_ADOPTING,
+                 "2026-08-14T12:00:00Z", "2026-08-14T12:00:00Z", "main"),
+            )
+
+        restarted = self._restarted_service()
+        handled = restarted.recover_after_restart()
+        adoption = restarted.get(experiment_id)
+
+        self.assertEqual(handled, [experiment_id])
+        self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
+        self.assertNotEqual(adoption.status, STATUS_INTERRUPTED)
+        self.assertIn("no longer available", adoption.reason or "")
 
     def test_parallel_adoption_is_prevented(self):
         first_id = "01" * 16

@@ -84,11 +84,22 @@ class FakeGitHub:
                     return dict(pr)
             raise AssertionError(f"unknown PR {number}")
 
+        if method == "GET" and "/pulls/" in path and "?" not in path:
+            number = int(path.rsplit("/", 1)[1])
+            for pr in self.pulls:
+                if pr["number"] == number:
+                    return {**pr, "node_id": f"PR_{number}"}
+            raise AssertionError(f"unknown PR {number}")
+
         if method == "PUT" and path.endswith("/merge"):
             number = int(path.split("/pulls/", 1)[1].split("/", 1)[0])
             for pr in self.pulls:
                 if pr["number"] == number:
                     pr["state"] = "closed"
+                    # Mirror what GitHub reports once a PR is merged, so
+                    # the already-merged check sees real evidence.
+                    pr["merged"] = True
+                    pr["merge_commit_sha"] = "merged-sha"
                     return {"merged": True, "sha": "merged-sha"}
             raise AssertionError(f"unknown PR {number}")
 

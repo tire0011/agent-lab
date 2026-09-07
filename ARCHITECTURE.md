@@ -143,6 +143,33 @@
 - `MailboxTaskWorker` daemon polls every 10 s (`submit_approved` + `poll_running`)
 - Terminal states write outbox files; `failed`/`needs_review` also write a problem JSON to `state/runs/`
 
+### 8) Adoption restart recovery
+
+- Modules: `modules/experiment_adoption_service.py` (adoption itself),
+  `modules/task_finalization.py` (the late lifecycle around it:
+  `merging → deploying → restart_requested → validating_live → succeeded`)
+- A process restart is an expected boundary, not a failure — the refresh
+  flow restarts Nexus deliberately — so `recover_after_restart()`
+  reconstructs an adoption caught in `queued`/`adopting` from durable
+  evidence instead of marking it `interrupted` (Issue #125; that status
+  previously propagated into a misleading `needs_review`):
+  - GitHub already reports the pull request merged → recorded as
+    `adopted` with the real merge commit. `merge_and_complete()` is
+    idempotent for the same reason: it checks `merged_commit_sha()`
+    first, so a resumed adoption can never merge twice.
+  - Otherwise the **same** adoption record is resumed — same adoption id,
+    experiment, issue, PR and branch; no new record is created. The
+    pipeline re-derives its state from git, and `experiment_commit_sha`
+    is persisted the moment the commit exists so a restart after that
+    step resumes from it rather than failing on a now-clean worktree.
+  - `recovery_attempts` (additive column) bounds resumes at
+    `_MAX_RECOVERY_ATTEMPTS`; beyond that, or when the experiment/worktree
+    is genuinely gone, the adoption becomes `needs_review` naming the
+    actual obstacle.
+  - Adoptions are serialized by design, so if several are found stuck at
+    once only the oldest is resumed and the rest are flagged for review
+    rather than left to fight over the adoption lock.
+
 ## Near-term target architecture (planned, not complete)
 
 1. **V1 MCP agent path**

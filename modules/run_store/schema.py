@@ -410,6 +410,7 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
             reason TEXT NULL,
             local_sync_pending INTEGER NOT NULL DEFAULT 0,
             diagnostic_worktree_path TEXT NULL,
+            recovery_attempts INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(experiment_id)
@@ -421,6 +422,14 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
             ON experiment_adoptions(experiment_id);
         """
     )
+    # CREATE TABLE IF NOT EXISTS never adds columns to a table an older
+    # version already created, so the restart-recovery counter is migrated
+    # in explicitly.
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(experiment_adoptions)")}
+    if "recovery_attempts" not in existing:
+        conn.execute(
+            "ALTER TABLE experiment_adoptions ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _migrate_operations_audit(conn: sqlite3.Connection) -> None:

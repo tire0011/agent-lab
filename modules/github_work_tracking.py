@@ -608,9 +608,37 @@ class GitHubWorkTrackingService:
             },
         )
 
+    def merged_commit_sha(self, ref: GitHubWorkRef) -> str | None:
+        """The merge commit of *ref*'s pull request, or ``None`` if unmerged.
+
+        GitHub itself is the durable record of whether a merge happened, so
+        this is the evidence a restarted adoption uses to tell "the merge
+        never ran" apart from "the merge succeeded and the process died
+        before it could persist that". Returns ``None`` when there is no
+        pull request yet or it is not merged; a lookup failure propagates
+        as ``GitHubWorkTrackingError`` rather than being reported as "not
+        merged", since guessing here could cause a duplicate merge.
+        """
+        if ref.pr_number is None:
+            return None
+        pull = self._request("GET", f"/repos/{self.repository}/pulls/{ref.pr_number}")
+        if not bool(pull.get("merged")):
+            return None
+        return str(pull.get("merge_commit_sha") or "") or None
+
     def merge_and_complete(self, ref: GitHubWorkRef, *, expected_head_sha: str | None = None) -> str:
         if ref.pr_number is None:
             raise GitHubWorkTrackingError("cannot merge work without a pull request")
+
+        # A pull request that GitHub already reports as merged must never be
+        # merged a second time: after a restart mid-adoption the merge may
+        # already have happened, and re-issuing it would either fail the
+        # whole adoption or (worse) land the change twice.
+        already_merged = self.merged_commit_sha(ref)
+        if already_merged is not None:
+            self._close_completed_issue(ref)
+            return already_merged
+
         payload: dict[str, Any] = {"merge_method": "squash"}
         if expected_head_sha:
             payload["sha"] = expected_head_sha
@@ -621,12 +649,15 @@ class GitHubWorkTrackingService:
         )
         if not bool(result.get("merged")):
             raise GitHubWorkTrackingError(str(result.get("message") or "GitHub did not merge the pull request"))
+        self._close_completed_issue(ref)
+        return str(result.get("sha") or expected_head_sha or "")
+
+    def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
         self._request(
             "PATCH",
             f"/repos/{self.repository}/issues/{ref.issue_number}",
             {"state": "closed", "state_reason": "completed"},
         )
-        return str(result.get("sha") or expected_head_sha or "")
 
     def _remote_branch_sha(self, branch_name: str) -> str:
         quoted = urllib.parse.quote(branch_name, safe="")
