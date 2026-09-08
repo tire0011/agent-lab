@@ -248,16 +248,43 @@ class TaskFinalizationCoordinator:
             if existing.experiment_id != experiment_id:
                 raise RuntimeError("finalization state is bound to a different experiment")
             return existing
+
         now = time.time()
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO task_finalizations (
-                    approval_id, experiment_id, phase, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (approval_id, experiment_id, PHASE_VERIFIED, now, now),
-            )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._get(approval_id)
+            if existing is not None:
+                if existing.experiment_id != experiment_id:
+                    raise RuntimeError("finalization state is bound to a different experiment")
+                self._conn.commit()
+                return existing
+
+            experiment_state = self._get_by_experiment(experiment_id)
+            if experiment_state is not None:
+                updated = self._conn.execute(
+                    """
+                    UPDATE task_finalizations
+                    SET approval_id=?, updated_at=?
+                    WHERE experiment_id=? AND approval_id=?
+                    """,
+                    (approval_id, now, experiment_id, experiment_state.approval_id),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("finalization state ownership changed during approval rebind")
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO task_finalizations (
+                        approval_id, experiment_id, phase, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (approval_id, experiment_id, PHASE_VERIFIED, now, now),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
         state = self._get(approval_id)
         if state is None:
             raise RuntimeError("failed to persist task finalization state")
@@ -268,6 +295,17 @@ class TaskFinalizationCoordinator:
             "SELECT * FROM task_finalizations WHERE approval_id = ?",
             (approval_id,),
         ).fetchone()
+        return self._state_from_row(row)
+
+    def _get_by_experiment(self, experiment_id: str) -> _State | None:
+        row = self._conn.execute(
+            "SELECT * FROM task_finalizations WHERE experiment_id = ?",
+            (experiment_id,),
+        ).fetchone()
+        return self._state_from_row(row)
+
+    @staticmethod
+    def _state_from_row(row: sqlite3.Row | None) -> _State | None:
         if row is None:
             return None
         return _State(
@@ -289,12 +327,12 @@ class TaskFinalizationCoordinator:
 
     def _save(self, state: _State) -> None:
         with self._conn:
-            self._conn.execute(
+            updated = self._conn.execute(
                 """
                 UPDATE task_finalizations
                 SET phase=?, restart_requested_at=?, retry_count=?, merge_commit=?,
                     live_validation_json=?, last_error=?, updated_at=?
-                WHERE approval_id=?
+                WHERE approval_id=? AND experiment_id=?
                 """,
                 (
                     state.phase,
@@ -305,8 +343,11 @@ class TaskFinalizationCoordinator:
                     state.last_error,
                     time.time(),
                     state.approval_id,
+                    state.experiment_id,
                 ),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError("finalization state ownership changed to another approval")
 
     def _sync_live_checkout(self) -> None:
         status = subprocess.run(
