@@ -850,7 +850,18 @@ _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 # merged in by ``GET /logs``. Experiment id / mailbox task id / job id
 # remain available as optional detail/filter fields on every entry;
 # ``source`` is only the primary at-a-glance grouping.
-_MAILBOX_SOURCE_PHASES = {"mailbox", "queued"}
+_MAILBOX_SOURCE_PHASES = {
+    "mailbox",
+    "queued",
+    # Entries written before the phase for mailbox loggers was corrected
+    # (see modules/logging_config._phase_for_logger) carry the logger's
+    # module name as their phase. Recognizing those here reclassifies the
+    # existing history as `mailbox` on read, with no migration.
+    "mailbox_processor",
+    "poll_runner",
+    "processing",
+    "retention",
+}
 _CONTROLLER_SOURCE_PHASES = {
     "research", "selection", "selection_reformat_retry", "selection_policy_replan",
 }
