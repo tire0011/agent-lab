@@ -131,6 +131,132 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         self.assertEqual(live_calls, [(self.approval.id, self.experiment.id)])
         self.assertEqual(resumed.get_phase(self.approval.id), PHASE_SUCCEEDED)
 
+    def test_new_approval_rebinds_existing_experiment_state_without_reset(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(_FakeAdoptionService(adoption))
+        self.addCleanup(coordinator.close)
+
+        state = coordinator._get_or_create(self.approval.id, self.experiment.id)
+        state.phase = PHASE_RESTART_REQUESTED
+        state.restart_requested_at = 123.5
+        state.retry_count = 2
+        state.merge_commit = "existing-merge"
+        state.live_validation_json = '{"previous": true}'
+        state.last_error = "previous error"
+        coordinator._save(state)
+
+        rebound = coordinator._get_or_create("approval-2", self.experiment.id)
+
+        self.assertEqual(rebound.approval_id, "approval-2")
+        self.assertEqual(rebound.phase, PHASE_RESTART_REQUESTED)
+        self.assertEqual(rebound.restart_requested_at, 123.5)
+        self.assertEqual(rebound.retry_count, 2)
+        self.assertEqual(rebound.merge_commit, "existing-merge")
+        self.assertEqual(rebound.live_validation_json, '{"previous": true}')
+        self.assertEqual(rebound.last_error, "previous error")
+        self.assertIsNone(coordinator.get_phase(self.approval.id))
+        self.assertEqual(coordinator.get_phase("approval-2"), PHASE_RESTART_REQUESTED)
+        count = coordinator._conn.execute(
+            "SELECT COUNT(*) FROM task_finalizations WHERE experiment_id=?",
+            (self.experiment.id,),
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_repeated_new_approvals_reuse_one_finalization_row_idempotently(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(_FakeAdoptionService(adoption))
+        self.addCleanup(coordinator.close)
+
+        state = coordinator._get_or_create(self.approval.id, self.experiment.id)
+        state.phase = PHASE_MERGING
+        state.retry_count = 1
+        coordinator._save(state)
+
+        second = coordinator._get_or_create("approval-2", self.experiment.id)
+        same_second = coordinator._get_or_create("approval-2", self.experiment.id)
+        third = coordinator._get_or_create("approval-3", self.experiment.id)
+
+        self.assertEqual(second.phase, PHASE_MERGING)
+        self.assertEqual(same_second.approval_id, "approval-2")
+        self.assertEqual(third.approval_id, "approval-3")
+        self.assertEqual(third.retry_count, 1)
+        rows = coordinator._conn.execute(
+            "SELECT approval_id, phase, retry_count FROM task_finalizations WHERE experiment_id=?",
+            (self.experiment.id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["approval_id"], "approval-3")
+        self.assertEqual(rows[0]["phase"], PHASE_MERGING)
+        self.assertEqual(rows[0]["retry_count"], 1)
+
+    def test_stale_approval_cannot_save_after_finalization_is_rebound(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(_FakeAdoptionService(adoption))
+        self.addCleanup(coordinator.close)
+
+        stale = coordinator._get_or_create(self.approval.id, self.experiment.id)
+        coordinator._get_or_create("approval-2", self.experiment.id)
+        stale.phase = PHASE_SUCCEEDED
+
+        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+            coordinator._save(stale)
+
+        self.assertEqual(coordinator.get_phase("approval-2"), "verified")
+
+    def test_new_approval_continues_from_restart_phase_through_live_validation(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        fake = _FakeAdoptionService(adoption)
+        first = self._coordinator(fake, process_started_at=100.0)
+        state = first._get_or_create(self.approval.id, self.experiment.id)
+        state.phase = PHASE_RESTART_REQUESTED
+        state.restart_requested_at = 150.0
+        state.retry_count = 1
+        state.merge_commit = "merge-sha"
+        first._save(state)
+        first.close()
+
+        restart_calls = []
+        live_calls = []
+        resumed = self._coordinator(
+            fake,
+            process_started_at=200.0,
+            restart_runner=lambda services: restart_calls.append(services),
+            live_validator=lambda approval, experiment: (
+                live_calls.append((approval.id, experiment.id))
+                or {"summary": "live after approval rebind"}
+            ),
+        )
+        self.addCleanup(resumed.close)
+        new_approval = SimpleNamespace(id="approval-2", task_body=self.approval.task_body)
+
+        result = resumed.advance(new_approval, self.experiment)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.phase, PHASE_SUCCEEDED)
+        self.assertEqual(restart_calls, [])
+        self.assertEqual(live_calls, [("approval-2", self.experiment.id)])
+        self.assertEqual(resumed.get_phase("approval-2"), PHASE_SUCCEEDED)
+
 
 class FinalizingMailboxTaskServiceTests(unittest.TestCase):
     def setUp(self):
