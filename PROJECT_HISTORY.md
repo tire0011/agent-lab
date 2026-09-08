@@ -382,7 +382,7 @@ Regression coverage reproduces a command that commits/pushes and then kills its 
 
 The intended end-to-end continuation of the verified version experiment reached the adoption/finalization layer and exposed a separate restart bug not covered by the mailbox-command recovery. After a service restart, an adoption left in `queued`/`adopting` was converted to terminal `interrupted`, and the original task ended `needs_review` even though the mailbox and services were healthy.
 
-Issue #125 defines startup recovery for the higher-level adoption lifecycle: reconstruct progress from durable GitHub/Git/service evidence, preserve the same task/experiment/adoption/Issue/PR identity, resume from the latest confirmed phase, avoid duplicate merge/deploy work, and make repeated startup recovery idempotent. A restart alone must not be treated as failure. Issue #125 remains open with no merged implementation yet.
+Issue #125 defines startup recovery for the higher-level adoption lifecycle: reconstruct progress from durable GitHub/Git/service evidence, preserve the same task/experiment/adoption/Issue/PR identity, resume from the latest confirmed phase, avoid duplicate merge/deploy work, and make repeated startup recovery idempotent. A restart alone must not be treated as failure.
 
 **Lesson:** restart resilience must exist at every persisted lifecycle layer. A durable outer coordinator cannot rely on a lower-level service that turns non-terminal state into `interrupted` on startup.
 
@@ -401,6 +401,38 @@ Verification added **40 focused tests**. The branch had the same **29 pre-existi
 A real chat implementation request still produced `TaskOrchestratorError: Failed to parse JSON` because model output contained a JSON-invalid backslash escape inside a command string. This shows that the existing schema/syntax-repair work does not yet make arbitrary model-generated command strings robust across all quoting cases.
 
 **Lesson:** avoid fragile nested string encoding where possible; otherwise JSON repair/validation must specifically normalize or reject invalid escape sequences before orchestration state is lost. No merged fix is recorded yet.
+
+### 80. 2026-09-07: adoption restart recovery was implemented and merged
+
+Issue #125 / PR #127 changed restart handling from terminal interruption to durable reconstruction. If GitHub already shows the PR merged, Nexus records the real merge commit without merging again; otherwise it resumes the same adoption record from persisted Git state. The experiment commit SHA is persisted as soon as it exists so recovery can continue from a clean post-commit worktree. Recovery attempts are bounded, and genuinely unrecoverable or conflicting concurrent state becomes `needs_review` instead of being guessed through.
+
+Regression coverage included restart before merge, after commit, after merge, repeated idempotent startup recovery, exhausted recovery budget, and inconsistent multiple stuck adoptions. The branch had the same **27 pre-existing failures** as clean `main`, with **1,291 passing versus 1,286** on the base.
+
+**Lesson:** self-restart recovery should resume the same durable lifecycle identity and derive completion from external/persisted evidence; restart itself is not a failure signal.
+
+### 81. 2026-09-07: the recovery E2E exposed finalization ownership tied to transient approvals
+
+After PR #127, the real retry reused the existing experiment and its already-green exact-commit CI evidence, but autonomous finalization failed before adoption with `failed to persist task finalization state`. Issue #128 traced this to `task_finalizations`: the lifecycle is unique by `experiment_id` but lookup/creation begins from the new mailbox `approval_id`, so a later approval for the same experiment collides with the existing row and cannot resume it.
+
+The desired model is that finalization state belongs primarily to the durable experiment/lifecycle, while approval IDs are transient request context. Issue #128 remains open and calls for safe reuse/rebinding or a stable experiment-owned finalization identity, preserving phase/restart/retry/merge/live-validation state and preventing concurrent approvals from driving the same experiment.
+
+**Lesson:** persistence keys should match the lifetime of the state they own. A transient transport/request identity should not own a lifecycle that intentionally survives retries and new approvals.
+
+### 82. 2026-09-07 to 2026-09-08: mailbox retention became state-aware and self-maintaining
+
+Issue #129 / PR #130 fixed two accumulating queue problems: the outbox had grown to **233 responses** with no retention policy, and exhausted inbox messages were re-read and re-skipped forever. Retention now runs inside the mailbox processor with a configurable **5-day default** (zero or invalid configuration disables deletion), removes only terminal exhausted inbox items after logging their failure context, and protects any outbox file still needed by incomplete mailbox/operation-chain/approval publication state.
+
+A copy of the real mailbox was reduced from **233 to 37 outbox files**, deleting **196** old responses in one clean commit while leaving the working tree clean. Full-suite comparison showed the identical **27 pre-existing failures**, with **1,310 passing versus 1,292** on clean `main`.
+
+**Lesson:** retention of durable queues must be state-aware. Git age alone cannot tell whether a file is still required to finish a persisted commit/publish transition; cleanup belongs next to the state machine that knows those invariants.
+
+### 83. 2026-09-08: log readability failures were isolated; fix is verified but not yet merged
+
+Phone use of the unified log timeline exposed three stacked defects: the bounded feed rendered oldest-first so current events were buried, permanently skipped mailbox messages flooded INFO on every poll, and mailbox records were misclassified as `source: experiment`. Issue #131 / open PR #132 changes the main feed to newest-first while keeping causal trace views chronological, moves terminal-skip repetition to DEBUG while retaining skipped counts in poll summaries, and fixes both new and historical mailbox source classification without migration.
+
+PR #132 has local browser verification at phone viewport plus **12 focused tests**. Its full-suite comparison reports the same **27 pre-existing failures**, with **1,322 passing versus 1,310** on the base. It remains open and is not yet adopted on `main`.
+
+**Lesson:** observability can fail at presentation semantics even when the underlying events exist. Ordering, noise policy, and source classification are part of diagnostic correctness.
 
 ## What Nexus currently learns
 
@@ -443,11 +475,11 @@ Current `main` includes:
 - persisted verification-run evidence with repeated-failure detection,
 - exact-commit GitHub Actions evidence as authoritative verification with bounded local fallback,
 - mandatory GitHub-backed implementation lifecycle using Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion,
-- persisted post-verification finalization that continues verified tasks through PR finalization/merge, adoption/deployment, service restart recovery, task-specific live validation, and only then final `succeeded`, but adoption-startup recovery remains incomplete under Issue #125,
+- persisted post-verification finalization through PR merge, adoption/deployment, service restart recovery, task-specific live validation, and only then final `succeeded`; adoption startup recovery is now evidence-based and idempotent, while cross-approval finalization reuse remains open under Issue #128,
 - restart-aware mailbox command recovery using persisted Git baselines, optional declared service postconditions, tri-state evidence (`succeeded`/`failed`/`unknown`), and cached idempotent replay,
 - GitHub Actions verification for PRs and `nexus/**` pushes,
 - SQLite state and durable project/idea/decision/history documents,
-- separate Git-backed mailbox repository with crash-safe publication, rejected-chain recovery, fetch/rebase/push synchronization, deferred trusted command execution, and synchronous internal-command compatibility,
+- separate Git-backed mailbox repository with crash-safe publication, rejected-chain recovery, fetch/rebase/push synchronization, deferred trusted command execution, synchronous internal-command compatibility, and state-aware mailbox retention,
 - signed webhook wake-up with timer fallback and bounded recovery diagnostics,
 - modularized mailbox, run-store, experiment-service, central-logging, and browser-client code,
 - application-wide central structured logging from work submission onward, with unauthenticated read-only `/logs`, `/logs/public`, and `/logs/trace` surfaces plus authenticated write/control endpoints,
@@ -459,7 +491,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), higher-level adoption restart recovery (Issue #125), remaining Issue #123 restart paths, measurement of the two-stage tool gateway, a successful real autonomous-finalization E2E, controller JSON escape hardening, and broader validation of bounded verification repair remain open work/research. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
+Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), cross-approval finalization recovery (Issue #128), remaining Issue #123 restart paths, controller JSON escape hardening, merge/adoption of the log-readability fix in PR #132, measurement of the two-stage tool gateway, a successful real autonomous-finalization E2E, and broader validation of bounded verification repair remain open work/research. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
 
 ## Important lessons so far
 
@@ -518,6 +550,9 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 53. **Restart recovery is layered.** Mailbox-command resilience does not imply adoption/finalization resilience; every durable coordinator must reconstruct its own unfinished state idempotently.
 54. **Search completeness must be explicit.** Bounded historical scans should report truncation, and operational traces should bridge correlation-ID changes rather than forcing manual joins.
 55. **Nested model-generated serialization is fragile.** Structured-output repair must handle invalid escaping or reduce the number of string-encoding layers.
+56. **Persistent state ownership must match lifecycle identity.** Retry/approval IDs may change while an experiment/finalization lifecycle intentionally continues.
+57. **Retention belongs with the state machine that knows liveness.** Durable queue files must not be aged out while persisted transitions still depend on them.
+58. **Log presentation is diagnostic semantics.** Ordering, source classification, and repetitive-noise policy determine whether existing evidence is actually usable.
 
 ## Open research directions
 
@@ -544,9 +579,10 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 - enforce and test `find_tool` grant semantics so only `found` can authorize execution and suggestions cannot (Issue #117),
 - model verification, integration, deployment, and final completion distinctly across outbox/UI/state (Issue #119),
 - investigate missing-capability recovery, deduplicated issue creation, tool provisioning, and promotion of recurring gaps into OperationsRegistry capabilities (Issue #120),
-- implement and exercise Issue #125 across restart before/after merge, integration/deployment, intentional restart, live validation, idempotent repeated recovery, and exactly-once final response,
+- fix and exercise Issue #128 so later approvals resume the same finalization state without losing durable progress or allowing concurrent drivers,
 - validate Issue #123 beyond the command-channel fix: restart/resume across remaining mailbox/task paths, explicit expected-state evidence, and exactly-once pending replies,
 - harden controller structured-output parsing against JSON-invalid escape sequences and measure repair success without broad lossy normalization,
+- merge/validate PR #132 against live Nexus logs and measure whether newest-first ordering and quieter terminal skips reduce diagnosis time on mobile,
 - investigate missing-capability detection and structured issue creation before automatic tool generation,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
@@ -556,19 +592,20 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 
 ## Current next-step candidates
 
-1. **Adoption restart recovery:** implement Issue #125 first, then repeat the real verified-feature finalization path and confirm the same task/experiment/PR survives restart through merge -> deploy -> live validation -> exactly-once final success.
+1. **Finalization identity recovery:** implement Issue #128, then repeat the real verified-feature finalization path and confirm a later approval reuses the same experiment/finalization state through merge -> deploy -> live validation -> exactly-once final success.
 2. **Restart-recovery E2E:** exercise the real Inbox refresh path with PR #124, including declared service postconditions, repeated restart/idempotence, and an inconclusive case that must remain `unknown`; then decide whether broader Issue #123 acceptance criteria need more work.
 3. **Controller JSON escaping:** reproduce the `Invalid \\escape` failure with a focused regression and harden structured-output repair or payload encoding without weakening semantic validation.
-4. **Tool-grant contract:** implement Issue #117 so `related_tools` can never be interpreted as granted operations, then repeat the version/tool-gateway path.
-5. **Missing-capability learning:** implement Issue #120 and test `rg`-missing recovery, fallback/provisioning, deduplicated issue creation, and later promotion to a reusable tool.
-6. **Completion-state modeling:** complete Issue #119 so outbox/UI distinguish verified, integrated, deployed, and final succeeded states even outside the finalization coordinator internals.
-7. **Real post-OOM rerun:** repeat the feature task that previously caused prompt growth/tool looping and measure whether PRs #95/#97/#99 now finish without repetition or local OOM.
-8. **Tool-gateway measurement:** compare the two-stage discovery/invocation protocol with direct catalog exposure and quantify context reduction versus resolver cost, invalid-goal recovery, and wrong selection.
-9. **Verification-repair measurement:** run representative repairable and non-repairable failures and measure recovery, repeat detection, latency, model calls, CI runs, and intervention.
-10. **Authoritative-CI measurement:** run several experiments and verify exact-SHA CI reuse removes duplicate local suites without accepting stale evidence.
-11. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
-12. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
-13. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
-14. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
-15. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
-16. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
+4. **Log-readability adoption:** review/merge PR #132 and validate the live mobile timeline, source filters, and terminal-skip noise behavior.
+5. **Tool-grant contract:** implement Issue #117 so `related_tools` can never be interpreted as granted operations, then repeat the version/tool-gateway path.
+6. **Missing-capability learning:** implement Issue #120 and test `rg`-missing recovery, fallback/provisioning, deduplicated issue creation, and later promotion to a reusable tool.
+7. **Completion-state modeling:** complete Issue #119 so outbox/UI distinguish verified, integrated, deployed, and final succeeded states even outside the finalization coordinator internals.
+8. **Real post-OOM rerun:** repeat the feature task that previously caused prompt growth/tool looping and measure whether PRs #95/#97/#99 now finish without repetition or local OOM.
+9. **Tool-gateway measurement:** compare the two-stage discovery/invocation protocol with direct catalog exposure and quantify context reduction versus resolver cost, invalid-goal recovery, and wrong selection.
+10. **Verification-repair measurement:** run representative repairable and non-repairable failures and measure recovery, repeat detection, latency, model calls, CI runs, and intervention.
+11. **Authoritative-CI measurement:** run several experiments and verify exact-SHA CI reuse removes duplicate local suites without accepting stale evidence.
+12. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
+13. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
+14. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
+15. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
+16. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
+17. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
