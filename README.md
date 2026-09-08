@@ -17,6 +17,15 @@ Example: `agent-lab-mailbox/examples/idea-template.md`.
 
 **Outbox** (`agent-lab-mailbox/outbox/`): Nexus writes responses here. Processed mailbox state is kept in the dedicated mailbox repository rather than under `agent-lab/communication/`.
 
+**Retention:** each poll deletes outbox responses older than
+`NEXUS_MAILBOX_RETENTION_DAYS` days (default `5`; set `0` to disable), and drops
+inbox messages that exhausted their retries — those are terminal and would
+otherwise be re-read and re-skipped on every poll forever. A message's reason
+for removal is logged before it goes, so `GET /logs/trace/{reference}` still
+explains it afterwards. Files that a publisher or the commit-retry path still
+needs are never deleted. The files leave the working tree; git history keeps
+them.
+
 **Processing rules:**
 
 - `idea` — appended to `IDEAS.md` under `### Mailbox submissions` with state `new`; response committed and pushed.

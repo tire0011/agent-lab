@@ -371,6 +371,83 @@ class MailboxProcessor:
     def ensure_clean_worktree(self) -> bool:
         return git_is_clean(self._mailbox_repo_path)
 
+    def prune_old_messages(self, *, now=None) -> Any:
+        """Delete finished outbox responses and dead inbox messages.
+
+        Runs as part of the normal poll (see ``run_mailbox_poll_once``),
+        after pending commits have been retried - a file still needed to
+        finalize a commit is protected, and retrying first lets those
+        records reach ``done`` so the next poll can prune them.
+
+        The deletions are committed with explicit pathspecs; pushing is
+        left to the poll's existing fetch/rebase/push sync. A pass with
+        nothing to prune makes no commit at all.
+        """
+        from . import retention
+
+        days = retention.retention_days()
+        plan = retention.plan_prune(
+            self.conn, inbox=self.inbox, outbox=self.outbox, days=days, now=now,
+        )
+        if not plan or self.dry_run:
+            return plan
+
+        for path in plan.inbox:
+            self._log_terminal_inbox_message(path)
+
+        removed: list[Path] = []
+        for path in plan.paths:
+            try:
+                path.unlink()
+                removed.append(path)
+            except FileNotFoundError:
+                removed.append(path)  # already gone; still stage the deletion
+            except OSError:
+                logger.warning("could not delete mailbox file %s", path.name)
+
+        if not removed:
+            return plan
+
+        commit_msg = f"mailbox: prune {plan.summary()} older than {days}d"
+        if not git_add_and_commit(
+            self._mailbox_repo_path, removed, commit_msg, self._mailbox_commit_prefixes
+        ):
+            logger.warning("mailbox prune could not be committed")
+        else:
+            logger.info(
+                "Mailbox pruned %s (protected=%d truncated=%s)",
+                plan.summary(), plan.protected, plan.truncated,
+            )
+        return plan
+
+    def _log_terminal_inbox_message(self, path: Path) -> None:
+        """Record why an inbox message is being dropped, before it is gone.
+
+        Written through the same task logger the message used while it was
+        being processed, so ``GET /logs/trace/{reference}`` can still
+        explain what happened to it once the file no longer exists.
+        """
+        try:
+            rel = str(path.relative_to(self._mailbox_repo_path))
+        except ValueError:
+            rel = path.name
+        row = self.conn.execute(
+            "SELECT retry_count, last_error, msg_type FROM mailbox_messages WHERE file_path = ?",
+            (str(path),),
+        ).fetchone()
+        task_log = get_task_logger(
+            _transient_mailbox_task_id(rel), log_dir=self.task_log_dir,
+        )
+        task_log.warning(
+            "mailbox",
+            "message_discarded",
+            "mailbox message removed from the inbox after exhausting its retries",
+            source_file=path.name,
+            message_type=str(row[2]) if row else "unknown",
+            retry_count=int(row[0]) if row and row[0] is not None else MAX_RETRY,
+            last_error=str(row[1]) if row and row[1] else "unknown",
+        )
+
     def retry_pending_git_commits(self) -> None:
         rows = self.conn.execute(
             """

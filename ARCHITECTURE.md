@@ -111,6 +111,22 @@
 - Git integration: commits outbox + IDEAS.md (idea type only), pushes to tracked branch
 - Lock: `state/mailbox.lock` via `fcntl.flock` prevents concurrent runs on the Ubuntu deployment; the implementation includes a Windows fallback for portable local checks
 - Deployment: systemd oneshot service + 1-minute timer (see `deploy/nexus-mailbox.{service,timer}`)
+- Retention (`modules/mailbox/retention.py`, Issue #129): each poll deletes
+  outbox responses older than `NEXUS_MAILBOX_RETENTION_DAYS` (default 5,
+  `0` disables; an unparsable value also disables rather than guessing),
+  and drops inbox messages whose record shows they exhausted `MAX_RETRY` —
+  those are terminal and were otherwise re-read and re-skipped on every
+  poll forever. A message's reason for removal is logged first, so
+  `GET /logs/trace/{reference}` still explains it after the file is gone.
+  Pruning runs *after* `retry_pending_git_commits()` and never deletes a
+  file that is still needed: anything referenced by a `mailbox_messages`
+  row that is not `done`, or by an `operation_chains`/
+  `mailbox_task_approvals` row whose `publish_status` is not `pushed`, is
+  protected — deleting it would strand that record permanently. That
+  constraint is why retention lives in the processor (which holds the
+  SQLite state) rather than in an external cron or `git rm` job. Deletions
+  are committed with explicit pathspecs and pushed by the poll's existing
+  fetch/rebase/push sync; a poll with nothing to prune makes no commit.
 - Command channel restart recovery (`modules/mailbox/development.py` +
   `modules/mailbox/command_recovery.py`, Issue #123): the trusted `command`
   message type runs the shell command as a detached background job so
