@@ -18,6 +18,20 @@ configure_logging()
 logger = logging.getLogger("mailbox_processor")
 
 
+_PERMANENT_SKIP_MARKERS = ("max retries",)
+
+
+def _is_permanent_skip(reason: str | None) -> bool:
+    """Whether a skip reason will still hold on every future poll.
+
+    A message whose retries are exhausted is skipped forever; one skipped
+    because it is already done disappears as soon as its inbox file is
+    cleaned up. Only the first kind needs to stop being re-announced.
+    """
+    text = (reason or "").lower()
+    return any(marker in text for marker in _PERMANENT_SKIP_MARKERS)
+
+
 def _resolve_repo_paths(
     code_repo_path_arg: str | None,
     mailbox_repo_path_arg: str | None,
@@ -139,13 +153,24 @@ def main(argv: list[str] | None = None) -> int:
         if status == "done":
             logger.info("done: %s -> %s", file_, r.get("outbox", ""))
         elif status == "skipped":
-            logger.info("skipped: %s (%s)", file_, r.get("reason", ""))
+            # A message skipped for a permanent reason is skipped again on
+            # every future poll, so announcing it at INFO each time floods
+            # the feed and pushes real events out of the default window
+            # (see PROJECT_HISTORY lesson 37: keep success quiet, keep the
+            # detail available on demand). The count still appears in the
+            # summary below, and the per-file detail stays at DEBUG.
+            level = logging.DEBUG if _is_permanent_skip(r.get("reason")) else logging.INFO
+            logger.log(level, "skipped: %s (%s)", file_, r.get("reason", ""))
         else:
             logger.warning("failed: %s: %s", file_, r.get("error", ""))
 
     done = sum(1 for r in result.results if r.get("status") == "done")
     failed = sum(1 for r in result.results if r.get("status") == "failed")
-    logger.info("Processed %d message(s): %d done, %d failed", len(result.results), done, failed)
+    skipped = sum(1 for r in result.results if r.get("status") == "skipped")
+    logger.info(
+        "Processed %d message(s): %d done, %d failed, %d skipped",
+        len(result.results), done, failed, skipped,
+    )
     return 0
 
 

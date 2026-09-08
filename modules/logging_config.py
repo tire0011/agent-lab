@@ -18,6 +18,24 @@ DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _HANDLER_MARKER = "_nexus_central_handler"
 _APPLICATION_LOGGERS = ("api", "mailbox_processor", "modules", "nexus")
 
+# Loggers whose records belong to a known subsystem. Without this the phase
+# fell back to the logger's last name segment - "mailbox_processor",
+# "poll_runner", "processing" - none of which any reader recognizes, so
+# mailbox activity was classified as `source: experiment` and the Logs
+# tab's "mailbox" filter hid exactly the lines it should show.
+_LOGGER_PHASE_PREFIXES = (
+    ("mailbox_processor", "mailbox"),
+    ("modules.mailbox", "mailbox"),
+)
+
+
+def _phase_for_logger(logger_name: str) -> str:
+    """Coarse phase for a stdlib log record, from its logger name."""
+    for prefix, phase in _LOGGER_PHASE_PREFIXES:
+        if logger_name == prefix or logger_name.startswith(f"{prefix}."):
+            return phase
+    return logger_name.rsplit(".", 1)[-1]
+
 
 def _configured_level() -> int:
     value = os.environ.get("NEXUS_LOG_LEVEL", "INFO").upper()
@@ -49,7 +67,11 @@ class StructuredJsonlHandler(logging.Handler):
             return
         try:
             level = record.levelname if record.levelname in {"DEBUG", "INFO", "WARNING", "ERROR"} else "INFO"
-            phase = str(getattr(record, "phase", "") or record.name.rsplit(".", 1)[-1] or "system")
+            phase = str(
+                getattr(record, "phase", "")
+                or _phase_for_logger(record.name)
+                or "system"
+            )
             event = str(getattr(record, "event", "") or record.funcName or "log")
             extra: dict[str, Any] = {}
             for field in ("experiment_id", "mailbox_task_id", "job_id", "session_id"):

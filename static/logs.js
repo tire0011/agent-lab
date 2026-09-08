@@ -85,16 +85,24 @@ function renderLogSourceErrors(sourceErrors) {
 // systemd journal line), rendered as a collapsible card in one common,
 // compact shape: time, level, source, message, with everything else as
 // expandable detail. Every value is written via textContent only.
-function renderLogEntries(entries) {
+// The API returns entries chronologically (oldest first). The feed is
+// rendered newest-first, because a log viewer has to open on what just
+// happened - with 500 entries per page the newest was previously at the
+// very bottom, unreachable on a phone. A trace is rendered in its natural
+// order instead: it is the causal story of one order (mailbox intake ->
+// controller -> implementation -> verification -> result) and reading it
+// backwards makes no sense.
+function renderLogEntries(entries, { newestFirst = true } = {}) {
   logsElements.content.replaceChildren();
   if (!entries.length) {
     logsElements.content.textContent = "Keine Log-Einträge gefunden.";
     return;
   }
+  const ordered = newestFirst ? [...entries].reverse() : entries;
   const list = document.createElement("ul");
   list.className = "item-list";
 
-  for (const entry of entries) {
+  for (const entry of ordered) {
     const li = document.createElement("li");
     li.className = "log-entry";
 
@@ -309,7 +317,7 @@ async function loadTrace(reference) {
   try {
     const data = await requestJson(`/logs/trace/${encodeURI(value)}`, { headers: authHeaders() });
     const entries = data.entries || [];
-    renderLogEntries(entries);
+    renderLogEntries(entries, { newestFirst: false });
     renderTraceSummary(data);
     updateLogsSuccessStatus(entries);
     renderLogsTruncationHint(data.truncated);
