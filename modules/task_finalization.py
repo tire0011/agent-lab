@@ -35,6 +35,7 @@ PHASE_NEEDS_REVIEW = "needs_review"
 
 _DEFAULT_MAX_RETRIES = 2
 _DEFAULT_HEALTH_URL = "http://127.0.0.1:8000/health"
+_ACTIVE_APPROVAL_STATUSES = {"pending_approval", "approved", "submitted", "running"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +64,7 @@ LiveValidator = Callable[[Any, Any], dict[str, Any]]
 class TaskFinalizationCoordinator:
     """Continue a verified development task until the merged code is live.
 
-    Experiment verification remains evidence only.  The existing adoption
+    Experiment verification remains evidence only. The existing adoption
     service owns PR finalization/merge and repository adoption; this class
     persists the late task lifecycle around it and resumes after process
     restarts, including the intentional service restart during deployment.
@@ -145,7 +146,7 @@ class TaskFinalizationCoordinator:
                 self._save(state)
             try:
                 adoption = self.adoption_service.start_adoption(str(experiment.id))
-            except Exception as exc:  # keep the same task/experiment for a bounded retry
+            except Exception as exc:
                 return self._retry_or_review(state, f"could not start adoption: {exc}")
             state.phase = PHASE_MERGING
             state.last_error = None
@@ -248,26 +249,76 @@ class TaskFinalizationCoordinator:
             if existing.experiment_id != experiment_id:
                 raise RuntimeError("finalization state is bound to a different experiment")
             return existing
+
         now = time.time()
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO task_finalizations (
-                    approval_id, experiment_id, phase, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (approval_id, experiment_id, PHASE_VERIFIED, now, now),
-            )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._get(approval_id)
+            if existing is not None:
+                if existing.experiment_id != experiment_id:
+                    raise RuntimeError("finalization state is bound to a different experiment")
+                self._conn.commit()
+                return existing
+
+            experiment_state = self._get_by_experiment(experiment_id)
+            if experiment_state is not None:
+                if self._approval_is_active(experiment_state.approval_id):
+                    raise RuntimeError(
+                        "finalization state is already owned by an active approval: "
+                        f"{experiment_state.approval_id}"
+                    )
+                updated = self._conn.execute(
+                    """
+                    UPDATE task_finalizations
+                    SET approval_id=?, retry_count=0, last_error=NULL, updated_at=?
+                    WHERE experiment_id=? AND approval_id=?
+                    """,
+                    (approval_id, now, experiment_id, experiment_state.approval_id),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("finalization state ownership changed during approval rebind")
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO task_finalizations (
+                        approval_id, experiment_id, phase, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (approval_id, experiment_id, PHASE_VERIFIED, now, now),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
         state = self._get(approval_id)
         if state is None:
             raise RuntimeError("failed to persist task finalization state")
         return state
+
+    def _approval_is_active(self, approval_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT status FROM mailbox_task_approvals WHERE id=?",
+            (approval_id,),
+        ).fetchone()
+        return row is not None and str(row["status"]) in _ACTIVE_APPROVAL_STATUSES
 
     def _get(self, approval_id: str) -> _State | None:
         row = self._conn.execute(
             "SELECT * FROM task_finalizations WHERE approval_id = ?",
             (approval_id,),
         ).fetchone()
+        return self._state_from_row(row)
+
+    def _get_by_experiment(self, experiment_id: str) -> _State | None:
+        row = self._conn.execute(
+            "SELECT * FROM task_finalizations WHERE experiment_id = ?",
+            (experiment_id,),
+        ).fetchone()
+        return self._state_from_row(row)
+
+    @staticmethod
+    def _state_from_row(row: sqlite3.Row | None) -> _State | None:
         if row is None:
             return None
         return _State(
@@ -289,12 +340,12 @@ class TaskFinalizationCoordinator:
 
     def _save(self, state: _State) -> None:
         with self._conn:
-            self._conn.execute(
+            updated = self._conn.execute(
                 """
                 UPDATE task_finalizations
                 SET phase=?, restart_requested_at=?, retry_count=?, merge_commit=?,
                     live_validation_json=?, last_error=?, updated_at=?
-                WHERE approval_id=?
+                WHERE approval_id=? AND experiment_id=?
                 """,
                 (
                     state.phase,
@@ -305,8 +356,11 @@ class TaskFinalizationCoordinator:
                     state.last_error,
                     time.time(),
                     state.approval_id,
+                    state.experiment_id,
                 ),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError("finalization state ownership changed to another approval")
 
     def _sync_live_checkout(self) -> None:
         status = subprocess.run(
@@ -360,7 +414,7 @@ class TaskFinalizationCoordinator:
     def _validate_live(self, approval: Any, experiment: Any) -> dict[str, Any]:
         health_url = os.environ.get("NEXUS_LIVE_HEALTH_URL", _DEFAULT_HEALTH_URL)
         try:
-            with urllib.request.urlopen(health_url, timeout=10) as response:  # noqa: S310 - localhost by default
+            with urllib.request.urlopen(health_url, timeout=10) as response:  # noqa: S310
                 if response.status != 200:
                     raise RuntimeError(f"health endpoint returned HTTP {response.status}")
                 payload = json.loads(response.read().decode("utf-8"))
