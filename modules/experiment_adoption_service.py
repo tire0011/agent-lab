@@ -459,15 +459,43 @@ class ExperimentAdoptionService:
         ``wait_for_ci`` already refuses to report a result whose base has
         moved; the SHA comparison here rejects a result reported for some
         other commit of the same experiment.
+
+        A verdict already accepted for that exact commit is read from the
+        durable store first and is sufficient on its own (Issue #138).
+        Re-deriving it needs live credentials, so a restart into a context
+        without a token used to make accepted evidence vanish and left the
+        #136 retry stuck at ``no_ci_evidence`` - the lifecycle is only
+        restart-safe if the fact outlives the process that observed it.
+
+        Precedence is therefore: **the most recent authoritative
+        observation for the checkpoint SHA wins.** A live lookup runs only
+        when no verdict is stored yet, and whatever it finds is written
+        through, so a re-run that flips the conclusion supersedes the old
+        record. An implementation replaced through the normal lifecycle
+        gets a new checkpoint SHA, which has no record and so goes live.
         """
         work_ref = self.github_work_tracking.for_experiment(experiment_id)
-        verification = self.github_work_tracking.wait_for_ci(
-            experiment_id,
-            start_timeout_seconds=0,
-            completion_timeout_seconds=0,
-            poll_interval_seconds=0.01,
-        )
         checkpoint_sha = (work_ref.checkpoint_sha or "").strip() if work_ref is not None else ""
+
+        recorded = None
+        if checkpoint_sha:
+            recorded = self.github_work_tracking.recorded_ci_for(checkpoint_sha)
+        if recorded is not None:
+            logger.debug(
+                "using persisted CI verification for %s (%s: %s)",
+                experiment_id,
+                checkpoint_sha,
+                recorded.status,
+            )
+            verification = recorded
+        else:
+            verification = self.github_work_tracking.wait_for_ci(
+                experiment_id,
+                start_timeout_seconds=0,
+                completion_timeout_seconds=0,
+                poll_interval_seconds=0.01,
+            )
+
         return AuthoritativeCI(
             verification=verification,
             checkpoint_sha=checkpoint_sha,

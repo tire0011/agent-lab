@@ -106,6 +106,36 @@ Decision log for architecture and operating choices.
 - Revisit if: adoption gains other gates whose failures leave no exit
   code, or if CI stops being the authoritative verification source.
 
+### D-014: An accepted CI verdict is a durable fact, not a live lookup
+
+- Status: Accepted
+- Why: Issue #138. D-013 made the retry depend on exact-commit CI, but
+  the evidence was re-derived with a live GitHub call every time. On the
+  real #115/#116 retry that call returned `GitHub CI identity
+  unavailable: configure GITHUB_TOKEN/GH_TOKEN`, so evidence Nexus had
+  already accepted for commit `28399a0a` (run `33898643539`, success)
+  simply vanished and the adoption stayed stuck at `no_ci_evidence`.
+  Restart-safety (#125/#128) is worthless if a lifecycle fact only exists
+  while the process that observed it is alive and credentialed.
+- Rule: when a GitHub Actions run *completes*, its conclusion for that
+  exact commit is written to `github_ci_verifications`, keyed by commit
+  SHA. `wait_for_ci` does the writing, so every caller - the verification
+  path included - populates the store. Only `passed`/`failed` are stored;
+  `unavailable` says nothing about the commit and caching it would let an
+  outage masquerade as evidence. No token or secret is persisted.
+- Precedence: the most recent authoritative observation for a checkpoint
+  SHA wins. A live lookup runs only when no verdict is stored yet, and
+  whatever it finds is written through, so a re-run that flips the
+  conclusion supersedes the old record. An implementation replaced
+  through the normal lifecycle gets a *new* checkpoint SHA, which has no
+  record and therefore goes live - that, not cache expiry, is how new
+  work gets re-verified.
+- Consequence: a green verdict is never reused for another commit (the
+  lookup is an exact-SHA match, so there is simply no row to find), and a
+  red verdict stays terminal.
+- Revisit if: verdicts ever need to expire, or a second CI provider is
+  added - `provider` is stored so the store can tell them apart.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

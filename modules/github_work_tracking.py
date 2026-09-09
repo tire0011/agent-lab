@@ -205,6 +205,35 @@ class GitHubWorkTrackingService:
                 self._conn.execute(
                     "ALTER TABLE github_experiment_links ADD COLUMN checkpoint_sha TEXT"
                 )
+            # Durable record of authoritative CI verdicts (Issue #138).
+            # Once Nexus has accepted a completed GitHub Actions conclusion
+            # for an exact commit, that is a lifecycle fact. Re-deriving it
+            # needs live credentials, so a restart into a context without a
+            # token made already-accepted evidence disappear and blocked
+            # the #136 retry. Keyed by commit SHA because that is what the
+            # evidence is *about*; a verdict is never reused for any other
+            # commit. No token or secret is stored here.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS github_ci_verifications (
+                    commit_sha TEXT PRIMARY KEY,
+                    experiment_id TEXT,
+                    status TEXT NOT NULL,
+                    conclusion TEXT,
+                    run_id INTEGER,
+                    url TEXT,
+                    workflow TEXT,
+                    provider TEXT NOT NULL DEFAULT 'github_actions',
+                    observed_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_github_ci_verifications_experiment
+                ON github_ci_verifications(experiment_id, observed_at)
+                """
+            )
 
     def ensure_for_source(self, source) -> GitHubWorkRef:
         self.require_lifecycle_ready()
@@ -467,6 +496,85 @@ class GitHubWorkTrackingService:
             {"body": body[:64000]},
         )
 
+    # Only a completed run carries a verdict worth keeping; "unavailable"
+    # says nothing about the commit and must never be cached, or a
+    # temporary outage would masquerade as evidence.
+    _AUTHORITATIVE_CI_STATUSES = ("passed", "failed")
+
+    def record_ci_verification(
+        self,
+        verification: GitHubCIVerification,
+        *,
+        experiment_id: str | None = None,
+        workflow: str = _DEFAULT_CI_WORKFLOW,
+    ) -> bool:
+        """Persist an authoritative CI verdict for its exact commit (#138).
+
+        Returns whether anything was stored. The most recent authoritative
+        observation for a commit wins: a re-run that flips the conclusion
+        overwrites the previous record, which is what makes the precedence
+        deterministic without a live lookup at read time.
+        """
+        commit_sha = (verification.commit_sha or "").strip()
+        if not commit_sha or verification.status not in self._AUTHORITATIVE_CI_STATUSES:
+            return False
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO github_ci_verifications (
+                    commit_sha, experiment_id, status, conclusion, run_id, url,
+                    workflow, provider, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'github_actions', ?)
+                ON CONFLICT(commit_sha) DO UPDATE SET
+                    experiment_id=COALESCE(excluded.experiment_id, github_ci_verifications.experiment_id),
+                    status=excluded.status,
+                    conclusion=excluded.conclusion,
+                    run_id=excluded.run_id,
+                    url=excluded.url,
+                    workflow=excluded.workflow,
+                    provider=excluded.provider,
+                    observed_at=excluded.observed_at
+                """,
+                (
+                    commit_sha,
+                    experiment_id,
+                    verification.status,
+                    verification.conclusion,
+                    verification.run_id,
+                    verification.url,
+                    workflow,
+                    _utcnow_iso(),
+                ),
+            )
+        return True
+
+    def recorded_ci_for(self, commit_sha: str) -> GitHubCIVerification | None:
+        """The stored verdict for exactly this commit, or ``None``.
+
+        A pure local read: it works after a restart and without any
+        GitHub credentials, which is the whole point of the store. The
+        exact-match lookup is also what enforces "a success for another
+        commit is never reused" - there is simply no row to find.
+        """
+        sha = (commit_sha or "").strip()
+        if not sha:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM github_ci_verifications WHERE commit_sha = ? LIMIT 1", (sha,)
+        ).fetchone()
+        if row is None:
+            return None
+        return GitHubCIVerification(
+            status=str(row["status"]),
+            commit_sha=str(row["commit_sha"]),
+            conclusion=str(row["conclusion"]) if row["conclusion"] else None,
+            run_id=int(row["run_id"]) if row["run_id"] is not None else None,
+            url=str(row["url"]) if row["url"] else None,
+            reason=(
+                f"persisted {row['provider']} verification observed at {row['observed_at']}"
+            ),
+        )
+
     def wait_for_ci(
         self,
         experiment_id: str,
@@ -577,7 +685,7 @@ class GitHubWorkTrackingService:
                     else:
                         status = "unavailable"
                         reason = f"GitHub Actions completed without authoritative result: {conclusion}"
-                    return GitHubCIVerification(
+                    verification = GitHubCIVerification(
                         status=status,
                         commit_sha=run_sha,
                         conclusion=conclusion,
@@ -585,6 +693,26 @@ class GitHubWorkTrackingService:
                         url=str(run.get("html_url") or "") or None,
                         reason=reason,
                     )
+                    # Persist here, at the single point that knows the
+                    # verdict is authoritative and which commit it is for,
+                    # so every caller populates the store - including the
+                    # verification path, which is where the evidence in
+                    # #138's reproduction was first seen and then lost.
+                    # Only a verdict for the SHA we actually asked about is
+                    # kept; a run reported for some other commit is not
+                    # evidence for this one.
+                    if run_sha == sha:
+                        try:
+                            self.record_ci_verification(
+                                verification,
+                                experiment_id=experiment_id,
+                                workflow=workflow,
+                            )
+                        except sqlite3.Error:
+                            logger.warning(
+                                "could not persist CI verification for %s", sha, exc_info=True
+                            )
+                    return verification
                 if now >= completion_deadline:
                     return GitHubCIVerification(
                         status="unavailable",
