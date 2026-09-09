@@ -410,13 +410,13 @@ Regression coverage included restart before merge, after commit, after merge, re
 
 **Lesson:** self-restart recovery should resume the same durable lifecycle identity and derive completion from external/persisted evidence; restart itself is not a failure signal.
 
-### 81. 2026-09-07: the recovery E2E exposed finalization ownership tied to transient approvals
+### 81. 2026-09-07 to 2026-09-09: finalization state was rebound from transient approvals to the experiment lifecycle
 
-After PR #127, the real retry reused the existing experiment and its already-green exact-commit CI evidence, but autonomous finalization failed before adoption with `failed to persist task finalization state`. Issue #128 traced this to `task_finalizations`: the lifecycle is unique by `experiment_id` but lookup/creation begins from the new mailbox `approval_id`, so a later approval for the same experiment collides with the existing row and cannot resume it.
+After PR #127, a real retry reused the existing experiment and already-green exact-commit CI evidence, but autonomous finalization failed because `task_finalizations` was unique by experiment while lookup began from a new mailbox approval ID. Issue #128 / PR #133 fixed this by looking up the durable row by `experiment_id` and atomically rebinding it to a later approval when the previous owner is terminal.
 
-The desired model is that finalization state belongs primarily to the durable experiment/lifecycle, while approval IDs are transient request context. Issue #128 remains open and calls for safe reuse/rebinding or a stable experiment-owned finalization identity, preserving phase/restart/retry/merge/live-validation state and preventing concurrent approvals from driving the same experiment.
+The rebind preserves lifecycle progress such as phase, restart timestamp, merge commit, and live-validation evidence; only per-approval retry/error state is reset. Active-owner takeover and stale writes are rejected, so two approvals cannot drive the same experiment concurrently. Regression coverage includes repeated retries and continuation from `restart_requested` through live validation.
 
-**Lesson:** persistence keys should match the lifetime of the state they own. A transient transport/request identity should not own a lifecycle that intentionally survives retries and new approvals.
+**Lesson:** persistence keys should match the lifetime of the state they own. A transient transport/request identity may own a retry budget, but not a lifecycle designed to survive retries and re-approvals.
 
 ### 82. 2026-09-07 to 2026-09-08: mailbox retention became state-aware and self-maintaining
 
@@ -426,13 +426,39 @@ A copy of the real mailbox was reduced from **233 to 37 outbox files**, deleting
 
 **Lesson:** retention of durable queues must be state-aware. Git age alone cannot tell whether a file is still required to finish a persisted commit/publish transition; cleanup belongs next to the state machine that knows those invariants.
 
-### 83. 2026-09-08: log readability failures were isolated; fix is verified but not yet merged
+### 83. 2026-09-08: log readability fixes merged after mobile diagnosis
 
-Phone use of the unified log timeline exposed three stacked defects: the bounded feed rendered oldest-first so current events were buried, permanently skipped mailbox messages flooded INFO on every poll, and mailbox records were misclassified as `source: experiment`. Issue #131 / open PR #132 changes the main feed to newest-first while keeping causal trace views chronological, moves terminal-skip repetition to DEBUG while retaining skipped counts in poll summaries, and fixes both new and historical mailbox source classification without migration.
+Phone use of the unified log timeline exposed three stacked defects: the bounded feed rendered oldest-first so current events were buried, permanently skipped mailbox messages flooded INFO on every poll, and mailbox records were misclassified as `source: experiment`. Issue #131 / PR #132 fixed the main feed to newest-first while keeping causal trace views chronological, moved terminal-skip repetition to DEBUG while retaining skipped counts in poll summaries, and corrected both new and historical mailbox source classification without migration.
 
-PR #132 has local browser verification at phone viewport plus **12 focused tests**. Its full-suite comparison reports the same **27 pre-existing failures**, with **1,322 passing versus 1,310** on the base. It remains open and is not yet adopted on `main`.
+PR #132 merged after browser verification at phone viewport plus **12 focused tests**. Its full-suite comparison reported the same **27 pre-existing failures**, with **1,322 passing versus 1,310** on the base.
 
 **Lesson:** observability can fail at presentation semantics even when the underlying events exist. Ordering, noise policy, and source classification are part of diagnostic correctness.
+
+### 84. 2026-09-09: adoption began reusing exact-commit CI with integration-aware precedence
+
+Issue #134 / PR #135 aligned adoption with the earlier exact-SHA verification rule. Green GitHub Actions evidence is reusable only for the persisted checkpoint SHA and only while that checkpoint's parent still matches the current target-branch base. If `main` moved, Nexus runs integration validation on the current-base worktree instead of treating stale green CI as sufficient.
+
+Only explicit GitHub Actions `failure` is authoritative red evidence. Cancelled, timed-out, skipped, neutral, unavailable, or transient lookup failures fall back to local integration validation. The workflow run's actual `head_sha` is used as evidence identity.
+
+**Lesson:** checkpoint correctness and integration correctness are different facts. Exact-commit CI can replace duplicate tests only while the integration base it was verified against is still valid.
+
+### 85. 2026-09-09: stale adoption failures became evidence-revisable but bounded
+
+A later retry exposed that an exhausted finalization retry budget could permanently freeze an adoption whose old local failure never reached a real test verdict. Issue #136 / PR #137 introduced persisted failure assessment: a non-zero test exit code remains terminal evidence, but a no-verdict failure such as timeout/git/worktree failure may be superseded when authoritative green CI now exists for the exact checkpoint.
+
+Superseded failures are archived for audit, the same adoption identity is reused, and a separate stale-retry budget permits at most **two** such reopenings. The coordinator consults this evidence only when the ordinary retry budget is exhausted, preserving the fresh bounded retry semantics added for approval rebinding. Full suite: **1,287 tests with one pre-existing environment-sensitive failure**; 24 new focused tests covered the stale-failure path.
+
+**Lesson:** durable failure state should distinguish an implementation verdict from failure to obtain a verdict. New authoritative evidence may invalidate the latter, but recovery must be bounded and auditable.
+
+### 86. 2026-09-09: authoritative CI evidence became durable across restart and credential changes
+
+The stale-failure work exposed another restart dependency: `wait_for_ci` observed authoritative CI but only logged it, so later adoption/recovery had to query GitHub again. Issue #138 / PR #139 added a SQLite `github_ci_verifications` store keyed by commit SHA. Successful and failed authoritative observations are persisted with run metadata; unavailable results are deliberately not cached.
+
+Adoption now consults persisted exact-SHA evidence before any live lookup. A later authoritative observation for the same checkpoint supersedes the older one, while a new checkpoint naturally has no reusable row. This lets restart recovery continue even if GitHub credentials or live API access are temporarily unavailable, without reusing evidence from another commit or persisting secrets.
+
+PR #139 added **15 focused tests**. The full suite reported **1,305 tests with one pre-existing environment-sensitive failure**. A real single test still does not cover the entire adoption -> merge -> deploy -> restart recovery -> live validation -> succeeded chain, so that remains an important E2E target.
+
+**Lesson:** if a fact is authoritative enough to drive a durable lifecycle, it must itself be durable and keyed to the exact identity it proves.
 
 ## What Nexus currently learns
 
@@ -440,7 +466,7 @@ Nexus accumulates durable information from:
 
 - code and tests,
 - project/idea/decision/history documents,
-- SQLite experiment, controller/session, chat-job, local-LLM-job, GitHub-work mapping, operation, tool-loop, verification-run, finalization, and adaptive service state,
+- SQLite experiment, controller/session, chat-job, local-LLM-job, GitHub-work mapping, operation, tool-loop, verification-run, finalization, CI-verification, adoption-failure-history, and adaptive service state,
 - mailbox `context` knowledge,
 - experiment outcomes, central structured logs, diagnostics, activity, usage, CI evidence where integrated, and cost data where available.
 
@@ -473,9 +499,10 @@ Current `main` includes:
 - single-call Codex experiment execution,
 - worktree-isolated experiments with shared real-tool verification/adoption, distinct timeout state, persisted adaptive timeout, and bounded focused repair after actionable verification failures,
 - persisted verification-run evidence with repeated-failure detection,
-- exact-commit GitHub Actions evidence as authoritative verification with bounded local fallback,
+- exact-commit GitHub Actions evidence as authoritative verification with bounded local fallback and persisted exact-SHA CI observations reusable across restart,
 - mandatory GitHub-backed implementation lifecycle using Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion,
-- persisted post-verification finalization through PR merge, adoption/deployment, service restart recovery, task-specific live validation, and only then final `succeeded`; adoption startup recovery is now evidence-based and idempotent, while cross-approval finalization reuse remains open under Issue #128,
+- persisted post-verification finalization through PR merge, adoption/deployment, service restart recovery, task-specific live validation, and only then final `succeeded`; finalization state is experiment-owned and can be safely rebound to later terminal-owner approvals,
+- restart-aware adoption with integration-aware CI precedence, auditable stale-failure supersession, and bounded stale retries,
 - restart-aware mailbox command recovery using persisted Git baselines, optional declared service postconditions, tri-state evidence (`succeeded`/`failed`/`unknown`), and cached idempotent replay,
 - GitHub Actions verification for PRs and `nexus/**` pushes,
 - SQLite state and durable project/idea/decision/history documents,
@@ -483,7 +510,7 @@ Current `main` includes:
 - signed webhook wake-up with timer fallback and bounded recovery diagnostics,
 - modularized mailbox, run-store, experiment-service, central-logging, and browser-client code,
 - application-wide central structured logging from work submission onward, with unauthenticated read-only `/logs`, `/logs/public`, and `/logs/trace` surfaces plus authenticated write/control endpoints,
-- one source-aware operational log timeline combining structured logs with bounded Nexus service journals, full-history bounded search, cross-ID execution tracing, log rotation, explicit truncation reporting, and literal-secret redaction,
+- one source-aware operational log timeline combining structured logs with bounded Nexus service journals, full-history bounded search, cross-ID execution tracing, log rotation, explicit truncation reporting, literal-secret redaction, newest-first feed ordering, and quieter terminal-skip handling,
 - authenticated audited operations for local model, services, logs, processes, Git, and diagnostics,
 - authenticated MCP HTTP surface with read-only inspection plus explicitly enabled bootstrap write tools,
 - trusted-development mailbox task auto-execution,
@@ -491,7 +518,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), cross-approval finalization recovery (Issue #128), remaining Issue #123 restart paths, controller JSON escape hardening, merge/adoption of the log-readability fix in PR #132, measurement of the two-stage tool gateway, a successful real autonomous-finalization E2E, and broader validation of bounded verification repair remain open work/research. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
+Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), remaining Issue #123 restart paths, controller JSON escape hardening, measurement of the two-stage tool gateway, a successful real autonomous-finalization E2E, and broader validation of bounded verification repair/stale-adoption recovery remain open work/research. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
 
 ## Important lessons so far
 
@@ -553,6 +580,9 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 56. **Persistent state ownership must match lifecycle identity.** Retry/approval IDs may change while an experiment/finalization lifecycle intentionally continues.
 57. **Retention belongs with the state machine that knows liveness.** Durable queue files must not be aged out while persisted transitions still depend on them.
 58. **Log presentation is diagnostic semantics.** Ordering, source classification, and repetitive-noise policy determine whether existing evidence is actually usable.
+59. **Checkpoint verification and integration validation are separate facts.** Exact-SHA green CI is not sufficient after the target branch moves.
+60. **No-verdict failures are not implementation verdicts.** New authoritative evidence can supersede an old timeout/infrastructure failure, but retries must remain bounded and auditable.
+61. **Authoritative evidence must be durable.** A restart-safe lifecycle cannot depend on an observation that exists only in process memory or live credentials.
 
 ## Open research directions
 
@@ -569,8 +599,9 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 - validate conversation-style mailbox rendering against linked/pending/multi-response cases (Issue #75),
 - measure whether full-history log search and cross-ID tracing reduce diagnosis time and whether scan budgets/truncation behave well on larger histories,
 - measure whether submission-time job/session/mailbox correlation makes failures diagnosable without external tracing,
-- measure authoritative exact-SHA CI reuse: wait time, local fallback frequency, false timeout elimination, and end-to-end experiment latency,
+- measure authoritative exact-SHA CI reuse and persisted evidence across restarts: wait time, live lookup avoidance, local fallback frequency, false timeout elimination, stale-evidence rejection, and end-to-end latency,
 - measure bounded verification repair: recovery rate, iterations, repeated-failure stops, extra model/CI cost, and reduction in human intervention,
+- measure stale-adoption recovery: how often no-verdict failures are superseded, whether the two-retry budget is sufficient, and whether terminal implementation failures remain closed,
 - evaluate whether self-healing operations and duplicate-loop prevention materially reduce human intervention,
 - evaluate MCP as the standard control path and narrow temporary bootstrap capabilities over time,
 - measure whether the mandatory GitHub lifecycle improves fire-and-forget development, traceability, recovery, and review,
@@ -579,10 +610,9 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 - enforce and test `find_tool` grant semantics so only `found` can authorize execution and suggestions cannot (Issue #117),
 - model verification, integration, deployment, and final completion distinctly across outbox/UI/state (Issue #119),
 - investigate missing-capability recovery, deduplicated issue creation, tool provisioning, and promotion of recurring gaps into OperationsRegistry capabilities (Issue #120),
-- fix and exercise Issue #128 so later approvals resume the same finalization state without losing durable progress or allowing concurrent drivers,
 - validate Issue #123 beyond the command-channel fix: restart/resume across remaining mailbox/task paths, explicit expected-state evidence, and exactly-once pending replies,
 - harden controller structured-output parsing against JSON-invalid escape sequences and measure repair success without broad lossy normalization,
-- merge/validate PR #132 against live Nexus logs and measure whether newest-first ordering and quieter terminal skips reduce diagnosis time on mobile,
+- run a real single-chain autonomous finalization E2E through adoption -> merge -> deploy -> restart recovery -> live validation -> exactly-once success using the new persisted CI/failure/rebind semantics,
 - investigate missing-capability detection and structured issue creation before automatic tool generation,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
@@ -592,20 +622,19 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 
 ## Current next-step candidates
 
-1. **Finalization identity recovery:** implement Issue #128, then repeat the real verified-feature finalization path and confirm a later approval reuses the same experiment/finalization state through merge -> deploy -> live validation -> exactly-once final success.
+1. **Real autonomous-finalization E2E:** rerun the verified feature lifecycle through later approval/rebind, exact-SHA persisted CI reuse, adoption, merge, deploy, restart recovery, live validation, and exactly-once final success; PR #116 remains the original unfinished smoke feature.
 2. **Restart-recovery E2E:** exercise the real Inbox refresh path with PR #124, including declared service postconditions, repeated restart/idempotence, and an inconclusive case that must remain `unknown`; then decide whether broader Issue #123 acceptance criteria need more work.
 3. **Controller JSON escaping:** reproduce the `Invalid \\escape` failure with a focused regression and harden structured-output repair or payload encoding without weakening semantic validation.
-4. **Log-readability adoption:** review/merge PR #132 and validate the live mobile timeline, source filters, and terminal-skip noise behavior.
-5. **Tool-grant contract:** implement Issue #117 so `related_tools` can never be interpreted as granted operations, then repeat the version/tool-gateway path.
-6. **Missing-capability learning:** implement Issue #120 and test `rg`-missing recovery, fallback/provisioning, deduplicated issue creation, and later promotion to a reusable tool.
-7. **Completion-state modeling:** complete Issue #119 so outbox/UI distinguish verified, integrated, deployed, and final succeeded states even outside the finalization coordinator internals.
-8. **Real post-OOM rerun:** repeat the feature task that previously caused prompt growth/tool looping and measure whether PRs #95/#97/#99 now finish without repetition or local OOM.
-9. **Tool-gateway measurement:** compare the two-stage discovery/invocation protocol with direct catalog exposure and quantify context reduction versus resolver cost, invalid-goal recovery, and wrong selection.
-10. **Verification-repair measurement:** run representative repairable and non-repairable failures and measure recovery, repeat detection, latency, model calls, CI runs, and intervention.
-11. **Authoritative-CI measurement:** run several experiments and verify exact-SHA CI reuse removes duplicate local suites without accepting stale evidence.
-12. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
-13. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
-14. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
-15. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
-16. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
-17. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
+4. **Tool-grant contract:** implement Issue #117 so `related_tools` can never be interpreted as granted operations, then repeat the version/tool-gateway path.
+5. **Missing-capability learning:** implement Issue #120 and test `rg`-missing recovery, fallback/provisioning, deduplicated issue creation, and later promotion to a reusable tool.
+6. **Completion-state modeling:** complete Issue #119 so outbox/UI distinguish verified, integrated, deployed, and final succeeded states even outside the finalization coordinator internals.
+7. **Real post-OOM rerun:** repeat the feature task that previously caused prompt growth/tool looping and measure whether PRs #95/#97/#99 now finish without repetition or local OOM.
+8. **Tool-gateway measurement:** compare the two-stage discovery/invocation protocol with direct catalog exposure and quantify context reduction versus resolver cost, invalid-goal recovery, and wrong selection.
+9. **Verification-repair measurement:** run representative repairable and non-repairable failures and measure recovery, repeat detection, latency, model calls, CI runs, and intervention.
+10. **Authoritative-CI/recovery measurement:** run several experiments across service restarts and target-branch movement; verify persisted exact-SHA evidence avoids duplicate live lookup while never covering another commit or stale integration base.
+11. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
+12. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
+13. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
+14. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
+15. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
+16. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
