@@ -12,6 +12,7 @@ from modules.experiment_adoption_service import (
     STATUS_FAILED,
     STATUS_NOT_STARTED,
     STATUS_QUEUED,
+    StaleFailureAssessment,
 )
 from modules.mailbox.task_service import MailboxTaskService
 from modules.task_finalization import (
@@ -24,12 +25,21 @@ from modules.task_finalization import (
 
 
 class _FakeAdoptionService:
-    def __init__(self, adoption):
+    def __init__(self, adoption, *, assessment=None):
         self.adoption = adoption
         self.starts = 0
+        self.assessments = 0
+        # Default: no failure is ever superseded, i.e. pre-#136 behaviour.
+        self.assessment = assessment or StaleFailureAssessment(
+            False, "no_ci_evidence", "no authoritative evidence"
+        )
 
     def get(self, experiment_id):
         return self.adoption
+
+    def assess_failure(self, experiment_id):
+        self.assessments += 1
+        return self.assessment
 
     def start_adoption(self, experiment_id):
         self.starts += 1

@@ -411,6 +411,7 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
             local_sync_pending INTEGER NOT NULL DEFAULT 0,
             diagnostic_worktree_path TEXT NULL,
             recovery_attempts INTEGER NOT NULL DEFAULT 0,
+            stale_retry_attempts INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(experiment_id)
@@ -420,15 +421,42 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
             ON experiment_adoptions(status);
         CREATE INDEX IF NOT EXISTS idx_experiment_adoptions_experiment_id
             ON experiment_adoptions(experiment_id);
+
+        -- Durable attempt history. An adoption row is reused across
+        -- retries (there is exactly one per experiment), so a superseded
+        -- failure would otherwise be overwritten and lost. Each retry
+        -- appends the failure it replaced here, which is what keeps the
+        -- original reason auditable after the row moves on.
+        CREATE TABLE IF NOT EXISTS experiment_adoption_failures (
+            id TEXT PRIMARY KEY,
+            adoption_id TEXT NOT NULL,
+            experiment_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT NULL,
+            test_exit_code INTEGER NULL,
+            test_output TEXT NULL,
+            experiment_commit_sha TEXT NULL,
+            started_at TEXT NULL,
+            ended_at TEXT NULL,
+            superseded_at TEXT NOT NULL,
+            superseded_by TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_experiment_adoption_failures_experiment_id
+            ON experiment_adoption_failures(experiment_id, superseded_at);
         """
     )
     # CREATE TABLE IF NOT EXISTS never adds columns to a table an older
-    # version already created, so the restart-recovery counter is migrated
-    # in explicitly.
+    # version already created, so the attempt counters are migrated in
+    # explicitly.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(experiment_adoptions)")}
     if "recovery_attempts" not in existing:
         conn.execute(
             "ALTER TABLE experiment_adoptions ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    if "stale_retry_attempts" not in existing:
+        conn.execute(
+            "ALTER TABLE experiment_adoptions ADD COLUMN stale_retry_attempts INTEGER NOT NULL DEFAULT 0"
         )
 
 

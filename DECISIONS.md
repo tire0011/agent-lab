@@ -73,6 +73,32 @@ Decision log for architecture and operating choices.
 - Revisit if: the VM stops being single-operator/experimental, or log
   content starts carrying third-party data.
 
+### D-013: A persisted adoption failure is evidence, not a permanent verdict
+
+- Status: Accepted
+- Why: Issue #136. A `failed` adoption row can record two very different
+  things: that the tests *ran and rejected* the change, or that the local
+  run never reached a verdict at all (it timed out, git failed, the
+  worktree could not be built). Only the first is a statement about the
+  implementation. Treating both as permanent meant a lifecycle fix could
+  never reach the experiments it was written for: after #134 removed the
+  local full suite as a mandatory gate, experiment `3946adc3` still ended
+  in `needs_review` on every retry because its 2026-09-06 timeout row was
+  reused instead of re-evaluated.
+- Rule: `test_exit_code` set to a non-zero value is a verdict and stays
+  terminal; no later evidence overrules it. An unset `test_exit_code`
+  means no verdict was reached, and that failure is superseded only when
+  authoritative GitHub CI for the *exact* verified checkpoint is green
+  now - the same evidence adoption itself accepts (#134). The decision is
+  never made by matching words in the failure text.
+- Consequence: a genuinely broken implementation is never retried, because
+  its CI is red or missing. A retry reuses the same adoption row, appends
+  the failure it replaced to `experiment_adoption_failures`, and is
+  bounded by `stale_retry_attempts` (max 2) - separate from the restart
+  recovery budget of #125, which bounds a different thing.
+- Revisit if: adoption gains other gates whose failures leave no exit
+  code, or if CI stops being the authoritative verification source.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

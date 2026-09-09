@@ -175,6 +175,20 @@ class MailboxTaskRejectRequest(BaseModel):
 
 
 
+class ExperimentAdoptionFailure(BaseModel):
+    id: str
+    adoption_id: str
+    status: str
+    reason: str | None = None
+    test_exit_code: int | None = None
+    test_output_lines: list[str] = Field(default_factory=list)
+    experiment_commit_sha: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    superseded_at: str
+    superseded_by: str
+
+
 class ExperimentAdoptionStatus(BaseModel):
     id: str | None = None
     experiment_id: str
@@ -191,6 +205,12 @@ class ExperimentAdoptionStatus(BaseModel):
     reason: str | None = None
     local_sync_pending: bool = False
     diagnostic_worktree_path: str | None = None
+    recovery_attempts: int = 0
+    stale_retry_attempts: int = 0
+    # Failures this adoption row already superseded. There is one row per
+    # experiment, so a retry overwrites the failure that preceded it; this
+    # is where the earlier reason stays readable (Issue #136).
+    previous_failures: list[ExperimentAdoptionFailure] = Field(default_factory=list)
     created_at: str | None = None
     updated_at: str | None = None
 

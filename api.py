@@ -1193,7 +1193,9 @@ def get_experiment_adoption(
     except ExperimentNotFoundError:
         raise HTTPException(status_code=404, detail="experiment not found")
     # Chosen contract: never 404 just because adoption was not started yet.
-    return ExperimentAdoptionStatus(**adoption_service.get(experiment.id).to_dict())
+    payload = adoption_service.get(experiment.id).to_dict()
+    payload["previous_failures"] = adoption_service.failure_history(experiment.id)
+    return ExperimentAdoptionStatus(**payload)
 
 
 @app.get("/operations/catalog", response_model=OperationsCatalogResponse)
