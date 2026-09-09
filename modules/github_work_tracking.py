@@ -476,14 +476,58 @@ class GitHubWorkTrackingService:
         completion_timeout_seconds: float = _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS,
         poll_interval_seconds: float = _DEFAULT_CI_POLL_INTERVAL_SECONDS,
     ) -> GitHubCIVerification:
-        """Wait for the push workflow that verifies the exact checkpoint SHA."""
-        ref = self.ensure_for_experiment(experiment_id)
+        """Return authoritative CI only when it verifies the tree adoption will use."""
+        try:
+            ref = self.ensure_for_experiment(experiment_id)
+        except GitHubWorkTrackingError as exc:
+            return GitHubCIVerification(
+                status="unavailable",
+                commit_sha="",
+                reason=f"GitHub CI identity unavailable: {str(exc)[:1000]}",
+            )
+
         sha = (ref.checkpoint_sha or "").strip()
         if not sha:
             return GitHubCIVerification(
                 status="unavailable",
                 commit_sha="",
                 reason="experiment checkpoint SHA is missing",
+            )
+
+        # A checkpoint is built on the target-branch SHA that existed when
+        # verification ran. If target branch moved since then, the integrated
+        # tree is different from the CI'd tree even when cherry-pick is clean.
+        # In that case exact-checkpoint CI is not authoritative for adoption;
+        # callers must execute their integration fallback on the current base.
+        try:
+            checkpoint = self._request("GET", f"/repos/{self.repository}/commits/{sha}")
+            parents = checkpoint.get("parents") or []
+            checkpoint_base = str((parents[0] if parents else {}).get("sha") or "").strip()
+            target = self._request(
+                "GET",
+                f"/repos/{self.repository}/git/ref/heads/{urllib.parse.quote(self.target_branch, safe='')}",
+            )
+            target_sha = str(((target.get("object") or {}).get("sha") or "")).strip()
+        except GitHubWorkTrackingError as exc:
+            return GitHubCIVerification(
+                status="unavailable",
+                commit_sha=sha,
+                reason=f"GitHub integration-base lookup failed: {str(exc)[:1000]}",
+            )
+        if not checkpoint_base or not target_sha:
+            return GitHubCIVerification(
+                status="unavailable",
+                commit_sha=sha,
+                reason="GitHub integration-base evidence is incomplete",
+            )
+        if checkpoint_base != target_sha:
+            return GitHubCIVerification(
+                status="unavailable",
+                commit_sha=sha,
+                reason=(
+                    "target branch moved since checkpoint verification; "
+                    "integration fallback is required for the current base"
+                ),
             )
 
         started_deadline = time.monotonic() + max(0.0, start_timeout_seconds)
@@ -523,12 +567,23 @@ class GitHubWorkTrackingService:
                     completion_deadline = now + max(0.0, completion_timeout_seconds)
                 if str(run.get("status") or "").lower() == "completed":
                     conclusion = str(run.get("conclusion") or "unknown").lower()
+                    run_sha = str(run.get("head_sha") or "").strip()
+                    if conclusion == "success":
+                        status = "passed"
+                        reason = None
+                    elif conclusion == "failure":
+                        status = "failed"
+                        reason = None
+                    else:
+                        status = "unavailable"
+                        reason = f"GitHub Actions completed without authoritative result: {conclusion}"
                     return GitHubCIVerification(
-                        status="passed" if conclusion == "success" else "failed",
-                        commit_sha=sha,
+                        status=status,
+                        commit_sha=run_sha,
                         conclusion=conclusion,
                         run_id=int(run["id"]) if run.get("id") is not None else None,
                         url=str(run.get("html_url") or "") or None,
+                        reason=reason,
                     )
                 if now >= completion_deadline:
                     return GitHubCIVerification(
