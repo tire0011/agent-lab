@@ -450,6 +450,27 @@ class ExperimentAdoptionService:
             )
             return None
 
+    def _integration_base_sha(self) -> str:
+        """The target-branch commit adoption would cherry-pick onto.
+
+        Read from the local ``origin/<target>`` ref rather than from
+        GitHub, because this has to work in a process with no
+        credentials - and because it is the base adoption actually uses.
+        Returns an empty string when it cannot be resolved, which callers
+        treat as "cannot prove the base is unchanged".
+        """
+        proc = _run_git(
+            ["rev-parse", f"origin/{_DEFAULT_TARGET_BRANCH}"],
+            cwd=str(self.repo_root),
+            timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "could not resolve the integration base for %s", _DEFAULT_TARGET_BRANCH
+            )
+            return ""
+        return (proc.stdout or "").strip()
+
     def _exact_commit_ci(self, experiment_id: str) -> AuthoritativeCI:
         """Authoritative GitHub CI for the exact verified checkpoint (#134).
 
@@ -459,15 +480,56 @@ class ExperimentAdoptionService:
         ``wait_for_ci`` already refuses to report a result whose base has
         moved; the SHA comparison here rejects a result reported for some
         other commit of the same experiment.
+
+        A verdict already accepted for that exact commit is read from the
+        durable store first and is sufficient on its own (Issue #138).
+        Re-deriving it needs live credentials, so a restart into a context
+        without a token used to make accepted evidence vanish and left the
+        #136 retry stuck at ``no_ci_evidence`` - the lifecycle is only
+        restart-safe if the fact outlives the process that observed it.
+
+        Precedence is therefore: **the most recent authoritative
+        observation for the checkpoint SHA, taken on the base we are about
+        to integrate onto, wins.** A live lookup runs only when no such
+        verdict is stored, and whatever it finds is written through, so a
+        re-run that flips the conclusion supersedes the old record. An
+        implementation replaced through the normal lifecycle gets a new
+        checkpoint SHA, which has no record and so goes live.
+
+        The base is part of the question, not a detail: ``wait_for_ci``
+        refuses to call CI authoritative once the target branch has moved
+        past the checkpoint's parent, because cherry-picking the same
+        checkpoint onto a different base produces a tree CI never saw
+        (#134). Reading a stored verdict has to honour that too, so the
+        base this adoption will actually integrate onto is resolved from
+        the local ``origin/<target>`` ref - no credentials needed - and a
+        verdict recorded against any other base is not reused.
         """
         work_ref = self.github_work_tracking.for_experiment(experiment_id)
-        verification = self.github_work_tracking.wait_for_ci(
-            experiment_id,
-            start_timeout_seconds=0,
-            completion_timeout_seconds=0,
-            poll_interval_seconds=0.01,
-        )
         checkpoint_sha = (work_ref.checkpoint_sha or "").strip() if work_ref is not None else ""
+
+        recorded = None
+        integration_base = self._integration_base_sha()
+        if checkpoint_sha and integration_base:
+            recorded = self.github_work_tracking.recorded_ci_for(
+                checkpoint_sha, base_sha=integration_base
+            )
+        if recorded is not None:
+            logger.debug(
+                "using persisted CI verification for %s (%s: %s)",
+                experiment_id,
+                checkpoint_sha,
+                recorded.status,
+            )
+            verification = recorded
+        else:
+            verification = self.github_work_tracking.wait_for_ci(
+                experiment_id,
+                start_timeout_seconds=0,
+                completion_timeout_seconds=0,
+                poll_interval_seconds=0.01,
+            )
+
         return AuthoritativeCI(
             verification=verification,
             checkpoint_sha=checkpoint_sha,
