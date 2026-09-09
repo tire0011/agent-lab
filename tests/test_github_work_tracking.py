@@ -17,6 +17,7 @@ class FakeGitHub:
         }
         self.next_issue = 43
         self.refs = {"main": "main-sha"}
+        self.commit_parents = {}
         self.pulls = []
         self.workflow_runs = []
         self.calls = []
@@ -46,6 +47,11 @@ class FakeGitHub:
             }
             self.issues[number] = issue
             return dict(issue)
+
+        if method == "GET" and path.startswith("/repos/tire0011/agent-lab/commits/"):
+            sha = path.rsplit("/", 1)[1]
+            parent_sha = self.commit_parents.get(sha, self.refs["main"])
+            return {"sha": sha, "parents": [{"sha": parent_sha}]}
 
         if method == "GET" and "/git/ref/heads/" in path:
             encoded = path.split("/git/ref/heads/", 1)[1]
@@ -96,8 +102,6 @@ class FakeGitHub:
             for pr in self.pulls:
                 if pr["number"] == number:
                     pr["state"] = "closed"
-                    # Mirror what GitHub reports once a PR is merged, so
-                    # the already-merged check sees real evidence.
                     pr["merged"] = True
                     pr["merge_commit_sha"] = "merged-sha"
                     return {"merged": True, "sha": "merged-sha"}
