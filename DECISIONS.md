@@ -123,16 +123,27 @@ Decision log for architecture and operating choices.
   path included - populates the store. Only `passed`/`failed` are stored;
   `unavailable` says nothing about the commit and caching it would let an
   outage masquerade as evidence. No token or secret is persisted.
+- The base is part of the question. #134 only calls exact-checkpoint CI
+  authoritative while the checkpoint's parent is still the target head,
+  because cherry-picking the same checkpoint onto a moved base produces a
+  tree CI never saw. So the base is stored *with* the verdict, and a
+  stored verdict is reused only when it matches the base this adoption
+  will actually integrate onto - resolved from the local
+  `origin/<target>` ref, which needs no credentials and is the base
+  adoption really uses. A row with no recorded base cannot prove the rule
+  and is not reused. Otherwise a green verdict cached while `main=A`
+  would survive `main` advancing to `B` and skip the integration
+  verification that case requires.
 - Precedence: the most recent authoritative observation for a checkpoint
-  SHA wins. A live lookup runs only when no verdict is stored yet, and
-  whatever it finds is written through, so a re-run that flips the
-  conclusion supersedes the old record. An implementation replaced
-  through the normal lifecycle gets a *new* checkpoint SHA, which has no
-  record and therefore goes live - that, not cache expiry, is how new
-  work gets re-verified.
+  SHA, taken on that same base, wins. A live lookup runs only when no
+  such verdict is stored, and whatever it finds is written through, so a
+  re-run that flips the conclusion supersedes the old record. An
+  implementation replaced through the normal lifecycle gets a *new*
+  checkpoint SHA, which has no record and therefore goes live - that, not
+  cache expiry, is how new work gets re-verified.
 - Consequence: a green verdict is never reused for another commit (the
-  lookup is an exact-SHA match, so there is simply no row to find), and a
-  red verdict stays terminal.
+  lookup is an exact-SHA match, so there is simply no row to find) nor on
+  another base, and a red verdict stays terminal.
 - Revisit if: verdicts ever need to expire, or a second CI provider is
   added - `provider` is stored so the store can tell them apart.
 

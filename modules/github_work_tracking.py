@@ -224,6 +224,7 @@ class GitHubWorkTrackingService:
                     url TEXT,
                     workflow TEXT,
                     provider TEXT NOT NULL DEFAULT 'github_actions',
+                    base_sha TEXT,
                     observed_at TEXT NOT NULL
                 )
                 """
@@ -234,6 +235,14 @@ class GitHubWorkTrackingService:
                 ON github_ci_verifications(experiment_id, observed_at)
                 """
             )
+            ci_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(github_ci_verifications)")
+            }
+            if "base_sha" not in ci_columns:
+                self._conn.execute(
+                    "ALTER TABLE github_ci_verifications ADD COLUMN base_sha TEXT"
+                )
 
     def ensure_for_source(self, source) -> GitHubWorkRef:
         self.require_lifecycle_ready()
@@ -507,8 +516,15 @@ class GitHubWorkTrackingService:
         *,
         experiment_id: str | None = None,
         workflow: str = _DEFAULT_CI_WORKFLOW,
+        base_sha: str | None = None,
     ) -> bool:
         """Persist an authoritative CI verdict for its exact commit (#138).
+
+        ``base_sha`` is the target-branch commit the verified checkpoint
+        was built on. It is stored because a verdict is only authoritative
+        for adoption while the integration base is unchanged (#134): the
+        same checkpoint cherry-picked onto a moved base produces a tree CI
+        never saw. Without it a reader cannot tell the two apart.
 
         Returns whether anything was stored. The most recent authoritative
         observation for a commit wins: a re-run that flips the conclusion
@@ -523,8 +539,8 @@ class GitHubWorkTrackingService:
                 """
                 INSERT INTO github_ci_verifications (
                     commit_sha, experiment_id, status, conclusion, run_id, url,
-                    workflow, provider, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'github_actions', ?)
+                    workflow, provider, base_sha, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'github_actions', ?, ?)
                 ON CONFLICT(commit_sha) DO UPDATE SET
                     experiment_id=COALESCE(excluded.experiment_id, github_ci_verifications.experiment_id),
                     status=excluded.status,
@@ -533,6 +549,7 @@ class GitHubWorkTrackingService:
                     url=excluded.url,
                     workflow=excluded.workflow,
                     provider=excluded.provider,
+                    base_sha=excluded.base_sha,
                     observed_at=excluded.observed_at
                 """,
                 (
@@ -543,18 +560,29 @@ class GitHubWorkTrackingService:
                     verification.run_id,
                     verification.url,
                     workflow,
+                    (base_sha or "").strip() or None,
                     _utcnow_iso(),
                 ),
             )
         return True
 
-    def recorded_ci_for(self, commit_sha: str) -> GitHubCIVerification | None:
+    def recorded_ci_for(
+        self, commit_sha: str, *, base_sha: str | None = None
+    ) -> GitHubCIVerification | None:
         """The stored verdict for exactly this commit, or ``None``.
 
         A pure local read: it works after a restart and without any
         GitHub credentials, which is the whole point of the store. The
         exact-match lookup is also what enforces "a success for another
         commit is never reused" - there is simply no row to find.
+
+        ``base_sha`` is the integration base the caller is about to use.
+        When given, a verdict is only returned if it was recorded against
+        that same base, which carries #134's rule into the durable store:
+        a checkpoint verified on top of ``A`` says nothing about the tree
+        produced by cherry-picking it onto ``B``. A row with no recorded
+        base predates this and cannot be shown to satisfy the rule, so it
+        is not reused either - the caller falls back to live verification.
         """
         sha = (commit_sha or "").strip()
         if not sha:
@@ -563,6 +591,16 @@ class GitHubWorkTrackingService:
             "SELECT * FROM github_ci_verifications WHERE commit_sha = ? LIMIT 1", (sha,)
         ).fetchone()
         if row is None:
+            return None
+        recorded_base = str(row["base_sha"] or "").strip()
+        if base_sha is not None and recorded_base != (base_sha or "").strip():
+            logger.info(
+                "ignoring persisted CI verification for %s: integration base moved "
+                "(verified on %s, integrating onto %s)",
+                sha,
+                recorded_base or "unknown",
+                base_sha,
+            )
             return None
         return GitHubCIVerification(
             status=str(row["status"]),
@@ -703,10 +741,17 @@ class GitHubWorkTrackingService:
                     # evidence for this one.
                     if run_sha == sha:
                         try:
+                            # `checkpoint_base` is the target-branch commit
+                            # this checkpoint was verified on top of, and
+                            # equals the current target head here - the
+                            # early return above guarantees it. Storing it
+                            # is what lets a later reader re-apply the same
+                            # base check without GitHub.
                             self.record_ci_verification(
                                 verification,
                                 experiment_id=experiment_id,
                                 workflow=workflow,
+                                base_sha=checkpoint_base,
                             )
                         except sqlite3.Error:
                             logger.warning(

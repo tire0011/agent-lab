@@ -27,7 +27,7 @@ from modules.experiment_adoption_service import (
     ExperimentAdoptionService,
 )
 from modules.github_work_tracking import GitHubCIVerification, GitHubWorkTrackingService
-from tests.test_experiment_adoption_service import AdoptionRepoFixture
+from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 _TIMEOUT_REASON = "Die Integrationstests konnten nicht erfolgreich abgeschlossen werden."
 
@@ -41,6 +41,9 @@ class PersistedCIEvidenceTests(unittest.TestCase):
         "completion_timeout_seconds": 0,
         "poll_interval_seconds": 0.01,
     }
+    # The target head the stubbed GitHub API reports, which is also the
+    # checkpoint's parent - so wait_for_ci considers the base unchanged.
+    _STUB_BASE_SHA = "base" + "0" * 36
 
     def setUp(self) -> None:
         self.fx = AdoptionRepoFixture()
@@ -70,6 +73,23 @@ class PersistedCIEvidenceTests(unittest.TestCase):
             conclusion="failure",
             run_id=42,
         )
+
+    def _integration_base(self) -> str:
+        """The target-branch commit adoption would cherry-pick onto."""
+        return git(self.fx.repo, "rev-parse", "origin/main").stdout.strip()
+
+    def _record(self, verification: GitHubCIVerification, **kwargs) -> bool:
+        """Record a verdict against the base that is current right now."""
+        kwargs.setdefault("base_sha", self._integration_base())
+        return self.fx.github_work_tracking.record_ci_verification(verification, **kwargs)
+
+    def _advance_target_branch(self) -> None:
+        """Move origin/main on, the way any other merge would."""
+        (self.fx.repo / "unrelated.py").write_text("MOVED = True\n", encoding="utf-8")
+        git(self.fx.repo, "add", "unrelated.py")
+        git(self.fx.repo, "commit", "-m", "unrelated change on main")
+        git(self.fx.repo, "push", "origin", "main")
+        git(self.fx.repo, "fetch", "origin", "main")
 
     def _stale_failed_adoption(self) -> None:
         """The historical row: a local suite timeout, no verdict."""
@@ -125,7 +145,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
     # ---- the store -----------------------------------------------------
 
     def test_an_authoritative_verdict_is_stored_and_read_back(self):
-        stored = self.fx.github_work_tracking.record_ci_verification(
+        stored = self._record(
             self._green(), experiment_id=self.experiment_id
         )
         self.assertTrue(stored)
@@ -138,7 +158,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
 
     def test_an_unavailable_result_is_never_cached(self):
         """A temporary outage says nothing about the commit."""
-        stored = self.fx.github_work_tracking.record_ci_verification(
+        stored = self._record(
             GitHubCIVerification(
                 status="unavailable", commit_sha=self.checkpoint_sha, reason="no run started"
             )
@@ -147,15 +167,15 @@ class PersistedCIEvidenceTests(unittest.TestCase):
         self.assertIsNone(self.fx.github_work_tracking.recorded_ci_for(self.checkpoint_sha))
 
     def test_evidence_is_only_ever_found_for_the_exact_commit(self):
-        self.fx.github_work_tracking.record_ci_verification(self._green())
+        self._record(self._green())
 
         self.assertIsNone(self.fx.github_work_tracking.recorded_ci_for("b" * 40))
         self.assertIsNone(self.fx.github_work_tracking.recorded_ci_for(""))
 
     def test_the_newest_authoritative_observation_supersedes(self):
         """Deterministic precedence: a re-run that flips the verdict wins."""
-        self.fx.github_work_tracking.record_ci_verification(self._green())
-        self.fx.github_work_tracking.record_ci_verification(self._red())
+        self._record(self._green())
+        self._record(self._red())
 
         recorded = self.fx.github_work_tracking.recorded_ci_for(self.checkpoint_sha)
         self.assertEqual(recorded.status, "failed")
@@ -187,7 +207,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
 
     def _github_api(self, *, head_sha: str, conclusion: str = "success"):
         """A minimal GitHub API stub for the endpoints wait_for_ci walks."""
-        base_sha = "base" + "0" * 36
+        base_sha = self._STUB_BASE_SHA
 
         def _request(method, path, payload=None):
             if "/actions/workflows/" in path:
@@ -262,7 +282,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
     def test_assess_failure_uses_persisted_evidence_without_credentials(self):
         """The acceptance criterion, end to end at the assessment level."""
         self._stale_failed_adoption()
-        self.fx.github_work_tracking.record_ci_verification(
+        self._record(
             self._green(), experiment_id=self.experiment_id
         )
 
@@ -285,7 +305,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
 
     def test_no_live_lookup_happens_when_durable_evidence_exists(self):
         self._stale_failed_adoption()
-        self.fx.github_work_tracking.record_ci_verification(self._green())
+        self._record(self._green())
 
         tracking, adoption_service = self._restarted_without_credentials()
         with patch.object(
@@ -298,7 +318,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
     def test_persisted_success_for_another_commit_is_not_reused(self):
         """Rule 2: a green verdict belongs to its own commit only."""
         self._stale_failed_adoption()
-        self.fx.github_work_tracking.record_ci_verification(self._green(commit_sha="c" * 40))
+        self._record(self._green(commit_sha="c" * 40))
 
         _, adoption_service = self._restarted_without_credentials()
         assessment = adoption_service.assess_failure(self.experiment_id)
@@ -309,7 +329,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
     def test_persisted_red_evidence_stays_terminal(self):
         """Rule 3: cached data must never turn a red result green."""
         self._stale_failed_adoption()
-        self.fx.github_work_tracking.record_ci_verification(self._red())
+        self._record(self._red())
 
         _, adoption_service = self._restarted_without_credentials()
         assessment = adoption_service.assess_failure(self.experiment_id)
@@ -317,10 +337,85 @@ class PersistedCIEvidenceTests(unittest.TestCase):
         self.assertFalse(assessment.retryable)
         self.assertEqual(assessment.category, "no_ci_evidence")
 
+    def test_a_moved_integration_base_invalidates_the_cached_verdict(self):
+        """Review finding on PR #139.
+
+        `wait_for_ci` only calls exact-checkpoint CI authoritative while
+        the checkpoint's parent is still the target head, because the same
+        checkpoint cherry-picked onto a moved base produces a tree CI
+        never saw (#134). Reading a stored verdict has to honour that too,
+        or a green result cached while main=A would survive main advancing
+        to B and adoption would skip the integration verification it needs.
+        """
+        self._stale_failed_adoption()
+        self._record(self._green(), experiment_id=self.experiment_id)
+
+        # Sanity: on the unchanged base the verdict is usable.
+        _, before_move = self._restarted_without_credentials()
+        self.assertTrue(before_move.assess_failure(self.experiment_id).retryable)
+
+        self._advance_target_branch()
+
+        _, after_move = self._restarted_without_credentials()
+        assessment = after_move.assess_failure(self.experiment_id)
+
+        self.assertFalse(
+            assessment.retryable,
+            "a verdict from before the base moved is not authoritative for this integration",
+        )
+        self.assertEqual(assessment.category, "no_ci_evidence")
+
+    def test_the_store_rejects_a_verdict_taken_on_a_different_base(self):
+        self._record(self._green())
+        recorded_base = self._integration_base()
+
+        self.assertIsNotNone(
+            self.fx.github_work_tracking.recorded_ci_for(
+                self.checkpoint_sha, base_sha=recorded_base
+            )
+        )
+        self.assertIsNone(
+            self.fx.github_work_tracking.recorded_ci_for(
+                self.checkpoint_sha, base_sha="f" * 40
+            )
+        )
+
+    def test_a_verdict_without_a_recorded_base_is_not_reused(self):
+        """Rows written before the base was tracked cannot prove the rule."""
+        self._record(self._green())
+        conn = sqlite3.connect(self.fx.db_path)
+        with conn:
+            conn.execute("UPDATE github_ci_verifications SET base_sha=NULL")
+        conn.close()
+
+        self.assertIsNone(
+            self.fx.github_work_tracking.recorded_ci_for(
+                self.checkpoint_sha, base_sha=self._integration_base()
+            )
+        )
+        # Without a base to check against, the row is still readable.
+        self.assertIsNotNone(
+            self.fx.github_work_tracking.recorded_ci_for(self.checkpoint_sha)
+        )
+
+    def test_wait_for_ci_stores_the_base_it_validated(self):
+        with patch.object(
+            self.fx.github_work_tracking,
+            "_request",
+            side_effect=self._github_api(head_sha=self.checkpoint_sha),
+        ):
+            self.fx.github_work_tracking.wait_for_ci(self.experiment_id, **self._BOUNDED)
+
+        stored_base = sqlite3.connect(self.fx.db_path).execute(
+            "SELECT base_sha FROM github_ci_verifications WHERE commit_sha=?",
+            (self.checkpoint_sha,),
+        ).fetchone()[0]
+        self.assertEqual(stored_base, self._STUB_BASE_SHA)
+
     def test_a_new_checkpoint_is_not_covered_by_the_old_verdict(self):
         """A replaced implementation gets a new SHA, so it goes live again."""
         self._stale_failed_adoption()
-        self.fx.github_work_tracking.record_ci_verification(self._green())
+        self._record(self._green())
 
         ref = self.fx.github_work_tracking.for_experiment(self.experiment_id)
         ref.checkpoint_sha = "d" * 40
@@ -339,7 +434,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
         available to the retry; the persisted verdict alone carries it.
         """
         self._stale_failed_adoption()
-        self.fx.github_work_tracking.record_ci_verification(
+        self._record(
             self._green(), experiment_id=self.experiment_id
         )
 
