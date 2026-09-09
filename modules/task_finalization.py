@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -24,6 +25,8 @@ from modules.experiment_adoption_service import (
 from modules.runtime_execution import resolve_python_interpreter
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
+
+logger = logging.getLogger(__name__)
 
 PHASE_VERIFIED = "verified"
 PHASE_MERGING = "merging"
@@ -134,18 +137,44 @@ class TaskFinalizationCoordinator:
         state = self._get_or_create(str(approval.id), str(experiment.id))
         adoption = self.adoption_service.get(str(experiment.id))
 
+        superseded: Any | None = None
         if adoption.status in {STATUS_NOT_STARTED, STATUS_FAILED, STATUS_INTERRUPTED}:
             if adoption.status in {STATUS_FAILED, STATUS_INTERRUPTED}:
                 if state.retry_count >= self.max_retries:
-                    return self._needs_review(
-                        state,
-                        f"finalization retries exhausted after adoption status={adoption.status}: "
-                        f"{getattr(adoption, 'reason', None) or 'unknown error'}",
+                    # The retry budget counts attempts made against the same
+                    # evidence, so an exhausted budget only means "nothing
+                    # new has happened". When current evidence has actually
+                    # superseded the recorded failure (Issue #136) - most
+                    # concretely a lifecycle fix like #134 landing after the
+                    # failure was written - that is a genuinely new
+                    # situation and earns a fresh budget. Without this an
+                    # obsolete row stays terminal forever and the lifecycle
+                    # fix never reaches the experiments it was written for.
+                    superseded = self._superseded_failure(experiment)
+                    if superseded is None:
+                        return self._needs_review(
+                            state,
+                            "finalization retries exhausted after adoption "
+                            f"status={adoption.status}: "
+                            f"{getattr(adoption, 'reason', None) or 'unknown error'}",
+                        )
+                    logger.info(
+                        "granting a fresh finalization budget for %s: %s",
+                        experiment.id,
+                        getattr(superseded, "detail", ""),
                     )
+                    state.retry_count = 0
                 state.retry_count += 1
                 self._save(state)
             try:
-                adoption = self.adoption_service.start_adoption(str(experiment.id))
+                # Passing the assessment back is what tells the adoption
+                # service to spend one unit of the evidence budget. An
+                # ordinary retry leaves `superseded` None and so does not
+                # consume it - otherwise ordinary retries could exhaust the
+                # budget before any evidence changed.
+                adoption = self.adoption_service.start_adoption(
+                    str(experiment.id), superseded=superseded
+                )
             except Exception as exc:
                 return self._retry_or_review(state, f"could not start adoption: {exc}")
             state.phase = PHASE_MERGING
@@ -216,6 +245,26 @@ class TaskFinalizationCoordinator:
             state.phase,
             str(details or "merged, deployed and live validation passed"),
         )
+
+    def _superseded_failure(self, experiment: Any) -> Any | None:
+        """The adoption service's verdict that a recorded failure is stale.
+
+        Returns the assessment when the failure no longer stands, else
+        ``None``. An adoption service that predates #136 (or a test double
+        without the method) simply never supersedes anything, which is the
+        old behaviour.
+        """
+        assess = getattr(self.adoption_service, "assess_failure", None)
+        if assess is None:
+            return None
+        try:
+            assessment = assess(str(experiment.id))
+        except Exception:  # noqa: BLE001 - the retry budget must still apply
+            logger.warning(
+                "could not assess adoption failure for %s", experiment.id, exc_info=True
+            )
+            return None
+        return assessment if getattr(assessment, "retryable", False) else None
 
     def _retry_or_review(
         self,

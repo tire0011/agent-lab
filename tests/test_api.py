@@ -601,6 +601,7 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         self.adoption_service = MagicMock()
         self.adoption_service.get.return_value = SimpleNamespace(to_dict=lambda: dict(self.adoption_state), status="queued")
         self.adoption_service.start_adoption.return_value = SimpleNamespace(to_dict=lambda: dict(self.adoption_state), status="queued")
+        self.adoption_service.failure_history.return_value = []
         api.app.dependency_overrides[api.get_experiment_adoption_service] = lambda: self.adoption_service
 
         self.operations_service = MagicMock()
@@ -654,6 +655,29 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         response = self.client.get(f"/experiments/{self.experiment.id[:8]}/adoption", headers=self.HEADERS)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "not_started")
+
+    def test_get_adoption_exposes_superseded_failures(self):
+        """A retry overwrites the failed row, so the old reason must stay readable."""
+        self.adoption_service.failure_history.return_value = [{
+            "id": "hist1",
+            "adoption_id": "row1",
+            "status": "failed",
+            "reason": "Die Integrationstests konnten nicht erfolgreich abgeschlossen werden.",
+            "test_exit_code": None,
+            "test_output_lines": ["[test command timed out]"],
+            "experiment_commit_sha": "d757a26",
+            "started_at": "2026-09-06T15:50:20+00:00",
+            "ended_at": "2026-09-06T16:01:36+00:00",
+            "superseded_at": "2026-09-09T10:00:00+00:00",
+            "superseded_by": "retrying a previously failed adoption",
+        }]
+
+        body = self.client.get(
+            f"/experiments/{self.experiment.id}/adoption", headers=self.HEADERS
+        ).json()
+
+        self.assertEqual(len(body["previous_failures"]), 1)
+        self.assertIn("Integrationstests", body["previous_failures"][0]["reason"])
 
     def test_get_experiment_embeds_adoption_when_present(self):
         response = self.client.get(f"/experiments/{self.experiment.id}", headers=self.HEADERS)

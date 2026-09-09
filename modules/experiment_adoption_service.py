@@ -22,7 +22,11 @@ from modules.experiment_service import (
     _truncate_text,
     _utcnow_iso,
 )
-from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
+from modules.github_work_tracking import (
+    GitHubCIVerification,
+    GitHubWorkTrackingError,
+    GitHubWorkTrackingService,
+)
 from modules.mailbox import MailboxLock
 from modules.redaction import bounded_lines, redact, sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -50,6 +54,14 @@ _DEFAULT_TARGET_BRANCH = "main"
 # Nexus deliberately), but an adoption that keeps dying mid-pipeline is a
 # real problem and must not resume forever.
 _MAX_RECOVERY_ATTEMPTS = 3
+
+# How often a *failed* adoption may be retried because its recorded
+# failure turned out to be stale. Separate from the restart-recovery
+# budget above: that one bounds crashes mid-pipeline, this one bounds
+# retries granted on fresh external evidence. A failure that keeps coming
+# back despite green CI is a real problem and must reach a human.
+_MAX_STALE_RETRIES = 2
+
 _DEFAULT_LOCK_PATH = "/var/lib/nexus/adoption.lock"
 
 
@@ -77,6 +89,7 @@ class ExperimentAdoption:
     local_sync_pending: bool = False
     diagnostic_worktree_path: str | None = None
     recovery_attempts: int = 0
+    stale_retry_attempts: int = 0
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -98,8 +111,48 @@ class ExperimentAdoption:
             "local_sync_pending": self.local_sync_pending,
             "diagnostic_worktree_path": self.diagnostic_worktree_path,
             "recovery_attempts": self.recovery_attempts,
+            "stale_retry_attempts": self.stale_retry_attempts,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoritativeCI:
+    """GitHub CI evidence together with whether it verifies the exact commit."""
+
+    verification: GitHubCIVerification
+    checkpoint_sha: str
+    exact: bool
+
+    @property
+    def passed(self) -> bool:
+        """Green CI that verifies the exact checkpoint - the only kind that counts."""
+        return bool(self.exact and self.verification.status == "passed")
+
+
+@dataclass(frozen=True, slots=True)
+class StaleFailureAssessment:
+    """Whether a persisted adoption failure still reflects reality (#136)."""
+
+    retryable: bool
+    category: str
+    detail: str
+    previous_reason: str | None = None
+    evidence_commit_sha: str | None = None
+    evidence_run_id: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.retryable
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "retryable": self.retryable,
+            "category": self.category,
+            "detail": self.detail,
+            "previous_reason": self.previous_reason,
+            "evidence_commit_sha": self.evidence_commit_sha,
+            "evidence_run_id": self.evidence_run_id,
         }
 
 
@@ -141,6 +194,9 @@ def _row_to_adoption(row: sqlite3.Row | None, experiment_id: str) -> ExperimentA
         diagnostic_worktree_path=row["diagnostic_worktree_path"],
         recovery_attempts=(
             int(row["recovery_attempts"] or 0) if "recovery_attempts" in row.keys() else 0
+        ),
+        stale_retry_attempts=(
+            int(row["stale_retry_attempts"] or 0) if "stale_retry_attempts" in row.keys() else 0
         ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -394,10 +450,212 @@ class ExperimentAdoptionService:
             )
             return None
 
-    def start_adoption(self, experiment_id: str) -> ExperimentAdoption:
+    def _exact_commit_ci(self, experiment_id: str) -> AuthoritativeCI:
+        """Authoritative GitHub CI for the exact verified checkpoint (#134).
+
+        The single definition of "authoritative", shared by the adoption
+        pipeline and the stale-failure assessment: CI evidence only counts
+        when it verifies the very commit adoption is about to integrate.
+        ``wait_for_ci`` already refuses to report a result whose base has
+        moved; the SHA comparison here rejects a result reported for some
+        other commit of the same experiment.
+        """
+        work_ref = self.github_work_tracking.for_experiment(experiment_id)
+        verification = self.github_work_tracking.wait_for_ci(
+            experiment_id,
+            start_timeout_seconds=0,
+            completion_timeout_seconds=0,
+            poll_interval_seconds=0.01,
+        )
+        checkpoint_sha = (work_ref.checkpoint_sha or "").strip() if work_ref is not None else ""
+        return AuthoritativeCI(
+            verification=verification,
+            checkpoint_sha=checkpoint_sha,
+            exact=bool(checkpoint_sha and verification.commit_sha == checkpoint_sha),
+        )
+
+    def assess_failure(self, experiment_id: str) -> StaleFailureAssessment:
+        """Decide whether a persisted adoption failure still stands.
+
+        A ``failed`` row is not automatically an immutable fact about the
+        implementation (Issue #136). It can also record that the *local*
+        run never reached a verdict - it timed out, the worktree could not
+        be prepared, git failed - or that a gate has since been removed.
+        The concrete case: adoption re-ran the full local suite, that run
+        timed out after ~11 minutes, and #134 then removed the local suite
+        as a mandatory gate in favour of exact-commit GitHub CI. Without
+        this assessment the obsolete row blocks every future retry forever
+        and the lifecycle fix cannot reach the experiments it was written
+        for.
+
+        The rule is deliberately narrow and evidence-based, never a
+        keyword match on the German failure text:
+
+        * ``test_exit_code`` set to a non-zero value is a *verdict* about
+          the change - the tests ran and rejected it. That stays terminal
+          no matter how much other evidence appears; only a repair may
+          clear it. (The #134 branch that honours failing authoritative CI
+          records exit code 1 for exactly this reason.)
+        * ``test_exit_code`` unset means no verdict was ever reached. Such
+          a failure is superseded only when authoritative CI for the exact
+          verified checkpoint is green *now* - the same evidence adoption
+          itself would accept.
+
+        So a genuinely broken implementation is never retried: its CI is
+        red or missing, and the assessment refuses.
+        """
+        record = self.get(experiment_id)
+        if record.status not in {STATUS_FAILED, STATUS_INTERRUPTED}:
+            return StaleFailureAssessment(
+                False, "not_failed", f"adoption status is {record.status}"
+            )
+
+        previous_reason = record.reason
+        if record.test_exit_code is not None and record.test_exit_code != 0:
+            return StaleFailureAssessment(
+                False,
+                "test_verdict",
+                "the recorded failure is a test verdict about the change "
+                f"(exit code {record.test_exit_code}) and stays terminal",
+                previous_reason=previous_reason,
+            )
+
+        if record.stale_retry_attempts >= _MAX_STALE_RETRIES:
+            return StaleFailureAssessment(
+                False,
+                "budget_exhausted",
+                f"the adoption was already retried {record.stale_retry_attempts} time(s) "
+                "on fresh evidence and kept failing; manual review required",
+                previous_reason=previous_reason,
+            )
+
+        try:
+            evidence = self._exact_commit_ci(experiment_id)
+        except Exception:  # noqa: BLE001 - missing evidence must not raise into the caller
+            logger.warning(
+                "could not read authoritative CI evidence for %s", experiment_id, exc_info=True
+            )
+            return StaleFailureAssessment(
+                False,
+                "evidence_unavailable",
+                "authoritative CI evidence could not be read",
+                previous_reason=previous_reason,
+            )
+
+        ci = evidence.verification
+        if not evidence.passed:
+            return StaleFailureAssessment(
+                False,
+                "no_ci_evidence",
+                "no successful authoritative CI for the exact verified checkpoint "
+                f"(status={ci.status}; reason={ci.reason or 'none'})",
+                previous_reason=previous_reason,
+            )
+
+        return StaleFailureAssessment(
+            True,
+            "superseded_local_verification",
+            "the recorded failure never produced a test verdict and authoritative "
+            f"GitHub Actions passed for the exact checkpoint {evidence.checkpoint_sha}"
+            f" (run_id={ci.run_id})",
+            previous_reason=previous_reason,
+            evidence_commit_sha=evidence.checkpoint_sha,
+            evidence_run_id=ci.run_id,
+        )
+
+    def failure_history(self, experiment_id: str) -> list[dict[str, Any]]:
+        """Superseded adoption failures, oldest first.
+
+        The adoption row itself is reused across retries, so this is where
+        a replaced failure remains readable after the retry moved on.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM experiment_adoption_failures WHERE experiment_id=? "
+                "ORDER BY superseded_at ASC, id ASC",
+                (experiment_id,),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "adoption_id": row["adoption_id"],
+                "status": row["status"],
+                "reason": row["reason"],
+                "test_exit_code": row["test_exit_code"],
+                "test_output_lines": bounded_lines(row["test_output"], max_lines=50),
+                "experiment_commit_sha": row["experiment_commit_sha"],
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+                "superseded_at": row["superseded_at"],
+                "superseded_by": row["superseded_by"],
+            }
+            for row in rows
+        ]
+
+    def _archive_failure(self, record: ExperimentAdoption, *, superseded_by: str) -> None:
+        """Append the failure a retry is about to overwrite. Caller holds the lock."""
+        self._conn.execute(
+            """
+            INSERT INTO experiment_adoption_failures (
+                id, adoption_id, experiment_id, status, reason, test_exit_code,
+                test_output, experiment_commit_sha, started_at, ended_at,
+                superseded_at, superseded_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                record.id or "",
+                record.experiment_id,
+                record.status,
+                record.reason,
+                record.test_exit_code,
+                record.test_output,
+                record.experiment_commit_sha,
+                record.started_at,
+                record.ended_at,
+                _utcnow_iso(),
+                superseded_by[:500],
+            ),
+        )
+
+    def start_adoption(
+        self,
+        experiment_id: str,
+        *,
+        superseded: StaleFailureAssessment | None = None,
+    ) -> ExperimentAdoption:
+        """Queue adoption for a verified experiment.
+
+        Restarting a *failed* adoption reuses the same row - there is one
+        per experiment - which means the retry would silently overwrite
+        the failure that preceded it. So the replaced failure is always
+        appended to the durable attempt history first, in the transaction
+        that queues the retry (Issue #136).
+
+        Whether a failed adoption *should* be restarted is the caller's
+        policy decision, not this method's: the finalization coordinator
+        consults :meth:`assess_failure` before reopening an exhausted
+        lifecycle, while an operator calling the adopt endpoint has
+        already decided.
+
+        ``superseded`` is that assessment, passed back by a caller that
+        restarted *because* current evidence overruled the recorded
+        failure. Only such a restart consumes ``stale_retry_attempts``:
+        that budget bounds how often changed evidence may reopen the
+        lifecycle, so ordinary retries - a finalization retry still inside
+        its own budget, an operator pressing adopt - must not spend it.
+        Otherwise two ordinary retries would exhaust the evidence budget
+        before any evidence had changed, and #136's whole point (changed
+        evidence reopens an exhausted lifecycle) would be unreachable.
+        """
         existing = self.get(experiment_id)
         if existing.status in {STATUS_ADOPTED, STATUS_QUEUED, STATUS_ADOPTING, STATUS_NEEDS_REVIEW}:
             return existing
+
+        restarting_failure = existing.status in {STATUS_FAILED, STATUS_INTERRUPTED}
+        on_fresh_evidence = restarting_failure and bool(
+            superseded is not None and superseded.retryable
+        )
 
         other = self._find_active_other(experiment_id)
         if other is not None:
@@ -408,7 +666,33 @@ class ExperimentAdoptionService:
         validation = self._validate_startable(experiment_id, persist_review=True)
         now = _utcnow_iso()
         adoption_id = existing.id or uuid.uuid4().hex
+
+        retry_reason: str | None = None
+        # A fresh start (nothing failed yet) resets the budget; an ordinary
+        # retry carries it unchanged; only an evidence-granted retry spends
+        # one unit of it.
+        stale_retry_attempts = existing.stale_retry_attempts if restarting_failure else 0
+        if restarting_failure:
+            retry_reason = (
+                f"retrying a previously {existing.status} adoption; the superseded "
+                f"failure was: {existing.reason or 'unknown'}"
+            )
+        if on_fresh_evidence:
+            stale_retry_attempts += 1
+            retry_reason = (
+                f"retrying a superseded {existing.status} adoption on fresh evidence "
+                f"({superseded.detail}); the superseded failure was: "
+                f"{existing.reason or 'unknown'}"
+            )
+
+        # One transaction: the previous failure is archived, the row is
+        # reset to `queued` and the attempt is counted before any worker
+        # exists to observe an in-between state. A crash between the two
+        # writes could otherwise either lose the failure history or hand
+        # out an unbounded retry.
         with self._lock, self._conn:
+            if restarting_failure:
+                self._archive_failure(existing, superseded_by=retry_reason or "retry")
             self._conn.execute(
                 """
                 INSERT INTO experiment_adoptions (
@@ -416,8 +700,9 @@ class ExperimentAdoptionService:
                     experiment_commit_sha, integrated_commit_sha, target_branch,
                     expected_files_json, actual_files_json, test_exit_code,
                     test_output, reason, local_sync_pending,
-                    diagnostic_worktree_path, created_at, updated_at
-                ) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?)
+                    diagnostic_worktree_path, recovery_attempts,
+                    stale_retry_attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, ?, 0, NULL, 0, ?, ?, ?)
                 ON CONFLICT(experiment_id) DO UPDATE SET
                     status=excluded.status,
                     started_at=NULL,
@@ -429,10 +714,11 @@ class ExperimentAdoptionService:
                     actual_files_json=excluded.actual_files_json,
                     test_exit_code=NULL,
                     test_output=NULL,
-                    reason=NULL,
+                    reason=excluded.reason,
                     local_sync_pending=0,
                     diagnostic_worktree_path=NULL,
                     recovery_attempts=0,
+                    stale_retry_attempts=excluded.stale_retry_attempts,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -442,9 +728,21 @@ class ExperimentAdoptionService:
                     _DEFAULT_TARGET_BRANCH,
                     json.dumps(validation["expected_files"]),
                     json.dumps(validation["actual_files"]),
+                    sanitized_reason(retry_reason),
+                    stale_retry_attempts,
                     now,
                     now,
                 ),
+            )
+        if restarting_failure:
+            logger.info(
+                "restarting adoption %s for %s (%s; evidence-granted retries used: %d); "
+                "superseded failure: %s",
+                adoption_id,
+                experiment_id,
+                "on fresh evidence" if on_fresh_evidence else "ordinary retry",
+                stale_retry_attempts,
+                existing.reason or "unknown",
             )
         thread = threading.Thread(
             target=self._run_thread,
@@ -876,17 +1174,12 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            work_ref = self.github_work_tracking.for_experiment(experiment_id)
-            ci = self.github_work_tracking.wait_for_ci(
-                experiment_id,
-                start_timeout_seconds=0,
-                completion_timeout_seconds=0,
-                poll_interval_seconds=0.01,
-            )
-            checkpoint_sha = (work_ref.checkpoint_sha or "").strip() if work_ref is not None else ""
-            exact_ci = bool(checkpoint_sha and ci.commit_sha == checkpoint_sha)
+            evidence = self._exact_commit_ci(experiment_id)
+            ci = evidence.verification
+            checkpoint_sha = evidence.checkpoint_sha
+            exact_ci = evidence.exact
             verification_summary: str
-            if ci.status == "passed" and exact_ci:
+            if evidence.passed:
                 test_exit_code = 0
                 test_output = (
                     "Reused authoritative GitHub Actions verification for exact checkpoint "
