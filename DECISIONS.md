@@ -92,10 +92,17 @@ Decision log for architecture and operating choices.
   now - the same evidence adoption itself accepts (#134). The decision is
   never made by matching words in the failure text.
 - Consequence: a genuinely broken implementation is never retried, because
-  its CI is red or missing. A retry reuses the same adoption row, appends
-  the failure it replaced to `experiment_adoption_failures`, and is
-  bounded by `stale_retry_attempts` (max 2) - separate from the restart
-  recovery budget of #125, which bounds a different thing.
+  its CI is red or missing. Every retry reuses the same adoption row and
+  appends the failure it replaced to `experiment_adoption_failures`.
+- Budget: `stale_retry_attempts` (max 2) bounds only how often *changed
+  evidence* may reopen an exhausted lifecycle, so only a restart the
+  caller made *because* of a successful assessment spends it. Ordinary
+  retries - a finalization retry inside its own budget, an operator
+  pressing adopt - leave it untouched; otherwise two ordinary retries
+  would exhaust the evidence budget before any evidence had changed and
+  this decision would be unreachable in exactly the case it exists for.
+  It is separate again from #125's restart-recovery budget, which bounds a
+  third thing (crashes mid-pipeline).
 - Revisit if: adoption gains other gates whose failures leave no exit
   code, or if CI stops being the authoritative verification source.
 

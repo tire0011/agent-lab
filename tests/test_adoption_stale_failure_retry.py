@@ -201,6 +201,88 @@ class StaleFailureAssessmentTests(unittest.TestCase):
         self.assertFalse(assessment.retryable)
         self.assertEqual(assessment.category, "budget_exhausted")
 
+    def test_ordinary_retries_do_not_consume_the_evidence_budget(self):
+        """Review finding on PR #137.
+
+        ``stale_retry_attempts`` bounds how often *changed evidence* may
+        reopen the lifecycle. If ordinary retries spent it too, two normal
+        finalization retries (which never consult the assessment, because
+        they are still inside their own budget) would exhaust it before any
+        evidence had changed - and the one thing #136 exists to allow would
+        become unreachable.
+        """
+        self._historical_failure()
+
+        # Two ordinary retries: no assessment passed, so no evidence was
+        # claimed. Each one fails again without a verdict.
+        for _ in range(2):
+            with patch.object(
+                self.fx.adoption_service, "_run_adoption_pipeline"
+            ) as pipeline:
+                pipeline.side_effect = lambda *a, **k: self.fx.adoption_service._set_status(
+                    self.experiment_id,
+                    STATUS_FAILED,
+                    ended_at="2026-09-08T00:00:00+00:00",
+                    reason=_TIMEOUT_REASON,
+                    test_exit_code=None,
+                    test_output="[test command timed out]",
+                )
+                self.fx.adoption_service.start_adoption(self.experiment_id)
+                self.fx.adoption_service.wait_for_thread(self.experiment_id, timeout=5)
+
+        self.assertEqual(
+            self.fx.adoption_service.get(self.experiment_id).stale_retry_attempts, 0
+        )
+
+        # Evidence only turns green now. The stale retry must still be open.
+        with patch.object(
+            self.fx.github_work_tracking, "wait_for_ci", return_value=self._green_ci()
+        ):
+            assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
+
+        self.assertTrue(assessment.retryable, assessment.detail)
+        self.assertEqual(assessment.category, "superseded_local_verification")
+
+        # Every ordinary retry still archived the failure it replaced, so
+        # nothing was lost by not counting them.
+        self.assertEqual(len(self.fx.adoption_service.failure_history(self.experiment_id)), 2)
+
+    def test_only_an_evidence_granted_retry_spends_the_budget(self):
+        self._historical_failure()
+        green = self._green_ci()
+
+        with (
+            patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=green),
+            patch("modules.experiment_adoption_service.run_verification_test"),
+        ):
+            assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
+            self.fx.adoption_service.start_adoption(
+                self.experiment_id, superseded=assessment
+            )
+            adoption = self.fx.wait_terminal(self.experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED)
+        self.assertEqual(adoption.stale_retry_attempts, 1)
+        # The row's own `reason` has moved on to the success message by now,
+        # so why the retry was allowed lives in the archive.
+        history = self.fx.adoption_service.failure_history(self.experiment_id)
+        self.assertIn("on fresh evidence", history[-1]["superseded_by"])
+
+    def test_a_non_retryable_assessment_does_not_spend_the_budget(self):
+        """A caller may hand back a refusal; that is still an ordinary retry."""
+        self._historical_failure()
+        refusal = StaleFailureAssessment(False, "no_ci_evidence", "nothing green")
+
+        with patch.object(self.fx.adoption_service, "_run_adoption_pipeline"):
+            self.fx.adoption_service.start_adoption(
+                self.experiment_id, superseded=refusal
+            )
+            self.fx.adoption_service.wait_for_thread(self.experiment_id, timeout=5)
+
+        self.assertEqual(
+            self.fx.adoption_service.get(self.experiment_id).stale_retry_attempts, 0
+        )
+
     def test_unreadable_ci_evidence_does_not_raise_into_the_caller(self):
         self._historical_failure()
 
@@ -258,10 +340,13 @@ class StaleFailureAssessmentTests(unittest.TestCase):
             observed["row"] = row
             raise RuntimeError("stop before the pipeline does any work")
 
+        granted = StaleFailureAssessment(
+            True, "superseded_local_verification", "green exact-commit CI"
+        )
         with patch.object(
             self.fx.adoption_service, "_run_adoption_pipeline", side_effect=_capture
         ):
-            self.fx.adoption_service.start_adoption(self.experiment_id)
+            self.fx.adoption_service.start_adoption(self.experiment_id, superseded=granted)
             self.fx.adoption_service.wait_for_thread(self.experiment_id, timeout=5)
 
         status, attempts, reason = observed["row"]
@@ -374,6 +459,7 @@ class FinalizationStaleRetryTests(unittest.TestCase):
 
         class _Service:
             starts = 0
+            superseded_arguments: list = []
 
             def get(self, experiment_id):
                 return adoption
@@ -381,8 +467,9 @@ class FinalizationStaleRetryTests(unittest.TestCase):
             def assess_failure(self, experiment_id):
                 return assessment
 
-            def start_adoption(inner, experiment_id):
+            def start_adoption(inner, experiment_id, *, superseded=None):
                 inner.starts += 1
+                inner.superseded_arguments = [*inner.superseded_arguments, superseded]
                 adoption.status = "queued"
                 return adoption
 
@@ -398,6 +485,9 @@ class FinalizationStaleRetryTests(unittest.TestCase):
         self.assertEqual(result.status, "running")
         self.assertEqual(result.phase, PHASE_MERGING)
         self.assertEqual(service.starts, 1)
+        # The assessment is handed back, which is what authorizes spending
+        # one unit of the evidence budget.
+        self.assertTrue(service.superseded_arguments[-1].retryable)
         state = coordinator._get(str(self.approval.id))
         self.assertEqual(state.retry_count, 1)
         self.assertIsNone(state.last_error)

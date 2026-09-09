@@ -618,25 +618,44 @@ class ExperimentAdoptionService:
             ),
         )
 
-    def start_adoption(self, experiment_id: str) -> ExperimentAdoption:
+    def start_adoption(
+        self,
+        experiment_id: str,
+        *,
+        superseded: StaleFailureAssessment | None = None,
+    ) -> ExperimentAdoption:
         """Queue adoption for a verified experiment.
 
         Restarting a *failed* adoption reuses the same row - there is one
         per experiment - which means the retry would silently overwrite
-        the failure that preceded it. So the replaced failure is appended
-        to the durable attempt history first and the restart is counted,
-        both in the transaction that queues the retry (Issue #136).
+        the failure that preceded it. So the replaced failure is always
+        appended to the durable attempt history first, in the transaction
+        that queues the retry (Issue #136).
 
         Whether a failed adoption *should* be restarted is the caller's
         policy decision, not this method's: the finalization coordinator
-        consults :meth:`assess_failure` before spending a retry, while an
-        operator calling the adopt endpoint has already decided.
+        consults :meth:`assess_failure` before reopening an exhausted
+        lifecycle, while an operator calling the adopt endpoint has
+        already decided.
+
+        ``superseded`` is that assessment, passed back by a caller that
+        restarted *because* current evidence overruled the recorded
+        failure. Only such a restart consumes ``stale_retry_attempts``:
+        that budget bounds how often changed evidence may reopen the
+        lifecycle, so ordinary retries - a finalization retry still inside
+        its own budget, an operator pressing adopt - must not spend it.
+        Otherwise two ordinary retries would exhaust the evidence budget
+        before any evidence had changed, and #136's whole point (changed
+        evidence reopens an exhausted lifecycle) would be unreachable.
         """
         existing = self.get(experiment_id)
         if existing.status in {STATUS_ADOPTED, STATUS_QUEUED, STATUS_ADOPTING, STATUS_NEEDS_REVIEW}:
             return existing
 
         restarting_failure = existing.status in {STATUS_FAILED, STATUS_INTERRUPTED}
+        on_fresh_evidence = restarting_failure and bool(
+            superseded is not None and superseded.retryable
+        )
 
         other = self._find_active_other(experiment_id)
         if other is not None:
@@ -649,13 +668,22 @@ class ExperimentAdoptionService:
         adoption_id = existing.id or uuid.uuid4().hex
 
         retry_reason: str | None = None
-        stale_retry_attempts = 0
+        # A fresh start (nothing failed yet) resets the budget; an ordinary
+        # retry carries it unchanged; only an evidence-granted retry spends
+        # one unit of it.
+        stale_retry_attempts = existing.stale_retry_attempts if restarting_failure else 0
         if restarting_failure:
             retry_reason = (
                 f"retrying a previously {existing.status} adoption; the superseded "
                 f"failure was: {existing.reason or 'unknown'}"
             )
-            stale_retry_attempts = existing.stale_retry_attempts + 1
+        if on_fresh_evidence:
+            stale_retry_attempts += 1
+            retry_reason = (
+                f"retrying a superseded {existing.status} adoption on fresh evidence "
+                f"({superseded.detail}); the superseded failure was: "
+                f"{existing.reason or 'unknown'}"
+            )
 
         # One transaction: the previous failure is archived, the row is
         # reset to `queued` and the attempt is counted before any worker
@@ -708,9 +736,11 @@ class ExperimentAdoptionService:
             )
         if restarting_failure:
             logger.info(
-                "restarting adoption %s for %s (attempt %d); superseded failure: %s",
+                "restarting adoption %s for %s (%s; evidence-granted retries used: %d); "
+                "superseded failure: %s",
                 adoption_id,
                 experiment_id,
+                "on fresh evidence" if on_fresh_evidence else "ordinary retry",
                 stale_retry_attempts,
                 existing.reason or "unknown",
             )

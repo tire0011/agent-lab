@@ -137,6 +137,7 @@ class TaskFinalizationCoordinator:
         state = self._get_or_create(str(approval.id), str(experiment.id))
         adoption = self.adoption_service.get(str(experiment.id))
 
+        superseded: Any | None = None
         if adoption.status in {STATUS_NOT_STARTED, STATUS_FAILED, STATUS_INTERRUPTED}:
             if adoption.status in {STATUS_FAILED, STATUS_INTERRUPTED}:
                 if state.retry_count >= self.max_retries:
@@ -166,7 +167,14 @@ class TaskFinalizationCoordinator:
                 state.retry_count += 1
                 self._save(state)
             try:
-                adoption = self.adoption_service.start_adoption(str(experiment.id))
+                # Passing the assessment back is what tells the adoption
+                # service to spend one unit of the evidence budget. An
+                # ordinary retry leaves `superseded` None and so does not
+                # consume it - otherwise ordinary retries could exhaust the
+                # budget before any evidence changed.
+                adoption = self.adoption_service.start_adoption(
+                    str(experiment.id), superseded=superseded
+                )
             except Exception as exc:
                 return self._retry_or_review(state, f"could not start adoption: {exc}")
             state.phase = PHASE_MERGING

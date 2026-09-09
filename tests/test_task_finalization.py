@@ -29,6 +29,7 @@ class _FakeAdoptionService:
         self.adoption = adoption
         self.starts = 0
         self.assessments = 0
+        self.superseded_arguments = []
         # Default: no failure is ever superseded, i.e. pre-#136 behaviour.
         self.assessment = assessment or StaleFailureAssessment(
             False, "no_ci_evidence", "no authoritative evidence"
@@ -41,8 +42,9 @@ class _FakeAdoptionService:
         self.assessments += 1
         return self.assessment
 
-    def start_adoption(self, experiment_id):
+    def start_adoption(self, experiment_id, *, superseded=None):
         self.starts += 1
+        self.superseded_arguments.append(superseded)
         self.adoption.status = STATUS_QUEUED
         return self.adoption
 
