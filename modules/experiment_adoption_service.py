@@ -311,9 +311,6 @@ class ExperimentAdoptionService:
 
         blocker = self._recovery_blocker(experiment_id)
         if blocker is not None:
-            # Genuinely unrecoverable: resuming would only fail again in a
-            # background thread, so say why now instead of producing a
-            # confusing "failed" a moment later.
             self._set_status(
                 experiment_id,
                 STATUS_NEEDS_REVIEW,
@@ -352,10 +349,6 @@ class ExperimentAdoptionService:
             )
             return False
 
-        # Resume the same record: back to queued, then re-run the pipeline.
-        # The pipeline re-derives its state from git and from what this
-        # record already persisted, so no new experiment/issue/PR/adoption
-        # is created.
         self._set_status(
             experiment_id,
             STATUS_QUEUED,
@@ -380,16 +373,9 @@ class ExperimentAdoptionService:
         return True
 
     def _recovery_blocker(self, experiment_id: str) -> str | None:
-        """Why this adoption cannot be resumed, or ``None`` if it can be.
-
-        Only reports obstacles that no amount of retrying can clear - the
-        experiment record or its worktree being gone. Transient problems
-        are deliberately *not* reported here: those are the ones a resume
-        is supposed to work through.
-        """
         try:
             experiment = self.experiment_service.get_experiment(experiment_id)
-        except Exception:  # noqa: BLE001 - any lookup failure is unrecoverable here
+        except Exception:
             return "the experiment record is no longer available"
         worktree_path = getattr(experiment, "worktree_path", "") or ""
         if not worktree_path or not os.path.isdir(worktree_path):
@@ -397,20 +383,12 @@ class ExperimentAdoptionService:
         return None
 
     def _merged_sha_for(self, experiment_id: str) -> str | None:
-        """Ask GitHub whether this experiment's pull request is already merged.
-
-        Returns ``None`` when there is no pull request yet. A lookup that
-        *fails* also returns ``None`` so recovery falls through to a normal
-        resume - the pipeline re-checks the merge state itself before
-        merging, so an unreachable API here delays the answer rather than
-        risking a wrong one.
-        """
         try:
             work_ref = self.github_work_tracking.for_experiment(experiment_id)
             if work_ref is None:
                 return None
             return self.github_work_tracking.merged_commit_sha(work_ref)
-        except Exception:  # noqa: BLE001 - evidence is optional, never fatal
+        except Exception:
             logger.warning(
                 "could not determine merge state for %s during recovery", experiment_id
             )
@@ -481,7 +459,7 @@ class ExperimentAdoptionService:
     def _run_thread(self, adoption_id: str, experiment_id: str, *, resume: bool = False) -> None:
         try:
             self._run_adoption_pipeline(adoption_id, experiment_id, resume=resume)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("experiment adoption %s failed unexpectedly", experiment_id)
             try:
                 self._set_status(
@@ -546,21 +524,13 @@ class ExperimentAdoptionService:
         return self.get(experiment_id)
 
     def _resumable_commit_sha(self, experiment_id: str) -> str | None:
-        """The experiment commit a previous attempt already created, if any.
-
-        Returns the persisted ``experiment_commit_sha`` only when the
-        experiment worktree's HEAD still *is* that commit. Anything else -
-        no recorded commit, a missing worktree, or a HEAD that has moved -
-        yields ``None`` so the caller falls back to the normal path rather
-        than resuming on an assumption.
-        """
         record = self.get(experiment_id)
         recorded = (record.experiment_commit_sha or "").strip()
         if not recorded:
             return None
         try:
             experiment = self.experiment_service.get_experiment(experiment_id)
-        except Exception:  # noqa: BLE001 - treated as "cannot resume"
+        except Exception:
             return None
         worktree_path = getattr(experiment, "worktree_path", "") or ""
         if not worktree_path or not os.path.isdir(worktree_path):
@@ -781,14 +751,6 @@ class ExperimentAdoptionService:
 
             resumed_commit_sha = self._resumable_commit_sha(experiment_id) if resume else None
             if resumed_commit_sha is not None:
-                # A previous attempt already committed the verified changes,
-                # so this worktree is now clean. Re-running the diff/commit
-                # steps would fail twice over - _validate_startable would
-                # see a worktree that no longer matches the stored
-                # verification diff, and `git commit` would find nothing to
-                # commit. Matching HEAD against the commit we recorded is
-                # the stronger check anyway: it proves this tree *is* the
-                # verified one rather than merely resembling it.
                 experiment = self.experiment_service.get_experiment(experiment_id)
                 worktree_path = str(experiment.worktree_path)
                 record = self.get(experiment_id)
@@ -862,11 +824,6 @@ class ExperimentAdoptionService:
                         elog=elog,
                     )
                 experiment_commit_sha = self._git_stdout(["rev-parse", "HEAD"], worktree_path, elog).strip() or None
-                # Persist the commit the moment it exists, not only when the
-                # pipeline finishes: it is the evidence a restart-recovery
-                # run needs to know this step already happened. Persisting
-                # it only at the end would lose exactly the case recovery
-                # exists for.
                 self._set_status(
                     experiment_id,
                     STATUS_ADOPTING,
@@ -919,52 +876,118 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            test_command_template = _TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
-            test_command = [part.format(python=self.experiment_service.test_python_executable) for part in test_command_template]
-            test_timeout_seconds = self.experiment_service._get_test_timeout_seconds()
-            test_run = run_verification_test(
-                test_command,
-                cwd=str(integration_path),
-                timeout_seconds=test_timeout_seconds,
+            work_ref = self.github_work_tracking.for_experiment(experiment_id)
+            ci = self.github_work_tracking.wait_for_ci(
+                experiment_id,
+                start_timeout_seconds=0,
+                completion_timeout_seconds=0,
+                poll_interval_seconds=0.01,
             )
-            test_exit_code = test_run.exit_code
-            test_output = test_run.output
-            if test_run.timed_out:
-                keep_integration = True
-                elog.log_process(
-                    "adoption", "integration_tests_timeout",
-                    "Integration test command timed out",
-                    command=test_command, cwd=str(integration_path),
-                    duration_ms=test_run.duration_ms,
-                    timed_out=True, level="ERROR",
-                    timeout_seconds=test_timeout_seconds,
+            checkpoint_sha = (work_ref.checkpoint_sha or "").strip() if work_ref is not None else ""
+            exact_ci = bool(checkpoint_sha and ci.commit_sha == checkpoint_sha)
+            verification_summary: str
+            if ci.status == "passed" and exact_ci:
+                test_exit_code = 0
+                test_output = (
+                    "Reused authoritative GitHub Actions verification for exact checkpoint "
+                    f"{checkpoint_sha}; workflow=tests.yml; run_id={ci.run_id}; conclusion={ci.conclusion}."
                 )
-                next_timeout_seconds = self.experiment_service._increase_test_timeout_seconds(test_timeout_seconds)
-                if next_timeout_seconds > test_timeout_seconds:
-                    elog.warning(
-                        "adoption", "test_timeout_increased",
-                        f"Verification test timeout increased from {test_timeout_seconds}s to "
-                        f"{next_timeout_seconds}s for future runs",
-                        previous_timeout_seconds=test_timeout_seconds,
-                        new_timeout_seconds=next_timeout_seconds,
-                    )
-            elif test_run.exception is not None:
+                verification_summary = (
+                    f"authoritative GitHub Actions passed for exact checkpoint `{checkpoint_sha}`"
+                )
+                elog.info(
+                    "adoption",
+                    "authoritative_ci_reused",
+                    "Reusing successful exact-commit GitHub Actions verification; local full-suite fallback skipped",
+                    commit_sha=checkpoint_sha,
+                    run_id=ci.run_id,
+                    conclusion=ci.conclusion,
+                    url=ci.url,
+                )
+            elif ci.status == "failed" and exact_ci:
                 keep_integration = True
-                elog.error(
-                    "adoption", "integration_tests_exception",
-                    "Integration test command raised an exception",
-                    exc=test_run.exception, command=test_command,
-                    cwd=str(integration_path),
+                return self._finish_failure(
+                    experiment_id,
+                    reason=(
+                        "Die autoritative GitHub-CI für den verifizierten Commit ist fehlgeschlagen; "
+                        "ein lokaler Fallback darf dieses Ergebnis nicht überschreiben."
+                    ),
+                    actual_files=actual_files,
+                    expected_files=expected_files,
+                    test_exit_code=1,
+                    test_output=(
+                        f"GitHub Actions exact checkpoint {checkpoint_sha}: "
+                        f"conclusion={ci.conclusion}; run_id={ci.run_id}; reason={ci.reason or 'none'}"
+                    ),
+                    experiment_commit_sha=experiment_commit_sha,
+                    diagnostic_worktree_path=str(integration_path),
+                    elog=elog,
                 )
             else:
-                elog.log_process(
-                    "adoption", "integration_tests_completed",
-                    f"Integration tests finished with exit code {test_exit_code}",
-                    command=test_command, cwd=str(integration_path),
-                    duration_ms=test_run.duration_ms,
-                    exit_code=test_exit_code,
-                    stdout=test_run.stdout, stderr=test_run.stderr,
+                if ci.status == "passed" and not exact_ci:
+                    elog.warning(
+                        "adoption",
+                        "authoritative_ci_sha_mismatch",
+                        "Ignoring GitHub CI result because it does not match the persisted checkpoint SHA",
+                        checkpoint_sha=checkpoint_sha,
+                        ci_commit_sha=ci.commit_sha,
+                    )
+                else:
+                    elog.info(
+                        "adoption",
+                        "local_tests_fallback_started",
+                        "Authoritative exact-commit GitHub CI is unavailable; running local fallback tests",
+                        checkpoint_sha=checkpoint_sha,
+                        ci_status=ci.status,
+                        reason=ci.reason,
+                    )
+                test_command_template = _TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
+                test_command = [part.format(python=self.experiment_service.test_python_executable) for part in test_command_template]
+                test_timeout_seconds = self.experiment_service._get_test_timeout_seconds()
+                test_run = run_verification_test(
+                    test_command,
+                    cwd=str(integration_path),
+                    timeout_seconds=test_timeout_seconds,
                 )
+                test_exit_code = test_run.exit_code
+                test_output = test_run.output
+                verification_summary = f"local fallback integration tests passed (exit code {test_exit_code})"
+                if test_run.timed_out:
+                    keep_integration = True
+                    elog.log_process(
+                        "adoption", "integration_tests_timeout",
+                        "Integration test command timed out",
+                        command=test_command, cwd=str(integration_path),
+                        duration_ms=test_run.duration_ms,
+                        timed_out=True, level="ERROR",
+                        timeout_seconds=test_timeout_seconds,
+                    )
+                    next_timeout_seconds = self.experiment_service._increase_test_timeout_seconds(test_timeout_seconds)
+                    if next_timeout_seconds > test_timeout_seconds:
+                        elog.warning(
+                            "adoption", "test_timeout_increased",
+                            f"Verification test timeout increased from {test_timeout_seconds}s to "
+                            f"{next_timeout_seconds}s for future runs",
+                            previous_timeout_seconds=test_timeout_seconds,
+                            new_timeout_seconds=next_timeout_seconds,
+                        )
+                elif test_run.exception is not None:
+                    keep_integration = True
+                    elog.error(
+                        "adoption", "integration_tests_exception",
+                        "Integration test command raised an exception",
+                        exc=test_run.exception, command=test_command,
+                        cwd=str(integration_path),
+                    )
+                else:
+                    elog.log_process(
+                        "adoption", "integration_tests_completed",
+                        f"Integration tests finished with exit code {test_exit_code}",
+                        command=test_command, cwd=str(integration_path),
+                        duration_ms=test_run.duration_ms,
+                        exit_code=test_exit_code,
+                        stdout=test_run.stdout, stderr=test_run.stderr,
+                    )
 
             bounded_test_output = "\n".join(bounded_lines(test_output, max_lines=200))
             if test_exit_code != 0:
@@ -1098,8 +1121,7 @@ class ExperimentAdoptionService:
                 f"Fixes #{work_ref.issue_number}\n\n"
                 f"Nexus experiment: `{experiment_id}`\n\n"
                 f"Goal: {_collapse_summary(experiment.goal, max_chars=1000)}\n\n"
-                f"Verification: integration tests passed (exit code {test_exit_code}); "
-                "deterministic quality gate passed.\n\n"
+                f"Verification: {verification_summary}; deterministic quality gate passed.\n\n"
                 f"Changed files: {', '.join(actual_files[:30]) or '(none)'}"
             )
             try:
@@ -1129,7 +1151,6 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            # Pull the now-merged main before attempting the local fast-forward.
             _run_git(
                 ["fetch", "origin", _DEFAULT_TARGET_BRANCH],
                 cwd=str(self.repo_root),
