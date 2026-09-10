@@ -530,15 +530,49 @@ class FailureAnalysisService:
         goal: str | None = None,
         elog: Any = None,
     ) -> FailureAnalysis:
+        """Sync entry point for callers with no event loop of their own.
+
+        Wraps :meth:`analyze_async` in ``asyncio.run`` - the same pattern
+        :class:`~modules.task_orchestrator.NexusTaskOrchestrator` uses for
+        its own sync ``run()``. Do **not** call this from inside a running
+        event loop (``asyncio.run`` raises ``RuntimeError`` there); an
+        async caller should await :meth:`analyze_async` directly instead,
+        which is exactly what makes this service reusable from a future
+        async orchestrator/tool-call path, not just today's sync mailbox
+        workers and sync FastAPI endpoints.
+        """
+        return asyncio.run(
+            self.analyze_async(
+                subject_type=subject_type,
+                subject_id=subject_id,
+                failure=failure,
+                evidence=evidence,
+                goal=goal,
+                elog=elog,
+            )
+        )
+
+    async def analyze_async(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str,
+        failure: dict[str, Any] | str,
+        evidence: list[dict[str, Any]] | None = None,
+        goal: str | None = None,
+        elog: Any = None,
+    ) -> FailureAnalysis:
         """Best-effort structured diagnosis of *failure*. Never raises.
 
-        *evidence* should already be bounded/relevant (see
+        The core async entry point - awaitable directly from any async
+        caller, so it works whether or not an event loop is already
+        running. *evidence* should already be bounded/relevant (see
         :func:`evidence_from_log_entries`); this method bounds it again
         defensively regardless of what the caller passed.
         """
         analysis_id = uuid.uuid4().hex
         try:
-            analysis = self._analyze(
+            analysis = await self._analyze(
                 analysis_id=analysis_id,
                 subject_type=subject_type,
                 subject_id=subject_id,
@@ -563,6 +597,33 @@ class FailureAnalysisService:
         return analysis
 
     def analyze_from_logs(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str,
+        experiment_id: str | None,
+        mailbox_task_id: str | None = None,
+        failure: dict[str, Any] | str,
+        goal: str | None = None,
+        max_items: int = _MAX_EVIDENCE_ITEMS,
+        elog: Any = None,
+    ) -> FailureAnalysis:
+        """Sync wrapper around :meth:`analyze_from_logs_async` (see :meth:`analyze`
+        for why an async caller must await the ``_async`` form instead)."""
+        return asyncio.run(
+            self.analyze_from_logs_async(
+                subject_type=subject_type,
+                subject_id=subject_id,
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
+                failure=failure,
+                goal=goal,
+                max_items=max_items,
+                elog=elog,
+            )
+        )
+
+    async def analyze_from_logs_async(
         self,
         *,
         subject_type: str,
@@ -599,7 +660,7 @@ class FailureAnalysisService:
                 experiment_id, mailbox_task_id, exc_info=True,
             )
         evidence = evidence_from_log_entries(entries, max_items=max_items)
-        return self.analyze(
+        return await self.analyze_async(
             subject_type=subject_type,
             subject_id=subject_id,
             failure=failure,
@@ -612,7 +673,7 @@ class FailureAnalysisService:
     # Core analysis
     # ------------------------------------------------------------------
 
-    def _analyze(
+    async def _analyze(
         self,
         *,
         analysis_id: str,
@@ -650,13 +711,11 @@ class FailureAnalysisService:
 
         model_name = getattr(self._client, "model", None)
         try:
-            raw = asyncio.run(
-                self._client.complete(
-                    prompt=prompt,
-                    system=_SYSTEM_PROMPT,
-                    temperature=0.0,
-                    max_tokens=self._max_tokens,
-                )
+            raw = await self._client.complete(
+                prompt=prompt,
+                system=_SYSTEM_PROMPT,
+                temperature=0.0,
+                max_tokens=self._max_tokens,
             )
         except LlamaCppClientError as exc:
             return _unavailable_analysis(

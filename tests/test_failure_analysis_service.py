@@ -404,5 +404,69 @@ class Issue115Issue116RegressionFixtureTests(unittest.TestCase):
         self.assertEqual(service.latest_for_subject("task_finalization", self.experiment_id)["id"], analysis.id)
 
 
+class AsyncEntryPointTests(unittest.IsolatedAsyncioTestCase):
+    """Regression coverage for the PR #146 review finding.
+
+    ``FailureAnalysisService`` is documented (#145) as reusable from
+    anywhere in Nexus, including a future async orchestrator/tool-call
+    path. The sync ``analyze()``/``analyze_from_logs()`` wrap
+    ``asyncio.run()``, which raises ``RuntimeError: asyncio.run() cannot
+    be called from a running event loop`` when invoked from code that
+    already has one - and the outer try/except in the old implementation
+    swallowed that into a misleading ``analysis_unavailable`` record.
+    ``analyze_async()``/``analyze_from_logs_async()`` are the fix: the core
+    logic never calls ``asyncio.run()`` itself, so an async caller awaits
+    it directly instead. ``IsolatedAsyncioTestCase`` runs each test body
+    inside a running event loop (via its own internal ``asyncio.run``),
+    which is exactly the situation that used to break.
+    """
+
+    async def test_analyze_async_returns_a_real_diagnosis_from_a_running_loop(self):
+        tmp = Path(tempfile.mkdtemp())
+        client = _FakeClient(_diagnosis_json(summary="ok from a running loop", category="lifecycle_logic"))
+        service = _service(tmp, client)
+        self.addCleanup(service.close)
+
+        analysis = await service.analyze_async(
+            subject_type="tool", subject_id="t-async-1", failure="boom",
+            evidence=[{"event": "e", "level": "ERROR"}],
+        )
+
+        self.assertNotEqual(analysis.category, CATEGORY_UNAVAILABLE)
+        self.assertEqual(analysis.category, "lifecycle_logic")
+        self.assertEqual(analysis.summary, "ok from a running loop")
+        self.assertIsNotNone(service.get(analysis.id))
+
+    async def test_analyze_from_logs_async_returns_a_real_diagnosis_from_a_running_loop(self):
+        tmp = Path(tempfile.mkdtemp())
+        log_dir = tmp / "logs"
+        elog = ExperimentLogger("expasync1234567890abcdef1234567", log_dir=log_dir)
+        elog.warning("adoption", "ci_evidence_rejected", "not authoritative", rejection_reason="target_base_moved")
+
+        client = _FakeClient(_diagnosis_json(category="lifecycle_logic"))
+        service = FailureAnalysisService(db_path=str(tmp / "agent.db"), llama_client=client, log_dir=log_dir)
+        self.addCleanup(service.close)
+
+        analysis = await service.analyze_from_logs_async(
+            subject_type="task_finalization",
+            subject_id="expasync1234567890abcdef1234567",
+            experiment_id="expasync1234567890abcdef1234567",
+            failure={"status": "needs_review"},
+        )
+
+        self.assertNotEqual(analysis.category, CATEGORY_UNAVAILABLE)
+        self.assertIn("ci_evidence_rejected", client.prompts[0])
+
+    def test_sync_analyze_still_works_with_no_event_loop_running(self):
+        # The existing sync mailbox/API call sites must keep working.
+        tmp = Path(tempfile.mkdtemp())
+        client = _FakeClient(_diagnosis_json(category="lifecycle_logic"))
+        service = _service(tmp, client)
+        self.addCleanup(service.close)
+
+        analysis = service.analyze(subject_type="tool", subject_id="t-sync-1", failure="boom")
+        self.assertNotEqual(analysis.category, CATEGORY_UNAVAILABLE)
+
+
 if __name__ == "__main__":
     unittest.main()
