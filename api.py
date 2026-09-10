@@ -37,6 +37,7 @@ from modules.nexus_chat_jobs import NexusChatJobService, STATUS_FAILED, STATUS_S
 from modules.task_orchestrator import TaskOrchestratorError
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
+from modules.failure_analysis_service import FailureAnalysisService
 from modules.operations_registry import OperationValidationError, OperationsRegistry
 from modules.operation_chain_service import OperationChainService
 from modules import redaction
@@ -54,6 +55,9 @@ from models import (
     ExperimentDetail,
     ExperimentLogEntry,
     ExperimentLogsResponse,
+    FailureAnalysesResponse,
+    FailureAnalysisEntry,
+    FailureAnalysisRequest,
     LogTraceResponse,
     UnifiedLogsResponse,
     ExperimentsResponse,
@@ -184,6 +188,15 @@ def get_mailbox_task_service() -> MailboxTaskService:
 def get_experiment_adoption_service() -> ExperimentAdoptionService:
     """Singleton adoption service for the process."""
     return ExperimentAdoptionService(experiment_service=_resolve_experiment_service())
+
+
+@lru_cache(maxsize=1)
+def get_failure_analysis_service() -> FailureAnalysisService:
+    """Singleton failure-analysis service for the process (#145).
+
+    Overridable in tests via ``app.dependency_overrides[get_failure_analysis_service]``.
+    """
+    return FailureAnalysisService()
 
 
 @lru_cache(maxsize=1)
@@ -1653,6 +1666,67 @@ def get_public_diagnostics(
         experiments=diagnostic_experiments,
         problems=list_problems(),
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Failure analysis (#145) — manual/debug inspection of stored diagnoses,
+# and an endpoint to trigger one on demand. The automatic integrations live
+# in modules/mailbox/task_service.py and
+# modules/mailbox/finalizing_task_service.py; this surface is for humans
+# (or scripts) inspecting/requesting an analysis directly.
+# ---------------------------------------------------------------------------
+
+FAILURE_ANALYSES_DEFAULT_LIMIT = 20
+FAILURE_ANALYSES_MAX_LIMIT = 100
+
+
+@app.get("/diagnostics/failure-analyses", response_model=FailureAnalysesResponse)
+def list_failure_analyses(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=FAILURE_ANALYSES_DEFAULT_LIMIT, ge=LIMIT_MIN, le=FAILURE_ANALYSES_MAX_LIMIT),
+    subject_type: str | None = Query(default=None),
+    subject_id: str | None = Query(default=None),
+    service: FailureAnalysisService = Depends(get_failure_analysis_service),
+) -> FailureAnalysesResponse:
+    authorize(x_api_key)
+    entries = service.list_recent(limit=limit, subject_type=subject_type, subject_id=subject_id)
+    return FailureAnalysesResponse(count=len(entries), analyses=entries)
+
+
+@app.get("/diagnostics/failure-analyses/{analysis_id}", response_model=FailureAnalysisEntry)
+def get_failure_analysis(
+    analysis_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: FailureAnalysisService = Depends(get_failure_analysis_service),
+) -> FailureAnalysisEntry:
+    authorize(x_api_key)
+    entry = service.get(analysis_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="failure analysis not found")
+    return FailureAnalysisEntry(**entry)
+
+
+@app.post("/diagnostics/failure-analyses/analyze", response_model=FailureAnalysisEntry, status_code=201)
+def trigger_failure_analysis(
+    request: FailureAnalysisRequest,
+    x_api_key: str | None = Header(default=None),
+    service: FailureAnalysisService = Depends(get_failure_analysis_service),
+) -> FailureAnalysisEntry:
+    authorize(x_api_key)
+    if not request.experiment_id and not request.mailbox_task_id:
+        raise HTTPException(
+            status_code=400, detail="experiment_id or mailbox_task_id is required"
+        )
+    subject_id = request.experiment_id or request.mailbox_task_id
+    analysis = service.analyze_from_logs(
+        subject_type=request.subject_type,
+        subject_id=subject_id,
+        experiment_id=request.experiment_id,
+        mailbox_task_id=request.mailbox_task_id,
+        failure={"reason": request.reason or "manual analysis request"},
+    )
+    return FailureAnalysisEntry(**analysis.to_dict())
 
 
 @app.get("/logs/public", response_model=UnifiedLogsResponse)
