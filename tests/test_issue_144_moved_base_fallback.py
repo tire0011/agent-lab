@@ -43,6 +43,16 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
             url="https://example.invalid/actions/runs/33898643539",
         )
 
+    def _unavailable_after_base_move(self) -> GitHubCIVerification:
+        return GitHubCIVerification(
+            status="unavailable",
+            commit_sha=self.checkpoint_sha,
+            reason=(
+                "target branch moved since checkpoint verification; "
+                "integration fallback is required for the current base"
+            ),
+        )
+
     def _historical_timeout(self, *, test_exit_code=None) -> None:
         with sqlite3.connect(self.fx.db_path) as conn:
             conn.execute(
@@ -101,12 +111,10 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         new_base = self._prepare_moved_base()
         coordinator = self._coordinator()
 
-        # The moved-base branch must be recognized before the old generic
-        # assess_failure path can turn it into terminal no_ci_evidence.
         with patch.object(
-            self.fx.adoption_service,
-            "assess_failure",
-            side_effect=AssertionError("generic stale assessment must not run"),
+            self.fx.github_work_tracking,
+            "wait_for_ci",
+            return_value=self._unavailable_after_base_move(),
         ):
             assessment = coordinator._failure_assessment(
                 SimpleNamespace(id=self.experiment_id)
@@ -125,17 +133,18 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
     def test_moved_base_passes_current_main_integration_fallback_and_reuses_row(self):
         self._prepare_moved_base()
         coordinator = self._coordinator()
-        assessment = coordinator._failure_assessment(SimpleNamespace(id=self.experiment_id))
+        unavailable = self._unavailable_after_base_move()
+
+        with patch.object(
+            self.fx.github_work_tracking,
+            "wait_for_ci",
+            return_value=unavailable,
+        ):
+            assessment = coordinator._failure_assessment(
+                SimpleNamespace(id=self.experiment_id)
+            )
         self.assertTrue(assessment.retryable)
 
-        unavailable = GitHubCIVerification(
-            status="unavailable",
-            commit_sha=self.checkpoint_sha,
-            reason=(
-                "target branch moved since checkpoint verification; "
-                "integration fallback is required for the current base"
-            ),
-        )
         with (
             patch.object(
                 self.fx.github_work_tracking,
@@ -162,7 +171,7 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         self.assertEqual(history[0]["adoption_id"], self.adoption_id)
         self.assertIn("current integration base", history[0]["superseded_by"])
 
-    def test_real_test_verdict_is_not_reopened_by_moved_base(self):
+    def test_real_test_verdict_is_not_reopened_by_persisted_green_ci(self):
         self._historical_timeout(test_exit_code=1)
         self.fx.github_work_tracking.record_ci_verification(
             self._green(),
@@ -172,18 +181,12 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         self._advance_main()
         coordinator = self._coordinator()
 
-        sentinel = SimpleNamespace(retryable=False, category="test_verdict")
-        with patch.object(
-            self.fx.adoption_service,
-            "assess_failure",
-            return_value=sentinel,
-        ) as generic:
-            assessment = coordinator._failure_assessment(
-                SimpleNamespace(id=self.experiment_id)
-            )
+        assessment = coordinator._failure_assessment(
+            SimpleNamespace(id=self.experiment_id)
+        )
 
-        self.assertIs(assessment, sentinel)
-        generic.assert_called_once_with(self.experiment_id)
+        self.assertFalse(assessment.retryable)
+        self.assertEqual(assessment.category, "test_verdict")
 
 
 if __name__ == "__main__":
