@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from modules.ci_evidence_backfill import _BACKFILL_MARKER, backfill_legacy_ci_evidence
 from modules.experiment_adoption_service import STATUS_FAILED, ExperimentAdoptionService
-from modules.github_work_tracking import GitHubWorkTrackingService
+from modules.github_work_tracking import GitHubCIVerification, GitHubWorkTrackingService
 from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 
@@ -38,8 +38,6 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
             "legacy verified checkpoint",
         ).stdout.strip()
 
-        # Keep the historical checkpoint reachable from the main repository's
-        # shared object store even if the experiment worktree is later removed.
         git(
             self.worktree,
             "update-ref",
@@ -104,8 +102,6 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
             conn.close()
 
     def _reset_to_pre_139_database(self) -> None:
-        # Model a database from before #139/#140: historical verification is
-        # present, but neither the durable CI row nor the one-shot marker is.
         conn = sqlite3.connect(self.fx.db_path)
         try:
             with conn:
@@ -265,8 +261,6 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
         self._insert_legacy_ci_run()
         self._reset_to_pre_139_database()
 
-        # Remove the experiment worktree; the checkpoint is still reachable
-        # from the main repo via the ref created in setUp.
         git(self.fx.repo, "worktree", "remove", "--force", str(self.worktree))
         shutil.rmtree(self.worktree, ignore_errors=True)
         self.assertFalse(self.worktree.exists())
@@ -300,17 +294,12 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
 
         self._advance_target_branch()
 
-        # The real read path resolves the now-moved origin/main and rejects
-        # the cached historical verdict for the old base.
-        with patch.object(
-            tracking,
-            "wait_for_ci",
-            return_value=type(before)(
-                False,
-                "unused",
-                "unused",
-            ),
-        ):
+        unavailable = GitHubCIVerification(
+            status="unavailable",
+            commit_sha=self.checkpoint_sha,
+            reason="no live credentials after target base moved",
+        )
+        with patch.object(tracking, "wait_for_ci", return_value=unavailable):
             after = adoption.assess_failure(self.experiment_id)
         self.assertFalse(after.retryable)
         self.assertEqual(after.category, "no_ci_evidence")
