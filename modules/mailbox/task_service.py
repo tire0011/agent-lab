@@ -117,10 +117,13 @@ class MailboxTaskService:
         orchestrator_factory: Any | None = None,
         github_work_tracking: GitHubWorkTrackingService | None = None,
         task_log_dir: str | Path | None = None,
+        failure_analysis_service: Any | None = None,
     ) -> None:
         self.db_path = db_path
         self.experiment_service = experiment_service
         self._task_log_dir = task_log_dir
+        self.failure_analysis_service = failure_analysis_service
+        self._owns_failure_analysis_service = failure_analysis_service is None
         if mailbox_config is not None:
             self.outbox_dir = Path(mailbox_config.outbox_dir)
             self.repo_path = Path(mailbox_config.code_repo_path)
@@ -167,7 +170,87 @@ class MailboxTaskService:
                 close_tracking()
             except Exception:
                 logger.exception("mailbox_task: failed closing GitHub work tracking")
+        if self._owns_failure_analysis_service and self.failure_analysis_service is not None:
+            try:
+                self.failure_analysis_service.close()
+            except Exception:
+                logger.exception("mailbox_task: failed closing failure analysis service")
         self._conn.close()
+
+    def _failure_analysis(self) -> Any | None:
+        """Lazily-built :class:`FailureAnalysisService`, or ``None`` if unavailable (#145).
+
+        Diagnosis reuses an already-optional capability: a Nexus deployment
+        without a reachable local LLM must still process mailbox tasks
+        normally, so any failure to construct the service here degrades to
+        "no diagnosis" rather than blocking task processing. Shared across
+        every terminal-failure call site (this base class's own
+        ``_transition_terminal`` and the finalization subclass), so at most
+        one instance - and one lazily-opened SQLite connection to the run
+        store - exists per service.
+        """
+        if self.failure_analysis_service is None:
+            try:
+                from modules.failure_analysis_service import FailureAnalysisService
+
+                self.failure_analysis_service = FailureAnalysisService(
+                    db_path=self.db_path, log_dir=self._resolve_log_dir()
+                )
+            except Exception:
+                logger.exception("mailbox_task: could not initialize failure analysis service")
+                return None
+        return self.failure_analysis_service
+
+    def _analyze_task_failure(self, approval: MailboxTaskApproval, status: str, exp: Any) -> None:
+        """Best-effort diagnosis for a mailbox task that failed or needs review (#145).
+
+        Distinct from the finalization-phase integration
+        (``FinalizingMailboxTaskService._analyze_finalization_failure``):
+        this covers the earlier development/verification stage, before
+        adoption/finalization is even attempted - a demonstration that the
+        analyzer is reusable beyond the finalization call site it was first
+        written for.
+        """
+        service = self._failure_analysis()
+        if service is None:
+            return
+        try:
+            task_log = self._task_logger(approval.id)
+            service.analyze_from_logs(
+                subject_type="mailbox_task",
+                subject_id=exp.id,
+                experiment_id=exp.id,
+                mailbox_task_id=approval.id,
+                failure={
+                    "status": status,
+                    "phase": "verification",
+                    "reason": _safe_error(getattr(exp, "error", None)),
+                    "test_exit_code": getattr(exp, "test_exit_code", None),
+                },
+                goal=_safe_error(str(getattr(approval, "task_body", "") or "")[:500]),
+                elog=task_log,
+            )
+        except Exception:
+            logger.exception(
+                "mailbox_task: failure analysis errored for task %s", approval.id
+            )
+
+    def _resolve_log_dir(self) -> str | Path:
+        """The structured-log directory this service actually writes to.
+
+        Shared by ``_task_logger`` and the failure-analysis integration
+        (``_failure_analysis``/``_analyze_task_failure``): the latter must
+        read evidence from the exact same directory the former writes to,
+        or a deployment/test using a non-default ``task_log_dir`` would
+        silently get an empty evidence bundle.
+        """
+        if self._task_log_dir is not None:
+            return self._task_log_dir
+        if self.experiment_service is not None:
+            candidate = getattr(self.experiment_service, "experiment_log_dir", None)
+            if isinstance(candidate, (str, Path)):
+                return candidate
+        return DEFAULT_LOG_DIR
 
     def _task_logger(self, approval_id: str):
         """Durable, pre-experiment structured logger for one mailbox task.
@@ -178,14 +261,7 @@ class MailboxTaskService:
         complete task path from the moment a task arrives. Never raises:
         a logging failure must not interrupt task processing.
         """
-        log_dir: str | Path = DEFAULT_LOG_DIR
-        if self._task_log_dir is not None:
-            log_dir = self._task_log_dir
-        elif self.experiment_service is not None:
-            candidate = getattr(self.experiment_service, "experiment_log_dir", None)
-            if isinstance(candidate, (str, Path)):
-                log_dir = candidate
-        return get_task_logger(approval_id, log_dir=log_dir)
+        return get_task_logger(approval_id, log_dir=self._resolve_log_dir())
 
     # ------------------------------------------------------------------
     # CRUD / approval state
@@ -710,6 +786,7 @@ class MailboxTaskService:
                 experiment_id=getattr(exp, "id", None),
             )
             self._write_problem(approval, new_status, summary, exp)
+            self._analyze_task_failure(approval, new_status, exp)
         else:
             task_log.info(
                 "queued", "task_completed", f"mailbox task reached terminal status {new_status}",

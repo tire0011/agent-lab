@@ -711,3 +711,54 @@ class OperationResponse(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     duration_ms: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Failure analysis (#145): the reusable LLM-powered diagnosis service.
+# ---------------------------------------------------------------------------
+
+
+class FailureAnalysisRootCause(BaseModel):
+    cause: str
+    confidence: float = 0.0
+    evidence: list[str] = Field(default_factory=list)
+
+
+class FailureAnalysisAction(BaseModel):
+    type: str
+    target: str = ""
+
+
+class FailureAnalysisEntry(BaseModel):
+    id: str
+    subject_type: str
+    subject_id: str
+    created_at: str
+    provider: str
+    model: str | None = None
+    summary: str
+    category: str
+    confidence: float = 0.0
+    likely_root_causes: list[FailureAnalysisRootCause] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
+    recommended_checks: list[str] = Field(default_factory=list)
+    recommended_actions: list[FailureAnalysisAction] = Field(default_factory=list)
+    can_self_recover: bool = False
+    needs_external_model: bool = False
+    needs_human: bool = False
+    escalation_reason: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class FailureAnalysesResponse(BaseModel):
+    count: int
+    analyses: list[FailureAnalysisEntry]
+
+
+class FailureAnalysisRequest(BaseModel):
+    """Manual/debug request to analyze a specific Nexus failure (#145)."""
+
+    subject_type: str = Field(..., min_length=1, max_length=80)
+    experiment_id: str | None = Field(default=None, max_length=128)
+    mailbox_task_id: str | None = Field(default=None, max_length=128)
+    reason: str | None = Field(default=None, max_length=2000)

@@ -24,6 +24,37 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
                 logger.exception("mailbox_task: failed closing finalization coordinator")
         super().close()
 
+    def _analyze_finalization_failure(self, approval: Any, exp: Any, finalization_summary: str) -> None:
+        """Best-effort diagnosis when finalization lands in needs_review (#145).
+
+        Never allowed to affect the finalization outcome that already
+        happened - this runs strictly after the terminal state and its
+        outbox/problem record are already persisted.
+        """
+        service = self._failure_analysis()
+        if service is None:
+            return
+        try:
+            task_log = self._task_logger(approval.id)
+            service.analyze_from_logs(
+                subject_type="task_finalization",
+                subject_id=exp.id,
+                experiment_id=exp.id,
+                mailbox_task_id=approval.id,
+                failure={
+                    "status": "needs_review",
+                    "phase": "finalization",
+                    "reason": finalization_summary,
+                    "test_exit_code": getattr(exp, "test_exit_code", None),
+                },
+                goal=_base._safe_error(str(getattr(approval, "task_body", "") or "")[:500]),
+                elog=task_log,
+            )
+        except Exception:
+            logger.exception(
+                "mailbox_task: failure analysis errored for finalization of %s", exp.id
+            )
+
     def poll_running(self) -> None:
         if self.experiment_service is None:
             return
@@ -180,6 +211,7 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
             self._conn.commit()
         if status == _base._STATUS_NEEDS_REVIEW:
             self._write_problem(approval, status, summary, exp)
+            self._analyze_finalization_failure(approval, exp, finalization_summary)
 
 
 def install() -> None:
