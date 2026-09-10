@@ -40,7 +40,17 @@ def _connect(db_path: str) -> sqlite3.Connection:
 def init_db(db_path: str | None = None) -> sqlite3.Connection:
     """Open a database and apply the complete schema and additive migrations."""
     _sync_database_paths()
-    return _schema.init_db(DEFAULT_DB_PATH if db_path is None else db_path)
+    conn = _schema.init_db(DEFAULT_DB_PATH if db_path is None else db_path)
+
+    # GitHubWorkTrackingService owns the durable CI table, so the table may
+    # not exist on the first init_db() during process construction. Once it
+    # does exist, every later initialization opportunistically migrates
+    # authoritative CI evidence left by pre-#139 experiment verification.
+    # The migration is local-only and idempotent.
+    from modules.ci_evidence_backfill import backfill_legacy_ci_evidence
+
+    backfill_legacy_ci_evidence(conn)
+    return conn
 
 
 __all__ = [
