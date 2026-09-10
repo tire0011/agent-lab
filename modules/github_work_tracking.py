@@ -566,6 +566,40 @@ class GitHubWorkTrackingService:
             )
         return True
 
+    def recorded_ci_details(self, commit_sha: str) -> dict[str, Any] | None:
+        """The stored row for this commit as plain fields, ignoring base validity.
+
+        Separate from :meth:`recorded_ci_for` on purpose: that method
+        answers "may this verdict be used", and deliberately returns
+        ``None`` both when nothing was ever recorded and when what was
+        recorded no longer applies to the current base. Diagnosis needs to
+        tell those apart (Issue #141), and needs the row's own base and
+        timestamp to say *why*. This never decides anything - callers must
+        still go through ``recorded_ci_for`` for the verdict itself.
+
+        The table holds no credentials, so every field here is safe to log.
+        """
+        sha = (commit_sha or "").strip()
+        if not sha:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM github_ci_verifications WHERE commit_sha = ? LIMIT 1", (sha,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "commit_sha": str(row["commit_sha"]),
+            "experiment_id": str(row["experiment_id"]) if row["experiment_id"] else None,
+            "status": str(row["status"]),
+            "conclusion": str(row["conclusion"]) if row["conclusion"] else None,
+            "run_id": int(row["run_id"]) if row["run_id"] is not None else None,
+            "url": str(row["url"]) if row["url"] else None,
+            "workflow": str(row["workflow"]) if row["workflow"] else None,
+            "provider": str(row["provider"]),
+            "base_sha": str(row["base_sha"]) if row["base_sha"] else None,
+            "observed_at": str(row["observed_at"]),
+        }
+
     def recorded_ci_for(
         self, commit_sha: str, *, base_sha: str | None = None
     ) -> GitHubCIVerification | None:
