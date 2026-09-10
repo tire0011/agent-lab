@@ -2,7 +2,7 @@
 
 Issue #138 made exact-commit CI verdicts durable in ``github_ci_verifications``.
 Experiments verified before that table existed can already contain the same
-accepted verdict in ``verification_runs``.  This migration copies only that
+accepted verdict in ``verification_runs``. This migration copies only that
 explicit GitHub Actions evidence; it never upgrades a generic/local test pass.
 """
 
@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,9 @@ _REQUIRED_TABLES = {
     "verification_runs",
     "github_experiment_links",
     "github_ci_verifications",
+    "service_settings",
 }
+_BACKFILL_MARKER = "migration.issue140_ci_evidence_backfill_v1"
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -38,14 +42,13 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     }
 
 
-def _checkpoint_base(worktree_path: str | None, checkpoint_sha: str) -> str | None:
-    """Resolve the checkpoint parent using only the persisted local worktree."""
-    if not worktree_path or not Path(worktree_path).is_dir():
+def _git_parent(repo: Path, checkpoint_sha: str) -> str | None:
+    if not repo.is_dir():
         return None
     try:
         proc = subprocess.run(
             ["git", "rev-parse", f"{checkpoint_sha}^1"],
-            cwd=worktree_path,
+            cwd=str(repo),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -58,6 +61,38 @@ def _checkpoint_base(worktree_path: str | None, checkpoint_sha: str) -> str | No
     if proc.returncode != 0 or _SHA_RE.fullmatch(base_sha) is None:
         return None
     return base_sha.lower()
+
+
+def _checkpoint_base(
+    worktree_path: str | None,
+    checkpoint_sha: str,
+    *,
+    repo_root: str | None = None,
+) -> str | None:
+    """Resolve the checkpoint parent without any GitHub/network lookup.
+
+    Prefer the historical worktree while it still exists. If it has already
+    been cleaned up (or cannot resolve the object), fall back to the main
+    repository: git worktrees share its object store and the published Nexus
+    branch keeps the checkpoint reachable there.
+    """
+    candidates: list[Path] = []
+    if worktree_path:
+        candidates.append(Path(worktree_path))
+    fallback = repo_root or os.environ.get("NEXUS_REPO_ROOT") or os.getcwd()
+    if fallback:
+        candidate = Path(fallback)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    production_root = Path("/agent")
+    if production_root not in candidates:
+        candidates.append(production_root)
+
+    for candidate in candidates:
+        base_sha = _git_parent(candidate, checkpoint_sha)
+        if base_sha is not None:
+            return base_sha
+    return None
 
 
 def _parse_authoritative_ci(row: sqlite3.Row, checkpoint_sha: str):
@@ -95,14 +130,43 @@ def _parse_authoritative_ci(row: sqlite3.Row, checkpoint_sha: str):
     }
 
 
-def backfill_legacy_ci_evidence(conn: sqlite3.Connection) -> int:
-    """Migrate pre-#139 CI evidence without network access.
+def _backfill_done(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT value FROM service_settings WHERE key=?",
+        (_BACKFILL_MARKER,),
+    ).fetchone()
+    return bool(row and str(row[0]) == "done")
 
-    Existing durable rows always win.  The checkpoint's first parent is
-    reconstructed from the persisted experiment worktree so #139's base-SHA
-    validity rule remains enforceable after migration.
+
+def _mark_backfill_done(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT INTO service_settings(key, value, updated_at)
+        VALUES (?, 'done', ?)
+        ON CONFLICT(key) DO UPDATE SET value='done', updated_at=excluded.updated_at
+        """,
+        (_BACKFILL_MARKER, datetime.now(timezone.utc).isoformat()),
+    )
+
+
+def backfill_legacy_ci_evidence(
+    conn: sqlite3.Connection,
+    *,
+    repo_root: str | None = None,
+) -> int:
+    """Migrate pre-#139 CI evidence once, without network access.
+
+    Existing durable rows always win. The checkpoint's first parent is
+    reconstructed from local git so #139's base-SHA validity rule remains
+    enforceable after migration. Once the historical population has been
+    scanned, a durable marker prevents future ``init_db`` hot paths from
+    rescanning every experiment or spawning git subprocesses again.
     """
     if not _REQUIRED_TABLES.issubset(_tables(conn)):
+        # In particular, GitHubWorkTrackingService may not have created its
+        # table yet. Do not mark the migration complete until it can run.
+        return 0
+    if _backfill_done(conn):
         return 0
 
     old_row_factory = conn.row_factory
@@ -127,7 +191,9 @@ def backfill_legacy_ci_evidence(conn: sqlite3.Connection) -> int:
             checkpoint_sha = str(link["checkpoint_sha"] or "").strip().lower()
             if _SHA_RE.fullmatch(checkpoint_sha) is None:
                 continue
-            base_sha = _checkpoint_base(link["worktree_path"], checkpoint_sha)
+            base_sha = _checkpoint_base(
+                link["worktree_path"], checkpoint_sha, repo_root=repo_root
+            )
             if base_sha is None:
                 continue
 
@@ -175,8 +241,11 @@ def backfill_legacy_ci_evidence(conn: sqlite3.Connection) -> int:
                         checkpoint_sha,
                     )
                 break
-        if inserted:
-            conn.commit()
+
+        # This is a versioned one-shot migration. Current code persists new CI
+        # observations directly, so no future historical candidates can appear.
+        _mark_backfill_done(conn)
+        conn.commit()
         return inserted
     finally:
         conn.row_factory = old_row_factory
