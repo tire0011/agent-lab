@@ -160,7 +160,7 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         history = self.fx.adoption_service.failure_history(self.experiment_id)
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["adoption_id"], self.adoption_id)
-        self.assertIn("integration fallback", history[0]["superseded_by"])
+        self.assertIn("current integration base", history[0]["superseded_by"])
 
     def test_real_test_verdict_is_not_reopened_by_moved_base(self):
         self._historical_timeout(test_exit_code=1)
