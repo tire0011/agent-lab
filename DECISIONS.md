@@ -147,6 +147,48 @@ Decision log for architecture and operating choices.
 - Revisit if: verdicts ever need to expire, or a second CI provider is
   added - `provider` is stored so the store can tell them apart.
 
+### D-015: The CI-evidence decision path is a named event vocabulary
+
+- Status: Accepted
+- Why: Issue #141. D-013 and D-014 made adoption retries turn on evidence,
+  but the logs only showed the outcome. The real #115/#116 retry surfaced
+  nothing but `finalization retries exhausted after adoption status=failed:
+  Die Integrationstests konnten nicht erfolgreich abgeschlossen werden.` -
+  which reads like a failing test suite, when the actual cause was a
+  missing durable row, a live lookup, and no credentials to make it. That
+  took SQLite queries and hand-called internals to find. A decision the
+  system makes on evidence has to be readable from the evidence it used.
+- The events, which are a stable interface and not free text:
+  `ci_evidence_lookup` (was anything stored for this checkpoint),
+  `ci_evidence_reused` (a durable verdict was accepted, with the run and
+  base it came from), `ci_evidence_rejected` (evidence exists but cannot
+  support this integration, with `rejection_reason` one of
+  `target_base_moved`, `incomplete_base_evidence`, `checkpoint_mismatch`,
+  `red_verdict`), `ci_evidence_live_fallback` and
+  `ci_evidence_live_result` (why GitHub was asked and what it said - this
+  is where a credential problem reads as itself),
+  `stale_adoption_assessment`, `stale_adoption_requeued` and
+  `finalization_blocked`.
+- Accepted and rejected are exclusive. `ci_evidence_reused` means a
+  verdict that can actually support the retry, so a *red* stored verdict
+  is loaded the same way but reported only as `red_verdict` - logging one
+  piece of evidence as both would defeat the point of a vocabulary meant
+  for automated diagnosis. `red_verdict` is emitted once, where the
+  verdict is resolved, and carries `source` (`persisted` or `live`) so it
+  reads the same whichever path produced it; consumers never repeat it.
+- One decision, one event. `assess_failure` logs its verdict once at the
+  boundary rather than at each of its six return paths; the evidence
+  events beneath it come from `_exact_commit_ci`. That method runs twice
+  per retry - once to assess, once inside the pipeline - so its events
+  carry the calling `phase` (`assessment` vs `adoption`) to tell the two
+  passes apart rather than being suppressed.
+- Detail belongs in structured fields, never in prose. That is also what
+  keeps secrets out: `ExperimentLogger` redacts every string field through
+  `_bounded_text`, so nothing hand-rolled is needed and nothing bypasses
+  it.
+- Revisit if: an automated diagnosis consumer appears - it would make
+  these names a versioned contract rather than a convention.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.experiment_adoption_service import (
+    _NullExperimentLogger,
     STATUS_ADOPTED,
     STATUS_ADOPTING,
     STATUS_FAILED,
@@ -150,14 +151,35 @@ class TaskFinalizationCoordinator:
                     # situation and earns a fresh budget. Without this an
                     # obsolete row stays terminal forever and the lifecycle
                     # fix never reaches the experiments it was written for.
-                    superseded = self._superseded_failure(experiment)
+                    assessment = self._failure_assessment(experiment)
+                    superseded = (
+                        assessment if getattr(assessment, "retryable", False) else None
+                    )
                     if superseded is None:
-                        return self._needs_review(
-                            state,
+                        reason = (
                             "finalization retries exhausted after adoption "
                             f"status={adoption.status}: "
-                            f"{getattr(adoption, 'reason', None) or 'unknown error'}",
+                            f"{getattr(adoption, 'reason', None) or 'unknown error'}"
                         )
+                        # The historical failure text alone made this look
+                        # like a generic test failure. Name the decision and
+                        # the evidence category that produced it (#141).
+                        self._elog(experiment).warning(
+                            "finalization",
+                            "finalization_blocked",
+                            "Finalization stays in needs_review; the recorded "
+                            "adoption failure was not superseded",
+                            # Not `phase`: that is the log entry's own
+                            # column, and this is the finalization phase.
+                            finalization_phase=PHASE_NEEDS_REVIEW,
+                            adoption_status=adoption.status,
+                            assessment_category=getattr(assessment, "category", None),
+                            assessment_detail=getattr(assessment, "detail", None),
+                            retry_count=state.retry_count,
+                            max_retries=self.max_retries,
+                            reason=reason,
+                        )
+                        return self._needs_review(state, reason)
                     logger.info(
                         "granting a fresh finalization budget for %s: %s",
                         experiment.id,
@@ -246,25 +268,37 @@ class TaskFinalizationCoordinator:
             str(details or "merged, deployed and live validation passed"),
         )
 
-    def _superseded_failure(self, experiment: Any) -> Any | None:
-        """The adoption service's verdict that a recorded failure is stale.
+    def _elog(self, experiment: Any):
+        """An ExperimentLogger for this experiment, or a no-op stand-in.
 
-        Returns the assessment when the failure no longer stands, else
-        ``None``. An adoption service that predates #136 (or a test double
-        without the method) simply never supersedes anything, which is the
-        old behaviour.
+        Diagnostics must never break the lifecycle they describe, so any
+        failure to build one degrades to silence.
+        """
+        try:
+            return self.experiment_service.get_experiment_logger(str(experiment.id))
+        except Exception:  # noqa: BLE001 - logging is never worth a lifecycle failure
+            logger.warning("no experiment logger for %s", experiment.id, exc_info=True)
+            return _NullExperimentLogger()
+
+    def _failure_assessment(self, experiment: Any) -> Any | None:
+        """The adoption service's verdict on whether a failure still stands.
+
+        Returns the assessment itself - the caller decides what a
+        non-retryable one means - so the reason it refused can be logged
+        rather than collapsed into ``None`` (#141). An adoption service
+        that predates #136 (or a test double without the method) has no
+        verdict to give, which is the old behaviour.
         """
         assess = getattr(self.adoption_service, "assess_failure", None)
         if assess is None:
             return None
         try:
-            assessment = assess(str(experiment.id))
+            return assess(str(experiment.id))
         except Exception:  # noqa: BLE001 - the retry budget must still apply
             logger.warning(
                 "could not assess adoption failure for %s", experiment.id, exc_info=True
             )
             return None
-        return assessment if getattr(assessment, "retryable", False) else None
 
     def _retry_or_review(
         self,
