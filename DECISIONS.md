@@ -161,13 +161,21 @@ Decision log for architecture and operating choices.
 - The events, which are a stable interface and not free text:
   `ci_evidence_lookup` (was anything stored for this checkpoint),
   `ci_evidence_reused` (a durable verdict was accepted, with the run and
-  base it came from), `ci_evidence_rejected` (one existed and could not be
-  used, with `rejection_reason` one of `target_base_moved`,
-  `incomplete_base_evidence`, `checkpoint_mismatch`, `red_verdict`),
-  `ci_evidence_live_fallback` and `ci_evidence_live_result` (why GitHub
-  was asked and what it said - this is where a credential problem reads as
-  itself), `stale_adoption_assessment`, `stale_adoption_requeued` and
+  base it came from), `ci_evidence_rejected` (evidence exists but cannot
+  support this integration, with `rejection_reason` one of
+  `target_base_moved`, `incomplete_base_evidence`, `checkpoint_mismatch`,
+  `red_verdict`), `ci_evidence_live_fallback` and
+  `ci_evidence_live_result` (why GitHub was asked and what it said - this
+  is where a credential problem reads as itself),
+  `stale_adoption_assessment`, `stale_adoption_requeued` and
   `finalization_blocked`.
+- Accepted and rejected are exclusive. `ci_evidence_reused` means a
+  verdict that can actually support the retry, so a *red* stored verdict
+  is loaded the same way but reported only as `red_verdict` - logging one
+  piece of evidence as both would defeat the point of a vocabulary meant
+  for automated diagnosis. `red_verdict` is emitted once, where the
+  verdict is resolved, and carries `source` (`persisted` or `live`) so it
+  reads the same whichever path produced it; consumers never repeat it.
 - One decision, one event. `assess_failure` logs its verdict once at the
   boundary rather than at each of its six return paths; the evidence
   events beneath it come from `_exact_commit_ci`. That method runs twice

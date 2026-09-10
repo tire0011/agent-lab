@@ -156,6 +156,8 @@ class CIEvidenceLoggingTests(unittest.TestCase):
         self.assertTrue(reused["observed_at"])
         # A durable hit must not reach for GitHub at all.
         self.assertEqual(self._events("ci_evidence_live_fallback"), [])
+        # An accepted verdict is never also reported as rejected.
+        self.assertEqual(self._events("ci_evidence_rejected"), [])
 
     def test_a_persisted_miss_logs_the_fallback_and_its_result(self):
         self._stale_failed_adoption()
@@ -206,8 +208,7 @@ class CIEvidenceLoggingTests(unittest.TestCase):
             self._one("ci_evidence_live_fallback")["fallback_reason"], "target_base_moved"
         )
 
-    def test_a_red_persisted_verdict_is_logged_as_such(self):
-        self._stale_failed_adoption()
+    def _record_red(self) -> None:
         self.fx.github_work_tracking.record_ci_verification(
             GitHubCIVerification(
                 status="failed",
@@ -218,6 +219,10 @@ class CIEvidenceLoggingTests(unittest.TestCase):
             experiment_id=self.experiment_id,
             base_sha=self._integration_base(),
         )
+
+    def test_a_red_persisted_verdict_is_logged_as_such(self):
+        self._stale_failed_adoption()
+        self._record_red()
         _, adoption = self._without_credentials()
 
         adoption.assess_failure(self.experiment_id)
@@ -225,6 +230,46 @@ class CIEvidenceLoggingTests(unittest.TestCase):
         rejected = self._one("ci_evidence_rejected")
         self.assertEqual(rejected["rejection_reason"], "red_verdict")
         self.assertEqual(rejected["run_id"], 99)
+        self.assertEqual(rejected["source"], "persisted")
+        self.assertEqual(rejected["conclusion"], "failure")
+
+    def test_a_red_verdict_is_never_also_logged_as_reused(self):
+        """One piece of evidence must not be both accepted and rejected.
+
+        `ci_evidence_reused` means an accepted, usable verdict. A red one
+        is loaded the same way but supports nothing, so logging both would
+        make the decision path ambiguous for exactly the automated
+        diagnosis this vocabulary exists for.
+        """
+        self._stale_failed_adoption()
+        self._record_red()
+        _, adoption = self._without_credentials()
+
+        adoption.assess_failure(self.experiment_id)
+
+        self.assertEqual(self._events("ci_evidence_reused"), [])
+        # The store still answered, so no live lookup was made.
+        self.assertEqual(self._events("ci_evidence_live_fallback"), [])
+        self.assertTrue(self._one("ci_evidence_lookup")["persisted_found"])
+
+    def test_a_red_live_verdict_is_rejected_the_same_way(self):
+        """`red_verdict` means one thing regardless of where it came from."""
+        self._stale_failed_adoption()
+        red = GitHubCIVerification(
+            status="failed",
+            commit_sha=self.checkpoint_sha,
+            conclusion="failure",
+            run_id=1234,
+        )
+        tracking, adoption = self._without_credentials()
+
+        with patch.object(tracking, "wait_for_ci", return_value=red):
+            adoption.assess_failure(self.experiment_id)
+
+        rejected = self._one("ci_evidence_rejected")
+        self.assertEqual(rejected["rejection_reason"], "red_verdict")
+        self.assertEqual(rejected["source"], "live")
+        self.assertEqual(self._events("ci_evidence_reused"), [])
 
     # ---- the assessment and the requeue --------------------------------
 

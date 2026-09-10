@@ -557,22 +557,30 @@ class ExperimentAdoptionService:
 
         if recorded is not None:
             verification = recorded
-            elog.info(
-                phase,
-                "ci_evidence_reused",
-                "Reusing persisted authoritative CI evidence; no GitHub lookup needed",
-                source="persisted",
-                checkpoint_sha=checkpoint_sha,
-                ci_status=recorded.status,
-                conclusion=recorded.conclusion,
-                run_id=recorded.run_id,
-                provider=(stored or {}).get("provider"),
-                workflow=(stored or {}).get("workflow"),
-                observed_at=(stored or {}).get("observed_at"),
-                recorded_base_sha=(stored or {}).get("base_sha"),
-                base_validated=True,
-            )
+            evidence_source = "persisted"
+            if recorded.status == "passed":
+                # `ci_evidence_reused` means an accepted, usable verdict.
+                # A red one is loaded the same way but supports nothing, so
+                # it is reported below as a rejection instead - one piece of
+                # evidence must never be logged as both accepted and
+                # rejected in the same pass.
+                elog.info(
+                    phase,
+                    "ci_evidence_reused",
+                    "Reusing persisted authoritative CI evidence; no GitHub lookup needed",
+                    source="persisted",
+                    checkpoint_sha=checkpoint_sha,
+                    ci_status=recorded.status,
+                    conclusion=recorded.conclusion,
+                    run_id=recorded.run_id,
+                    provider=(stored or {}).get("provider"),
+                    workflow=(stored or {}).get("workflow"),
+                    observed_at=(stored or {}).get("observed_at"),
+                    recorded_base_sha=(stored or {}).get("base_sha"),
+                    base_validated=True,
+                )
         else:
+            evidence_source = "live"
             # Why the store could not answer decides what the operator has
             # to fix, so name it rather than collapsing every case into
             # "no evidence".
@@ -641,10 +649,28 @@ class ExperimentAdoptionService:
                 "ci_evidence_rejected",
                 "CI result does not verify the exact checkpoint and cannot be used",
                 rejection_reason="checkpoint_mismatch",
+                source=evidence_source,
                 checkpoint_sha=checkpoint_sha or None,
                 commit_sha=verification.commit_sha or None,
                 ci_status=verification.status,
                 run_id=verification.run_id,
+            )
+        elif exact and verification.status == "failed":
+            # CI verified this exact tree and rejected it. Logged here, at
+            # the one place that resolves a verdict, so it reads the same
+            # whether the row came from the store or from a live lookup -
+            # and so no consumer has to repeat it.
+            elog.warning(
+                phase,
+                "ci_evidence_rejected",
+                "Authoritative CI verified this exact checkpoint and failed it",
+                rejection_reason="red_verdict",
+                source=evidence_source,
+                checkpoint_sha=checkpoint_sha,
+                ci_status=verification.status,
+                conclusion=verification.conclusion,
+                run_id=verification.run_id,
+                observed_at=(stored or {}).get("observed_at"),
             )
 
         return AuthoritativeCI(
@@ -757,18 +783,10 @@ class ExperimentAdoptionService:
 
         ci = evidence.verification
         if not evidence.passed:
-            if evidence.exact and ci.status == "failed":
-                # Distinct from "no evidence": the change was verified and
-                # rejected. Only a repair clears this, so name it.
-                elog.warning(
-                    "assessment",
-                    "ci_evidence_rejected",
-                    "Authoritative CI for the exact checkpoint is red; the failure stands",
-                    rejection_reason="red_verdict",
-                    checkpoint_sha=evidence.checkpoint_sha,
-                    run_id=ci.run_id,
-                    conclusion=ci.conclusion,
-                )
+            # Why the evidence does not support a retry has already been
+            # named by `_exact_commit_ci` (red_verdict, target_base_moved,
+            # checkpoint_mismatch, ...); repeating it here would log one
+            # decision twice.
             return StaleFailureAssessment(
                 False,
                 "no_ci_evidence",
