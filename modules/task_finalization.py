@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.experiment_adoption_service import (
-    _MAX_STALE_RETRIES,
     _NullExperimentLogger,
     STATUS_ADOPTED,
     STATUS_ADOPTING,
@@ -282,103 +281,76 @@ class TaskFinalizationCoordinator:
             logger.warning("no experiment logger for %s", experiment.id, exc_info=True)
             return _NullExperimentLogger()
 
-    def _moved_base_integration_assessment(self, experiment: Any) -> StaleFailureAssessment | None:
-        """Recognize green checkpoint CI that needs validation on a newer target base.
+    def _failure_assessment(self, experiment: Any) -> Any | None:
+        """Return the adoption verdict, promoting persisted green CI to integration fallback.
 
-        Exact-checkpoint CI remains authoritative only for the base it was recorded
-        against.  When that base moved, the normal adoption pipeline already has the
-        correct integration fallback: create a worktree from current ``origin/main``,
-        cherry-pick the experiment change, and run the integration tests there.  The
-        stale-failure gate must therefore reopen the *existing* adoption so that
-        pipeline can execute instead of converting the moved-base state into terminal
-        ``no_ci_evidence`` (#144).
+        ``ExperimentAdoptionService.assess_failure`` remains the single owner of CI
+        authority and base validation. If it rejects a previously persisted green
+        exact-checkpoint verdict as ``no_ci_evidence``, finalization does not repeat
+        the base comparison. It only observes that durable green evidence exists and
+        reopens the existing adoption for the pipeline's current-base integration
+        fallback. A real test verdict or exhausted stale-retry budget is returned by
+        the adoption service with a different category and is never overridden.
         """
+        assess = getattr(self.adoption_service, "assess_failure", None)
+        if assess is None:
+            return None
+        try:
+            assessment = assess(str(experiment.id))
+        except Exception:  # noqa: BLE001 - the retry budget must still apply
+            logger.warning(
+                "could not assess adoption failure for %s", experiment.id, exc_info=True
+            )
+            return None
+
+        if getattr(assessment, "category", None) != "no_ci_evidence":
+            return assessment
+
         experiment_id = str(experiment.id)
         try:
-            adoption = self.adoption_service.get(experiment_id)
-            if adoption.status not in {STATUS_FAILED, STATUS_INTERRUPTED}:
-                return None
-            if adoption.test_exit_code is not None and adoption.test_exit_code != 0:
-                return None
-            if int(getattr(adoption, "stale_retry_attempts", 0) or 0) >= _MAX_STALE_RETRIES:
-                return None
-
             work_ref = self.github_work_tracking.for_experiment(experiment_id)
             checkpoint_sha = (
                 str(getattr(work_ref, "checkpoint_sha", "") or "").strip()
                 if work_ref is not None
                 else ""
             )
-            if not checkpoint_sha:
-                return None
-
-            details = self.github_work_tracking.recorded_ci_details(checkpoint_sha)
-            if not details or str(details.get("status") or "") != "passed":
-                return None
-
-            recorded_base = str(details.get("base_sha") or "").strip()
-            integration_base = str(self.adoption_service._integration_base_sha() or "").strip()
-            if not recorded_base or not integration_base or recorded_base == integration_base:
-                return None
-
-            run_id = details.get("run_id")
-            assessment = StaleFailureAssessment(
-                True,
-                "integration_fallback_required",
-                "authoritative GitHub Actions passed for the exact checkpoint, but "
-                "the target base moved; validate the checkpoint change on the current "
-                "integration base before retrying adoption",
-                previous_reason=getattr(adoption, "reason", None),
-                evidence_commit_sha=checkpoint_sha,
-                evidence_run_id=int(run_id) if run_id is not None else None,
+            details = (
+                self.github_work_tracking.recorded_ci_details(checkpoint_sha)
+                if checkpoint_sha
+                else None
             )
-            self._elog(experiment).info(
-                "assessment",
-                "stale_adoption_assessment",
-                "Moved target base requires integration fallback before stale adoption can continue",
-                retryable=True,
-                category=assessment.category,
-                detail=assessment.detail,
-                previous_reason=assessment.previous_reason,
-                evidence_commit_sha=assessment.evidence_commit_sha,
-                evidence_run_id=assessment.evidence_run_id,
-                recorded_base_sha=recorded_base,
-                integration_base_sha=integration_base,
-                stale_retry_attempts=int(getattr(adoption, "stale_retry_attempts", 0) or 0),
-                max_stale_retries=_MAX_STALE_RETRIES,
-            )
-            return assessment
-        except Exception:  # noqa: BLE001 - fall back to the normal assessment path
+        except Exception:  # noqa: BLE001 - preserve the adoption service's refusal
             logger.warning(
-                "could not assess moved-base integration fallback for %s",
+                "could not inspect persisted CI evidence for %s",
                 experiment_id,
                 exc_info=True,
             )
-            return None
+            return assessment
 
-    def _failure_assessment(self, experiment: Any) -> Any | None:
-        """The adoption service's verdict on whether a failure still stands.
+        if not details or str(details.get("status") or "") != "passed":
+            return assessment
 
-        A persisted green checkpoint whose recorded base differs from current main is
-        handled first: it is neither reusable CI nor missing evidence.  It is explicit
-        evidence that the existing adoption must enter its current-base integration
-        fallback.  All other cases continue through the adoption service's normal
-        stale-failure rules.
-        """
-        moved_base = self._moved_base_integration_assessment(experiment)
-        if moved_base is not None:
-            return moved_base
-
-        assess = getattr(self.adoption_service, "assess_failure", None)
-        if assess is None:
-            return None
-        try:
-            return assess(str(experiment.id))
-        except Exception:  # noqa: BLE001 - the retry budget must still apply
-            logger.warning(
-                "could not assess adoption failure for %s", experiment.id, exc_info=True
-            )
-            return None
+        run_id = details.get("run_id")
+        promoted = StaleFailureAssessment(
+            True,
+            "integration_fallback_required",
+            "a persisted green exact-checkpoint verdict is no longer authoritative "
+            "for the integration; validate the checkpoint change on the current "
+            "integration base before retrying adoption",
+            previous_reason=getattr(assessment, "previous_reason", None),
+            evidence_commit_sha=checkpoint_sha,
+            evidence_run_id=int(run_id) if run_id is not None else None,
+        )
+        self._elog(experiment).info(
+            "finalization",
+            "integration_fallback_required",
+            "Persisted green checkpoint evidence requires current-base integration fallback",
+            checkpoint_sha=checkpoint_sha,
+            run_id=promoted.evidence_run_id,
+            original_assessment_category=getattr(assessment, "category", None),
+            original_assessment_detail=getattr(assessment, "detail", None),
+        )
+        return promoted
 
     def _retry_or_review(
         self,
