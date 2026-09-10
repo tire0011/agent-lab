@@ -22,6 +22,7 @@ from modules.experiment_adoption_service import (
     STATUS_NOT_STARTED,
     STATUS_QUEUED,
     ExperimentAdoptionService,
+    StaleFailureAssessment,
 )
 from modules.runtime_execution import resolve_python_interpreter
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -281,24 +282,75 @@ class TaskFinalizationCoordinator:
             return _NullExperimentLogger()
 
     def _failure_assessment(self, experiment: Any) -> Any | None:
-        """The adoption service's verdict on whether a failure still stands.
+        """Return the adoption verdict, promoting persisted green CI to integration fallback.
 
-        Returns the assessment itself - the caller decides what a
-        non-retryable one means - so the reason it refused can be logged
-        rather than collapsed into ``None`` (#141). An adoption service
-        that predates #136 (or a test double without the method) has no
-        verdict to give, which is the old behaviour.
+        ``ExperimentAdoptionService.assess_failure`` remains the single owner of CI
+        authority and base validation. If it rejects a previously persisted green
+        exact-checkpoint verdict as ``no_ci_evidence``, finalization does not repeat
+        the base comparison. It only observes that durable green evidence exists and
+        reopens the existing adoption for the pipeline's current-base integration
+        fallback. A real test verdict or exhausted stale-retry budget is returned by
+        the adoption service with a different category and is never overridden.
         """
         assess = getattr(self.adoption_service, "assess_failure", None)
         if assess is None:
             return None
         try:
-            return assess(str(experiment.id))
+            assessment = assess(str(experiment.id))
         except Exception:  # noqa: BLE001 - the retry budget must still apply
             logger.warning(
                 "could not assess adoption failure for %s", experiment.id, exc_info=True
             )
             return None
+
+        if getattr(assessment, "category", None) != "no_ci_evidence":
+            return assessment
+
+        experiment_id = str(experiment.id)
+        try:
+            work_ref = self.github_work_tracking.for_experiment(experiment_id)
+            checkpoint_sha = (
+                str(getattr(work_ref, "checkpoint_sha", "") or "").strip()
+                if work_ref is not None
+                else ""
+            )
+            details = (
+                self.github_work_tracking.recorded_ci_details(checkpoint_sha)
+                if checkpoint_sha
+                else None
+            )
+        except Exception:  # noqa: BLE001 - preserve the adoption service's refusal
+            logger.warning(
+                "could not inspect persisted CI evidence for %s",
+                experiment_id,
+                exc_info=True,
+            )
+            return assessment
+
+        if not details or str(details.get("status") or "") != "passed":
+            return assessment
+
+        run_id = details.get("run_id")
+        promoted = StaleFailureAssessment(
+            True,
+            "integration_fallback_required",
+            "a persisted green exact-checkpoint verdict is no longer authoritative "
+            "for the integration; validate the checkpoint change on the current "
+            "integration base before retrying adoption",
+            previous_reason=getattr(assessment, "previous_reason", None),
+            evidence_commit_sha=checkpoint_sha,
+            evidence_run_id=int(run_id) if run_id is not None else None,
+        )
+        self._elog(experiment).info(
+            "finalization",
+            "integration_fallback_required",
+            "Persisted green checkpoint evidence requires current-base integration fallback",
+            checkpoint_sha=checkpoint_sha,
+            run_id=promoted.evidence_run_id,
+            original_assessment_category=getattr(assessment, "category", None),
+            original_assessment_detail=getattr(assessment, "detail", None),
+        )
+        return promoted
 
     def _retry_or_review(
         self,
