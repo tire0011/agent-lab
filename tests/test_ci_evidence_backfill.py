@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from modules.ci_evidence_backfill import _BACKFILL_MARKER, backfill_legacy_ci_evidence
 from modules.experiment_adoption_service import STATUS_FAILED, ExperimentAdoptionService
 from modules.github_work_tracking import GitHubWorkTrackingService
 from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
@@ -23,11 +25,11 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
         self.fx.create_experiment(experiment_id=self.experiment_id, changed_files=["app.py"])
 
         experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
-        worktree = Path(experiment.worktree_path)
-        self.base_sha = git(worktree, "rev-parse", "HEAD").stdout.strip()
-        tree_sha = git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip()
+        self.worktree = Path(experiment.worktree_path)
+        self.base_sha = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        tree_sha = git(self.worktree, "rev-parse", "HEAD^{tree}").stdout.strip()
         self.checkpoint_sha = git(
-            worktree,
+            self.worktree,
             "commit-tree",
             tree_sha,
             "-p",
@@ -35,6 +37,15 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
             "-m",
             "legacy verified checkpoint",
         ).stdout.strip()
+
+        # Keep the historical checkpoint reachable from the main repository's
+        # shared object store even if the experiment worktree is later removed.
+        git(
+            self.worktree,
+            "update-ref",
+            f"refs/heads/legacy-ci-{self.experiment_id[:8]}",
+            self.checkpoint_sha,
+        )
 
         ref = self.fx.github_work_tracking.for_experiment(self.experiment_id)
         ref.checkpoint_sha = self.checkpoint_sha
@@ -92,35 +103,53 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def _restart_current_code_without_credentials(self):
-        # Model a database from before #139: the historical verification row
-        # exists, but the durable CI table did not yet exist.
+    def _reset_to_pre_139_database(self) -> None:
+        # Model a database from before #139/#140: historical verification is
+        # present, but neither the durable CI row nor the one-shot marker is.
         conn = sqlite3.connect(self.fx.db_path)
         try:
             with conn:
                 conn.execute("DROP TABLE IF EXISTS github_ci_verifications")
+                conn.execute("DELETE FROM service_settings WHERE key=?", (_BACKFILL_MARKER,))
         finally:
             conn.close()
 
-        with patch.dict(os.environ, {"GITHUB_TOKEN": "", "GH_TOKEN": ""}, clear=False):
+    def _restart_current_code_without_credentials(self):
+        self._reset_to_pre_139_database()
+
+        with patch.dict(
+            os.environ,
+            {
+                "GITHUB_TOKEN": "",
+                "GH_TOKEN": "",
+                "NEXUS_REPO_ROOT": str(self.fx.repo),
+            },
+            clear=False,
+        ):
             tracking = GitHubWorkTrackingService(
                 db_path=self.fx.db_path,
                 repo_root=str(self.fx.repo),
                 repository="tire0011/agent-lab",
             )
+            adoption = ExperimentAdoptionService(
+                experiment_service=self.fx.experiment_service,
+                db_path=self.fx.db_path,
+                repo_root=str(self.fx.repo),
+                worktrees_root=str(self.fx.worktrees),
+                lock_path=self.fx.lock_path,
+                github_work_tracking=tracking,
+            )
         self.addCleanup(tracking.close)
-        self.assertFalse(tracking.configured)
-
-        adoption = ExperimentAdoptionService(
-            experiment_service=self.fx.experiment_service,
-            db_path=self.fx.db_path,
-            repo_root=str(self.fx.repo),
-            worktrees_root=str(self.fx.worktrees),
-            lock_path=self.fx.lock_path,
-            github_work_tracking=tracking,
-        )
         self.addCleanup(adoption.close)
+        self.assertFalse(tracking.configured)
         return tracking, adoption
+
+    def _advance_target_branch(self) -> None:
+        (self.fx.repo / "unrelated-after-ci.py").write_text("MOVED = True\n", encoding="utf-8")
+        git(self.fx.repo, "add", "unrelated-after-ci.py")
+        git(self.fx.repo, "commit", "-m", "advance main after historical CI")
+        git(self.fx.repo, "push", "origin", "main")
+        git(self.fx.repo, "fetch", "origin", "main")
 
     def test_pre_139_green_ci_is_backfilled_and_reopens_stale_adoption(self):
         self._insert_legacy_ci_run()
@@ -159,9 +188,6 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
             ),
         )
 
-        # Spend the retry through the normal #136 path. The historical
-        # failure is archived before the worker runs and the evidence budget
-        # is incremented durably.
         with patch.object(adoption, "_run_adoption_pipeline"):
             adoption.start_adoption(self.experiment_id, superseded=assessment)
             adoption.wait_for_thread(self.experiment_id, timeout=5)
@@ -170,13 +196,12 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["adoption_id"], "c617b97314ed4da98c539be99130c6c0")
 
-    def test_backfill_is_idempotent_and_does_not_replace_newer_durable_evidence(self):
+    def test_backfill_is_one_shot_and_does_not_replace_newer_durable_evidence(self):
         self._insert_legacy_ci_run()
         tracking, _ = self._restart_current_code_without_credentials()
         first = tracking.recorded_ci_for(self.checkpoint_sha, base_sha=self.base_sha)
         self.assertEqual(first.status, "passed")
 
-        # A later authoritative observation owns the durable row.
         conn = sqlite3.connect(self.fx.db_path)
         with conn:
             conn.execute(
@@ -192,13 +217,22 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
 
         from modules.run_store import init_db
 
-        migrated = init_db(self.fx.db_path)
-        migrated.close()
-        row = sqlite3.connect(self.fx.db_path).execute(
+        with patch("modules.ci_evidence_backfill.subprocess.run") as git_run:
+            migrated = init_db(self.fx.db_path)
+            migrated.close()
+        git_run.assert_not_called()
+
+        conn = sqlite3.connect(self.fx.db_path)
+        row = conn.execute(
             "SELECT status, conclusion, run_id, observed_at FROM github_ci_verifications WHERE commit_sha=?",
             (self.checkpoint_sha,),
         ).fetchone()
+        marker = conn.execute(
+            "SELECT value FROM service_settings WHERE key=?", (_BACKFILL_MARKER,)
+        ).fetchone()
+        conn.close()
         self.assertEqual(row, ("failed", "failure", 999, "2026-09-09T00:00:00+00:00"))
+        self.assertEqual(marker, ("done",))
 
     def test_generic_local_success_is_not_reinterpreted_as_github_ci(self):
         self._insert_legacy_ci_run(
@@ -227,18 +261,59 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
             tracking.recorded_ci_for(self.checkpoint_sha, base_sha=self.base_sha)
         )
 
-    def test_backfilled_green_ci_is_invalid_after_target_base_moves(self):
+    def test_main_repo_recovers_parent_after_worktree_cleanup(self):
         self._insert_legacy_ci_run()
-        tracking, _ = self._restart_current_code_without_credentials()
+        self._reset_to_pre_139_database()
+
+        # Remove the experiment worktree; the checkpoint is still reachable
+        # from the main repo via the ref created in setUp.
+        git(self.fx.repo, "worktree", "remove", "--force", str(self.worktree))
+        shutil.rmtree(self.worktree, ignore_errors=True)
+        self.assertFalse(self.worktree.exists())
+
+        tracking = GitHubWorkTrackingService(
+            db_path=self.fx.db_path,
+            repo_root=str(self.fx.repo),
+            repository="tire0011/agent-lab",
+            token="unused",
+        )
+        self.addCleanup(tracking.close)
+        conn = sqlite3.connect(self.fx.db_path)
+        inserted = backfill_legacy_ci_evidence(conn, repo_root=str(self.fx.repo))
+        conn.close()
+
+        self.assertEqual(inserted, 1)
         self.assertIsNotNone(
             tracking.recorded_ci_for(self.checkpoint_sha, base_sha=self.base_sha)
         )
 
-        # #139 semantics remain unchanged: the historical verdict belongs to
-        # the base it was verified on, not an arbitrary later integration base.
-        self.assertIsNone(
-            tracking.recorded_ci_for(self.checkpoint_sha, base_sha="f" * 40)
-        )
+    def test_backfilled_green_ci_is_invalid_after_target_base_moves(self):
+        self._insert_legacy_ci_run()
+        self._insert_stale_adoption()
+        tracking, adoption = self._restart_current_code_without_credentials()
+
+        with patch.object(
+            tracking, "wait_for_ci", side_effect=AssertionError("must not call GitHub")
+        ):
+            before = adoption.assess_failure(self.experiment_id)
+        self.assertTrue(before.retryable, before.detail)
+
+        self._advance_target_branch()
+
+        # The real read path resolves the now-moved origin/main and rejects
+        # the cached historical verdict for the old base.
+        with patch.object(
+            tracking,
+            "wait_for_ci",
+            return_value=type(before)(
+                False,
+                "unused",
+                "unused",
+            ),
+        ):
+            after = adoption.assess_failure(self.experiment_id)
+        self.assertFalse(after.retryable)
+        self.assertEqual(after.category, "no_ci_evidence")
 
 
 if __name__ == "__main__":
