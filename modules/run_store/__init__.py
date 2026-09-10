@@ -42,11 +42,10 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
     _sync_database_paths()
     conn = _schema.init_db(DEFAULT_DB_PATH if db_path is None else db_path)
 
-    # GitHubWorkTrackingService owns the durable CI table, so the table may
-    # not exist on the first init_db() during process construction. Once it
-    # does exist, every later initialization opportunistically migrates
-    # authoritative CI evidence left by pre-#139 experiment verification.
-    # The migration is local-only and idempotent.
+    # Pre-#139 CI evidence is a finite historical population. The migration
+    # records a durable completion marker after its first real scan, so hot
+    # init_db() call sites pay only a single settings lookup afterwards and
+    # never rescan experiments or spawn git subprocesses repeatedly.
     from modules.ci_evidence_backfill import backfill_legacy_ci_evidence
 
     backfill_legacy_ci_evidence(conn)
