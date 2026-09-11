@@ -492,6 +492,34 @@ Issue #144 / PR #147 fixed this by returning a bounded `integration_fallback_req
 
 **Lesson:** rejected evidence can still describe the next valid verification path. A moved base should invalidate reuse of old CI without being misclassified as absence of evidence.
 
+### 91. 2026-09-11: failure analysis became a mailbox-visible durable result
+
+Issue #148 / PR #152 extended `FailureAnalysisService` beyond SQLite/log diagnostics by publishing concise correlated `failure_analysis` messages through the existing Git-backed outbox lifecycle. Analysis rows now carry experiment/task correlation plus persistent publication state; a dedicated publisher uses the same write/commit/push and restart-idempotency semantics as other outbox producers. Publishing is gated to lifecycle-correlated analyses, and publish failure is isolated from both the original failure and the diagnosis itself.
+
+The user-visible message contains the bounded summary, category/confidence, top cause, recommended checks and recovery/escalation flags; unavailable analyses can also produce a concise notification. **Lesson:** useful autonomous diagnosis should reach the operator through the normal work channel, while detailed evidence remains in logs/SQLite. Notification delivery needs the same persistent exactly-once semantics as other durable outputs.
+
+### 92. 2026-09-11: the real moved-base retry exposed verified-source versus integration-candidate state
+
+After PR #147, the real #115/#116 chain reached the moved-base integration fallback but still failed before adoption. An earlier adoption attempt had already committed the verified experiment worktree; the experiment record still described the pre-commit diff, so the normal source-integrity guard interpreted the now-clean committed worktree as post-verification tampering.
+
+Issue #149 / PR #153 fixed this without weakening the ordinary guard. For `integration_fallback_required` only, Nexus proves that the persisted source commit is still HEAD, the worktree is clean, and the commit diff exactly equals the verified experiment diff. It then restores that trusted commit to the original pre-commit diff shape and lets the existing adoption guard validate it normally before constructing the current-base integration candidate. Distinct `verified_source_integrity` and `integration_candidate` events separate the two facts; deliberately mutated source remains terminal/auditable.
+
+**Lesson:** a verified source state and a later integration candidate are different lifecycle artifacts. Recovery must normalize trusted historical representations before applying an invariant, rather than weakening the invariant because the representation changed.
+
+### 93. 2026-09-11: missing failure-analysis state was traced to deployment/runtime freshness rather than a missing finalization call site
+
+Issue #150 / PR #154 investigated why a real finalization reached `needs_review` while the live database had no `failure_analyses` table. Code-path review found that normal, exceptional, and resumed finalization terminal paths already converge on the analyzer hook. The schema is centrally created by `run_store.init_db()`; therefore a missing table on the live runtime most strongly indicates that the active process predates the migration/feature or otherwise has stale deployment state, not that current code omitted the analyzer call.
+
+PR #154 improved error logs with task/experiment correlation and added a regression that reconstructs a finalization across a simulated process restart, exhausts adoption retries from persisted state, reaches `needs_review`, and confirms the analyzer fires. Focused suites passed **10**, **73**, and **318** tests for the relevant groups. The real live #115/#116 reproduction still needs a post-deploy/restart validation before this behavior is considered operationally proven.
+
+**Lesson:** source correctness and deployed-runtime freshness are separate evidence. When a migrated table or capability is absent in production, first distinguish stale process/schema activation from a missing code path, and test recovery using newly constructed services rather than only in-memory mocks.
+
+### 94. 2026-09-11: structured failure-analysis observability is the next open diagnostic layer
+
+Issue #151 / PR #155 proposes explicit lifecycle events for failure-analysis request, service/schema initialization, model call, persistence, completion/unavailable/skipped outcomes, startup feature status, and resumed-finalization source. It intentionally logs only safe identities/diagnostic fields, not prompts, raw model output, credentials, or raw exception text.
+
+PR #155 is **open and not yet adopted on `main`**. Its purpose is to make a future missing analysis explainable from the normal `/logs` feed without DB inspection or debugger attachment, including whether the running deployment even activated the feature.
+
 ## What Nexus currently learns
 
 Nexus accumulates durable information from:
@@ -534,12 +562,12 @@ Current `main` includes:
 - exact-commit GitHub Actions evidence as authoritative verification with bounded local fallback, persisted exact-SHA CI observations reusable across restart, and offline backfill of pre-schema authoritative evidence,
 - mandatory GitHub-backed implementation lifecycle using Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion,
 - persisted post-verification finalization through PR merge, adoption/deployment, service restart recovery, task-specific live validation, and only then final `succeeded`; finalization state is experiment-owned and can be safely rebound to later terminal-owner approvals,
-- restart-aware adoption with integration-aware CI precedence, auditable stale-failure supersession, bounded stale retries, and explicit moved-base integration fallback on the current target branch,
-- a reusable local-first failure-analysis service with bounded/redacted evidence, structured persisted diagnoses, best-effort lifecycle integration, and diagnostic API access,
+- restart-aware adoption with integration-aware CI precedence, auditable stale-failure supersession, bounded stale retries, moved-base integration fallback on the current target branch, and separate integrity handling for persisted verified-source commits versus integration candidates,
+- a reusable local-first failure-analysis service with bounded/redacted evidence, structured persisted diagnoses, best-effort lifecycle integration, diagnostic API access, and correlated restart-idempotent mailbox outbox publication,
 - restart-aware mailbox command recovery using persisted Git baselines, optional declared service postconditions, tri-state evidence (`succeeded`/`failed`/`unknown`), and cached idempotent replay,
 - GitHub Actions verification for PRs and `nexus/**` pushes,
 - SQLite state and durable project/idea/decision/history documents,
-- separate Git-backed mailbox repository with crash-safe publication, rejected-chain recovery, fetch/rebase/push synchronization, deferred trusted command execution, synchronous internal-command compatibility, and state-aware mailbox retention,
+- separate Git-backed mailbox repository with crash-safe publication, rejected-chain recovery, fetch/rebase/push synchronization, deferred trusted command execution, synchronous internal-command compatibility, state-aware mailbox retention, and failure-analysis notifications,
 - signed webhook wake-up with timer fallback and bounded recovery diagnostics,
 - modularized mailbox, run-store, experiment-service, central-logging, and browser-client code,
 - application-wide central structured logging from work submission onward, including stable CI-evidence/stale-adoption decision events, with unauthenticated read-only `/logs`, `/logs/public`, and `/logs/trace` surfaces plus authenticated write/control endpoints,
@@ -551,7 +579,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), remaining Issue #123 restart paths, controller JSON escape hardening, measurement of the two-stage tool gateway, a successful real autonomous-finalization E2E, validation of LLM failure-analysis quality/actionability, and broader validation of bounded verification repair/stale-adoption recovery remain open work/research. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
+Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), remaining Issue #123 restart paths, controller JSON escape hardening, measurement of the two-stage tool gateway, a successful real autonomous-finalization E2E, validation of LLM failure-analysis quality/actionability, live validation that failure analysis activates after deploy/restart, and structured failure-analysis observability (Issue #151 / open PR #155) remain open work/research. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
 
 ## Important lessons so far
 
@@ -620,6 +648,9 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 63. **Decision observability is part of agent reasoning infrastructure.** Log why evidence was accepted/rejected and which fallback was selected, not only the final status.
 64. **Diagnosis should be reusable and failure-isolated.** An LLM analyzer may propose next actions, but its own failure must never hide or replace the original error.
 65. **Invalidated evidence can still guide recovery.** `target_base_moved` means revalidate the combined tree, not `no evidence`.
+66. **Human-facing diagnosis is a durable output.** A useful analysis should be surfaced through the normal mailbox channel with restart-safe exactly-once publication rather than remaining hidden in internal storage.
+67. **Invariant checks must account for lifecycle representation changes.** A trusted verified diff may later exist as a clean persisted commit; recovery should prove and normalize that state before reusing the invariant, not weaken source-integrity checks.
+68. **Deployment freshness is evidence.** Missing migrated schema/capabilities can indicate stale running code even when current source and tests are correct; recovery tests should reconstruct services from durable state.
 
 ## Open research directions
 
@@ -638,8 +669,10 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 - measure whether submission-time job/session/mailbox correlation makes failures diagnosable without external tracing,
 - measure authoritative exact-SHA CI reuse, historical backfill, and persisted evidence across restarts: wait time, live lookup avoidance, local fallback frequency, false timeout elimination, stale-evidence rejection, and end-to-end latency,
 - measure bounded verification repair: recovery rate, iterations, repeated-failure stops, extra model/CI cost, and reduction in human intervention,
-- measure stale-adoption recovery including moved-base integration fallback: how often no-verdict failures are superseded, fallback success/failure rate, whether the two-retry budget is sufficient, and whether terminal implementation failures remain closed,
-- measure local-LLM failure analysis: diagnosis accuracy, calibration/confidence usefulness, actionability of recommended checks, context size/cost, malformed-output rate, and reduction in human diagnosis time before allowing automatic diagnostic loops,
+- measure stale-adoption recovery including moved-base source normalization/integration fallback: how often no-verdict failures are superseded, fallback success/failure rate, whether the two-retry budget is sufficient, whether trusted committed-source normalization works across restart, and whether terminal implementation/tamper failures remain closed,
+- measure local-LLM failure analysis: diagnosis accuracy, calibration/confidence usefulness, actionability of recommended checks, context size/cost, malformed-output rate, outbox usefulness, and reduction in human diagnosis time before allowing automatic diagnostic loops,
+- validate failure-analysis activation on a freshly deployed/restarted live Nexus and distinguish code-path bugs from stale runtime/schema activation,
+- evaluate structured FailureAnalysisService lifecycle observability from Issue #151 / PR #155 if adopted: can `/logs` alone explain skipped/init/model/persistence failures and recovery-path invocation?,
 - evaluate whether self-healing operations and duplicate-loop prevention materially reduce human intervention,
 - evaluate MCP as the standard control path and narrow temporary bootstrap capabilities over time,
 - measure whether the mandatory GitHub lifecycle improves fire-and-forget development, traceability, recovery, and review,
@@ -650,7 +683,7 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 - investigate missing-capability recovery, deduplicated issue creation, tool provisioning, and promotion of recurring gaps into OperationsRegistry capabilities (Issue #120),
 - validate Issue #123 beyond the command-channel fix: restart/resume across remaining mailbox/task paths, explicit expected-state evidence, and exactly-once pending replies,
 - harden controller structured-output parsing against JSON-invalid escape sequences and measure repair success without broad lossy normalization,
-- run a real single-chain autonomous finalization E2E through adoption -> moved-base fallback when applicable -> merge -> deploy -> restart recovery -> live validation -> exactly-once success using the new persisted CI/failure/rebind semantics,
+- run a real single-chain autonomous finalization E2E through adoption -> moved-base source normalization/fallback when applicable -> merge -> deploy -> restart recovery -> live validation -> exactly-once success using the persisted CI/failure/rebind semantics,
 - investigate missing-capability detection and structured issue creation before automatic tool generation,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
@@ -660,20 +693,22 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 
 ## Current next-step candidates
 
-1. **Real autonomous-finalization E2E:** rerun the verified feature lifecycle through later approval/rebind, exact-SHA persisted/backfilled CI reuse, moved-base integration fallback when required, adoption, merge, deploy, restart recovery, live validation, and exactly-once final success; PR #116 remains the original unfinished smoke feature.
-2. **Failure-analysis validation:** run the new `FailureAnalysisService` against several real lifecycle/tool failures and measure diagnosis accuracy, confidence calibration, useful next checks, malformed-output handling, and whether it reduces manual log/DB inspection before enabling any automatic diagnostic loop.
-3. **Restart-recovery E2E:** exercise the real Inbox refresh path with PR #124, including declared service postconditions, repeated restart/idempotence, and an inconclusive case that must remain `unknown`; then decide whether broader Issue #123 acceptance criteria need more work.
-4. **Controller JSON escaping:** reproduce the `Invalid \\escape` failure with a focused regression and harden structured-output repair or payload encoding without weakening semantic validation.
-5. **Tool-grant contract:** implement Issue #117 so `related_tools` can never be interpreted as granted operations, then repeat the version/tool-gateway path.
-6. **Missing-capability learning:** implement Issue #120 and test `rg`-missing recovery, fallback/provisioning, deduplicated issue creation, and later promotion to a reusable tool.
-7. **Completion-state modeling:** complete Issue #119 so outbox/UI distinguish verified, integrated, deployed, and final succeeded states even outside the finalization coordinator internals.
-8. **Real post-OOM rerun:** repeat the feature task that previously caused prompt growth/tool looping and measure whether PRs #95/#97/#99 now finish without repetition or local OOM.
-9. **Tool-gateway measurement:** compare the two-stage discovery/invocation protocol with direct catalog exposure and quantify context reduction versus resolver cost, invalid-goal recovery, and wrong selection.
-10. **Verification-repair measurement:** run representative repairable and non-repairable failures and measure recovery, repeat detection, latency, model calls, CI runs, and intervention.
-11. **Authoritative-CI/recovery measurement:** run several experiments across service restarts and target-branch movement; verify persisted/backfilled exact-SHA evidence avoids duplicate live lookup while never covering another commit or stale integration base.
-12. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
-13. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
-14. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
-15. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
-16. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
-17. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
+1. **Real autonomous-finalization E2E:** rerun the verified feature lifecycle through later approval/rebind, exact-SHA persisted/backfilled CI reuse, moved-base source normalization/integration fallback when required, adoption, merge, deploy, restart recovery, live validation, and exactly-once final success; PR #116 remains the original unfinished smoke feature.
+2. **Failure-analysis live activation:** after deploying/restarting current `main`, reproduce a real finalization `needs_review` and verify the migrated `failure_analyses` schema exists, analysis runs, persists, and publishes exactly one correlated outbox notification.
+3. **Failure-analysis observability:** review/validate open PR #155 against the live failure path; if adopted, confirm `/logs` alone distinguishes skipped invocation, stale deployment, service/schema initialization failure, model failure, malformed output, and persistence failure.
+4. **Failure-analysis quality:** run the analyzer against several real lifecycle/tool failures and measure diagnosis accuracy, confidence calibration, useful next checks, malformed-output handling, outbox usefulness, and whether it reduces manual log/DB inspection before enabling any automatic diagnostic loop.
+5. **Restart-recovery E2E:** exercise the real Inbox refresh path with PR #124, including declared service postconditions, repeated restart/idempotence, and an inconclusive case that must remain `unknown`; then decide whether broader Issue #123 acceptance criteria need more work.
+6. **Controller JSON escaping:** reproduce the `Invalid \\escape` failure with a focused regression and harden structured-output repair or payload encoding without weakening semantic validation.
+7. **Tool-grant contract:** implement Issue #117 so `related_tools` can never be interpreted as granted operations, then repeat the version/tool-gateway path.
+8. **Missing-capability learning:** implement Issue #120 and test `rg`-missing recovery, fallback/provisioning, deduplicated issue creation, and later promotion to a reusable tool.
+9. **Completion-state modeling:** complete Issue #119 so outbox/UI distinguish verified, integrated, deployed, and final succeeded states even outside the finalization coordinator internals.
+10. **Real post-OOM rerun:** repeat the feature task that previously caused prompt growth/tool looping and measure whether PRs #95/#97/#99 now finish without repetition or local OOM.
+11. **Tool-gateway measurement:** compare the two-stage discovery/invocation protocol with direct catalog exposure and quantify context reduction versus resolver cost, invalid-goal recovery, and wrong selection.
+12. **Verification-repair measurement:** run representative repairable and non-repairable failures and measure recovery, repeat detection, latency, model calls, CI runs, and intervention.
+13. **Authoritative-CI/recovery measurement:** run several experiments across service restarts and target-branch movement; verify persisted/backfilled exact-SHA evidence avoids duplicate live lookup while never covering another commit or stale integration base.
+14. **Adaptive-routing measurement:** run representative simple/medium/large tasks and measure selection, fallback, success, latency, tokens, cost, and intervention.
+15. **Persistent job/resource measurement:** quantify local-model/chat queue/runtime/token behavior plus RAM/swap/mmap pressure and recovery across restarts.
+16. **Local-model/context benchmark:** compare local candidates under identical actual VM limits and test two-pass context gathering versus larger context.
+17. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
+18. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
+19. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
