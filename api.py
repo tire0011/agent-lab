@@ -728,6 +728,7 @@ _MAILBOX_TYPE_LABELS_DE = {
     "question": "Frage",
     "context": "Kontext",
     "task_approval_result": "Freigabe-Ergebnis",
+    "failure_analysis": "Fehleranalyse",
 }
 
 _SAFE_SENDER_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")

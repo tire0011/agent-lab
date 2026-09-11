@@ -702,6 +702,57 @@ class TaskApprovalOutboxPublisher(_TablePublisher):
         return self.publish_many(self.fetch_pending())
 
 
+class FailureAnalysisOutboxPublisher(_TablePublisher):
+    """Publishes failure-analysis outbox notifications (#148).
+
+    Same shared git lifecycle as the other producers: the analysis service
+    writes the file + a ``pending_write``/``written`` DB row, and this
+    publisher is responsible for committing and pushing it. A given
+    analysis row is only ever picked up here once its ``publish_status``
+    leaves ``pushed`` behind is impossible - ``fetch_pending`` simply never
+    selects a ``pushed`` row again, so restart/re-polling cannot produce a
+    second commit for the same analysis.
+    """
+
+    _TABLE = "failure_analyses"
+    _ID_COLUMN = "id"
+    _COMMIT_SHA_COLUMN = "publish_commit_sha"
+
+    def fetch_pending(self) -> list[PublishRecord]:
+        rows = self._conn.execute(
+            """SELECT id, outbox_file, publish_status,
+                      publish_commit_sha, publish_retry_count, outbox_content
+               FROM failure_analyses
+               WHERE outbox_file IS NOT NULL
+                 AND publish_status IN (?, ?, ?, ?, ?, ?)
+               ORDER BY created_at ASC""",
+            (
+                PUBLISH_PENDING_WRITE,
+                PUBLISH_WRITTEN,
+                _PENDING_COMPAT,
+                PUBLISH_COMMITTING,
+                PUBLISH_COMMITTED,
+                PUBLISH_FAILED,
+            ),
+        ).fetchall()
+        records = []
+        for row in rows:
+            stored_content: str | None = row["outbox_content"]
+            content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
+            records.append(PublishRecord(
+                record_id=row["id"],
+                outbox_file=row["outbox_file"],
+                publish_status=row["publish_status"],
+                publish_commit_sha=row["publish_commit_sha"],
+                publish_retry_count=row["publish_retry_count"] or 0,
+                content_fn=content_fn,
+            ))
+        return records
+
+    def publish_pending(self) -> int:
+        return self.publish_many(self.fetch_pending())
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@ from typing import Any
 
 from modules import central_logging
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
+from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 from modules.redaction import redact
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
@@ -75,6 +76,21 @@ _LOW_CONFIDENCE_ESCALATION_THRESHOLD = 0.35
 
 _DEFAULT_ANALYSIS_TIMEOUT_SECONDS = 60.0
 _DEFAULT_MAX_TOKENS = 900
+
+# Additive migration (#148): correlation ids + the shared outbox publish
+# lifecycle columns (see modules.outbox_publisher).
+_FAILURE_ANALYSES_ADDITIVE_COLUMNS = [
+    ("experiment_id", "TEXT"),
+    ("mailbox_task_id", "TEXT"),
+    ("outbox_file", "TEXT"),
+    ("outbox_content", "TEXT"),
+    ("publish_status", "TEXT"),
+    ("publish_commit_sha", "TEXT"),
+    ("publish_pushed_at", "TEXT"),
+    ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("publish_last_error", "TEXT"),
+    ("updated_at", "TEXT"),
+]
 
 # Fields every structured log entry (see modules.central_logging) carries
 # that are either redundant with the compact rendering below or too
@@ -142,6 +158,8 @@ class FailureAnalysis:
     needs_human: bool = False
     escalation_reason: str | None = None
     evidence_refs: tuple[str, ...] = ()
+    experiment_id: str | None = None
+    mailbox_task_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +181,8 @@ class FailureAnalysis:
             "needs_human": self.needs_human,
             "escalation_reason": self.escalation_reason,
             "evidence_refs": list(self.evidence_refs),
+            "experiment_id": self.experiment_id,
+            "mailbox_task_id": self.mailbox_task_id,
         }
 
 
@@ -394,6 +414,8 @@ def _coerce_analysis(
     provider: str,
     model: str | None,
     evidence_refs: list[str],
+    experiment_id: str | None = None,
+    mailbox_task_id: str | None = None,
 ) -> FailureAnalysis:
     confidence = _coerce_confidence(data.get("confidence"))
     needs_human = bool(data.get("needs_human", False))
@@ -427,6 +449,8 @@ def _coerce_analysis(
         needs_human=needs_human,
         escalation_reason=escalation_reason,
         evidence_refs=tuple(evidence_refs),
+        experiment_id=experiment_id,
+        mailbox_task_id=mailbox_task_id,
     )
 
 
@@ -438,6 +462,8 @@ def _unavailable_analysis(
     provider: str,
     model: str | None,
     reason: str,
+    experiment_id: str | None = None,
+    mailbox_task_id: str | None = None,
 ) -> FailureAnalysis:
     return FailureAnalysis(
         id=analysis_id,
@@ -451,7 +477,69 @@ def _unavailable_analysis(
         confidence=0.0,
         needs_human=True,
         escalation_reason=_bounded(reason, _MAX_TEXT_ITEM_CHARS),
+        experiment_id=experiment_id,
+        mailbox_task_id=mailbox_task_id,
     )
+
+
+def _yesno(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def render_outbox_content(analysis: FailureAnalysis) -> str:
+    """Concise, user-visible mailbox outbox notification for one analysis (#148).
+
+    Every field pulled in here already went through ``redact``/``_bounded``
+    when the analysis was coerced from the model's output (or, for an
+    unavailable analysis, when the escalation reason was captured) - so no
+    additional redaction is needed at render time.
+    """
+    front_matter = (
+        "---\n"
+        "type: failure_analysis\n"
+        f"analysis_id: {analysis.id}\n"
+        f"subject_type: {analysis.subject_type}\n"
+        f"subject_id: {analysis.subject_id}\n"
+        f"experiment_id: {analysis.experiment_id or ''}\n"
+        f"mailbox_task_id: {analysis.mailbox_task_id or ''}\n"
+        f"category: {analysis.category}\n"
+        f"confidence: {analysis.confidence:.2f}\n"
+        f"created_at: {analysis.created_at}\n"
+        "---\n"
+    )
+
+    if analysis.category == CATEGORY_UNAVAILABLE:
+        body = (
+            "# Failure Analysis Unavailable\n\n"
+            "Nexus attempted to diagnose this failure automatically, but the "
+            "diagnosis itself did not complete. The original failure/result "
+            "is unaffected.\n\n"
+            f"Reason: {analysis.escalation_reason or 'unknown'}\n\n"
+            f"Analysis id: {analysis.id}\n"
+            f"Experiment: {analysis.experiment_id or 'none'}\n"
+            f"Task: {analysis.mailbox_task_id or 'none'}\n"
+        )
+        return front_matter + "\n" + body
+
+    top_cause = analysis.likely_root_causes[0].cause if analysis.likely_root_causes else "unknown"
+    next_checks = list(analysis.recommended_checks[:3])
+    checks_block = "\n".join(f"- {check}" for check in next_checks) if next_checks else "- (none identified)"
+
+    body = (
+        "# Failure Analysis\n\n"
+        f"Summary: {analysis.summary}\n\n"
+        f"Category: {analysis.category}\n"
+        f"Confidence: {analysis.confidence:.2f}\n"
+        f"Likely cause: {top_cause}\n"
+        f"Next checks:\n{checks_block}\n\n"
+        f"Self recoverable: {_yesno(analysis.can_self_recover)}\n"
+        f"External model recommended: {_yesno(analysis.needs_external_model)}\n"
+        f"Human required: {_yesno(analysis.needs_human)}\n\n"
+        f"Analysis id: {analysis.id}\n"
+        f"Experiment: {analysis.experiment_id or 'none'}\n"
+        f"Task: {analysis.mailbox_task_id or 'none'}\n"
+    )
+    return front_matter + "\n" + body
 
 
 class FailureAnalysisService:
@@ -475,6 +563,9 @@ class FailureAnalysisService:
         analysis_timeout_seconds: float | None = None,
         log_dir: str | Path = central_logging.DEFAULT_LOG_DIR,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
+        mailbox_config: Any | None = None,
+        outbox_dir: str | Path | None = None,
+        repo_root: str | Path | None = None,
     ) -> None:
         self.db_path = db_path
         timeout = analysis_timeout_seconds
@@ -483,6 +574,23 @@ class FailureAnalysisService:
         self._client = llama_client or LlamaCppClient(timeout=max(5.0, timeout))
         self._max_tokens = max(200, max_tokens)
         self._log_dir = Path(log_dir)
+
+        # Outbox publishing (#148) is optional: a caller that never supplies
+        # mailbox_config (or outbox_dir + repo_root) still gets a fully
+        # working analyzer - it just never emits an outbox notification for
+        # its analyses. This keeps every existing construction site (tests,
+        # the manual/API entry points) working unchanged.
+        if mailbox_config is not None:
+            self._outbox_dir: Path | None = Path(mailbox_config.outbox_dir)
+            self._repo_root: Path | None = Path(mailbox_config.mailbox_repo_path)
+        elif outbox_dir is not None and repo_root is not None:
+            self._outbox_dir = Path(outbox_dir)
+            self._repo_root = Path(repo_root)
+        else:
+            self._outbox_dir = None
+            self._repo_root = None
+        self._repo_lock = RepoLock(self._repo_root) if self._repo_root is not None else None
+
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -515,6 +623,20 @@ class FailureAnalysisService:
                     ON failure_analyses(created_at);
                 """
             )
+            # Additive migration (#148): outbox publish lifecycle + correlation
+            # columns, added via ALTER TABLE for pre-existing databases created
+            # before this feature existed - same pattern used for
+            # operation_chains / mailbox_task_approvals in run_store/schema.py.
+            existing = {row[1] for row in self._conn.execute("PRAGMA table_info(failure_analyses)")}
+            for column_name, column_type in _FAILURE_ANALYSES_ADDITIVE_COLUMNS:
+                if column_name not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE failure_analyses ADD COLUMN {column_name} {column_type}"
+                    )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_failure_analyses_mailbox_task "
+                "ON failure_analyses(mailbox_task_id)"
+            )
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -529,6 +651,8 @@ class FailureAnalysisService:
         evidence: list[dict[str, Any]] | None = None,
         goal: str | None = None,
         elog: Any = None,
+        experiment_id: str | None = None,
+        mailbox_task_id: str | None = None,
     ) -> FailureAnalysis:
         """Sync entry point for callers with no event loop of their own.
 
@@ -549,6 +673,8 @@ class FailureAnalysisService:
                 evidence=evidence,
                 goal=goal,
                 elog=elog,
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
             )
         )
 
@@ -561,6 +687,8 @@ class FailureAnalysisService:
         evidence: list[dict[str, Any]] | None = None,
         goal: str | None = None,
         elog: Any = None,
+        experiment_id: str | None = None,
+        mailbox_task_id: str | None = None,
     ) -> FailureAnalysis:
         """Best-effort structured diagnosis of *failure*. Never raises.
 
@@ -569,6 +697,13 @@ class FailureAnalysisService:
         running. *evidence* should already be bounded/relevant (see
         :func:`evidence_from_log_entries`); this method bounds it again
         defensively regardless of what the caller passed.
+
+        *experiment_id*/*mailbox_task_id* correlate the analysis with the
+        mailbox task / experiment lifecycle that triggered it (#148, both
+        optional - plenty of callers diagnose something with no mailbox
+        context at all). When at least one is supplied, a concise outbox
+        notification is published in addition to the full structured
+        record persisted below.
         """
         analysis_id = uuid.uuid4().hex
         try:
@@ -579,6 +714,8 @@ class FailureAnalysisService:
                 failure=failure,
                 evidence=evidence or [],
                 goal=goal,
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
             )
         except Exception as exc:  # noqa: BLE001 - diagnosis must never break the caller
             logger.exception(
@@ -591,9 +728,12 @@ class FailureAnalysisService:
                 provider="local",
                 model=getattr(self._client, "model", None),
                 reason=f"{type(exc).__name__}: {exc}",
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
             )
         self._persist(analysis)
         self._log(analysis, elog)
+        self._publish_outbox(analysis)
         return analysis
 
     def analyze_from_logs(
@@ -667,6 +807,8 @@ class FailureAnalysisService:
             evidence=evidence,
             goal=goal,
             elog=elog,
+            experiment_id=experiment_id,
+            mailbox_task_id=mailbox_task_id,
         )
 
     # ------------------------------------------------------------------
@@ -682,6 +824,8 @@ class FailureAnalysisService:
         failure: dict[str, Any] | str,
         evidence: list[dict[str, Any]],
         goal: str | None,
+        experiment_id: str | None = None,
+        mailbox_task_id: str | None = None,
     ) -> FailureAnalysis:
         if not subject_type or not subject_id:
             raise FailureAnalysisError("subject_type and subject_id are required")
@@ -725,6 +869,8 @@ class FailureAnalysisService:
                 provider="local",
                 model=model_name,
                 reason=f"local model call failed: {exc}",
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
             )
 
         try:
@@ -739,6 +885,8 @@ class FailureAnalysisService:
                 provider="local",
                 model=model_name,
                 reason=f"local model returned unparseable output: {exc}",
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
             )
         if not isinstance(data, dict):
             return _unavailable_analysis(
@@ -748,6 +896,8 @@ class FailureAnalysisService:
                 provider="local",
                 model=model_name,
                 reason="local model output was not a JSON object",
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
             )
 
         return _coerce_analysis(
@@ -758,6 +908,8 @@ class FailureAnalysisService:
             provider="local",
             model=model_name,
             evidence_refs=evidence_refs,
+            experiment_id=experiment_id,
+            mailbox_task_id=mailbox_task_id,
         )
 
     # ------------------------------------------------------------------
@@ -772,8 +924,9 @@ class FailureAnalysisService:
                     INSERT INTO failure_analyses (
                         id, subject_type, subject_id, created_at, provider, model,
                         category, confidence, can_self_recover, needs_external_model,
-                        needs_human, analysis_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        needs_human, analysis_json, experiment_id, mailbox_task_id,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         analysis.id,
@@ -788,6 +941,9 @@ class FailureAnalysisService:
                         int(analysis.needs_external_model),
                         int(analysis.needs_human),
                         _json_dumps(analysis.to_dict()),
+                        analysis.experiment_id,
+                        analysis.mailbox_task_id,
+                        analysis.created_at,
                     ),
                 )
         except Exception:  # noqa: BLE001 - persistence must never break the caller
@@ -815,6 +971,63 @@ class FailureAnalysisService:
             )
         except Exception:  # noqa: BLE001 - logging must never break the caller
             logger.warning("failure_analysis: could not write elog entry", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Mailbox outbox publishing (#148)
+    # ------------------------------------------------------------------
+
+    def _publish_outbox(self, analysis: FailureAnalysis) -> None:
+        """Best-effort: publish one outbox notification for *analysis*.
+
+        Never raises and never touches the analysis record's own columns -
+        a publish failure here must not alter the underlying diagnosis or
+        the lifecycle state it describes. Skipped entirely when this
+        service was constructed without outbox configuration, or when the
+        analysis has no mailbox task / experiment correlation at all (a
+        manual/API-only analysis has nothing to notify).
+        """
+        if self._outbox_dir is None or self._repo_root is None:
+            return
+        if not analysis.mailbox_task_id and not analysis.experiment_id:
+            return
+        try:
+            self._write_outbox_file(analysis)
+        except Exception:  # noqa: BLE001 - publishing must never break the caller
+            logger.exception(
+                "failure_analysis: could not write outbox notification for %s", analysis.id
+            )
+
+    def _write_outbox_file(self, analysis: FailureAnalysis) -> None:
+        assert self._outbox_dir is not None and self._repo_root is not None and self._repo_lock is not None
+        self._outbox_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        filename = f"{ts}-failure-analysis-{analysis.id[:8]}.md"
+        path = self._outbox_dir / filename
+        content = render_outbox_content(analysis)
+        rel_path = str(path.relative_to(self._repo_root))
+
+        with self._repo_lock:
+            # Persist publish intent + full content before the atomic write so
+            # a crash between write and the second DB update is recoverable
+            # via FailureAnalysisOutboxPublisher.content_fn (same recovery
+            # contract as modules.outbox_publisher.OutboxPublisher).
+            with self._conn:
+                self._conn.execute(
+                    """UPDATE failure_analyses
+                       SET outbox_file=?, outbox_content=?, publish_status=?, updated_at=?
+                       WHERE id=?""",
+                    (rel_path, content, PUBLISH_PENDING_WRITE, _utcnow_iso(), analysis.id),
+                )
+
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(path)
+
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE failure_analyses SET publish_status=?, updated_at=? WHERE id=?",
+                    (PUBLISH_WRITTEN, _utcnow_iso(), analysis.id),
+                )
 
     def get(self, analysis_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(

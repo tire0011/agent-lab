@@ -30,6 +30,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from modules.failure_analysis_service import FailureAnalysisService
 from modules.mailbox.config import MailboxConfig
 from modules.mailbox import git_is_clean
 from modules.outbox_publisher import (
@@ -38,6 +39,7 @@ from modules.outbox_publisher import (
     PUBLISH_PENDING_WRITE,
     PUBLISH_PUSHED,
     PUBLISH_WRITTEN,
+    FailureAnalysisOutboxPublisher,
     OperationChainOutboxPublisher,
     PublishRecord,
     TaskApprovalOutboxPublisher,
@@ -151,6 +153,42 @@ def _insert_approval(
     )
     conn.commit()
     conn.close()
+
+
+def _insert_failure_analysis(
+    db_path: str,
+    analysis_id: str,
+    outbox_rel: str,
+    publish_status: str = PUBLISH_WRITTEN,
+    commit_sha: str | None = None,
+    category: str = "lifecycle_logic",
+    confidence: float = 0.8,
+) -> None:
+    conn = init_db(db_path)
+    conn.execute(
+        """INSERT INTO failure_analyses
+           (id, subject_type, subject_id, created_at, provider, model,
+            category, confidence, can_self_recover, needs_external_model,
+            needs_human, analysis_json, experiment_id, mailbox_task_id,
+            outbox_file, publish_status, publish_commit_sha, updated_at)
+           VALUES (?, 'mailbox_task', 'exp1', '2026-01-01T00:00:00Z', 'local', NULL,
+                   ?, ?, 0, 0, 0, '{}', 'exp1', 'task1',
+                   ?, ?, ?, '2026-01-01T00:00:00Z')""",
+        (analysis_id, category, confidence, outbox_rel, publish_status, commit_sha),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _get_failure_analysis(db_path: str, analysis_id: str) -> dict:
+    conn = init_db(db_path)
+    cur = conn.execute(
+        "SELECT * FROM failure_analyses WHERE id=?", (analysis_id,)
+    )
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    conn.close()
+    return dict(zip(cols, row))
 
 
 def _get_chain(db_path: str, request_id: str) -> dict:
@@ -1056,6 +1094,112 @@ class TestPushErrorRedaction(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self._check_no_secret(fmt, fragment, "git_push debug log")
                 self.assertIn("[REMOTE]", fmt, "REMOTE placeholder absent from debug log")
+
+
+# ============================================================================
+# Failure-analysis outbox notifications (#148)
+# ============================================================================
+
+
+class TestFailureAnalysisPublishLifecycle(unittest.TestCase):
+    """FailureAnalysisOutboxPublisher shares the same lifecycle guarantees
+    (write -> commit -> push, restart idempotency, publish failure does not
+    touch the underlying record) as the other two producers above."""
+
+    def setUp(self):
+        self.ctx = tempfile.TemporaryDirectory()
+        tmp = Path(self.ctx.name)
+        self.repo, self.remote = _make_repo_with_remote(tmp)
+        self.db = str(tmp / "state.db")
+        self.cfg = _legacy_config(self.repo)
+        # failure_analyses is created lazily by FailureAnalysisService's own
+        # _ensure_schema() (it isn't part of run_store/schema.py's init_db
+        # migrations) - touch it once so the table exists before inserting
+        # rows directly, mirroring how it's actually created in production
+        # (an analysis is always persisted before it is ever polled here).
+        FailureAnalysisService(db_path=self.db, llama_client=object()).close()
+
+    def tearDown(self):
+        self.ctx.cleanup()
+
+    def test_failure_analysis_written_committed_pushed(self):
+        outbox_rel = "communication/outbox/failure-analysis-abc.md"
+        (self.repo / outbox_rel).write_text("failure analysis\n")
+        _insert_failure_analysis(self.db, "fa1", outbox_rel)
+
+        pub = FailureAnalysisOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
+        try:
+            self.assertEqual(pub.publish_pending(), 1)
+        finally:
+            pub.close()
+
+        row = _get_failure_analysis(self.db, "fa1")
+        self.assertEqual(row["publish_status"], PUBLISH_PUSHED)
+        self.assertTrue(row["publish_commit_sha"])
+        self.assertIsNone(row["publish_last_error"])
+        self.assertEqual(_remote_head(self.remote, outbox_rel), "failure analysis\n")
+        self.assertTrue(git_is_clean(self.repo))
+        # Publishing only ever touches the publish_* / outbox_* columns -
+        # the diagnosis itself is untouched.
+        self.assertEqual(row["category"], "lifecycle_logic")
+        self.assertEqual(row["confidence"], 0.8)
+
+    def test_restart_does_not_republish_an_already_pushed_analysis(self):
+        """Restart/re-polling must not duplicate the outbox message for the
+        same analysis: a row already at PUBLISH_PUSHED is never selected
+        again by fetch_pending, so a second poll produces no new commit."""
+        outbox_rel = "communication/outbox/failure-analysis-pushed.md"
+        (self.repo / outbox_rel).write_text("already pushed\n")
+        _git(["add", "--", outbox_rel], self.repo)
+        _git(["commit", "--no-verify", "-m", "outbox: publish fa-pushed"], self.repo)
+        sha = _git(["rev-parse", "HEAD"], self.repo).stdout.strip()
+        _git(["push", "origin", "HEAD"], self.repo)
+        commits_before = _commit_count(self.repo)
+
+        _insert_failure_analysis(
+            self.db, "fa-pushed", outbox_rel,
+            publish_status=PUBLISH_PUSHED, commit_sha=sha,
+        )
+
+        pub = FailureAnalysisOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
+        try:
+            # publish_pending only selects non-pushed rows; nothing to do.
+            self.assertEqual(pub.publish_pending(), 0)
+        finally:
+            pub.close()
+
+        self.assertEqual(_commit_count(self.repo), commits_before)
+        row = _get_failure_analysis(self.db, "fa-pushed")
+        self.assertEqual(row["publish_status"], PUBLISH_PUSHED)
+        self.assertEqual(row["publish_commit_sha"], sha)
+
+    def test_publish_failure_never_touches_the_analysis_record(self):
+        """AC: 'Outbox publish failure must be logged but must not change
+        the original task/finalization status' - here, the persisted
+        diagnosis itself (category/confidence/etc)."""
+        outbox_rel = "communication/outbox/failure-analysis-retry.md"
+        (self.repo / outbox_rel).write_text("retry body\n")
+        _insert_failure_analysis(
+            self.db, "fa-retry", outbox_rel,
+            category="environment", confidence=0.42,
+        )
+
+        # Break the remote so the push fails.
+        _git(["remote", "set-url", "origin",
+              str(Path(self.ctx.name) / "nonexistent.git")], self.repo)
+
+        pub = FailureAnalysisOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
+        try:
+            self.assertEqual(pub.publish_pending(), 0)
+        finally:
+            pub.close()
+
+        row = _get_failure_analysis(self.db, "fa-retry")
+        self.assertEqual(row["publish_status"], PUBLISH_FAILED)
+        self.assertTrue(row["publish_last_error"])
+        # The diagnosis itself is exactly what was persisted before publishing.
+        self.assertEqual(row["category"], "environment")
+        self.assertEqual(row["confidence"], 0.42)
 
 
 if __name__ == "__main__":

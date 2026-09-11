@@ -194,7 +194,10 @@ class MailboxTaskService:
                 from modules.failure_analysis_service import FailureAnalysisService
 
                 self.failure_analysis_service = FailureAnalysisService(
-                    db_path=self.db_path, log_dir=self._resolve_log_dir()
+                    db_path=self.db_path,
+                    log_dir=self._resolve_log_dir(),
+                    outbox_dir=self.outbox_dir,
+                    repo_root=self.mailbox_repo_path,
                 )
             except Exception:
                 logger.exception("mailbox_task: could not initialize failure analysis service")

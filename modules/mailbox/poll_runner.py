@@ -242,7 +242,7 @@ def run_mailbox_poll_once(
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
-    from modules.outbox_publisher import TaskApprovalOutboxPublisher
+    from modules.outbox_publisher import FailureAnalysisOutboxPublisher, TaskApprovalOutboxPublisher
 
     run_name = threading.current_thread().name
     logger.info("Mailbox poll start run=%s dry_run=%s", run_name, dry_run)
@@ -263,6 +263,7 @@ def run_mailbox_poll_once(
     chain_service = None
     publisher = None
     task_publisher = None
+    failure_analysis_publisher = None
     operations_registry = None
     experiment_service = None
     try:
@@ -293,9 +294,14 @@ def run_mailbox_poll_once(
             db_path=db_path,
             mailbox_config=mailbox_config,
         )
+        failure_analysis_publisher = FailureAnalysisOutboxPublisher(
+            db_path=db_path,
+            mailbox_config=mailbox_config,
+        )
         if not dry_run:
             publisher.publish_pending()
             task_publisher.publish_pending()
+            failure_analysis_publisher.publish_pending()
             processor.retry_pending_git_commits()
             # Prune only after pending commits have been retried: a file
             # still needed to finalize one is protected, and retrying first
@@ -367,6 +373,7 @@ def run_mailbox_poll_once(
                 ("operation_chain_service", chain_service),
                 ("operation_chain_publisher", publisher),
                 ("task_approval_outbox_publisher", task_publisher),
+                ("failure_analysis_outbox_publisher", failure_analysis_publisher),
                 ("operations_registry", operations_registry),
                 ("experiment_service", experiment_service),
             ):
