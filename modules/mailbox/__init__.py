@@ -99,3 +99,11 @@ from modules.failure_analysis_observability import install as _install_failure_a
 
 _install_failure_analysis_observability()
 del _install_failure_analysis_observability
+
+# The package import above happens before configure_logging() in the API and
+# mailbox entry points.  Patch the mailbox service constructor now so it emits
+# the startup feature-status event later, once central logging is active.
+from modules.failure_analysis_startup_observability import install as _install_failure_analysis_startup_observability
+
+_install_failure_analysis_startup_observability()
+del _install_failure_analysis_startup_observability
