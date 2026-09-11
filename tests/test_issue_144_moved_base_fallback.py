@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from modules.experiment_adoption_service import STATUS_ADOPTED, STATUS_FAILED
+from modules.experiment_service import _truncate_text
 from modules.github_work_tracking import GitHubCIVerification
 from modules.task_finalization import TaskFinalizationCoordinator
 from modules.verification_runner import run_verification_test as real_run_verification_test
@@ -92,6 +93,40 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         git(worktree, "add", "--all")
         git(worktree, "commit", "-m", "persist verified experiment source")
         return git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    def _replace_verified_snapshot_with_large_diff(self) -> None:
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
+        worktree = Path(experiment.worktree_path)
+        (worktree / "app.py").write_text(
+            "VALUE = 'large verified diff'\n" + "PAYLOAD = '" + ("x" * 70000) + "'\n",
+            encoding="utf-8",
+        )
+        snapshot = self.fx.adoption_service._capture_snapshot(
+            str(worktree),
+            self.fx.experiment_service.get_experiment_logger(self.experiment_id),
+            phase="test",
+        )
+        truncated = _truncate_text(
+            snapshot["diff_text"],
+            self.fx.experiment_service.max_diff_bytes,
+            label="diff",
+        )
+        self.assertIsNotNone(truncated)
+        self.assertIn("[... diff truncated]", truncated)
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE experiments
+                SET git_status=?, diff_stat=?, diff_text=?
+                WHERE id=?
+                """,
+                (
+                    snapshot["git_status"],
+                    snapshot["diff_stat"],
+                    truncated,
+                    self.experiment_id,
+                ),
+            )
 
     def _advance_main(self) -> str:
         (self.fx.repo / "unrelated.py").write_text("MOVED = True\n", encoding="utf-8")
@@ -245,6 +280,39 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
             )
         )
         self.assertTrue(any(event.get("outcome") == "queued" for event in candidate_events))
+
+    def test_truncated_verified_diff_reaches_moved_base_integration_candidate(self):
+        self._replace_verified_snapshot_with_large_diff()
+        _, source_commit = self._prepare_moved_base(committed_source=True)
+        self.assertIsNotNone(source_commit)
+        coordinator = self._coordinator(max_retries=0)
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
+        self.assertIn("[... diff truncated]", experiment.diff_text)
+        unavailable = self._unavailable_after_base_move()
+
+        with (
+            patch.object(
+                self.fx.github_work_tracking,
+                "wait_for_ci",
+                return_value=unavailable,
+            ),
+            patch(
+                "modules.experiment_adoption_service.run_verification_test",
+                side_effect=real_run_verification_test,
+            ) as local_tests,
+        ):
+            result = coordinator.advance(SimpleNamespace(id="approval-149-large-diff"), experiment)
+            adoption = self.fx.wait_terminal(self.experiment_id)
+
+        self.assertEqual(result.status, "running")
+        self.assertEqual(adoption.status, STATUS_ADOPTED)
+        self.assertEqual(adoption.id, self.adoption_id)
+        self.assertEqual(adoption.stale_retry_attempts, 1)
+        local_tests.assert_called_once()
+        source_events = [
+            event for event in self._events() if event.get("event") == "verified_source_integrity"
+        ]
+        self.assertTrue(any(event.get("outcome") == "accepted" for event in source_events))
 
     def test_actual_mutation_of_committed_verified_source_is_still_rejected(self):
         _, source_commit = self._prepare_moved_base(committed_source=True)
