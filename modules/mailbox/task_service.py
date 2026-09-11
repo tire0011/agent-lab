@@ -177,7 +177,7 @@ class MailboxTaskService:
                 logger.exception("mailbox_task: failed closing failure analysis service")
         self._conn.close()
 
-    def _failure_analysis(self) -> Any | None:
+    def _failure_analysis(self, *, context: str | None = None) -> Any | None:
         """Lazily-built :class:`FailureAnalysisService`, or ``None`` if unavailable (#145).
 
         Diagnosis reuses an already-optional capability: a Nexus deployment
@@ -188,6 +188,12 @@ class MailboxTaskService:
         ``_transition_terminal`` and the finalization subclass), so at most
         one instance - and one lazily-opened SQLite connection to the run
         store - exists per service.
+
+        *context* identifies the originating experiment/task (#150) so an
+        operator can tell, from this log line alone, which lifecycle event
+        went undiagnosed - construction is retried (and re-logged) on every
+        caller until it succeeds, since a transient cause (e.g. an
+        unwritable path) can clear between calls.
         """
         if self.failure_analysis_service is None:
             try:
@@ -200,7 +206,10 @@ class MailboxTaskService:
                     repo_root=self.mailbox_repo_path,
                 )
             except Exception:
-                logger.exception("mailbox_task: could not initialize failure analysis service")
+                logger.exception(
+                    "mailbox_task: could not initialize failure analysis service (%s)",
+                    context or "no context",
+                )
                 return None
         return self.failure_analysis_service
 
@@ -214,8 +223,15 @@ class MailboxTaskService:
         analyzer is reusable beyond the finalization call site it was first
         written for.
         """
-        service = self._failure_analysis()
+        service = self._failure_analysis(
+            context=f"mailbox_task={approval.id} experiment={exp.id}"
+        )
         if service is None:
+            logger.warning(
+                "mailbox_task: failure analysis unavailable for task %s (experiment %s); "
+                "no analysis or analysis_unavailable record will be produced",
+                approval.id, exp.id,
+            )
             return
         try:
             task_log = self._task_logger(approval.id)
@@ -235,7 +251,8 @@ class MailboxTaskService:
             )
         except Exception:
             logger.exception(
-                "mailbox_task: failure analysis errored for task %s", approval.id
+                "mailbox_task: failure analysis errored for task %s (experiment %s)",
+                approval.id, exp.id,
             )
 
     def _resolve_log_dir(self) -> str | Path:

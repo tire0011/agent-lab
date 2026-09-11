@@ -31,8 +31,16 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
         happened - this runs strictly after the terminal state and its
         outbox/problem record are already persisted.
         """
-        service = self._failure_analysis()
+        service = self._failure_analysis(
+            context=f"finalization mailbox_task={approval.id} experiment={exp.id}"
+        )
         if service is None:
+            logger.warning(
+                "mailbox_task: failure analysis unavailable for finalization of "
+                "task %s (experiment %s); no analysis or analysis_unavailable "
+                "record will be produced",
+                approval.id, exp.id,
+            )
             return
         try:
             task_log = self._task_logger(approval.id)
@@ -52,7 +60,9 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
             )
         except Exception:
             logger.exception(
-                "mailbox_task: failure analysis errored for finalization of %s", exp.id
+                "mailbox_task: failure analysis errored for finalization of task %s "
+                "(experiment %s)",
+                approval.id, exp.id,
             )
 
     def poll_running(self) -> None:
