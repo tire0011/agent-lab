@@ -58,6 +58,7 @@ _STRUCTURED_EXTRA_FIELDS = (
     "implementation",
     "outcome",
 )
+_STRING_EXTRA_FIELDS = frozenset({"experiment_id", "mailbox_task_id", "job_id", "session_id"})
 
 
 def _phase_for_logger(logger_name: str) -> str:
@@ -108,7 +109,7 @@ class StructuredJsonlHandler(logging.Handler):
             for field in _STRUCTURED_EXTRA_FIELDS:
                 value = getattr(record, field, None)
                 if value is not None and value != "":
-                    extra[field] = value
+                    extra[field] = str(value) if field in _STRING_EXTRA_FIELDS else value
             # `source` is reserved by the unified Logs API for the coarse
             # mailbox/controller/system classification and is overwritten on
             # read.  Failure-analysis events use it internally for lifecycle
