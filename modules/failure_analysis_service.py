@@ -77,21 +77,6 @@ _LOW_CONFIDENCE_ESCALATION_THRESHOLD = 0.35
 _DEFAULT_ANALYSIS_TIMEOUT_SECONDS = 60.0
 _DEFAULT_MAX_TOKENS = 900
 
-# Additive migration (#148): correlation ids + the shared outbox publish
-# lifecycle columns (see modules.outbox_publisher).
-_FAILURE_ANALYSES_ADDITIVE_COLUMNS = [
-    ("experiment_id", "TEXT"),
-    ("mailbox_task_id", "TEXT"),
-    ("outbox_file", "TEXT"),
-    ("outbox_content", "TEXT"),
-    ("publish_status", "TEXT"),
-    ("publish_commit_sha", "TEXT"),
-    ("publish_pushed_at", "TEXT"),
-    ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
-    ("publish_last_error", "TEXT"),
-    ("updated_at", "TEXT"),
-]
-
 # Fields every structured log entry (see modules.central_logging) carries
 # that are either redundant with the compact rendering below or too
 # large/noisy to hand to the model (raw stdout/stderr, stack traces, the
@@ -594,49 +579,17 @@ class FailureAnalysisService:
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
-        self._ensure_schema()
+        # Schema ownership (#148): the failure_analyses table + its additive
+        # outbox/correlation columns are created centrally by
+        # modules.run_store.schema.init_db() (called just above), the same
+        # place operation_chains/mailbox_task_approvals are created. That
+        # guarantees the table exists before any caller touches it -
+        # including FailureAnalysisOutboxPublisher, which never constructs
+        # a FailureAnalysisService and would otherwise be able to run its
+        # first query against a database where the table was never made.
 
     def close(self) -> None:
         self._conn.close()
-
-    def _ensure_schema(self) -> None:
-        with self._conn:
-            self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS failure_analyses (
-                    id TEXT PRIMARY KEY,
-                    subject_type TEXT NOT NULL,
-                    subject_id TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    model TEXT,
-                    category TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    can_self_recover INTEGER NOT NULL DEFAULT 0,
-                    needs_external_model INTEGER NOT NULL DEFAULT 0,
-                    needs_human INTEGER NOT NULL DEFAULT 0,
-                    analysis_json TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_failure_analyses_subject
-                    ON failure_analyses(subject_type, subject_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_failure_analyses_recent
-                    ON failure_analyses(created_at);
-                """
-            )
-            # Additive migration (#148): outbox publish lifecycle + correlation
-            # columns, added via ALTER TABLE for pre-existing databases created
-            # before this feature existed - same pattern used for
-            # operation_chains / mailbox_task_approvals in run_store/schema.py.
-            existing = {row[1] for row in self._conn.execute("PRAGMA table_info(failure_analyses)")}
-            for column_name, column_type in _FAILURE_ANALYSES_ADDITIVE_COLUMNS:
-                if column_name not in existing:
-                    self._conn.execute(
-                        f"ALTER TABLE failure_analyses ADD COLUMN {column_name} {column_type}"
-                    )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_failure_analyses_mailbox_task "
-                "ON failure_analyses(mailbox_task_id)"
-            )
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -731,9 +684,14 @@ class FailureAnalysisService:
                 experiment_id=experiment_id,
                 mailbox_task_id=mailbox_task_id,
             )
-        self._persist(analysis)
+        persisted = self._persist(analysis)
         self._log(analysis, elog)
-        self._publish_outbox(analysis)
+        # Only publish an outbox notification once the durable record it
+        # points back to actually exists (#148 review): otherwise a DB
+        # write failure could still leave an untracked outbox file with no
+        # corresponding failure_analyses row to publish/track it from.
+        if persisted:
+            self._publish_outbox(analysis)
         return analysis
 
     def analyze_from_logs(
@@ -916,7 +874,15 @@ class FailureAnalysisService:
     # Persistence / visibility
     # ------------------------------------------------------------------
 
-    def _persist(self, analysis: FailureAnalysis) -> None:
+    def _persist(self, analysis: FailureAnalysis) -> bool:
+        """Durably store *analysis*. Returns True on success.
+
+        Never raises - a persistence failure must not break the caller -
+        but the caller (analyze_async) uses the return value to decide
+        whether it is safe to publish an outbox notification: an outbox
+        message that outlives its own DB row would be an untracked orphan
+        with no publish-lifecycle record behind it (#148 review).
+        """
         try:
             with self._conn:
                 self._conn.execute(
@@ -946,11 +912,13 @@ class FailureAnalysisService:
                         analysis.created_at,
                     ),
                 )
+            return True
         except Exception:  # noqa: BLE001 - persistence must never break the caller
             logger.exception(
                 "failure_analysis: could not persist analysis for %s/%s",
                 analysis.subject_type, analysis.subject_id,
             )
+            return False
 
     def _log(self, analysis: FailureAnalysis, elog: Any) -> None:
         if elog is None:

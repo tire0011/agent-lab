@@ -268,6 +268,46 @@ class PublishFailureDoesNotAffectAnalysisTests(unittest.TestCase):
         self.assertIsNone(row["outbox_file"])
         self.assertIsNone(row["publish_status"])
 
+    def test_persist_failure_skips_publish_and_leaves_no_orphan_outbox_file(self):
+        """Regression (#148 review): _publish_outbox must not run when
+        _persist() itself failed - otherwise an outbox file/git-tracked
+        intent could exist with no durable failure_analyses row behind it
+        for the shared publisher to track.
+
+        _persist() is a real DB write wrapped in try/except (see
+        test_write_failure_is_swallowed_and_analysis_is_unaffected above
+        for a genuine DB-level failure elsewhere); here we drive the same
+        "persistence did not succeed" branch directly, since
+        sqlite3.Connection methods cannot be monkeypatched on an instance.
+        """
+        client = _FakeClient(_diagnosis_json(category="lifecycle_logic", confidence=0.9))
+        service = FailureAnalysisService(
+            db_path=str(self.tmp / "agent.db"), llama_client=client, mailbox_config=self.cfg,
+        )
+        self.addCleanup(service.close)
+
+        published = {"called": False}
+
+        def _tracking_publish(analysis):
+            published["called"] = True
+
+        service._publish_outbox = _tracking_publish
+        service._persist = lambda analysis: False  # simulate a persistence failure
+
+        try:
+            analysis = service.analyze(
+                subject_type="mailbox_task", subject_id="exp-7", failure="x",
+                experiment_id="exp-7", mailbox_task_id="task-7",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.fail(f"analyze() must never raise from a persistence failure, got {exc!r}")
+
+        self.assertFalse(published["called"], "_publish_outbox must not run after a failed _persist()")
+        self.assertEqual(_outbox_files(self.cfg.outbox_dir), [])
+        self.assertEqual(analysis.category, "lifecycle_logic")
+        # And genuinely nothing was written to the DB either.
+        self.assertIsNone(service.get(analysis.id))
+
 
 class RenderOutboxContentUnitTests(unittest.TestCase):
     """Direct unit coverage of the content renderer independent of the LLM."""

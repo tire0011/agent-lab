@@ -30,7 +30,6 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from modules.failure_analysis_service import FailureAnalysisService
 from modules.mailbox.config import MailboxConfig
 from modules.mailbox import git_is_clean
 from modules.outbox_publisher import (
@@ -1112,15 +1111,30 @@ class TestFailureAnalysisPublishLifecycle(unittest.TestCase):
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
         self.cfg = _legacy_config(self.repo)
-        # failure_analyses is created lazily by FailureAnalysisService's own
-        # _ensure_schema() (it isn't part of run_store/schema.py's init_db
-        # migrations) - touch it once so the table exists before inserting
-        # rows directly, mirroring how it's actually created in production
-        # (an analysis is always persisted before it is ever polled here).
-        FailureAnalysisService(db_path=self.db, llama_client=object()).close()
+        # Deliberately never construct a FailureAnalysisService here: the
+        # failure_analyses table + its outbox columns must already exist on
+        # any database that only ever went through run_store.init_db()
+        # (#148 review - a real deployment DB can reach the mailbox poller
+        # before any failure analysis has ever run).  init_db() is called
+        # implicitly below by _insert_failure_analysis / the publisher
+        # itself, exercising exactly that path.
 
     def tearDown(self):
         self.ctx.cleanup()
+
+    def test_failure_analysis_table_available_with_no_prior_service_construction(self):
+        """Regression (#148 review): a plain init_db() database - with no
+        FailureAnalysisService ever constructed - must not make the
+        publisher's first query fail with "no such table"."""
+        from modules.run_store import init_db as _init_db
+
+        _init_db(self.db).close()
+
+        pub = FailureAnalysisOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
+        try:
+            self.assertEqual(pub.publish_pending(), 0)
+        finally:
+            pub.close()
 
     def test_failure_analysis_written_committed_pushed(self):
         outbox_rel = "communication/outbox/failure-analysis-abc.md"

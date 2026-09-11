@@ -245,6 +245,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_operations_audit(conn)
     _migrate_operation_chains(conn)
     _migrate_operation_log(conn)
+    _migrate_failure_analyses(conn)
     _migrate_router_tables(conn)
     conn.commit()
     return conn
@@ -537,6 +538,67 @@ def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE operation_chains ADD COLUMN {column_name} {column_type}"
             )
+
+
+# Additive migration (#148): correlation ids + the shared outbox publish
+# lifecycle columns (see modules.outbox_publisher / modules.failure_analysis_service).
+_FAILURE_ANALYSES_ADDITIVE_COLUMNS = [
+    ("experiment_id", "TEXT"),
+    ("mailbox_task_id", "TEXT"),
+    ("outbox_file", "TEXT"),
+    ("outbox_content", "TEXT"),
+    ("publish_status", "TEXT"),
+    ("publish_commit_sha", "TEXT"),
+    ("publish_pushed_at", "TEXT"),
+    ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("publish_last_error", "TEXT"),
+    ("updated_at", "TEXT"),
+]
+
+
+def _migrate_failure_analyses(conn: sqlite3.Connection) -> None:
+    """Create failure_analyses table (idempotent additive migration).
+
+    Owned centrally here (not by FailureAnalysisService itself) so that
+    every caller who only ever goes through init_db() - including
+    FailureAnalysisOutboxPublisher, which never constructs a
+    FailureAnalysisService - can rely on the table existing before it runs
+    a query against it. A publisher that only sees the table via a
+    service-owned lazy CREATE TABLE could hit "no such table" on a real
+    deployment DB where no analysis has ever run yet.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS failure_analyses (
+            id TEXT PRIMARY KEY,
+            subject_type TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT,
+            category TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            can_self_recover INTEGER NOT NULL DEFAULT 0,
+            needs_external_model INTEGER NOT NULL DEFAULT 0,
+            needs_human INTEGER NOT NULL DEFAULT 0,
+            analysis_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_failure_analyses_subject
+            ON failure_analyses(subject_type, subject_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_failure_analyses_recent
+            ON failure_analyses(created_at);
+        """
+    )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(failure_analyses)")}
+    for column_name, column_type in _FAILURE_ANALYSES_ADDITIVE_COLUMNS:
+        if column_name not in existing:
+            conn.execute(
+                f"ALTER TABLE failure_analyses ADD COLUMN {column_name} {column_type}"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_failure_analyses_mailbox_task "
+        "ON failure_analyses(mailbox_task_id)"
+    )
 
 
 def _migrate_router_tables(conn: sqlite3.Connection) -> None:
