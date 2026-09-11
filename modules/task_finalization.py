@@ -21,6 +21,7 @@ from modules.experiment_adoption_service import (
     STATUS_NEEDS_REVIEW,
     STATUS_NOT_STARTED,
     STATUS_QUEUED,
+    ExperimentAdoptionError,
     ExperimentAdoptionService,
     StaleFailureAssessment,
 )
@@ -190,6 +191,13 @@ class TaskFinalizationCoordinator:
                 state.retry_count += 1
                 self._save(state)
             try:
+                # A previous adoption may already have committed the exact
+                # source diff that was verified. For the moved-base fallback,
+                # restore that trusted commit to its original verified diff
+                # shape before the ordinary adoption guard runs. This keeps
+                # verified-source integrity separate from the later
+                # current-base integration candidate (#149).
+                self._prepare_integration_fallback_source(experiment, superseded)
                 # Passing the assessment back is what tells the adoption
                 # service to spend one unit of the evidence budget. An
                 # ordinary retry leaves `superseded` None and so does not
@@ -198,6 +206,15 @@ class TaskFinalizationCoordinator:
                 adoption = self.adoption_service.start_adoption(
                     str(experiment.id), superseded=superseded
                 )
+                if getattr(superseded, "category", None) == "integration_fallback_required":
+                    self._elog(experiment).info(
+                        "finalization",
+                        "integration_candidate",
+                        "Current-base integration candidate was queued after verified source integrity passed",
+                        outcome="queued",
+                        source_commit_sha=getattr(adoption, "experiment_commit_sha", None),
+                        integration_base_sha=self._integration_base_sha(),
+                    )
             except Exception as exc:
                 return self._retry_or_review(state, f"could not start adoption: {exc}")
             state.phase = PHASE_MERGING
@@ -351,6 +368,118 @@ class TaskFinalizationCoordinator:
             original_assessment_detail=getattr(assessment, "detail", None),
         )
         return promoted
+
+    def _prepare_integration_fallback_source(self, experiment: Any, assessment: Any | None) -> None:
+        """Restore a previously committed verified source diff for a moved-base retry.
+
+        The first adoption attempt may have committed the experiment worktree before
+        failing later in integration. The experiment record still stores the verified
+        *pre-commit* git status/stat, so blindly applying the normal start guard to the
+        now-clean worktree incorrectly reports checkpoint tampering. For the explicit
+        moved-base fallback only, prove that the persisted source commit is exactly the
+        verified diff, prove the worktree itself has not changed, then restore that diff
+        shape so the existing adoption guard can independently validate it again.
+        """
+        if getattr(assessment, "category", None) != "integration_fallback_required":
+            return
+
+        experiment_id = str(experiment.id)
+        adoption = self.adoption_service.get(experiment_id)
+        source_sha = str(getattr(adoption, "experiment_commit_sha", "") or "").strip()
+        if not source_sha:
+            # The old attempt never created a source commit. The ordinary guard
+            # must validate the still-uncommitted verified worktree as before.
+            return
+
+        worktree_raw = str(getattr(experiment, "worktree_path", "") or "")
+        worktree = Path(worktree_raw)
+        elog = self._elog(experiment)
+
+        def run_git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", *args],
+                cwd=worktree,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                check=False,
+            )
+
+        def reject(reason: str) -> None:
+            elog.warning(
+                "finalization",
+                "verified_source_integrity",
+                "Persisted verified source commit failed integrity validation",
+                outcome="rejected",
+                source_form="persisted_commit",
+                source_commit_sha=source_sha,
+                reason=reason,
+            )
+            raise ExperimentAdoptionError(
+                "Die Änderungen im Experiment-Worktree haben sich seit der erfolgreichen Prüfung verändert."
+            )
+
+        if not worktree_raw or not worktree.is_dir():
+            reject("experiment worktree is unavailable")
+
+        head = run_git("rev-parse", "HEAD")
+        status = run_git("status", "--porcelain", "--untracked-files=all")
+        if head.returncode != 0 or status.returncode != 0:
+            reject("git could not inspect the persisted source worktree")
+        if head.stdout.strip() != source_sha:
+            reject("worktree HEAD no longer matches the persisted source commit")
+        if status.stdout.strip():
+            reject("worktree contains changes after the persisted source commit")
+
+        parent = run_git("rev-parse", f"{source_sha}^")
+        stat = run_git("diff", f"{source_sha}^", source_sha, "--stat")
+        diff = run_git("diff", f"{source_sha}^", source_sha)
+        if parent.returncode != 0 or stat.returncode != 0 or diff.returncode != 0:
+            reject("persisted source commit cannot be compared with its parent")
+
+        stored_stat = str(getattr(experiment, "diff_stat", "") or "").strip()
+        stored_diff = str(getattr(experiment, "diff_text", "") or "").strip()
+        if stat.stdout.strip() != stored_stat or diff.stdout.strip() != stored_diff:
+            reject("persisted source commit does not equal the verified experiment diff")
+
+        elog.info(
+            "finalization",
+            "verified_source_integrity",
+            "Persisted source commit exactly matches the verified experiment diff",
+            outcome="accepted",
+            source_form="persisted_commit",
+            source_commit_sha=source_sha,
+        )
+
+        reset = run_git("reset", "--mixed", parent.stdout.strip())
+        if reset.returncode != 0:
+            reject("verified source commit could not be restored to its pre-commit diff")
+
+        # Prove the restoration itself produced exactly the snapshot expected by
+        # ExperimentAdoptionService._validate_startable. If not, put HEAD back so
+        # this compatibility step never leaves a half-restored source behind.
+        restored_status = run_git("status", "--short", "--untracked-files=all")
+        restored_stat = run_git("diff", "--stat", "HEAD")
+        stored_status = str(getattr(experiment, "git_status", "") or "").strip()
+        if (
+            restored_status.returncode != 0
+            or restored_stat.returncode != 0
+            or restored_status.stdout.strip() != stored_status
+            or restored_stat.stdout.strip() != stored_stat
+        ):
+            run_git("reset", "--hard", source_sha)
+            reject("restored source no longer matches the verified worktree snapshot")
+
+    def _integration_base_sha(self) -> str | None:
+        resolver = getattr(self.adoption_service, "_integration_base_sha", None)
+        if resolver is None:
+            return None
+        try:
+            value = resolver()
+        except Exception:  # noqa: BLE001 - diagnostics must not break finalization
+            return None
+        return str(value or "").strip() or None
 
     def _retry_or_review(
         self,
