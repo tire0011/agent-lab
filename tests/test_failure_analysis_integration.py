@@ -25,7 +25,13 @@ from modules.mailbox.task_service import (
     _STATUS_NEEDS_REVIEW,
     _STATUS_SUCCEEDED,
 )
-from modules.task_finalization import FinalizationResult, PHASE_NEEDS_REVIEW, PHASE_SUCCEEDED
+from modules.task_finalization import (
+    FinalizationResult,
+    PHASE_NEEDS_REVIEW,
+    PHASE_SUCCEEDED,
+    TaskFinalizationCoordinator,
+)
+from modules.experiment_adoption_service import STATUS_NOT_STARTED
 
 
 def _make_exp(id="exp1", status="queued", test_exit_code=None, diff_stat=None, error=None):
@@ -293,6 +299,128 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
 
         self.assertEqual(svc.get(approval.id).status, _STATUS_NEEDS_REVIEW)
         self.assertTrue(list((self.tmp / "outbox").glob("*.md")))
+
+
+class _RaisingAdoptionService:
+    """Always fails to start adoption, like a worktree-integrity mismatch (#150)."""
+
+    def __init__(self, error: str):
+        self.error = error
+        self.starts = 0
+
+    def get(self, experiment_id):
+        return SimpleNamespace(
+            status=STATUS_NOT_STARTED,
+            reason=None,
+            integrated_commit_sha=None,
+            local_sync_pending=False,
+        )
+
+    def start_adoption(self, experiment_id, *, superseded=None):
+        self.starts += 1
+        raise RuntimeError(self.error)
+
+
+class FinalizationResumedRecoveryIntegrationTests(unittest.TestCase):
+    """A finalization needing review after resuming across a process restart (#150).
+
+    The other ``FinalizationFailureIntegrationTests`` inject a
+    ``FinalizationResult`` directly, exercising only the direct terminal
+    transition. Production finalization instead accumulates retries across
+    repeated ``advance()`` calls (a real ``TaskFinalizationCoordinator``,
+    not a mock), and a process restart mid-finalization rebuilds both the
+    ``FinalizingMailboxTaskService`` and its ``TaskFinalizationCoordinator``
+    from the persisted ``task_finalizations`` row rather than reusing the
+    original in-memory objects. This exercises that whole resumed path -
+    matching the issue's concrete reproduction (adoption repeatedly failing
+    with "could not start adoption: ...") - end to end into the analyzer.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db_path = str(self.tmp / "nexus.db")
+
+    def _service(self, *, finalization_coordinator, failure_analysis_service):
+        exp = _make_exp(id="experiment-1", status="succeeded", test_exit_code=0)
+        exp.quality_evaluation = {"outcome": "pass"}
+        exp_service = MagicMock()
+        exp_service.get_experiment.return_value = exp
+        github = MagicMock()
+        return MailboxTaskService(
+            db_path=self.db_path,
+            experiment_service=exp_service,
+            outbox_dir=str(self.tmp / "outbox"),
+            repo_path=str(self.tmp),
+            operations_registry=MagicMock(),
+            github_work_tracking=github,
+            task_log_dir=str(self.tmp / "logs"),
+            failure_analysis_service=failure_analysis_service,
+            finalization_coordinator=finalization_coordinator,
+        ), exp
+
+    def _coordinator(self, adoption_service, *, max_retries):
+        return TaskFinalizationCoordinator(
+            experiment_service=MagicMock(),
+            github_work_tracking=MagicMock(),
+            db_path=self.db_path,
+            repo_root=str(self.tmp),
+            adoption_service=adoption_service,
+            restart_runner=lambda services: None,
+            live_validator=lambda approval, experiment: {"summary": "live ok"},
+            max_retries=max_retries,
+        )
+
+    def test_needs_review_after_restart_mid_finalization_triggers_analysis(self):
+        error = "could not start adoption: worktree changed since verification"
+
+        # First process: one failed adoption attempt, then it "restarts"
+        # before retries are exhausted, exactly as a deploy-triggered
+        # restart would interrupt finalization mid-retry.
+        coordinator_1 = self._coordinator(_RaisingAdoptionService(error), max_retries=1)
+        svc_1, exp = self._service(
+            finalization_coordinator=coordinator_1, failure_analysis_service=MagicMock()
+        )
+        message = svc_1._conn.execute(
+            """INSERT INTO mailbox_messages
+               (file_path, source_commit_sha, msg_type, created_by, status, received_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("/tmp/task.md", "abc", "task", "tester", "done", "2026-09-11T00:00:00Z"),
+        )
+        approval = svc_1.create_approval(
+            message.lastrowid, "Add --version", "tester", "/tmp/task.md", "2026-09-11T00:00:00Z",
+        )
+        with svc_1._conn:
+            svc_1._conn.execute(
+                "UPDATE mailbox_task_approvals SET status=?, experiment_id=? WHERE id=?",
+                ("running", exp.id, approval.id),
+            )
+
+        svc_1.poll_running()  # first attempt: adoption fails, retry budget not yet exhausted
+
+        self.assertEqual(svc_1.get(approval.id).status, "running")
+        coordinator_1.close()
+        svc_1.close()
+
+        # Second process: a fresh service and a fresh coordinator, resuming
+        # purely from the persisted db_path - nothing in-memory carries over.
+        analyzer = MagicMock()
+        coordinator_2 = self._coordinator(_RaisingAdoptionService(error), max_retries=1)
+        svc_2, exp_2 = self._service(
+            finalization_coordinator=coordinator_2, failure_analysis_service=analyzer
+        )
+        self.addCleanup(coordinator_2.close)
+        self.addCleanup(svc_2.close)
+
+        svc_2.poll_running()  # second attempt: retry budget now exhausted -> needs_review
+
+        self.assertEqual(svc_2.get(approval.id).status, _STATUS_NEEDS_REVIEW)
+        analyzer.analyze_from_logs.assert_called_once()
+        kwargs = analyzer.analyze_from_logs.call_args.kwargs
+        self.assertEqual(kwargs["subject_type"], "task_finalization")
+        self.assertEqual(kwargs["experiment_id"], "experiment-1")
+        self.assertEqual(kwargs["mailbox_task_id"], approval.id)
+        self.assertEqual(kwargs["failure"]["status"], "needs_review")
+        self.assertIn("could not start adoption", kwargs["failure"]["reason"])
 
 
 if __name__ == "__main__":
