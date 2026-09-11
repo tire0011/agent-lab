@@ -51,7 +51,7 @@ _STRUCTURED_EXTRA_FIELDS = (
     "reason",
     "duration_ms",
     "persistence_outcome",
-    "source",
+    "lifecycle_source",
     "failure_analysis_requested",
     "configured",
     "importable",
@@ -109,6 +109,14 @@ class StructuredJsonlHandler(logging.Handler):
                 value = getattr(record, field, None)
                 if value is not None and value != "":
                     extra[field] = value
+            # `source` is reserved by the unified Logs API for the coarse
+            # mailbox/controller/system classification and is overwritten on
+            # read.  Failure-analysis events use it internally for lifecycle
+            # origin (e.g. recovery), so preserve that value under a name the
+            # Logs API will not replace.
+            lifecycle_source = getattr(record, "source", None)
+            if lifecycle_source is not None and lifecycle_source != "":
+                extra["lifecycle_source"] = lifecycle_source
             exc = record.exc_info[1] if record.exc_info else None
             if level == "ERROR":
                 self._structured.error(phase, event, record.getMessage(), exc=exc, **extra)
