@@ -1,13 +1,16 @@
-"""Regression tests for Issue #144 moved-target-base stale adoption recovery."""
+"""Regression tests for Issue #144/#149 moved-target-base stale adoption recovery."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from modules.experiment_adoption_service import STATUS_ADOPTED, STATUS_FAILED
+from modules.experiment_service import _truncate_text
 from modules.github_work_tracking import GitHubCIVerification
 from modules.task_finalization import TaskFinalizationCoordinator
 from modules.verification_runner import run_verification_test as real_run_verification_test
@@ -53,24 +56,75 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
             ),
         )
 
-    def _historical_timeout(self, *, test_exit_code=None) -> None:
+    def _historical_timeout(
+        self,
+        *,
+        test_exit_code=None,
+        experiment_commit_sha="d757a26a8778135bacf7c1008f9db0eda1e127a1",
+        actual_files=None,
+    ) -> None:
+        files = actual_files or ["app.py"]
         with sqlite3.connect(self.fx.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO experiment_adoptions (
                     id, experiment_id, status, experiment_commit_sha,
-                    target_branch, test_exit_code, test_output, reason,
+                    target_branch, actual_files_json, expected_files_json,
+                    test_exit_code, test_output, reason,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'main', ?, ?, ?, 't', 't')
+                ) VALUES (?, ?, ?, ?, 'main', ?, ?, ?, ?, ?, 't', 't')
                 """,
                 (
                     self.adoption_id,
                     self.experiment_id,
                     STATUS_FAILED,
-                    "d757a26a8778135bacf7c1008f9db0eda1e127a1",
+                    experiment_commit_sha,
+                    json.dumps(files),
+                    json.dumps(files),
                     test_exit_code,
                     "[test command timed out]" if test_exit_code is None else "FAILED",
                     _TIMEOUT_REASON,
+                ),
+            )
+
+    def _commit_verified_source(self) -> str:
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
+        worktree = Path(experiment.worktree_path)
+        git(worktree, "add", "--all")
+        git(worktree, "commit", "-m", "persist verified experiment source")
+        return git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    def _replace_verified_snapshot_with_large_diff(self) -> None:
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
+        worktree = Path(experiment.worktree_path)
+        (worktree / "app.py").write_text(
+            "VALUE = 'large verified diff'\n" + "PAYLOAD = '" + ("x" * 70000) + "'\n",
+            encoding="utf-8",
+        )
+        snapshot = self.fx.adoption_service._capture_snapshot(
+            str(worktree),
+            self.fx.experiment_service.get_experiment_logger(self.experiment_id),
+            phase="test",
+        )
+        truncated = _truncate_text(
+            snapshot["diff_text"],
+            self.fx.experiment_service.max_diff_bytes,
+            label="diff",
+        )
+        self.assertIsNotNone(truncated)
+        self.assertIn("[... diff truncated]", truncated)
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE experiments
+                SET git_status=?, diff_stat=?, diff_text=?
+                WHERE id=?
+                """,
+                (
+                    snapshot["git_status"],
+                    snapshot["diff_stat"],
+                    truncated,
+                    self.experiment_id,
                 ),
             )
 
@@ -82,7 +136,7 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         git(self.fx.repo, "fetch", "origin", "main")
         return git(self.fx.repo, "rev-parse", "origin/main").stdout.strip()
 
-    def _coordinator(self) -> TaskFinalizationCoordinator:
+    def _coordinator(self, *, max_retries: int = 2) -> TaskFinalizationCoordinator:
         coordinator = TaskFinalizationCoordinator(
             experiment_service=self.fx.experiment_service,
             github_work_tracking=self.fx.github_work_tracking,
@@ -91,12 +145,16 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
             adoption_service=self.fx.adoption_service,
             restart_runner=lambda services: None,
             live_validator=lambda approval, experiment: {"summary": "ok"},
+            max_retries=max_retries,
         )
         self.addCleanup(coordinator.close)
         return coordinator
 
-    def _prepare_moved_base(self) -> str:
-        self._historical_timeout()
+    def _prepare_moved_base(self, *, committed_source: bool = False) -> tuple[str, str | None]:
+        source_commit = self._commit_verified_source() if committed_source else None
+        self._historical_timeout(
+            experiment_commit_sha=source_commit or "d757a26a8778135bacf7c1008f9db0eda1e127a1"
+        )
         stored = self.fx.github_work_tracking.record_ci_verification(
             self._green(),
             experiment_id=self.experiment_id,
@@ -105,10 +163,18 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         self.assertTrue(stored)
         new_base = self._advance_main()
         self.assertNotEqual(self.old_base, new_base)
-        return new_base
+        return new_base, source_commit
+
+    def _events(self) -> list[dict]:
+        events: list[dict] = []
+        for path in self.fx.logs.glob("*.jsonl"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    events.append(json.loads(line))
+        return events
 
     def test_moved_base_is_integration_fallback_not_no_ci_evidence(self):
-        new_base = self._prepare_moved_base()
+        new_base, _ = self._prepare_moved_base()
         coordinator = self._coordinator()
 
         with patch.object(
@@ -170,6 +236,109 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["adoption_id"], self.adoption_id)
         self.assertIn("current integration base", history[0]["superseded_by"])
+
+    def test_committed_verified_source_reaches_moved_base_integration_candidate(self):
+        _, source_commit = self._prepare_moved_base(committed_source=True)
+        self.assertIsNotNone(source_commit)
+        coordinator = self._coordinator(max_retries=0)
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
+        unavailable = self._unavailable_after_base_move()
+
+        with (
+            patch.object(
+                self.fx.github_work_tracking,
+                "wait_for_ci",
+                return_value=unavailable,
+            ),
+            patch(
+                "modules.experiment_adoption_service.run_verification_test",
+                side_effect=real_run_verification_test,
+            ) as local_tests,
+        ):
+            result = coordinator.advance(SimpleNamespace(id="approval-149"), experiment)
+            adoption = self.fx.wait_terminal(self.experiment_id)
+
+        self.assertEqual(result.status, "running")
+        self.assertEqual(adoption.status, STATUS_ADOPTED)
+        self.assertEqual(adoption.id, self.adoption_id)
+        self.assertEqual(adoption.stale_retry_attempts, 1)
+        local_tests.assert_called_once()
+
+        history = self.fx.adoption_service.failure_history(self.experiment_id)
+        self.assertEqual(history[0]["experiment_commit_sha"], source_commit)
+        events = self._events()
+        source_events = [event for event in events if event.get("event") == "verified_source_integrity"]
+        candidate_events = [event for event in events if event.get("event") == "integration_candidate"]
+        self.assertTrue(source_events)
+        self.assertTrue(candidate_events)
+        self.assertTrue(
+            any(
+                event.get("source_form") == "persisted_commit"
+                and event.get("outcome") == "accepted"
+                and event.get("source_commit_sha") == source_commit
+                for event in source_events
+            )
+        )
+        self.assertTrue(any(event.get("outcome") == "queued" for event in candidate_events))
+
+    def test_truncated_verified_diff_reaches_moved_base_integration_candidate(self):
+        self._replace_verified_snapshot_with_large_diff()
+        _, source_commit = self._prepare_moved_base(committed_source=True)
+        self.assertIsNotNone(source_commit)
+        coordinator = self._coordinator(max_retries=0)
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
+        self.assertIn("[... diff truncated]", experiment.diff_text)
+        unavailable = self._unavailable_after_base_move()
+
+        with (
+            patch.object(
+                self.fx.github_work_tracking,
+                "wait_for_ci",
+                return_value=unavailable,
+            ),
+            patch(
+                "modules.experiment_adoption_service.run_verification_test",
+                side_effect=real_run_verification_test,
+            ) as local_tests,
+        ):
+            result = coordinator.advance(SimpleNamespace(id="approval-149-large-diff"), experiment)
+            adoption = self.fx.wait_terminal(self.experiment_id)
+
+        self.assertEqual(result.status, "running")
+        self.assertEqual(adoption.status, STATUS_ADOPTED)
+        self.assertEqual(adoption.id, self.adoption_id)
+        self.assertEqual(adoption.stale_retry_attempts, 1)
+        local_tests.assert_called_once()
+        source_events = [
+            event for event in self._events() if event.get("event") == "verified_source_integrity"
+        ]
+        self.assertTrue(any(event.get("outcome") == "accepted" for event in source_events))
+
+    def test_actual_mutation_of_committed_verified_source_is_still_rejected(self):
+        _, source_commit = self._prepare_moved_base(committed_source=True)
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
+        worktree = Path(experiment.worktree_path)
+        (worktree / "app.py").write_text("VALUE = 'tampered after verification'\n", encoding="utf-8")
+
+        coordinator = self._coordinator(max_retries=0)
+        with patch.object(
+            self.fx.github_work_tracking,
+            "wait_for_ci",
+            return_value=self._unavailable_after_base_move(),
+        ):
+            result = coordinator.advance(SimpleNamespace(id="approval-149-tampered"), experiment)
+
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("seit der erfolgreichen Prüfung verändert", result.summary)
+        self.assertEqual(
+            git(worktree, "rev-parse", "HEAD").stdout.strip(),
+            source_commit,
+        )
+        self.assertIn("tampered", (worktree / "app.py").read_text(encoding="utf-8"))
+        source_events = [
+            event for event in self._events() if event.get("event") == "verified_source_integrity"
+        ]
+        self.assertTrue(any(event.get("outcome") == "rejected" for event in source_events))
 
     def test_real_test_verdict_is_not_reopened_by_persisted_green_ci(self):
         self._historical_timeout(test_exit_code=1)
