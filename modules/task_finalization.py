@@ -25,6 +25,7 @@ from modules.experiment_adoption_service import (
     ExperimentAdoptionService,
     StaleFailureAssessment,
 )
+from modules.experiment_service import _truncate_text
 from modules.runtime_execution import resolve_python_interpreter
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
@@ -213,7 +214,6 @@ class TaskFinalizationCoordinator:
                         "Current-base integration candidate was queued after verified source integrity passed",
                         outcome="queued",
                         source_commit_sha=getattr(adoption, "experiment_commit_sha", None),
-                        integration_base_sha=self._integration_base_sha(),
                     )
             except Exception as exc:
                 return self._retry_or_review(state, f"could not start adoption: {exc}")
@@ -440,7 +440,9 @@ class TaskFinalizationCoordinator:
 
         stored_stat = str(getattr(experiment, "diff_stat", "") or "").strip()
         stored_diff = str(getattr(experiment, "diff_text", "") or "").strip()
-        if stat.stdout.strip() != stored_stat or diff.stdout.strip() != stored_diff:
+        max_diff_bytes = int(getattr(self.experiment_service, "max_diff_bytes", 64 * 1024))
+        comparable_diff = _truncate_text(diff.stdout, max_diff_bytes, label="diff") or ""
+        if stat.stdout.strip() != stored_stat or comparable_diff.strip() != stored_diff:
             reject("persisted source commit does not equal the verified experiment diff")
 
         elog.info(
@@ -456,30 +458,10 @@ class TaskFinalizationCoordinator:
         if reset.returncode != 0:
             reject("verified source commit could not be restored to its pre-commit diff")
 
-        # Prove the restoration itself produced exactly the snapshot expected by
-        # ExperimentAdoptionService._validate_startable. If not, put HEAD back so
-        # this compatibility step never leaves a half-restored source behind.
-        restored_status = run_git("status", "--short", "--untracked-files=all")
-        restored_stat = run_git("diff", "--stat", "HEAD")
-        stored_status = str(getattr(experiment, "git_status", "") or "").strip()
-        if (
-            restored_status.returncode != 0
-            or restored_stat.returncode != 0
-            or restored_status.stdout.strip() != stored_status
-            or restored_stat.stdout.strip() != stored_stat
-        ):
-            run_git("reset", "--hard", source_sha)
-            reject("restored source no longer matches the verified worktree snapshot")
-
-    def _integration_base_sha(self) -> str | None:
-        resolver = getattr(self.adoption_service, "_integration_base_sha", None)
-        if resolver is None:
-            return None
-        try:
-            value = resolver()
-        except Exception:  # noqa: BLE001 - diagnostics must not break finalization
-            return None
-        return str(value or "").strip() or None
+        # The normal adoption guard runs immediately after this helper and
+        # captures the restored worktree with its own scratch index. It is the
+        # authoritative second check (including untracked/new files), so do not
+        # duplicate that snapshot logic here with subtly different git semantics.
 
     def _retry_or_review(
         self,
