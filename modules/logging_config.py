@@ -28,6 +28,37 @@ _LOGGER_PHASE_PREFIXES = (
     ("modules.mailbox", "mailbox"),
 )
 
+# Explicitly allow diagnostic correlation fields from stdlib LogRecords into
+# the unified JSONL feed.  Keeping an allow-list avoids accidentally copying
+# arbitrary record attributes, prompts, credentials, or raw model output.
+_STRUCTURED_EXTRA_FIELDS = (
+    "experiment_id",
+    "mailbox_task_id",
+    "job_id",
+    "session_id",
+    "approval_id",
+    "subject_type",
+    "subject_id",
+    "analysis_id",
+    "lifecycle_phase",
+    "call_site",
+    "analyzer_provider",
+    "analyzer_model",
+    "db_identity",
+    "log_directory",
+    "service_newly_created",
+    "service_reused",
+    "reason",
+    "duration_ms",
+    "persistence_outcome",
+    "source",
+    "failure_analysis_requested",
+    "configured",
+    "importable",
+    "implementation",
+    "outcome",
+)
+
 
 def _phase_for_logger(logger_name: str) -> str:
     """Coarse phase for a stdlib log record, from its logger name."""
@@ -74,10 +105,10 @@ class StructuredJsonlHandler(logging.Handler):
             )
             event = str(getattr(record, "event", "") or record.funcName or "log")
             extra: dict[str, Any] = {}
-            for field in ("experiment_id", "mailbox_task_id", "job_id", "session_id"):
+            for field in _STRUCTURED_EXTRA_FIELDS:
                 value = getattr(record, field, None)
-                if value:
-                    extra[field] = str(value)
+                if value is not None and value != "":
+                    extra[field] = value
             exc = record.exc_info[1] if record.exc_info else None
             if level == "ERROR":
                 self._structured.error(phase, event, record.getMessage(), exc=exc, **extra)
