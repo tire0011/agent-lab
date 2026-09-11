@@ -9,11 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from modules.experiment_adoption_service import (
-    STATUS_ADOPTED,
-    STATUS_FAILED,
-    ExperimentAdoptionError,
-)
+from modules.experiment_adoption_service import STATUS_ADOPTED, STATUS_FAILED
 from modules.github_work_tracking import GitHubCIVerification
 from modules.task_finalization import TaskFinalizationCoordinator
 from modules.verification_runner import run_verification_test as real_run_verification_test
@@ -105,7 +101,7 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         git(self.fx.repo, "fetch", "origin", "main")
         return git(self.fx.repo, "rev-parse", "origin/main").stdout.strip()
 
-    def _coordinator(self) -> TaskFinalizationCoordinator:
+    def _coordinator(self, *, max_retries: int = 2) -> TaskFinalizationCoordinator:
         coordinator = TaskFinalizationCoordinator(
             experiment_service=self.fx.experiment_service,
             github_work_tracking=self.fx.github_work_tracking,
@@ -114,13 +110,16 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
             adoption_service=self.fx.adoption_service,
             restart_runner=lambda services: None,
             live_validator=lambda approval, experiment: {"summary": "ok"},
+            max_retries=max_retries,
         )
         self.addCleanup(coordinator.close)
         return coordinator
 
     def _prepare_moved_base(self, *, committed_source: bool = False) -> tuple[str, str | None]:
         source_commit = self._commit_verified_source() if committed_source else None
-        self._historical_timeout(experiment_commit_sha=source_commit or "d757a26a8778135bacf7c1008f9db0eda1e127a1")
+        self._historical_timeout(
+            experiment_commit_sha=source_commit or "d757a26a8778135bacf7c1008f9db0eda1e127a1"
+        )
         stored = self.fx.github_work_tracking.record_ci_verification(
             self._green(),
             experiment_id=self.experiment_id,
@@ -206,16 +205,9 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
     def test_committed_verified_source_reaches_moved_base_integration_candidate(self):
         _, source_commit = self._prepare_moved_base(committed_source=True)
         self.assertIsNotNone(source_commit)
-        coordinator = self._coordinator()
+        coordinator = self._coordinator(max_retries=0)
+        experiment = self.fx.experiment_service.get_experiment(self.experiment_id)
         unavailable = self._unavailable_after_base_move()
-
-        with patch.object(
-            self.fx.github_work_tracking,
-            "wait_for_ci",
-            return_value=unavailable,
-        ):
-            assessment = coordinator._failure_assessment(SimpleNamespace(id=self.experiment_id))
-        self.assertTrue(assessment.retryable)
 
         with (
             patch.object(
@@ -228,24 +220,31 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):
-            self.fx.adoption_service.start_adoption(
-                self.experiment_id,
-                superseded=assessment,
-            )
+            result = coordinator.advance(SimpleNamespace(id="approval-149"), experiment)
             adoption = self.fx.wait_terminal(self.experiment_id)
 
+        self.assertEqual(result.status, "running")
         self.assertEqual(adoption.status, STATUS_ADOPTED)
         self.assertEqual(adoption.id, self.adoption_id)
-        self.assertEqual(adoption.experiment_commit_sha, source_commit)
+        self.assertEqual(adoption.stale_retry_attempts, 1)
         local_tests.assert_called_once()
 
+        history = self.fx.adoption_service.failure_history(self.experiment_id)
+        self.assertEqual(history[0]["experiment_commit_sha"], source_commit)
         events = self._events()
         source_events = [event for event in events if event.get("event") == "verified_source_integrity"]
         candidate_events = [event for event in events if event.get("event") == "integration_candidate"]
         self.assertTrue(source_events)
         self.assertTrue(candidate_events)
-        self.assertTrue(any(event.get("source_form") == "persisted_commit" for event in source_events))
-        self.assertTrue(any(event.get("outcome") == "prepared" for event in candidate_events))
+        self.assertTrue(
+            any(
+                event.get("source_form") == "persisted_commit"
+                and event.get("outcome") == "accepted"
+                and event.get("source_commit_sha") == source_commit
+                for event in source_events
+            )
+        )
+        self.assertTrue(any(event.get("outcome") == "queued" for event in candidate_events))
 
     def test_actual_mutation_of_committed_verified_source_is_still_rejected(self):
         _, source_commit = self._prepare_moved_base(committed_source=True)
@@ -253,25 +252,25 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
         worktree = Path(experiment.worktree_path)
         (worktree / "app.py").write_text("VALUE = 'tampered after verification'\n", encoding="utf-8")
 
-        coordinator = self._coordinator()
+        coordinator = self._coordinator(max_retries=0)
         with patch.object(
             self.fx.github_work_tracking,
             "wait_for_ci",
             return_value=self._unavailable_after_base_move(),
         ):
-            assessment = coordinator._failure_assessment(SimpleNamespace(id=self.experiment_id))
-        self.assertTrue(assessment.retryable)
+            result = coordinator.advance(SimpleNamespace(id="approval-149-tampered"), experiment)
 
-        with self.assertRaisesRegex(ExperimentAdoptionError, "seit der erfolgreichen Prüfung verändert"):
-            self.fx.adoption_service.start_adoption(
-                self.experiment_id,
-                superseded=assessment,
-            )
-
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("seit der erfolgreichen Prüfung verändert", result.summary)
         self.assertEqual(
             git(worktree, "rev-parse", "HEAD").stdout.strip(),
             source_commit,
         )
+        self.assertIn("tampered", (worktree / "app.py").read_text(encoding="utf-8"))
+        source_events = [
+            event for event in self._events() if event.get("event") == "verified_source_integrity"
+        ]
+        self.assertTrue(any(event.get("outcome") == "rejected" for event in source_events))
 
     def test_real_test_verdict_is_not_reopened_by_persisted_green_ci(self):
         self._historical_timeout(test_exit_code=1)
