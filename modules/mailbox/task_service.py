@@ -24,19 +24,18 @@ from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrac
 from .development import process_command
 from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 from modules.run_store import DEFAULT_DB_PATH, init_db
-from modules.task_orchestrator import (
-    ACTION_ANSWER,
-    ACTION_CLARIFICATION,
-    ACTION_COMMAND,
-    ACTION_MISSING_CAPABILITY,
-    ACTION_NEW_EXPERIMENT,
-    ACTION_RESUME_EXPERIMENT,
-    NexusTaskOrchestrator,
-    TaskDecision,
-)
+# ``modules.task_orchestrator`` is imported lazily, not here. It imports
+# ``modules.mailbox.development``, which runs this package's ``__init__`` and
+# comes straight back to this module - so importing the orchestrator *first*
+# raised `ImportError: cannot import name 'ACTION_ANSWER' from partially
+# initialized module`. The cycle made whole test files uncollectable and left
+# `import modules.task_orchestrator` working only when something happened to
+# import the mailbox package before it. Annotations are already lazy here
+# (`from __future__ import annotations`), so only the runtime uses need it.
 
 if TYPE_CHECKING:
     from modules.experiment_service import ExperimentService
+    from modules.task_orchestrator import TaskDecision
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +149,11 @@ class MailboxTaskService:
             )
         self.operations_registry = operations_registry
         self._owns_operations_registry = owns_registry
-        self._orchestrator_factory = orchestrator_factory or NexusTaskOrchestrator
+        if orchestrator_factory is None:
+            from modules.task_orchestrator import NexusTaskOrchestrator
+
+            orchestrator_factory = NexusTaskOrchestrator
+        self._orchestrator_factory = orchestrator_factory
         self.github_work_tracking = github_work_tracking or GitHubWorkTrackingService(
             db_path=db_path,
             repo_root=str(self.repo_path),
@@ -491,6 +494,15 @@ class MailboxTaskService:
         approval: MailboxTaskApproval,
         decision: TaskDecision,
     ) -> None:
+        from modules.task_orchestrator import (
+            ACTION_ANSWER,
+            ACTION_CLARIFICATION,
+            ACTION_COMMAND,
+            ACTION_MISSING_CAPABILITY,
+            ACTION_NEW_EXPERIMENT,
+            ACTION_RESUME_EXPERIMENT,
+        )
+
         if decision.action == ACTION_NEW_EXPERIMENT:
             self._start_new_experiment(approval)
         elif decision.action == ACTION_RESUME_EXPERIMENT:
