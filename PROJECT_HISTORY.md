@@ -732,3 +732,19 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 17. **Project-memory experiment:** retrieve only relevant history and measure idea relevance, repetition, prompt size, and task success.
 18. **Mandatory GitHub lifecycle measurement:** verify reuse/resume/conflict/provider-failure behavior across multiple experiments on one Issue/branch/PR.
 19. **Source-context hygiene experiment:** run Issue #74 on a small module set and compare context reduction against readability and unchanged behavior.
+
+## 2026-09-12 follow-up: PR #157 merged and the autonomy prerequisites moved from proposal to code
+
+PR #157 merged into `main` after the corrected pytest workflow reached **1,508 passed, 71 skipped in 2m37s**. The adoption guard now compares the semantic Git tree that would be integrated with the verified checkpoint rather than comparing dirty/clean worktree presentation. The repository also now contains the persisted initiative tick and its 15-minute timer, but the timer intentionally ships **disabled** until a complete manual adoption -> merge -> deploy -> live-validation cycle succeeds once. The CI migration ultimately exposed **147 previously uncollected tests across eight files**, contradictory stale expectations, and an operation-chain outbox test whose default `/agent` dependency revealed that a swallowed publication exception can let a chain report completed even when its outbox result vanished; that production-risk follow-up is tracked in Issue #158.
+
+This supersedes the earlier section 95 status that described PR #157 as a red draft. The remaining acceptance target is no longer “get #157 green”; it is to deploy current `main` and prove the first complete lifecycle E2E before enabling autonomous initiative.
+
+**Lesson:** test discovery is part of the specification. An unexecuted test is not neutral; it can preserve false or contradictory expectations while CI still reports green.
+
+## 2026-09-12 follow-up: Issue #158 captured structural simplification targets rather than new lifecycle rules
+
+The autonomy diagnosis also produced Issue #158 with architectural work that deliberately did **not** block PR #157. A captured controller turn showed a 7,415-character prompt exceeding a host-memory-derived safe local budget of 4,784 characters and escalating to `codex_readonly`, strengthening the hypothesis that the current role split may assign the hardest orchestration work to the weakest model while frequently bypassing it in real sessions. The agreed direction is to measure local-versus-escalated controller usage before changing roles.
+
+Issue #158 also records four broader debts: the long serial lifecycle should be simplified only after one green E2E proves which stages earn their existence; plan safety still relies partly on brittle prose substring checks and should move toward behavioral invariants; long-running work has no explicit heartbeat, so liveness is inferred with a coarse staleness window and zombie rows remain possible; and tests must be hermetic so no suite execution can reach a real paid provider. More than one autonomously initiated item per tick should wait for explicit claim/heartbeat semantics.
+
+**Lesson:** after repeated recovery fixes, the next architectural improvement may be subtraction. Measure which stages, model roles, and policy layers contribute value before adding more lifecycle semantics.
