@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Nexus initiative tick every 15 minutes
+
+[Timer]
+# Deliberately slower than the mailbox poll: a tick starts real work, and one
+# item at a time is the point. The service is a no-op while anything is running.
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=nexus-tick.service
+
+[Install]
+WantedBy=timers.target

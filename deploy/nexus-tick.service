@@ -1,0 +1,19 @@
+[Unit]
+Description=Nexus initiative tick (decide and start one piece of Nexus's own work)
+After=network.target agent-api.service
+
+[Service]
+Type=oneshot
+User=agent
+WorkingDirectory=/agent
+StateDirectory=nexus
+EnvironmentFile=/etc/agent-lab/agent.env
+Environment=AGENT_DB_PATH=/var/lib/nexus/agent.db
+# Start conservatively: drain verified-but-unintegrated work only. Drop the
+# flag once a full self-started cycle has been observed end to end.
+ExecStart=/agent/.venv/bin/python /agent/nexus_tick.py --integration-only
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
