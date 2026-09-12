@@ -268,14 +268,17 @@ class PublisherCommitPushTests(unittest.TestCase):
         self.assertNotIn("A ", status[:2])
 
     def test_path_traversal_outbox_file_rejected(self):
-        for malicious in (
+        # Ids come from the loop index, not from hash(): Python randomises
+        # string hashes per process, and the same pattern in
+        # test_outbox_publisher.py did collide on CI.
+        for index, malicious in enumerate((
             "communication/outbox/../../etc/passwd",
             "/etc/passwd",
             "communication/inbox/x.md",
             "communication/outbox/../outbox/y.md/../../../secrets.md",
-        ):
+        )):
             with self.subTest(outbox_file=malicious):
-                request_id = f"traversal-{abs(hash(malicious))}"
+                request_id = f"traversal-{index}"
                 _insert_chain_row(self.db, request_id, malicious)
                 pub = OperationChainPublisher(db_path=self.db, repo_root=str(self.repo))
                 try:
