@@ -468,10 +468,17 @@ def test_maintenance_execute_unknown_operation_returns_400(api_client):
     assert resp.status_code == 400
 
 
-def test_maintenance_execute_rejected_service_name_returns_400(api_client):
+def test_maintenance_execute_missing_service_name_returns_400(api_client):
+    # Service names are deliberately *not* restricted to an allowlist: Nexus
+    # has to be able to operate its own units (nexus-tick, nexus-mailbox, ...)
+    # as they are added, and a hardcoded pair would block that. Only an absent
+    # name is refused. This test previously asserted that "sshd" returned 400
+    # while two unit tests in this same file asserted arbitrary names were
+    # forwarded - a contradiction that survived because CI collected zero
+    # tests from this file.
     resp = api_client.post(
         "/maintenance/execute",
-        json={"operation": "service_status", "args": {"service": "sshd"}},
+        json={"operation": "service_status", "args": {}},
         headers={
             "X-Api-Key": _MAINT_API_KEY,
             "X-Maintenance-Token": _MAINT_TOKEN,
