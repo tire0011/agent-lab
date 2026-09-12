@@ -178,10 +178,19 @@ class FailureAnalysisObservabilityTests(unittest.TestCase):
         self.assertIn("failure_analysis_service_initialization_failed", self.capture.events)
         self.assertIn("failure_analysis_skipped", self.capture.events)
 
+    def test_finalization_source_only_marks_startup_state_as_recovery(self) -> None:
+        import modules.failure_analysis_observability as obs
+
+        service = SimpleNamespace(
+            _failure_analysis_recovery_experiment_ids=frozenset({"exp-recovered"})
+        )
+        self.assertEqual(obs._finalization_source(service, "exp-recovered"), "recovery")
+        self.assertEqual(obs._finalization_source(service, "exp-new"), "initial")
+        self.assertEqual(obs._finalization_source(SimpleNamespace(), "exp-new"), "initial")
+
     def test_recovery_needs_review_event_records_source_and_request_decision(self) -> None:
-        # The runtime wrapper derives `source=recovery` from a persisted
-        # task_finalizations row.  This record-level assertion protects the
-        # machine-readable contract consumed by operators/log tooling.
+        # Recovery is derived from state captured at process startup. This
+        # record-level assertion protects the machine-readable log contract.
         import modules.failure_analysis_observability as obs
 
         obs._event(  # noqa: SLF001 - verify the structured event contract directly

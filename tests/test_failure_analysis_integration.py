@@ -14,6 +14,8 @@ decided on.
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,6 +110,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp1")
 
         svc.poll_running()
+        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_FAILED)
         analyzer.analyze_from_logs.assert_called_once()
@@ -126,6 +129,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp2")
 
         svc.poll_running()
+        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_NEEDS_REVIEW)
         analyzer.analyze_from_logs.assert_called_once()
@@ -140,6 +144,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp3")
 
         svc.poll_running()
+        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_SUCCEEDED)
         analyzer.analyze_from_logs.assert_not_called()
@@ -155,9 +160,46 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp4")
 
         svc.poll_running()  # must not raise
+        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_FAILED)
         analyzer.analyze_from_logs.assert_called_once()
+
+    def test_poll_loop_continues_while_analysis_runs(self):
+        analyzer = MagicMock()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_analysis(**_kwargs):
+            started.set()
+            release.wait(2)
+
+        analyzer.analyze_from_logs.side_effect = blocking_analysis
+        exp_service = MagicMock()
+        experiments = {
+            "exp-a": _make_exp(id="exp-a", status="failed", error="boom-a"),
+            "exp-b": _make_exp(id="exp-b", status="failed", error="boom-b"),
+        }
+        exp_service.get_experiment.side_effect = experiments.__getitem__
+        svc = _make_service(self.tmp, exp_service, failure_analysis_service=analyzer)
+        self.addCleanup(svc.close)
+        approval_a = _submit(svc, "exp-a")
+        approval_b = _submit(svc, "exp-b")
+
+        try:
+            before = time.monotonic()
+            svc.poll_running()
+            elapsed = time.monotonic() - before
+
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(svc.get(approval_a).status, _STATUS_FAILED)
+            self.assertEqual(svc.get(approval_b).status, _STATUS_FAILED)
+            self.assertTrue(started.wait(1))
+        finally:
+            release.set()
+            self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+
+        self.assertEqual(analyzer.analyze_from_logs.call_count, 2)
 
     def test_lazy_construction_failure_degrades_silently(self):
         # No failure_analysis_service injected: the base class tries to
@@ -179,6 +221,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         fa_module.FailureAnalysisService = _boom
         try:
             svc.poll_running()
+            self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
         finally:
             fa_module.FailureAnalysisService = original
 
@@ -215,6 +258,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         fa_module.FailureAnalysisService = _Capturing
         try:
             svc.poll_running()
+            self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
         finally:
             fa_module.FailureAnalysisService = original
 
@@ -264,6 +308,7 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
         self.addCleanup(svc.close)
 
         svc.poll_running()
+        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc.get(approval.id).status, _STATUS_NEEDS_REVIEW)
         analyzer.analyze_from_logs.assert_called_once()
@@ -282,6 +327,7 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
         self.addCleanup(svc.close)
 
         svc.poll_running()
+        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc.get(approval.id).status, _STATUS_SUCCEEDED)
         analyzer.analyze_from_logs.assert_not_called()
@@ -296,6 +342,7 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
         self.addCleanup(svc.close)
 
         svc.poll_running()  # must not raise
+        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc.get(approval.id).status, _STATUS_NEEDS_REVIEW)
         self.assertTrue(list((self.tmp / "outbox").glob("*.md")))
@@ -396,6 +443,7 @@ class FinalizationResumedRecoveryIntegrationTests(unittest.TestCase):
             )
 
         svc_1.poll_running()  # first attempt: adoption fails, retry budget not yet exhausted
+        self.assertTrue(svc_1._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc_1.get(approval.id).status, "running")
         coordinator_1.close()
@@ -412,6 +460,7 @@ class FinalizationResumedRecoveryIntegrationTests(unittest.TestCase):
         self.addCleanup(svc_2.close)
 
         svc_2.poll_running()  # second attempt: retry budget now exhausted -> needs_review
+        self.assertTrue(svc_2._wait_for_failure_analyses(timeout=2))
 
         self.assertEqual(svc_2.get(approval.id).status, _STATUS_NEEDS_REVIEW)
         analyzer.analyze_from_logs.assert_called_once()

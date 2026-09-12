@@ -18,6 +18,8 @@ def _entry(**overrides):
         "id": "a1",
         "subject_type": "task_finalization",
         "subject_id": "exp-1",
+        "experiment_id": "exp-1",
+        "mailbox_task_id": "task-1",
         "created_at": "2026-09-10T00:00:00Z",
         "provider": "local",
         "model": "qwen2.5-coder-7b-instruct",
@@ -60,6 +62,8 @@ class FailureAnalysisApiTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["count"], 1)
         self.assertEqual(body["analyses"][0]["category"], "lifecycle_logic")
+        self.assertEqual(body["analyses"][0]["experiment_id"], "exp-1")
+        self.assertEqual(body["analyses"][0]["mailbox_task_id"], "task-1")
 
     def test_list_forwards_filters(self):
         self.service.list_recent.return_value = []

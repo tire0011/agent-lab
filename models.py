@@ -734,6 +734,8 @@ class FailureAnalysisEntry(BaseModel):
     subject_type: str
     subject_id: str
     created_at: str
+    experiment_id: str | None = None
+    mailbox_task_id: str | None = None
     provider: str
     model: str | None = None
     summary: str

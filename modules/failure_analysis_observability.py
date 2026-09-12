@@ -325,15 +325,10 @@ def _install_service_instrumentation() -> None:
     service_cls._failure_analysis_observability_installed = True
 
 
-def _finalization_source(service: Any, approval_id: str) -> str:
-    """Distinguish a first finalization pass from persisted-state recovery."""
-    try:
-        row = service._conn.execute(  # noqa: SLF001 - lifecycle instrumentation seam
-            "SELECT phase FROM task_finalizations WHERE approval_id=?", (approval_id,)
-        ).fetchone()
-        return "recovery" if row is not None else "initial"
-    except Exception:  # noqa: BLE001 - older DB/schema or synthetic tests
-        return "initial"
+def _finalization_source(service: Any, experiment_id: str) -> str:
+    """Return recovery only for finalization state present at process startup."""
+    recovered = getattr(service, "_failure_analysis_recovery_experiment_ids", ())
+    return "recovery" if experiment_id in recovered else "initial"
 
 
 def _install_mailbox_instrumentation() -> None:
@@ -343,6 +338,22 @@ def _install_mailbox_instrumentation() -> None:
     service_cls = base.MailboxTaskService
     if getattr(service_cls, "_failure_analysis_callsite_observability_installed", False):
         return
+
+    original_init = service_cls.__init__
+
+    @functools.wraps(original_init)
+    def observed_mailbox_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        try:
+            rows = self._conn.execute(  # noqa: SLF001 - lifecycle instrumentation seam
+                "SELECT experiment_id FROM task_finalizations"
+            ).fetchall()
+            recovered = frozenset(str(row[0]) for row in rows if row[0])
+        except Exception:  # noqa: BLE001 - older DB/schema or synthetic tests
+            recovered = frozenset()
+        self._failure_analysis_recovery_experiment_ids = recovered
+
+    service_cls.__init__ = observed_mailbox_init
 
     original_lookup = service_cls._failure_analysis
 
@@ -409,7 +420,7 @@ def _install_mailbox_instrumentation() -> None:
 
     @functools.wraps(original_advance_verified)
     def observed_advance_verified(self: Any, approval: Any, exp: Any) -> None:
-        source = _finalization_source(self, str(getattr(approval, "id", "") or ""))
+        source = _finalization_source(self, str(getattr(exp, "id", "") or ""))
         token = _FINALIZATION_SOURCE.set(source)
         try:
             return original_advance_verified(self, approval, exp)
