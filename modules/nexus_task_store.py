@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -380,6 +380,55 @@ class NexusTaskStore:
             "by_provider": by_provider,
             "by_outcome": by_outcome,
         }
+
+    def stale_sessions(self, older_than_seconds: int) -> list[NexusTaskSession]:
+        """Sessions left mid-turn with nothing driving them.
+
+        A session only reaches a terminal status through ``_persist_final``. If
+        the turn never gets there - the process died, an exception escaped, the
+        loop hit a limit - the row simply stays ``active`` forever. On the live
+        database 17 of 41 sessions ever started were in that state, untouched
+        for 8 to 19 days, with nothing reaping or reporting them.
+
+        Liveness is inferred from ``updated_at`` because there is no heartbeat
+        (see #158). The threshold therefore has to sit well clear of a slow but
+        healthy turn.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=max(60, older_than_seconds))
+        ).isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM nexus_task_sessions
+                WHERE status IN ('active', 'queued') AND updated_at < ?
+                ORDER BY updated_at
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def abandon_stale_sessions(self, older_than_seconds: int) -> list[NexusTaskSession]:
+        """Give up on stale sessions explicitly instead of leaving them ``active``.
+
+        Deliberately does *not* resume them: re-running a controller turn costs
+        a model call and may repeat whatever killed it. Marking the state
+        honestly is the useful part - it makes the count visible and stops a
+        dead session from looking like work in progress.
+        """
+        stale = self.stale_sessions(older_than_seconds)
+        for session in stale:
+            self.set_status(session.id, "abandoned")
+            self.append_event(
+                session.id,
+                role="system",
+                kind="abandoned",
+                content=(
+                    "Session was left mid-turn and had no activity for over "
+                    f"{max(60, older_than_seconds)}s; marked abandoned."
+                ),
+            )
+        return stale
 
     def set_status(self, session_id: str, status: str) -> None:
         with self._lock:
