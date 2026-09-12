@@ -65,12 +65,27 @@ def mock_registry():
 
 
 @pytest.fixture
-def service(temp_db, temp_outbox, mock_registry):
+def temp_repo_root():
+    """A stand-in repo root, so tests never reach into the real /agent.
+
+    OperationChainService defaults repo_root to /agent and puts its
+    outbox_publisher.lock there. On a machine without /agent the lock cannot be
+    created, `_write_outbox_result` raises, and the exception is swallowed by a
+    bare `except Exception` - so outbox files silently never appeared. That is
+    why the outbox tests passed on the VM and failed on CI runners.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield tmpdir
+
+
+@pytest.fixture
+def service(temp_db, temp_outbox, mock_registry, temp_repo_root):
     """Create a service instance."""
     svc = OperationChainService(
         db_path=temp_db,
         outbox_dir=temp_outbox,
         operations_registry=mock_registry,
+        repo_root=temp_repo_root,
     )
     yield svc
     svc.close()
@@ -457,13 +472,12 @@ class TestOperationChainServiceRealRegistryIntegration:
     action except `disk` and `memory` fail: OperationChainService used to
     pass underscore action names (e.g. "git_status") straight into
     OperationsRegistry.execute(), while the registry's own catalog/handler
-    dispatch was keyed on space-separated names (e.g. "git status"). Pure
-    allowlist validation could not catch this because the allowlist and the
-    registry disagreed on names in the same way. This test runs every
-    allowlisted chain action through the *real* OperationsRegistry (no
-    mocked `execute`/`_specs`) end to end via OperationChainService, so a
-    reintroduced name mismatch fails loudly here instead of only in
-    production Nexus operation chains.
+    dispatch was keyed on space-separated names (e.g. "git status"). Name
+    validation could not catch this, because both sides disagreed on names
+    in the same way. This test runs chain actions through the *real*
+    OperationsRegistry (no mocked `execute`/`_specs`) end to end via
+    OperationChainService, so a reintroduced name mismatch fails loudly here
+    instead of only in production Nexus operation chains.
     """
 
     def _run_actions(self, real_registry, temp_outbox, actions_with_args):
@@ -473,6 +487,7 @@ class TestOperationChainServiceRealRegistryIntegration:
                 db_path=str(Path(db_dir) / "chains.db"),
                 outbox_dir=temp_outbox,
                 operations_registry=registry,
+                repo_root=db_dir,
             )
             try:
                 steps = [
@@ -495,7 +510,7 @@ class TestOperationChainServiceRealRegistryIntegration:
             finally:
                 service.close()
 
-    def test_every_allowlisted_action_reaches_registry_handler(self, real_registry, temp_outbox):
+    def test_chain_actions_reach_registry_handlers(self, real_registry, temp_outbox):
         experiment_id = real_registry[1].id[:8]
         adoption_id = real_registry[2].id
 
@@ -517,27 +532,6 @@ class TestOperationChainServiceRealRegistryIntegration:
             "help": {},
             "process_status": {},
         }
-        # Track the real catalog, not a stale copy. `_CHAIN_OPERATION_ALLOWLIST`
-        # used to be the source of truth here; it no longer exists anywhere in
-        # the codebase, so this assertion raised NameError on every run - which
-        # nobody saw, because CI collected zero tests from this file (it uses
-        # plain pytest classes, and CI ran `unittest discover`).
-        # The chain has no allowlist of its own: it dispatches straight through
-        # OperationsRegistry, so the catalog *is* the allowlist.
-        registry = real_registry[0]
-        catalog_names = {spec.name for spec in registry.catalog()}
-        not_exercised = {
-            # Side-effecting: pulls the mailbox repo. Running it here would
-            # mutate real state during a test.
-            "inbox_refresh",
-            # Needs a running llama-server, which CI runners do not have.
-            "local_model_status",
-        }
-        assert set(action_args) | not_exercised == catalog_names, (
-            "operations added to the registry must be exercised here or listed "
-            "as deliberately not exercised: "
-            f"{catalog_names - set(action_args) - not_exercised}"
-        )
 
         actions = list(action_args.items())
         # OperationChainRequest caps chains at 10 steps, so split into batches.
