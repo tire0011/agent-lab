@@ -409,11 +409,30 @@ class NexusTaskOrchestrator:
                 try:
                     decision = self._parse(corrected_raw)
                 except TaskOrchestratorError as correction_error:
+                    self.task_store.record_controller_turn(
+                        session.id,
+                        provider_used=provider_used,
+                        outcome="invalid_json",
+                        prompt_chars=len(prompt),
+                        safe_local_budget_chars=budget_plan.safe_local_budget_chars,
+                        detail=str(correction_error),
+                    )
                     raise TaskOrchestratorError(
                         "controller returned invalid JSON and its single correction "
                         f"retry also failed: {correction_error}"
                     ) from correction_error
             action = str(decision.get("action", "")).strip().lower()
+            # One durable row per turn (#158). Which model decided this turn was
+            # previously recoverable only from a log line, so the question "does
+            # the local controller produce usable decisions" could not be
+            # answered without grepping the journal.
+            self.task_store.record_controller_turn(
+                session.id,
+                provider_used=provider_used,
+                outcome=action or "unparsed",
+                prompt_chars=len(prompt),
+                safe_local_budget_chars=budget_plan.safe_local_budget_chars,
+            )
             if action in _ORCHESTRATOR_TOOLS:
                 execution_decision = self._action_to_tool_decision(decision)
                 if task_logger is not None:
@@ -1390,6 +1409,14 @@ Rules:
         human can resolve capacity/configuration and resume; nothing required
         to continue is silently discarded.
         """
+        # Counted like any other turn: a statistic that only records the turns
+        # that succeeded would answer the wrong question.
+        self.task_store.record_controller_turn(
+            session_id,
+            provider_used="none",
+            outcome="budget_exceeded",
+            detail=reason,
+        )
         result = TaskDecision(
             action=ACTION_MISSING_CAPABILITY,
             reason=reason,
