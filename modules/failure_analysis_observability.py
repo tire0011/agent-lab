@@ -197,6 +197,9 @@ def _install_service_instrumentation() -> None:
             _event("failure_analysis_requested", **fields)
         _event("failure_analysis_started", **fields)
         started = time.monotonic()
+        request_context = dict(_REQUEST_CONTEXT.get())
+        request_context.update(fields)
+        context_token = _REQUEST_CONTEXT.set(request_context)
         persist_token = _PERSIST_OUTCOME.set(None)
         try:
             analysis = await original_analyze_async(self, *args, **kwargs)
@@ -229,6 +232,7 @@ def _install_service_instrumentation() -> None:
             return analysis
         finally:
             _PERSIST_OUTCOME.reset(persist_token)
+            _REQUEST_CONTEXT.reset(context_token)
 
     service_cls.analyze_async = observed_analyze_async
 

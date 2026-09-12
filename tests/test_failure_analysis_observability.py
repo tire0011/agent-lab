@@ -147,10 +147,9 @@ class FailureAnalysisObservabilityTests(unittest.TestCase):
         self.assertEqual(completed.persistence_outcome, "failed")
 
     def test_initialization_failure_emits_service_and_schema_failure(self) -> None:
-        missing_parent = self.tmp / "does-not-exist" / "agent.db"
         with self.assertRaises(Exception):
             FailureAnalysisService(
-                db_path=str(missing_parent),
+                db_path=str(self.tmp),
                 llama_client=_FakeClient(_diagnosis_json()),
             )
 
@@ -163,7 +162,7 @@ class FailureAnalysisObservabilityTests(unittest.TestCase):
         # dependencies are touched.
         service = MailboxTaskService.__new__(MailboxTaskService)
         service.failure_analysis_service = None
-        service.db_path = str(self.tmp / "missing" / "agent.db")
+        service.db_path = str(self.tmp)
         service._task_log_dir = self.tmp / "logs"
         service.experiment_service = None
         service.outbox_dir = self.tmp / "outbox"
