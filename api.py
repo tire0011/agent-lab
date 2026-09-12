@@ -34,6 +34,7 @@ from modules.mailbox.task_service import (
 )
 from modules.nexus_chat_service import NexusChatService
 from modules.nexus_chat_jobs import NexusChatJobService, STATUS_FAILED, STATUS_SUCCEEDED
+from modules.nexus_task_store import NexusTaskStore
 from modules.task_orchestrator import TaskOrchestratorError
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
 from modules.experiment_service import ExperimentNotFoundError, ExperimentService
@@ -117,6 +118,13 @@ _PROCESS_START_TIME = time.time()
 configure_logging()
 _logger = logging.getLogger(__name__)
 _MCP_MOUNT = create_mcp_mount()
+
+# How long a controller session may sit untouched mid-turn before it is called
+# abandoned. Liveness has to be inferred from `updated_at` because there is no
+# heartbeat (#158), so this sits well clear of a slow but healthy turn: local
+# inference plus tool calls can legitimately take many minutes, and calling a
+# live session dead is worse than noticing a dead one late.
+_STALE_SESSION_SECONDS = int(os.environ.get("NEXUS_STALE_SESSION_SECONDS", 6 * 60 * 60))
 
 
 
@@ -319,6 +327,26 @@ async def lifespan(app: FastAPI):
         mts.recover_after_restart()
         _resolve_experiment_adoption_service().recover_after_restart()
         _resolve_operation_chain_service().recover_after_restart()
+
+        # Controller sessions only reach a terminal status through the final
+        # decision path, so a turn that dies mid-flight leaves its row `active`
+        # forever. 17 of the 41 sessions ever started were in that state,
+        # untouched for 8 to 19 days, with nothing reaping or reporting them
+        # (#158). Marking them is deliberate and does not resume anything:
+        # re-running a turn costs a model call and may repeat whatever killed
+        # it. Never aborts startup.
+        try:
+            _abandoned = NexusTaskStore().abandon_stale_sessions(
+                _STALE_SESSION_SECONDS
+            )
+            if _abandoned:
+                _logger.warning(
+                    "marked %d controller session(s) abandoned after %ds without activity",
+                    len(_abandoned),
+                    _STALE_SESSION_SECONDS,
+                )
+        except Exception as _exc:  # noqa: BLE001 - recovery must not block startup
+            _logger.error("could not reap stale controller sessions: %s", _exc)
 
         # Best-effort outbox recovery: publish any un-pushed outbox records from
         # a previous crash.  Both publishers share the same MailboxConfig / DB.
