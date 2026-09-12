@@ -189,6 +189,74 @@ Decision log for architecture and operating choices.
 - Revisit if: an automated diagnosis consumer appears - it would make
   these names a versioned contract rather than a convention.
 
+### D-016: Adoption judges content, not worktree layout
+
+- Status: Accepted
+- Why: Experiment `3946adc3` was implemented, verified, and green in GitHub
+  Actions for commit `28399a0a` on 2026-09-04 - and still ended in
+  `needs_review` on eight consecutive retries between 2026-09-06 and
+  2026-09-10. `_validate_startable` compared the *text* of `git status
+  --short` and `git diff --stat` against what verification had stored.
+  Adoption's own first step commits the verified changes, which turns the
+  dirty worktree clean and makes those strings differ. The precondition the
+  retry checked was destroyed by the attempt that preceded it, so the retry
+  could never converge. Tree comparison proved the content was
+  byte-identical to what CI verified the whole time.
+- Rule: when the stored status/stat text no longer matches, that is not a
+  verdict. Adoption then asks the question the text was only approximating:
+  is the tree that would be integrated identical to the tree of the verified
+  checkpoint? `_capture_snapshot` already builds a scratch index holding HEAD
+  plus every worktree change, so its `write-tree` *is* the content adoption
+  would integrate. Equal trees continue; anything else keeps the old refusal.
+- This is stricter, not looser. A tree hash covers every byte of every file;
+  `git status` text covers which paths changed. Content CI never saw cannot
+  pass under either arrangement, which is what the accompanying regressions
+  pin down.
+- The fallback matters: with no checkpoint SHA recorded there is nothing
+  authoritative to compare against, so the conservative text comparison still
+  applies rather than defaulting to permissive.
+- Consequence: D-013 through D-015 reasoned carefully about CI evidence, but
+  no evidence rule could ever have unblocked this - the guard aborted one
+  layer above, before any CI logic was consulted. The misleading message it
+  produced ("Die Integrationstests konnten nicht erfolgreich abgeschlossen
+  werden") is what kept the diagnosis pointed at the wrong layer.
+- Revisit if: adoption ever integrates something other than the worktree's
+  full tree (a partial or path-filtered adoption would need its own
+  invariant).
+
+### D-017: Nexus selects its own work, one item at a time
+
+- Status: Accepted
+- Why: Every entry point was reactive - the mailbox timer waits for a human
+  to drop a file, `/chat` waits for typing, `MailboxTaskWorker` only moves
+  what a human already approved. Nothing inspected Nexus's own state and
+  decided what to do. `NexusControllerService` was written for exactly this
+  and was instantiated only in tests. Autonomy was not blocked by a bug; the
+  component that starts work had never been connected.
+- Rule: `modules/nexus_initiative.py` picks exactly one item per tick,
+  persists the decision *before* dispatching, and hands it to the pipeline
+  that already exists. It adds no lifecycle stage of its own.
+- Priority order is deliberate: unintegrated verified work first, then
+  labelled open issues, then `new` ideas. Finishing started work is cheaper
+  and more valuable than starting new work, and the live database held
+  **seven** succeeded experiments that were never integrated - the dominant
+  failure mode, not an edge case.
+- Running states are only trusted while fresh. The live database holds an
+  experiment queued since 2026-08-14 and six mailbox tasks at `running`,
+  untouched since 2026-09-02 at the latest. A busy check that believed them
+  would never run again, so past `NEXUS_INITIATIVE_STALE_AFTER_SECONDS` a row
+  is treated as abandoned and reported rather than obeyed. Cleanup is left to
+  the services that own that state.
+- Bounds: one item per tick, a no-op while anything is genuinely running, and
+  `NEXUS_INITIATIVE_DAILY_BUDGET` (default 8) self-started items per 24h.
+  Issues must carry the `nexus` label, so opening an issue is not the same as
+  dispatching an agent at it.
+- Only dispatchable work is listed. Under `--integration-only` no controller
+  exists, so ideas and issues are omitted from the backlog entirely rather
+  than reported as work that cannot be started.
+- Revisit if: a tick should ever run more than one item concurrently - that
+  needs a real work-claiming mechanism, not a wider busy check.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

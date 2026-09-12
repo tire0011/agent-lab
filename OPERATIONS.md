@@ -255,7 +255,9 @@ All `/maintenance/*` endpoints require **both**:
 | service_logs        | `service`, `lines`        | `journalctl` tail for allowed service            |
 | process_status      | —                         | Filtered `ps aux` for known Nexus processes      |
 
-Allowed service names: `llama-server`, `agent-api`.
+Service names are not restricted to an allowlist — Nexus must be able to
+operate its own units (`nexus-tick`, `nexus-mailbox`, …) as they are added.
+Any non-empty unit name is accepted; only an absent name is refused.
 
 ### Example: run the test suite remotely
 
@@ -281,7 +283,9 @@ curl -s -X POST .../maintenance/execute \
 - Requires two independent auth factors (`X-Api-Key` + `X-Maintenance-Token`).
 - `MAINTENANCE_EXPIRY` auto-disables the window at a specified UTC time.
 - No arbitrary command strings; only the named operations above are accepted.
-- Only `llama-server` and `agent-api` are accepted as service names.
+- Any non-empty systemd unit name is accepted; `service_restart` runs
+  `sudo systemctl restart` on it. The gate is the maintenance window itself
+  (disabled by default, two tokens, optional expiry), not a name list.
 - All output is truncated and redacted (API keys, tokens, secrets).
 - Every operation call is written to an in-memory audit log (`GET /maintenance/audit`).
 

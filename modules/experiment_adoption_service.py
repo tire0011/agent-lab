@@ -1101,6 +1101,37 @@ class ExperimentAdoptionService:
             return None
         return recorded if head.stdout.strip() == recorded else None
 
+    def _verified_checkpoint_sha(self, experiment_id: str, experiment: Any) -> str:
+        """Return the commit whose content verification actually accepted.
+
+        The GitHub work ref is authoritative. ``test_command`` is the fallback
+        for experiments verified before a work ref existed: verification writes
+        it as ``["GitHub Actions", <workflow>, <sha>]``.
+        """
+        try:
+            work_ref = self.github_work_tracking.for_experiment(experiment_id)
+        except Exception:
+            work_ref = None
+        sha = (getattr(work_ref, "checkpoint_sha", None) or "").strip() if work_ref is not None else ""
+        if sha:
+            return sha
+        command = getattr(experiment, "test_command", None) or []
+        if len(command) >= 3 and str(command[0]).strip() == "GitHub Actions":
+            return str(command[2]).strip()
+        return ""
+
+    def _tree_sha_of(self, worktree_path: str, commit_sha: str, elog, *, phase: str) -> str:
+        if not commit_sha:
+            return ""
+        proc = _run_git(
+            ["rev-parse", f"{commit_sha}^{{tree}}"],
+            cwd=worktree_path,
+            timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
+            elog=elog,
+            phase=phase,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
     def _validate_startable(self, experiment_id: str, *, persist_review: bool) -> dict[str, Any]:
         experiment = self.experiment_service.get_experiment(experiment_id)
         if experiment.status != STATUS_SUCCEEDED:
@@ -1119,9 +1150,31 @@ class ExperimentAdoptionService:
         current_stat = (snapshot["diff_stat"] or "").strip()
         stored_stat = (experiment.diff_stat or "").strip()
         if current_status != stored_status or current_stat != stored_stat:
-            raise ExperimentAdoptionError(
-                "Die Änderungen im Experiment-Worktree haben sich seit der erfolgreichen Prüfung verändert."
-            )
+            # `git status`/`diff --stat` describe how the content is *arranged*
+            # in the worktree, not what the content is. Adoption's own first
+            # step commits the verified changes, which turns a dirty worktree
+            # into a clean one and makes those strings differ from the ones
+            # verification stored - so a resumed adoption accused itself of
+            # tampering and could never converge (#147 follow-up; the real
+            # blocker behind the eight identical needs_review retries).
+            # The content invariant answers the question the strings only
+            # approximated: is the tree adoption would integrate byte-for-byte
+            # the tree CI verified?
+            checkpoint_sha = self._verified_checkpoint_sha(experiment_id, experiment)
+            verified_tree = self._tree_sha_of(worktree_path, checkpoint_sha, elog, phase="adoption")
+            current_tree = (snapshot.get("tree_sha") or "").strip()
+            if verified_tree and current_tree and verified_tree == current_tree:
+                elog.info(
+                    "adoption", "worktree_content_matches_checkpoint",
+                    "Worktree layout changed since verification, but its content is "
+                    "identical to the verified checkpoint; continuing adoption",
+                    checkpoint_sha=checkpoint_sha,
+                    tree_sha=current_tree,
+                )
+            else:
+                raise ExperimentAdoptionError(
+                    "Die Änderungen im Experiment-Worktree haben sich seit der erfolgreichen Prüfung verändert."
+                )
 
         actual_files = _safe_list(snapshot["changed"].all_paths())
         expected_files = _safe_list((quality.get("changed_files") or quality.get("expected_files") or actual_files))
@@ -1220,6 +1273,19 @@ class ExperimentAdoptionService:
                 elog=elog,
                 phase=phase,
             )
+            # The scratch index already holds HEAD plus every worktree change,
+            # so its tree *is* the content adoption would integrate. Recording
+            # it lets the content be compared directly against the verified
+            # checkpoint, independently of whether that content currently sits
+            # in the worktree as uncommitted changes or as a commit.
+            tree_proc = _run_git(
+                ["write-tree"],
+                cwd=worktree_path,
+                env=index_env,
+                timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
+                elog=elog,
+                phase=phase,
+            )
         finally:
             shutil.rmtree(scratch_dir, ignore_errors=True)
         return {
@@ -1227,6 +1293,7 @@ class ExperimentAdoptionService:
             "diff_stat": stat_proc.stdout,
             "diff_text": diff_proc.stdout,
             "changed": parse_git_status_short(status_proc.stdout),
+            "tree_sha": tree_proc.stdout.strip() if tree_proc.returncode == 0 else "",
         }
 
     def _transition_status(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:

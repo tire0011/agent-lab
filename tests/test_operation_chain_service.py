@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from models import (
     OperationChainRequest,
@@ -64,12 +65,27 @@ def mock_registry():
 
 
 @pytest.fixture
-def service(temp_db, temp_outbox, mock_registry):
+def temp_repo_root():
+    """A stand-in repo root, so tests never reach into the real /agent.
+
+    OperationChainService defaults repo_root to /agent and puts its
+    outbox_publisher.lock there. On a machine without /agent the lock cannot be
+    created, `_write_outbox_result` raises, and the exception is swallowed by a
+    bare `except Exception` - so outbox files silently never appeared. That is
+    why the outbox tests passed on the VM and failed on CI runners.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield tmpdir
+
+
+@pytest.fixture
+def service(temp_db, temp_outbox, mock_registry, temp_repo_root):
     """Create a service instance."""
     svc = OperationChainService(
         db_path=temp_db,
         outbox_dir=temp_outbox,
         operations_registry=mock_registry,
+        repo_root=temp_repo_root,
     )
     yield svc
     svc.close()
@@ -122,12 +138,15 @@ class TestOperationChainService:
             time.sleep(0.01)
         mock_registry.execute.assert_called_with("local_model_status", {})
 
-    def test_max_ten_steps_limit_rejected(self, service):
-        """Test chain with >10 steps is rejected."""
+    def test_max_ten_steps_limit_rejected(self):
+        """A chain with >10 steps cannot even be constructed."""
+        # The cap lives on OperationChainRequest, so it is enforced before
+        # start_chain() is ever reached. This test used to call start_chain()
+        # and assert STATUS_REJECTED, which was unreachable - the constructor
+        # raised first. Nobody saw it: CI collected zero tests from this file.
         steps = [OperationChainStep(id=f"step{i}", action="git_status") for i in range(11)]
-        request = OperationChainRequest(steps=steps)
-        result = service.start_chain(request)
-        assert result.overall_status == STATUS_REJECTED
+        with pytest.raises(ValidationError):
+            OperationChainRequest(steps=steps)
 
     def test_forbidden_pattern_in_argument_rejected(self, service):
         """Test chain with forbidden pattern in arguments is rejected."""
@@ -337,32 +356,44 @@ class TestOperationChainService:
     def test_outbox_file_written(self, service):
         """Test that outbox file is written."""
         outbox_dir = Path(service.outbox_dir)
-        
+
         request = OperationChainRequest(
             steps=[OperationChainStep(id="step1", action="git_status")],
         )
-        
+
         result = service.start_chain(request)
-        time.sleep(1)
-        
-        # Check file was written
-        files = list(outbox_dir.glob("*operation-chain-result*"))
-        assert len(files) > 0
+
+        # The chain runs in a background thread. A flat sleep(1) was not enough
+        # on a loaded host, which is why this failed intermittently once the
+        # file started being collected at all.
+        deadline = time.time() + 15
+        files: list[Path] = []
+        while time.time() < deadline:
+            files = list(outbox_dir.glob("*operation-chain-result*"))
+            if files:
+                break
+            time.sleep(0.05)
+        assert files, f"no outbox file for chain {result.request_id}"
 
     def test_rejected_chain_has_outbox_file(self, service):
         """Test rejected chains also write outbox files."""
         outbox_dir = Path(service.outbox_dir)
-        
-        # Create invalid request
+
+        # A forbidden argument pattern is what actually produces a rejection.
+        # This test used to use an unknown action name and assert REJECTED,
+        # which contradicted test_start_chain_queued in this same file: the
+        # mock registry's _specs is empty, so "git_status" there is exactly as
+        # unknown as "git_commit" was here. Unknown actions are not rejected up
+        # front - they fail during execution.
         request = OperationChainRequest(
             steps=[
-                OperationChainStep(id="s1", action="git_commit"),  # Invalid action
+                OperationChainStep(id="s1", action="git_log", arguments={"limit": "1; rm -rf /"}),
             ]
         )
-        
+
         result = service.start_chain(request)
         assert result.overall_status == STATUS_REJECTED
-        
+
         # Check file was written
         files = list(outbox_dir.glob("*operation-chain-result*"))
         assert len(files) > 0
@@ -441,13 +472,12 @@ class TestOperationChainServiceRealRegistryIntegration:
     action except `disk` and `memory` fail: OperationChainService used to
     pass underscore action names (e.g. "git_status") straight into
     OperationsRegistry.execute(), while the registry's own catalog/handler
-    dispatch was keyed on space-separated names (e.g. "git status"). Pure
-    allowlist validation could not catch this because the allowlist and the
-    registry disagreed on names in the same way. This test runs every
-    allowlisted chain action through the *real* OperationsRegistry (no
-    mocked `execute`/`_specs`) end to end via OperationChainService, so a
-    reintroduced name mismatch fails loudly here instead of only in
-    production Nexus operation chains.
+    dispatch was keyed on space-separated names (e.g. "git status"). Name
+    validation could not catch this, because both sides disagreed on names
+    in the same way. This test runs chain actions through the *real*
+    OperationsRegistry (no mocked `execute`/`_specs`) end to end via
+    OperationChainService, so a reintroduced name mismatch fails loudly here
+    instead of only in production Nexus operation chains.
     """
 
     def _run_actions(self, real_registry, temp_outbox, actions_with_args):
@@ -457,6 +487,7 @@ class TestOperationChainServiceRealRegistryIntegration:
                 db_path=str(Path(db_dir) / "chains.db"),
                 outbox_dir=temp_outbox,
                 operations_registry=registry,
+                repo_root=db_dir,
             )
             try:
                 steps = [
@@ -479,7 +510,7 @@ class TestOperationChainServiceRealRegistryIntegration:
             finally:
                 service.close()
 
-    def test_every_allowlisted_action_reaches_registry_handler(self, real_registry, temp_outbox):
+    def test_chain_actions_reach_registry_handlers(self, real_registry, temp_outbox):
         experiment_id = real_registry[1].id[:8]
         adoption_id = real_registry[2].id
 
@@ -498,9 +529,9 @@ class TestOperationChainServiceRealRegistryIntegration:
             "problems_list": {},
             "inbox_status": {},
             "outbox_status": {},
+            "help": {},
+            "process_status": {},
         }
-        # Make sure this test tracks the real allowlist, not a stale copy.
-        assert set(action_args) == _CHAIN_OPERATION_ALLOWLIST
 
         actions = list(action_args.items())
         # OperationChainRequest caps chains at 10 steps, so split into batches.

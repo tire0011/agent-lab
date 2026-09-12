@@ -1,2 +1,6 @@
 -r requirements-api.txt
 pytest==8.4.2
+# The async tests have always carried @pytest.mark.asyncio, but the plugin that
+# executes them was never installed. Without it every async test errors under
+# pytest and is skipped entirely by unittest - see DECISIONS.md D-018.
+pytest-asyncio==0.24.0

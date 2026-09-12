@@ -33,15 +33,20 @@ Allowed operations
 - test_task_result          — result of a background test task by id
 - local_model_status        — HEAD /v1/models against the local llama-server
 - local_model_test          — POST /v1/chat/completions with a short ping prompt
-- service_status            — systemctl is-active for llama-server / agent-api
-- service_restart           — systemctl restart for llama-server / agent-api
-- service_logs              — journalctl tail for llama-server / agent-api
+- service_status            — systemctl is-active for a named unit
+- service_restart           — systemctl restart for a named unit
+- service_logs              — journalctl tail for a named unit
 - process_status            — ps filtered for known Nexus/llama process names
 
 Safety guarantees
 -----------------
 - Only the operations listed above are accepted; no arbitrary command strings.
-- Only the service names ``llama-server`` and ``agent-api`` are accepted.
+- Service names are **not** restricted to an allowlist: Nexus must be able to
+  operate its own units as they are added, so any non-empty unit name is
+  accepted. ``service_restart`` therefore runs ``sudo systemctl restart`` on
+  whatever unit is named. The protection for that is the gate around the whole
+  service - disabled by default, two separate tokens, and an optional expiry -
+  not a list of names.
 - All outputs are bounded/truncated.
 - Every operation call is written to an in-memory audit log accessible via
   :meth:`MaintenanceService.audit_log`.
