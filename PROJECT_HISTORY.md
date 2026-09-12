@@ -514,11 +514,25 @@ PR #154 improved error logs with task/experiment correlation and added a regress
 
 **Lesson:** source correctness and deployed-runtime freshness are separate evidence. When a migrated table or capability is absent in production, first distinguish stale process/schema activation from a missing code path, and test recovery using newly constructed services rather than only in-memory mocks.
 
-### 94. 2026-09-11: structured failure-analysis observability is the next open diagnostic layer
+### 94. 2026-09-11 to 2026-09-12: structured failure-analysis observability merged
 
-Issue #151 / PR #155 proposes explicit lifecycle events for failure-analysis request, service/schema initialization, model call, persistence, completion/unavailable/skipped outcomes, startup feature status, and resumed-finalization source. It intentionally logs only safe identities/diagnostic fields, not prompts, raw model output, credentials, or raw exception text.
+Issue #151 / PR #155 added explicit lifecycle events for failure-analysis request, service/schema initialization, model call, persistence, completion/unavailable/skipped outcomes, startup feature status, and resumed-finalization source. Logging intentionally excludes prompts, raw model output, credentials, and raw exception text while retaining safe correlation/diagnostic fields.
 
-PR #155 is **open and not yet adopted on `main`**. Its purpose is to make a future missing analysis explainable from the normal `/logs` feed without DB inspection or debugger attachment, including whether the running deployment even activated the feature.
+PR #155 merged on 2026-09-12. The unified `/logs` feed can now distinguish whether failure analysis was invoked, skipped, unavailable because initialization/model/persistence failed, or resumed through recovery, and startup reports whether the deployed feature/schema is active.
+
+**Lesson:** autonomous diagnosis itself needs observable lifecycle state; otherwise a missing diagnosis creates another opaque failure layer.
+
+### 95. 2026-09-12: autonomy audit found three independent blockers before true self-directed operation
+
+Issue #156 and draft PR #157 traced why Nexus still had not been doing useful work on its own. The investigation found three separate causes rather than one architectural failure.
+
+First, resumed adoption compared textual worktree layout (`git status --short` / `git diff --stat`) with the verified state. Adoption's own commit changed a dirty verified worktree into a clean committed representation, so the guard interpreted its own transition as tampering. The real version experiment had verified green on 2026-09-04 but then reached `needs_review` on **eight consecutive retries**. The proposed fix compares the content/tree being integrated against the verified checkpoint instead of comparing presentation of the worktree.
+
+Second, no production component actually initiated work autonomously: `NexusControllerService` existed but was instantiated only in tests, while mailbox/chat paths remained reactive. The draft adds a persisted one-item initiative tick with priority **unintegrated verified work -> explicitly labelled open issues -> new ideas**, bounded by a daily budget and staleness-aware busy detection. Live data showed **seven succeeded experiments had never been integrated**, plus stale/zombie rows that a naive busy check would treat as permanently active.
+
+Third, authoritative CI had a collection hole: the existing `unittest discover` runner silently skipped plain pytest-style tests. **120 tests in six files were collected zero times** while CI could still report green; after switching to pytest, **119 of the 120 newly visible tests passed unchanged**. Corrected collection then exposed non-hermetic tests whose behavior varies with host memory because prompt-budget escalation can reach a real external provider instead of the injected test double. The draft branch reported **20 failed, 1,461 passed** in the CI-like environment and therefore remains intentionally red/unmerged.
+
+**Lessons:** autonomy needs both a reliable last-mile integration path and an explicit initiative source; lifecycle invariants should compare semantic content rather than incidental worktree representation; and authoritative CI is only authoritative if its collection is complete and hermetic. Before adding more lifecycle semantics, prove one real adoption -> merge -> deploy -> live-validation cycle end to end.
 
 ## What Nexus currently learns
 
@@ -563,7 +577,7 @@ Current `main` includes:
 - mandatory GitHub-backed implementation lifecycle using Issues, Issue-linked branches, WIP checkpoints, Draft PRs, verification, merge, and Issue completion,
 - persisted post-verification finalization through PR merge, adoption/deployment, service restart recovery, task-specific live validation, and only then final `succeeded`; finalization state is experiment-owned and can be safely rebound to later terminal-owner approvals,
 - restart-aware adoption with integration-aware CI precedence, auditable stale-failure supersession, bounded stale retries, moved-base integration fallback on the current target branch, and separate integrity handling for persisted verified-source commits versus integration candidates,
-- a reusable local-first failure-analysis service with bounded/redacted evidence, structured persisted diagnoses, best-effort lifecycle integration, diagnostic API access, and correlated restart-idempotent mailbox outbox publication,
+- a reusable local-first failure-analysis service with bounded/redacted evidence, structured persisted diagnoses, best-effort lifecycle integration, diagnostic API access, correlated restart-idempotent mailbox outbox publication, and structured lifecycle observability,
 - restart-aware mailbox command recovery using persisted Git baselines, optional declared service postconditions, tri-state evidence (`succeeded`/`failed`/`unknown`), and cached idempotent replay,
 - GitHub Actions verification for PRs and `nexus/**` pushes,
 - SQLite state and durable project/idea/decision/history documents,
@@ -579,7 +593,7 @@ Current `main` includes:
 - invariant protections for auth, secrets, redaction and state validity rather than broad static positive execution allowlists,
 - tests and policy boundaries.
 
-Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), remaining Issue #123 restart paths, controller JSON escape hardening, measurement of the two-stage tool gateway, a successful real autonomous-finalization E2E, validation of LLM failure-analysis quality/actionability, live validation that failure analysis activates after deploy/restart, and structured failure-analysis observability (Issue #151 / open PR #155) remain open work/research. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
+Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (Issue #74), strict discovery-grant semantics (Issue #117), explicit verification/integration/deployment status modeling (Issue #119), missing-capability recovery/issue creation (Issue #120), remaining Issue #123 restart paths, controller JSON escape hardening, measurement of the two-stage tool gateway, validation of LLM failure-analysis quality/actionability, and a successful real autonomous-finalization E2E remain open work/research. Issue #156 / draft PR #157 now also tracks the concrete prerequisites for self-directed operation: semantic adoption integrity, a production initiative tick, complete pytest collection, and hermetic provider-routing tests. The Grafana/OpenTelemetry experiment remains rejected. Draft PR #116 is successful CI evidence but remains unmerged.
 
 ## Important lessons so far
 
@@ -651,6 +665,9 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 66. **Human-facing diagnosis is a durable output.** A useful analysis should be surfaced through the normal mailbox channel with restart-safe exactly-once publication rather than remaining hidden in internal storage.
 67. **Invariant checks must account for lifecycle representation changes.** A trusted verified diff may later exist as a clean persisted commit; recovery should prove and normalize that state before reusing the invariant, not weaken source-integrity checks.
 68. **Deployment freshness is evidence.** Missing migrated schema/capabilities can indicate stale running code even when current source and tests are correct; recovery tests should reconstruct services from durable state.
+69. **Autonomy needs an initiator as well as an executor.** Durable controller/experiment machinery remains reactive unless something periodically selects work and records that decision before dispatch.
+70. **CI authority depends on collection and hermeticity.** A green workflow is not trustworthy if tests are silently undiscovered or can escape to real providers because shared host state changes routing.
+71. **Compare semantic state, not representation.** Lifecycle guards should validate the content that will be integrated; dirty-vs-clean worktree layout can change legitimately during recovery.
 
 ## Open research directions
 
@@ -671,8 +688,7 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 - measure bounded verification repair: recovery rate, iterations, repeated-failure stops, extra model/CI cost, and reduction in human intervention,
 - measure stale-adoption recovery including moved-base source normalization/integration fallback: how often no-verdict failures are superseded, fallback success/failure rate, whether the two-retry budget is sufficient, whether trusted committed-source normalization works across restart, and whether terminal implementation/tamper failures remain closed,
 - measure local-LLM failure analysis: diagnosis accuracy, calibration/confidence usefulness, actionability of recommended checks, context size/cost, malformed-output rate, outbox usefulness, and reduction in human diagnosis time before allowing automatic diagnostic loops,
-- validate failure-analysis activation on a freshly deployed/restarted live Nexus and distinguish code-path bugs from stale runtime/schema activation,
-- evaluate structured FailureAnalysisService lifecycle observability from Issue #151 / PR #155 if adopted: can `/logs` alone explain skipped/init/model/persistence failures and recovery-path invocation?,
+- validate failure-analysis activation and structured lifecycle observability on a freshly deployed/restarted live Nexus: can `/logs` alone explain skipped/init/model/persistence failures and recovery-path invocation?,
 - evaluate whether self-healing operations and duplicate-loop prevention materially reduce human intervention,
 - evaluate MCP as the standard control path and narrow temporary bootstrap capabilities over time,
 - measure whether the mandatory GitHub lifecycle improves fire-and-forget development, traceability, recovery, and review,
@@ -683,7 +699,11 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 - investigate missing-capability recovery, deduplicated issue creation, tool provisioning, and promotion of recurring gaps into OperationsRegistry capabilities (Issue #120),
 - validate Issue #123 beyond the command-channel fix: restart/resume across remaining mailbox/task paths, explicit expected-state evidence, and exactly-once pending replies,
 - harden controller structured-output parsing against JSON-invalid escape sequences and measure repair success without broad lossy normalization,
-- run a real single-chain autonomous finalization E2E through adoption -> moved-base source normalization/fallback when applicable -> merge -> deploy -> restart recovery -> live validation -> exactly-once success using the persisted CI/failure/rebind semantics,
+- finish Issue #156 / PR #157 by making the newly complete pytest suite hermetic, then prove one real stranded verified experiment can traverse adoption -> merge -> deploy -> live validation before enabling broader initiative work,
+- evaluate the proposed initiative tick after the integration-only E2E succeeds: stale-work detection, one-item concurrency, daily budget, priority ordering, duplicate avoidance, and useful-work rate,
+- test whether reversing current model roles improves reliability/cost: stronger external reasoning for routing/planning/review with local models focused on bounded tool/context work, rather than compensating for a 7B model owning the hardest orchestration decisions,
+- investigate checked-out-branch pollution from runtime outbox commits during feature-branch work,
+- investigate claim/heartbeat semantics before allowing more than one autonomously initiated item per tick,
 - investigate missing-capability detection and structured issue creation before automatic tool generation,
 - stronger automatic evaluation and improvement-quality-per-euro metrics,
 - automatic discovery of recurring operational problems,
@@ -693,9 +713,9 @@ Conversation-style Inbox/Outbox rendering (Issue #75), source-context hygiene (I
 
 ## Current next-step candidates
 
-1. **Real autonomous-finalization E2E:** rerun the verified feature lifecycle through later approval/rebind, exact-SHA persisted/backfilled CI reuse, moved-base source normalization/integration fallback when required, adoption, merge, deploy, restart recovery, live validation, and exactly-once final success; PR #116 remains the original unfinished smoke feature.
-2. **Failure-analysis live activation:** after deploying/restarting current `main`, reproduce a real finalization `needs_review` and verify the migrated `failure_analyses` schema exists, analysis runs, persists, and publishes exactly one correlated outbox notification.
-3. **Failure-analysis observability:** review/validate open PR #155 against the live failure path; if adopted, confirm `/logs` alone distinguishes skipped invocation, stale deployment, service/schema initialization failure, model failure, malformed output, and persistence failure.
+1. **Unblock real autonomy E2E:** finish Issue #156 / draft PR #157 by isolating the corrected pytest suite from real provider calls, get authoritative CI green, then use the semantic adoption invariant to carry one of the stranded verified experiments through adoption -> merge -> deploy -> live validation. Do not add more lifecycle semantics before this succeeds once.
+2. **Enable initiative conservatively:** after the E2E succeeds, enable the persisted initiative tick in integration-only mode first; verify stale/zombie rows do not block it, then expand from stranded verified work to labelled Issues and `new` ideas.
+3. **Failure-analysis live activation:** reproduce a real finalization `needs_review` on freshly deployed/restarted `main` and confirm the analysis schema, invocation, persistence, outbox publication, and new PR #155 lifecycle events are all visible in `/logs`.
 4. **Failure-analysis quality:** run the analyzer against several real lifecycle/tool failures and measure diagnosis accuracy, confidence calibration, useful next checks, malformed-output handling, outbox usefulness, and whether it reduces manual log/DB inspection before enabling any automatic diagnostic loop.
 5. **Restart-recovery E2E:** exercise the real Inbox refresh path with PR #124, including declared service postconditions, repeated restart/idempotence, and an inconclusive case that must remain `unknown`; then decide whether broader Issue #123 acceptance criteria need more work.
 6. **Controller JSON escaping:** reproduce the `Invalid \\escape` failure with a focused regression and harden structured-output repair or payload encoding without weakening semantic validation.
