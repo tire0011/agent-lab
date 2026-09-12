@@ -47,11 +47,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from modules.mailbox import git_push
 from modules.redaction import redact as _redact_full
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger(__name__)
+
+
+def git_push(repo_root: Any) -> bool:
+    """Push the mailbox repo, resolving ``modules.mailbox`` at call time.
+
+    Imported lazily rather than at module scope: ``modules.mailbox``'s package
+    __init__ eagerly installs the finalizing task service, which imports
+    ``modules.mailbox.task_service``, which imports this module - so importing
+    ``modules.outbox_publisher`` first raised `ImportError: cannot import name
+    'PUBLISH_PENDING_WRITE' from partially initialized module`. That made whole
+    test files uncollectable depending on import order.
+    """
+    from modules.mailbox import git_push as _git_push
+
+    return _git_push(repo_root)
 
 # ---------------------------------------------------------------------------
 # Lifecycle state constants

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from models import (
     OperationChainRequest,
@@ -122,12 +123,15 @@ class TestOperationChainService:
             time.sleep(0.01)
         mock_registry.execute.assert_called_with("local_model_status", {})
 
-    def test_max_ten_steps_limit_rejected(self, service):
-        """Test chain with >10 steps is rejected."""
+    def test_max_ten_steps_limit_rejected(self):
+        """A chain with >10 steps cannot even be constructed."""
+        # The cap lives on OperationChainRequest, so it is enforced before
+        # start_chain() is ever reached. This test used to call start_chain()
+        # and assert STATUS_REJECTED, which was unreachable - the constructor
+        # raised first. Nobody saw it: CI collected zero tests from this file.
         steps = [OperationChainStep(id=f"step{i}", action="git_status") for i in range(11)]
-        request = OperationChainRequest(steps=steps)
-        result = service.start_chain(request)
-        assert result.overall_status == STATUS_REJECTED
+        with pytest.raises(ValidationError):
+            OperationChainRequest(steps=steps)
 
     def test_forbidden_pattern_in_argument_rejected(self, service):
         """Test chain with forbidden pattern in arguments is rejected."""
@@ -337,32 +341,44 @@ class TestOperationChainService:
     def test_outbox_file_written(self, service):
         """Test that outbox file is written."""
         outbox_dir = Path(service.outbox_dir)
-        
+
         request = OperationChainRequest(
             steps=[OperationChainStep(id="step1", action="git_status")],
         )
-        
+
         result = service.start_chain(request)
-        time.sleep(1)
-        
-        # Check file was written
-        files = list(outbox_dir.glob("*operation-chain-result*"))
-        assert len(files) > 0
+
+        # The chain runs in a background thread. A flat sleep(1) was not enough
+        # on a loaded host, which is why this failed intermittently once the
+        # file started being collected at all.
+        deadline = time.time() + 15
+        files: list[Path] = []
+        while time.time() < deadline:
+            files = list(outbox_dir.glob("*operation-chain-result*"))
+            if files:
+                break
+            time.sleep(0.05)
+        assert files, f"no outbox file for chain {result.request_id}"
 
     def test_rejected_chain_has_outbox_file(self, service):
         """Test rejected chains also write outbox files."""
         outbox_dir = Path(service.outbox_dir)
-        
-        # Create invalid request
+
+        # A forbidden argument pattern is what actually produces a rejection.
+        # This test used to use an unknown action name and assert REJECTED,
+        # which contradicted test_start_chain_queued in this same file: the
+        # mock registry's _specs is empty, so "git_status" there is exactly as
+        # unknown as "git_commit" was here. Unknown actions are not rejected up
+        # front - they fail during execution.
         request = OperationChainRequest(
             steps=[
-                OperationChainStep(id="s1", action="git_commit"),  # Invalid action
+                OperationChainStep(id="s1", action="git_log", arguments={"limit": "1; rm -rf /"}),
             ]
         )
-        
+
         result = service.start_chain(request)
         assert result.overall_status == STATUS_REJECTED
-        
+
         # Check file was written
         files = list(outbox_dir.glob("*operation-chain-result*"))
         assert len(files) > 0
@@ -498,9 +514,30 @@ class TestOperationChainServiceRealRegistryIntegration:
             "problems_list": {},
             "inbox_status": {},
             "outbox_status": {},
+            "help": {},
+            "process_status": {},
         }
-        # Make sure this test tracks the real allowlist, not a stale copy.
-        assert set(action_args) == _CHAIN_OPERATION_ALLOWLIST
+        # Track the real catalog, not a stale copy. `_CHAIN_OPERATION_ALLOWLIST`
+        # used to be the source of truth here; it no longer exists anywhere in
+        # the codebase, so this assertion raised NameError on every run - which
+        # nobody saw, because CI collected zero tests from this file (it uses
+        # plain pytest classes, and CI ran `unittest discover`).
+        # The chain has no allowlist of its own: it dispatches straight through
+        # OperationsRegistry, so the catalog *is* the allowlist.
+        registry = real_registry[0]
+        catalog_names = {spec.name for spec in registry.catalog()}
+        not_exercised = {
+            # Side-effecting: pulls the mailbox repo. Running it here would
+            # mutate real state during a test.
+            "inbox_refresh",
+            # Needs a running llama-server, which CI runners do not have.
+            "local_model_status",
+        }
+        assert set(action_args) | not_exercised == catalog_names, (
+            "operations added to the registry must be exercised here or listed "
+            "as deliberately not exercised: "
+            f"{catalog_names - set(action_args) - not_exercised}"
+        )
 
         actions = list(action_args.items())
         # OperationChainRequest caps chains at 10 steps, so split into batches.
