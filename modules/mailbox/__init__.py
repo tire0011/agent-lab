@@ -90,3 +90,20 @@ from .finalizing_task_service import install as _install_finalizing_task_service
 
 _install_finalizing_task_service()
 del _install_finalizing_task_service
+
+# Install the failure-analysis diagnostics only after the finalizing mailbox
+# class is behind the historic import surface.  This instruments both direct
+# task failures and resumed/finalization paths without changing their lifecycle
+# behavior or eagerly constructing an LLM client.
+from modules.failure_analysis_observability import install as _install_failure_analysis_observability
+
+_install_failure_analysis_observability()
+del _install_failure_analysis_observability
+
+# The package import above happens before configure_logging() in the API and
+# mailbox entry points.  Patch the mailbox service constructor now so it emits
+# the startup feature-status event later, once central logging is active.
+from modules.failure_analysis_startup_observability import install as _install_failure_analysis_startup_observability
+
+_install_failure_analysis_startup_observability()
+del _install_failure_analysis_startup_observability

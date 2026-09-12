@@ -7,12 +7,14 @@ only then select an execution primitive.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
 import sqlite3
 import threading
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +126,11 @@ class MailboxTaskService:
         self._task_log_dir = task_log_dir
         self.failure_analysis_service = failure_analysis_service
         self._owns_failure_analysis_service = failure_analysis_service is None
+        self._failure_analysis_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="failure-analysis"
+        )
+        self._failure_analysis_futures: set[Future[Any]] = set()
+        self._failure_analysis_futures_lock = threading.Lock()
         if mailbox_config is not None:
             self.outbox_dir = Path(mailbox_config.outbox_dir)
             self.repo_path = Path(mailbox_config.code_repo_path)
@@ -157,6 +164,9 @@ class MailboxTaskService:
         )
 
     def close(self) -> None:
+        # Finish queued diagnoses before closing their shared service/SQLite
+        # connection. Analysis runs outside the mailbox poll loop.
+        self._failure_analysis_executor.shutdown(wait=True)
         if self._owns_operations_registry and self.operations_registry is not None:
             close = getattr(self.operations_registry, "close", None)
             if close:
@@ -176,6 +186,35 @@ class MailboxTaskService:
             except Exception:
                 logger.exception("mailbox_task: failed closing failure analysis service")
         self._conn.close()
+
+    def _schedule_failure_analysis(self, callback: Any, *args: Any) -> None:
+        """Queue best-effort diagnosis without blocking the mailbox poll loop."""
+        context = contextvars.copy_context()
+        try:
+            future = self._failure_analysis_executor.submit(context.run, callback, *args)
+        except RuntimeError:
+            logger.warning("mailbox_task: failure analysis skipped because service is closing")
+            return
+        with self._failure_analysis_futures_lock:
+            self._failure_analysis_futures.add(future)
+        future.add_done_callback(self._failure_analysis_done)
+
+    def _failure_analysis_done(self, future: Future[Any]) -> None:
+        with self._failure_analysis_futures_lock:
+            self._failure_analysis_futures.discard(future)
+        try:
+            future.result()
+        except Exception:
+            logger.exception("mailbox_task: background failure analysis crashed")
+
+    def _wait_for_failure_analyses(self, timeout: float | None = None) -> bool:
+        """Wait for already queued diagnoses; used by shutdown and tests."""
+        with self._failure_analysis_futures_lock:
+            pending = tuple(self._failure_analysis_futures)
+        if not pending:
+            return True
+        _done, not_done = wait(pending, timeout=timeout)
+        return not not_done
 
     def _failure_analysis(self, *, context: str | None = None) -> Any | None:
         """Lazily-built :class:`FailureAnalysisService`, or ``None`` if unavailable (#145).
@@ -806,7 +845,9 @@ class MailboxTaskService:
                 experiment_id=getattr(exp, "id", None),
             )
             self._write_problem(approval, new_status, summary, exp)
-            self._analyze_task_failure(approval, new_status, exp)
+            self._schedule_failure_analysis(
+                self._analyze_task_failure, approval, new_status, exp
+            )
         else:
             task_log.info(
                 "queued", "task_completed", f"mailbox task reached terminal status {new_status}",

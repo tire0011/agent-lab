@@ -221,7 +221,12 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
             self._conn.commit()
         if status == _base._STATUS_NEEDS_REVIEW:
             self._write_problem(approval, status, summary, exp)
-            self._analyze_finalization_failure(approval, exp, finalization_summary)
+            self._schedule_failure_analysis(
+                self._analyze_finalization_failure,
+                approval,
+                exp,
+                finalization_summary,
+            )
 
 
 def install() -> None:
