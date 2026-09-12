@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -11,6 +12,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from modules.run_store import DEFAULT_DB_PATH, init_db
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -75,6 +78,28 @@ class NexusTaskStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_nexus_task_events_session
                     ON nexus_task_events(session_id, id);
+
+                -- One row per controller turn (#158). Until this existed the
+                -- only record of which model actually decided a turn was a log
+                -- line, so answering "how often does the local controller
+                -- handle a turn, and does it produce a usable decision" meant
+                -- grepping the systemd journal - retention-bound, unqueryable
+                -- from the API, and impossible to separate from test runs.
+                CREATE TABLE IF NOT EXISTS nexus_controller_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    provider_used TEXT NOT NULL,
+                    escalated INTEGER NOT NULL,
+                    prompt_chars INTEGER NULL,
+                    safe_local_budget_chars INTEGER NULL,
+                    outcome TEXT NOT NULL,
+                    detail TEXT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_nexus_controller_turns_session
+                    ON nexus_controller_turns(session_id, id);
+                CREATE INDEX IF NOT EXISTS idx_nexus_controller_turns_created
+                    ON nexus_controller_turns(created_at);
                 """
             )
 
@@ -289,6 +314,72 @@ class NexusTaskStore:
             )
             used += event_cost
         return list(reversed(newest_first))
+
+    def record_controller_turn(
+        self,
+        session_id: str,
+        *,
+        provider_used: str,
+        outcome: str,
+        prompt_chars: int | None = None,
+        safe_local_budget_chars: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Persist what decided one controller turn, and what came of it.
+
+        Recording is best-effort on purpose: instrumentation must never be the
+        reason a turn fails.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO nexus_controller_turns (
+                        session_id, created_at, provider_used, escalated,
+                        prompt_chars, safe_local_budget_chars, outcome, detail
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        _now(),
+                        str(provider_used)[:64],
+                        0 if provider_used == "local" else 1,
+                        prompt_chars,
+                        safe_local_budget_chars,
+                        str(outcome)[:64],
+                        str(detail)[:500] if detail else None,
+                    ),
+                )
+                self._conn.commit()
+        except Exception:  # noqa: BLE001 - never break a turn to record it
+            logger.exception("failed to record controller turn for %s", session_id)
+
+    def controller_turn_stats(self, since: str | None = None) -> dict[str, Any]:
+        """Aggregate the question this table exists to answer."""
+        where, params = ("WHERE created_at >= ?", (since,)) if since else ("", ())
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT provider_used, escalated, outcome, COUNT(*) AS n
+                FROM nexus_controller_turns {where}
+                GROUP BY provider_used, escalated, outcome
+                """,
+                params,
+            ).fetchall()
+        total = sum(int(r["n"]) for r in rows)
+        escalated = sum(int(r["n"]) for r in rows if int(r["escalated"]))
+        by_outcome: dict[str, int] = {}
+        by_provider: dict[str, int] = {}
+        for r in rows:
+            by_outcome[str(r["outcome"])] = by_outcome.get(str(r["outcome"]), 0) + int(r["n"])
+            by_provider[str(r["provider_used"])] = by_provider.get(str(r["provider_used"]), 0) + int(r["n"])
+        return {
+            "total_turns": total,
+            "escalated_turns": escalated,
+            "escalation_rate": round(escalated / total, 4) if total else 0.0,
+            "by_provider": by_provider,
+            "by_outcome": by_outcome,
+        }
 
     def set_status(self, session_id: str, status: str) -> None:
         with self._lock:

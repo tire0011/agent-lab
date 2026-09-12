@@ -800,12 +800,17 @@ class TestSecurityRejections(unittest.TestCase):
         self.assertEqual(row["publish_status"], PUBLISH_FAILED)
 
     def test_path_traversal_rejected(self):
-        for bad in [
+        # The id used to be derived from `abs(hash(bad)) % 10000`. Python
+        # randomises string hashes per process, so on an unlucky seed two of
+        # these three paths landed in the same bucket and the second insert hit
+        # `UNIQUE constraint failed: operation_chains.request_id`. The loop
+        # index is what the id actually needs to be: distinct and stable.
+        for index, bad in enumerate([
             "communication/outbox/../../README.md",
             "/etc/passwd",
             "communication/inbox/x.md",
-        ]:
-            rid = f"traversal-{abs(hash(bad)) % 10000}"
+        ]):
+            rid = f"traversal-{index}"
             _insert_chain(self.db, rid, bad)
             pub = OperationChainOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
             try:

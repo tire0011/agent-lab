@@ -17,6 +17,8 @@ from pathlib import Path
 
 from modules.central_logging import (
     DEFAULT_LOG_DIR,
+    FALLBACK_LOG_DIR,
+    resolve_log_dir,
     MAX_STDERR_CHARS,
     MAX_STDOUT_CHARS,
     ExperimentLogger,
@@ -393,7 +395,16 @@ class ExperimentLoggerReadPathTests(unittest.TestCase):
         self.assertEqual([e["event"] for e in limited], ["e7", "e8", "e9"])
 
     def test_default_log_dir_is_plain_relative_path(self):
-        self.assertEqual(DEFAULT_LOG_DIR, "state/experiment-logs")
+        # Unchanged guarantee: with nothing configured the default stays a
+        # plain relative path, so a fresh checkout needs no setup.
+        self.assertEqual(resolve_log_dir({}), "state/experiment-logs")
+        self.assertEqual(FALLBACK_LOG_DIR, "state/experiment-logs")
+
+    def test_log_dir_is_overridable(self):
+        # Without an override the suite writes into the production log
+        # directory, which is how test data got mixed into real history.
+        self.assertEqual(resolve_log_dir({"AGENT_LOG_DIR": "/tmp/elsewhere"}), "/tmp/elsewhere")
+        self.assertEqual(resolve_log_dir({"AGENT_LOG_DIR": "  "}), "state/experiment-logs")
 
 
 class ReadAllLogEntriesTests(unittest.TestCase):

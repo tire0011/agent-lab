@@ -46,7 +46,28 @@ except ImportError:  # pragma: no cover - Windows development fallback
 
 logger = logging.getLogger("nexus.experiment")
 
-DEFAULT_LOG_DIR = "state/experiment-logs"
+FALLBACK_LOG_DIR = "state/experiment-logs"
+
+
+def resolve_log_dir(env: dict[str, str] | None = None) -> str:
+    """Where experiment logs are written.
+
+    Configurable for the same reason AGENT_DB_PATH is: a bare relative path
+    means every process that imports this module writes into whatever
+    ``state/experiment-logs`` resolves to from its working directory. The test
+    suite did exactly that - a run dropped its files into the production
+    directory (116 MB, 5203 files), mixing test turns into real history. That
+    is how a first pass at measuring controller escalation for #158 reported
+    test numbers as if they were production.
+
+    The default stays a plain relative path so a fresh checkout works with no
+    configuration; only an explicit ``AGENT_LOG_DIR`` overrides it.
+    """
+    source = os.environ if env is None else env
+    return (source.get("AGENT_LOG_DIR") or "").strip() or FALLBACK_LOG_DIR
+
+
+DEFAULT_LOG_DIR = resolve_log_dir()
 
 # Prefix used for the durable, pre-experiment mailbox task log file
 # (``<log_dir>/task-<mailbox_task_id>.jsonl``), so a single directory
