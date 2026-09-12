@@ -186,6 +186,32 @@
     once only the oldest is resumed and the rest are flagged for review
     rather than left to fight over the adoption lock.
 
+### 9) Initiative tick (self-directed work selection)
+
+- Modules: `modules/nexus_initiative.py`, CLI entry point `nexus_tick.py`,
+  units `deploy/nexus-tick.{service,timer}` (every 15 min)
+- This is the step that makes Nexus self-directed rather than purely
+  reactive. Every other entry point waits to be asked; this one inspects
+  Nexus's own state and starts one piece of work.
+- Per tick: refuse if anything is genuinely running → refuse if the daily
+  budget is spent → collect dispatchable candidates → take the first →
+  persist the decision → dispatch. Persisting *before* dispatch means a
+  crash mid-dispatch leaves a record of intent, not a silent gap.
+- Priority: `integration_backlog` (succeeded experiments whose adoption is
+  `not_started`/`needs_review`/`interrupted`, dispatched to
+  `ExperimentAdoptionService.start_adoption`) → `open_issue` (open GitHub
+  issues labelled `nexus`, via `NexusControllerService.handle_issue`) →
+  `new_idea` (IDEAS.md entries in state `new`, via `handle_idea`).
+- Bounds: one item per tick; `NEXUS_INITIATIVE_DAILY_BUDGET` (default 8) per
+  24h; issues require the `nexus` label. `--integration-only` builds no LLM
+  controller at all and drains only already-verified work.
+- Staleness: a row in a running state counts as busy only while it is newer
+  than `NEXUS_INITIATIVE_STALE_AFTER_SECONDS` (default 2h). Older rows are
+  reported through `abandoned_work()` and otherwise ignored — see D-017.
+- Audit: `nexus_initiative_log` records every tick (decision, chosen source,
+  reason, what else was considered, failure detail), readable via
+  `NexusInitiativeService.history()`.
+
 ## Near-term target architecture (planned, not complete)
 
 1. **V1 MCP agent path**
