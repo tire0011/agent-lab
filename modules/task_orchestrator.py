@@ -205,6 +205,14 @@ class ControllerBudgetExceededError(TaskOrchestratorError):
     """
 
 
+# A bare hex run is only a *candidate* experiment id: commit shas and dates match
+# it too, so every candidate is resolved against the experiment service before it
+# is treated as one (#164 review).
+_EXPERIMENT_ID_PATTERN = re.compile(r"\b[0-9a-f]{8,32}\b", re.IGNORECASE)
+_MAX_EXPERIMENT_ID_CANDIDATES = 5
+_RESUME_INTENT_PATTERN = re.compile(r"\b(resume|continue|continuing)\b", re.IGNORECASE)
+
+
 class NexusTaskOrchestrator:
     """Persistent local-LLM controller that chooses Nexus's next action."""
 
@@ -529,6 +537,61 @@ class NexusTaskOrchestrator:
                         f"retry also failed: {correction_error}"
                     ) from correction_error
             action = str(decision.get("action", "")).strip().lower()
+            # What the controller itself chose. A redirect below may change the
+            # action this turn executes, but the turn record has to keep saying
+            # which decision the model actually produced (#158).
+            controller_action = action
+            turn_detail: str | None = None
+            terminal_not_found = (
+                self._terminal_not_found_observation(
+                    str(decision.get("goal", "")).strip(), observations, state_token
+                )
+                if action == TOOL_FIND_TOOL
+                else None
+            )
+            resume_experiment_id = str(
+                (terminal_not_found or {}).get("resume_experiment_id") or ""
+            )
+            if terminal_not_found is not None and resume_experiment_id:
+                # The lookup is terminal and the resolver already established -
+                # against the experiment service, not against a regex - which
+                # experiment this task is about. Go there directly instead of
+                # letting the controller ask the same dead question again.
+                turn_detail = (
+                    f"repeated terminal {TOOL_FIND_TOOL} lookup redirected to "
+                    f"{ACTION_RESUME_EXPERIMENT} ({resume_experiment_id})"
+                )
+                logger.info(
+                    "find_tool terminal not_found redirected session_id=%s goal=%s "
+                    "next_action=%s experiment_id=%s",
+                    session.id,
+                    str(decision.get("goal", ""))[:500],
+                    ACTION_RESUME_EXPERIMENT,
+                    resume_experiment_id,
+                )
+                self.task_store.append_event(
+                    session.id,
+                    role="system",
+                    kind="find_tool_redirected",
+                    content=turn_detail,
+                    metadata={
+                        "controller_action": controller_action,
+                        "controller_reason": str(decision.get("reason", ""))[:1000],
+                        "goal": str(decision.get("goal", ""))[:500],
+                        "experiment_id": resume_experiment_id,
+                    },
+                )
+                decision = {
+                    "action": ACTION_RESUME_EXPERIMENT,
+                    "experiment_id": resume_experiment_id,
+                    "message": "",
+                    "reason": (
+                        "identical find_tool lookup was terminal after not_found; "
+                        "using the surfaced resume_experiment capability instead"
+                    ),
+                }
+                action = ACTION_RESUME_EXPERIMENT
+                terminal_not_found = None
             # One durable row per turn (#158). Which model decided this turn was
             # previously recoverable only from a log line, so the question "does
             # the local controller produce usable decisions" could not be
@@ -536,9 +599,10 @@ class NexusTaskOrchestrator:
             self.task_store.record_controller_turn(
                 session.id,
                 provider_used=provider_used,
-                outcome=action or "unparsed",
+                outcome=controller_action or "unparsed",
                 prompt_chars=len(prompt),
                 safe_local_budget_chars=budget_plan.safe_local_budget_chars,
+                detail=turn_detail,
             )
             if action in _ORCHESTRATOR_TOOLS:
                 execution_decision = self._action_to_tool_decision(decision)
@@ -564,6 +628,15 @@ class NexusTaskOrchestrator:
                 )
                 if not check.allowed:
                     observation = check.observation or {"event": "duplicate_tool_call"}
+                    if terminal_not_found is not None:
+                        # The guard already refuses the repeat and counts it, so
+                        # pre-empting it would only hide the repeat from the
+                        # budget that is supposed to end this loop. Make its
+                        # verdict actionable instead (#164).
+                        observation = {
+                            **observation,
+                            **self._terminal_not_found_guidance(terminal_not_found),
+                        }
                     logger.warning(
                         "tool loop detected session_id=%s signature=%s previous_call_id=%s recovery=%s",
                         session.id,
@@ -596,11 +669,20 @@ class NexusTaskOrchestrator:
                         )
                 else:
                     execution_decision["session_id"] = session.id
+                    # find_tool decides its not_found guidance from what this
+                    # task is about, so it needs the task itself.
+                    execution_decision["current_task"] = task
                     observation = await self._execute_tool(
                         execution_decision,
                         budget_plan=budget_plan,
                         task_logger=task_logger,
                     )
+                    if (
+                        tool == TOOL_FIND_TOOL
+                        and observation.get("status") == "not_found"
+                    ):
+                        observation = dict(observation)
+                        observation["state_token"] = state_token
                     self.loop_guard.record_result(check.call_id, observation)
                 event_id = self.task_store.append_event(
                     session.id,
@@ -987,11 +1069,124 @@ Rules:
             )
         return _TOOL_ACCURACY_UNKNOWN
 
+    def _resolvable_experiment_ids(self, text: str) -> list[str]:
+        """Hex-looking tokens in ``text`` that are actually experiments.
+
+        "Looks like hex" is not an identity. A commit sha matches the same
+        pattern, and so does a date like ``20260913``; handing one to
+        ``resume_experiment`` turns an ordinary task ("continue reviewing the
+        regression from commit 4f1b3f2a") into ``unknown experiment``. Only ids
+        the experiment service can actually resolve count as experiment ids.
+
+        Resolution is bounded: a pathological input full of hex tokens must not
+        turn one lookup into dozens of database queries.
+        """
+        resolved: list[str] = []
+        candidates = list(dict.fromkeys(_EXPERIMENT_ID_PATTERN.findall(text)))
+        for candidate in candidates[:_MAX_EXPERIMENT_ID_CANDIDATES]:
+            try:
+                experiment = self.experiment_service.resolve_experiment(candidate)
+            except Exception:  # noqa: BLE001 - unknown id, not an error here
+                continue
+            experiment_id = str(getattr(experiment, "id", "") or "").strip()
+            # The resolved id has to look like one too: a service that answers
+            # every lookup (a stub, a stale cache) must not be able to turn a
+            # commit sha into an "experiment" by returning something arbitrary.
+            if not _EXPERIMENT_ID_PATTERN.fullmatch(experiment_id):
+                continue
+            if experiment_id not in resolved:
+                resolved.append(experiment_id)
+        return resolved
+
+    def _find_tool_not_found_metadata(
+        self,
+        task_text: str,
+        goal: str,
+        related_operations: list[str],
+    ) -> dict[str, Any]:
+        """What the controller can do instead, for this task and this goal.
+
+        Deliberately scoped to the current task and lookup rather than to the
+        session's history: an experiment id and the word "resume" left over
+        from an earlier, unrelated request say nothing about what this task
+        needs, and offering a direct capability on that basis points the
+        controller at someone else's work.
+        """
+        context_text = " ".join(part for part in (task_text or "", goal or "") if part)
+        experiment_ids = self._resolvable_experiment_ids(context_text)
+        resume_relevant = bool(_RESUME_INTENT_PATTERN.search(context_text))
+        direct_capabilities = (
+            [ACTION_RESUME_EXPERIMENT]
+            if len(experiment_ids) == 1 and resume_relevant
+            else []
+        )
+        if ACTION_RESUME_EXPERIMENT in direct_capabilities:
+            recommended_next_action = ACTION_RESUME_EXPERIMENT
+        elif related_operations:
+            recommended_next_action = "resolve_related_operation"
+        else:
+            recommended_next_action = ACTION_MISSING_CAPABILITY
+        metadata: dict[str, Any] = {
+            "retryable": False,
+            "related_operations": list(related_operations),
+            "direct_capabilities": direct_capabilities,
+            "recommended_next_action": recommended_next_action,
+        }
+        if direct_capabilities:
+            # The id the capability was offered for, already resolved. Whoever
+            # acts on it must not have to guess which token was meant, and must
+            # never re-derive it from different text.
+            metadata["resume_experiment_id"] = experiment_ids[0]
+        return metadata
+
+    @staticmethod
+    def _terminal_not_found_observation(
+        goal: str,
+        observations: list[dict[str, Any]],
+        state_token: str,
+    ) -> dict[str, Any] | None:
+        """The terminal ``not_found`` this exact lookup already produced, if any."""
+        return next(
+            (
+                observation
+                for observation in reversed(observations)
+                if observation.get("tool") == TOOL_FIND_TOOL
+                and observation.get("status") == "not_found"
+                and observation.get("retryable") is False
+                and observation.get("state_token") == state_token
+                and str(observation.get("goal", "")).strip() == goal
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
+        """Turn a refused repeat into an answer the controller can act on.
+
+        The loop guard says "you already called this"; on its own that leaves
+        the controller to guess what else to do, which is how the loop in #164
+        kept going. This carries the terminal lookup's alternatives back.
+        """
+        return {
+            "status": "not_found",
+            "retryable": False,
+            "goal": str(prior.get("goal", "")),
+            "related_tools": list(prior.get("related_tools") or []),
+            "related_operations": list(prior.get("related_operations") or []),
+            "direct_capabilities": list(prior.get("direct_capabilities") or []),
+            "recommended_next_action": prior.get("recommended_next_action"),
+            "reason": (
+                "An identical find_tool lookup already returned not_found "
+                "without a relevant state change."
+            ),
+        }
+
     async def _resolve_find_tool(
         self,
         goal: str,
         *,
         session_id: str,
+        current_task: str = "",
         budget_plan: PromptBudgetPlan | None = None,
         task_logger: Any | None = None,
         expected_operation: str | None = None,
@@ -1044,6 +1239,7 @@ Rules:
                 "goal": clean_goal,
                 "reason": "No read-only OperationsRegistry candidate matched the requested capability.",
                 "related_tools": [],
+                **self._find_tool_not_found_metadata(current_task, clean_goal, []),
                 "metrics": {
                     "candidate_count": 0,
                     "candidate_operations": [],
@@ -1193,6 +1389,11 @@ Rules:
             "error": final_error,
             "guidance": final_guidance,
             "related_tools": related_tools,
+            **(
+                self._find_tool_not_found_metadata(current_task, clean_goal, related_tools)
+                if final_status == "not_found"
+                else {}
+            ),
             "metrics": {
                 "candidate_count": len(candidates),
                 "candidate_operations": [spec.name for spec in candidates],
@@ -1228,7 +1429,8 @@ Rules:
                 "description": (
                     "Resolve one needed read-only Nexus operation by goal. Returns either "
                     "one full operation schema, invalid_goal for placeholder/generic requests, "
-                    "or structured not_found; it never implements missing tools."
+                    "or actionable non-retryable not_found with related operations and direct "
+                    "controller capabilities; it never implements missing tools."
                 ),
                 "arguments": {"goal": "run a shell command in the repository"},
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
@@ -1377,6 +1579,7 @@ Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
 - Use find_tool when you need an OperationsRegistry capability that has not already been resolved in this session; then invoke only the returned identifier with call_tool. Never guess concrete tool names.
+- A find_tool observation with status=not_found and retryable=false is terminal for that exact goal while state is unchanged. Never repeat the identical lookup. Prefer its direct_capabilities/recommended_next_action, resolve a more specific related operation, use command/python_run, or choose missing_capability. related_operations are suggestions only and are not call_tool grants.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
@@ -1610,6 +1813,7 @@ Rules:
             return await self._resolve_find_tool(
                 str(decision.get("goal", "")).strip(),
                 session_id=str(decision.get("session_id", "")),
+                current_task=str(decision.get("current_task", "")),
                 budget_plan=budget_plan,
                 task_logger=task_logger,
             )
