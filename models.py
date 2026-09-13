@@ -752,6 +752,41 @@ class FailureAnalysisEntry(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
+class NexusSessionClaim(BaseModel):
+    """One claimed unit of controller work and how alive it looks (#162)."""
+
+    session_id: str
+    source_type: str
+    source_id: str | None = None
+    title: str | None = None
+    status: str
+    worker_id: str | None = None
+    claimed_at: str | None = None
+    last_heartbeat_at: str | None = None
+    heartbeat_age_seconds: float | None = None
+    stale: bool = False
+
+
+class NexusLivenessResponse(BaseModel):
+    """Heartbeat/liveness state, so "is this still running?" is answerable.
+
+    ``unclaimed_working_sessions`` counts rows in a working status that carry
+    no heartbeat at all - pre-heartbeat rows, or a caller that never claimed
+    its work. They are reported rather than hidden: that gap is precisely what
+    heartbeats exist to close.
+    """
+
+    generated_at: str
+    stale_after_seconds: int
+    heartbeat_interval_seconds: int
+    live_claims: int
+    stale_claims: int
+    unclaimed_working_sessions: int
+    resting_statuses: list[str] = Field(default_factory=list)
+    counts_by_status: dict[str, int] = Field(default_factory=dict)
+    claims: list[NexusSessionClaim] = Field(default_factory=list)
+
+
 class FailureAnalysesResponse(BaseModel):
     count: int
     analyses: list[FailureAnalysisEntry]

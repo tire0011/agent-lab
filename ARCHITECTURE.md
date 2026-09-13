@@ -212,6 +212,35 @@
   reason, what else was considered, failure detail), readable via
   `NexusInitiativeService.history()`.
 
+### 10) Work heartbeats (explicit liveness)
+
+- Modules: `modules/heartbeat.py` (shared semantics), persistence in
+  `modules/nexus_task_store.py`, refreshed by `modules/task_orchestrator.py`
+- Answers "is this work still owned by a live worker?" without overloading
+  `updated_at`. A controller turn claims its session (`worker_id`,
+  `claimed_at`), a background thread refreshes `last_heartbeat_at` every
+  `NEXUS_HEARTBEAT_INTERVAL_SECONDS` (default 30) while the turn runs, and
+  the turn releases the claim with an explicit `terminal_reason` when it
+  ends.
+- A heartbeat updates `last_heartbeat_at` only. `updated_at` keeps meaning
+  "the session changed", so a heartbeat can never disguise a dead turn as
+  recent activity.
+- Stale claims: a claim quiet for longer than
+  `NEXUS_STALE_HEARTBEAT_SECONDS` (default 15 min, clamped to a safe floor)
+  is reconciled to `abandoned` with `terminal_reason=heartbeat_timeout`, once
+  - reconciliation clears the heartbeat it selects on, so repeating it is a
+  no-op. Run at API startup and on every `nexus_tick`. It never resumes the
+  work.
+- Resting states (`waiting_for_user`, `blocked_missing_capability`) have no
+  owner by design and are never reaped. `waiting_for_llm` is not resting: the
+  worker is blocked on its own inference job and keeps beating.
+- Sessions that never claimed (rows predating this, or a caller that does not
+  claim) still fall back to the six-hour `updated_at` reaper from #160, and
+  are counted separately so the gap stays visible.
+- Inspection: `GET /diagnostics/nexus/liveness` (API key) reports every
+  claim with its owner, heartbeat age and staleness, plus status counts. It
+  reports only - it never reaps.
+
 ## Near-term target architecture (planned, not complete)
 
 1. **V1 MCP agent path**

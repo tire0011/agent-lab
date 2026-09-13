@@ -11,9 +11,28 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from modules.heartbeat import (
+    heartbeat_age_seconds,
+    is_stale,
+    resolve_interval,
+    resolve_stale_timeout,
+)
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger(__name__)
+
+# Statuses in which a live worker is supposed to be driving the session. Only
+# these can go stale: everything else is either finished or deliberately at
+# rest.
+WORKING_STATUSES: tuple[str, ...] = ("active", "queued", "waiting_for_llm")
+
+# Intentional resting states. A session waiting for a human reply, or blocked
+# on a capability nobody has built yet, has no worker by design - silence there
+# is correct, not death (#162).
+RESTING_STATUSES: tuple[str, ...] = ("waiting_for_user", "blocked_missing_capability")
+
+STATUS_ABANDONED = "abandoned"
+TERMINAL_REASON_HEARTBEAT_TIMEOUT = "heartbeat_timeout"
 
 
 def _now() -> str:
@@ -37,6 +56,10 @@ class NexusTaskSession:
     status: str
     created_at: str
     updated_at: str
+    worker_id: str | None = None
+    claimed_at: str | None = None
+    last_heartbeat_at: str | None = None
+    terminal_reason: str | None = None
 
 
 class NexusTaskStore:
@@ -102,6 +125,28 @@ class NexusTaskStore:
                     ON nexus_controller_turns(created_at);
                 """
             )
+            self._migrate_heartbeat_columns()
+
+    def _migrate_heartbeat_columns(self) -> None:
+        """Add the explicit ownership/liveness columns (#162).
+
+        ``updated_at`` moves whenever anything touches the row, which is why it
+        was never a usable liveness signal. These columns say instead who
+        claimed the work, since when, when that worker last reported itself
+        alive, and how the claim ended.
+        """
+        existing = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(nexus_task_sessions)")
+        }
+        for column in ("worker_id", "claimed_at", "last_heartbeat_at", "terminal_reason"):
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE nexus_task_sessions ADD COLUMN {column} TEXT NULL"
+                )
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_nexus_task_heartbeat
+                   ON nexus_task_sessions(status, last_heartbeat_at)"""
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -390,9 +435,13 @@ class NexusTaskStore:
         database 17 of 41 sessions ever started were in that state, untouched
         for 8 to 19 days, with nothing reaping or reporting them.
 
-        Liveness is inferred from ``updated_at`` because there is no heartbeat
-        (see #158). The threshold therefore has to sit well clear of a slow but
-        healthy turn.
+        This is the legacy, pre-heartbeat safety net and only covers sessions
+        that never reported a heartbeat at all: rows written before #162, or by
+        a caller that does not claim its work. Liveness there can only be
+        inferred from ``updated_at``, so the threshold has to sit well clear of
+        a slow but healthy turn. Claimed work is governed by
+        ``reconcile_stale_heartbeats`` instead, which is both faster and
+        honest about what it measures.
         """
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=max(60, older_than_seconds))
@@ -401,7 +450,9 @@ class NexusTaskStore:
             rows = self._conn.execute(
                 """
                 SELECT * FROM nexus_task_sessions
-                WHERE status IN ('active', 'queued') AND updated_at < ?
+                WHERE status IN ('active', 'queued')
+                  AND last_heartbeat_at IS NULL
+                  AND updated_at < ?
                 ORDER BY updated_at
                 """,
                 (cutoff,),
@@ -430,6 +481,227 @@ class NexusTaskStore:
             )
         return stale
 
+    # ------------------------------------------------------------------
+    # Explicit ownership and liveness (#162)
+    #
+    # The contract: a worker claims a session before it starts driving it,
+    # refreshes ``last_heartbeat_at`` while it is alive, and releases the claim
+    # with an explicit terminal reason when the turn ends. A claim whose
+    # heartbeats stopped is reconciled to ``abandoned`` - not because the row
+    # is old, but because the worker responsible for it stopped saying it was
+    # alive.
+    # ------------------------------------------------------------------
+
+    def claim_session(self, session_id: str, *, worker_id: str) -> bool:
+        """Record who owns this session now, and start its heartbeat.
+
+        Claiming is deliberately unconditional: the controller runs one turn
+        per session at a time today, and a restarted worker must be able to
+        take over its own abandoned session. It is the claim *identity* that
+        makes a takeover observable, and ``heartbeat`` that stops the previous
+        owner from keeping a claim it no longer holds alive.
+        """
+        now = _now()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE nexus_task_sessions
+                   SET worker_id=?, claimed_at=?, last_heartbeat_at=?,
+                       terminal_reason=NULL, updated_at=?
+                   WHERE id=?""",
+                (str(worker_id)[:128], now, now, now, session_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def heartbeat(self, session_id: str, *, worker_id: str) -> bool:
+        """Report the owning worker alive. Returns False if the claim is gone.
+
+        Only ``last_heartbeat_at`` moves: ``updated_at`` keeps meaning "the
+        session changed", so a heartbeat never disguises a dead turn as recent
+        activity. The ``worker_id`` guard means a worker whose claim was reaped
+        or taken over cannot resurrect it by continuing to beat.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE nexus_task_sessions
+                   SET last_heartbeat_at=?
+                   WHERE id=? AND worker_id=?""",
+                (_now(), session_id, str(worker_id)[:128]),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def release_claim(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        worker_id: str | None = None,
+    ) -> bool:
+        """End a claim with an explicit outcome instead of letting it go quiet.
+
+        The owner is kept for observability ("who ran this"); the heartbeat is
+        cleared so a finished session can never be mistaken for a live one, and
+        so reconciliation has nothing left to reap.
+        """
+        params: list[Any] = [str(reason)[:200], _now(), session_id]
+        clause = ""
+        if worker_id is not None:
+            clause = " AND worker_id=?"
+            params.append(str(worker_id)[:128])
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""UPDATE nexus_task_sessions
+                    SET last_heartbeat_at=NULL, terminal_reason=?, updated_at=?
+                    WHERE id=?{clause}""",
+                params,
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def stale_heartbeat_sessions(
+        self, stale_after_seconds: object = None
+    ) -> list[NexusTaskSession]:
+        """Claimed working sessions whose worker stopped reporting itself alive.
+
+        Resting and terminal statuses are excluded by construction: they have
+        no worker to declare dead. Sessions that never heartbeat are excluded
+        too - there is no claim to reconcile - and remain the legacy
+        ``stale_sessions`` path's problem.
+        """
+        timeout = resolve_stale_timeout(stale_after_seconds)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=timeout)
+        ).isoformat()
+        placeholders = ",".join("?" for _ in WORKING_STATUSES)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM nexus_task_sessions
+                WHERE status IN ({placeholders})
+                  AND worker_id IS NOT NULL
+                  AND last_heartbeat_at IS NOT NULL
+                  AND last_heartbeat_at < ?
+                ORDER BY last_heartbeat_at
+                """,
+                (*WORKING_STATUSES, cutoff),
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def reconcile_stale_heartbeats(
+        self, stale_after_seconds: object = None
+    ) -> list[NexusTaskSession]:
+        """Give abandoned claims an explicit terminal outcome, exactly once.
+
+        Idempotent by construction: reconciling clears ``last_heartbeat_at``,
+        which is the very thing ``stale_heartbeat_sessions`` selects on, so a
+        second pass over the same session finds nothing. Like #160 this never
+        re-runs the work - re-running a controller turn costs a model call and
+        may repeat whatever killed it - but unlike #160 it can act in minutes
+        rather than hours, because a missing heartbeat means something.
+        """
+        timeout = resolve_stale_timeout(stale_after_seconds)
+        stale = self.stale_heartbeat_sessions(timeout)
+        reconciled: list[NexusTaskSession] = []
+        for session in stale:
+            with self._lock:
+                cursor = self._conn.execute(
+                    """UPDATE nexus_task_sessions
+                       SET status=?, terminal_reason=?, last_heartbeat_at=NULL,
+                           updated_at=?
+                       WHERE id=? AND last_heartbeat_at IS NOT NULL""",
+                    (
+                        STATUS_ABANDONED,
+                        TERMINAL_REASON_HEARTBEAT_TIMEOUT,
+                        _now(),
+                        session.id,
+                    ),
+                )
+                self._conn.commit()
+            if cursor.rowcount == 0:
+                # Another reaper got there first; nothing to report twice.
+                continue
+            age = heartbeat_age_seconds(session.last_heartbeat_at)
+            self.append_event(
+                session.id,
+                role="system",
+                kind=TERMINAL_REASON_HEARTBEAT_TIMEOUT,
+                content=(
+                    f"Worker {session.worker_id or 'unknown'} stopped sending "
+                    f"heartbeats (last seen {session.last_heartbeat_at}, "
+                    f"{int(age or 0)}s ago, timeout {timeout}s); claim released "
+                    "and session marked abandoned."
+                ),
+                metadata={
+                    "worker_id": session.worker_id,
+                    "last_heartbeat_at": session.last_heartbeat_at,
+                    "stale_after_seconds": timeout,
+                    "terminal_reason": TERMINAL_REASON_HEARTBEAT_TIMEOUT,
+                },
+            )
+            refreshed = self.get(session.id)
+            reconciled.append(refreshed or session)
+        return reconciled
+
+    def liveness(self, stale_after_seconds: object = None) -> dict[str, Any]:
+        """What Nexus and operators need to answer "is this still alive?".
+
+        Returns every claim the store knows about together with its heartbeat
+        age, plus the working sessions that carry no claim at all - those are
+        the blind spot heartbeats exist to close, so they are counted rather
+        than hidden.
+        """
+        timeout = resolve_stale_timeout(stale_after_seconds)
+        now = datetime.now(timezone.utc)
+        placeholders = ",".join("?" for _ in WORKING_STATUSES)
+        with self._lock:
+            count_rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM nexus_task_sessions GROUP BY status"
+            ).fetchall()
+            # Only working rows can be claimed, so only they are listed: the
+            # journal grows without bound and a diagnostic must not.
+            rows = self._conn.execute(
+                f"""SELECT * FROM nexus_task_sessions
+                    WHERE status IN ({placeholders})
+                    ORDER BY last_heartbeat_at IS NULL, last_heartbeat_at""",
+                WORKING_STATUSES,
+            ).fetchall()
+        counts = {str(row["status"]): int(row["n"]) for row in count_rows}
+        claims: list[dict[str, Any]] = []
+        unclaimed = 0
+        for row in rows:
+            session = self._row(row)
+            if session.last_heartbeat_at is None:
+                unclaimed += 1
+                continue
+            age = heartbeat_age_seconds(session.last_heartbeat_at, now=now)
+            claims.append(
+                {
+                    "session_id": session.id,
+                    "source_type": session.source_type,
+                    "source_id": session.source_id,
+                    "title": session.title,
+                    "status": session.status,
+                    "worker_id": session.worker_id,
+                    "claimed_at": session.claimed_at,
+                    "last_heartbeat_at": session.last_heartbeat_at,
+                    "heartbeat_age_seconds": round(age, 3) if age is not None else None,
+                    "stale": is_stale(session.last_heartbeat_at, timeout, now=now),
+                }
+            )
+        stale_count = sum(1 for claim in claims if claim["stale"])
+        return {
+            "generated_at": now.isoformat(),
+            "stale_after_seconds": timeout,
+            "heartbeat_interval_seconds": resolve_interval(),
+            "live_claims": len(claims) - stale_count,
+            "stale_claims": stale_count,
+            "unclaimed_working_sessions": unclaimed,
+            "resting_statuses": list(RESTING_STATUSES),
+            "counts_by_status": counts,
+            "claims": claims,
+        }
+
     def set_status(self, session_id: str, status: str) -> None:
         with self._lock:
             self._conn.execute(
@@ -447,6 +719,7 @@ class NexusTaskStore:
 
     @staticmethod
     def _row(row: sqlite3.Row) -> NexusTaskSession:
+        keys = set(row.keys())
         return NexusTaskSession(
             id=row["id"],
             source_type=row["source_type"],
@@ -455,4 +728,8 @@ class NexusTaskStore:
             status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            worker_id=row["worker_id"] if "worker_id" in keys else None,
+            claimed_at=row["claimed_at"] if "claimed_at" in keys else None,
+            last_heartbeat_at=row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None,
+            terminal_reason=row["terminal_reason"] if "terminal_reason" in keys else None,
         )

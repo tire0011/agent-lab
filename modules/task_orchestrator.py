@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
+from modules.heartbeat import Heartbeat, worker_id as heartbeat_worker_id
 from modules.local_llm_jobs import LocalLlmJobError, LocalLlmJobService
 from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
@@ -311,6 +312,34 @@ class NexusTaskOrchestrator:
             title=title,
             session_id=session_id,
         )
+        # Claim the session and report this worker alive for as long as the
+        # turn runs (#162). A turn can legitimately spend minutes inside one
+        # local inference call without writing anything, so the heartbeat - not
+        # ``updated_at`` - is what says the work still has an owner. If this
+        # process dies mid-turn the beats simply stop and the session is
+        # reconciled explicitly instead of sitting `active` forever.
+        worker = heartbeat_worker_id()
+        try:
+            self.task_store.claim_session(session.id, worker_id=worker)
+        except Exception:  # noqa: BLE001 - never fail a turn over its own bookkeeping
+            logger.exception("could not claim session %s", session.id)
+        heartbeat = Heartbeat(
+            lambda: self.task_store.heartbeat(session.id, worker_id=worker),
+            name=f"nexus-heartbeat-{session.id[:8]}",
+        )
+        heartbeat.start()
+        try:
+            return await self._run_claimed(session, task, task_logger=task_logger)
+        finally:
+            heartbeat.stop()
+
+    async def _run_claimed(
+        self,
+        session: Any,
+        task: str,
+        *,
+        task_logger: Any | None = None,
+    ) -> TaskDecision:
         self.task_store.set_status(session.id, "active")
         # This event id anchors "prior" history: persisted history is never
         # re-read past this point, since every tool observation produced by
@@ -1821,6 +1850,10 @@ Rules:
             self._record_missing_capability(task, decision)
         else:
             self.task_store.set_status(session_id, "action_selected")
+        # The turn ended on purpose, so the claim ends with a stated outcome
+        # rather than by going quiet. Nothing is left for the reaper to find,
+        # and "why did this stop" is answerable from the row itself (#162).
+        self.task_store.release_claim(session_id, reason=decision.action)
 
     def _record_missing_capability(self, task: str, decision: TaskDecision) -> None:
         repo_root = getattr(self.operations_registry, "repo_root", None)

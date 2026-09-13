@@ -41,6 +41,18 @@ must also provide:
 - `GITHUB_TOKEN=<fine-grained token>` with write access to Issues, Contents and
   Pull requests. The token value must never be logged.
 
+Optional, for controller work liveness (see ARCHITECTURE.md section 10):
+
+- `NEXUS_HEARTBEAT_INTERVAL_SECONDS` (default 30) - how often a running
+  controller turn reports itself alive.
+- `NEXUS_STALE_HEARTBEAT_SECONDS` (default 900) - how long a claim may go
+  without a heartbeat before it is marked abandoned. Clamped to a safe floor:
+  zero, negative or unparsable values fall back to the default rather than
+  reaping work that is still running.
+- `NEXUS_STALE_SESSION_SECONDS` (default 6 h) - the older `updated_at`-based
+  fallback, which now only applies to sessions that never reported a
+  heartbeat at all.
+
 Both `agent-api.service` and `nexus-mailbox.service` already load this shared
 environment file. Missing configuration blocks only implementation/resume work;
 the API and read-only operations remain available and log an actionable startup
@@ -197,7 +209,13 @@ If agent/API behavior regresses:
 2. Correlate with latest `state/runs/*.json` entries.
 3. Confirm env var presence and endpoint credentials.
 4. Re-run minimal known-good task.
-5. Log findings in `IDEAS.md`/`DECISIONS.md` before broad changes.
+5. For a controller session that looks stuck, ask
+   `GET /diagnostics/nexus/liveness` (needs `x-api-key`): it names the owning
+   worker, when it last reported itself alive, and whether that claim is
+   already stale. A live heartbeat means slow, not dead; a stale one is reaped
+   at the next API start or `nexus_tick`, with `terminal_reason` recorded on
+   the session.
+6. Log findings in `IDEAS.md`/`DECISIONS.md` before broad changes.
 
 ## Maintenance API (temporary remote-maintenance bridge)
 
