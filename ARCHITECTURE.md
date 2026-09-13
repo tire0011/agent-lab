@@ -260,6 +260,38 @@
   claim with its owner, heartbeat age and staleness, plus status counts. It
   reports only - it never reaps.
 
+### 11) Local-model execution (one shared job path)
+
+- Modules: `modules/local_llm_jobs.py` (queue, worker, persistence,
+  liveness), callers `modules/task_orchestrator.py` (role `controller`,
+  `tool_resolver`) and `modules/failure_analysis_service.py` (role
+  `failure_analysis`).
+- Every feature that needs the local model submits a job and awaits it.
+  Nobody calls llama-server directly: `LlamaCppClient` is the transport the
+  job worker uses, not an interface features wire up themselves.
+- One service per database, process-wide
+  (`acquire_local_llm_job_service`/`release_local_llm_job_service`), so two
+  features cannot open two concurrent requests against a single-worker
+  llama-server. Callers that inject their own client (tests) get an isolated
+  worker instead of silently sharing someone else's.
+- Jobs are rows in `local_llm_jobs`: `role`, status, prompt/system,
+  `created_at`/`started_at`/`finished_at`, result or `error` +
+  `error_kind`, and the session they belong to. `role` is observability
+  only - it never changes how a job runs - so one feature's local-model
+  traffic can be read back without filtering another's.
+- No caller-side deadline. A waiter blocks for as long as the job legitimately
+  takes; the service's own watchdog
+  (`NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS`, default 1h, clamped 5m-2h) is the
+  HTTP read timeout, and a `running` job that outlives it by the grace window
+  is swept to `failed` with `error_kind=stuck`, which releases its waiter.
+- Terminal writes are status-guarded: a job cancelled (`cancel()`) or swept
+  as stuck while its request was still in flight stays terminal, and the late
+  result is discarded rather than resurrecting it. A process restart marks
+  orphaned `running` rows `failed` (`error_kind=interrupted`) at startup.
+- A caller that cannot get a result degrades in its own terms - failure
+  analysis persists exactly one `analysis_unavailable` record - and never
+  re-enters itself over its own failed job.
+
 ## Near-term target architecture (planned, not complete)
 
 1. **V1 MCP agent path**

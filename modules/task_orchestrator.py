@@ -23,7 +23,12 @@ from typing import Any
 
 from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
 from modules.heartbeat import Heartbeat, worker_id as heartbeat_worker_id
-from modules.local_llm_jobs import LocalLlmJobError, LocalLlmJobService
+from modules.local_llm_jobs import (
+    LocalLlmJobError,
+    LocalLlmJobService,
+    acquire_local_llm_job_service,
+    release_local_llm_job_service,
+)
 from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
@@ -244,8 +249,18 @@ class NexusTaskOrchestrator:
             max_identical_calls=max_identical_calls or int(os.environ.get("NEXUS_ORCHESTRATOR_MAX_IDENTICAL_CALLS", "3")),
             max_non_progressing_cycles=max_non_progressing_cycles or int(os.environ.get("NEXUS_ORCHESTRATOR_MAX_CYCLES", "2")),
         )
-        self.llm_jobs = llm_job_service or LocalLlmJobService(db_path=db_path, llama_client=self.llama)
+        # The shared local-LLM execution path (#167): controller inference and
+        # every other local-model caller (failure analysis included) queue on
+        # one worker per database, so they serialize instead of racing
+        # llama-server with independent requests.
+        self.llm_jobs = llm_job_service or acquire_local_llm_job_service(
+            db_path=db_path, llama_client=llama_client
+        )
         self._owns_llm_jobs = llm_job_service is None
+        if llama_client is None and llm_job_service is None:
+            # One client object for the whole process, owned by the shared
+            # job service - including its watchdog timeout.
+            self.llama = self.llm_jobs.llama
         repo_root = str(getattr(operations_registry, "repo_root", "/agent"))
         self.task_store = task_store or NexusTaskStore(db_path=db_path)
         self._owns_task_store = task_store is None
@@ -280,7 +295,7 @@ class NexusTaskOrchestrator:
     def close(self) -> None:
         self.loop_guard.close()
         if self._owns_llm_jobs:
-            self.llm_jobs.close()
+            release_local_llm_job_service(self.llm_jobs)
         if self._owns_delegation:
             self.delegation.close()
         if self._owns_memory:
@@ -884,6 +899,7 @@ class NexusTaskOrchestrator:
             max_tokens=max_tokens,
             session_id=session_id,
             response_format=response_format,
+            role=role,
         )
         self._claimed_status(session_id, waiting_status)
         try:
