@@ -27,7 +27,12 @@ from modules.local_llm_jobs import LocalLlmJobError, LocalLlmJobService
 from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
-from modules.nexus_task_store import NexusTaskStore
+from modules.nexus_task_store import (
+    STATUS_FAILED,
+    TERMINAL_REASON_TURN_CANCELLED,
+    TERMINAL_REASON_TURN_FAILED,
+    NexusTaskStore,
+)
 from modules.prompt_budget import (
     CHARS_PER_TOKEN,
     PromptBudgetPlan,
@@ -242,6 +247,18 @@ class NexusTaskOrchestrator:
             llama_client=self.llama, db_path=db_path, repo_root=repo_root
         )
         self._owns_delegation = delegation_service is None
+        # session_id -> the worker id this process currently holds the claim
+        # under. Every status write during a claimed turn is scoped to it, so a
+        # worker that was reaped or taken over stops being able to drive the
+        # session it no longer owns. One worker drives a session at a time, so
+        # a plain dict keyed by session is enough.
+        self._claims: dict[str, str] = {}
+
+    def _claimed_status(self, session_id: str, status: str) -> None:
+        """Set a status, but only while this process still owns the session."""
+        self.task_store.set_status(
+            session_id, status, worker_id=self._claims.get(session_id)
+        )
 
     def close(self) -> None:
         self.loop_guard.close()
@@ -321,6 +338,7 @@ class NexusTaskOrchestrator:
         worker = heartbeat_worker_id()
         try:
             self.task_store.claim_session(session.id, worker_id=worker)
+            self._claims[session.id] = worker
         except Exception:  # noqa: BLE001 - never fail a turn over its own bookkeeping
             logger.exception("could not claim session %s", session.id)
         heartbeat = Heartbeat(
@@ -330,8 +348,41 @@ class NexusTaskOrchestrator:
         heartbeat.start()
         try:
             return await self._run_claimed(session, task, task_logger=task_logger)
+        except asyncio.CancelledError:
+            self._abort_turn(session.id, TERMINAL_REASON_TURN_CANCELLED, "cancelled")
+            raise
+        except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
+            self._abort_turn(
+                session.id,
+                TERMINAL_REASON_TURN_FAILED,
+                f"{type(exc).__name__}: {exc}",
+            )
+            raise
         finally:
             heartbeat.stop()
+            self._claims.pop(session.id, None)
+
+    def _abort_turn(self, session_id: str, reason: str, detail: str) -> None:
+        """Record a turn that died in the open, instead of letting it go quiet.
+
+        Without this the row would keep its last status and a frozen heartbeat
+        until the reaper found it, and an outcome we actually witnessed would
+        end up recorded as ``heartbeat_timeout`` - "nobody ever told us" - which
+        is a weaker and less true fact than "this turn raised".
+        """
+        try:
+            self.task_store.finalize_turn(
+                session_id,
+                worker_id=self._claims.get(session_id),
+                status=STATUS_FAILED,
+                reason=reason,
+                event_role="system",
+                event_kind=reason,
+                event_content=f"Controller turn ended without a decision: {detail}"[:2000],
+                event_metadata={"terminal_reason": reason},
+            )
+        except Exception:  # noqa: BLE001 - the original failure is what matters
+            logger.exception("could not record failed turn for %s", session_id)
 
     async def _run_claimed(
         self,
@@ -340,7 +391,7 @@ class NexusTaskOrchestrator:
         *,
         task_logger: Any | None = None,
     ) -> TaskDecision:
-        self.task_store.set_status(session.id, "active")
+        self._claimed_status(session.id, "active")
         # This event id anchors "prior" history: persisted history is never
         # re-read past this point, since every tool observation produced by
         # this run is already tracked (and budgeted) via ``observations``
@@ -725,13 +776,13 @@ class NexusTaskOrchestrator:
             session_id=session_id,
             response_format=response_format,
         )
-        self.task_store.set_status(session_id, waiting_status)
+        self._claimed_status(session_id, waiting_status)
         try:
             return await self.llm_jobs.wait(job_id), "local"
         except LocalLlmJobError as exc:
             raise TaskOrchestratorError(f"local LLM job failed: {exc}") from exc
         finally:
-            self.task_store.set_status(session_id, "active")
+            self._claimed_status(session_id, "active")
 
     @staticmethod
     def _json_correction_prompt(
@@ -1836,24 +1887,38 @@ Rules:
         }
 
     def _persist_final(self, session_id: str, task: str, decision: TaskDecision) -> None:
-        self.task_store.append_event(
-            session_id,
-            role="assistant",
-            kind=decision.action,
-            content=decision.message or decision.reason or decision.action,
-            metadata={"reason": decision.reason, "experiment_id": decision.experiment_id, "has_command": bool(decision.command)},
-        )
         if decision.action == ACTION_CLARIFICATION:
-            self.task_store.set_status(session_id, "waiting_for_user")
+            status = "waiting_for_user"
         elif decision.action == ACTION_MISSING_CAPABILITY:
-            self.task_store.set_status(session_id, "blocked_missing_capability")
-            self._record_missing_capability(task, decision)
+            status = "blocked_missing_capability"
         else:
-            self.task_store.set_status(session_id, "action_selected")
-        # The turn ended on purpose, so the claim ends with a stated outcome
-        # rather than by going quiet. Nothing is left for the reaper to find,
-        # and "why did this stop" is answerable from the row itself (#162).
-        self.task_store.release_claim(session_id, reason=decision.action)
+            status = "action_selected"
+        # Journal, status and claim release in one ownership-scoped write. The
+        # turn ended on purpose, so the claim ends with a stated outcome rather
+        # than by going quiet - and if this worker was taken over meanwhile,
+        # none of it lands on the new owner's session (#162).
+        recorded = self.task_store.finalize_turn(
+            session_id,
+            worker_id=self._claims.get(session_id),
+            status=status,
+            reason=decision.action,
+            event_role="assistant",
+            event_kind=decision.action,
+            event_content=decision.message or decision.reason or decision.action,
+            event_metadata={
+                "reason": decision.reason,
+                "experiment_id": decision.experiment_id,
+                "has_command": bool(decision.command),
+            },
+        )
+        if not recorded:
+            logger.warning(
+                "discarding final decision for %s: the claim moved to another worker",
+                session_id,
+            )
+            return
+        if decision.action == ACTION_MISSING_CAPABILITY:
+            self._record_missing_capability(task, decision)
 
     def _record_missing_capability(self, task: str, decision: TaskDecision) -> None:
         repo_root = getattr(self.operations_registry, "repo_root", None)

@@ -32,7 +32,15 @@ WORKING_STATUSES: tuple[str, ...] = ("active", "queued", "waiting_for_llm")
 RESTING_STATUSES: tuple[str, ...] = ("waiting_for_user", "blocked_missing_capability")
 
 STATUS_ABANDONED = "abandoned"
+STATUS_FAILED = "failed"
 TERMINAL_REASON_HEARTBEAT_TIMEOUT = "heartbeat_timeout"
+
+# A turn that died in the open says so. Without this the row would stay
+# `active` with a frozen heartbeat until the reaper found it, and an outcome we
+# actually witnessed - an exception, a cancellation - would be recorded as
+# "nobody ever told us", which is a different and weaker fact.
+TERMINAL_REASON_TURN_FAILED = "turn_failed"
+TERMINAL_REASON_TURN_CANCELLED = "turn_cancelled"
 
 
 def _now() -> str:
@@ -543,6 +551,10 @@ class NexusTaskStore:
         The owner is kept for observability ("who ran this"); the heartbeat is
         cleared so a finished session can never be mistaken for a live one, and
         so reconciliation has nothing left to reap.
+
+        This is the bare primitive, for a caller that is releasing a claim and
+        nothing else. A turn that is ending uses ``finalize_turn`` instead, so
+        its journal entry, status and release cannot straddle a takeover.
         """
         params: list[Any] = [str(reason)[:200], _now(), session_id]
         clause = ""
@@ -558,6 +570,60 @@ class NexusTaskStore:
             )
             self._conn.commit()
         return cursor.rowcount > 0
+
+    def finalize_turn(
+        self,
+        session_id: str,
+        *,
+        worker_id: str | None,
+        status: str,
+        reason: str,
+        event_role: str = "assistant",
+        event_kind: str | None = None,
+        event_content: str = "",
+        event_metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """End a turn: journal it, set its status and release the claim, atomically.
+
+        One transaction, one ownership check. Split across three calls these
+        writes could straddle a takeover - the event landing in a session the
+        worker no longer owns, or the release clearing the *new* owner's
+        heartbeat - and a turn would end half in one worker's world and half in
+        another's. Returns False when the claim has already moved on, in which
+        case nothing is written at all: the session belongs to whoever holds it
+        now, and this worker's turn is over either way.
+        """
+        now = _now()
+        clause = " AND worker_id=?" if worker_id is not None else ""
+        params: list[Any] = [status[:64], str(reason)[:200], now, session_id]
+        if worker_id is not None:
+            params.append(str(worker_id)[:128])
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""UPDATE nexus_task_sessions
+                    SET status=?, terminal_reason=?, last_heartbeat_at=NULL, updated_at=?
+                    WHERE id=?{clause}""",
+                params,
+            )
+            if cursor.rowcount == 0:
+                self._conn.rollback()
+                return False
+            if event_kind:
+                self._conn.execute(
+                    """INSERT INTO nexus_task_events
+                       (session_id, role, kind, content, metadata_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        event_role[:32],
+                        event_kind[:64],
+                        event_content[:MAX_EVENT_CONTENT_CHARS],
+                        json.dumps(event_metadata or {}, separators=(",", ":")),
+                        now,
+                    ),
+                )
+            self._conn.commit()
+        return True
 
     def stale_heartbeat_sessions(
         self, stale_after_seconds: object = None
@@ -601,25 +667,45 @@ class NexusTaskStore:
         rather than hours, because a missing heartbeat means something.
         """
         timeout = resolve_stale_timeout(stale_after_seconds)
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout)).isoformat()
         stale = self.stale_heartbeat_sessions(timeout)
+        placeholders = ",".join("?" for _ in WORKING_STATUSES)
         reconciled: list[NexusTaskSession] = []
         for session in stale:
             with self._lock:
+                # Re-check every condition that made this session a candidate,
+                # inside the write. Selecting and updating are two statements,
+                # and reaping runs in a different process from the worker: if
+                # the owner beats, or a restarted worker takes the session
+                # over, in between, the row no longer matches and the write
+                # does nothing. Matching on the exact heartbeat that was
+                # selected is what makes that a compare-and-set rather than a
+                # hope.
                 cursor = self._conn.execute(
-                    """UPDATE nexus_task_sessions
-                       SET status=?, terminal_reason=?, last_heartbeat_at=NULL,
-                           updated_at=?
-                       WHERE id=? AND last_heartbeat_at IS NOT NULL""",
+                    f"""UPDATE nexus_task_sessions
+                        SET status=?, terminal_reason=?, last_heartbeat_at=NULL,
+                            updated_at=?
+                        WHERE id=?
+                          AND status IN ({placeholders})
+                          AND worker_id IS ?
+                          AND last_heartbeat_at IS ?
+                          AND last_heartbeat_at < ?""",
                     (
                         STATUS_ABANDONED,
                         TERMINAL_REASON_HEARTBEAT_TIMEOUT,
                         _now(),
                         session.id,
+                        *WORKING_STATUSES,
+                        session.worker_id,
+                        session.last_heartbeat_at,
+                        cutoff,
                     ),
                 )
                 self._conn.commit()
             if cursor.rowcount == 0:
-                # Another reaper got there first; nothing to report twice.
+                # The claim moved on between selection and now - a fresh
+                # heartbeat, a takeover, or another reaper. Either way it is
+                # not ours to end, and not ours to report.
                 continue
             age = heartbeat_age_seconds(session.last_heartbeat_at)
             self.append_event(
@@ -702,13 +788,25 @@ class NexusTaskStore:
             "claims": claims,
         }
 
-    def set_status(self, session_id: str, status: str) -> None:
+    def set_status(self, session_id: str, status: str, *, worker_id: str | None = None) -> bool:
+        """Move a session's status, optionally only while ``worker_id`` owns it.
+
+        Passing the owner makes the write a no-op once the claim has moved on,
+        so a superseded worker cannot drive the state of a session another
+        worker now holds. Callers with no claim (recovery paths, tests) omit it
+        and write unconditionally, as before.
+        """
+        clause = " AND worker_id=?" if worker_id is not None else ""
+        params: list[Any] = [status[:64], _now(), session_id]
+        if worker_id is not None:
+            params.append(str(worker_id)[:128])
         with self._lock:
-            self._conn.execute(
-                "UPDATE nexus_task_sessions SET status=?, updated_at=? WHERE id=?",
-                (status[:64], _now(), session_id),
+            cursor = self._conn.execute(
+                f"UPDATE nexus_task_sessions SET status=?, updated_at=? WHERE id=?{clause}",
+                params,
             )
             self._conn.commit()
+        return cursor.rowcount > 0
 
     def get(self, session_id: str) -> NexusTaskSession | None:
         with self._lock:

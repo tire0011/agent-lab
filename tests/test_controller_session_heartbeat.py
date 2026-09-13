@@ -10,12 +10,15 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from modules.nexus_task_store import STATUS_ABANDONED, NexusTaskStore
+from modules.nexus_task_store import (
+    STATUS_FAILED,
+    TERMINAL_REASON_TURN_FAILED,
+    NexusTaskStore,
+)
 from modules.task_orchestrator import ACTION_ANSWER, NexusTaskOrchestrator
 
 
@@ -102,7 +105,17 @@ class ControllerSessionHeartbeatTests(unittest.TestCase):
         self.assertEqual(self.store.reconcile_stale_heartbeats(60), [])
         self.assertEqual(self.store.liveness()["claims"], [])
 
-    def test_a_turn_that_crashes_stops_beating_and_is_reapable(self):
+    def _only_session_id(self) -> str:
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT id FROM nexus_task_sessions LIMIT 1").fetchone()
+        conn.close()
+        return row[0]
+
+    def test_a_turn_that_raises_records_what_happened(self):
+        # Left to the reaper this would eventually read `heartbeat_timeout` -
+        # "nobody ever told us" - when in fact we watched it fail. A process
+        # that is killed outright still falls to the reaper; an exception we
+        # caught should not.
         class _Boom:
             async def complete(self, **kwargs):
                 raise RuntimeError("local model died mid-turn")
@@ -112,28 +125,42 @@ class ControllerSessionHeartbeatTests(unittest.TestCase):
         with self.assertRaises(Exception):
             orchestrator.run("inspect something")
 
-        claims = self.store.liveness()["claims"]
-        self.assertEqual(len(claims), 1)
-        self.assertTrue(claims[0]["worker_id"])
-        # Still `active` with a frozen heartbeat - which is precisely what the
-        # reaper is for, and what `updated_at` could never tell apart from a
-        # slow healthy turn.
-        self.assertEqual(claims[0]["status"], "active")
+        session = self.store.get(self._only_session_id())
+        self.assertEqual(session.status, STATUS_FAILED)
+        self.assertEqual(session.terminal_reason, TERMINAL_REASON_TURN_FAILED)
+        self.assertIsNone(session.last_heartbeat_at)
+        events = self.store.recent_events(session.id, kind=TERMINAL_REASON_TURN_FAILED)
+        self.assertEqual(len(events), 1)
+        self.assertIn("RuntimeError", events[0]["content"])
+        # Nothing left for the reaper to find, so nothing to misclassify later.
+        self.assertEqual(self.store.liveness()["claims"], [])
+        self.assertEqual(self.store.reconcile_stale_heartbeats(60), [])
 
-        # Once the silence outlasts the timeout, the claim is reconciled.
-        session_id = claims[0]["session_id"]
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            "UPDATE nexus_task_sessions SET last_heartbeat_at=? WHERE id=?",
-            ((datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(), session_id),
+    def test_a_turn_taken_over_mid_flight_cannot_write_its_own_ending(self):
+        # A restarted worker claims the session while this turn is still
+        # thinking. Everything the old turn writes afterwards - its status
+        # flips, its decision, its claim release - must miss.
+        taken_over: list[str] = []
+
+        def take_over() -> None:
+            session_id = self._only_session_id()
+            self.store.claim_session(session_id, worker_id="worker-restarted")
+            taken_over.append(session_id)
+
+        orchestrator = self._orchestrator(
+            _Client(['{"action":"answer","message":"done","reason":"done"}'], take_over)
         )
-        conn.commit()
-        conn.close()
 
-        released = self.store.reconcile_stale_heartbeats(120)
+        orchestrator.run("inspect something")
 
-        self.assertEqual([s.id for s in released], [session_id])
-        self.assertEqual(self.store.get(session_id).status, STATUS_ABANDONED)
+        session = self.store.get(taken_over[0])
+        self.assertEqual(session.worker_id, "worker-restarted")
+        # The old worker's `finally: active` and its final decision both miss,
+        # so the row still reads as the new owner left it.
+        self.assertEqual(session.status, "waiting_for_llm")
+        self.assertIsNone(session.terminal_reason)
+        self.assertIsNotNone(session.last_heartbeat_at)
+        self.assertEqual(self.store.recent_events(session.id, kind="answer"), [])
 
 
 if __name__ == "__main__":

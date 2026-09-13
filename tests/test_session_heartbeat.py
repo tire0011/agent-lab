@@ -357,6 +357,137 @@ class SessionClaimTests(unittest.TestCase):
         )
         self.assertIsNotNone(self.store.get(sid).last_heartbeat_at)
 
+    # -- races between selecting a candidate and ending it ------------------
+    #
+    # Selection and reconciliation are two statements, and the reaper runs in a
+    # different process from the worker (API startup, `nexus_tick`). Anything
+    # that can happen in between has to be survivable, because the window is
+    # real.
+
+    def _reap_with_interleaved(self, action) -> list:
+        """Reconcile, running ``action`` between candidate selection and the write."""
+        original = self.store.stale_heartbeat_sessions
+
+        def selecting(*args, **kwargs):
+            candidates = original(*args, **kwargs)
+            action()
+            return candidates
+
+        self.store.stale_heartbeat_sessions = selecting  # type: ignore[method-assign]
+        try:
+            return self.store.reconcile_stale_heartbeats(120)
+        finally:
+            self.store.stale_heartbeat_sessions = original  # type: ignore[method-assign]
+
+    def test_a_worker_that_beats_during_reaping_is_not_reaped(self):
+        # The worker was merely late, not dead: its beat lands after it was
+        # picked as a candidate but before the reaper writes.
+        sid = self._session("r1", worker="worker-a", last_heartbeat_at=_ago(minutes=30))
+
+        released = self._reap_with_interleaved(
+            lambda: self.store.heartbeat(sid, worker_id="worker-a")
+        )
+
+        self.assertEqual(released, [])
+        session = self.store.get(sid)
+        self.assertEqual(session.status, "active")
+        self.assertIsNone(session.terminal_reason)
+        self.assertIsNotNone(session.last_heartbeat_at)
+
+    def test_a_takeover_during_reaping_is_not_reaped(self):
+        # A restarted worker claimed the session in the same window. Ending the
+        # claim now would abandon live work and strand the new owner.
+        sid = self._session("r2", worker="worker-a", last_heartbeat_at=_ago(minutes=30))
+
+        released = self._reap_with_interleaved(
+            lambda: self.store.claim_session(sid, worker_id="worker-b")
+        )
+
+        self.assertEqual(released, [])
+        session = self.store.get(sid)
+        self.assertEqual(session.status, "active")
+        self.assertEqual(session.worker_id, "worker-b")
+        self.assertIsNotNone(session.last_heartbeat_at)
+
+    def test_a_session_that_finished_during_reaping_is_not_reaped(self):
+        sid = self._session("r3", worker="worker-a", last_heartbeat_at=_ago(minutes=30))
+
+        released = self._reap_with_interleaved(
+            lambda: self.store.finalize_turn(
+                sid,
+                worker_id="worker-a",
+                status="action_selected",
+                reason="answer",
+                event_kind="answer",
+                event_content="done",
+            )
+        )
+
+        self.assertEqual(released, [])
+        session = self.store.get(sid)
+        self.assertEqual(session.status, "action_selected")
+        self.assertEqual(session.terminal_reason, "answer")
+
+    def test_a_genuinely_dead_worker_is_still_reaped_through_that_path(self):
+        # The guard must not be so tight that nothing is ever reaped.
+        sid = self._session("r4", worker="worker-a", last_heartbeat_at=_ago(minutes=30))
+
+        released = self._reap_with_interleaved(lambda: None)
+
+        self.assertEqual([s.id for s in released], [sid])
+        self.assertEqual(self.store.get(sid).status, STATUS_ABANDONED)
+
+    # -- ownership-scoped writes -------------------------------------------
+
+    def test_a_superseded_worker_cannot_move_the_status(self):
+        sid = self._session("o1", worker="worker-a")
+        self.store.claim_session(sid, worker_id="worker-b")
+
+        self.assertFalse(self.store.set_status(sid, "waiting_for_llm", worker_id="worker-a"))
+        self.assertTrue(self.store.set_status(sid, "waiting_for_llm", worker_id="worker-b"))
+        self.assertEqual(self.store.get(sid).status, "waiting_for_llm")
+
+    def test_a_superseded_worker_cannot_finalize_a_taken_over_session(self):
+        sid = self._session("o2", worker="worker-a")
+        self.store.claim_session(sid, worker_id="worker-b")
+
+        recorded = self.store.finalize_turn(
+            sid,
+            worker_id="worker-a",
+            status="action_selected",
+            reason="answer",
+            event_kind="answer",
+            event_content="stale decision",
+        )
+
+        self.assertFalse(recorded)
+        session = self.store.get(sid)
+        self.assertEqual(session.status, "active")
+        self.assertIsNone(session.terminal_reason)
+        # The new owner's heartbeat survives, and nothing was journalled.
+        self.assertIsNotNone(session.last_heartbeat_at)
+        self.assertEqual(self.store.recent_events(sid, kind="answer"), [])
+
+    def test_finalizing_journals_and_releases_in_one_step(self):
+        sid = self._session("o3", worker="worker-a")
+
+        self.assertTrue(
+            self.store.finalize_turn(
+                sid,
+                worker_id="worker-a",
+                status="waiting_for_user",
+                reason="clarification",
+                event_kind="clarification",
+                event_content="which repository?",
+            )
+        )
+
+        session = self.store.get(sid)
+        self.assertEqual(session.status, "waiting_for_user")
+        self.assertEqual(session.terminal_reason, "clarification")
+        self.assertIsNone(session.last_heartbeat_at)
+        self.assertEqual(len(self.store.recent_events(sid, kind="clarification")), 1)
+
     # -- observability ------------------------------------------------------
 
     def test_liveness_reports_owners_ages_and_staleness(self):

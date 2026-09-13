@@ -225,12 +225,26 @@
 - A heartbeat updates `last_heartbeat_at` only. `updated_at` keeps meaning
   "the session changed", so a heartbeat can never disguise a dead turn as
   recent activity.
+- Every write a claimed turn makes is scoped to its own `worker_id`: status
+  changes, the final decision and the release all miss if the session has
+  since been taken over, so a superseded worker cannot drive or end a session
+  it no longer owns. The terminal write is one transaction
+  (`NexusTaskStore.finalize_turn`) rather than three, so a turn can never end
+  half in one worker's world and half in another's.
+- A turn that raises or is cancelled records that: `failed` with
+  `terminal_reason=turn_failed`/`turn_cancelled`. Only a worker that vanished
+  without a chance to say anything (a killed process) falls to the reaper, so
+  `heartbeat_timeout` keeps meaning "nobody ever told us".
 - Stale claims: a claim quiet for longer than
   `NEXUS_STALE_HEARTBEAT_SECONDS` (default 15 min, clamped to a safe floor)
   is reconciled to `abandoned` with `terminal_reason=heartbeat_timeout`, once
   - reconciliation clears the heartbeat it selects on, so repeating it is a
   no-op. Run at API startup and on every `nexus_tick`. It never resumes the
-  work.
+  work. Selection and reconciliation are separate statements in separate
+  processes, so the write re-checks the whole predicate - working status, the
+  same owner, the exact heartbeat that was selected, still past the cutoff -
+  and does nothing if the worker beat or the session was taken over in
+  between.
 - Resting states (`waiting_for_user`, `blocked_missing_capability`) have no
   owner by design and are never reaped. `waiting_for_llm` is not resting: the
   worker is blocked on its own inference job and keeps beating.

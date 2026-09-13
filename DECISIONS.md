@@ -283,6 +283,16 @@ Decision log for architecture and operating choices.
 - Reconciliation clears the heartbeat it selects on, so it is idempotent by
   construction, and it never re-runs the work - re-running a turn costs a
   model call and may repeat whatever killed it (as in #160).
+- Reaping is a compare-and-set, not a two-step read-then-write. The reaper
+  runs in a different process from the worker, so the window between
+  selecting a candidate and ending it is real: the write re-checks the owner
+  and the exact heartbeat it selected, and a worker that beat in between
+  keeps its claim.
+- Every write a claimed turn makes is scoped to its own worker id, and the
+  terminal write is a single transaction. A turn that raises or is cancelled
+  says so (`failed`, with `turn_failed`/`turn_cancelled`); `heartbeat_timeout`
+  is reserved for a worker that never got to say anything at all, so the two
+  facts stay distinguishable.
 - Ownership survives reaping: `worker_id` stays on the row so "who was
   running this" is answerable afterwards.
 - Revisit if: concurrency arrives. Claiming is currently unconditional
