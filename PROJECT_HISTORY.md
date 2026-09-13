@@ -748,3 +748,47 @@ The autonomy diagnosis also produced Issue #158 with architectural work that del
 Issue #158 also records four broader debts: the long serial lifecycle should be simplified only after one green E2E proves which stages earn their existence; plan safety still relies partly on brittle prose substring checks and should move toward behavioral invariants; long-running work has no explicit heartbeat, so liveness is inferred with a coarse staleness window and zombie rows remain possible; and tests must be hermetic so no suite execution can reach a real paid provider. More than one autonomously initiated item per tick should wait for explicit claim/heartbeat semantics.
 
 **Lesson:** after repeated recovery fixes, the next architectural improvement may be subtraction. Measure which stages, model roles, and policy layers contribute value before adding more lifecycle semantics.
+
+## 2026-09-12 follow-up: measurement corrected the controller-role hypothesis and exposed zombie sessions
+
+PR #159 measured the production controller instead of inferring behavior from one oversized turn. Across 30 days of journals, **67 local-provider selections** and **15 budget escalations** showed that only about **22%** of local turns escalated; an independent test-run sample showed **673 local turns / 126 escalations (19%)**. The local controller therefore handles roughly four turns in five, so the earlier idea that it is “mostly bypassed” is not supported by current evidence.
+
+The measurement uncovered a more concrete reliability defect: of **41 controller sessions**, **17 (41%)** remained `active` despite no activity for **8–19 days**. PR #159 added durable per-turn instrumentation (`nexus_controller_turns`) so provider, escalation, prompt size/budget, and outcome can be queried directly, including failed turns. It also isolated test logging through `AGENT_LOG_DIR`; previous test runs had written **116 MB / 5,203 files** into the production log directory and contaminated measurement data. Full CI: **1,515 passed, 71 skipped**.
+
+PR #160 then added conservative startup reaping for stale controller sessions: with no heartbeat yet available, `updated_at` uses a deliberately loose **6-hour** default threshold, excludes `waiting_for_user`, is idempotent, and records `abandoned` rather than automatically re-running potentially unsafe/expensive work. Against a copy of the live database it marked exactly the known **17** zombie sessions and left the 24 non-zombie sessions unchanged.
+
+**Lessons:** architecture decisions should follow measured production behavior, not one anecdotal trace; test telemetry must be physically isolated from production evidence; and durable state without an explicit liveness owner eventually becomes zombie state.
+
+## 2026-09-12 follow-up: CI became more hermetic and guarded against silent collection regressions
+
+PR #161 closed two measurement/verification holes from Issue #158. Tests could previously escape through host-memory-dependent controller escalation and invoke a real Codex binary; one observed suite path made a real roughly **6-second** Codex call, while failure counts changed by environment. Test bootstrap now forces an impossible `AGENT_CODEX_BIN` unless an individual test explicitly overrides it, leaving production Codex behavior unchanged.
+
+The PR also added a collection guard that fails CI when any test file contributes zero tests. This protects against the same class of error that had allowed **147 tests across eight files** to remain silently unexecuted. The guard verified that all **93 test files** currently contribute tests; targeted verification reported **107 passed**.
+
+**Lesson:** hermeticity and collection completeness are prerequisites for authoritative CI. A suite that can reach real providers or silently ignore files cannot be treated as stable evidence.
+
+## 2026-09-13: explicit worker heartbeat replaced timestamp-inferred controller liveness
+
+Issue #162 / PR #165 implemented the reusable liveness primitive requested by the architecture review. Controller sessions now persist `worker_id`, `claimed_at`, `last_heartbeat_at`, and `terminal_reason`; active turns refresh a heartbeat (default interval 30 s), while resting states such as `waiting_for_user` are intentionally unclaimed. A stale claimed worker becomes `abandoned` with `terminal_reason=heartbeat_timeout` through an idempotent compare-and-set reconciliation path. Diagnostics expose ownership, heartbeat age, staleness, and status counts through `/diagnostics/nexus/liveness`.
+
+Ownership now gates session writes and finalization so a reaped or superseded worker cannot later resurrect or terminate a session it no longer owns. Heartbeats update only `last_heartbeat_at`, not generic `updated_at`, avoiding false liveness in unrelated timestamp-based logic. Review added race coverage for beat/takeover/completion interleavings. PR #165 merged with green CI and **50 new heartbeat/liveness tests**; a local full-suite comparison had **1,575 passed and one environment-dependent failure also reproducible on `main`**.
+
+Issue #163 remains the follow-up: diagnostics/failure analysis should consume heartbeat plus terminal state to classify healthy, successful, failed, cancelled, abandoned, restart-interrupted, and inconclusive executions without guessing.
+
+**Lesson:** liveness should be an explicit lease/ownership signal, not an inference from arbitrary row updates. This is also a prerequisite for safe future multi-worker concurrency.
+
+## 2026-09-13: terminal `find_tool:not_found` behavior removed a real controller loop
+
+A real #115/#116 E2E retry referenced an existing experiment that should have been resumed. The controller reasonably tried `find_tool` for lifecycle inspection, received a correct `not_found` response with related operations, then repeated essentially the same lookup until the duplicate-loop guard stopped the task. Issue #164 / PR #166 made `not_found` explicitly non-retryable for unchanged state, surfaces related operations plus safe direct capabilities/recommended next action, and can route an unambiguous resume request to `resume_experiment` rather than spending several local-model turns rediscovering the same absence.
+
+Review tightened the fix substantially: candidate experiment IDs must actually resolve (not merely look hex-like), resume intent is derived from the current task rather than old session history, the normal loop guard remains authoritative/accounted instead of being bypassed, and persisted controller-turn records retain what the model actually chose while logging any deterministic redirect separately. The final CI environment reported **1,584 passed**. PR #166 merged on `main`.
+
+**Lesson:** a negative discovery result is itself actionable state. Once a lookup says “no exact tool exists,” unchanged repetition should be structurally impossible, while suggestions/direct capabilities remain distinct from execution grants.
+
+## 2026-09-13: the latest E2E exposed configuration and local-model execution-path gaps
+
+Continuing the real #115/#116 lifecycle exposed two operational gaps after the controller-loop fix. First, finalization could reach mandatory GitHub lifecycle code with the repository configured but no usable GitHub token, even though the Nexus restart script had reported configuration healthy because it validated only the API key. Issue #168 now tracks fail-fast restart validation for all mandatory lifecycle configuration without logging secret values.
+
+Second, `FailureAnalysisService` still called llama-server directly with its own 60-second read timeout while controller inference already used durable queued local-LLM jobs. On the real failure path the diagnosis started but the direct request timed out and persisted `analysis_unavailable`, even though normal local inference routinely takes multiple minutes. Issue #167 proposes one local-model execution mechanism; open PR #169 currently routes failure analysis through the shared `LocalLlmJobService`, adds job roles and common cancellation/stuck/error observability, and serializes controller/resolver/analysis work through one worker. Its branch reports **1,503 passed, 71 skipped** with remaining failures matching its base environment, but the PR is still open and therefore not yet adopted history.
+
+**Lessons:** restart validation must cover the configuration required by the complete lifecycle, not only service startup; and slow local inference should share one durable queue/liveness/error model rather than each feature inventing its own timeout and direct HTTP path.
