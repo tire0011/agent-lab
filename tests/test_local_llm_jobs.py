@@ -7,18 +7,22 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from modules import heartbeat
 from modules.local_llm_jobs import (
     ERROR_KIND_CANCELLED,
     ERROR_KIND_STUCK,
+    ERROR_KIND_INTERRUPTED,
     ROLE_CONTROLLER,
     ROLE_FAILURE_ANALYSIS,
     LocalLlmJobError,
     LocalLlmJobService,
     STATUS_CANCELLED,
     STATUS_FAILED,
+    STATUS_RUNNING,
     STATUS_SUCCEEDED,
     acquire_local_llm_job_service,
     llama_server_failure_diagnostics,
@@ -76,6 +80,32 @@ class _FailingClient:
     ):
         del prompt, temperature, max_tokens, response_format
         raise self._exc
+
+
+class _ConcurrencyProbe:
+    """Records whether two workers were ever inside the model call at once."""
+
+    model = "test-local-model"
+
+    def __init__(self, *, delay: float = 0.0, shared_state: dict | None = None):
+        self.delay = delay
+        self.calls = 0
+        self.state = shared_state if shared_state is not None else {"active": 0, "max_concurrent": 0}
+        self._lock = threading.Lock()
+
+    async def complete(self, *, prompt, temperature, max_tokens, response_format=None, system=None):
+        del temperature, max_tokens, response_format, system
+        with self._lock:
+            self.calls += 1
+            self.state["active"] += 1
+            self.state["max_concurrent"] = max(self.state["max_concurrent"], self.state["active"])
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            return "reply:" + prompt
+        finally:
+            with self._lock:
+                self.state["active"] -= 1
 
 
 class _RemoteProtocolError(Exception):
@@ -271,6 +301,112 @@ class JobRoleAndLivenessTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 release.set()
                 service.close()
+
+
+class CrossProcessSerializationTests(unittest.IsolatedAsyncioTestCase):
+    """The one-request-at-a-time rule lives in the database, not in a process.
+
+    Nexus runs the controller (`nexus_tick`) and the API as separate
+    processes against the same database, so a process-wide singleton cannot
+    be the thing that stops them racing llama-server. Each service instance
+    here has its own connection and its own worker - the same situation two
+    processes are in.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = str(Path(self.tmp.name) / "jobs.db")
+
+    def _service(self, client) -> LocalLlmJobService:
+        service = LocalLlmJobService(
+            db_path=self.db_path,
+            llama_client=client,
+            poll_interval=0.01,
+            idle_poll_interval=0.02,
+        )
+        self.addCleanup(service.close)
+        return service
+
+    async def test_two_services_on_one_database_never_run_concurrently(self):
+        first_client = _ConcurrencyProbe(delay=0.15)
+        second_client = _ConcurrencyProbe(delay=0.15, shared_state=first_client.state)
+        first = self._service(first_client)
+        second = self._service(second_client)
+
+        jobs = [first.submit(f"a{i}", role=ROLE_CONTROLLER) for i in range(3)]
+        jobs += [second.submit(f"b{i}", role=ROLE_FAILURE_ANALYSIS) for i in range(3)]
+
+        for job_id in jobs:
+            self.assertTrue((await first.wait(job_id)).startswith("reply:"))
+
+        # Both workers were awake and willing to run the whole time; the
+        # claim is what kept them from overlapping at llama-server. Which
+        # worker won which job is deliberately not asserted - either may
+        # drain the queue, and only the overlap matters.
+        self.assertEqual(first_client.state["max_concurrent"], 1)
+        self.assertEqual(first_client.calls + second_client.calls, len(jobs))
+
+    async def test_a_worker_executes_work_another_process_queued(self):
+        producer_client = _ConcurrencyProbe()
+        producer = self._service(producer_client)
+        job_id = producer.submit("queued by the other process", role=ROLE_FAILURE_ANALYSIS)
+        # The producer exits before its own worker gets to the job.
+        producer.close()
+
+        consumer_client = _ConcurrencyProbe()
+        consumer = self._service(consumer_client)
+        self.assertEqual(await consumer.wait(job_id), "reply:queued by the other process")
+        self.assertEqual(consumer.get(job_id).worker_id, consumer.worker_id)
+
+    def test_startup_does_not_kill_another_live_worker_claim(self):
+        client = _ConcurrencyProbe()
+        live = self._service(client)
+        job_id = live.submit("owned by a live worker")
+        # A claim a live worker is still refreshing, as another process would
+        # see it. Starting a second service must leave it alone.
+        with live._lock:
+            live._conn.execute(
+                "UPDATE local_llm_jobs SET status = 'running', started_at = ?, worker_id = ?, "
+                "lease_expires_at = ? WHERE id = ?",
+                (
+                    heartbeat.now_iso(),
+                    "another-host:4242:beef",
+                    (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+                    job_id,
+                ),
+            )
+
+        newcomer = self._service(_ConcurrencyProbe())
+        self.assertEqual(newcomer.get(job_id).status, STATUS_RUNNING)
+
+    def test_a_dead_workers_claim_is_released_and_the_slot_freed(self):
+        client = _ConcurrencyProbe()
+        service = self._service(client)
+        abandoned = service.submit("owned by a process that died")
+        with service._lock:
+            service._conn.execute(
+                "UPDATE local_llm_jobs SET status = 'running', started_at = ?, worker_id = ?, "
+                "lease_expires_at = ? WHERE id = ?",
+                (
+                    heartbeat.now_iso(),
+                    "dead-host:1:dead",
+                    (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+                    abandoned,
+                ),
+            )
+
+        follow_up = service.submit("must not wait for a dead worker")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if service.get(follow_up).status == STATUS_SUCCEEDED:
+                break
+            time.sleep(0.02)
+
+        self.assertEqual(service.get(follow_up).status, STATUS_SUCCEEDED)
+        released = service.get(abandoned)
+        self.assertEqual(released.status, STATUS_FAILED)
+        self.assertEqual(released.error_kind, ERROR_KIND_INTERRUPTED)
 
 
 class SchemaMigrationTests(unittest.TestCase):

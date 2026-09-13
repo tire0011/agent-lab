@@ -266,8 +266,14 @@ class NexusTaskOrchestrator:
         self._owns_task_store = task_store is None
         self.memory = memory or NexusMemory(db_path=db_path, repo_root=repo_root, task_store=self.task_store)
         self._owns_memory = memory is None
+        # Handed the orchestrator's own job service rather than just its
+        # client: local delegation is another role on the same queue (#167),
+        # so it can never open a second request path to llama-server.
         self.delegation = delegation_service or NexusDelegationService(
-            llama_client=self.llama, db_path=db_path, repo_root=repo_root
+            llama_client=self.llama,
+            db_path=db_path,
+            repo_root=repo_root,
+            llm_job_service=self.llm_jobs,
         )
         self._owns_delegation = delegation_service is None
         # session_id -> the worker id this process currently holds the claim

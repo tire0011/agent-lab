@@ -2,6 +2,12 @@
 
 The local model remains the controller. Delegates are consultants/workers that
 return an observation; control always comes back to the local orchestrator.
+
+The ``local_worker`` delegate runs on the same shared local-LLM job path as
+every other local-model caller (#167/D-019): it is another role on the one
+queue, not a second way to reach llama-server. The external delegates
+(``codex_readonly``, ``azure_openai``) talk to their own services and are not
+affected by that rule.
 """
 
 from __future__ import annotations
@@ -14,6 +20,13 @@ from typing import Any
 import httpx
 
 from modules.llama_cpp_client import LlamaCppClient
+from modules.local_llm_jobs import (
+    ROLE_LOCAL_WORKER,
+    LocalLlmJobError,
+    LocalLlmJobService,
+    acquire_local_llm_job_service,
+    release_local_llm_job_service,
+)
 from modules.run_store import DEFAULT_DB_PATH
 
 
@@ -43,14 +56,24 @@ class NexusDelegationService:
         codex_service: Any | None = None,
         db_path: str = DEFAULT_DB_PATH,
         repo_root: str = "/agent",
+        llm_job_service: LocalLlmJobService | None = None,
     ) -> None:
-        self.llama = llama_client or LlamaCppClient(timeout=120.0)
+        # Local delegation is queued work, not a private HTTP path: the same
+        # shared service the controller and failure analysis use runs it, so a
+        # delegate cannot race them at llama-server.
+        self.llm_jobs = llm_job_service or acquire_local_llm_job_service(
+            db_path=db_path, llama_client=llama_client
+        )
+        self._owns_llm_jobs = llm_job_service is None
+        self.llama = llama_client or self.llm_jobs.llama
         self.codex_service = codex_service
         self.db_path = db_path
         self.repo_root = repo_root
         self._owns_codex = False
 
     def close(self) -> None:
+        if self._owns_llm_jobs:
+            release_local_llm_job_service(self.llm_jobs)
         if self._owns_codex and self.codex_service is not None:
             close = getattr(self.codex_service, "close", None)
             if close:
@@ -99,11 +122,23 @@ class NexusDelegationService:
             "Return concise findings and a recommended next step.\n\n"
             f"SUB-PROBLEM:\n{task[:6000]}\n\nCONTEXT:\n{context[:6000]}"
         )
+        job_id = self.llm_jobs.submit(
+            prompt, temperature=0.1, max_tokens=900, role=ROLE_LOCAL_WORKER
+        )
         try:
-            raw = await self.llama.complete(prompt=prompt, temperature=0.1, max_tokens=900)
-            return DelegationResult("local_worker", True, raw, {})
+            raw = await self.llm_jobs.wait(job_id)
+            return DelegationResult("local_worker", True, raw, {"job_id": job_id})
+        except LocalLlmJobError as exc:
+            return DelegationResult(
+                "local_worker",
+                False,
+                "",
+                {"job_id": job_id, "error": "LocalLlmJobError", "error_kind": exc.kind},
+            )
         except Exception as exc:  # noqa: BLE001
-            return DelegationResult("local_worker", False, "", {"error": type(exc).__name__})
+            return DelegationResult(
+                "local_worker", False, "", {"job_id": job_id, "error": type(exc).__name__}
+            )
 
     async def _codex(self, task: str, context: str) -> DelegationResult:
         try:

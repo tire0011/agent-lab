@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from modules import heartbeat
 from modules.llama_cpp_client import LlamaCppClient
 from modules.redaction import redact
 from modules.run_store import DEFAULT_DB_PATH
@@ -30,6 +31,7 @@ _TERMINAL = {STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED}
 # and in the logs. Roles are free-form strings; these are the ones Nexus ships.
 ROLE_CONTROLLER = "controller"
 ROLE_FAILURE_ANALYSIS = "failure_analysis"
+ROLE_LOCAL_WORKER = "local_worker"
 
 # Error classification (#167). A job's failure reason is part of the shared
 # observability contract: callers should be able to tell a wedged worker from
@@ -51,6 +53,22 @@ _STUCK_GRACE_SECONDS = 120.0
 # Cheap opportunistic sweep: at most one stuck-job UPDATE per interval, no
 # extra thread. Waiters poll anyway, so this is where liveness is enforced.
 _STUCK_SWEEP_INTERVAL_SECONDS = 30.0
+
+# Cross-process serialization (#167 review). A process-wide singleton only
+# stops one process from racing itself; Nexus runs the controller (nexus_tick)
+# and the API in separate processes against the same database, so the "one
+# request at a time" rule has to live in the database. A worker claims the
+# single inference slot by transitioning a job to `running` inside one
+# IMMEDIATE transaction, and states its liveness on the claim (D-018) rather
+# than letting a dead process hold the slot forever.
+_LEASE_ENV_VAR = "NEXUS_LOCAL_LLM_LEASE_SECONDS"
+_DEFAULT_LEASE_SECONDS = 120
+# How long a worker blocks on SQLite's write lock before giving up. Claims are
+# short (a few statements), so contention resolves well inside this.
+_BUSY_TIMEOUT_MS = 10_000
+# How often an otherwise idle worker looks for work another process queued, or
+# for the inference slot another process released.
+_DEFAULT_IDLE_POLL_SECONDS = 1.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,7 +188,8 @@ def llama_server_failure_diagnostics(
 
 
 _JOB_COLUMNS = (
-    "id,status,session_id,created_at,started_at,finished_at,result,error,role,error_kind"
+    "id,status,session_id,created_at,started_at,finished_at,result,error,role,error_kind,"
+    "worker_id,lease_expires_at"
 )
 
 
@@ -186,14 +205,25 @@ class LocalLlmJob:
     error: str | None = None
     role: str = ROLE_CONTROLLER
     error_kind: str | None = None
+    worker_id: str | None = None
+    lease_expires_at: str | None = None
 
 
 class LocalLlmJobService:
-    """Persist and serialize slow local-LLM inference behind a single worker.
+    """Persist and serialize slow local-LLM inference behind one claimed slot.
 
-    The first implementation intentionally stays small: one daemon worker,
-    SQLite persistence and polling.  llama-server remains the inference
-    backend.  The controller no longer owns the long HTTP request itself.
+    One daemon worker per process, SQLite persistence and polling;
+    llama-server remains the inference backend and callers never own the long
+    HTTP request themselves.
+
+    Serialization is enforced in the database, not in the process: a worker
+    runs a job only after claiming the single inference slot in one IMMEDIATE
+    transaction, so the controller process and the API process cannot both be
+    talking to llama-server at once. A claim states its own liveness
+    (``worker_id`` + ``lease_expires_at``, refreshed while the request is in
+    flight); a claim whose lease expired belonged to a process that died, and
+    is reclaimed. Queued work is visible to every worker, so a job submitted
+    by a process that then exits is still executed.
     """
 
     def __init__(
@@ -202,6 +232,7 @@ class LocalLlmJobService:
         db_path: str = DEFAULT_DB_PATH,
         llama_client: LlamaCppClient | None = None,
         poll_interval: float = 0.25,
+        idle_poll_interval: float | None = None,
     ) -> None:
         self.db_path = db_path
         watchdog = float(os.environ.get("NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS", "3600"))
@@ -209,11 +240,26 @@ class LocalLlmJobService:
         self.watchdog_seconds = watchdog
         self.llama = llama_client or LlamaCppClient(timeout=watchdog)
         self.poll_interval = max(0.05, poll_interval)
+        self.idle_poll_interval = max(
+            0.01,
+            _DEFAULT_IDLE_POLL_SECONDS if idle_poll_interval is None else idle_poll_interval,
+        )
         self._stuck_after_seconds = watchdog + _STUCK_GRACE_SECONDS
         self._last_stuck_sweep = 0.0
+        # Identity and liveness come from the shared heartbeat contract
+        # (D-018): who owns a claim, and for how long silence still means
+        # "alive". The lease floor is deliberate - calling live work dead is
+        # worse than noticing a dead worker late.
+        self.worker_id = heartbeat.worker_id()
+        self.lease_seconds = heartbeat.resolve_stale_timeout(
+            os.environ.get(_LEASE_ENV_VAR, _DEFAULT_LEASE_SECONDS)
+        )
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Autocommit: the claim below is one explicit IMMEDIATE transaction,
+        # and everything else is a single statement.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS local_llm_jobs (
@@ -254,23 +300,20 @@ class LocalLlmJobService:
             self._conn.execute("ALTER TABLE local_llm_jobs ADD COLUMN system TEXT")
         if "error_kind" not in columns:
             self._conn.execute("ALTER TABLE local_llm_jobs ADD COLUMN error_kind TEXT")
-        # A process restart cannot keep an in-flight HTTP request alive. Make
-        # that state explicit rather than leaving an immortal `running` row.
+        if "worker_id" not in columns:
+            self._conn.execute("ALTER TABLE local_llm_jobs ADD COLUMN worker_id TEXT")
+        if "lease_expires_at" not in columns:
+            self._conn.execute("ALTER TABLE local_llm_jobs ADD COLUMN lease_expires_at TEXT")
         self._conn.execute(
-            """
-            UPDATE local_llm_jobs
-            SET status = ?, finished_at = ?, error = ?, error_kind = ?
-            WHERE status = ?
-            """,
-            (
-                STATUS_FAILED,
-                _now(),
-                "local LLM worker interrupted by process restart",
-                ERROR_KIND_INTERRUPTED,
-                STATUS_RUNNING,
-            ),
+            "CREATE INDEX IF NOT EXISTS idx_local_llm_jobs_status_created "
+            "ON local_llm_jobs (status, created_at)"
         )
-        self._conn.commit()
+        # A process that died cannot keep an in-flight HTTP request alive, so
+        # its claim is released here. Only dead claims: a `running` job whose
+        # lease is still being refreshed belongs to another live process, and
+        # killing it on our startup is exactly the cross-process damage this
+        # lease exists to prevent.
+        self._reclaim_dead_leases()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._closed = threading.Event()
         self._worker = threading.Thread(target=self._worker_loop, name="local-llm-job-worker", daemon=True)
@@ -403,13 +446,17 @@ class LocalLlmJobService:
         return cancelled
 
     def _sweep_stuck_jobs(self, *, force: bool = False) -> int:
-        """Fail `running` jobs that outlived the worker's own watchdog (#167).
+        """Release `running` jobs no live worker can still finish (#167).
 
-        Liveness for every role, owned by this component: the worker cannot
-        exceed its client watchdog while healthy, so a row still `running`
-        well past it means the worker is wedged and its waiter would block
-        forever. Rate-limited, and never raises - a sweep failure must not
-        break the submit/wait it was called from.
+        Two ways a claim dies, and a waiter needs both:
+
+        * the owner stopped heartbeating - its process died, so the claim is
+          reclaimed (see :meth:`_reclaim_dead_leases`);
+        * the owner is alive but wedged past its own client watchdog, which a
+          heartbeat cannot detect because the heartbeat is still beating.
+
+        Rate-limited, and never raises - a sweep failure must not break the
+        submit/wait it was called from.
         """
         now = time.monotonic()
         if not force and (now - self._last_stuck_sweep) < _STUCK_SWEEP_INTERVAL_SECONDS:
@@ -446,7 +493,7 @@ class LocalLlmJobService:
                 "local_llm stuck jobs detected count=%s stuck_after_seconds=%.0f",
                 stuck, self._stuck_after_seconds,
             )
-        return stuck
+        return stuck + self._reclaim_dead_leases()
 
     async def wait(self, job_id: str) -> str:
         """Await one job's result. Never imposes a deadline of its own (#167).
@@ -479,6 +526,145 @@ class LocalLlmJobService:
             await asyncio.sleep(delay)
             delay = min(self.poll_interval, delay * 2)
 
+    def _lease_deadline(self) -> str:
+        return (
+            datetime.now(timezone.utc) + timedelta(seconds=self.lease_seconds)
+        ).isoformat()
+
+    def _reclaim_dead_leases(self) -> int:
+        """Release claims whose owner stopped stating liveness.
+
+        A `running` row with an expired (or, for rows written before leases
+        existed, missing) lease belonged to a process that died mid-request:
+        the HTTP call went with it, the job will never finish, and until it is
+        released it holds the single inference slot for everyone. Never
+        touches a claim that is still being refreshed - that one belongs to a
+        live worker, possibly in another process.
+        """
+        try:
+            with self._lock:
+                return self._conn.execute(
+                    """
+                    UPDATE local_llm_jobs
+                    SET status = ?, finished_at = ?, error = ?, error_kind = ?
+                    WHERE status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    """,
+                    (
+                        STATUS_FAILED,
+                        _now(),
+                        "local LLM worker stopped heartbeating; claim released",
+                        ERROR_KIND_INTERRUPTED,
+                        STATUS_RUNNING,
+                        _now(),
+                    ),
+                ).rowcount
+        except sqlite3.Error as exc:
+            _LOGGER.warning("local_llm lease reclaim failed: %s", exc)
+            return 0
+
+    def _claim_next_job(self) -> str | None:
+        """Claim the single inference slot for the oldest queued job, if free.
+
+        One IMMEDIATE transaction does the whole decision - release dead
+        claims, check that nobody live is running, take the oldest queued job
+        - so two workers in two processes cannot both conclude the slot is
+        theirs. Returns the claimed job id, or None when there is nothing to
+        run or another worker holds the slot.
+        """
+        # An idle worker polls for work another process queued. Checking that
+        # first keeps the common "nothing to do" tick a single read instead of
+        # a write transaction every process fights over.
+        try:
+            with self._lock:
+                pending = self._conn.execute(
+                    "SELECT 1 FROM local_llm_jobs WHERE status = ? LIMIT 1", (STATUS_QUEUED,)
+                ).fetchone()
+        except sqlite3.Error as exc:
+            _LOGGER.warning("local_llm claim could not look for queued work: %s", exc)
+            return None
+        if pending is None:
+            return None
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                _LOGGER.warning("local_llm claim could not start transaction: %s", exc)
+                return None
+            try:
+                now = _now()
+                released = self._conn.execute(
+                    """
+                    UPDATE local_llm_jobs
+                    SET status = ?, finished_at = ?, error = ?, error_kind = ?
+                    WHERE status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    """,
+                    (
+                        STATUS_FAILED,
+                        now,
+                        "local LLM worker stopped heartbeating; claim released",
+                        ERROR_KIND_INTERRUPTED,
+                        STATUS_RUNNING,
+                        now,
+                    ),
+                ).rowcount
+                busy = self._conn.execute(
+                    "SELECT id, worker_id FROM local_llm_jobs WHERE status = ? LIMIT 1",
+                    (STATUS_RUNNING,),
+                ).fetchone()
+                if busy is not None:
+                    self._conn.execute("COMMIT")
+                    return None
+                row = self._conn.execute(
+                    "SELECT id FROM local_llm_jobs WHERE status = ? "
+                    "ORDER BY created_at, rowid LIMIT 1",
+                    (STATUS_QUEUED,),
+                ).fetchone()
+                if row is None:
+                    self._conn.execute("COMMIT")
+                    return None
+                job_id = str(row["id"])
+                claimed = self._conn.execute(
+                    "UPDATE local_llm_jobs SET status = ?, started_at = ?, worker_id = ?, "
+                    "lease_expires_at = ? WHERE id = ? AND status = ?",
+                    (
+                        STATUS_RUNNING,
+                        now,
+                        self.worker_id,
+                        self._lease_deadline(),
+                        job_id,
+                        STATUS_QUEUED,
+                    ),
+                ).rowcount
+                self._conn.execute("COMMIT")
+            except sqlite3.Error as exc:
+                _LOGGER.warning("local_llm claim failed: %s", exc)
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                return None
+        if released:
+            _LOGGER.error(
+                "local_llm released %s claim(s) whose worker stopped heartbeating", released
+            )
+        return job_id if claimed else None
+
+    def _refresh_lease(self, job_id: str) -> bool:
+        """Restate this worker's claim. False once the claim is no longer ours."""
+        try:
+            with self._lock:
+                refreshed = self._conn.execute(
+                    "UPDATE local_llm_jobs SET lease_expires_at = ? "
+                    "WHERE id = ? AND status = ? AND worker_id = ?",
+                    (self._lease_deadline(), job_id, STATUS_RUNNING, self.worker_id),
+                ).rowcount
+            return bool(refreshed)
+        except sqlite3.Error as exc:
+            # Losing the database is not the same as losing the claim: keep
+            # beating and let the next refresh decide.
+            _LOGGER.warning("local_llm lease refresh failed job_id=%s reason=%s", job_id, exc)
+            return True
+
     def _finalize(self, job_id: str, sql: str, params: tuple[Any, ...]) -> int:
         """Apply a terminal update for a job the worker just finished.
 
@@ -500,26 +686,43 @@ class LocalLlmJobService:
             return 0
 
     def _worker_loop(self) -> None:
+        """Run claimable work, then wait to be woken or for the idle poll.
+
+        The in-process queue is only a wake-up signal now; what may actually
+        run is decided by the claim, so this worker also picks up jobs another
+        process queued and slots another process released.
+        """
         while not self._closed.is_set():
-            job_id = self._queue.get()
-            if job_id is None:
+            while not self._closed.is_set():
+                job_id = self._claim_next_job()
+                if job_id is None:
+                    break
+                self._run(job_id)
+            if self._closed.is_set():
                 return
-            self._run(job_id)
+            try:
+                signal = self._queue.get(timeout=self.idle_poll_interval)
+            except queue.Empty:
+                continue
+            if signal is None:
+                return
 
     def _run(self, job_id: str) -> None:
+        """Execute a job this worker has already claimed.
+
+        The claim (status, owner, lease) was taken in :meth:`_claim_next_job`;
+        here the worker only has to keep stating that it is alive and record
+        the outcome under its own ownership.
+        """
         with self._lock:
             row = self._conn.execute(
-                "SELECT prompt,temperature,max_tokens,response_format,session_id,status,role,system "
-                "FROM local_llm_jobs WHERE id = ?",
+                "SELECT prompt,temperature,max_tokens,response_format,session_id,status,role,system,"
+                "worker_id FROM local_llm_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
-            if row is None or row["status"] != STATUS_QUEUED:
-                return
-            self._conn.execute(
-                "UPDATE local_llm_jobs SET status = ?, started_at = ? WHERE id = ?",
-                (STATUS_RUNNING, _now(), job_id),
-            )
-            self._conn.commit()
+        if row is None or row["status"] != STATUS_RUNNING or row["worker_id"] != self.worker_id:
+            _LOGGER.warning("local_llm job no longer claimed by this worker job_id=%s", job_id)
+            return
         session_id = row["session_id"]
         max_tokens = int(row["max_tokens"])
         prompt_chars = len(str(row["prompt"]))
@@ -531,6 +734,14 @@ class LocalLlmJobService:
             job_id, role, session_id, model, max_tokens, prompt_chars,
         )
         started = time.perf_counter()
+        # Liveness is stated, not inferred (D-018): while this request is in
+        # flight the claim is refreshed, so no other process steals the slot -
+        # and if this process dies, the lease lapses and the slot is released.
+        lease = heartbeat.Heartbeat(
+            lambda: self._refresh_lease(job_id),
+            interval_seconds=max(1, int(self.lease_seconds // 3)),
+            name=f"local-llm-lease-{job_id[:8]}",
+        ).start()
         try:
             completion_options: dict[str, Any] = {}
             if row["response_format"]:
@@ -550,6 +761,7 @@ class LocalLlmJobService:
                 )
             )
         except Exception as exc:  # noqa: BLE001
+            lease.stop()
             duration = time.perf_counter() - started
             error_kind = classify_job_error(exc)
             diagnostics = llama_server_failure_diagnostics()
@@ -566,12 +778,13 @@ class LocalLlmJobService:
                 diagnostics.get("recent_journal") or diagnostics.get("journalctl_error"),
                 exc_info=True,
             )
-            # Status-guarded: a job cancelled or swept as stuck while the
-            # request was in flight stays terminal as it was recorded.
+            # Guarded by status *and* ownership: a job cancelled, swept as
+            # stuck, or reclaimed by another worker while this request was in
+            # flight stays terminal as it was recorded.
             self._finalize(
                 job_id,
                 "UPDATE local_llm_jobs SET status = ?, finished_at = ?, error = ?, error_kind = ? "
-                "WHERE id = ? AND status = ?",
+                "WHERE id = ? AND status = ? AND worker_id = ?",
                 (
                     STATUS_FAILED,
                     _now(),
@@ -579,9 +792,11 @@ class LocalLlmJobService:
                     error_kind,
                     job_id,
                     STATUS_RUNNING,
+                    self.worker_id,
                 ),
             )
             return
+        lease.stop()
         duration = time.perf_counter() - started
         _LOGGER.info(
             "local_llm job succeeded job_id=%s role=%s session_id=%s provider=local model=%s "
@@ -591,8 +806,8 @@ class LocalLlmJobService:
         updated = self._finalize(
             job_id,
             "UPDATE local_llm_jobs SET status = ?, finished_at = ?, result = ?, error = NULL, "
-            "error_kind = NULL WHERE id = ? AND status = ?",
-            (STATUS_SUCCEEDED, _now(), result, job_id, STATUS_RUNNING),
+            "error_kind = NULL WHERE id = ? AND status = ? AND worker_id = ?",
+            (STATUS_SUCCEEDED, _now(), result, job_id, STATUS_RUNNING, self.worker_id),
         )
         if not updated:
             _LOGGER.warning(

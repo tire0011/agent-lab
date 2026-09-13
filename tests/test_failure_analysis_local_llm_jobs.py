@@ -21,6 +21,7 @@ So the checks here are about *which mechanism* runs the inference:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import tempfile
@@ -391,6 +392,7 @@ class SharedWithControllerTests(_FailureAnalysisJobTestCase):
         )
         worker.join(timeout=30)
         self.assertFalse(worker.is_alive())
+        asyncio.run(jobs.wait(controller_job))
 
         # Both roles are in one queue, on one worker: nothing overlapped, and
         # both jobs carry the same observability fields under different roles.

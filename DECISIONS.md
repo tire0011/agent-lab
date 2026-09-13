@@ -321,10 +321,23 @@ Decision log for architecture and operating choices.
   liveness, cancellation, stuck-job detection, logging and resource control
   live there, not in each feature. A caller that needs a second inference
   mechanism needs a reason, not a convenience.
-- One service per database, process-wide (`acquire_local_llm_job_service`),
-  because sharing the *class* would still mean two workers and two
-  simultaneous requests. Callers that bring their own client (tests) keep an
-  isolated worker; production callers bring none and therefore share.
+- One service per database per process (`acquire_local_llm_job_service`),
+  because sharing the *class* would still mean two workers in one process.
+  Callers that bring their own client (tests) keep an isolated worker;
+  production callers bring none and therefore share.
+- A process-wide singleton is not the invariant, though: Nexus runs the
+  controller (`nexus_tick`) and the API in separate processes against one
+  database, so "one request at a time" has to be decided where both can see
+  it. The single inference slot is claimed in SQLite (`BEGIN IMMEDIATE`:
+  release dead claims, refuse if a live claim exists, else take the oldest
+  queued job), and the claim states its liveness under D-018 (`worker_id`,
+  `lease_expires_at`). A lapsed lease means a dead process, and its slot is
+  released; a live lease is never touched by another process's startup,
+  which is how the old blanket "mark every running row failed at startup"
+  recovery would have killed a healthy job in another process.
+- Every local-model caller means every one: the `local_worker` delegate is a
+  role on this queue too, not a private client call. Only genuinely
+  different resources (Codex, Azure OpenAI) keep their own paths.
 - Callers are told apart by a job `role`, not by a separate mechanism. The
   role is observability only - it never changes how a job runs - so
   "what did failure analysis ask the model, and how did those jobs end?"
