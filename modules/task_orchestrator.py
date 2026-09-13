@@ -254,11 +254,20 @@ class NexusTaskOrchestrator:
         # a plain dict keyed by session is enough.
         self._claims: dict[str, str] = {}
 
+    def _claim_owner(self, session_id: str) -> str | None:
+        """The worker id this process holds the session under, if it does."""
+        return self._claims.get(session_id)
+
     def _claimed_status(self, session_id: str, status: str) -> None:
         """Set a status, but only while this process still owns the session."""
-        self.task_store.set_status(
-            session_id, status, worker_id=self._claims.get(session_id)
-        )
+        owner = self._claim_owner(session_id)
+        if owner is None:
+            # Unreachable from a claimed turn - ``run_async`` refuses to start
+            # one without a claim - so this is a bug guard, not a fallback. It
+            # fails closed: an unowned write is the thing being prevented.
+            logger.warning("refusing unowned status write for session %s", session_id)
+            return
+        self.task_store.set_status(session_id, status, worker_id=owner)
 
     def close(self) -> None:
         self.loop_guard.close()
@@ -335,12 +344,26 @@ class NexusTaskOrchestrator:
         # ``updated_at`` - is what says the work still has an owner. If this
         # process dies mid-turn the beats simply stop and the session is
         # reconciled explicitly instead of sitting `active` forever.
+        #
+        # The claim is a prerequisite, not bookkeeping around one: treating a
+        # failure here as survivable would be worse than never claiming, since
+        # every later write then falls back to "no owner" and the ownership
+        # rules switch themselves off exactly when persistence is already
+        # misbehaving. Refusing is the safe direction - the session keeps the
+        # state it has, and any worker that does own it keeps it.
         worker = heartbeat_worker_id()
         try:
-            self.task_store.claim_session(session.id, worker_id=worker)
-            self._claims[session.id] = worker
-        except Exception:  # noqa: BLE001 - never fail a turn over its own bookkeeping
-            logger.exception("could not claim session %s", session.id)
+            claimed = self.task_store.claim_session(session.id, worker_id=worker)
+        except Exception as exc:
+            raise TaskOrchestratorError(
+                f"could not claim Nexus task session {session.id!r}: {exc}"
+            ) from exc
+        if not claimed:
+            raise TaskOrchestratorError(
+                f"could not claim Nexus task session {session.id!r}: "
+                "the session is no longer there to claim"
+            )
+        self._claims[session.id] = worker
         heartbeat = Heartbeat(
             lambda: self.task_store.heartbeat(session.id, worker_id=worker),
             name=f"nexus-heartbeat-{session.id[:8]}",
@@ -370,10 +393,14 @@ class NexusTaskOrchestrator:
         end up recorded as ``heartbeat_timeout`` - "nobody ever told us" - which
         is a weaker and less true fact than "this turn raised".
         """
+        owner = self._claim_owner(session_id)
+        if owner is None:
+            logger.warning("refusing unowned failure write for session %s", session_id)
+            return
         try:
             self.task_store.finalize_turn(
                 session_id,
-                worker_id=self._claims.get(session_id),
+                worker_id=owner,
                 status=STATUS_FAILED,
                 reason=reason,
                 event_role="system",
@@ -1897,9 +1924,13 @@ Rules:
         # turn ended on purpose, so the claim ends with a stated outcome rather
         # than by going quiet - and if this worker was taken over meanwhile,
         # none of it lands on the new owner's session (#162).
+        owner = self._claim_owner(session_id)
+        if owner is None:
+            logger.warning("refusing unowned final write for session %s", session_id)
+            return
         recorded = self.task_store.finalize_turn(
             session_id,
-            worker_id=self._claims.get(session_id),
+            worker_id=owner,
             status=status,
             reason=decision.action,
             event_role="assistant",

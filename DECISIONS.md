@@ -288,6 +288,10 @@ Decision log for architecture and operating choices.
   selecting a candidate and ending it is real: the write re-checks the owner
   and the exact heartbeat it selected, and a worker that beat in between
   keeps its claim.
+- Claiming is a prerequisite for running a turn, not bookkeeping around one.
+  A claim that fails aborts the turn instead of degrading to unowned writes:
+  the fallback would disable the ownership rules precisely in the failure mode
+  they exist for, and refusing leaves the session to whoever does own it.
 - Every write a claimed turn makes is scoped to its own worker id, and the
   terminal write is a single transaction. A turn that raises or is cancelled
   says so (`failed`, with `turn_failed`/`turn_cancelled`); `heartbeat_timeout`

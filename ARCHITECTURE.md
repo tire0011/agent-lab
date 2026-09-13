@@ -225,6 +225,11 @@
 - A heartbeat updates `last_heartbeat_at` only. `updated_at` keeps meaning
   "the session changed", so a heartbeat can never disguise a dead turn as
   recent activity.
+- No claim, no turn: if claiming raises or finds nothing to claim, the turn
+  fails with a `TaskOrchestratorError` before the heartbeat starts and before
+  anything is written. Proceeding unclaimed would make every later write fall
+  back to "no owner" and switch the ownership rules off exactly when
+  persistence is already misbehaving.
 - Every write a claimed turn makes is scoped to its own `worker_id`: status
   changes, the final decision and the release all miss if the session has
   since been taken over, so a superseded worker cannot drive or end a session

@@ -19,7 +19,11 @@ from modules.nexus_task_store import (
     TERMINAL_REASON_TURN_FAILED,
     NexusTaskStore,
 )
-from modules.task_orchestrator import ACTION_ANSWER, NexusTaskOrchestrator
+from modules.task_orchestrator import (
+    ACTION_ANSWER,
+    NexusTaskOrchestrator,
+    TaskOrchestratorError,
+)
 
 
 class _Registry:
@@ -50,6 +54,44 @@ class _Client:
         if self.observer is not None:
             self.observer()
         return self.responses.pop(0)
+
+
+class _UnclaimableStore:
+    """A real store whose claim never succeeds, recording every write attempt.
+
+    Persistence failing is exactly when the ownership guarantees must not
+    quietly switch themselves off, so this models both shapes of that failure.
+    """
+
+    def __init__(self, store: NexusTaskStore, *, mode: str) -> None:
+        self._store = store
+        self._mode = mode
+        self.writes: list[str] = []
+
+    def __getattr__(self, name):  # delegate everything not listed below
+        return getattr(self._store, name)
+
+    def claim_session(self, *args, **kwargs):
+        self.writes.append("claim_session")
+        if self._mode == "raises":
+            raise sqlite3.OperationalError("disk I/O error")
+        return False
+
+    def set_status(self, *args, **kwargs):
+        self.writes.append("set_status")
+        return self._store.set_status(*args, **kwargs)
+
+    def finalize_turn(self, *args, **kwargs):
+        self.writes.append("finalize_turn")
+        return self._store.finalize_turn(*args, **kwargs)
+
+    def append_event(self, *args, **kwargs):
+        self.writes.append("append_event")
+        return self._store.append_event(*args, **kwargs)
+
+    def heartbeat(self, *args, **kwargs):
+        self.writes.append("heartbeat")
+        return self._store.heartbeat(*args, **kwargs)
 
 
 class ControllerSessionHeartbeatTests(unittest.TestCase):
@@ -161,6 +203,39 @@ class ControllerSessionHeartbeatTests(unittest.TestCase):
         self.assertIsNone(session.terminal_reason)
         self.assertIsNotNone(session.last_heartbeat_at)
         self.assertEqual(self.store.recent_events(session.id, kind="answer"), [])
+
+
+    def _assert_no_unowned_writes(self, mode: str) -> None:
+        store = _UnclaimableStore(self.store, mode=mode)
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=_Registry(self.db_path, self._tmp.name),
+            experiment_service=MagicMock(),
+            llama_client=_Client(['{"action":"answer","message":"x","reason":"x"}']),
+            delegation_service=_Delegation(),
+            task_store=store,
+        )
+        self.addCleanup(orchestrator.close)
+
+        with self.assertRaises(TaskOrchestratorError):
+            orchestrator.run("inspect something")
+
+        # Nothing ran, and nothing was written without an owner.
+        self.assertEqual(store.writes, ["claim_session"])
+        session = self.store.get(self._only_session_id())
+        self.assertEqual(session.status, "active")
+        self.assertIsNone(session.terminal_reason)
+        self.assertIsNone(session.last_heartbeat_at)
+        self.assertIsNone(session.worker_id)
+        self.assertEqual(self.store.recent_events(session.id), [])
+
+    def test_a_refused_claim_stops_the_turn_before_it_writes_anything(self):
+        # claim_session() -> False: the row is not there to claim.
+        self._assert_no_unowned_writes("false")
+
+    def test_a_claim_that_raises_stops_the_turn_before_it_writes_anything(self):
+        # claim_session() raises: persistence is in trouble. Proceeding would
+        # mean every later write falls back to "no owner".
+        self._assert_no_unowned_writes("raises")
 
 
 if __name__ == "__main__":
