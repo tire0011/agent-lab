@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -34,6 +34,7 @@ from modules.mailbox.task_service import (
 )
 from modules.nexus_chat_service import NexusChatService
 from modules.nexus_chat_jobs import NexusChatJobService, STATUS_FAILED, STATUS_SUCCEEDED
+from modules.heartbeat import resolve_stale_timeout
 from modules.nexus_task_store import NexusTaskStore
 from modules.task_orchestrator import TaskOrchestratorError
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
@@ -74,6 +75,8 @@ from models import (
     MaintenanceExecuteRequest,
     MaintenanceExecuteResponse,
     MaintenanceStatusResponse,
+    NexusLivenessResponse,
+    NexusSessionClaim,
     OperationCatalogEntry,
     OperationResponse,
     OperationsCatalogResponse,
@@ -125,6 +128,14 @@ _MCP_MOUNT = create_mcp_mount()
 # inference plus tool calls can legitimately take many minutes, and calling a
 # live session dead is worse than noticing a dead one late.
 _STALE_SESSION_SECONDS = int(os.environ.get("NEXUS_STALE_SESSION_SECONDS", 6 * 60 * 60))
+
+# The heartbeat path (#162) replaces that inference for work that claims itself:
+# a worker says explicitly that it is alive, so silence means something and the
+# timeout can be minutes instead of hours. ``resolve_stale_timeout`` clamps a
+# zero/negative/unparsable setting to a safe floor rather than reaping live work.
+_STALE_HEARTBEAT_SECONDS = resolve_stale_timeout(
+    os.environ.get("NEXUS_STALE_HEARTBEAT_SECONDS")
+)
 
 
 
@@ -233,6 +244,22 @@ def get_operation_chain_service() -> OperationChainService:
         operations_registry=_resolve_operations_service(),
         mailbox_config=MailboxConfig.from_env(),
     )
+
+
+def get_nexus_task_store() -> Iterator[NexusTaskStore]:
+    """Controller session store for liveness inspection.
+
+    Opened and closed per request rather than cached: this serves occasional
+    diagnostic reads, and a process-lifetime connection for them would be one
+    more shared handle for no benefit.
+
+    Overridable in tests via ``app.dependency_overrides[get_nexus_task_store]``.
+    """
+    store = NexusTaskStore()
+    try:
+        yield store
+    finally:
+        store.close()
 
 
 @lru_cache(maxsize=1)
@@ -347,6 +374,33 @@ async def lifespan(app: FastAPI):
                 )
         except Exception as _exc:  # noqa: BLE001 - recovery must not block startup
             _logger.error("could not reap stale controller sessions: %s", _exc)
+
+        # Claims whose worker stopped heartbeating (#162). A restart is the
+        # clearest case: every worker this process inherited is gone by
+        # definition, so their claims are reconciled to an explicit terminal
+        # reason instead of waiting out the six-hour `updated_at` threshold.
+        # Idempotent, and never resumes the work.
+        _claim_store = None
+        try:
+            _claim_store = NexusTaskStore()
+            _stale_claims = _claim_store.reconcile_stale_heartbeats(
+                _STALE_HEARTBEAT_SECONDS
+            )
+            if _stale_claims:
+                _logger.warning(
+                    "released %d controller claim(s) with no heartbeat for %ds: %s",
+                    len(_stale_claims),
+                    _STALE_HEARTBEAT_SECONDS,
+                    ", ".join(s.id for s in _stale_claims[:10]),
+                )
+        except Exception as _exc:  # noqa: BLE001 - recovery must not block startup
+            _logger.error("could not reconcile stale controller claims: %s", _exc)
+        finally:
+            if _claim_store is not None:
+                try:
+                    _claim_store.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Best-effort outbox recovery: publish any un-pushed outbox records from
         # a previous crash.  Both publishers share the same MailboxConfig / DB.
@@ -1708,6 +1762,28 @@ def get_public_diagnostics(
 
 FAILURE_ANALYSES_DEFAULT_LIMIT = 20
 FAILURE_ANALYSES_MAX_LIMIT = 100
+
+
+@app.get("/diagnostics/nexus/liveness", response_model=NexusLivenessResponse)
+def get_nexus_liveness(
+    x_api_key: str | None = Header(default=None),
+    stale_after_seconds: int | None = Query(default=None, ge=0),
+    store: NexusTaskStore = Depends(get_nexus_task_store),
+) -> NexusLivenessResponse:
+    """Who owns which controller work, and when it last reported itself alive.
+
+    Read-only: it reports staleness but never reaps, so an operator can look at
+    a suspect session without changing its state. ``stale_after_seconds`` only
+    reframes the question - the store clamps it to the same safe floor the
+    reaper uses, so no query can make live work look dead (#162).
+    """
+    authorize(x_api_key)
+    snapshot = store.liveness(
+        stale_after_seconds if stale_after_seconds else _STALE_HEARTBEAT_SECONDS
+    )
+    return NexusLivenessResponse(
+        **{**snapshot, "claims": [NexusSessionClaim(**c) for c in snapshot["claims"]]}
+    )
 
 
 @app.get("/diagnostics/failure-analyses", response_model=FailureAnalysesResponse)

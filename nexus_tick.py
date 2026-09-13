@@ -21,6 +21,7 @@ import sys
 
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
+from modules.nexus_task_store import NexusTaskStore
 from modules.run_store import DEFAULT_DB_PATH
 
 configure_logging()
@@ -94,6 +95,34 @@ def _build_service(args) -> NexusInitiativeService:
     )
 
 
+def _reconcile_stale_claims(db_path: str) -> None:
+    """Release controller claims whose worker stopped heartbeating (#162).
+
+    The tick runs on a timer, which makes it the natural place to notice a dead
+    worker: the API only reconciles at startup, and a worker that dies while
+    the API keeps running would otherwise hold its claim until the next
+    restart. Never resumes the work and never fails the tick - a tick that
+    could not reap is still a tick that can decide.
+    """
+    store = None
+    try:
+        store = NexusTaskStore(db_path=db_path)
+        released = store.reconcile_stale_heartbeats()
+        for session in released:
+            logger.warning(
+                "released stale claim: session=%s worker=%s status=%s",
+                session.id, session.worker_id, session.status,
+            )
+    except Exception as exc:  # noqa: BLE001 - reaping must not break a tick
+        logger.warning("could not reconcile stale controller claims: %s", exc)
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
@@ -111,6 +140,11 @@ def main(argv: list[str] | None = None) -> int:
              "(no LLM controller is constructed)",
     )
     args = parser.parse_args(argv)
+
+    # --dry-run reports what would happen and changes nothing, reaping
+    # included.
+    if not args.dry_run:
+        _reconcile_stale_claims(args.db_path)
 
     service = _build_service(args)
     try:

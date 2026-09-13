@@ -257,6 +257,53 @@ Decision log for architecture and operating choices.
 - Revisit if: a tick should ever run more than one item concurrently - that
   needs a real work-claiming mechanism, not a wider busy check.
 
+### D-018: Liveness is something a worker states, not something a row implies
+
+- Status: Accepted
+- Why: Nexus inferred liveness from `updated_at`, which only says "this row
+  changed recently". That is wrong in both directions: a healthy controller
+  turn can spend minutes inside one local inference call without writing
+  anything, while a dead one keeps its last `updated_at` forever. D-017's
+  staleness rule and #160's reaper both had to pick thresholds in hours
+  because no better signal existed - the live database held 17 of 41 sessions
+  stuck `active` for 8 to 19 days.
+- Rule: long-running work is *claimed* (`worker_id`, `claimed_at`), refreshes
+  `last_heartbeat_at` while its owner is alive, and is released with an
+  explicit `terminal_reason` when it ends. `modules/heartbeat.py` holds the
+  shared semantics; each subsystem persists them in its own table.
+- A heartbeat never touches `updated_at`. Otherwise it would re-arm every
+  timestamp-based check in the system and quietly make dead work look busy.
+- Silence only means death where a worker was supposed to be working.
+  `waiting_for_user` and `blocked_missing_capability` are deliberate resting
+  states with no owner by design, and are never reaped.
+- A timeout of zero, a negative number or an unparsable one is a
+  configuration mistake, not a request to reap everything in flight: it falls
+  back to the default, and no configuration can push the timeout below a safe
+  floor. Calling live work dead is worse than noticing dead work late.
+- Reconciliation clears the heartbeat it selects on, so it is idempotent by
+  construction, and it never re-runs the work - re-running a turn costs a
+  model call and may repeat whatever killed it (as in #160).
+- Reaping is a compare-and-set, not a two-step read-then-write. The reaper
+  runs in a different process from the worker, so the window between
+  selecting a candidate and ending it is real: the write re-checks the owner
+  and the exact heartbeat it selected, and a worker that beat in between
+  keeps its claim.
+- Claiming is a prerequisite for running a turn, not bookkeeping around one.
+  A claim that fails aborts the turn instead of degrading to unowned writes:
+  the fallback would disable the ownership rules precisely in the failure mode
+  they exist for, and refusing leaves the session to whoever does own it.
+- Every write a claimed turn makes is scoped to its own worker id, and the
+  terminal write is a single transaction. A turn that raises or is cancelled
+  says so (`failed`, with `turn_failed`/`turn_cancelled`); `heartbeat_timeout`
+  is reserved for a worker that never got to say anything at all, so the two
+  facts stay distinguishable.
+- Ownership survives reaping: `worker_id` stays on the row so "who was
+  running this" is answerable afterwards.
+- Revisit if: concurrency arrives. Claiming is currently unconditional
+  because one worker drives a session at a time; multiple workers competing
+  for the same item would need a conditional claim (compare-and-set on the
+  existing owner) on top of the same columns.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns
