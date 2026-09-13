@@ -529,6 +529,95 @@ class NexusTaskOrchestrator:
                         f"retry also failed: {correction_error}"
                     ) from correction_error
             action = str(decision.get("action", "")).strip().lower()
+            if action == TOOL_FIND_TOOL:
+                goal = str(decision.get("goal", "")).strip()
+                prior_not_found = next(
+                    (
+                        observation
+                        for observation in reversed(observations)
+                        if observation.get("tool") == TOOL_FIND_TOOL
+                        and observation.get("status") == "not_found"
+                        and observation.get("retryable") is False
+                        and observation.get("state_token") == state_token
+                        and str(observation.get("goal", "")).strip() == goal
+                    ),
+                    None,
+                )
+                if prior_not_found is not None:
+                    experiment_ids = list(
+                        dict.fromkeys(
+                            re.findall(
+                                r"\b[0-9a-f]{8,32}\b",
+                                task,
+                                flags=re.IGNORECASE,
+                            )
+                        )
+                    )
+                    direct_capabilities = list(
+                        prior_not_found.get("direct_capabilities") or []
+                    )
+                    if (
+                        ACTION_RESUME_EXPERIMENT in direct_capabilities
+                        and len(experiment_ids) == 1
+                    ):
+                        decision = {
+                            "action": ACTION_RESUME_EXPERIMENT,
+                            "experiment_id": experiment_ids[0],
+                            "message": "",
+                            "reason": (
+                                "identical find_tool lookup was terminal after not_found; "
+                                "using the surfaced resume_experiment capability instead"
+                            ),
+                        }
+                        action = ACTION_RESUME_EXPERIMENT
+                        logger.info(
+                            "find_tool terminal not_found redirected session_id=%s goal=%s "
+                            "next_action=%s",
+                            session.id,
+                            goal[:500],
+                            action,
+                        )
+                    else:
+                        blocked = {
+                            "tool": TOOL_FIND_TOOL,
+                            "status": "not_found",
+                            "goal": goal,
+                            "retryable": False,
+                            "state_token": state_token,
+                            "event": "find_tool_retry_blocked",
+                            "reason": (
+                                "An identical find_tool lookup already returned not_found "
+                                "without a relevant state change."
+                            ),
+                            "related_tools": list(
+                                prior_not_found.get("related_tools") or []
+                            ),
+                            "related_operations": list(
+                                prior_not_found.get("related_operations") or []
+                            ),
+                            "direct_capabilities": direct_capabilities,
+                            "recommended_next_action": prior_not_found.get(
+                                "recommended_next_action"
+                            ),
+                        }
+                        self.task_store.record_controller_turn(
+                            session.id,
+                            provider_used=provider_used,
+                            outcome="find_tool_retry_blocked",
+                            prompt_chars=len(prompt),
+                            safe_local_budget_chars=budget_plan.safe_local_budget_chars,
+                            detail=blocked["reason"],
+                        )
+                        event_id = self.task_store.append_event(
+                            session.id,
+                            role="tool",
+                            kind=TOOL_FIND_TOOL,
+                            content=json.dumps(blocked, separators=(",", ":")),
+                            metadata={"reason": str(decision.get("reason", ""))[:1000]},
+                        )
+                        blocked["event_id"] = event_id
+                        observations.append(blocked)
+                        continue
             # One durable row per turn (#158). Which model decided this turn was
             # previously recoverable only from a log line, so the question "does
             # the local controller produce usable decisions" could not be
@@ -601,6 +690,12 @@ class NexusTaskOrchestrator:
                         budget_plan=budget_plan,
                         task_logger=task_logger,
                     )
+                    if (
+                        tool == TOOL_FIND_TOOL
+                        and observation.get("status") == "not_found"
+                    ):
+                        observation = dict(observation)
+                        observation["state_token"] = state_token
                     self.loop_guard.record_result(check.call_id, observation)
                 event_id = self.task_store.append_event(
                     session.id,
@@ -987,6 +1082,57 @@ Rules:
             )
         return _TOOL_ACCURACY_UNKNOWN
 
+    def _find_tool_not_found_metadata(
+        self,
+        session_id: str,
+        goal: str,
+        related_operations: list[str],
+    ) -> dict[str, Any]:
+        context = [goal]
+        recent_events = getattr(self.task_store, "recent_events", None)
+        if callable(recent_events):
+            for event in recent_events(
+                session_id,
+                role="user",
+                kind="input",
+                limit=8,
+            ):
+                context.append(str(event["content"] or ""))
+        context_text = " ".join(context)
+        experiment_ids = list(
+            dict.fromkeys(
+                re.findall(
+                    r"\b[0-9a-f]{8,32}\b",
+                    context_text,
+                    flags=re.IGNORECASE,
+                )
+            )
+        )
+        resume_relevant = bool(
+            re.search(
+                r"\b(resume|continue|continuing)\b",
+                context_text,
+                flags=re.IGNORECASE,
+            )
+        )
+        direct_capabilities = (
+            [ACTION_RESUME_EXPERIMENT]
+            if len(experiment_ids) == 1 and resume_relevant
+            else []
+        )
+        if ACTION_RESUME_EXPERIMENT in direct_capabilities:
+            recommended_next_action = ACTION_RESUME_EXPERIMENT
+        elif related_operations:
+            recommended_next_action = "resolve_related_operation"
+        else:
+            recommended_next_action = ACTION_MISSING_CAPABILITY
+        return {
+            "retryable": False,
+            "related_operations": list(related_operations),
+            "direct_capabilities": direct_capabilities,
+            "recommended_next_action": recommended_next_action,
+        }
+
     async def _resolve_find_tool(
         self,
         goal: str,
@@ -1044,6 +1190,7 @@ Rules:
                 "goal": clean_goal,
                 "reason": "No read-only OperationsRegistry candidate matched the requested capability.",
                 "related_tools": [],
+                **self._find_tool_not_found_metadata(session_id, clean_goal, []),
                 "metrics": {
                     "candidate_count": 0,
                     "candidate_operations": [],
@@ -1193,6 +1340,11 @@ Rules:
             "error": final_error,
             "guidance": final_guidance,
             "related_tools": related_tools,
+            **(
+                self._find_tool_not_found_metadata(session_id, clean_goal, related_tools)
+                if final_status == "not_found"
+                else {}
+            ),
             "metrics": {
                 "candidate_count": len(candidates),
                 "candidate_operations": [spec.name for spec in candidates],
@@ -1228,7 +1380,8 @@ Rules:
                 "description": (
                     "Resolve one needed read-only Nexus operation by goal. Returns either "
                     "one full operation schema, invalid_goal for placeholder/generic requests, "
-                    "or structured not_found; it never implements missing tools."
+                    "or actionable non-retryable not_found with related operations and direct "
+                    "controller capabilities; it never implements missing tools."
                 ),
                 "arguments": {"goal": "run a shell command in the repository"},
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
@@ -1377,6 +1530,7 @@ Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
 - Use find_tool when you need an OperationsRegistry capability that has not already been resolved in this session; then invoke only the returned identifier with call_tool. Never guess concrete tool names.
+- A find_tool observation with status=not_found and retryable=false is terminal for that exact goal while state is unchanged. Never repeat the identical lookup. Prefer its direct_capabilities/recommended_next_action, resolve a more specific related operation, use command/python_run, or choose missing_capability. related_operations are suggestions only and are not call_tool grants.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
