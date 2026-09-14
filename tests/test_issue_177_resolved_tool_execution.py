@@ -23,12 +23,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest.mock import MagicMock
+
 from modules.nexus_tool_router import bind_resolved_arguments
+from modules.operations_registry import OperationArgSpec
+from modules.task_orchestrator import ACTION_ANSWER, NexusTaskOrchestrator
 from modules.failure_analysis_service import (
     CATEGORY_UNAVAILABLE,
     FailureAnalysisService,
 )
 
+from tests.test_task_orchestrator import _Client, _MultiRegistry, _NamedSpec
 from tests.test_issue_172_failure_analysis_tools import (
     _ScriptedClient,
     _diagnosis_json,
@@ -276,6 +281,110 @@ class NonDefaultArgumentTests(unittest.TestCase):
         _client, rows = self._run({"service_status": {"service": "agent-api"}})
 
         self.assertEqual(rows, [], "a value absent from the goal must not run")
+
+
+class ControllerResolvedToolTests(unittest.TestCase):
+    """The controller drives the same path, on the same terms.
+
+    It pays the identical formality after a resolution, on the identical
+    local model, so it executes a bound read-only operation without a second
+    decision - and refuses just as firmly when the arguments could not be
+    tied to the goal.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.registry = _MultiRegistry(str(Path(self.tmp.name) / "state.db"), self.tmp.name)
+        self.registry._specs.append(
+            _NamedSpec(
+                "service_status",
+                "systemctl-Status eines systemd-Service.",
+                tags=["service", "status", "systemd", "health"],
+                arguments=[
+                    OperationArgSpec("service", "string", "Unit-Name.", default="agent-api")
+                ],
+                mutates_state=False,
+            )
+        )
+
+    def _run(self, goal, resolver_json):
+        client = _Client([
+            json.dumps({"type": "tool", "tool": "find_tool", "goal": goal, "reason": "need it"}),
+            resolver_json,
+            json.dumps({
+                "type": "action", "action": "answer",
+                "message": "done", "reason": "evidence gathered",
+            }),
+        ])
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=self.registry,
+            experiment_service=MagicMock(),
+            llama_client=client,
+            delegation_service=None,
+        )
+        try:
+            result = orchestrator.run(goal)
+        finally:
+            orchestrator.close()
+        return result, client
+
+    def test_a_bound_operation_runs_without_a_second_decision(self):
+        result, client = self._run(
+            "inspect service_status of llama-server",
+            json.dumps({
+                "status": "found", "operation": "service_status",
+                "reason": "it reports service health",
+                "arguments": {"service": "llama-server"},
+            }),
+        )
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(
+            [(name, args) for name, args, _caller in self.registry.calls],
+            [("service_status", {"service": "llama-server"})],
+        )
+        # Three inferences in total: the find_tool decision, the resolver,
+        # and the final action. None of them was "now call the tool".
+        self.assertEqual(len(client.prompts), 3, client.prompts)
+        self.assertTrue(client.prompts[1].startswith("TOOL RESOLVER MODE."))
+
+    def test_an_unbound_goal_is_not_executed_by_the_controller_either(self):
+        result, _client = self._run(
+            "inspect service_status of llama-server",
+            json.dumps({
+                "status": "found", "operation": "service_status",
+                "reason": "it reports service health",
+            }),
+        )
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(self.registry.calls, [], "must not fall back to the default service")
+
+    def test_an_argument_free_operation_runs_directly(self):
+        _result, _client = self._run(
+            "inspect git_status of the repository",
+            json.dumps({
+                "status": "found", "operation": "git_status",
+                "reason": "it reports repository changes",
+            }),
+        )
+
+        self.assertEqual(
+            [(name, args) for name, args, _caller in self.registry.calls],
+            [("git_status", {})],
+        )
+
+    def test_a_mutating_operation_is_never_executed_directly(self):
+        _result, _client = self._run(
+            "trigger inbox_refresh for the mailbox",
+            json.dumps({
+                "status": "found", "operation": "inbox_refresh",
+                "reason": "it polls the mailbox",
+            }),
+        )
+
+        self.assertEqual(self.registry.calls, [])
 
 
 class DirectExecutionEligibilityTests(unittest.TestCase):

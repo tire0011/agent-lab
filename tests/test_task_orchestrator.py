@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from modules.nexus_delegation import DelegationResult
+from modules.operations_registry import OperationArgSpec
 from modules.runtime_execution import resolve_python_interpreter
 from modules.central_logging import get_task_logger, read_log_entries
 from modules.task_orchestrator import (
@@ -42,7 +43,11 @@ class _Client:
 class _Spec:
     name = "experiment_show"
     description = "show experiment"
-    arguments = []
+    # The real OperationSpec derives to_dict() from this list, so the fake must
+    # too: it used to declare no arguments while reporting a required one, and
+    # a caller that reads the schema off the spec would have been told this
+    # operation takes nothing.
+    arguments = [OperationArgSpec("experiment_id", "string", "Experiment-ID.", required=True)]
     tags = ["experiment", "status"]
     # Declared, like the real OperationSpec: a spec that does not say whether
     # it mutates state is treated as mutating and is not discoverable at all.
@@ -52,7 +57,7 @@ class _Spec:
         return {
             "operation": "experiment_show",
             "description": "show experiment",
-            "arguments": [{"name": "experiment_id", "type": "string", "required": True}],
+            "arguments": [argument.to_dict() for argument in self.arguments],
             "tags": list(self.tags),
             "mutates_state": self.mutates_state,
         }

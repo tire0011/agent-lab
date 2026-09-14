@@ -762,6 +762,15 @@ class NexusTaskOrchestrator:
                 observation = dict(observation)
                 observation["event_id"] = event_id
                 observations.append(observation)
+                executed = self._execute_resolved_tool(
+                    session_id=session.id,
+                    state_token=state_token,
+                    observation=observation,
+                    reason=str(decision.get("reason", "")),
+                    task_logger=task_logger,
+                )
+                if executed is not None:
+                    observations.append(executed)
                 continue
 
             if action not in _FINAL_ACTIONS:
@@ -1263,6 +1272,7 @@ Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
 - Use find_tool when you need an OperationsRegistry capability that has not already been resolved in this session; then invoke only the returned identifier with call_tool. Never guess concrete tool names.
+- Name the concrete values a capability needs inside the find_tool goal ("the service_logs of llama-server"). When they can be read straight out of the goal, that operation is executed for you and its result is the next observation - do not call it again. A goal that names none, for a capability that takes some, comes back with the reason and is yours to call with explicit arguments.
 - A find_tool observation with status=not_found and retryable=false is terminal for that exact goal while state is unchanged. Never repeat the identical lookup. Prefer its direct_capabilities/recommended_next_action, resolve a more specific related operation, use command/python_run, or choose missing_capability. related_operations are suggestions only and are not call_tool grants.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
@@ -1758,6 +1768,80 @@ Rules:
                 "metadata": {"error": previous_error or "all available providers failed"},
             },
         }
+
+    def _execute_resolved_tool(
+        self,
+        *,
+        session_id: str,
+        state_token: str,
+        observation: dict[str, Any],
+        reason: str,
+        task_logger: Any | None = None,
+    ) -> dict[str, Any] | None:
+        """Run a read-only operation ``find_tool`` already resolved *and* bound.
+
+        The controller pays the same formality failure analysis did (#177):
+        after the resolver has returned one operation and read its arguments
+        straight out of the goal, asking the model to confirm "now call it"
+        buys nothing and costs a full decision on the local model.
+
+        Executed only when the router bound the arguments against that goal.
+        ``resolved_arguments`` is ``None`` whenever a value could not be tied
+        back to it, and that must never be read as "use the defaults" - it is
+        how a goal naming ``llama-server`` would be answered with
+        ``agent-api``. Everything else is the ordinary path: the same loop
+        guard, the same grant rule, the same read-only boundary in
+        ``execute_operation``, the same durable event.
+        """
+        if observation.get("tool") != TOOL_FIND_TOOL or observation.get("status") != "found":
+            return None
+        operation = str(observation.get("resolved_tool") or "").strip()
+        arguments = observation.get("resolved_arguments")
+        if not operation or not isinstance(arguments, dict):
+            return None
+
+        check = self.loop_guard.check(
+            session_id,
+            ACTION_CALL_TOOL,
+            {"tool": operation, "arguments": dict(arguments)},
+            state_token=state_token,
+            reason=f"executing the read-only operation find_tool resolved: {reason}"[:1000],
+        )
+        if not check.allowed:
+            return None
+        try:
+            result = self._execute_operation(
+                {"operation": operation, "args": dict(arguments), "session_id": session_id}
+            )
+        except TaskOrchestratorError as exc:
+            # A refused execution is an observation about this turn, not a
+            # failure of it: the model still sees why and can choose again.
+            result = {
+                "tool": "operation",
+                "operation": operation,
+                "args": dict(arguments),
+                "error": "invalid_tool_request",
+                "reason": str(exc)[:1000],
+            }
+        self.loop_guard.record_result(check.call_id, result)
+        if task_logger is not None:
+            task_logger.info(
+                "orchestration",
+                "resolved_tool_executed",
+                f"executed {operation} directly from its find_tool resolution",
+                tool=operation,
+                session_id=session_id,
+            )
+        event_id = self.task_store.append_event(
+            session_id,
+            role="tool",
+            kind=str(result.get("tool", "operation")),
+            content=json.dumps(result, separators=(",", ":")),
+            metadata={"reason": f"resolved by find_tool: {reason}"[:1000]},
+        )
+        result = dict(result)
+        result["event_id"] = event_id
+        return result
 
     def _execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
         try:
