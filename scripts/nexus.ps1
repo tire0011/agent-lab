@@ -35,17 +35,31 @@ function Write-Section([string]$Title) {
     Write-Host "=== $Title ===" -ForegroundColor Cyan
 }
 
-function Assert-AgentApiConfiguration {
+function Test-AgentEnvironmentValue([string]$NamePattern) {
     # agent.env is intentionally root-owned and not readable by the agent user.
-    # Use sudo + grep as a boolean presence check; never read or print the secret.
+    # Keep validation boolean-only: grep's quiet mode returns only an exit code,
+    # so neither API keys nor GitHub tokens enter PowerShell output or logs.
+    $AssignmentPattern = "^[[:space:]]*($NamePattern)[[:space:]]*=[[:space:]]*[^[:space:]].*$"
+    sudo grep -Eq $AssignmentPattern $AgentEnvironmentFile
+    return $LASTEXITCODE -eq 0
+}
+
+function Assert-NexusConfiguration {
     sudo test -f $AgentEnvironmentFile
     if ($LASTEXITCODE -ne 0) {
-        throw "agent-api configuration missing: $AgentEnvironmentFile does not exist. Restart aborted."
+        throw "Nexus configuration missing: $AgentEnvironmentFile does not exist. Restart aborted."
     }
 
-    sudo grep -Eq '^\s*AGENT_API_KEY\s*=.+$' $AgentEnvironmentFile
-    if ($LASTEXITCODE -ne 0) {
-        throw "agent-api configuration invalid: AGENT_API_KEY is missing or empty in $AgentEnvironmentFile. Restart aborted to keep the existing service state intact."
+    if (-not (Test-AgentEnvironmentValue 'AGENT_API_KEY')) {
+        throw "Nexus configuration invalid: AGENT_API_KEY is missing or empty in $AgentEnvironmentFile. Restart aborted to keep the existing service state intact."
+    }
+
+    if (-not (Test-AgentEnvironmentValue 'GITHUB_REPOSITORY')) {
+        throw "Nexus configuration invalid: GITHUB_REPOSITORY is missing or empty in $AgentEnvironmentFile. Restart aborted to keep the existing service state intact."
+    }
+
+    if (-not (Test-AgentEnvironmentValue 'GITHUB_TOKEN|GH_TOKEN')) {
+        throw "Nexus configuration invalid: GITHUB_TOKEN or GH_TOKEN is missing or empty in $AgentEnvironmentFile. Restart aborted to keep the existing service state intact."
     }
 }
 
@@ -207,8 +221,8 @@ function Invoke-NexusMailbox {
 
 function Restart-Nexus {
     Write-Section 'Validating Nexus configuration'
-    Assert-AgentApiConfiguration
-    Write-Host 'agent-api configuration OK (AGENT_API_KEY present).' -ForegroundColor Green
+    Assert-NexusConfiguration
+    Write-Host 'Nexus configuration OK (API key, GitHub repository, and GitHub token present).' -ForegroundColor Green
 
     Write-Section 'Restarting Nexus'
     sudo systemctl daemon-reload
