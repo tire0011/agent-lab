@@ -15,10 +15,17 @@ Design points (see the issue for the full spec):
 * **Bounded, relevance-filtered context.** Callers never hand the model raw
   full logs; :func:`evidence_from_log_entries` picks a small, relevant slice
   and every field is length-capped.
-* **Local model first.** Uses :class:`~modules.llama_cpp_client.LlamaCppClient`
-  against the configured local Nexus LLM by default; the provider is not
-  hard-coded into the analysis shape, so a future external-model fallback
-  can be added without changing callers.
+* **One local-model execution path.** Local inference is submitted to the
+  shared :class:`~modules.local_llm_jobs.LocalLlmJobService` under the
+  ``failure_analysis`` role (#167), never as a second direct HTTP request to
+  llama-server: queueing, serialization, liveness, cancellation, stuck-job
+  handling and job observability all belong to that one component. The
+  provider is not hard-coded into the analysis shape, so a future
+  external-model fallback can be added without changing callers.
+* **No analysis-side deadline.** A valid diagnosis on the deployed local
+  model may legitimately need minutes; the shared job service's liveness
+  handling decides when inference is genuinely stuck, not a fixed
+  failure-analysis timeout.
 * **No secrets in the prompt or the stored result.** Every piece of text
   that reaches the model or the database goes through
   ``modules.redaction.redact`` first.
@@ -33,9 +40,9 @@ Design points (see the issue for the full spec):
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
-import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -44,7 +51,14 @@ from pathlib import Path
 from typing import Any
 
 from modules import central_logging
-from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extract_json
+from modules.llama_cpp_client import LlamaCppClientError, extract_json
+from modules.local_llm_jobs import (
+    ROLE_FAILURE_ANALYSIS,
+    LocalLlmJobError,
+    LocalLlmJobService,
+    acquire_local_llm_job_service,
+    release_local_llm_job_service,
+)
 from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 from modules.redaction import redact
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -74,8 +88,15 @@ _MAX_EVIDENCE_REFS_PER_CAUSE = 6
 # on its own, regardless of what the model itself claimed.
 _LOW_CONFIDENCE_ESCALATION_THRESHOLD = 0.35
 
-_DEFAULT_ANALYSIS_TIMEOUT_SECONDS = 60.0
 _DEFAULT_MAX_TOKENS = 900
+
+# Re-entrancy guard (#167). Diagnosing a failure must never become the next
+# failure to diagnose: if anything on the analysis path ever asked for an
+# analysis again, this stops the recursion at the first nested call instead
+# of queueing a second local-model job and persisting a second record.
+_ANALYSIS_IN_PROGRESS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "failure_analysis_in_progress", default=False
+)
 
 # Fields every structured log entry (see modules.central_logging) carries
 # that are either redundant with the compact rendering below or too
@@ -545,6 +566,7 @@ class FailureAnalysisService:
         *,
         db_path: str = DEFAULT_DB_PATH,
         llama_client: Any | None = None,
+        job_service: LocalLlmJobService | None = None,
         analysis_timeout_seconds: float | None = None,
         log_dir: str | Path = central_logging.DEFAULT_LOG_DIR,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
@@ -552,11 +574,26 @@ class FailureAnalysisService:
         outbox_dir: str | Path | None = None,
         repo_root: str | Path | None = None,
     ) -> None:
+        """Build an analyzer bound to the shared local-LLM job service (#167).
+
+        *job_service* injects an existing :class:`LocalLlmJobService`;
+        *llama_client* injects the inference client a private job service
+        should drive. With neither, the process-wide shared service for
+        *db_path* is acquired, which is what puts failure-analysis jobs on the
+        same queue and worker as controller jobs.
+
+        *analysis_timeout_seconds* is accepted but ignored: a valid diagnosis
+        on the deployed local model may legitimately take minutes, and the
+        60s deadline this used to install is exactly what turned a healthy
+        slow analysis into ``analysis_unavailable`` (#167). Liveness is the
+        shared job service's job now.
+        """
         self.db_path = db_path
-        timeout = analysis_timeout_seconds
-        if timeout is None:
-            timeout = float(os.environ.get("NEXUS_FAILURE_ANALYSIS_TIMEOUT_SECONDS", _DEFAULT_ANALYSIS_TIMEOUT_SECONDS))
-        self._client = llama_client or LlamaCppClient(timeout=max(5.0, timeout))
+        if analysis_timeout_seconds is not None:
+            logger.info(
+                "failure_analysis: analysis_timeout_seconds is ignored since #167; "
+                "liveness is handled by the shared local LLM job service"
+            )
         self._max_tokens = max(200, max_tokens)
         self._log_dir = Path(log_dir)
 
@@ -588,8 +625,21 @@ class FailureAnalysisService:
         # a FailureAnalysisService and would otherwise be able to run its
         # first query against a database where the table was never made.
 
+        # Inference wiring last: an unusable database must fail construction
+        # before a job worker is started for it.
+        self._jobs = job_service or acquire_local_llm_job_service(
+            db_path=db_path, llama_client=llama_client
+        )
+        self._owns_jobs = job_service is None
+        # Kept for provider/model reporting only (the analysis record, logs and
+        # observability all name the model). Production inference never calls
+        # this client directly - it goes through self._jobs.
+        self._client = getattr(self._jobs, "llama", None)
+
     def close(self) -> None:
         self._conn.close()
+        if self._owns_jobs:
+            release_local_llm_job_service(self._jobs)
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -659,6 +709,26 @@ class FailureAnalysisService:
         record persisted below.
         """
         analysis_id = uuid.uuid4().hex
+        if _ANALYSIS_IN_PROGRESS.get():
+            # Bounded and explicit (#167): one analysis per failure. A nested
+            # request is refused before any job is queued and before anything
+            # is persisted, so a failing analysis can never fan out into more
+            # analyses or more durable records.
+            logger.warning(
+                "failure_analysis: refusing nested analysis for %s/%s",
+                subject_type, subject_id,
+            )
+            return _unavailable_analysis(
+                analysis_id=analysis_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                provider="local",
+                model=getattr(self._client, "model", None),
+                reason="nested failure analysis refused",
+                experiment_id=experiment_id,
+                mailbox_task_id=mailbox_task_id,
+            )
+        guard_token = _ANALYSIS_IN_PROGRESS.set(True)
         try:
             analysis = await self._analyze(
                 analysis_id=analysis_id,
@@ -684,6 +754,8 @@ class FailureAnalysisService:
                 experiment_id=experiment_id,
                 mailbox_task_id=mailbox_task_id,
             )
+        finally:
+            _ANALYSIS_IN_PROGRESS.reset(guard_token)
         persisted = self._persist(analysis)
         self._log(analysis, elog)
         # Only publish an outbox notification once the durable record it
@@ -812,21 +884,46 @@ class FailureAnalysisService:
         )
 
         model_name = getattr(self._client, "model", None)
+        # Local inference goes through the shared job service (#167): one
+        # queue, one worker, one set of job semantics for controller and
+        # failure-analysis work alike. No deadline is imposed here - the job
+        # service decides when a job is genuinely stuck.
+        job_id = self._jobs.submit(
+            prompt,
+            temperature=0.0,
+            max_tokens=self._max_tokens,
+            session_id=analysis_id,
+            role=ROLE_FAILURE_ANALYSIS,
+            system=_SYSTEM_PROMPT,
+        )
+        logger.info(
+            "failure_analysis: local LLM job submitted job_id=%s role=%s analysis_id=%s "
+            "subject=%s/%s",
+            job_id, ROLE_FAILURE_ANALYSIS, analysis_id, subject_type, subject_id,
+        )
         try:
-            raw = await self._client.complete(
-                prompt=prompt,
-                system=_SYSTEM_PROMPT,
-                temperature=0.0,
-                max_tokens=self._max_tokens,
+            raw = await self._jobs.wait(job_id)
+        except LocalLlmJobError as exc:
+            # Job failure, cancellation and stuck-job detection all land here
+            # and all produce the same durable analysis_unavailable record.
+            # Nothing re-triggers an analysis: the original lifecycle failure
+            # keeps whatever result it already had.
+            logger.warning(
+                "failure_analysis: local LLM job did not produce a result job_id=%s "
+                "status=%s error_kind=%s analysis_id=%s",
+                job_id, getattr(exc, "status", None), getattr(exc, "kind", None), analysis_id,
             )
-        except LlamaCppClientError as exc:
             return _unavailable_analysis(
                 analysis_id=analysis_id,
                 subject_type=subject_type,
                 subject_id=subject_id,
                 provider="local",
                 model=model_name,
-                reason=f"local model call failed: {exc}",
+                reason=(
+                    f"local model call failed: job {job_id} "
+                    f"{getattr(exc, 'status', None) or 'failed'}"
+                    f"/{getattr(exc, 'kind', None) or 'unknown'}: {exc}"
+                ),
                 experiment_id=experiment_id,
                 mailbox_task_id=mailbox_task_id,
             )
