@@ -355,6 +355,53 @@ Decision log for architecture and operating choices.
   component grows a concurrency limit; the callers still do not grow their
   own HTTP paths.
 
+### D-020: Nexus has one tool mechanism, used by several roles
+
+- Status: Accepted
+- Why: Tool discovery and tool execution lived inside
+  `NexusTaskOrchestrator`, so only the persistent controller could reach
+  them. Every other LLM role could describe the evidence it was handed but
+  never check anything. The #115/#116 rerun showed the cost: finalization
+  returned an old persisted `needs_review` reason saying
+  `GITHUB_TOKEN/GH_TOKEN` was unavailable, failure analysis produced a
+  correct, well-formed diagnosis of exactly that claim, and asked a human to
+  verify a token the running `agent-api` process already had. The real cause
+  was stale persisted adoption state (#171). No amount of better reasoning
+  over the supplied evidence could have found that - only current evidence
+  could.
+- Rule: `modules/nexus_tool_router.py` owns capability discovery
+  (`find_tool`) and read-only capability execution (`call_tool`) for every
+  role: one `OperationsRegistry` catalog, one read-only denylist, one
+  candidate-scoring and resolver prompt, one "`call_tool` needs a prior
+  `find_tool` grant" rule, one set of registry-side validation, redaction and
+  audit logging. A role that needs tools uses this; it does not grow its own.
+- Roles differ by permission, not by mechanism. The controller may also run
+  commands, execute Python and delegate; failure analysis may only discover
+  and call read-only capabilities, and its action vocabulary contains nothing
+  else. That is the whole difference.
+- Two things stay injected, because they are genuinely per-role: inference
+  (the controller routes resolver calls through a memory budget with an
+  external-provider fallback; a diagnosis just queues a job under D-019) and
+  where grants live (persistent session events for the controller, the
+  current run for a one-shot diagnostic role).
+- A persisted failure reason is a claim about the past. When it asserts
+  something about the runtime or the configuration, diagnosis checks it
+  before interpreting it, and current evidence that contradicts it wins -
+  the stale string then becomes a finding rather than the conclusion.
+- Diagnosis gathers evidence; it never acts. No lifecycle transitions, no
+  code edits, no merges, no restarts, no retries - enforced by the read-only
+  catalog rather than by asking the model nicely.
+- Bounded like every other tool loop: a small step budget, the same
+  duplicate/non-progressing loop guard the controller uses, and tool output
+  redacted and length-capped before it reaches a prompt, a log, the persisted
+  analysis or the outbox.
+- No tools, or no capability for what was asked, is a valid outcome that must
+  be *said*: the diagnosis reports the missing evidence instead of assuming
+  either answer. Silence here is what made an unverified analysis
+  indistinguishable from a verified one.
+- Revisit if: a role needs a capability that is not read-only. That is a
+  permission model on the router (per-role allowlists), not a second router.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

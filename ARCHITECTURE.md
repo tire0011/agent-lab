@@ -307,6 +307,40 @@
   analysis persists exactly one `analysis_unavailable` record - and never
   re-enters itself over its own failed job.
 
+### 12) Tool discovery and execution (one shared router, several roles)
+
+- Modules: `modules/nexus_tool_router.py` (discovery, read-only execution,
+  grants, not-found metadata), backed by `modules/operations_registry.py`
+  (the capability catalog, argument validation, redaction, audit log) and
+  `modules/tool_loop_guard.py` (duplicate/non-progressing protection).
+  Callers: `modules/task_orchestrator.py` (the persistent controller) and
+  `modules/failure_analysis_service.py` (diagnosis, #172).
+- `find_tool` resolves one plain-language capability request against the
+  read-only catalog and returns that operation's schema; `call_tool` runs an
+  operation only when a `find_tool` result in the same session already
+  returned its schema. Both rules apply to every role - a role never guesses
+  a tool name, and never runs one it did not resolve.
+- Roles differ only in permission. The controller additionally has
+  `command`, `python_run`, `memory_search` and `delegate`; failure analysis
+  has discovery and read-only execution and nothing else, so a diagnosis
+  cannot transition lifecycle state, edit code, merge, restart or retry.
+- Inference and grant storage are injected, because they are genuinely
+  per-role: the controller resolves through a memory budget with an external
+  fallback and reads its grants back from persistent session events; failure
+  analysis queues a job under section 11 and keeps grants for the one
+  analysis they belong to.
+- Diagnosis runs a bounded evidence-gathering phase *before* it diagnoses:
+  a recorded failure reason is a claim about the past, and a runtime or
+  configuration claim ("GITHUB_TOKEN is unavailable") is checked against
+  current state rather than repeated. `github_status` is the read-only
+  capability for that specific claim - it reports whether a repository and a
+  credential resolve right now, never their values.
+- Bounds are the controller's, reused: a small step budget, the same loop
+  guard, and every tool result redacted and length-capped before it reaches
+  a prompt, a log, the persisted analysis or the outbox. No available
+  capability for what was asked is a valid outcome, and the diagnosis states
+  the missing evidence instead of assuming either answer.
+
 ## Near-term target architecture (planned, not complete)
 
 1. **V1 MCP agent path**

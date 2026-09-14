@@ -29,6 +29,17 @@ Design points (see the issue for the full spec):
 * **No secrets in the prompt or the stored result.** Every piece of text
   that reaches the model or the database goes through
   ``modules.redaction.redact`` first.
+* **Diagnosis may check, not only read (#172).** When the service is given
+  the shared :class:`~modules.nexus_tool_router.NexusToolRouter`, a bounded
+  evidence-gathering phase runs before the diagnosis itself: the same
+  ``find_tool``/``call_tool`` mechanism the persistent controller uses, on
+  the same read-only ``OperationsRegistry`` catalog, with the same schema
+  validation, redaction and audit logging. This exists because a persisted
+  failure reason is a claim about the past: "GITHUB_TOKEN is unavailable"
+  can be false by the time it is diagnosed, and only current evidence can
+  say so. The phase is read-only by construction, strictly bounded, and
+  entirely optional - without a router the service behaves exactly as it
+  did before.
 * **Reusable, not finalization-only.** :meth:`analyze` takes a generic
   ``subject_type``/``subject_id`` plus a caller-supplied evidence bundle;
   :meth:`analyze_from_logs` is a convenience helper for the common case of
@@ -59,9 +70,18 @@ from modules.local_llm_jobs import (
     acquire_local_llm_job_service,
     release_local_llm_job_service,
 )
+from modules.nexus_tool_router import (
+    ACTION_CALL_TOOL,
+    TOOL_FIND_TOOL,
+    InMemoryToolGrantLedger,
+    NexusToolRouter,
+    ToolResolverUnavailableError,
+    ToolRouterError,
+)
 from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
 from modules.redaction import redact
 from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.tool_loop_guard import PersistentToolLoopGuard
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +109,16 @@ _MAX_EVIDENCE_REFS_PER_CAUSE = 6
 _LOW_CONFIDENCE_ESCALATION_THRESHOLD = 0.35
 
 _DEFAULT_MAX_TOKENS = 900
+
+# Bounds on the optional evidence-gathering phase (#172). Diagnosis is
+# allowed to check a claim, not to go exploring: a couple of lookups, a
+# couple of calls, small results.
+_DEFAULT_MAX_TOOL_STEPS = 4
+_MAX_TOOL_DECISION_TOKENS = 300
+_MAX_TOOL_OUTPUT_LINES = 12
+_MAX_TOOL_OUTPUT_LINE_CHARS = 200
+_MAX_TOOL_REASON_CHARS = 200
+_MAX_TOOL_GOAL_CHARS = 200
 
 # Re-entrancy guard (#167). Diagnosing a failure must never become the next
 # failure to diagnose: if anything on the analysis path ever asked for an
@@ -299,8 +329,44 @@ _SYSTEM_PROMPT = (
     "You never invent evidence that was not supplied. You clearly "
     "distinguish observed symptoms from your hypotheses about their root "
     "cause, and you say so plainly when the evidence is insufficient to be "
-    "confident rather than guessing with false certainty."
+    "confident rather than guessing with false certainty. "
+    "A recorded failure reason is a claim about the moment it was written, "
+    "not a fact about now: when current tool evidence contradicts it, the "
+    "current evidence wins and the recorded reason is itself a finding - "
+    "most often stale persisted state rather than the condition it names."
 )
+
+# The evidence-gathering role. Deliberately narrower than the diagnosis role:
+# it decides what to look up, never what the failure means.
+_TOOL_SYSTEM_PROMPT = (
+    "You are Nexus's failure-diagnosis assistant in evidence-gathering mode. "
+    "You do not diagnose yet. You decide whether a claim in the recorded "
+    "failure can be checked against Nexus's current state, and if so you "
+    "look it up using read-only Nexus capabilities. "
+    "Runtime and configuration claims - a missing credential, an unreachable "
+    "service, a stopped timer, an unresolved repository - are exactly the "
+    "claims worth checking, because a persisted error string cannot tell you "
+    "whether it is still true. "
+    "You never change anything: no lifecycle transitions, no code edits, no "
+    "merges, no restarts, no retries. Gathering evidence is all you do, and "
+    "you stop as soon as you have it or no capability can supply it."
+)
+
+_TOOL_DECISION_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": [TOOL_FIND_TOOL, ACTION_CALL_TOOL, "done"]},
+            "goal": {"type": "string"},
+            "tool": {"type": "string"},
+            "arguments": {"type": "object", "additionalProperties": True},
+            "reason": {"type": "string"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+}
 
 _RESPONSE_SCHEMA_HINT = """Respond with ONLY a single JSON object (no prose, no markdown fences) with this shape:
 {
@@ -318,9 +384,84 @@ _RESPONSE_SCHEMA_HINT = """Respond with ONLY a single JSON object (no prose, no 
   "needs_human": true|false,
   "escalation_reason": "why, or null"
 }
-Cite evidence by its [E<n>] label in "evidence" lists. If the evidence does
-not support a confident diagnosis, say so via a low confidence value and a
-non-empty "missing_information" list rather than fabricating certainty."""
+Cite evidence by its [E<n>] label (log evidence) or [T<n>] label (current
+tool evidence) in "evidence" lists. If the evidence does not support a
+confident diagnosis, say so via a low confidence value and a non-empty
+"missing_information" list rather than fabricating certainty."""
+
+
+def render_tool_line(index: int, observation: dict[str, Any]) -> str:
+    """One gathered tool result as a single ``[T<n>] ...`` line.
+
+    Deliberately the same shape as :func:`render_evidence_line`, so current
+    evidence and logged evidence read as one vocabulary in the prompt and can
+    be cited the same way.
+    """
+    parts = [f"[T{index}]", str(observation.get("action") or "tool")]
+    for key in (
+        "goal", "status", "tool", "operation", "success",
+        "related_tools", "error", "reason", "output",
+    ):
+        value = observation.get(key)
+        if value is None or value == "" or value == []:
+            continue
+        if isinstance(value, (list, tuple)):
+            value = ",".join(str(item) for item in value)
+        parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
+def _build_tool_prompt(
+    *,
+    step: int,
+    max_steps: int,
+    subject_type: str,
+    subject_id: str,
+    goal: str | None,
+    failure_text: str,
+    evidence_lines: list[str],
+    tool_lines: list[str],
+) -> str:
+    lines = [
+        f"FAILURE ANALYSIS - EVIDENCE GATHERING STEP {step}/{max_steps}.",
+        f"Subject: {subject_type} {subject_id}",
+    ]
+    if goal:
+        lines.append(f"Goal Nexus was trying to achieve: {goal}")
+    lines.append(f"Recorded failure/status:\n{failure_text}")
+    lines.append("")
+    if evidence_lines:
+        lines.append("Logged evidence (most recent last):")
+        lines.extend(evidence_lines)
+    else:
+        lines.append("No structured log evidence was supplied.")
+    lines.append("")
+    if tool_lines:
+        lines.append("Current evidence gathered so far:")
+        lines.extend(tool_lines)
+    else:
+        lines.append("No current evidence has been gathered yet.")
+    lines.append("")
+    lines.append("""Respond with ONLY one JSON object (no prose, no markdown fences):
+{"action":"find_tool","goal":"<concrete read-only capability you need>","reason":"..."}
+{"action":"call_tool","tool":"<operation name a find_tool result returned>","arguments":{},"reason":"..."}
+{"action":"done","reason":"..."}
+
+Rules:
+- The recorded failure describes the past. If it asserts something about the
+  runtime or the configuration, check whether it is still true before the
+  diagnosis is written; a claim that current evidence contradicts points at
+  stale persisted state, not at the condition it names.
+- find_tool discovers a capability; its goal must name a concrete read-only
+  capability, never a placeholder. Never repeat a goal that already returned
+  not_found - nothing has changed since.
+- call_tool may only name an operation a find_tool result in this analysis
+  already returned, and only read-only operations exist here.
+- Read-only means read-only: never transition lifecycle state, edit code,
+  merge, restart, or retry anything.
+- Choose "done" as soon as you have the evidence you need, or once it is
+  clear that no available capability can supply it.""")
+    return "\n".join(lines)
 
 
 def _build_prompt(
@@ -330,6 +471,8 @@ def _build_prompt(
     goal: str | None,
     failure_text: str,
     evidence_lines: list[str],
+    tool_lines: list[str] | None = None,
+    tool_evidence_note: str | None = None,
 ) -> str:
     lines = [
         f"Subject: {subject_type} {subject_id}",
@@ -344,6 +487,17 @@ def _build_prompt(
     else:
         lines.append("No structured evidence was supplied.")
     lines.append("")
+    if tool_lines:
+        lines.append(
+            "Current evidence, gathered just now with read-only Nexus tools. "
+            "Where it contradicts the recorded failure above, it is the newer "
+            "fact and the recorded failure is itself a symptom to explain:"
+        )
+        lines.extend(tool_lines)
+        lines.append("")
+    if tool_evidence_note:
+        lines.append(tool_evidence_note)
+        lines.append("")
     lines.append(
         "Task: identify the current blocker; distinguish symptoms from "
         "likely root causes; cite which evidence supports each hypothesis; "
@@ -573,6 +727,10 @@ class FailureAnalysisService:
         mailbox_config: Any | None = None,
         outbox_dir: str | Path | None = None,
         repo_root: str | Path | None = None,
+        tool_router: NexusToolRouter | None = None,
+        operations_registry: Any | None = None,
+        experiment_service: Any | None = None,
+        max_tool_steps: int = _DEFAULT_MAX_TOOL_STEPS,
     ) -> None:
         """Build an analyzer bound to the shared local-LLM job service (#167).
 
@@ -596,6 +754,7 @@ class FailureAnalysisService:
             )
         self._max_tokens = max(200, max_tokens)
         self._log_dir = Path(log_dir)
+        self._max_tool_steps = max(0, min(int(max_tool_steps), 8))
 
         # Outbox publishing (#148) is optional: a caller that never supplies
         # mailbox_config (or outbox_dir + repo_root) still gets a fully
@@ -636,8 +795,54 @@ class FailureAnalysisService:
         # this client directly - it goes through self._jobs.
         self._client = getattr(self._jobs, "llama", None)
 
+        # Optional tool access (#172). Supplied either as a ready router or as
+        # the operations registry to build one from; without either, the
+        # evidence-gathering phase is simply never entered and this service
+        # behaves exactly as it did before. Building the router cannot be
+        # allowed to fail construction: an analyzer that can still read
+        # evidence is worth more than no analyzer at all.
+        self._tool_router: NexusToolRouter | None = tool_router
+        if self._tool_router is None and operations_registry is not None:
+            try:
+                self._tool_router = NexusToolRouter(
+                    operations_registry=operations_registry,
+                    experiment_service=experiment_service,
+                    schema_completion=self._tool_schema_completion,
+                    grant_ledger=InMemoryToolGrantLedger(),
+                    caller="failure analysis",
+                )
+            except Exception:  # noqa: BLE001 - diagnosis must survive a missing tool path
+                logger.warning(
+                    "failure_analysis: could not build the shared tool router; "
+                    "diagnosis will run without current-evidence gathering",
+                    exc_info=True,
+                )
+                self._tool_router = None
+        # The controller's duplicate/looping protections, reused rather than
+        # re-invented: the analysis id is the session, so one analysis's
+        # bounded budget can never be spent by another's.
+        self._tool_guard: PersistentToolLoopGuard | None = None
+        if self._tool_router is not None and self._max_tool_steps > 0:
+            try:
+                self._tool_guard = PersistentToolLoopGuard(
+                    db_path=db_path,
+                    max_total_steps=self._max_tool_steps,
+                    max_identical_calls=2,
+                    max_non_progressing_cycles=1,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "failure_analysis: could not open the tool loop guard; "
+                    "diagnosis will run without current-evidence gathering",
+                    exc_info=True,
+                )
+                self._tool_router = None
+
     def close(self) -> None:
         self._conn.close()
+        if self._tool_guard is not None:
+            self._tool_guard.close()
+            self._tool_guard = None
         if self._owns_jobs:
             release_local_llm_job_service(self._jobs)
 
@@ -842,6 +1047,311 @@ class FailureAnalysisService:
         )
 
     # ------------------------------------------------------------------
+    # Current-evidence gathering through the shared tool router (#172)
+    # ------------------------------------------------------------------
+
+    async def _tool_schema_completion(
+        self,
+        prompt: str,
+        *,
+        session_id: str,
+        max_tokens: int,
+        response_format: dict[str, Any],
+        role: str = "tool_resolver",
+        task_logger: Any | None = None,
+    ) -> tuple[str, str]:
+        """The router's inference path for this role: the shared job queue.
+
+        Failure analysis has no memory budget plan and no external fallback of
+        its own - it queues on the same local-LLM job service every other role
+        uses (#167), under its own role label so the resolver calls a diagnosis
+        made stay attributable.
+        """
+        del task_logger
+        job_id = self._jobs.submit(
+            prompt,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            session_id=session_id,
+            response_format=response_format,
+            role=ROLE_FAILURE_ANALYSIS,
+            system=_TOOL_SYSTEM_PROMPT,
+        )
+        logger.info(
+            "failure_analysis: tool resolver job submitted job_id=%s role=%s "
+            "analysis_id=%s resolver_role=%s",
+            job_id, ROLE_FAILURE_ANALYSIS, session_id, role,
+        )
+        try:
+            return await self._jobs.wait(job_id), "local"
+        except LocalLlmJobError as exc:
+            raise ToolResolverUnavailableError(str(exc)[:500], provider="local") from exc
+
+    def _bounded_tool_observation(
+        self, step: int, action: str, raw: dict[str, Any], reason: str
+    ) -> dict[str, Any]:
+        """One tool result, bounded and redacted, ready for the model context.
+
+        Nothing from a tool reaches a prompt, a log, the persisted analysis or
+        the outbox except through here: every value is coerced to text,
+        redacted and length-capped, and the raw registry payload is dropped
+        rather than carried along.
+        """
+        observation: dict[str, Any] = {
+            "step": step,
+            "action": action,
+            "reason": _bounded(reason, _MAX_TOOL_REASON_CHARS),
+        }
+        if action == TOOL_FIND_TOOL:
+            observation["goal"] = _bounded(raw.get("goal", ""), _MAX_TOOL_GOAL_CHARS)
+            observation["status"] = _bounded(raw.get("status", "unknown"), 40)
+            resolved = raw.get("resolved_tool")
+            if resolved:
+                observation["tool"] = _bounded(resolved, 80)
+            related = raw.get("related_tools")
+            if isinstance(related, list) and related:
+                observation["related_tools"] = [_bounded(item, 80) for item in related[:3]]
+            if raw.get("status") != "found":
+                observation["reason"] = _bounded(
+                    raw.get("reason") or reason, _MAX_TOOL_REASON_CHARS
+                )
+            return observation
+
+        observation["tool"] = _bounded(raw.get("operation", ""), 80)
+        if raw.get("error"):
+            observation["status"] = "refused"
+            observation["error"] = _bounded(raw.get("error"), 80)
+            observation["reason"] = _bounded(
+                raw.get("reason") or reason, _MAX_TOOL_REASON_CHARS
+            )
+            return observation
+        result = raw.get("result") or {}
+        success = bool(result.get("success"))
+        observation["status"] = "ok" if success else "failed"
+        observation["success"] = _yesno(success)
+        output_lines = [
+            _bounded(line, _MAX_TOOL_OUTPUT_LINE_CHARS)
+            for line in list(result.get("output_lines") or [])[:_MAX_TOOL_OUTPUT_LINES]
+        ]
+        if output_lines:
+            observation["output"] = " | ".join(output_lines)
+        if not success and result.get("error_summary"):
+            observation["error"] = _bounded(
+                result.get("error_summary"), _MAX_TOOL_OUTPUT_LINE_CHARS
+            )
+        return observation
+
+    def _tool_evidence_note(self, observations: list[dict[str, Any]]) -> str | None:
+        """What the diagnosis should say about evidence it could not get.
+
+        Silence here is what produced the failure mode in #172: an analysis
+        that never checked anything read exactly like one that checked and
+        found nothing. Naming the gap - no tool access at all, or no capability
+        for what was asked - keeps "I could not verify this" a stated finding
+        rather than an unstated assumption.
+        """
+        if self._tool_router is None or self._max_tool_steps <= 0:
+            return (
+                "No read-only diagnostic tools were available for this analysis, so "
+                "nothing in the recorded failure could be verified against current "
+                "state. Treat every runtime/configuration claim above as unverified, "
+                "and list what would need checking under \"missing_information\"."
+            )
+        unmet = [
+            str(item.get("goal") or "")
+            for item in observations
+            if item.get("action") == TOOL_FIND_TOOL
+            and str(item.get("status")) in ("not_found", "invalid_goal", "unavailable")
+        ]
+        if not observations:
+            return (
+                "No current evidence was gathered for this analysis. Say so rather "
+                "than treating the recorded failure as verified."
+            )
+        if unmet:
+            missing = "; ".join(goal for goal in unmet if goal)[:400]
+            return (
+                "No Nexus capability could supply evidence for: "
+                f"{missing or '(unnamed capability)'}. Report that evidence as "
+                "missing under \"missing_information\" instead of assuming either "
+                "answer."
+            )
+        return None
+
+    async def _gather_tool_evidence(
+        self,
+        *,
+        analysis_id: str,
+        subject_type: str,
+        subject_id: str,
+        goal: str | None,
+        failure_text: str,
+        evidence_lines: list[str],
+    ) -> list[dict[str, Any]]:
+        """Bounded, read-only current evidence for this failure. Never raises.
+
+        Returns the gathered observations in order. An empty list means the
+        phase was skipped or produced nothing - which is a valid outcome, not
+        an error: the diagnosis below then proceeds on logged evidence alone
+        and says what it could not check.
+        """
+        router = self._tool_router
+        guard = self._tool_guard
+        if router is None or guard is None or self._max_tool_steps <= 0:
+            return []
+        observations: list[dict[str, Any]] = []
+        try:
+            await self._gather_tool_evidence_steps(
+                analysis_id=analysis_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                goal=goal,
+                failure_text=failure_text,
+                evidence_lines=evidence_lines,
+                observations=observations,
+            )
+        except Exception:  # noqa: BLE001 - gathering never breaks diagnosis
+            logger.warning(
+                "failure_analysis: evidence gathering failed analysis_id=%s; "
+                "continuing with logged evidence only",
+                analysis_id, exc_info=True,
+            )
+        if observations:
+            logger.info(
+                "failure_analysis: gathered current evidence analysis_id=%s steps=%s",
+                analysis_id, len(observations),
+            )
+        return observations
+
+    async def _gather_tool_evidence_steps(
+        self,
+        *,
+        analysis_id: str,
+        subject_type: str,
+        subject_id: str,
+        goal: str | None,
+        failure_text: str,
+        evidence_lines: list[str],
+        observations: list[dict[str, Any]],
+    ) -> None:
+        """The bounded gathering loop itself, appending into *observations*.
+
+        Split out so partial progress survives: whatever was already gathered
+        when something unexpected goes wrong is still evidence, and the caller
+        keeps it instead of discarding the whole phase.
+        """
+        router = self._tool_router
+        guard = self._tool_guard
+        assert router is not None and guard is not None
+        # One state token per analysis: the failure being diagnosed does not
+        # change while it is diagnosed, so every lookup in this run shares a
+        # budget and a repeat really is a repeat.
+        state_token = f"analysis:{analysis_id}"
+        for step in range(1, self._max_tool_steps + 1):
+            within_budget, _ = guard.claim_step(analysis_id, state_token)
+            if not within_budget:
+                logger.info(
+                    "failure_analysis: tool evidence budget reached analysis_id=%s step=%s",
+                    analysis_id, step,
+                )
+                break
+            prompt = _build_tool_prompt(
+                step=step,
+                max_steps=self._max_tool_steps,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                goal=goal,
+                failure_text=failure_text,
+                evidence_lines=evidence_lines,
+                tool_lines=[
+                    render_tool_line(i, item) for i, item in enumerate(observations, start=1)
+                ],
+            )
+            try:
+                job_id = self._jobs.submit(
+                    prompt,
+                    temperature=0.0,
+                    max_tokens=_MAX_TOOL_DECISION_TOKENS,
+                    session_id=analysis_id,
+                    response_format=_TOOL_DECISION_RESPONSE_FORMAT,
+                    role=ROLE_FAILURE_ANALYSIS,
+                    system=_TOOL_SYSTEM_PROMPT,
+                )
+                raw = await self._jobs.wait(job_id)
+                decision = extract_json(raw)
+            except Exception:  # noqa: BLE001 - gathering never breaks diagnosis
+                logger.warning(
+                    "failure_analysis: evidence-gathering step failed analysis_id=%s step=%s",
+                    analysis_id, step, exc_info=True,
+                )
+                break
+            if not isinstance(decision, dict):
+                break
+            action = str(decision.get("action", "")).strip().lower()
+            reason = str(decision.get("reason", ""))
+            if action not in (TOOL_FIND_TOOL, ACTION_CALL_TOOL):
+                # "done", or anything else: the model has nothing more to look
+                # up. Either way this phase is over - it is not the place to
+                # argue with the model about its own vocabulary.
+                break
+
+            if action == TOOL_FIND_TOOL:
+                arguments: dict[str, Any] = {"goal": str(decision.get("goal", "")).strip()[:1000]}
+            else:
+                raw_arguments = decision.get("arguments")
+                arguments = {
+                    "tool": str(decision.get("tool", "")).strip(),
+                    "arguments": raw_arguments if isinstance(raw_arguments, dict) else {},
+                }
+            check = guard.check(
+                analysis_id, action, arguments, state_token=state_token, reason=reason
+            )
+            if not check.allowed:
+                logger.info(
+                    "failure_analysis: repeated tool call refused analysis_id=%s "
+                    "action=%s event=%s",
+                    analysis_id, action, (check.observation or {}).get("event"),
+                )
+                if check.stop:
+                    break
+                continue
+
+            try:
+                if action == TOOL_FIND_TOOL:
+                    result = await router.resolve_find_tool(
+                        arguments["goal"],
+                        session_id=analysis_id,
+                        current_task=failure_text,
+                    )
+                else:
+                    result = router.execute_operation(
+                        {
+                            "operation": arguments["tool"],
+                            "args": arguments["arguments"],
+                            "session_id": analysis_id,
+                        }
+                    )
+            except ToolRouterError as exc:
+                # A bad tool request is evidence about the diagnosis attempt,
+                # not a failure of it: record it and let the model try
+                # something else within the same budget.
+                result = {
+                    "operation": arguments.get("tool", ""),
+                    "error": "invalid_tool_request",
+                    "reason": str(exc),
+                }
+            except Exception:  # noqa: BLE001 - a tool failure never fails the analysis
+                logger.warning(
+                    "failure_analysis: tool execution failed analysis_id=%s action=%s",
+                    analysis_id, action, exc_info=True,
+                )
+                break
+            guard.record_result(check.call_id, {"action": action, "status": str(result.get("status") or "")})
+            observations.append(
+                self._bounded_tool_observation(step, action, result, reason)
+            )
+
+    # ------------------------------------------------------------------
     # Core analysis
     # ------------------------------------------------------------------
 
@@ -875,12 +1385,30 @@ class FailureAnalysisService:
         failure_text = _bounded(failure_text, _MAX_FAILURE_TEXT_CHARS) or "(no failure detail supplied)"
         bounded_goal = _bounded(goal, _MAX_GOAL_CHARS) if goal else None
 
+        # Check the claims before interpreting them (#172). Read-only,
+        # bounded, and optional: without a tool router this returns nothing
+        # and the diagnosis below is exactly the one it always was.
+        tool_observations = await self._gather_tool_evidence(
+            analysis_id=analysis_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            goal=bounded_goal,
+            failure_text=failure_text,
+            evidence_lines=evidence_lines,
+        )
+        tool_lines = [
+            render_tool_line(i, item) for i, item in enumerate(tool_observations, start=1)
+        ]
+        evidence_refs.extend(f"T{i}" for i in range(1, len(tool_observations) + 1))
+
         prompt = _build_prompt(
             subject_type=subject_type,
             subject_id=subject_id,
             goal=bounded_goal,
             failure_text=failure_text,
             evidence_lines=evidence_lines,
+            tool_lines=tool_lines,
+            tool_evidence_note=self._tool_evidence_note(tool_observations),
         )
 
         model_name = getattr(self._client, "model", None)

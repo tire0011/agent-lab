@@ -246,6 +246,11 @@ class MailboxTaskService:
                     log_dir=self._resolve_log_dir(),
                     outbox_dir=self.outbox_dir,
                     repo_root=self.mailbox_repo_path,
+                    # The same read-only capability catalog the controller
+                    # resolves against (#172), so a diagnosis here can check a
+                    # runtime claim instead of only repeating it.
+                    operations_registry=self.operations_registry,
+                    experiment_service=self.experiment_service,
                 )
             except Exception:
                 logger.exception(

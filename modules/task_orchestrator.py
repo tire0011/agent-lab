@@ -12,7 +12,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -38,6 +37,31 @@ from modules.nexus_task_store import (
     TERMINAL_REASON_TURN_FAILED,
     NexusTaskStore,
 )
+from modules.nexus_tool_router import (
+    ACTION_CALL_TOOL,
+    ACTION_MISSING_CAPABILITY,
+    ACTION_RESUME_EXPERIMENT,
+    EXPERIMENT_ID_PATTERN,
+    MAX_EXPERIMENT_ID_CANDIDATES,
+    MAX_RESOLVER_CANDIDATES,
+    READ_ONLY_OPERATION_DENYLIST,
+    RESUME_INTENT_PATTERN,
+    TOOL_ACCURACY_CORRECT,
+    TOOL_ACCURACY_INCORRECT,
+    TOOL_ACCURACY_UNKNOWN,
+    TOOL_FIND_TOOL,
+    TOOL_RESOLVER_RESPONSE_FORMAT,
+    TOOL_SEARCH_STOP_WORDS,
+    NexusToolRouter,
+    ToolResolverUnavailableError,
+    ToolRouterError,
+    invalid_find_tool_goal,
+    resolver_prompt,
+    selection_correctness,
+    terminal_not_found_guidance,
+    terminal_not_found_observation,
+    tokens as tool_search_tokens,
+)
 from modules.prompt_budget import (
     CHARS_PER_TOKEN,
     PromptBudgetPlan,
@@ -61,14 +85,10 @@ from modules.runtime_execution import (
 from modules.tool_loop_guard import PersistentToolLoopGuard
 
 ACTION_NEW_EXPERIMENT = "new_experiment"
-ACTION_RESUME_EXPERIMENT = "resume_experiment"
 ACTION_COMMAND = "command"
-TOOL_FIND_TOOL = "find_tool"
-ACTION_CALL_TOOL = "call_tool"
 TOOL_PYTHON_RUN = "python_run"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
-ACTION_MISSING_CAPABILITY = "missing_capability"
 
 # Delegates the local controller may fall back to when its compacted prompt
 # still exceeds the safe local budget. ``local_worker`` is deliberately
@@ -145,45 +165,16 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
     },
 }
 
-_TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "enum": ["found", "invalid_goal", "not_found", "unavailable"]},
-            "operation": {"type": "string"},
-            "reason": {"type": "string"},
-            "related_tools": {"type": "array", "items": {"type": "string"}},
-            "error": {"type": "string"},
-            "guidance": {"type": "string"},
-        },
-        "required": ["status", "reason"],
-        "additionalProperties": False,
-    },
-}
-
-_READ_ONLY_OPERATION_DENYLIST = {"inbox_refresh"}
-_MAX_RESOLVER_CANDIDATES = 5
-_TOOL_ACCURACY_UNKNOWN = "unknown"
-_TOOL_ACCURACY_CORRECT = "correct"
-_TOOL_ACCURACY_INCORRECT = "incorrect"
-_TOOL_SEARCH_STOP_WORDS = {
-    "a",
-    "an",
-    "and",
-    "check",
-    "for",
-    "has",
-    "inspect",
-    "need",
-    "needs",
-    "nexus",
-    "of",
-    "show",
-    "the",
-    "to",
-    "whether",
-}
+# The shared tool mechanism owns the resolver schema, the read-only
+# denylist, candidate scoring and the not-found metadata (#172). Re-exported
+# here under their historical names so existing importers keep working.
+_TOOL_RESOLVER_RESPONSE_FORMAT = TOOL_RESOLVER_RESPONSE_FORMAT
+_READ_ONLY_OPERATION_DENYLIST = READ_ONLY_OPERATION_DENYLIST
+_MAX_RESOLVER_CANDIDATES = MAX_RESOLVER_CANDIDATES
+_TOOL_ACCURACY_UNKNOWN = TOOL_ACCURACY_UNKNOWN
+_TOOL_ACCURACY_CORRECT = TOOL_ACCURACY_CORRECT
+_TOOL_ACCURACY_INCORRECT = TOOL_ACCURACY_INCORRECT
+_TOOL_SEARCH_STOP_WORDS = TOOL_SEARCH_STOP_WORDS
 
 
 @dataclass(slots=True)
@@ -210,12 +201,56 @@ class ControllerBudgetExceededError(TaskOrchestratorError):
     """
 
 
-# A bare hex run is only a *candidate* experiment id: commit shas and dates match
-# it too, so every candidate is resolved against the experiment service before it
-# is treated as one (#164 review).
-_EXPERIMENT_ID_PATTERN = re.compile(r"\b[0-9a-f]{8,32}\b", re.IGNORECASE)
-_MAX_EXPERIMENT_ID_CANDIDATES = 5
-_RESUME_INTENT_PATTERN = re.compile(r"\b(resume|continue|continuing)\b", re.IGNORECASE)
+_EXPERIMENT_ID_PATTERN = EXPERIMENT_ID_PATTERN
+_MAX_EXPERIMENT_ID_CANDIDATES = MAX_EXPERIMENT_ID_CANDIDATES
+_RESUME_INTENT_PATTERN = RESUME_INTENT_PATTERN
+
+
+class _TaskStoreGrantLedger:
+    """``find_tool`` grants as persistent controller-session events.
+
+    The controller's grants are already durable: every tool observation of a
+    turn is appended to the session's event log, so the ledger only has to
+    read them back. Recording is therefore a no-op here - writing a second
+    copy would create a grant record that could disagree with the session
+    history it is supposed to describe.
+    """
+
+    def __init__(self, task_store: NexusTaskStore) -> None:
+        self.task_store = task_store
+
+    def record_grant(self, session_id: str, observation: dict[str, Any]) -> None:
+        del session_id, observation
+
+    def latest_grant(self, session_id: str, operation: str) -> dict[str, Any] | None:
+        if not session_id or not operation:
+            return None
+        recent_events = getattr(self.task_store, "recent_events", None)
+        if not callable(recent_events):
+            return None
+        for event in recent_events(
+            session_id,
+            role="tool",
+            kind=TOOL_FIND_TOOL,
+            limit=50,
+        ):
+            try:
+                payload = json.loads(event["content"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload.get("status") != "found":
+                continue
+            schema = payload.get("operation")
+            if not isinstance(schema, dict):
+                continue
+            if str(schema.get("operation", "")).strip() != operation:
+                continue
+            return {
+                "event_id": int(event["id"]),
+                "operation": operation,
+                "schema": schema,
+            }
+        return None
 
 
 class NexusTaskOrchestrator:
@@ -276,6 +311,18 @@ class NexusTaskOrchestrator:
             llm_job_service=self.llm_jobs,
         )
         self._owns_delegation = delegation_service is None
+        # The one shared tool mechanism (#172): capability discovery and
+        # read-only capability execution live in NexusToolRouter, so the
+        # controller and every other Nexus LLM role drive the same catalog,
+        # the same resolver, the same grant rule and the same registry-side
+        # validation/redaction/audit path.
+        self.tool_router = NexusToolRouter(
+            operations_registry=operations_registry,
+            experiment_service=experiment_service,
+            schema_completion=self._router_schema_completion,
+            grant_ledger=_TaskStoreGrantLedger(self.task_store),
+            caller="local task orchestrator",
+        )
         # session_id -> the worker id this process currently holds the claim
         # under. Every status write during a claimed turn is scoped to it, so a
         # worker that was reaped or taken over stops being able to drive the
@@ -932,132 +979,23 @@ class NexusTaskOrchestrator:
 
     @staticmethod
     def _tokens(text: str) -> set[str]:
-        return {
-            token for token in re.findall(r"[a-z0-9]+", text.lower())
-            if len(token) > 1 and token not in _TOOL_SEARCH_STOP_WORDS
-        }
+        return tool_search_tokens(text)
 
     def _read_only_operation_specs(self) -> list[Any]:
-        return [
-            spec for spec in self.operations_registry.catalog()
-            if spec.name not in _READ_ONLY_OPERATION_DENYLIST
-        ]
+        return self.tool_router.read_only_operation_specs()
 
     def _candidate_operations(self, goal: str) -> list[Any]:
-        goal_tokens = self._tokens(goal)
-        scored: list[tuple[int, str, Any]] = []
-        for spec in self._read_only_operation_specs():
-            tags = " ".join(str(tag) for tag in getattr(spec, "tags", []) or [])
-            haystack = f"{spec.name} {spec.description} {tags}"
-            haystack_tokens = self._tokens(haystack)
-            score = len(goal_tokens & haystack_tokens)
-            if spec.name.lower() in goal.lower():
-                score += 5
-            for token in goal_tokens:
-                if token and token in spec.name.lower():
-                    score += 2
-            if score > 0:
-                scored.append((score, spec.name, spec))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [spec for _, _, spec in scored[:_MAX_RESOLVER_CANDIDATES]]
+        return self.tool_router.candidate_operations(goal)
 
     def _latest_operation_grant(self, session_id: str, operation: str) -> dict[str, Any] | None:
-        if not session_id or not operation:
-            return None
-        recent_events = getattr(self.task_store, "recent_events", None)
-        if not callable(recent_events):
-            return None
-        for event in recent_events(
-            session_id,
-            role="tool",
-            kind=TOOL_FIND_TOOL,
-            limit=50,
-        ):
-            try:
-                payload = json.loads(event["content"] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if payload.get("status") != "found":
-                continue
-            schema = payload.get("operation")
-            if not isinstance(schema, dict):
-                continue
-            if str(schema.get("operation", "")).strip() != operation:
-                continue
-            return {
-                "event_id": int(event["id"]),
-                "operation": operation,
-                "schema": schema,
-            }
-        return None
+        return self.tool_router.grant_ledger.latest_grant(session_id, operation)
 
     @staticmethod
     def _invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
-        normalized = re.sub(r"[^a-z0-9]+", " ", str(goal or "").lower()).strip()
-        if not normalized:
-            return True, "The goal is empty or whitespace only.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
-
-        placeholder_values = {
-            "plain language capability needed",
-            "plain-language capability needed",
-            "capability needed",
-            "example goal",
-            "placeholder goal",
-            "generic capability needed",
-            "replace with concrete capability",
-            "insert goal here",
-            "describe the operation you need",
-            "tool goal",
-        }
-        if normalized in placeholder_values:
-            return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
-
-        if "plain language" in normalized or "plain-language" in normalized:
-            if "capability needed" in normalized or "goal" in normalized:
-                return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
-        if "placeholder" in normalized or "example" in normalized:
-            if "goal" in normalized or "capability" in normalized or "request" in normalized:
-                return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
-        if "capability needed" in normalized and ("plain" in normalized or "placeholder" in normalized or "example" in normalized):
-            return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
-
-        generic_tokens = {"capability", "goal", "operation", "request", "tool", "task", "need", "needs"}
-        tokens = normalized.split()
-        if len(tokens) <= 2 and set(tokens) <= generic_tokens:
-            return True, "The goal is too generic to describe a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
-        return False, None, None
+        return invalid_find_tool_goal(goal)
 
     def _resolver_prompt(self, goal: str, candidates: list[Any]) -> str:
-        candidate_summaries = [
-            {
-                "operation": spec.name,
-                "description": spec.description,
-                "arguments": [
-                    argument.to_dict()
-                    for argument in getattr(spec, "arguments", [])
-                ],
-                "tags": list(getattr(spec, "tags", []) or []),
-            }
-            for spec in candidates
-        ]
-        return f"""TOOL RESOLVER MODE.
-You are resolving exactly one requested Nexus capability against a small candidate list.
-Return exactly one JSON object. Do not plan the task. Do not implement missing tools.
-
-GOAL:
-{goal[:1000]}
-
-CANDIDATE READ-ONLY OPERATIONS:
-{json.dumps(candidate_summaries, separators=(',', ':'))}
-
-Rules:
-- Choose status "found" only when one candidate directly satisfies the goal.
-- Choose status "invalid_goal" when the goal is empty, generic, or clearly a placeholder/example rather than a concrete capability request.
-- Choose status "not_found" when none is suitable.
-- If found, set operation to the exact candidate operation name.
-- If invalid_goal, leave operation empty, set error and guidance, and do not treat it as a missing capability.
-- If not_found, leave operation empty and list at most three related candidate names.
-"""
+        return resolver_prompt(goal, candidates)
 
     @staticmethod
     def _selection_correctness(
@@ -1067,58 +1005,15 @@ Rules:
         expected_operation: str | None,
         expected_status: str | None,
     ) -> str:
-        if status == "unavailable":
-            return _TOOL_ACCURACY_UNKNOWN
-        if not expected_operation and not expected_status:
-            return _TOOL_ACCURACY_UNKNOWN
-        if expected_status == "invalid_goal":
-            return (
-                _TOOL_ACCURACY_CORRECT
-                if status == "invalid_goal"
-                else _TOOL_ACCURACY_INCORRECT
-            )
-        if expected_status == "not_found":
-            return (
-                _TOOL_ACCURACY_CORRECT
-                if status == "not_found" and not selected_operation
-                else _TOOL_ACCURACY_INCORRECT
-            )
-        if expected_operation:
-            return (
-                _TOOL_ACCURACY_CORRECT
-                if status == "found" and selected_operation == expected_operation
-                else _TOOL_ACCURACY_INCORRECT
-            )
-        return _TOOL_ACCURACY_UNKNOWN
+        return selection_correctness(
+            status=status,
+            selected_operation=selected_operation,
+            expected_operation=expected_operation,
+            expected_status=expected_status,
+        )
 
     def _resolvable_experiment_ids(self, text: str) -> list[str]:
-        """Hex-looking tokens in ``text`` that are actually experiments.
-
-        "Looks like hex" is not an identity. A commit sha matches the same
-        pattern, and so does a date like ``20260913``; handing one to
-        ``resume_experiment`` turns an ordinary task ("continue reviewing the
-        regression from commit 4f1b3f2a") into ``unknown experiment``. Only ids
-        the experiment service can actually resolve count as experiment ids.
-
-        Resolution is bounded: a pathological input full of hex tokens must not
-        turn one lookup into dozens of database queries.
-        """
-        resolved: list[str] = []
-        candidates = list(dict.fromkeys(_EXPERIMENT_ID_PATTERN.findall(text)))
-        for candidate in candidates[:_MAX_EXPERIMENT_ID_CANDIDATES]:
-            try:
-                experiment = self.experiment_service.resolve_experiment(candidate)
-            except Exception:  # noqa: BLE001 - unknown id, not an error here
-                continue
-            experiment_id = str(getattr(experiment, "id", "") or "").strip()
-            # The resolved id has to look like one too: a service that answers
-            # every lookup (a stub, a stale cache) must not be able to turn a
-            # commit sha into an "experiment" by returning something arbitrary.
-            if not _EXPERIMENT_ID_PATTERN.fullmatch(experiment_id):
-                continue
-            if experiment_id not in resolved:
-                resolved.append(experiment_id)
-        return resolved
+        return self.tool_router.resolvable_experiment_ids(text)
 
     def _find_tool_not_found_metadata(
         self,
@@ -1126,40 +1021,9 @@ Rules:
         goal: str,
         related_operations: list[str],
     ) -> dict[str, Any]:
-        """What the controller can do instead, for this task and this goal.
-
-        Deliberately scoped to the current task and lookup rather than to the
-        session's history: an experiment id and the word "resume" left over
-        from an earlier, unrelated request say nothing about what this task
-        needs, and offering a direct capability on that basis points the
-        controller at someone else's work.
-        """
-        context_text = " ".join(part for part in (task_text or "", goal or "") if part)
-        experiment_ids = self._resolvable_experiment_ids(context_text)
-        resume_relevant = bool(_RESUME_INTENT_PATTERN.search(context_text))
-        direct_capabilities = (
-            [ACTION_RESUME_EXPERIMENT]
-            if len(experiment_ids) == 1 and resume_relevant
-            else []
+        return self.tool_router.find_tool_not_found_metadata(
+            task_text, goal, related_operations
         )
-        if ACTION_RESUME_EXPERIMENT in direct_capabilities:
-            recommended_next_action = ACTION_RESUME_EXPERIMENT
-        elif related_operations:
-            recommended_next_action = "resolve_related_operation"
-        else:
-            recommended_next_action = ACTION_MISSING_CAPABILITY
-        metadata: dict[str, Any] = {
-            "retryable": False,
-            "related_operations": list(related_operations),
-            "direct_capabilities": direct_capabilities,
-            "recommended_next_action": recommended_next_action,
-        }
-        if direct_capabilities:
-            # The id the capability was offered for, already resolved. Whoever
-            # acts on it must not have to guess which token was meant, and must
-            # never re-derive it from different text.
-            metadata["resume_experiment_id"] = experiment_ids[0]
-        return metadata
 
     @staticmethod
     def _terminal_not_found_observation(
@@ -1167,41 +1031,11 @@ Rules:
         observations: list[dict[str, Any]],
         state_token: str,
     ) -> dict[str, Any] | None:
-        """The terminal ``not_found`` this exact lookup already produced, if any."""
-        return next(
-            (
-                observation
-                for observation in reversed(observations)
-                if observation.get("tool") == TOOL_FIND_TOOL
-                and observation.get("status") == "not_found"
-                and observation.get("retryable") is False
-                and observation.get("state_token") == state_token
-                and str(observation.get("goal", "")).strip() == goal
-            ),
-            None,
-        )
+        return terminal_not_found_observation(goal, observations, state_token)
 
     @staticmethod
     def _terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
-        """Turn a refused repeat into an answer the controller can act on.
-
-        The loop guard says "you already called this"; on its own that leaves
-        the controller to guess what else to do, which is how the loop in #164
-        kept going. This carries the terminal lookup's alternatives back.
-        """
-        return {
-            "status": "not_found",
-            "retryable": False,
-            "goal": str(prior.get("goal", "")),
-            "related_tools": list(prior.get("related_tools") or []),
-            "related_operations": list(prior.get("related_operations") or []),
-            "direct_capabilities": list(prior.get("direct_capabilities") or []),
-            "recommended_next_action": prior.get("recommended_next_action"),
-            "reason": (
-                "An identical find_tool lookup already returned not_found "
-                "without a relevant state change."
-            ),
-        }
+        return terminal_not_found_guidance(prior)
 
     async def _resolve_find_tool(
         self,
@@ -1214,229 +1048,57 @@ Rules:
         expected_operation: str | None = None,
         expected_status: str | None = None,
     ) -> dict[str, Any]:
+        """Resolve one capability request through the shared tool router (#172)."""
         del budget_plan  # resolver must recompute current memory before its own inference
-        clean_goal = goal.strip()[:1000]
-        started = time.perf_counter()
-        legacy_catalog_schema_chars = len(
-            json.dumps(
-                [spec.to_dict() for spec in self.operations_registry.catalog()],
-                separators=(",", ":"),
-            )
+        return await self.tool_router.resolve_find_tool(
+            goal,
+            session_id=session_id,
+            current_task=current_task,
+            task_logger=task_logger,
+            expected_operation=expected_operation,
+            expected_status=expected_status,
         )
-        invalid_goal, error, guidance = self._invalid_find_tool_goal(clean_goal)
-        if invalid_goal:
-            return {
-                "tool": TOOL_FIND_TOOL,
-                "status": "invalid_goal",
-                "goal": clean_goal,
-                "error": error,
-                "guidance": guidance,
-                "reason": error or "The goal is not a concrete capability request.",
-                "related_tools": [],
-                "metrics": {
-                    "candidate_count": 0,
-                    "candidate_operations": [],
-                    "main_selected_schema_chars": 0,
-                    "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
-                    "resolver_input_chars": 0,
-                    "resolver_output_chars": 0,
-                    "resolver_llm_calls": 0,
-                    "selected_operation": None,
-                    "expected_operation": expected_operation,
-                    "expected_status": expected_status,
-                    "selection_correctness": self._selection_correctness(
-                        status="invalid_goal",
-                        selected_operation=None,
-                        expected_operation=expected_operation,
-                        expected_status=expected_status,
-                    ),
-                    "latency_ms": int((time.perf_counter() - started) * 1000),
-                },
-            }
-        candidates = self._candidate_operations(clean_goal)
-        if not candidates:
-            return {
-                "tool": TOOL_FIND_TOOL,
-                "status": "not_found",
-                "goal": clean_goal,
-                "reason": "No read-only OperationsRegistry candidate matched the requested capability.",
-                "related_tools": [],
-                **self._find_tool_not_found_metadata(current_task, clean_goal, []),
-                "metrics": {
-                    "candidate_count": 0,
-                    "candidate_operations": [],
-                    "main_selected_schema_chars": 0,
-                    "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
-                    "resolver_input_chars": 0,
-                    "resolver_output_chars": 0,
-                    "resolver_llm_calls": 0,
-                    "selected_operation": None,
-                    "expected_operation": expected_operation,
-                    "expected_status": expected_status,
-                    "selection_correctness": self._selection_correctness(
-                        status="not_found",
-                        selected_operation=None,
-                        expected_operation=expected_operation,
-                        expected_status=expected_status,
-                    ),
-                    "latency_ms": int((time.perf_counter() - started) * 1000),
-                },
-            }
-        prompt = self._resolver_prompt(clean_goal, candidates)
-        resolver_budget_plan = compute_budget(
+
+    async def _router_schema_completion(
+        self,
+        prompt: str,
+        *,
+        session_id: str,
+        max_tokens: int,
+        response_format: dict[str, Any],
+        role: str = "tool_resolver",
+        task_logger: Any | None = None,
+    ) -> tuple[str, str]:
+        """The controller's inference path, as the tool router expects it.
+
+        The router owns the resolver prompt and schema; this keeps the
+        controller-specific parts - a freshly computed memory budget and the
+        external-provider fallback - on the controller side, and translates
+        their failure modes into the router's one "resolver unavailable"
+        signal.
+        """
+        budget_plan = compute_budget(
             mem_available_kb=read_mem_available_kb(),
             swap_free_kb=read_swap_free_kb(),
             swap_total_kb=read_swap_total_kb(),
         )
         try:
-            raw, provider_used = await self._schema_completion(
+            return await self._schema_completion(
                 prompt,
                 session_id=session_id,
-                max_tokens=250,
-                response_format=_TOOL_RESOLVER_RESPONSE_FORMAT,
-                budget_plan=resolver_budget_plan,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                budget_plan=budget_plan,
                 waiting_status="waiting_for_tool_resolver",
-                role="tool_resolver",
+                role=role,
                 task_logger=task_logger,
             )
-            resolver_unavailable = False
         except ControllerBudgetExceededError as exc:
-            raw = json.dumps(
-                {
-                    "status": "unavailable",
-                    "operation": "",
-                    "reason": str(exc)[:500],
-                    "related_tools": [spec.name for spec in candidates[:3]],
-                },
-                separators=(",", ":"),
-            )
-            provider_used = "none"
-            resolver_unavailable = True
+            raise ToolResolverUnavailableError(
+                str(exc)[:500], provider="none", reason=str(exc)[:500]
+            ) from exc
         except TaskOrchestratorError as exc:
-            raw = json.dumps(
-                {
-                    "status": "unavailable",
-                    "operation": "",
-                    "reason": f"Tool resolver LLM job failed: {str(exc)[:500]}",
-                    "related_tools": [spec.name for spec in candidates[:3]],
-                },
-                separators=(",", ":"),
-            )
-            provider_used = "local"
-            resolver_unavailable = True
-
-        candidate_by_name = {spec.name: spec for spec in candidates}
-        try:
-            parsed = extract_json(raw)
-        except LlamaCppClientError:
-            parsed = {
-                "status": "unavailable",
-                "operation": "",
-                "reason": "Tool resolver returned invalid JSON.",
-                "related_tools": [spec.name for spec in candidates[:3]],
-            }
-            resolver_unavailable = True
-        if not isinstance(parsed, dict):
-            parsed = {
-                "status": "unavailable",
-                "operation": "",
-                "reason": "Tool resolver response was not a JSON object.",
-                "related_tools": [spec.name for spec in candidates[:3]],
-            }
-            resolver_unavailable = True
-        status = str(parsed.get("status", "")).strip()
-        operation = str(parsed.get("operation", "")).strip()
-        reason = str(parsed.get("reason", "")).strip()[:1000] or "Tool resolver did not provide a reason."
-        resolver_output_chars = len(raw)
-        resolver_llm_calls = 0 if provider_used == "none" else 1
-        if status == "found" and operation in candidate_by_name:
-            selected = candidate_by_name[operation].to_dict()
-            return {
-                "tool": TOOL_FIND_TOOL,
-                "status": "found",
-                "goal": clean_goal,
-                "resolved_tool": operation,
-                "arguments_schema": selected.get("arguments", []),
-                "operation": selected,
-                "reason": reason,
-                "metrics": {
-                    "candidate_count": len(candidates),
-                    "candidate_operations": [spec.name for spec in candidates],
-                    "main_selected_schema_chars": len(
-                        json.dumps(selected, separators=(",", ":"))
-                    ),
-                    "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
-                    "resolver_input_chars": len(prompt),
-                    "resolver_output_chars": resolver_output_chars,
-                    "resolver_llm_calls": resolver_llm_calls,
-                    "resolver_provider": provider_used,
-                    "latency_ms": int((time.perf_counter() - started) * 1000),
-                    "selected_operation": operation,
-                    "expected_operation": expected_operation,
-                    "expected_status": expected_status,
-                    "selection_correctness": self._selection_correctness(
-                        status="found",
-                        selected_operation=operation,
-                        expected_operation=expected_operation,
-                        expected_status=expected_status,
-                    ),
-                },
-            }
-        related = parsed.get("related_tools")
-        if not isinstance(related, list):
-            related = [spec.name for spec in candidates[:3]]
-        related_tools = [
-            str(item) for item in related
-            if str(item) in candidate_by_name
-        ][:3]
-        if status == "invalid_goal":
-            final_status = "invalid_goal"
-            final_reason = parsed.get("error") or reason or "The goal is not a concrete capability request."
-            final_guidance = parsed.get("guidance") or "Describe the operation you need, e.g. 'run a shell command in the repository'."
-            final_error = parsed.get("error") or final_reason
-        else:
-            final_status = "not_found" if status == "not_found" and not resolver_unavailable else "unavailable"
-            final_reason = (
-                reason
-                if final_status == "not_found" or resolver_unavailable
-                else f"Resolver selected unavailable operation {operation!r}."
-            )
-            final_guidance = "Describe the operation you need, e.g. 'run a shell command in the repository'."
-            final_error = None
-        return {
-            "tool": TOOL_FIND_TOOL,
-            "status": final_status,
-            "goal": clean_goal,
-            "reason": final_reason,
-            "error": final_error,
-            "guidance": final_guidance,
-            "related_tools": related_tools,
-            **(
-                self._find_tool_not_found_metadata(current_task, clean_goal, related_tools)
-                if final_status == "not_found"
-                else {}
-            ),
-            "metrics": {
-                "candidate_count": len(candidates),
-                "candidate_operations": [spec.name for spec in candidates],
-                "main_selected_schema_chars": 0,
-                "legacy_catalog_schema_chars": legacy_catalog_schema_chars,
-                "resolver_input_chars": len(prompt),
-                "resolver_output_chars": resolver_output_chars,
-                "resolver_llm_calls": resolver_llm_calls,
-                "resolver_provider": provider_used,
-                "latency_ms": int((time.perf_counter() - started) * 1000),
-                "selected_operation": operation or None,
-                "expected_operation": expected_operation,
-                "expected_status": expected_status,
-                "selection_correctness": self._selection_correctness(
-                    status=final_status,
-                    selected_operation=operation or None,
-                    expected_operation=expected_operation,
-                    expected_status=expected_status,
-                ),
-            },
-        }
+            raise ToolResolverUnavailableError(str(exc)[:500], provider="local") from exc
 
     def _capabilities(self) -> list[dict[str, Any]]:
         legacy_catalog_chars = len(
@@ -2098,46 +1760,10 @@ Rules:
         }
 
     def _execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
-        operation = str(decision.get("operation", "")).strip()
-        args = decision.get("args") or {}
-        if not isinstance(args, dict):
-            raise TaskOrchestratorError("operation args must be an object")
-        available = {spec.name for spec in self._read_only_operation_specs()}
-        if operation not in available:
-            raise TaskOrchestratorError(f"operation {operation!r} is not available")
-        grant = self._latest_operation_grant(
-            str(decision.get("session_id", "")).strip(),
-            operation,
-        )
-        if grant is None:
-            return {
-                "tool": "operation",
-                "operation": operation,
-                "args": args,
-                "error": "operation_not_granted",
-                "reason": (
-                    "Operation execution requires a prior successful find_tool result "
-                    "for the same persistent Nexus session."
-                ),
-            }
-        result = self.operations_registry.execute(
-            operation,
-            args,
-            caller="local task orchestrator",
-        )
-        payload = result.to_dict()
-        payload["output_lines"] = [
-            str(line)[:500]
-            for line in list(payload.get("output_lines") or [])[:80]
-        ]
-        return {
-            "tool": "operation",
-            "operation": operation,
-            "args": args,
-            "grant_event_id": grant["event_id"],
-            "operation_schema": grant["schema"],
-            "result": payload,
-        }
+        try:
+            return self.tool_router.execute_operation(decision)
+        except ToolRouterError as exc:
+            raise TaskOrchestratorError(str(exc)) from exc
 
     def _persist_final(self, session_id: str, task: str, decision: TaskDecision) -> None:
         if decision.action == ACTION_CLARIFICATION:

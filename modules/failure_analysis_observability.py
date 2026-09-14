@@ -36,6 +36,10 @@ def _safe_text(value: Any, max_chars: int = 160) -> str:
     return redact(str(value))[:max_chars]
 
 
+def _yesno(value: bool) -> str:
+    return "yes" if value else "no"
+
+
 def _safe_model(value: Any) -> str | None:
     if value is None:
         return None
@@ -326,6 +330,44 @@ def _install_service_instrumentation() -> None:
         return persisted
 
     service_cls._persist = observed_persist
+
+    original_gather = service_cls._gather_tool_evidence
+
+    @functools.wraps(original_gather)
+    async def observed_gather(self: Any, **kwargs: Any):
+        """Make the evidence-gathering phase visible without exposing it (#172).
+
+        Counts and statuses only: the goals a role asked for and the output a
+        tool returned are exactly the strings that can carry credentials or
+        repository detail, and they already have their place - the bounded,
+        redacted prompt - without also being copied into the log pipeline.
+        """
+        fields = _context_fields(
+            subject_type=str(kwargs.get("subject_type") or "") or None,
+            subject_id=_safe_text(kwargs.get("subject_id") or "") or None,
+            tool_access=_yesno(getattr(self, "_tool_router", None) is not None),
+        )
+        if getattr(self, "_tool_router", None) is None:
+            _event("failure_analysis_tool_evidence_skipped", **fields)
+            return await original_gather(self, **kwargs)
+        _event("failure_analysis_tool_evidence_started", **fields)
+        started = time.monotonic()
+        observations = await original_gather(self, **kwargs)
+        statuses = [
+            str(item.get("status") or "unknown")
+            for item in observations
+            if isinstance(item, dict)
+        ]
+        _event(
+            "failure_analysis_tool_evidence_completed",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            tool_calls=len(observations),
+            tool_statuses=",".join(statuses) or None,
+            **fields,
+        )
+        return observations
+
+    service_cls._gather_tool_evidence = observed_gather
     service_cls._failure_analysis_observability_installed = True
 
 
