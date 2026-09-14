@@ -459,6 +459,9 @@ Rules:
   already returned, and only read-only operations exist here.
 - Read-only means read-only: never transition lifecycle state, edit code,
   merge, restart, or retry anything.
+- An observation with status=refused means that exact call was already made
+  in this analysis. Repeating it returns nothing new: ask for different
+  evidence or answer "done".
 - Choose "done" as soon as you have the evidence you need, or once it is
   clear that no available capability can supply it.""")
     return "\n".join(lines)
@@ -827,8 +830,12 @@ class FailureAnalysisService:
                 self._tool_guard = PersistentToolLoopGuard(
                     db_path=db_path,
                     max_total_steps=self._max_tool_steps,
-                    max_identical_calls=2,
-                    max_non_progressing_cycles=1,
+                    # 2 would make the *first* repeat terminal, ending the
+                    # whole gathering phase on one wasted call. A repeat costs
+                    # that call; the phase ends when the model keeps repeating
+                    # (#175).
+                    max_identical_calls=3,
+                    max_non_progressing_cycles=2,
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -1307,13 +1314,38 @@ class FailureAnalysisService:
                 analysis_id, action, arguments, state_token=state_token, reason=reason
             )
             if not check.allowed:
+                event = str((check.observation or {}).get("event") or "duplicate_tool_call")
                 logger.info(
                     "failure_analysis: repeated tool call refused analysis_id=%s "
-                    "action=%s event=%s",
-                    analysis_id, action, (check.observation or {}).get("event"),
+                    "action=%s event=%s stop=%s",
+                    analysis_id, action, event, check.stop,
                 )
                 if check.stop:
                     break
+                # A silent `continue` left the model no way to learn that the
+                # call was refused: the next prompt looked exactly like the
+                # last one, so it repeated the same call and spent the budget
+                # on nothing. The refusal is an observation about the
+                # diagnosis attempt, the same way an invalid tool request is
+                # (#175).
+                observations.append(
+                    self._bounded_tool_observation(
+                        step,
+                        action,
+                        {
+                            "operation": arguments.get("tool", "") if action != TOOL_FIND_TOOL else "",
+                            "goal": arguments.get("goal", ""),
+                            "status": "refused",
+                            "error": event,
+                            "reason": (
+                                "This exact call was already made in this analysis and "
+                                "returned nothing new. Ask for different evidence, or "
+                                "answer \"done\"."
+                            ),
+                        },
+                        reason,
+                    )
+                )
                 continue
 
             try:

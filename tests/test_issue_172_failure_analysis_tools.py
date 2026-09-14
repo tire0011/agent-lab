@@ -536,11 +536,86 @@ class BoundedToolUseTests(unittest.TestCase):
         service.analyze(subject_type="experiment", subject_id="exp-1", failure="stalled")
 
         prompt = client.diagnosis_prompts[0]
-        # The lookup ran once; every identical repeat was refused by the
-        # shared loop guard rather than resolved again.
         tool_lines = [line for line in prompt.splitlines() if line.startswith("[T")]
-        self.assertEqual(len(tool_lines), 1, tool_lines)
+        # The lookup resolved exactly once; every identical repeat was refused
+        # by the shared loop guard rather than resolved again.
+        resolved = [line for line in tool_lines if "status=refused" not in line]
+        self.assertEqual(len(resolved), 1, tool_lines)
+        # A refusal is reported back instead of being swallowed, so the model
+        # can spend the remaining budget on something else (#175).
+        refused = [line for line in tool_lines if "status=refused" in line]
+        self.assertTrue(refused, tool_lines)
+        self.assertIn("Ask for different evidence", refused[0])
+        # A model that keeps repeating anyway is still bounded.
         self.assertLessEqual(len(client.tool_prompts), 6)
+
+    def test_a_refused_repeat_leaves_the_rest_of_the_budget_usable(self):
+        """Regression for #175: one repeat must not end the whole phase.
+
+        In the live analysis ``878e8008`` the model repeated its opening
+        ``find_tool``; the guard was configured so that the *first* repeat was
+        terminal, the loop broke out with a single observation, and 2 of 4
+        steps went unused. The diagnosis was then written almost entirely from
+        40 historical log lines and reproduced an obsolete token error.
+        """
+        client = _ScriptedClient(
+            tool_steps=[
+                json.dumps({
+                    "action": "find_tool",
+                    "goal": "check github_status lifecycle readiness",
+                    "reason": "the recorded blocker is a configuration claim",
+                }),
+                # The repeat that used to end everything.
+                json.dumps({
+                    "action": "find_tool",
+                    "goal": "check github_status lifecycle readiness",
+                    "reason": "asking again",
+                }),
+                json.dumps({
+                    "action": "call_tool",
+                    "tool": "github_status",
+                    "arguments": {},
+                    "reason": "read the current readiness",
+                }),
+                json.dumps({"action": "done", "reason": "verified"}),
+            ],
+            diagnosis=_diagnosis_json(summary="stale persisted blocker", category="lifecycle_logic"),
+        )
+        service = _service(self.tmp, client, max_tool_steps=4)
+        self.addCleanup(service.close)
+
+        analysis = service.analyze(
+            subject_type="mailbox_task",
+            subject_id="task-175",
+            failure=_STALE_FAILURE,
+        )
+
+        prompt = client.diagnosis_prompts[0]
+        # The call after the refusal still ran, and its evidence is what the
+        # diagnosis was written from.
+        self.assertIn("call_tool", prompt)
+        self.assertIn("lifecycle_ready: yes", prompt)
+        self.assertNotEqual(analysis.category, CATEGORY_UNAVAILABLE)
+
+    def test_the_refusal_is_visible_to_the_model_in_the_next_step(self):
+        client = _ScriptedClient(
+            tool_steps=[
+                json.dumps({"action": "find_tool", "goal": "check github_status readiness", "reason": "verify"}),
+                json.dumps({"action": "find_tool", "goal": "check github_status readiness", "reason": "again"}),
+                json.dumps({"action": "done", "reason": "enough"}),
+            ],
+            diagnosis=_diagnosis_json(),
+        )
+        service = _service(self.tmp, client, max_tool_steps=4)
+        self.addCleanup(service.close)
+
+        service.analyze(subject_type="experiment", subject_id="exp-175", failure="stalled")
+
+        # Step 3's prompt has to carry the refusal, otherwise it looks
+        # identical to step 2's and the model repeats itself again.
+        self.assertGreaterEqual(len(client.tool_prompts), 3)
+        self.assertIn("status=refused", client.tool_prompts[2])
+        self.assertIn("Ask for different evidence", client.tool_prompts[2])
 
     def test_step_budget_caps_the_gathering_phase(self):
         steps = [
