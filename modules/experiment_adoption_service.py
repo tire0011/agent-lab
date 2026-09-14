@@ -1207,6 +1207,70 @@ class ExperimentAdoptionService:
             return None
         return recorded if head.stdout.strip() == recorded else None
 
+    def _committed_verified_work(
+        self, experiment_id: str, experiment: Any, worktree_path: str, elog
+    ) -> tuple[str | None, list[str]]:
+        """``HEAD`` and its changed paths when the verified content is already committed.
+
+        Adoption commits the verified changes as its own first step, so any
+        attempt that got that far leaves a *clean* worktree with the content in
+        ``HEAD``. Deriving the file list from the uncommitted diff then yields
+        nothing and the attempt dies with "Keine Änderungen zur Übernahme
+        vorhanden." - for a change whose CI is green and whose content is
+        sitting right there. The adoption record cannot rescue it either:
+        requeuing resets ``experiment_commit_sha`` to NULL, so
+        :meth:`_resumable_commit_sha` has nothing left to resume from (#175).
+
+        The content invariant answers this without trusting any record, which
+        is also why it survives a process restart: if ``HEAD`` carries exactly
+        the tree verification accepted, and that tree differs from the target
+        branch, then ``HEAD`` *is* the change to adopt. Returns ``(None, [])``
+        when the content is not committed or there is genuinely nothing left
+        to integrate, and raises when the comparison itself could not be made
+        - an unanswerable question must not read as an empty answer.
+        """
+        checkpoint_sha = self._verified_checkpoint_sha(experiment_id, experiment)
+        verified_tree = self._tree_sha_of(worktree_path, checkpoint_sha, elog, phase="adoption")
+        head_sha = self._git_stdout(["rev-parse", "HEAD"], worktree_path, elog).strip()
+        head_tree = self._tree_sha_of(worktree_path, head_sha, elog, phase="adoption")
+        if not verified_tree or not head_tree or verified_tree != head_tree:
+            return None, []
+        # "Nothing to adopt" may only be concluded against a target branch
+        # that actually resolved. Without that check an unreachable ref would
+        # report an empty change set - reintroducing the very symptom this
+        # method exists to remove, under a cause nobody would look for.
+        target_ref = f"origin/{_DEFAULT_TARGET_BRANCH}"
+        resolved_target = _run_git(
+            ["rev-parse", "--verify", f"{target_ref}^{{commit}}"],
+            cwd=worktree_path,
+            timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
+            elog=elog,
+            phase="adoption",
+        )
+        if resolved_target.returncode != 0:
+            raise ExperimentAdoptionError(
+                f"Der Ziel-Branch {target_ref} ist im Experiment-Worktree nicht auflösbar."
+            )
+        # Three dots: what this experiment added since it diverged from the
+        # target branch, not whatever else landed on the target meanwhile.
+        changed = _run_git(
+            ["diff", "--name-only", f"{target_ref}...HEAD"],
+            cwd=worktree_path,
+            timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
+            elog=elog,
+            phase="adoption",
+        )
+        if changed.returncode != 0:
+            raise ExperimentAdoptionError(
+                "Der Experiment-Commit konnte nicht mit dem Ziel-Branch verglichen werden."
+            )
+        changed_files = _safe_list(
+            [line.strip() for line in changed.stdout.splitlines() if line.strip()]
+        )
+        if not changed_files:
+            return None, []
+        return head_sha, changed_files
+
     def _verified_checkpoint_sha(self, experiment_id: str, experiment: Any) -> str:
         """Return the commit whose content verification actually accepted.
 
@@ -1283,6 +1347,26 @@ class ExperimentAdoptionService:
                 )
 
         actual_files = _safe_list(snapshot["changed"].all_paths())
+        # An empty uncommitted diff is not the same thing as an empty change:
+        # the verified content may already be committed in the worktree. Decide
+        # that here rather than in the pipeline, so a retry that cannot possibly
+        # succeed is refused *before* it spends an attempt from the bounded
+        # budget - which is how ten seconds exhausted the retries in #175.
+        committed_commit_sha: str | None = None
+        if not actual_files:
+            committed_commit_sha, actual_files = self._committed_verified_work(
+                experiment_id, experiment, worktree_path, elog
+            )
+            if committed_commit_sha is None:
+                raise ExperimentAdoptionError("Keine Änderungen zur Übernahme vorhanden.")
+            elog.info(
+                "adoption",
+                "verified_work_already_committed",
+                "The worktree is clean because the verified content is already "
+                "committed; adopting that commit instead of an uncommitted diff",
+                experiment_commit_sha=committed_commit_sha,
+                changed_files=actual_files,
+            )
         expected_files = _safe_list((quality.get("changed_files") or quality.get("expected_files") or actual_files))
         review_reason = self._review_reason(actual_files, expected_files)
         if review_reason is not None:
@@ -1300,6 +1384,7 @@ class ExperimentAdoptionService:
             "actual_files": actual_files,
             "expected_files": expected_files,
             "snapshot": snapshot,
+            "committed_commit_sha": committed_commit_sha,
         }
 
     def _review_reason(self, actual_files: list[str], expected_files: list[str]) -> str | None:
@@ -1509,15 +1594,15 @@ class ExperimentAdoptionService:
                     changed_files=actual_files,
                     diff_stat=sanitized_reason(snapshot["diff_stat"], max_chars=1000),
                 )
-                if not actual_files:
-                    return self._finish_failure(
-                        experiment_id,
-                        reason="Keine Änderungen zur Übernahme vorhanden.",
-                        actual_files=actual_files,
-                        expected_files=expected_files,
-                        elog=elog,
-                    )
+                # Validation already proved there is something to adopt, and
+                # said in which shape: an uncommitted diff still to be
+                # committed, or a commit an earlier attempt left behind.
+                experiment_commit_sha = validation["committed_commit_sha"]
+                commit_message = self._commit_message(
+                    experiment_id, experiment.goal, experiment.plan
+                )
 
+            if experiment_commit_sha is None:
                 _run_git(["reset", "HEAD", "--"], cwd=worktree_path, timeout=60, elog=elog, phase="adoption")
                 for rel_path in actual_files:
                     add_proc = _run_git(
@@ -1536,7 +1621,6 @@ class ExperimentAdoptionService:
                             elog=elog,
                         )
 
-                commit_message = self._commit_message(experiment_id, experiment.goal, experiment.plan)
                 commit_proc = _run_git(
                     ["commit", "--no-verify", "-m", commit_message],
                     cwd=worktree_path,
@@ -1553,14 +1637,19 @@ class ExperimentAdoptionService:
                         elog=elog,
                     )
                 experiment_commit_sha = self._git_stdout(["rev-parse", "HEAD"], worktree_path, elog).strip() or None
-                self._set_status(
-                    experiment_id,
-                    STATUS_ADOPTING,
-                    experiment_commit_sha=experiment_commit_sha,
-                    actual_files_json=json.dumps(_safe_list(actual_files)),
-                    expected_files_json=json.dumps(_safe_list(expected_files)),
-                    updated_at=_utcnow_iso(),
-                )
+
+            # Persist the source commit whichever way it was obtained. A
+            # requeue resets this column, so an adoption that adopts an
+            # already-committed change has to write it back - otherwise the
+            # next attempt is blind again in exactly the same way.
+            self._set_status(
+                experiment_id,
+                STATUS_ADOPTING,
+                experiment_commit_sha=experiment_commit_sha,
+                actual_files_json=json.dumps(_safe_list(actual_files)),
+                expected_files_json=json.dumps(_safe_list(expected_files)),
+                updated_at=_utcnow_iso(),
+            )
 
             integration_path = self.worktrees_root / f"adopt-{experiment_id[:8]}-{uuid.uuid4().hex[:8]}"
             integration_path.parent.mkdir(parents=True, exist_ok=True)

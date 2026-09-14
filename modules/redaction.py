@@ -35,8 +35,23 @@ _SECRET_ENV_VARS = (
 # almost every line and destroy the logs' usefulness.
 _MIN_SECRET_VALUE_CHARS = 8
 
+_PLACEHOLDER = "[REDACTED]"
+
+# A secret is introduced by a keyword *and* an assignment - `token=ghp_...`,
+# `"api_key": "..."`, `Authorization: Bearer ...`. Matching a bare keyword
+# followed by whitespace instead, as this pattern once did, fires on ordinary
+# prose and eats the next word: "The GitHub token is not configured" became
+# "The GitHub token=[REDACTED] not configured", and in serialized JSON the
+# greedy `\S+` swallowed the closing quote and bracket, leaving the record
+# unparseable (#175). The separator is required, and the value stops at the
+# punctuation that structures the text around it.
 _SECRET_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)(\s*[:=]\s*|\s+)\S+"
+    r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)"
+    r"(\s*[:=]\s*)"
+    # An already-redacted value is matched whole so it is left alone: the
+    # shape patterns above run first, and re-matching their placeholder used
+    # to strip its closing bracket ("token=[REDACTED]]").
+    r"(\[REDACTED\]|\"[^\"]*\"|'[^']*'|[^\s\"',;)\]}]+)"
 )
 # Two additional secret shapes that the generic keyword-based pattern above
 # does not fully cover on its own: an HTTP "Bearer <token>" credential (the
@@ -67,6 +82,21 @@ _REMOTE_URL_PATTERN = re.compile(
 _PATH_PATTERN = re.compile(r"(?<!\w)(?:/[\w.~-]+){2,}")
 
 
+def _redacted_assignment(match: re.Match[str]) -> str:
+    """Replace the *value* of a keyword assignment, keeping its shape intact.
+
+    The separator is preserved and a quoted value stays quoted, so redacting a
+    serialized structure leaves it parseable - the reader of an analysis or a
+    publish error still sees where the secret was, instead of a record broken
+    at the point it mattered.
+    """
+    keyword, separator, value = match.group(1), match.group(2), match.group(3)
+    if value == _PLACEHOLDER:
+        return match.group(0)
+    quote = value[:1] if value[:1] in {'"', "'"} else ""
+    return f"{keyword}{separator}{quote}{_PLACEHOLDER}{quote}"
+
+
 def redact_known_secret_values(text: str) -> str:
     """Scrub the literal values of this process's configured credentials.
 
@@ -94,7 +124,7 @@ def redact_secrets(text: str) -> str:
     text = _BEARER_PATTERN.sub("[REDACTED]", text)
     text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
     text = _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", text)
-    return _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
+    return _SECRET_PATTERN.sub(_redacted_assignment, text)
 
 
 def redact(text: str) -> str:
