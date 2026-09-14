@@ -379,6 +379,16 @@ Decision log for architecture and operating choices.
   commands, execute Python and delegate; failure analysis may only discover
   and call read-only capabilities, and its action vocabulary contains nothing
   else. That is the whole difference.
+- Read-only is declared per capability (`mutates_state` on its
+  `OperationSpec`, required and keyword-only), never inferred from a denylist
+  of known-mutating names. A denylist gets the default backwards: an
+  operation added later would be read-only until somebody remembered to
+  exclude it, so a role that may only read would gain privileges nobody
+  granted it. Declaring it means a new mutating operation is invisible to
+  that role with no central list to maintain, and a spec that does not answer
+  the question does not construct. A spec that declares nothing - a
+  duck-typed one from elsewhere - is treated as mutating, because the
+  direction that needs a decision is the unsafe one.
 - Two things stay injected, because they are genuinely per-role: inference
   (the controller routes resolver calls through a memory budget with an
   external-provider fallback; a diagnosis just queues a job under D-019) and

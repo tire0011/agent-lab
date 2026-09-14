@@ -44,7 +44,6 @@ from modules.nexus_tool_router import (
     EXPERIMENT_ID_PATTERN,
     MAX_EXPERIMENT_ID_CANDIDATES,
     MAX_RESOLVER_CANDIDATES,
-    READ_ONLY_OPERATION_DENYLIST,
     RESUME_INTENT_PATTERN,
     TOOL_ACCURACY_CORRECT,
     TOOL_ACCURACY_INCORRECT,
@@ -166,10 +165,11 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
 }
 
 # The shared tool mechanism owns the resolver schema, the read-only
-# denylist, candidate scoring and the not-found metadata (#172). Re-exported
+# boundary, candidate scoring and the not-found metadata (#172). Re-exported
 # here under their historical names so existing importers keep working.
+# There is deliberately no read-only denylist to re-export any more: each
+# capability declares whether it mutates state (#174 review).
 _TOOL_RESOLVER_RESPONSE_FORMAT = TOOL_RESOLVER_RESPONSE_FORMAT
-_READ_ONLY_OPERATION_DENYLIST = READ_ONLY_OPERATION_DENYLIST
 _MAX_RESOLVER_CANDIDATES = MAX_RESOLVER_CANDIDATES
 _TOOL_ACCURACY_UNKNOWN = TOOL_ACCURACY_UNKNOWN
 _TOOL_ACCURACY_CORRECT = TOOL_ACCURACY_CORRECT

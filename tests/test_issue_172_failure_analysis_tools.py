@@ -29,7 +29,7 @@ from modules.nexus_tool_router import (
     NexusToolRouter,
     ToolRouterError,
 )
-from modules.operations_registry import OperationResult, OperationsRegistry
+from modules.operations_registry import OperationResult, OperationSpec, OperationsRegistry
 from modules.task_orchestrator import NexusTaskOrchestrator
 
 
@@ -371,6 +371,152 @@ class MissingCapabilityTests(unittest.TestCase):
             router.execute_operation(
                 {"operation": "inbox_refresh", "args": {}, "session_id": "analysis-1"}
             )
+
+
+class ReadOnlyBoundaryDurabilityTests(unittest.TestCase):
+    """The boundary has to hold for operations nobody has written yet.
+
+    Defining read-only as "the catalog minus a denylist" made a capability
+    added later read-only by default, so this role's privileges would grow
+    whenever the catalog did and nobody extended the list. These tests use
+    operations that are not in the real catalog at all, and never touch a
+    central list - if the boundary regresses to a denylist, they fail.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _registry_with(self, *extra_specs):
+        class _GrownRegistry(OperationsRegistry):
+            def catalog(inner):
+                return list(super().catalog()) + list(extra_specs)
+
+            def _op_merge_pull_request(inner, args):
+                raise AssertionError("a read-only role must never reach this handler")
+
+            def _op_future_operation(inner, args):
+                raise AssertionError("a read-only role must never reach this handler")
+
+        return _GrownRegistry(
+            experiment_service=SimpleNamespace(
+                resolve_experiment=lambda experiment_id: SimpleNamespace(id=experiment_id)
+            ),
+            db_path=str(self.tmp / "agent.db"),
+            repo_root=str(self.tmp),
+            github_work_tracking_factory=_StubGitHubTracking,
+        )
+
+    def _router(self, registry):
+        return NexusToolRouter(
+            operations_registry=registry,
+            schema_completion=None,
+            grant_ledger=InMemoryToolGrantLedger(),
+            caller="failure analysis",
+        )
+
+    def test_a_spec_must_declare_its_access_to_exist(self):
+        with self.assertRaises(TypeError):
+            OperationSpec("merge_pull_request", "Merge the pull request")
+
+    def test_newly_added_mutating_operation_is_neither_visible_nor_callable(self):
+        mutating = OperationSpec(
+            "merge_pull_request",
+            "Merge the pull request for an experiment.",
+            tags=["github", "merge", "pull request", "lifecycle", "readiness"],
+            mutates_state=True,
+        )
+        registry = self._registry_with(mutating)
+        self.addCleanup(registry.close)
+        router = self._router(registry)
+
+        # It is in the catalog the controller-facing registry exposes...
+        self.assertIn("merge_pull_request", [spec.name for spec in registry.catalog()])
+        # ...and absent from the surface a read-only role can see.
+        self.assertNotIn(
+            "merge_pull_request",
+            [spec.name for spec in router.read_only_operation_specs()],
+        )
+        # find_tool cannot even offer it as a candidate, so the resolver is
+        # never given the chance to pick it.
+        self.assertNotIn(
+            "merge_pull_request",
+            [spec.name for spec in router.candidate_operations("merge the pull request")],
+        )
+        with self.assertRaises(ToolRouterError):
+            router.execute_operation(
+                {"operation": "merge_pull_request", "args": {}, "session_id": "analysis-1"}
+            )
+
+    def test_a_forged_grant_does_not_make_a_mutating_operation_callable(self):
+        """Access is checked against the declaration, not against the grant."""
+        mutating = OperationSpec(
+            "merge_pull_request", "Merge the pull request.", mutates_state=True
+        )
+        registry = self._registry_with(mutating)
+        self.addCleanup(registry.close)
+        router = self._router(registry)
+        router.grant_ledger.record_grant(
+            "analysis-1", {"status": "found", "operation": mutating.to_dict()}
+        )
+
+        with self.assertRaises(ToolRouterError):
+            router.execute_operation(
+                {"operation": "merge_pull_request", "args": {}, "session_id": "analysis-1"}
+            )
+
+    def test_a_spec_that_declares_nothing_is_treated_as_mutating(self):
+        """Duck-typed specs fail closed too, not just OperationSpec ones."""
+        undeclared = SimpleNamespace(
+            name="future_operation",
+            description="Something a later change added without deciding.",
+            arguments=[],
+            tags=["future", "operation", "readiness"],
+            to_dict=lambda: {"operation": "future_operation", "description": "", "arguments": [], "tags": []},
+        )
+        registry = self._registry_with(undeclared)
+        self.addCleanup(registry.close)
+        router = self._router(registry)
+
+        self.assertNotIn(
+            "future_operation",
+            [spec.name for spec in router.read_only_operation_specs()],
+        )
+        with self.assertRaises(ToolRouterError):
+            router.execute_operation(
+                {"operation": "future_operation", "args": {}, "session_id": "analysis-1"}
+            )
+
+    def test_the_controller_sees_the_same_boundary(self):
+        """One boundary, not a diagnosis-only one the controller can bypass."""
+        mutating = OperationSpec(
+            "merge_pull_request", "Merge the pull request.", mutates_state=True
+        )
+        registry = self._registry_with(mutating)
+        self.addCleanup(registry.close)
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=registry,
+            experiment_service=registry.experiment_service,
+            llama_client=_ScriptedClient(tool_steps=[], diagnosis="{}"),
+            delegation_service=SimpleNamespace(catalog=lambda: [], close=lambda: None),
+        )
+        self.addCleanup(orchestrator.close)
+
+        self.assertNotIn(
+            "merge_pull_request",
+            [spec.name for spec in orchestrator._read_only_operation_specs()],
+        )
+
+    def test_every_real_capability_declares_its_access(self):
+        registry = _registry(self.tmp)
+        self.addCleanup(registry.close)
+        for spec in registry.catalog():
+            with self.subTest(operation=spec.name):
+                self.assertIsInstance(spec.mutates_state, bool)
+                self.assertEqual(spec.read_only, not spec.mutates_state)
+        self.assertEqual(
+            [spec.name for spec in registry.catalog() if spec.mutates_state],
+            ["inbox_refresh"],
+        )
 
 
 class BoundedToolUseTests(unittest.TestCase):

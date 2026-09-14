@@ -9,10 +9,19 @@ error string was indistinguishable from a current one.
 
 This module holds that mechanism instead, so the controller and the other
 roles drive the same code: the same ``OperationsRegistry`` catalog, the same
-read-only denylist, the same candidate scoring, the same resolver prompt and
-schema, the same "``call_tool`` needs a prior ``find_tool`` grant" rule, and
-the same registry-side validation, redaction and audit logging. Roles differ
-only in what they are *allowed* to do with it, not in how it works.
+declared read-only boundary, the same candidate scoring, the same resolver
+prompt and schema, the same "``call_tool`` needs a prior ``find_tool`` grant"
+rule, and the same registry-side validation, redaction and audit logging.
+Roles differ only in what they are *allowed* to do with it, not in how it
+works.
+
+What "read-only" means is declared by each capability (``mutates_state`` on
+its :class:`~modules.operations_registry.OperationSpec`) and never inferred
+from a list of known-mutating names. A denylist would make a capability
+added later read-only by default, so a role that may only read would gain
+privileges nobody granted it; declaring access per capability means a new
+mutating operation is invisible to that role with no central list to
+maintain.
 
 Two things are deliberately injected rather than owned here:
 
@@ -48,7 +57,6 @@ ACTION_CALL_TOOL = "call_tool"
 ACTION_RESUME_EXPERIMENT = "resume_experiment"
 ACTION_MISSING_CAPABILITY = "missing_capability"
 
-READ_ONLY_OPERATION_DENYLIST = {"inbox_refresh"}
 MAX_RESOLVER_CANDIDATES = 5
 
 TOOL_ACCURACY_UNKNOWN = "unknown"
@@ -156,6 +164,24 @@ class InMemoryToolGrantLedger:
 
     def latest_grant(self, session_id: str, operation: str) -> dict[str, Any] | None:
         return self._grants.get(session_id, {}).get(operation)
+
+
+def is_read_only(spec: Any) -> bool:
+    """Whether *spec* has declared itself safe for a read-only role.
+
+    Read-only is a declared property of a capability, never one inferred from
+    a list of known-bad names. A denylist gets the default backwards: an
+    operation added later is read-only until somebody remembers to exclude
+    it, so the privilege of a role that may only read grows on its own. Here
+    a spec that does not declare ``mutates_state`` is treated as mutating -
+    the direction that needs a decision is the unsafe one - which is why a
+    new mutating operation is invisible to such a role without any central
+    list being edited.
+    """
+    declared = getattr(spec, "mutates_state", None)
+    if not isinstance(declared, bool):
+        return False
+    return not declared
 
 
 def tokens(text: str) -> set[str]:
@@ -322,9 +348,16 @@ class NexusToolRouter:
     # ------------------------------------------------------------------
 
     def read_only_operation_specs(self) -> list[Any]:
+        """The capabilities a read-only role may discover and call.
+
+        The whole surface of that role: ``find_tool`` resolves against this
+        list and ``call_tool`` refuses anything outside it, so an operation
+        that has not declared itself read-only is neither discoverable nor
+        executable here.
+        """
         return [
             spec for spec in self.operations_registry.catalog()
-            if spec.name not in READ_ONLY_OPERATION_DENYLIST
+            if is_read_only(spec)
         ]
 
     def candidate_operations(self, goal: str) -> list[Any]:

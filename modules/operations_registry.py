@@ -61,10 +61,28 @@ class OperationArgSpec:
 
 @dataclass(slots=True)
 class OperationSpec:
+    """One capability's metadata, including whether calling it can change state.
+
+    ``mutates_state`` is required and keyword-only on purpose. Read-only used
+    to be defined negatively - "everything in the catalog except the names on
+    a denylist" - which made the safe set depend on somebody remembering to
+    extend that list whenever a mutating operation was added. A new operation
+    would have been read-only by default, and the diagnostic role that may
+    only read would have inherited it silently. Declaring access per
+    operation makes the question unskippable: a spec that does not answer it
+    does not construct, and a role that may only read filters on the answer
+    rather than on a list maintained somewhere else.
+    """
+
     name: str
     description: str
     arguments: list[OperationArgSpec] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    mutates_state: bool = field(kw_only=True)
+
+    @property
+    def read_only(self) -> bool:
+        return not self.mutates_state
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +90,7 @@ class OperationSpec:
             "description": self.description,
             "arguments": [argument.to_dict() for argument in self.arguments],
             "tags": list(self.tags),
+            "mutates_state": self.mutates_state,
         }
 
 
@@ -166,21 +185,21 @@ class OperationsRegistry:
         adoption_id = OperationArgSpec("adoption_id", "string", "Adoption-ID.", required=True)
         service = OperationArgSpec("service", "string", "systemd-Unit-Name (Standard: agent-api).", default=_DEFAULT_SERVICE_NAME)
         return {
-            "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts.", tags=["disk", "storage", "filesystem", "usage"]),
-            "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50], ["experiment", "logs", "jsonl", "history"]),
-            "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id], ["experiment", "status", "summary", "inspect"]),
-            "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"]),
-            "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"]),
-            "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"]),
-            "help": OperationSpec("help", "Liste aller erlaubten Operationen.", tags=["help", "catalog", "operations"]),
-            "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh", "write"]),
-            "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo.", tags=["memory", "ram", "host", "usage"]),
-            "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers.", tags=["mailbox", "status", "timer", "service"]),
-            "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers.", tags=["local model", "llama", "llm", "server", "models"]),
-            "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20], ["process", "memory", "rss", "host"]),
-            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50], ["service", "logs", "journalctl", "systemd"]),
-            "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service], ["service", "status", "systemd", "health"]),
-            "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id], ["adoption", "status", "summary", "inspect"]),
+            "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts.", tags=["disk", "storage", "filesystem", "usage"], mutates_state=False),
+            "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50], ["experiment", "logs", "jsonl", "history"], mutates_state=False),
+            "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id], ["experiment", "status", "summary", "inspect"], mutates_state=False),
+            "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
+            "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
+            "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
+            "help": OperationSpec("help", "Liste aller erlaubten Operationen.", tags=["help", "catalog", "operations"], mutates_state=False),
+            "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh", "write"], mutates_state=True),
+            "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo.", tags=["memory", "ram", "host", "usage"], mutates_state=False),
+            "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers.", tags=["mailbox", "status", "timer", "service"], mutates_state=False),
+            "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers.", tags=["local model", "llama", "llm", "server", "models"], mutates_state=False),
+            "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20], ["process", "memory", "rss", "host"], mutates_state=False),
+            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50], ["service", "logs", "journalctl", "systemd"], mutates_state=False),
+            "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service], ["service", "status", "systemd", "health"], mutates_state=False),
+            "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id], ["adoption", "status", "summary", "inspect"], mutates_state=False),
             "github_status": OperationSpec(
                 "github_status",
                 "Aktueller GitHub-Lifecycle-Readiness-Status des laufenden Prozesses "
@@ -190,10 +209,11 @@ class OperationsRegistry:
                     "token", "identity", "repository", "remote", "runtime",
                     "configuration", "environment", "diagnostics", "blocked",
                 ],
+                mutates_state=False,
             ),
-            "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", tags=["problems", "errors", "failures", "issues"]),
-            "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox.", tags=["mailbox", "inbox", "status", "messages"]),
-            "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox.", tags=["mailbox", "outbox", "status", "messages"]),
+            "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", tags=["problems", "errors", "failures", "issues"], mutates_state=False),
+            "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox.", tags=["mailbox", "inbox", "status", "messages"], mutates_state=False),
+            "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox.", tags=["mailbox", "outbox", "status", "messages"], mutates_state=False),
         }
 
     def _audit(self, operation: str, args: dict[str, Any], result: OperationResult, *, caller: str) -> None:

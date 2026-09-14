@@ -324,6 +324,12 @@
   `command`, `python_run`, `memory_search` and `delegate`; failure analysis
   has discovery and read-only execution and nothing else, so a diagnosis
   cannot transition lifecycle state, edit code, merge, restart or retry.
+- What counts as read-only is declared by each capability (`mutates_state` on
+  its `OperationSpec`, required and keyword-only) and surfaced in
+  `GET /operations/catalog`. The router filters on that declaration, so an
+  operation added later is outside a read-only role's surface until it
+  declares itself read-only - no denylist to keep in step with the catalog.
+  A spec that declares nothing is treated as mutating.
 - Inference and grant storage are injected, because they are genuinely
   per-role: the controller resolves through a memory budget with an external
   fallback and reads its grants back from persistent session events; failure
