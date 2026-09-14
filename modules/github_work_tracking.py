@@ -27,6 +27,16 @@ _DEFAULT_CI_START_TIMEOUT_SECONDS = 90.0
 _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS = 1500.0
 _DEFAULT_CI_POLL_INTERVAL_SECONDS = 10.0
 
+# The opening sentence of every lifecycle-readiness refusal. Exported so a
+# consumer that has only a *persisted* refusal text - written before the
+# blocker was recorded in a machine-readable column (#171) - can still
+# recognize it as this one condition instead of guessing at keywords. It
+# survives redaction (it names no secret and no path), unlike the
+# "Configure GITHUB_TOKEN/..." sentence that follows it.
+LIFECYCLE_READINESS_MESSAGE = (
+    "GitHub lifecycle is required for Nexus implementation work."
+)
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -140,7 +150,7 @@ class GitHubWorkTrackingService:
         if not missing:
             return None
         return (
-            "GitHub lifecycle is required for Nexus implementation work. "
+            f"{LIFECYCLE_READINESS_MESSAGE} "
             f"Configure {', '.join(missing)} before starting or resuming implementation."
         )
 

@@ -40,6 +40,12 @@ PHASE_VALIDATING_LIVE = "validating_live"
 PHASE_SUCCEEDED = "succeeded"
 PHASE_NEEDS_REVIEW = "needs_review"
 
+# Prefix of the error a finalization attempt records when adoption could
+# not even be started. It is a shared constant because the needs_review
+# requeue (#171) reads it back: a requeue that never started is not a new
+# situation, so it must spend the ordinary budget instead of renewing it.
+_START_FAILURE_PREFIX = "could not start adoption: "
+
 _DEFAULT_MAX_RETRIES = 2
 _DEFAULT_HEALTH_URL = "http://127.0.0.1:8000/health"
 _ACTIVE_APPROVAL_STATUSES = {"pending_approval", "approved", "submitted", "running"}
@@ -142,8 +148,44 @@ class TaskFinalizationCoordinator:
         adoption = self.adoption_service.get(str(experiment.id))
 
         superseded: Any | None = None
-        if adoption.status in {STATUS_NOT_STARTED, STATUS_FAILED, STATUS_INTERRUPTED}:
-            if adoption.status in {STATUS_FAILED, STATUS_INTERRUPTED}:
+        review_retry: Any | None = None
+        if adoption.status == STATUS_NEEDS_REVIEW:
+            review_retry = self._review_blocker_cleared(state, experiment, adoption)
+            if review_retry is None:
+                summary = (
+                    "adoption requires review: "
+                    f"{getattr(adoption, 'reason', None) or 'unknown reason'}"
+                )
+                if self._requeue_never_started(state):
+                    # Keep the recorded start failure at the front: it is
+                    # both the more useful diagnosis and the marker that
+                    # says this requeue budget is spent. Replacing it with
+                    # the review text would renew the budget on the next
+                    # attempt and restart the very loop it bounds.
+                    summary = f"{state.last_error} (requeue stopped; {summary})"
+                return self._needs_review(state, summary)
+
+        if (
+            adoption.status in {STATUS_NOT_STARTED, STATUS_FAILED, STATUS_INTERRUPTED}
+            or review_retry is not None
+        ):
+            if review_retry is not None:
+                # The blocker that parked this adoption is gone, so this is a
+                # new situation and not another attempt against the same
+                # evidence: the finalization budget starts over, exactly as
+                # it does for a superseded failure. The adoption service's
+                # own evidence budget then bounds how often a cleared
+                # blocker may reopen the same record - but only once the
+                # restart actually reaches it, so a requeue that never got
+                # that far keeps spending this budget instead of renewing
+                # it (see `_review_blocker_cleared`).
+                superseded = review_retry
+                if self._requeue_never_started(state):
+                    state.retry_count += 1
+                else:
+                    state.retry_count = 1
+                self._save(state)
+            elif adoption.status in {STATUS_FAILED, STATUS_INTERRUPTED}:
                 if state.retry_count >= self.max_retries:
                     # The retry budget counts attempts made against the same
                     # evidence, so an exhausted budget only means "nothing
@@ -216,7 +258,7 @@ class TaskFinalizationCoordinator:
                         source_commit_sha=getattr(adoption, "experiment_commit_sha", None),
                     )
             except Exception as exc:
-                return self._retry_or_review(state, f"could not start adoption: {exc}")
+                return self._retry_or_review(state, f"{_START_FAILURE_PREFIX}{exc}")
             state.phase = PHASE_MERGING
             state.last_error = None
             self._save(state)
@@ -226,12 +268,6 @@ class TaskFinalizationCoordinator:
             state.phase = PHASE_MERGING
             self._save(state)
             return FinalizationResult("running", state.phase, "verified change is being merged/adopted")
-
-        if adoption.status == STATUS_NEEDS_REVIEW:
-            return self._needs_review(
-                state,
-                f"adoption requires review: {getattr(adoption, 'reason', None) or 'unknown reason'}",
-            )
 
         if adoption.status != STATUS_ADOPTED:
             return self._retry_or_review(state, f"unexpected adoption status: {adoption.status}")
@@ -297,6 +333,74 @@ class TaskFinalizationCoordinator:
         except Exception:  # noqa: BLE001 - logging is never worth a lifecycle failure
             logger.warning("no experiment logger for %s", experiment.id, exc_info=True)
             return _NullExperimentLogger()
+
+    @staticmethod
+    def _requeue_never_started(state: _State) -> bool:
+        """Whether the previous finalization attempt failed before adoption began."""
+        return (state.last_error or "").startswith(_START_FAILURE_PREFIX)
+
+    def _review_blocker_cleared(
+        self, state: _State, experiment: Any, adoption: Any
+    ) -> Any | None:
+        """The assessment that reopens a persisted ``needs_review``, or None (#171).
+
+        A ``needs_review`` used to be terminal here without ever being
+        re-examined, so a review caused by a *transient* blocker - the
+        GitHub lifecycle being unconfigured in #115/PR #116 - kept
+        returning its recorded reason long after the VM was fixed and the
+        service restarted. That reads like a current readiness verdict
+        while no readiness check has happened at all.
+
+        The re-evaluation is the adoption service's own stale-adoption
+        assessment, so genuinely manual reviews stay terminal, the same
+        bounded evidence budget applies, and the same record is reused
+        rather than a second adoption being created.
+        """
+        assessment = self._failure_assessment(experiment)
+        reason = getattr(adoption, "reason", None) or "unknown reason"
+        # A cleared blocker that keeps failing to restart adoption is not
+        # new evidence, however often it is re-checked. Without this bound
+        # the same requeue would be attempted on every tick forever and a
+        # permanent obstacle would stay hidden behind a "retrying" status.
+        exhausted = (
+            self._requeue_never_started(state) and state.retry_count >= self.max_retries
+        )
+        if not getattr(assessment, "retryable", False) or exhausted:
+            self._elog(experiment).warning(
+                "finalization",
+                "needs_review_retained",
+                "Persisted adoption needs_review is reused as terminal; its "
+                "blocker is not re-evaluable, still applies, or its requeue "
+                "budget is spent",
+                finalization_phase=PHASE_NEEDS_REVIEW,
+                adoption_status=getattr(adoption, "status", None),
+                review_blocker=getattr(adoption, "review_blocker", None),
+                assessment_category=getattr(assessment, "category", None),
+                assessment_detail=getattr(assessment, "detail", None),
+                requeue_budget_spent=exhausted,
+                retry_count=state.retry_count,
+                max_retries=self.max_retries,
+                reason=reason,
+            )
+            return None
+
+        self._elog(experiment).info(
+            "finalization",
+            "needs_review_requeued",
+            "Persisted adoption needs_review is requeued; its recorded "
+            "blocker no longer applies",
+            adoption_status=getattr(adoption, "status", None),
+            review_blocker=getattr(adoption, "review_blocker", None),
+            assessment_category=getattr(assessment, "category", None),
+            assessment_detail=getattr(assessment, "detail", None),
+            previous_reason=reason,
+        )
+        logger.info(
+            "requeuing a needs_review adoption for %s: %s",
+            experiment.id,
+            getattr(assessment, "detail", ""),
+        )
+        return assessment
 
     def _failure_assessment(self, experiment: Any) -> Any | None:
         """Return the adoption verdict, promoting persisted green CI to integration fallback.

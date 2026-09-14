@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -234,11 +235,16 @@ class AdoptionRepoFixture:
         if github_configured:
             self.github_work_tracking = self.github_seed_tracking
         else:
-            self.github_work_tracking = GitHubWorkTrackingService(
-                db_path=self.db_path,
-                repo_root=str(self.repo),
-                repository="tire0011/agent-lab",
-            )
+            # "Unconfigured" has to mean unconfigured no matter what the
+            # ambient environment holds: the service falls back to
+            # GITHUB_TOKEN/GH_TOKEN, and a token in the test runner's
+            # environment would silently make this branch configured.
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "", "GH_TOKEN": ""}):
+                self.github_work_tracking = GitHubWorkTrackingService(
+                    db_path=self.db_path,
+                    repo_root=str(self.repo),
+                    repository="tire0011/agent-lab",
+                )
         self.adoption_service = ExperimentAdoptionService(
             experiment_service=self.experiment_service,
             db_path=self.db_path,
