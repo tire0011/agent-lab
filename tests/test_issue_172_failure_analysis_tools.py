@@ -70,9 +70,19 @@ class _ScriptedClient:
 
     model = "test-local-model"
 
-    def __init__(self, *, tool_steps: list[str], diagnosis: str):
+    def __init__(
+        self,
+        *,
+        tool_steps: list[str],
+        diagnosis: str,
+        resolver_arguments: dict[str, dict] | None = None,
+    ):
         self._tool_steps = list(tool_steps)
         self._diagnosis = diagnosis
+        # Argument values this stand-in "reads out of" a goal, per resolved
+        # operation - the resolver's job since #177, so a test can drive a
+        # bound call, an invented value, or a goal that binds nothing.
+        self._resolver_arguments = dict(resolver_arguments or {})
         self.prompts: list[str] = []
         self.tool_prompts: list[str] = []
         self.diagnosis_prompts: list[str] = []
@@ -99,15 +109,20 @@ class _ScriptedClient:
         self.diagnosis_prompts.append(prompt)
         return self._diagnosis
 
-    @staticmethod
-    def _resolve(prompt: str) -> str:
+    def _resolve(self, prompt: str) -> str:
         candidates = json.loads(prompt.split("CANDIDATE READ-ONLY OPERATIONS:\n", 1)[1].split("\n\nRules:", 1)[0])
         goal = prompt.split("GOAL:\n", 1)[1].split("\n\nCANDIDATE", 1)[0]
         for candidate in candidates:
             if candidate["operation"] in goal:
-                return json.dumps(
-                    {"status": "found", "operation": candidate["operation"], "reason": "direct match"}
-                )
+                found = {
+                    "status": "found",
+                    "operation": candidate["operation"],
+                    "reason": "direct match",
+                }
+                arguments = self._resolver_arguments.get(candidate["operation"])
+                if arguments is not None:
+                    found["arguments"] = arguments
+                return json.dumps(found)
         return json.dumps(
             {
                 "status": "not_found",

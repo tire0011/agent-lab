@@ -455,9 +455,12 @@ Rules:
 - find_tool discovers a capability; its goal must name a concrete read-only
   capability, never a placeholder. Never repeat a goal that already returned
   not_found - nothing has changed since.
-- A find_tool result that resolves a read-only operation needing no
-  arguments is executed for you; its result is the observation right after
-  it. Never ask for that same call again - read the result instead.
+- A find_tool result whose arguments could be read straight out of your goal
+  is executed for you; its result is the observation right after it. Never
+  ask for that same call again - read the result instead.
+- So name concrete values in the goal when the capability needs them ("the
+  service_logs of llama-server"). A goal that names none, for a capability
+  that takes some, comes back for you to call explicitly.
 - call_tool may only name an operation a find_tool result in this analysis
   already returned, and only read-only operations exist here.
 - Read-only means read-only: never transition lifecycle state, edit code,
@@ -1125,6 +1128,17 @@ class FailureAnalysisService:
                 observation["reason"] = _bounded(
                     raw.get("reason") or reason, _MAX_TOOL_REASON_CHARS
                 )
+            elif raw.get("resolved_arguments") is None:
+                # Resolved, but its arguments could not be tied to the goal, so
+                # it was not executed. Say why: without it the next step only
+                # sees a lookup that led nowhere and no reason to call the tool
+                # itself (#177 review).
+                observation["reason"] = _bounded(
+                    "not executed - "
+                    + str(raw.get("arguments_binding_reason") or "arguments unresolved")
+                    + "; call it yourself with explicit arguments",
+                    _MAX_TOOL_REASON_CHARS,
+                )
             return observation
 
         observation["tool"] = _bounded(raw.get("operation", ""), 80)
@@ -1388,22 +1402,29 @@ class FailureAnalysisService:
 
             if action != TOOL_FIND_TOOL:
                 continue
-            operation = self._directly_executable_operation(result)
-            if operation is None:
+            executable = self._directly_executable_operation(result)
+            if executable is None:
                 continue
+            operation, operation_arguments = executable
             executed = self._execute_resolved_operation(
                 analysis_id=analysis_id,
                 state_token=state_token,
                 step=step,
                 operation=operation,
+                arguments=operation_arguments,
                 reason=reason,
             )
             if executed is not None:
                 observations.append(executed)
 
     @staticmethod
-    def _directly_executable_operation(result: dict[str, Any]) -> str | None:
-        """The operation a resolved ``find_tool`` may run without a second decision.
+    def _directly_executable_operation(
+        result: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]] | None:
+        """The operation and arguments a resolved ``find_tool`` may run with.
+
+        ``None`` means no direct execution: the ordinary bounded decision flow
+        applies instead.
 
         Asking the local model to confirm "now call the tool you just asked
         for" is not a decision, it is a formality - and an expensive one: each
@@ -1418,10 +1439,16 @@ class FailureAnalysisService:
         one operation, the grant for it is already recorded, and
         :meth:`NexusToolRouter.execute_operation` independently refuses
         anything outside the read-only set. This returns ``None`` whenever that
-        determinism does not hold - a resolution that found nothing, a spec
-        that does not *state* it is read-only, or arguments that would have to
-        be invented - so those keep the ordinary bounded decision flow rather
-        than a guess.
+        determinism does not hold - a resolution that found nothing, or a spec
+        that does not *state* it is read-only.
+
+        Arguments are not this method's judgement call. The router binds them
+        against the goal and refuses to bind whatever it cannot tie back to
+        it, so ``resolved_arguments`` is either the values the goal actually
+        named or ``None``. Treating ``None`` as "run it with the defaults" is
+        the one reading that must never happen: it is how a goal naming
+        ``llama-server`` would have been answered with ``agent-api`` (#177
+        review).
         """
         if str(result.get("status") or "") != "found":
             return None
@@ -1433,15 +1460,20 @@ class FailureAnalysisService:
         # inferring one is how a mutating operation becomes auto-executable.
         if not isinstance(spec, dict) or spec.get("mutates_state") is not False:
             return None
-        for argument in result.get("arguments_schema") or []:
-            if not isinstance(argument, dict):
-                return None
-            if argument.get("required") and argument.get("default") is None:
-                return None
-        return operation
+        arguments = result.get("resolved_arguments")
+        if not isinstance(arguments, dict):
+            return None
+        return operation, arguments
 
     def _execute_resolved_operation(
-        self, *, analysis_id: str, state_token: str, step: int, operation: str, reason: str
+        self,
+        *,
+        analysis_id: str,
+        state_token: str,
+        step: int,
+        operation: str,
+        arguments: dict[str, Any],
+        reason: str,
     ) -> dict[str, Any] | None:
         """Run an already-resolved read-only operation through the normal path.
 
@@ -1454,11 +1486,12 @@ class FailureAnalysisService:
         guard = self._tool_guard
         if router is None or guard is None:
             return None
-        arguments = {"tool": operation, "arguments": {}}
+        # The signature carries the arguments, so the same operation asked for
+        # with different values is a different call, not a refused repeat.
         check = guard.check(
             analysis_id,
             ACTION_CALL_TOOL,
-            arguments,
+            {"tool": operation, "arguments": dict(arguments)},
             state_token=state_token,
             reason=f"executing the read-only operation find_tool resolved: {reason}"[:1000],
         )
@@ -1471,7 +1504,7 @@ class FailureAnalysisService:
             return None
         try:
             result = router.execute_operation(
-                {"operation": operation, "args": {}, "session_id": analysis_id}
+                {"operation": operation, "args": dict(arguments), "session_id": analysis_id}
             )
         except ToolRouterError as exc:
             result = {

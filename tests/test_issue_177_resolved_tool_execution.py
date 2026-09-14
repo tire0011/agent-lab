@@ -23,6 +23,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from modules.nexus_tool_router import bind_resolved_arguments
 from modules.failure_analysis_service import (
     CATEGORY_UNAVAILABLE,
     FailureAnalysisService,
@@ -201,6 +202,82 @@ class ResolvedToolExecutionTests(unittest.TestCase):
         self.assertLessEqual(len(call_line), 4000)
 
 
+class NonDefaultArgumentTests(unittest.TestCase):
+    """The regression the #178 review asked for, end to end.
+
+    ``service_status`` defaults its ``service`` to ``agent-api``. A goal that
+    names ``llama-server`` must never be answered by reading ``agent-api``:
+    the diagnosis would receive a perfectly well-formed report about the wrong
+    service and have no way to notice.
+    """
+
+    GOAL = "inspect service_status of llama-server"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.registry = _registry(self.tmp)
+        self.addCleanup(self.registry.close)
+
+    def _run(self, resolver_arguments):
+        client = _ScriptedClient(
+            tool_steps=[
+                json.dumps({
+                    "action": "find_tool",
+                    "goal": self.GOAL,
+                    "reason": "the failure names a service",
+                }),
+            ],
+            diagnosis=_diagnosis_json(summary="service inspected"),
+            resolver_arguments=resolver_arguments,
+        )
+        service = FailureAnalysisService(
+            db_path=str(self.tmp / "agent.db"),
+            llama_client=client,
+            operations_registry=self.registry,
+            max_tool_steps=4,
+        )
+        self.addCleanup(service.close)
+        service.analyze(
+            subject_type="experiment", subject_id="exp-178", failure="service unreachable"
+        )
+        con = sqlite3.connect(str(self.tmp / "agent.db"))
+        try:
+            rows = [
+                dict(zip(("operation", "args_json"), row))
+                for row in con.execute(
+                    "SELECT operation, args_json FROM operations_audit WHERE operation = 'service_status'"
+                )
+            ]
+        finally:
+            con.close()
+        return client, rows
+
+    def test_the_named_service_is_the_one_executed(self):
+        _client, rows = self._run({"service_status": {"service": "llama-server"}})
+
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(json.loads(rows[0]["args_json"]), {"service": "llama-server"})
+
+    def test_an_unbound_goal_is_never_answered_with_the_default(self):
+        client, rows = self._run({"service_status": {}})
+
+        self.assertEqual(rows, [], "service_status must not run on its default")
+        # The lookup still happened and is evidence; only the execution waits
+        # for an explicit decision.
+        prompt = client.diagnosis_prompts[0]
+        self.assertIn("find_tool", prompt)
+        self.assertNotIn("call_tool", prompt)
+        # And the next step is told why, so it can call the tool itself
+        # instead of seeing a lookup that apparently led nowhere.
+        self.assertIn("not executed", client.tool_prompts[1])
+        self.assertIn("call it yourself", client.tool_prompts[1])
+
+    def test_an_invented_value_is_never_executed(self):
+        _client, rows = self._run({"service_status": {"service": "agent-api"}})
+
+        self.assertEqual(rows, [], "a value absent from the goal must not run")
+
+
 class DirectExecutionEligibilityTests(unittest.TestCase):
     """What may run without a decision, decided on the spec - not on a name."""
 
@@ -210,6 +287,7 @@ class DirectExecutionEligibilityTests(unittest.TestCase):
             "status": "found",
             "resolved_tool": "git_status",
             "arguments_schema": [],
+            "resolved_arguments": {},
             "operation": {"operation": "git_status", "mutates_state": False, "arguments": []},
         }
         result.update(overrides)
@@ -218,8 +296,23 @@ class DirectExecutionEligibilityTests(unittest.TestCase):
     def setUp(self):
         self.eligible = FailureAnalysisService._directly_executable_operation
 
-    def test_read_only_no_argument_operation_is_eligible(self):
-        self.assertEqual(self.eligible(self._found()), "git_status")
+    def test_read_only_operation_with_bound_arguments_is_eligible(self):
+        self.assertEqual(self.eligible(self._found()), ("git_status", {}))
+        bound = self._found(
+            resolved_tool="service_status",
+            resolved_arguments={"service": "llama-server"},
+            operation={"operation": "service_status", "mutates_state": False},
+        )
+        self.assertEqual(self.eligible(bound), ("service_status", {"service": "llama-server"}))
+
+    def test_unbound_arguments_are_never_replaced_by_defaults(self):
+        # The router says None when it could not tie the values to the goal.
+        # Reading that as "use the defaults" is the whole bug.
+        self.assertIsNone(self.eligible(self._found(resolved_arguments=None)))
+        self.assertIsNone(self.eligible(self._found(resolved_arguments="{}")))
+        result = self._found()
+        del result["resolved_arguments"]
+        self.assertIsNone(self.eligible(result))
 
     def test_mutating_operation_is_never_eligible(self):
         result = self._found(
@@ -233,24 +326,6 @@ class DirectExecutionEligibilityTests(unittest.TestCase):
         self.assertIsNone(self.eligible(self._found(operation={"operation": "git_status"})))
         self.assertIsNone(self.eligible(self._found(operation=None)))
 
-    def test_required_arguments_without_a_default_are_not_invented(self):
-        result = self._found(
-            resolved_tool="experiment_show",
-            operation={"operation": "experiment_show", "mutates_state": False},
-            arguments_schema=[{"name": "experiment_id", "required": True, "default": None}],
-        )
-        self.assertIsNone(self.eligible(result))
-
-    def test_optional_and_defaulted_arguments_stay_eligible(self):
-        result = self._found(
-            resolved_tool="git_log",
-            arguments_schema=[
-                {"name": "limit", "required": False, "default": None},
-                {"name": "service", "required": True, "default": "agent-api"},
-            ],
-        )
-        self.assertEqual(self.eligible(result), "git_log")
-
     def test_an_unresolved_lookup_is_not_eligible(self):
         for result in (
             self._found(status="not_found", resolved_tool=""),
@@ -259,6 +334,85 @@ class DirectExecutionEligibilityTests(unittest.TestCase):
         ):
             with self.subTest(result=result):
                 self.assertIsNone(self.eligible(result))
+
+
+class ArgumentBindingTests(unittest.TestCase):
+    """Binding a value is a claim about the goal, and is checked as one."""
+
+    def setUp(self):
+        self.registry = _registry(Path(tempfile.mkdtemp()))
+        self.addCleanup(self.registry.close)
+        self.specs = {spec.name: spec for spec in self.registry.catalog()}
+
+    def bind(self, goal, operation, raw):
+        return bind_resolved_arguments(goal, self.specs[operation], raw)
+
+    def test_a_value_named_in_the_goal_is_bound(self):
+        bound, reason = self.bind(
+            "inspect service_status for llama-server", "service_status", {"service": "llama-server"}
+        )
+        self.assertEqual(bound, {"service": "llama-server"})
+        self.assertEqual(reason, "")
+
+    def test_an_invented_value_is_refused(self):
+        # The default validates perfectly and is still not what was asked for.
+        bound, reason = self.bind(
+            "inspect service_status for llama-server", "service_status", {"service": "agent-api"}
+        )
+        self.assertIsNone(bound)
+        self.assertIn("does not contain", reason)
+
+    def test_binding_nothing_never_means_use_the_defaults(self):
+        bound, reason = self.bind(
+            "inspect service_status for llama-server", "service_status", {}
+        )
+        self.assertIsNone(bound)
+        bound, _ = self.bind("inspect service_status", "service_status", None)
+        self.assertIsNone(bound)
+
+    def test_numbers_bind_as_whole_tokens(self):
+        bound, _ = self.bind("show the last 50 git_log commits", "git_log", {"limit": 50})
+        self.assertEqual(bound, {"limit": 50})
+        # "5" lives inside "50", but it was not the number the goal named.
+        bound, reason = self.bind("show the last 50 git_log commits", "git_log", {"limit": 5})
+        self.assertIsNone(bound)
+        self.assertIn("does not contain", reason)
+
+    def test_a_number_no_argument_accounted_for_blocks_binding(self):
+        # service bound, but the goal's 200 was dropped - limit would have
+        # silently fallen back to its default.
+        bound, reason = self.bind(
+            "service_logs of llama-server, last 200 lines",
+            "service_logs",
+            {"service": "llama-server"},
+        )
+        self.assertIsNone(bound)
+        self.assertIn("number", reason)
+
+    def test_schema_violations_are_refused(self):
+        for raw, expected in (
+            ({"limit": 999}, "maximum"),
+            ({"limit": 0}, "minimum"),
+            ({"limit": "ten"}, "integer"),
+            ({"nope": "x"}, "do not exist"),
+        ):
+            with self.subTest(raw=raw):
+                bound, reason = self.bind("git_log 999 0 ten x", "git_log", raw)
+                self.assertIsNone(bound, raw)
+                self.assertIn(expected, reason)
+
+    def test_a_required_argument_must_be_bound(self):
+        bound, reason = self.bind("experiment_show for abc123", "experiment_show", {})
+        self.assertIsNone(bound)
+        bound, reason = self.bind(
+            "experiment_show for abc123", "experiment_show", {"experiment_id": "abc123"}
+        )
+        self.assertEqual(bound, {"experiment_id": "abc123"})
+
+    def test_an_argument_free_operation_binds_nothing_and_stays_eligible(self):
+        bound, reason = self.bind("inspect git_status", "git_status", None)
+        self.assertEqual(bound, {})
+        self.assertEqual(reason, "")
 
 
 if __name__ == "__main__":
