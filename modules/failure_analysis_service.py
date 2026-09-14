@@ -455,6 +455,9 @@ Rules:
 - find_tool discovers a capability; its goal must name a concrete read-only
   capability, never a placeholder. Never repeat a goal that already returned
   not_found - nothing has changed since.
+- A find_tool result that resolves a read-only operation needing no
+  arguments is executed for you; its result is the observation right after
+  it. Never ask for that same call again - read the result instead.
 - call_tool may only name an operation a find_tool result in this analysis
   already returned, and only read-only operations exist here.
 - Read-only means read-only: never transition lifecycle state, edit code,
@@ -1382,6 +1385,115 @@ class FailureAnalysisService:
             observations.append(
                 self._bounded_tool_observation(step, action, result, reason)
             )
+
+            if action != TOOL_FIND_TOOL:
+                continue
+            operation = self._directly_executable_operation(result)
+            if operation is None:
+                continue
+            executed = self._execute_resolved_operation(
+                analysis_id=analysis_id,
+                state_token=state_token,
+                step=step,
+                operation=operation,
+                reason=reason,
+            )
+            if executed is not None:
+                observations.append(executed)
+
+    @staticmethod
+    def _directly_executable_operation(result: dict[str, Any]) -> str | None:
+        """The operation a resolved ``find_tool`` may run without a second decision.
+
+        Asking the local model to confirm "now call the tool you just asked
+        for" is not a decision, it is a formality - and an expensive one: each
+        controller-style decision costs many minutes on the 7B model, and in
+        analysis ``878e8008`` the model answered the formality by repeating its
+        ``find_tool`` instead of issuing ``call_tool``. The guard refused the
+        duplicate, gathering ended with one observation and no diagnostic
+        operation ever ran, and the diagnosis fell back on the stale token
+        hypothesis (#177).
+
+        Executing it instead is deterministic: the resolver returned exactly
+        one operation, the grant for it is already recorded, and
+        :meth:`NexusToolRouter.execute_operation` independently refuses
+        anything outside the read-only set. This returns ``None`` whenever that
+        determinism does not hold - a resolution that found nothing, a spec
+        that does not *state* it is read-only, or arguments that would have to
+        be invented - so those keep the ordinary bounded decision flow rather
+        than a guess.
+        """
+        if str(result.get("status") or "") != "found":
+            return None
+        operation = str(result.get("resolved_tool") or "").strip()
+        if not operation:
+            return None
+        spec = result.get("operation")
+        # Read-only must be stated. A missing field is not a "no", and
+        # inferring one is how a mutating operation becomes auto-executable.
+        if not isinstance(spec, dict) or spec.get("mutates_state") is not False:
+            return None
+        for argument in result.get("arguments_schema") or []:
+            if not isinstance(argument, dict):
+                return None
+            if argument.get("required") and argument.get("default") is None:
+                return None
+        return operation
+
+    def _execute_resolved_operation(
+        self, *, analysis_id: str, state_token: str, step: int, operation: str, reason: str
+    ) -> dict[str, Any] | None:
+        """Run an already-resolved read-only operation through the normal path.
+
+        Deliberately the same ``guard.check`` -> ``execute_operation`` ->
+        ``record_result`` sequence an explicit ``call_tool`` takes, so the loop
+        guard, the grant rule, the registry's validation and its audit record
+        all still apply. Only the LLM decision in front of it is skipped.
+        """
+        router = self._tool_router
+        guard = self._tool_guard
+        if router is None or guard is None:
+            return None
+        arguments = {"tool": operation, "arguments": {}}
+        check = guard.check(
+            analysis_id,
+            ACTION_CALL_TOOL,
+            arguments,
+            state_token=state_token,
+            reason=f"executing the read-only operation find_tool resolved: {reason}"[:1000],
+        )
+        if not check.allowed:
+            # Already run in this analysis; its result is in the evidence.
+            logger.info(
+                "failure_analysis: resolved tool already executed analysis_id=%s operation=%s",
+                analysis_id, operation,
+            )
+            return None
+        try:
+            result = router.execute_operation(
+                {"operation": operation, "args": {}, "session_id": analysis_id}
+            )
+        except ToolRouterError as exc:
+            result = {
+                "operation": operation,
+                "error": "invalid_tool_request",
+                "reason": str(exc),
+            }
+        except Exception:  # noqa: BLE001 - a tool failure never fails the analysis
+            logger.warning(
+                "failure_analysis: resolved tool execution failed analysis_id=%s operation=%s",
+                analysis_id, operation, exc_info=True,
+            )
+            return None
+        guard.record_result(
+            check.call_id,
+            {"action": ACTION_CALL_TOOL, "status": str(result.get("status") or "")},
+        )
+        logger.info(
+            "failure_analysis: executed resolved tool analysis_id=%s operation=%s step=%s",
+            analysis_id, operation, step,
+        )
+        return self._bounded_tool_observation(step, ACTION_CALL_TOOL, result, reason)
 
     # ------------------------------------------------------------------
     # Core analysis

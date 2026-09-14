@@ -76,6 +76,9 @@ class _ScriptedClient:
         self.prompts: list[str] = []
         self.tool_prompts: list[str] = []
         self.diagnosis_prompts: list[str] = []
+        # What the script actually answered each gathering step with, so a
+        # test can tell an LLM action decision from a deterministic one.
+        self.tool_decisions: list[str] = []
 
     async def complete(self, *, prompt, temperature, max_tokens, system=None, response_format=None):
         del temperature, max_tokens, system, response_format
@@ -86,9 +89,13 @@ class _ScriptedClient:
             return self._resolve(prompt)
         if prompt.startswith("FAILURE ANALYSIS - EVIDENCE GATHERING STEP"):
             self.tool_prompts.append(prompt)
-            if self._tool_steps:
-                return self._tool_steps.pop(0)
-            return json.dumps({"action": "done", "reason": "nothing left to check"})
+            decision = (
+                self._tool_steps.pop(0)
+                if self._tool_steps
+                else json.dumps({"action": "done", "reason": "nothing left to check"})
+            )
+            self.tool_decisions.append(decision)
+            return decision
         self.diagnosis_prompts.append(prompt)
         return self._diagnosis
 
