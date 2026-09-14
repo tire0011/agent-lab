@@ -52,21 +52,53 @@ class RedactionProseTests(unittest.TestCase):
         self.assertNotIn("ghp_configuredvalue12345", cleaned)
         self.assertIn("[REDACTED]", cleaned)
 
+    def test_quoted_json_keys_are_redacted(self):
+        """A serialized object writes the keyword quoted: ``{"password": ...}``.
+
+        The character after the keyword is then ``"``, not ``:``. Every value
+        here is deliberately shapeless - not ``ghp_``/``sk-`` and not a
+        configured env value - so only the keyword/assignment pattern can
+        catch it, and the test fails if that path regresses.
+        """
+        for key in ("password", "api_key", "token", "secret", "credential", "authorization"):
+            with self.subTest(key=key):
+                cleaned = redact_secrets(json.dumps({key: "hunter2hunter2"}))
+                self.assertNotIn("hunter2hunter2", cleaned)
+                self.assertEqual(json.loads(cleaned), {key: "[REDACTED]"})
+
     def test_redacting_serialized_json_keeps_it_parseable(self):
         document = {
             "missing_information": ["GitHub token status"],
             "summary": "The GitHub token is not configured",
             "model": "qwen2.5-coder-7b-instruct",
-            "config": {"token": "ghp_abcXYZ123456789abcdef", "retries": 2},
+            # Shapeless on purpose: no shape pattern rescues this one.
+            "config": {"token": "plainsecretvalue", "retries": 2},
+            "tokens": 5,
         }
         cleaned = redact_secrets(json.dumps(document))
 
+        self.assertNotIn("plainsecretvalue", cleaned)
         restored = json.loads(cleaned)
         self.assertEqual(restored["missing_information"], ["GitHub token status"])
         self.assertEqual(restored["summary"], "The GitHub token is not configured")
         self.assertEqual(restored["model"], "qwen2.5-coder-7b-instruct")
         self.assertEqual(restored["config"]["token"], "[REDACTED]")
         self.assertEqual(restored["config"]["retries"], 2)
+        # A count that merely contains a keyword is not an assignment.
+        self.assertEqual(restored["tokens"], 5)
+
+    def test_shapeless_values_are_redacted_without_any_shape_pattern(self):
+        for text, secret in (
+            ('{"password": "hunter2hunter2"}', "hunter2hunter2"),
+            ('{"api_key": "hunter2hunter2"}', "hunter2hunter2"),
+            ("password=hunter2hunter2", "hunter2hunter2"),
+            ("api_key: hunter2hunter2", "hunter2hunter2"),
+            ("'secret' => 'hunter2hunter2'", "hunter2hunter2"),
+        ):
+            with self.subTest(text=text):
+                cleaned = redact_secrets(text)
+                self.assertNotIn(secret, cleaned)
+                self.assertIn("[REDACTED]", cleaned)
 
     def test_an_already_redacted_value_is_not_redacted_again(self):
         self.assertEqual(

@@ -45,9 +45,17 @@ _PLACEHOLDER = "[REDACTED]"
 # greedy `\S+` swallowed the closing quote and bracket, leaving the record
 # unparseable (#175). The separator is required, and the value stops at the
 # punctuation that structures the text around it.
+#
+# The separator may carry the key's own closing quote, because a serialized
+# object writes the keyword quoted: in `{"password": "..."}` the character
+# after the keyword is `"`, not `:`. Requiring the colon immediately would
+# leave every JSON-shaped secret in the clear unless some other pattern
+# happened to recognize its value's shape.
 _SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|credential|authorization|cookie)"
-    r"(\s*[:=]\s*)"
+    # `=>` is one separator, not `=` followed by a value of `>`: reading it
+    # the wrong way both mangles the text and leaves the secret behind it.
+    r"([\"']?\s*(?:=>|[:=])\s*)"
     # An already-redacted value is matched whole so it is left alone: the
     # shape patterns above run first, and re-matching their placeholder used
     # to strip its closing bracket ("token=[REDACTED]]").
