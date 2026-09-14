@@ -171,7 +171,7 @@ class TestOperationChainAPI:
         monkeypatch.setenv("AGENT_API_KEY", "test-key")
         mock_svc = Mock()
         mock_svc.catalog = Mock(return_value=[
-            OperationSpec("git_status", "Git status"),
+            OperationSpec("git_status", "Git status", mutates_state=False),
         ])
         app.dependency_overrides[get_operations_service] = lambda: mock_svc
 

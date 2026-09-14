@@ -31,6 +31,9 @@ class _Spec:
         self.description = description
         self.arguments = []
         self.tags = ["git", "repository", "lifecycle"]
+        # Declared, like the real OperationSpec: an undeclared spec is
+        # treated as mutating and would not be discoverable at all.
+        self.mutates_state = False
 
     def to_dict(self):
         return {
@@ -38,6 +41,7 @@ class _Spec:
             "description": self.description,
             "arguments": [],
             "tags": list(self.tags),
+            "mutates_state": self.mutates_state,
         }
 
 

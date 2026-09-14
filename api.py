@@ -213,9 +213,15 @@ def get_experiment_adoption_service() -> ExperimentAdoptionService:
 def get_failure_analysis_service() -> FailureAnalysisService:
     """Singleton failure-analysis service for the process (#145).
 
+    Given the process's own operations registry so diagnosis reaches the same
+    read-only capability catalog the persistent controller does (#172).
+
     Overridable in tests via ``app.dependency_overrides[get_failure_analysis_service]``.
     """
-    return FailureAnalysisService()
+    return FailureAnalysisService(
+        operations_registry=get_operations_service(),
+        experiment_service=_resolve_experiment_service(),
+    )
 
 
 @lru_cache(maxsize=1)

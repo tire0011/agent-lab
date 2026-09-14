@@ -239,6 +239,10 @@ class OperationCatalogEntry(BaseModel):
     operation: str
     description: str
     arguments: list[OperationArgumentDefinition] = Field(default_factory=list)
+    # Whether calling this capability can change Nexus state. Surfaced so the
+    # boundary a read-only role filters on is visible wherever the catalog is
+    # read, not only inside the tool router.
+    mutates_state: bool = False
 
 
 class OperationsCatalogResponse(BaseModel):

@@ -44,6 +44,9 @@ class _Spec:
     description = "show experiment"
     arguments = []
     tags = ["experiment", "status"]
+    # Declared, like the real OperationSpec: a spec that does not say whether
+    # it mutates state is treated as mutating and is not discoverable at all.
+    mutates_state = False
 
     def to_dict(self):
         return {
@@ -51,6 +54,7 @@ class _Spec:
             "description": "show experiment",
             "arguments": [{"name": "experiment_id", "type": "string", "required": True}],
             "tags": list(self.tags),
+            "mutates_state": self.mutates_state,
         }
 
 
@@ -78,11 +82,15 @@ class _Registry:
 
 
 class _NamedSpec:
-    def __init__(self, name, description, *, tags=None, arguments=None):
+    # mutates_state is keyword-only and required here for the same reason it is
+    # on the real OperationSpec: a fake that could skip the declaration would
+    # stop mirroring the contract the router actually filters on.
+    def __init__(self, name, description, *, tags=None, arguments=None, mutates_state):
         self.name = name
         self.description = description
         self.tags = list(tags or [])
         self.arguments = list(arguments or [])
+        self.mutates_state = mutates_state
 
     def to_dict(self):
         return {
@@ -90,6 +98,7 @@ class _NamedSpec:
             "description": self.description,
             "arguments": [argument.to_dict() for argument in self.arguments],
             "tags": list(self.tags),
+            "mutates_state": self.mutates_state,
         }
 
 
@@ -99,9 +108,9 @@ class _MultiRegistry:
         self.db_path = db_path
         self.repo_root = Path(repo_root)
         self._specs = [
-            _NamedSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", tags=["experiment", "status"]),
-            _NamedSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes"]),
-            _NamedSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh"]),
+            _NamedSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", tags=["experiment", "status"], mutates_state=False),
+            _NamedSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes"], mutates_state=False),
+            _NamedSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh"], mutates_state=True),
         ]
 
     def catalog(self):

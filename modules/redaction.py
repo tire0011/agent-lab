@@ -45,6 +45,14 @@ _SECRET_PATTERN = re.compile(
 # without a preceding keyword at all (e.g. copy-pasted into a prompt).
 _BEARER_PATTERN = re.compile(r"(?i)bearer\s+\S+")
 _SK_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9]{10,}")
+# GitHub credentials have the same problem as bare "sk-..." keys and now the
+# same exposure: a diagnosis that reads GitHub lifecycle state (#172) handles
+# text where a token can appear with no keyword next to it - and the generic
+# keyword pattern above only consumes one word, so "token is ghp_..." leaves
+# the credential itself in the clear.
+_GITHUB_TOKEN_PATTERN = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})"
+)
 # HTTPS remote URLs with embedded credentials, e.g. ******github.com/...
 _URL_CRED_PATTERN = re.compile(r"https?://[^@\s]*:[^@\s]*@\S*")
 # Any remote URL that could reveal repository identity (plain HTTPS, SSH, SCP-style git@)
@@ -85,6 +93,7 @@ def redact_secrets(text: str) -> str:
     text = _REMOTE_URL_PATTERN.sub("[REMOTE]", text)
     text = _BEARER_PATTERN.sub("[REDACTED]", text)
     text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
+    text = _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", text)
     return _SECRET_PATTERN.sub(r"\1=[REDACTED]", text)
 
 
