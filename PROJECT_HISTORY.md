@@ -792,3 +792,43 @@ Continuing the real #115/#116 lifecycle exposed two operational gaps after the c
 Second, `FailureAnalysisService` still called llama-server directly with its own 60-second read timeout while controller inference already used durable queued local-LLM jobs. On the real failure path the diagnosis started but the direct request timed out and persisted `analysis_unavailable`, even though normal local inference routinely takes multiple minutes. Issue #167 proposes one local-model execution mechanism; open PR #169 currently routes failure analysis through the shared `LocalLlmJobService`, adds job roles and common cancellation/stuck/error observability, and serializes controller/resolver/analysis work through one worker. Its branch reports **1,503 passed, 71 skipped** with remaining failures matching its base environment, but the PR is still open and therefore not yet adopted history.
 
 **Lessons:** restart validation must cover the configuration required by the complete lifecycle, not only service startup; and slow local inference should share one durable queue/liveness/error model rather than each feature inventing its own timeout and direct HTTP path.
+
+## 2026-09-14: one durable local-model execution mechanism and fail-fast lifecycle configuration merged
+
+PR #169 merged the shared `LocalLlmJobService` path for controller, tool resolver, local-worker delegation, and FailureAnalysis. Jobs now carry roles, execute through a cross-process single-inference claim in SQLite, refresh leases while inference is live, classify cancellation/interruption/stuck/error outcomes, and discard late results after ownership is lost. FailureAnalysis no longer has a private 60-second llama-server request path, so slow-but-healthy local inference is treated as durable queued work rather than a timeout. The merged branch reported **1,516 passed, 71 skipped**; its remaining environment failures matched the unmodified base.
+
+Issue #168 / PR #170 then generalized restart validation to the complete mandatory lifecycle. Before any service-mutating `systemctl` action, `scripts/nexus.ps1` now requires non-empty API authentication, GitHub repository identity, and a supported GitHub token variable using boolean-only checks that never read or print secret values. Missing lifecycle configuration aborts the restart and preserves the currently running services.
+
+**Lessons:** Nexus should have one liveness/ownership model for local inference across roles; and deployment readiness must validate every mandatory downstream capability before intentionally restarting a working system.
+
+## 2026-09-14: stale `needs_review` state became condition-aware instead of permanently terminal
+
+The #115/#116 E2E showed that correcting the VM configuration did not unblock finalization because the old adoption `needs_review` reason was simply replayed without a fresh readiness check. Issue #171 / PR #173 added a machine-readable `review_blocker` to adoption state and extended the existing stale-failure assessment path to `needs_review`. A review is requeued only when its named external blocker can be proven cleared; genuinely manual reviews and real test verdicts remain terminal. The same adoption record is reused, superseded review state is archived, and bounded stale-retry accounting still applies. CI reported **1,624 passed, 71 skipped**.
+
+**Lesson:** persisted human-review state must distinguish an enduring verdict from a re-checkable environmental condition; durable error text alone is not current evidence.
+
+## 2026-09-14: FailureAnalysis gained shared read-only tools, then live testing exposed one unnecessary LLM decision
+
+Issue #172 / PR #174 extracted tool discovery/execution from the controller into a shared `NexusToolRouter` and gave FailureAnalysis a bounded read-only evidence-gathering phase. Diagnostic roles now use the same `find_tool` resolution, grant semantics, OperationsRegistry validation, loop guard, redaction, audit path, and bounded tool output as the normal controller. A new read-only `github_status` operation checks whether repository identity and credentials resolve without exposing their values. CI in the intended environment reported **1,640 passed, 71 skipped, 0 failed**.
+
+Live validation immediately found a remaining efficiency/reliability flaw: after `find_tool` had resolved one concrete read-only operation, FailureAnalysis asked the 7B model for another action decision merely to say `call_tool`. The model instead repeated `find_tool`; the duplicate guard correctly rejected it, no diagnostic operation ran, and the final diagnosis again leaned on stale historical evidence. Issue #177 tracks deterministic execution of an already-resolved safe read-only operation without that second model decision. Open PR #178 implements the proposal while preserving grant validation, read-only policy, audit, redaction, bounds, and loop accounting; its full CI reports **1,673 passed, 71 skipped**, but it is not yet adopted history.
+
+**Lesson:** use the LLM for ambiguous decisions, not deterministic plumbing. Once one safe executable operation has been resolved and its arguments are known, an extra model turn adds latency and another failure mode without adding judgment.
+
+## 2026-09-14: the real green-verified version experiment still failed to integrate, exposing committed-work retry and stale-evidence defects
+
+The continuing #115 / Draft PR #116 run reconfirmed authoritative green CI for checkpoint `28399a0` (Actions run `33898643539`, exit 0) but still did not integrate. After PR #173 correctly reopened the stale lifecycle blocker, adoption failed twice with “no changes to adopt” because an earlier attempt had already committed the verified worktree. FailureAnalysis then spent roughly **42 minutes** and returned the obsolete missing-token explanation with confidence 1.00 because current evidence gathering had collapsed early and historical logs dominated its context.
+
+Issue #175 / PR #176 merged three fixes. Adoption now recognizes a clean HEAD whose Git tree exactly matches the verified checkpoint and differs from the target branch as the change to adopt, and validates startability before consuming a retry. A refused duplicate tool call becomes an observation rather than ending the entire evidence-gathering phase, so remaining steps can seek different current evidence. Secret redaction was also corrected so ordinary prose containing words such as “token” is not corrupted and structured JSON remains parseable after redaction. Full CI: **1,660 passed, 71 skipped**.
+
+The original experiment remains `needs_review` until a fresh post-deployment finalization proves the whole adoption -> merge -> deploy -> restart recovery -> live validation path. Draft PR #116 remains open. The initiative timer should therefore remain disabled; green CI still does not satisfy the project’s acceptance boundary.
+
+**Lessons:** retry logic must understand already-persisted semantic work rather than only dirty worktree state; diagnostic history must not outweigh newer evidence merely because tool gathering stopped early; and redaction is part of data integrity as well as secrecy.
+
+## 2026-09-14: GitHub completion events were proposed as the missing return trigger from Nexus to ChatGPT
+
+Issue #179 records a communication architecture idea prompted by the current manual “check the Outbox again” workflow. The Git-backed mailbox should remain the durable/auditable source of truth, while Nexus emits one lightweight idempotent GitHub completion event only after the final Outbox result is persisted. An event-triggered ChatGPT/Work task could then wake, correlate the task/outbox reference, read the authoritative Outbox payload, and report the result without a manual user message.
+
+Candidate signals include a stable issue/PR comment or status update carrying only correlation metadata such as task ID, outbox reference, and terminal status; secrets and full response content stay in the mailbox. The design remains open and needs end-to-end validation against whatever GitHub event types ChatGPT/Work can actually consume.
+
+**Lesson:** durable communication and wake-up signaling are separate concerns. Keep the result in the mailbox and use an event only as an interrupt, with exactly-once/idempotent emission across restart recovery.
