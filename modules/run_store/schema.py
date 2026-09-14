@@ -411,6 +411,7 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
             reason TEXT NULL,
             local_sync_pending INTEGER NOT NULL DEFAULT 0,
             diagnostic_worktree_path TEXT NULL,
+            review_blocker TEXT NULL,
             recovery_attempts INTEGER NOT NULL DEFAULT 0,
             stale_retry_attempts INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -459,6 +460,11 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE experiment_adoptions ADD COLUMN stale_retry_attempts INTEGER NOT NULL DEFAULT 0"
         )
+    # Which re-evaluable condition produced a `needs_review` row (#171).
+    # The reason text alone cannot be re-checked; this names the blocker so
+    # a later attempt can ask whether it still applies.
+    if "review_blocker" not in existing:
+        conn.execute("ALTER TABLE experiment_adoptions ADD COLUMN review_blocker TEXT NULL")
 
 
 def _migrate_operations_audit(conn: sqlite3.Connection) -> None:

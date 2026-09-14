@@ -174,12 +174,21 @@ class StaleFailureAssessmentTests(unittest.TestCase):
         self.assertTrue(assessment.retryable)
 
     def test_a_non_failed_adoption_is_never_stale(self):
-        self._historical_failure(status=STATUS_NEEDS_REVIEW, reason="needs a human")
+        self._historical_failure(status=STATUS_ADOPTED, reason="adopted")
 
         assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
 
         self.assertFalse(assessment.retryable)
         self.assertEqual(assessment.category, "not_failed")
+
+    def test_a_manual_needs_review_is_never_stale(self):
+        """#171 assesses needs_review too, but only a named blocker is retryable."""
+        self._historical_failure(status=STATUS_NEEDS_REVIEW, reason="needs a human")
+
+        assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
+
+        self.assertFalse(assessment.retryable)
+        self.assertEqual(assessment.category, "manual_review")
 
     def test_the_stale_retry_budget_is_bounded(self):
         self._historical_failure()

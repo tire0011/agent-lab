@@ -23,6 +23,7 @@ from modules.experiment_service import (
     _utcnow_iso,
 )
 from modules.github_work_tracking import (
+    LIFECYCLE_READINESS_MESSAGE,
     GitHubCIVerification,
     GitHubWorkTrackingError,
     GitHubWorkTrackingService,
@@ -62,6 +63,13 @@ _MAX_RECOVERY_ATTEMPTS = 3
 # back despite green CI is a real problem and must reach a human.
 _MAX_STALE_RETRIES = 2
 
+# A `needs_review` row records *why* adoption stopped. Most reasons are a
+# judgement about the change itself and stay terminal, but some are an
+# external condition that a later attempt can simply re-check (#171). Such
+# a condition is named here, in the row, because the reason *text* cannot
+# be re-evaluated - only a named blocker can be asked "do you still hold?".
+REVIEW_BLOCKER_GITHUB_LIFECYCLE = "github_lifecycle_not_ready"
+
 _DEFAULT_LOCK_PATH = "/var/lib/nexus/adoption.lock"
 
 
@@ -88,6 +96,7 @@ class ExperimentAdoption:
     reason: str | None = None
     local_sync_pending: bool = False
     diagnostic_worktree_path: str | None = None
+    review_blocker: str | None = None
     recovery_attempts: int = 0
     stale_retry_attempts: int = 0
     created_at: str | None = None
@@ -110,6 +119,7 @@ class ExperimentAdoption:
             "reason": self.reason,
             "local_sync_pending": self.local_sync_pending,
             "diagnostic_worktree_path": self.diagnostic_worktree_path,
+            "review_blocker": self.review_blocker,
             "recovery_attempts": self.recovery_attempts,
             "stale_retry_attempts": self.stale_retry_attempts,
             "created_at": self.created_at,
@@ -201,6 +211,9 @@ def _row_to_adoption(row: sqlite3.Row | None, experiment_id: str) -> ExperimentA
         reason=row["reason"],
         local_sync_pending=bool(row["local_sync_pending"]),
         diagnostic_worktree_path=row["diagnostic_worktree_path"],
+        review_blocker=(
+            row["review_blocker"] if "review_blocker" in row.keys() else None
+        ),
         recovery_attempts=(
             int(row["recovery_attempts"] or 0) if "recovery_attempts" in row.keys() else 0
         ),
@@ -682,6 +695,11 @@ class ExperimentAdoptionService:
     def assess_failure(self, experiment_id: str) -> StaleFailureAssessment:
         """Decide whether a persisted adoption failure still stands.
 
+        A ``needs_review`` row is assessed too (#171), by
+        :meth:`_assess_needs_review`: it is only retryable when the row
+        names a re-evaluable blocker and that blocker demonstrably no
+        longer applies. Everything below is about ``failed``/``interrupted``.
+
         A ``failed`` row is not automatically an immutable fact about the
         implementation (Issue #136). It can also record that the *local*
         run never reached a verdict - it timed out, the worktree could not
@@ -736,7 +754,7 @@ class ExperimentAdoptionService:
     def _assess_failure(self, experiment_id: str, elog: Any) -> StaleFailureAssessment:
         """The decision itself; :meth:`assess_failure` logs its outcome."""
         record = self.get(experiment_id)
-        if record.status not in {STATUS_FAILED, STATUS_INTERRUPTED}:
+        if record.status not in {STATUS_FAILED, STATUS_INTERRUPTED, STATUS_NEEDS_REVIEW}:
             return StaleFailureAssessment(
                 False, "not_failed", f"adoption status is {record.status}"
             )
@@ -759,6 +777,9 @@ class ExperimentAdoptionService:
                 "on fresh evidence and kept failing; manual review required",
                 previous_reason=previous_reason,
             )
+
+        if record.status == STATUS_NEEDS_REVIEW:
+            return self._assess_needs_review(record)
 
         try:
             evidence = self._exact_commit_ci(
@@ -805,6 +826,75 @@ class ExperimentAdoptionService:
             evidence_commit_sha=evidence.checkpoint_sha,
             evidence_run_id=ci.run_id,
         )
+
+    def _assess_needs_review(self, record: ExperimentAdoption) -> StaleFailureAssessment:
+        """Decide whether a persisted ``needs_review`` may be resumed (#171).
+
+        ``needs_review`` means adoption stopped without a verdict about the
+        change - but not every such stop is a request for a human. Some
+        record an external condition (#115/PR #116: the GitHub lifecycle was
+        unconfigured, the VM was fixed afterwards and the service
+        restarted). Those are re-checkable, and re-checking is the only
+        honest answer: returning the persisted text would present a stale
+        configuration failure as a current readiness verdict.
+
+        The re-check asks the *live* dependency, never the recorded text,
+        and only for a blocker the row actually names. Anything else -
+        a file mismatch, a denied path, a failed merge, a manual review -
+        has no re-evaluable condition and stays terminal.
+        """
+        blocker = self._review_blocker_of(record)
+        previous_reason = record.reason
+        if blocker is None:
+            return StaleFailureAssessment(
+                False,
+                "manual_review",
+                "the recorded needs_review is not tied to a re-evaluable "
+                "condition and stays terminal",
+                previous_reason=previous_reason,
+            )
+
+        if blocker == REVIEW_BLOCKER_GITHUB_LIFECYCLE:
+            try:
+                self.github_work_tracking.require_lifecycle_ready()
+            except Exception as exc:  # noqa: BLE001 - a blocker that still holds is not an error
+                return StaleFailureAssessment(
+                    False,
+                    "review_blocker_persists",
+                    f"the recorded needs_review blocker {blocker} still applies: {exc}",
+                    previous_reason=previous_reason,
+                )
+            return StaleFailureAssessment(
+                True,
+                "review_blocker_cleared",
+                f"the recorded needs_review blocker {blocker} no longer applies; "
+                "the GitHub lifecycle is ready now",
+                previous_reason=previous_reason,
+            )
+
+        return StaleFailureAssessment(
+            False,
+            "manual_review",
+            f"the recorded needs_review blocker {blocker} cannot be re-evaluated",
+            previous_reason=previous_reason,
+        )
+
+    @staticmethod
+    def _review_blocker_of(record: ExperimentAdoption) -> str | None:
+        """The row's named blocker, recognizing rows written before #171.
+
+        Older rows - including the one this issue was filed for - predate
+        the column, so the readiness refusal survives only as text. That
+        one sentence is exported by the tracking service that produces it
+        (``LIFECYCLE_READINESS_MESSAGE``), so recognizing it is still
+        reading the producer's own marker rather than guessing keywords.
+        """
+        blocker = (record.review_blocker or "").strip()
+        if blocker:
+            return blocker
+        if LIFECYCLE_READINESS_MESSAGE in (record.reason or ""):
+            return REVIEW_BLOCKER_GITHUB_LIFECYCLE
+        return None
 
     def failure_history(self, experiment_id: str) -> list[dict[str, Any]]:
         """Superseded adoption failures, oldest first.
@@ -892,10 +982,21 @@ class ExperimentAdoptionService:
         evidence reopens an exhausted lifecycle) would be unreachable.
         """
         existing = self.get(experiment_id)
-        if existing.status in {STATUS_ADOPTED, STATUS_QUEUED, STATUS_ADOPTING, STATUS_NEEDS_REVIEW}:
+        # A `needs_review` row is reopened only by a caller that brings an
+        # assessment saying its blocker has cleared (#171). Without one it
+        # stays exactly as terminal as before - an operator pressing adopt
+        # on a review row still gets the record back untouched.
+        reopening_review = existing.status == STATUS_NEEDS_REVIEW and bool(
+            superseded is not None and superseded.retryable
+        )
+        if existing.status in {STATUS_ADOPTED, STATUS_QUEUED, STATUS_ADOPTING} or (
+            existing.status == STATUS_NEEDS_REVIEW and not reopening_review
+        ):
             return existing
 
-        restarting_failure = existing.status in {STATUS_FAILED, STATUS_INTERRUPTED}
+        restarting_failure = (
+            existing.status in {STATUS_FAILED, STATUS_INTERRUPTED} or reopening_review
+        )
         on_fresh_evidence = restarting_failure and bool(
             superseded is not None and superseded.retryable
         )
@@ -960,6 +1061,7 @@ class ExperimentAdoptionService:
                     reason=excluded.reason,
                     local_sync_pending=0,
                     diagnostic_worktree_path=NULL,
+                    review_blocker=NULL,
                     recovery_attempts=0,
                     stale_retry_attempts=excluded.stale_retry_attempts,
                     updated_at=excluded.updated_at
@@ -1061,6 +1163,10 @@ class ExperimentAdoptionService:
                     expected_files_json=excluded.expected_files_json,
                     actual_files_json=excluded.actual_files_json,
                     reason=excluded.reason,
+                    -- This review is about the worktree, not about any
+                    -- external condition, so an earlier row's blocker must
+                    -- not survive to authorize a retry of *this* reason.
+                    review_blocker=NULL,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -1355,6 +1461,7 @@ class ExperimentAdoptionService:
                 return self._finish_review(
                     experiment_id,
                     reason=f"GitHub lifecycle blocked before adoption: {exc}",
+                    review_blocker=self._lifecycle_readiness_blocker(),
                     elog=elog,
                 )
             fetch_proc = _run_git(
@@ -1698,6 +1805,7 @@ class ExperimentAdoptionService:
                 return self._finish_review(
                     experiment_id,
                     reason=f"GitHub lifecycle ist für die Veröffentlichung nicht bereit: {exc}",
+                    review_blocker=self._lifecycle_readiness_blocker(),
                     actual_files=actual_files,
                     expected_files=expected_files,
                     test_exit_code=test_exit_code,
@@ -1816,6 +1924,25 @@ class ExperimentAdoptionService:
             finally:
                 lock.release()
 
+    def _lifecycle_readiness_blocker(self) -> str | None:
+        """``REVIEW_BLOCKER_GITHUB_LIFECYCLE`` iff the lifecycle is unconfigured now.
+
+        A ``GitHubWorkTrackingError`` is not automatically a readiness
+        problem - the same call can fail because the GitHub API rejected a
+        request - and only the readiness case is re-evaluable. So the
+        blocker is recorded from the service's own current verdict rather
+        than from the exception text.
+        """
+        try:
+            return (
+                REVIEW_BLOCKER_GITHUB_LIFECYCLE
+                if self.github_work_tracking.readiness_error()
+                else None
+            )
+        except Exception:  # noqa: BLE001 - classification must never fail the review
+            logger.warning("could not classify GitHub lifecycle readiness", exc_info=True)
+            return None
+
     def _finish_failure(
         self,
         experiment_id: str,
@@ -1860,13 +1987,29 @@ class ExperimentAdoptionService:
         experiment_commit_sha: str | None = None,
         integrated_commit_sha: str | None = None,
         diagnostic_worktree_path: str | None = None,
+        review_blocker: str | None = None,
         elog=None,
     ) -> ExperimentAdoption:
+        """Park the adoption for review.
+
+        ``review_blocker`` names a re-evaluable external condition when there
+        is one (#171). It is deliberately not derived from ``reason``: the
+        text is a human explanation, while this is the machine-readable
+        handle a later attempt uses to ask whether the condition still holds.
+        Leaving it ``None`` keeps the review terminal, which is the default
+        for everything that is a judgement about the change itself.
+        """
         if elog is not None:
-            elog.warning("adoption", "adoption_needs_review", reason)
+            elog.warning(
+                "adoption",
+                "adoption_needs_review",
+                reason,
+                review_blocker=review_blocker,
+            )
         self._set_status(
             experiment_id,
             STATUS_NEEDS_REVIEW,
+            review_blocker=review_blocker,
             ended_at=_utcnow_iso(),
             experiment_commit_sha=experiment_commit_sha,
             integrated_commit_sha=integrated_commit_sha,

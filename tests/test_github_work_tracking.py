@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import unquote
 
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
@@ -139,11 +141,15 @@ class GitHubWorkTrackingTests(unittest.TestCase):
             service.close()
 
     def test_unconfigured_service_blocks_before_creating_issue(self):
-        service = GitHubWorkTrackingService(
-            db_path=str(Path(self.tmp.name) / "unconfigured.db"),
-            repo_root=self.tmp.name,
-            repository="tire0011/agent-lab",
-        )
+        # The token falls back to the environment, so the test runner's own
+        # GITHUB_TOKEN/GH_TOKEN would otherwise make this service configured
+        # and the assertion would test a live API call instead of the guard.
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "", "GH_TOKEN": ""}):
+            service = GitHubWorkTrackingService(
+                db_path=str(Path(self.tmp.name) / "unconfigured.db"),
+                repo_root=self.tmp.name,
+                repository="tire0011/agent-lab",
+            )
         try:
             with self.assertRaises(GitHubWorkTrackingError) as ctx:
                 service.ensure_for_source(
