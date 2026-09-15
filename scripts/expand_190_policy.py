@@ -26,7 +26,7 @@ pattern = re.compile(
     r"                f\"with external effect: \{match\.group\(0\)!r\}\"\n"
     r"            \)\n"
 )
-policy, removed = pattern.subn("", policy)
+policy, removed = pattern.subn("\n", policy)
 assert removed == 2, removed
 
 for line in (
