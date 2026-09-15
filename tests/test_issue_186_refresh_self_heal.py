@@ -374,6 +374,69 @@ class TestFailureAborts(RefreshSelfHealTestCase):
         self.assertTrue((self.harness.checkout / "state/second.log").is_file())
         self.assertEqual(self.harness.rescue_branches(), [])
 
+    def test_failed_rescue_commit_restores_already_archived_artifacts(self) -> None:
+        """Archiving must not survive a rescue that fails afterwards.
+
+        Archiving runs before the rescue commit, so a commit-phase failure
+        used to leave the checkout half-rescued: the artifact already outside
+        the repository, the work still uncommitted. #186 requires the checkout
+        to be untouched when a rescue fails, so the archive rolls back too.
+        """
+        artifact = "communication/outbox/generated.md"
+        self.harness.advance_upstream(3)
+        self.harness.write(artifact, "# generated\n")
+        self.harness.write("experiment.py", "print('work')\n")
+
+        before_head = _git(self.harness.checkout, "rev-parse", "HEAD")
+        before_status = self.harness.status()
+
+        # A branch at `nexus/rescue` makes every `nexus/rescue/<name>` ref
+        # impossible to create, so `git switch --create` fails for real -
+        # after the archive step has already moved the artifact out.
+        _git(self.harness.checkout, "branch", "nexus/rescue")
+
+        result = self.harness.refresh()
+
+        self.assertFalse(result.success)
+        self.assertIn("aborted", result.error)
+
+        self.assertEqual(_git(self.harness.checkout, "rev-parse", "HEAD"), before_head)
+        self.assertEqual(
+            _git(self.harness.checkout, "rev-parse", "--abbrev-ref", "HEAD"), "main"
+        )
+        self.assertEqual(self.harness.status(), before_status)
+        self.assertEqual(
+            (self.harness.checkout / artifact).read_text(encoding="utf-8"), "# generated\n"
+        )
+        self.assertEqual(
+            (self.harness.checkout / "experiment.py").read_text(encoding="utf-8"),
+            "print('work')\n",
+        )
+        self.assertEqual(self.harness.archived_files(), [])
+        self.assertEqual(self.harness.rescue_branches(), [])
+
+    def test_failed_rescue_commit_leaves_no_archive_index_entry(self) -> None:
+        """A rolled-back archive must not claim the artifact is already stored."""
+        artifact = "communication/outbox/generated.md"
+        self.harness.write(artifact, "# generated\n")
+        self.harness.write("experiment.py", "print('work')\n")
+        _git(self.harness.checkout, "branch", "nexus/rescue")
+
+        failed = self.harness.refresh()
+        self.assertFalse(failed.success)
+
+        # With the blocker removed the next refresh archives it for real,
+        # rather than deduplicating against an entry for a file that was
+        # put back.
+        _git(self.harness.checkout, "branch", "--delete", "nexus/rescue")
+        result = self.harness.refresh()
+
+        self.assertTrue(result.success, result.error)
+        archived = [item for item in result.rescue.archived if item.repo_path == artifact]
+        self.assertEqual(len(archived), 1)
+        self.assertFalse(archived[0].deduplicated)
+        self.assertTrue(Path(archived[0].archived_path).is_file())
+
     def test_failed_fetch_keeps_the_checkout_on_main(self) -> None:
         _git(self.harness.checkout, "remote", "set-url", "origin", str(self.harness.root / "gone"))
         result = self.harness.refresh()

@@ -367,6 +367,74 @@ class ArchiveIndex:
         os.replace(temp, self._path)
 
 
+class _ArchiveTransaction:
+    """Archive moves that can still be undone.
+
+    Archiving runs before the rescue commit, so the commit phase failing has
+    to put the artifacts back. An artifact already outside the repository is
+    a change to the checkout, and the contract is that a failed rescue leaves
+    the checkout exactly as it was - so the moves stay provisional until the
+    whole rescue has succeeded. Until :meth:`commit`, nothing is persisted:
+    the index is unsaved and the deduplicated originals are only parked in a
+    holding directory, never deleted.
+    """
+
+    def __init__(self, index: ArchiveIndex | None = None, archive_dir: Path | None = None) -> None:
+        self._index = index
+        self.archive_dir = archive_dir
+        self.archived: list[ArchivedFile] = []
+        self._moved: list[tuple[Path, Path]] = []
+        self._parked: list[tuple[Path, Path]] = []
+
+    def record_move(self, source: Path, destination: Path, relative: str, digest: str) -> None:
+        self._moved.append((source, destination))
+        if self._index is not None:
+            self._index.record(relative, digest, destination)
+        self.archived.append(ArchivedFile(repo_path=relative, archived_path=str(destination)))
+
+    def record_duplicate(self, source: Path, parked: Path, relative: str, existing: Path) -> None:
+        self._parked.append((source, parked))
+        self.archived.append(
+            ArchivedFile(repo_path=relative, archived_path=str(existing), deduplicated=True)
+        )
+
+    def rollback(self) -> None:
+        """Put every moved file back where it came from."""
+        for source, destination in reversed(self._moved):
+            try:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(destination), str(source))
+            except OSError:  # pragma: no cover - best effort rollback
+                logger.error("could not restore %s after a failed rescue", source)
+        for source, parked in reversed(self._parked):
+            try:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(parked), str(source))
+            except OSError:  # pragma: no cover - best effort rollback
+                logger.error("could not restore duplicate artifact %s", source)
+        self._moved.clear()
+        self._parked.clear()
+
+    def commit(self) -> None:
+        """Persist the index and drop the parked duplicate originals."""
+        if self._index is not None and self._moved:
+            self._index.save()
+        holding_dirs: set[Path] = set()
+        for _source, parked in self._parked:
+            holding_dirs.add(parked.parent)
+            try:
+                parked.unlink()
+            except OSError:  # pragma: no cover - the copy is still recoverable
+                logger.warning("duplicate artifact copy left behind at %s", parked)
+        for holding in holding_dirs:
+            try:
+                holding.rmdir()
+            except OSError:  # pragma: no cover - not empty, so something is left to keep
+                pass
+        self._moved.clear()
+        self._parked.clear()
+
+
 class CheckoutRescue:
     """Bring a dirty deployment checkout back to a clean, deployable state."""
 
@@ -418,38 +486,51 @@ class CheckoutRescue:
         work_paths = tuple(dict.fromkeys((*current.staged, *current.tracked, *work)))
 
         # Archive first: it is the only step that touches the filesystem
-        # outside git, it rolls itself back on failure, and doing it before
-        # any git mutation means a broken archive aborts the refresh with the
-        # checkout still exactly as it was.
-        archived, archive_dir = self._archive_runtime_artifacts(artifacts, timestamp)
+        # outside git, and doing it before any git mutation means a broken
+        # archive aborts the refresh with the checkout still exactly as it was.
+        # The moves stay provisional until the rescue as a whole succeeds, so a
+        # later failure - creating the branch, staging, committing, switching
+        # back - puts the artifacts back rather than leaving the checkout in a
+        # half-rescued state.
+        transaction = self._archive_runtime_artifacts(artifacts, timestamp)
 
         notes: list[str] = []
         if symlinks:
             notes.append(f"preserved {len(symlinks)} symlink(s) on the rescue branch")
         rescue_branch: str | None = None
         rescue_commit: str | None = None
-        if work_paths:
-            rescue_branch, rescue_commit, note = self._commit_work(work_paths, current, timestamp)
-            if note:
-                notes.append(note)
-        else:
-            notes.append("no source or work changes; nothing was committed")
+        try:
+            if work_paths:
+                rescue_branch, rescue_commit, note = self._commit_work(
+                    work_paths, current, timestamp
+                )
+                if note:
+                    notes.append(note)
+            else:
+                notes.append("no source or work changes; nothing was committed")
 
-        remaining = inspect_checkout(self._repo_root)
-        if not remaining.clean:
-            raise RescueError(
-                "checkout is still dirty after rescue: "
-                + ", ".join((*remaining.staged, *remaining.tracked, *remaining.untracked))[:300]
-            )
+            remaining = inspect_checkout(self._repo_root)
+            if not remaining.clean:
+                raise RescueError(
+                    "checkout is still dirty after rescue: "
+                    + ", ".join((*remaining.staged, *remaining.tracked, *remaining.untracked))[:300]
+                )
+        except BaseException:
+            # A rescue commit that already exists is left alone - deleting it
+            # would destroy the work it preserves, and it is reachable by name
+            # in the error. The archive is what gets undone.
+            transaction.rollback()
+            raise
 
+        transaction.commit()
         return RescueReport(
             performed=True,
             rescue_branch=rescue_branch,
             rescue_commit=rescue_commit,
             # Only claim paths that a commit actually preserved.
             rescued_paths=work_paths if rescue_commit else (),
-            archived=archived,
-            archive_dir=str(archive_dir) if archive_dir else None,
+            archived=tuple(transaction.archived),
+            archive_dir=str(transaction.archive_dir) if transaction.archive_dir else None,
             notes=tuple(notes),
         )
 
@@ -474,9 +555,10 @@ class CheckoutRescue:
 
     def _archive_runtime_artifacts(
         self, artifacts: Sequence[str], timestamp: str
-    ) -> tuple[tuple[ArchivedFile, ...], Path | None]:
+    ) -> _ArchiveTransaction:
+        """Move runtime artifacts aside, undoably. Nothing is persisted yet."""
         if not artifacts:
-            return (), None
+            return _ArchiveTransaction()
 
         try:
             self._archive_root.mkdir(parents=True, exist_ok=True)
@@ -490,9 +572,7 @@ class CheckoutRescue:
         except OSError as exc:  # pragma: no cover - defensive
             raise RescueError(f"runtime archive index is unusable: {exc}") from exc
 
-        moved: list[tuple[Path, Path]] = []
-        removed_duplicates: list[tuple[Path, Path]] = []
-        archived: list[ArchivedFile] = []
+        transaction = _ArchiveTransaction(index, archive_dir)
         try:
             for relative in artifacts:
                 source = self._repo_root / relative
@@ -504,51 +584,18 @@ class CheckoutRescue:
                 if existing is not None:
                     # Identical content is already archived; keeping a second
                     # copy would make retries accumulate duplicates.
-                    backup = self._duplicate_backup(source, timestamp)
-                    shutil.move(str(source), str(backup))
-                    removed_duplicates.append((source, backup))
-                    archived.append(
-                        ArchivedFile(
-                            repo_path=relative,
-                            archived_path=str(existing),
-                            deduplicated=True,
-                        )
-                    )
+                    parked = self._duplicate_backup(source, timestamp)
+                    shutil.move(str(source), str(parked))
+                    transaction.record_duplicate(source, parked, relative, existing)
                     continue
                 destination = self._unique_destination(archive_dir / relative)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(source), str(destination))
-                moved.append((source, destination))
-                index.record(relative, digest, destination)
-                archived.append(ArchivedFile(repo_path=relative, archived_path=str(destination)))
-            index.save()
+                transaction.record_move(source, destination, relative, digest)
         except (OSError, RescueError) as exc:
-            for source, destination in reversed(moved):
-                try:
-                    source.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(destination), str(source))
-                except OSError:  # pragma: no cover - best effort rollback
-                    logger.error("could not restore %s after a failed archive", source)
-            for source, backup in reversed(removed_duplicates):
-                try:
-                    shutil.move(str(backup), str(source))
-                except OSError:  # pragma: no cover - best effort rollback
-                    logger.error("could not restore duplicate artifact %s", backup)
+            transaction.rollback()
             raise RescueError(f"archiving runtime artifacts failed: {exc}") from exc
-
-        holding_dirs: set[Path] = set()
-        for _source, backup in removed_duplicates:
-            holding_dirs.add(backup.parent)
-            try:
-                backup.unlink()
-            except OSError:  # pragma: no cover - the copy is still recoverable
-                logger.warning("duplicate artifact copy left behind at %s", backup)
-        for holding in holding_dirs:
-            try:
-                holding.rmdir()
-            except OSError:  # pragma: no cover - not empty, so something is left to keep
-                pass
-        return tuple(archived), archive_dir
+        return transaction
 
     def _duplicate_backup(self, source: Path, timestamp: str) -> Path:
         """Staging path for an artifact whose content is already archived.
