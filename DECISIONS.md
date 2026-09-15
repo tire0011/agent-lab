@@ -412,6 +412,53 @@ Decision log for architecture and operating choices.
 - Revisit if: a role needs a capability that is not read-only. That is a
   permission model on the router (per-role allowlists), not a second router.
 
+### D-021: The live checkout is deployable state, and refresh self-heals it
+
+- Status: Accepted
+- Why: Refresh aborted whenever `/agent` was dirty. The invariant it was
+  protecting - never deploy over somebody's uncommitted work - was right, but
+  refusing to act was the wrong way to hold it. In the case that forced this
+  (#186) the only blocker was one *generated* file,
+  `communication/outbox/20260914170857-failure-analysis-7a2bc0c1.md`, while the
+  checkout sat nine commits behind `origin/main`. The deployment stalled and the
+  artifact still had to be cleared by hand, so the failure mode was "old code
+  keeps running" plus "a human is needed anyway".
+- Rule: `main` on the Nexus VM never retains local working-tree changes after
+  refresh handling. `modules/checkout_rescue.py` inspects the checkout and makes
+  it clean before `modules/nexus_refresh.py` updates it.
+- Work and runtime output are preserved differently, because they are different
+  things. Tracked/staged changes and unrecognized untracked files are *work*:
+  they are committed onto `nexus/rescue/<timestamp>-<short-head>` and stay in the
+  repository. Recognizable Nexus output - legacy in-repo mailbox drops, `state/`,
+  logs, caches, databases, temporary files - is *archived* outside the repository
+  under `/var/lib/nexus/runtime-archive/<timestamp>/`. Generated files must never
+  become a code commit, and code must never end up in an archive directory
+  nobody reads.
+- Unknown files are work, not artifacts. Preserving a file that turns out to be
+  junk costs an unused branch; deleting one that turns out to matter is
+  unrecoverable, so the classification defaults to the recoverable mistake.
+- Preservation is never destructive: no `git reset --hard`, no force checkout,
+  no force push, no silent delete. A deployment branch carrying local commits is
+  realigned by naming those commits on a rescue branch first and then moving the
+  branch reference - the commits stay reachable, which is what makes the move
+  safe.
+- A failed rescue or archive aborts the refresh *before* `main` is touched, and
+  the archive step rolls back files it already moved. A refresh that cannot
+  preserve must not deploy.
+- Rescue and archive are idempotent. A clean checkout needs no rescue, and an
+  artifact whose content is already recorded in the archive index is
+  deduplicated rather than copied again, so retries cannot accumulate
+  duplicates.
+- Services restart only after the updated checkout is verified (right branch,
+  clean tree, expected commit), and the result reports what was rescued, what
+  was archived, the previous and new HEAD, and how the services came back.
+- This is a safety net, not a workflow. Experiments still belong on their own
+  branches; a rescue branch appearing at all is a signal that something wrote to
+  the deployment checkout.
+- Revisit if: rescue branches start accumulating in normal operation. That
+  means something is using `/agent` as a workspace, which is a problem to fix at
+  the source rather than to keep rescuing.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

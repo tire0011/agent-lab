@@ -89,6 +89,59 @@ error.
 - Codex CLI is being installed/evaluated (not yet a required dependency).
 - VM managed identity exists but currently has no broad Azure permissions.
 
+## Refreshing the live checkout
+
+`scripts/refresh.sh` -> `scripts/nexus-refresh.ps1` -> `scripts/nexus-pull.ps1`
+updates `/agent` and restarts the services. The pull step runs
+`python -m modules.nexus_refresh --repo-root /agent`, which treats `/agent` as
+deployable state rather than a workspace and self-heals a dirty checkout before
+updating it (issue #186):
+
+1. Local **work** - tracked modifications, staged changes, and untracked files
+   that are not recognizable runtime output - is committed onto a rescue branch
+   `nexus/rescue/<timestamp>-<short-head>`. Nothing is reset or force-checked-out,
+   so the work stays in the repository and is reachable by name.
+2. **Runtime artifacts** - legacy `communication/outbox` and `communication/inbox`
+   drops, `state/`, logs, caches, databases, temporary files - are *moved* out of
+   the repository into `/var/lib/nexus/runtime-archive/<timestamp>/` instead of
+   being committed. Set `NEXUS_RUNTIME_ARCHIVE_DIR` (or `--archive-root`) to
+   archive elsewhere; add deployment-specific globs via
+   `NEXUS_RUNTIME_ARTIFACT_PATTERNS` (comma-separated) or repeated
+   `--artifact-pattern` arguments.
+3. Unknown untracked files count as work, not as artifacts: an unrecognized file
+   is preserved on the rescue branch and reported, never deleted.
+4. Only then is `main` checked out, verified clean, fetched and fast-forwarded.
+   If `main` carries local commits, they are first preserved on a rescue branch
+   and the branch reference is moved forward - no `git reset --hard`, no force push.
+5. Services are restarted only after the updated checkout is verified.
+
+If preservation or archiving fails, the refresh aborts *before* `main` is touched
+and the checkout is left exactly as it was - the archive step rolls back any file
+it already moved. Re-running the refresh is safe: a clean checkout needs no rescue,
+and an artifact whose content is already archived is deduplicated (via
+`<archive-root>/archive-index.json`) instead of copied again.
+
+Useful flags:
+
+```bash
+# Report only what the refresh would say, in machine-readable form.
+python -m modules.nexus_refresh --repo-root /agent --json
+
+# Restart units as part of the refresh itself.
+python -m modules.nexus_refresh --repo-root /agent --restart-services agent-api
+```
+
+Recovering rescued work:
+
+```bash
+git -C /agent branch --list 'nexus/rescue/*'
+git -C /agent show <rescue-branch>
+ls -R /var/lib/nexus/runtime-archive/
+```
+
+Experiments should still run on their own branches; this is a safety net, not
+the normal workflow.
+
 ## Known limitations
 
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.
