@@ -502,6 +502,59 @@ Decision log for architecture and operating choices.
   based on recorded outcomes — not a return to a single hard-coded agent.
 
 
+### D-023: Diagnosing Nexus is a command, and liveness is derived from a progress signal
+
+- Status: Accepted
+- Why: Finding out why a task failed meant composing ad-hoc shell commands
+  through the mailbox — probe Git for a branch, guess the systemd unit, build a
+  `journalctl` invocation, then correlate that against whichever of the four id
+  namespaces (mailbox task, experiment, controller session, issue/PR) the
+  operator happened to know. The #186/#187 investigation is the worked example:
+  Nexus created a branch, produced no implementation commit and no PR, and
+  establishing *where* execution stopped took a chain of hand-built commands.
+  Those commands were also the diagnosis's only evidence path, so a slightly
+  different guess produced a slightly different answer.
+- Decision: one read-only backend (`modules/nexus_diagnostics.py`) resolves any
+  reference an operator plausibly holds — a task/experiment/session id, a
+  unique prefix, an issue or PR number, an inbox filename — reads the lifecycle
+  out of the subsystem that owns it, and returns that together with bounded,
+  correlated logs. It is exposed three ways over the same code: HTTP
+  (`/diagnostics/status/...`, `/diagnostics/logs/...`), the operations catalog
+  (`nexus_status`, `nexus_logs`, `nexus_last_failure`), and the
+  failure-analysis routine, which no longer keeps a log lookup of its own.
+- Liveness is the part that needed a new idea. D-018 made a controller session
+  state that it is alive; mailbox tasks and experiments cannot, because they
+  are driven through several processes and no single owner is alive across the
+  span. Rather than inventing a second liveness mechanism, the same staleness
+  rule is applied to the newest **progress signal**: the claiming session's
+  heartbeat where there is one, otherwise the newest structured log entry,
+  otherwise the row's `updated_at`. The verdict names which source answered,
+  because "a worker stopped beating 40 minutes ago" and "the last log line is
+  40 minutes old" are different strengths of the same claim. The timeout keeps
+  `heartbeat.resolve_stale_timeout`'s clamped floor, so no caller can ask a
+  question that declares live work dead.
+- A stalled subject therefore counts as a failure for `last-failure`. A process
+  that died mid-run never wrote a `failed` status; its log simply stops, which
+  reads identically to work still in flight. Searching for explicit failures
+  alone would miss exactly the case the command exists for.
+- Read-only is structural, not a convention: the database is opened in
+  SQLite's `mode=ro` and pinned with `PRAGMA query_only`, so a write is
+  refused by the connection rather than merely absent from the code. Notably
+  this means *not* using `run_store.init_db`, the write path's entry point,
+  which creates the file and applies every additive migration and the
+  mailbox-approval backfill — a diagnostic built on it would have mutated the
+  database it was asked to describe, and would have done so on the incomplete
+  databases most worth inspecting. Missing tables and columns degrade to
+  "nothing known about that" instead.
+- Prefix resolution refuses an ambiguous shorthand, and ambiguity is judged
+  across every id namespace at once. Checking one table at a time and taking
+  the first hit would let the order of an internal list, rather than the
+  operator's input, decide between a mailbox task and an experiment.
+- Revisit if: the lifecycle vocabulary stops fitting a subsystem, or the
+  progress signal proves too coarse for a phase that is legitimately quiet for
+  longer than the stale timeout. The fix there is a per-phase timeout, not
+  dropping the derivation.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

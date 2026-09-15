@@ -478,6 +478,43 @@ Rules:
     return "\n".join(lines)
 
 
+def _with_lifecycle_context(
+    failure: dict[str, Any] | str, state: Any
+) -> dict[str, Any] | str:
+    """Fold the lifecycle facts into the failure the model is asked about.
+
+    Rendered as ordinary ``key=value`` lines alongside the caller's own
+    failure detail, because that is the shape :func:`_build_prompt` already
+    gives a dict failure - the model reads one description of the situation,
+    not two. A caller's own value always wins: it describes the failure that
+    prompted the analysis, while these are context around it.
+    """
+    if state is None:
+        return failure
+    context: dict[str, Any] = {
+        "nexus_lifecycle": state.lifecycle,
+        "nexus_status": state.status,
+        "nexus_branch": state.branch,
+        "nexus_commit": state.commit,
+        "nexus_pull_request": state.pr_number,
+        "nexus_issue": state.issue_number,
+        "nexus_worker": state.worker_id,
+        "nexus_last_error": state.last_error,
+    }
+    progress = getattr(state, "progress", None)
+    if progress is not None:
+        context["nexus_progress"] = progress.state
+        context["nexus_progress_detail"] = progress.reason
+        context["nexus_last_progress_at"] = progress.last_progress_at
+        context["nexus_last_progress_source"] = progress.source
+    context = {key: value for key, value in context.items() if value is not None}
+    if isinstance(failure, dict):
+        return {**context, **failure}
+    text = str(failure).strip()
+    rendered = "\n".join(f"{key}={value}" for key, value in context.items())
+    return f"{text}\n{rendered}" if text else rendered
+
+
 def _build_prompt(
     *,
     subject_type: str,
@@ -1029,39 +1066,62 @@ class FailureAnalysisService:
     ) -> FailureAnalysis:
         """Convenience wrapper: build the evidence bundle from structured logs.
 
-        Merges the experiment's own JSONL log with its correlated
-        pre-experiment mailbox task log (same merge the Logs API uses), so
-        the bundle covers the whole task path - mailbox intake through
-        adoption/finalization - not just whichever id the caller happens to
-        have on hand. Reading the logs is itself best-effort: a missing or
-        unreadable log directory yields an empty evidence bundle rather
-        than failing the analysis.
+        Both halves come from the shared diagnostic backend (#188) rather than
+        from a log lookup of this module's own. That backend merges the
+        experiment's JSONL log with its correlated pre-experiment mailbox task
+        log - the same merge the Logs API and the ``nexus logs`` commands use,
+        so the bundle covers the whole task path (mailbox intake through
+        adoption/finalization) and an operator running ``nexus logs`` on the
+        same task sees exactly the facts this diagnosis saw.
+
+        It also answers the question logs alone cannot: *was this interrupted,
+        is it still running, or did it finish?* A task whose worker died
+        mid-run leaves a log that simply stops, which reads identically to one
+        that is still going; the lifecycle row plus the heartbeat/progress
+        signal is what separates the two, and saying "interrupted" instead of
+        "ran out of log" is most of a diagnosis.
+
+        Best-effort throughout: an unresolvable subject or an unreadable log
+        directory costs the extra context, never the analysis.
         """
-        entries: list[dict[str, Any]] = []
-        try:
-            if experiment_id:
-                entries = central_logging.read_experiment_logs(
-                    self._log_dir, experiment_id, mailbox_task_id=mailbox_task_id, limit=200
-                )
-            elif mailbox_task_id:
-                path = self._log_dir / f"{central_logging.TASK_LOG_PREFIX}{mailbox_task_id}.jsonl"
-                entries = central_logging.read_log_entries(path, limit=200)
-        except Exception:  # noqa: BLE001 - evidence collection must never block diagnosis
-            logger.warning(
-                "failure_analysis: could not read logs for experiment=%s task=%s",
-                experiment_id, mailbox_task_id, exc_info=True,
-            )
+        state, entries = self._diagnostic_evidence(
+            experiment_id=experiment_id, mailbox_task_id=mailbox_task_id
+        )
         evidence = evidence_from_log_entries(entries, max_items=max_items)
         return await self.analyze_async(
             subject_type=subject_type,
             subject_id=subject_id,
-            failure=failure,
+            failure=_with_lifecycle_context(failure, state),
             evidence=evidence,
             goal=goal,
             elog=elog,
             experiment_id=experiment_id,
             mailbox_task_id=mailbox_task_id,
         )
+
+    def _diagnostic_evidence(
+        self, *, experiment_id: str | None, mailbox_task_id: str | None
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        """Lifecycle state and raw log entries from the shared backend (#188)."""
+        from modules.nexus_diagnostics import NexusDiagnostics
+
+        try:
+            diagnostics = NexusDiagnostics(db_path=self.db_path, log_dir=self._log_dir)
+        except Exception:  # noqa: BLE001 - evidence must never block diagnosis
+            logger.warning("failure_analysis: diagnostic backend unavailable", exc_info=True)
+            return None, []
+        try:
+            return diagnostics.evidence_bundle(
+                experiment_id=experiment_id, mailbox_task_id=mailbox_task_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "failure_analysis: could not gather diagnostics for experiment=%s task=%s",
+                experiment_id, mailbox_task_id, exc_info=True,
+            )
+            return None, []
+        finally:
+            diagnostics.close()
 
     # ------------------------------------------------------------------
     # Current-evidence gathering through the shared tool router (#172)

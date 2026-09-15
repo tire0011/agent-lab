@@ -52,6 +52,22 @@
   - `GET /logs/public` — backwards-compatible alias of `GET /logs`,
     returning the identical complete entries (the former reduced
     allowlist is gone).
+  - `GET /diagnostics/status/{reference}`, `GET /diagnostics/logs/{reference}`,
+    `GET /diagnostics/logs/service/{service}` and
+    `GET /diagnostics/logs/last-failure` (API key) — first-class diagnostic
+    commands (#188). Where `/logs` and `/logs/trace` return entries, these
+    join the lifecycle state onto them: `modules/nexus_diagnostics.py`
+    resolves a task/experiment/session id, a unique prefix, an issue or PR
+    number, or an inbox filename, reads the owning subsystem's row, and
+    returns lifecycle, branch, commit, PR, worker, last error and a
+    running/interrupted/completed progress verdict alongside bounded logs.
+    Read-only by construction: the database is opened `mode=ro` with
+    `PRAGMA query_only` — deliberately not through `run_store.init_db`, which
+    is the write path's entry point and would have made a diagnostic read
+    apply migrations and backfills to the database it was asked to describe.
+    That is what makes it safe to expose through the mailbox/chat catalog as
+    `nexus_status`/`nexus_logs`/`nexus_last_failure`; `modules/failure_analysis_service.py` reads the same
+    backend rather than a log lookup of its own.
   - `GET /logs/trace/{reference}` (no auth) — everything Nexus did for
     one order. `reference` may be an inbox message filename, an
     experiment id, a mailbox task id, a controller session or chat job
@@ -261,6 +277,17 @@
 - Inspection: `GET /diagnostics/nexus/liveness` (API key) reports every
   claim with its owner, heartbeat age and staleness, plus status counts. It
   reports only - it never reaps.
+- Extended to work that has no heartbeat of its own by
+  `modules/nexus_diagnostics.py` (#188). Mailbox tasks and experiments are
+  driven through several processes and phases, so no single owner is alive
+  across the span and there is nothing to beat - but "is this still running?"
+  is just as real a question there. Their liveness is derived from the newest
+  *progress signal*: the claiming session's heartbeat where one exists,
+  otherwise the newest structured log entry, otherwise the row's
+  `updated_at`. The staleness rule is `heartbeat.resolve_stale_timeout`
+  unchanged, floor and all, and the verdict reports which of the three
+  sources answered - "a worker stopped beating 40 minutes ago" and "the last
+  log line is 40 minutes old" are different strengths of the same claim.
 
 ### 11) Local-model execution (one shared job path)
 
