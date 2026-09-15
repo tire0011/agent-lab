@@ -1,7 +1,8 @@
 """Persistent publisher for completed operation-chain results.
 
-This module is kept as a thin backward-compatible shim.  All git logic now
-lives in ``modules.outbox_publisher.OperationChainOutboxPublisher``.
+This module is kept as a thin backward-compatible shim.  Git lifecycle logic
+lives in ``modules.outbox_publisher`` while canonical id+content/path ownership
+lives in ``modules.outbox_message_publisher``.
 """
 
 from __future__ import annotations
@@ -10,12 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from modules.outbox_message_publisher import OperationChainMessagePublisher
 from modules.outbox_publisher import (
     PUBLISH_COMMITTED,
     PUBLISH_FAILED,
     PUBLISH_PUSHED,
     PUBLISH_WRITTEN,
-    OperationChainOutboxPublisher,
 )
 from modules.run_store import DEFAULT_DB_PATH
 
@@ -43,7 +44,7 @@ class PublishCandidate:
 
 
 class OperationChainPublisher:
-    """Backward-compatible shim that delegates to OperationChainOutboxPublisher."""
+    """Backward-compatible shim using canonical id+content publishing."""
 
     def __init__(
         self,
@@ -51,7 +52,7 @@ class OperationChainPublisher:
         repo_root: str = "/agent",
         mailbox_config: Any = None,
     ) -> None:
-        self._inner = OperationChainOutboxPublisher(
+        self._inner = OperationChainMessagePublisher(
             mailbox_config=mailbox_config,
             db_path=db_path,
             repo_root=repo_root,
