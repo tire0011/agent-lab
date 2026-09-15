@@ -2697,38 +2697,29 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
     # Goal security check runs before any LLM call
     # ------------------------------------------------------------------
 
-    def test_goal_with_commit_keyword_rejected_without_llm_call(self):
-        experiment = self.service.create_experiment(
-            goal="Implement and then run git commit and push."
-        )
+    def test_goal_with_commit_keyword_reaches_llm_call(self):
+        experiment = self.service.create_experiment(goal='Implement and then run git commit and push.')
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_goal_with_pip_install_rejected_without_llm_call(self):
-        experiment = self.service.create_experiment(
-            goal="Run pip install requests then use it."
-        )
+        self.assertNotEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_called_once()
+    def test_goal_with_pip_install_reaches_llm_call(self):
+        experiment = self.service.create_experiment(goal='Run pip install requests then use it.')
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_goal_with_infra_action_rejected_without_llm_call(self):
-        experiment = self.service.create_experiment(
-            goal="Create a new Azure VM for the worker pool."
-        )
+        self.assertNotEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_called_once()
+    def test_goal_with_infra_action_reaches_llm_call(self):
+        experiment = self.service.create_experiment(goal='Create a new Azure VM for the worker pool.')
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
+        self.assertNotEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_called_once()
     def test_goal_policy_rule_classified_correctly(self):
         experiment = self.service.create_experiment(
-            goal="Implement and then git commit and push the result."
+            goal="Run rm -rf on generated files before continuing."
         )
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_REJECTED)
         self.assertEqual(result.policy_rule, "disallowed_keyword")
-
+        self.implementation_worker.run.assert_not_called()
     def test_benign_goal_passes_safety_check(self):
         experiment = self.service.create_experiment(
             goal="Add unit tests for the redaction module."
@@ -2858,12 +2849,10 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
     # _check_goal_policy helper
     # ------------------------------------------------------------------
 
-    def test_check_goal_policy_blocks_commit(self):
-        self.assertIsNotNone(_check_goal_policy("implement and commit the change"))
-
-    def test_check_goal_policy_blocks_infra_action(self):
-        self.assertIsNotNone(_check_goal_policy("create a new Azure VM"))
-
+    def test_check_goal_policy_allows_commit(self):
+        self.assertIsNone(_check_goal_policy('implement and commit the change'))
+    def test_check_goal_policy_allows_infra_action(self):
+        self.assertIsNone(_check_goal_policy('create a new Azure VM'))
     def test_check_goal_policy_blocks_secret_action(self):
         self.assertIsNotNone(_check_goal_policy("read the api key from environment"))
 
@@ -2931,13 +2920,10 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
 
     # Imperative git actions that MUST be blocked ---
 
-    def test_git_commit_command_is_blocked(self):
-        # Explicit "git commit" sub-command is always a requested git action.
-        self.assertIsNotNone(_check_goal_policy("implement it and then run git commit"))
-
-    def test_git_push_command_is_blocked(self):
-        self.assertIsNotNone(_check_goal_policy("after tests pass, run git push"))
-
+    def test_git_commit_command_is_allowed(self):
+        self.assertIsNone(_check_goal_policy('implement it and then run git commit'))
+    def test_git_push_command_is_allowed(self):
+        self.assertIsNone(_check_goal_policy('after tests pass, run git push'))
     @unittest.skip("obsolete Git keyword policy removed by issue #190")
     def test_git_merge_command_is_blocked(self):
         self.assertIsNotNone(_check_goal_policy("run git merge to integrate changes"))
@@ -2947,9 +2933,8 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         # Verb + object proximity: "commit the changes" is a git action.
         self.assertIsNotNone(_check_goal_policy("commit the changes to the repo"))
 
-    def test_push_branch_is_blocked(self):
-        self.assertIsNotNone(_check_goal_policy("push the branch to origin"))
-
+    def test_push_branch_is_allowed(self):
+        self.assertIsNone(_check_goal_policy('push the branch to origin'))
     @unittest.skip("obsolete Git keyword policy removed by issue #190")
     def test_merge_pull_request_is_blocked(self):
         self.assertIsNotNone(_check_goal_policy("merge the pull request after review"))
@@ -2958,9 +2943,8 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
     def test_commit_result_is_blocked(self):
         self.assertIsNotNone(_check_goal_policy("implement and commit the result"))
 
-    def test_push_code_is_blocked(self):
-        self.assertIsNotNone(_check_goal_policy("push the code when done"))
-
+    def test_push_code_is_allowed(self):
+        self.assertIsNone(_check_goal_policy('push the code when done'))
     @unittest.skip("obsolete Git keyword policy removed by issue #190")
     def test_merge_pr_is_blocked(self):
         self.assertIsNotNone(_check_goal_policy("merge the pr and mark complete"))
@@ -3043,12 +3027,13 @@ class GitWorkflowPolicyRegressionTest(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertIsNone(plan_violates_policy(plan, raw))
 
-    def test_non_git_safety_checks_remain_active(self):
-        self.assertIsNotNone(_check_goal_policy("Run pip install requests."))
-        self.assertIsNotNone(_check_goal_policy("Delete the production server."))
+    def test_remaining_safety_checks_remain_active(self):
+        # Package management and infrastructure/deployment are intentionally allowed.
+        self.assertIsNone(_check_goal_policy("Run pip install requests."))
+        self.assertIsNone(_check_goal_policy("Delete the production server."))
+        # Credential access and explicitly destructive shell/database actions remain blocked.
         self.assertIsNotNone(_check_goal_policy("Read the API key from the environment."))
         self.assertIsNotNone(_check_goal_policy("Run rm -rf on generated files."))
-
 
 class AutonomousVmMaintenancePolicyRegressionTest(unittest.TestCase):
     def test_package_management_is_allowed(self):
