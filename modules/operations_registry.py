@@ -183,7 +183,20 @@ class OperationsRegistry:
         limit20 = OperationArgSpec("limit", "integer", "Maximale Anzahl Prozesse.", default=20, minimum=1, maximum=200)
         experiment_id = OperationArgSpec("experiment_id", "string", "Experiment-ID oder eindeutiges Präfix.", required=True)
         adoption_id = OperationArgSpec("adoption_id", "string", "Adoption-ID.", required=True)
-        service = OperationArgSpec("service", "string", "systemd-Unit-Name (Standard: agent-api).", default=_DEFAULT_SERVICE_NAME)
+        service = OperationArgSpec("service", "string", "systemd-Unit-Name oder Kurzname (api, mailbox, llm; Standard: agent-api).", default=_DEFAULT_SERVICE_NAME)
+        since_minutes = OperationArgSpec("since_minutes", "integer", "Nur Einträge aus den letzten N Minuten.", minimum=1, maximum=60 * 24 * 7)
+        reference = OperationArgSpec(
+            "reference",
+            "string",
+            "Mailbox-Task-ID, Experiment-ID, Session-ID, Issue-/PR-Nummer (188, #188, PR #195), "
+            "Inbox-Dateiname oder eindeutiges ID-Präfix.",
+            required=True,
+        )
+        diagnostic_tags = [
+            "diagnose", "diagnostics", "logs", "log", "status", "lifecycle", "state",
+            "task", "experiment", "session", "issue", "pull request", "branch",
+            "stalled", "stuck", "interrupted", "heartbeat", "progress", "why",
+        ]
         return {
             "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts.", tags=["disk", "storage", "filesystem", "usage"], mutates_state=False),
             "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50], ["experiment", "logs", "jsonl", "history"], mutates_state=False),
@@ -197,7 +210,33 @@ class OperationsRegistry:
             "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers.", tags=["mailbox", "status", "timer", "service"], mutates_state=False),
             "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers.", tags=["local model", "llama", "llm", "server", "models"], mutates_state=False),
             "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20], ["process", "memory", "rss", "host"], mutates_state=False),
-            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50], ["service", "logs", "journalctl", "systemd"], mutates_state=False),
+            "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50, since_minutes], ["service", "logs", "journalctl", "systemd"], mutates_state=False),
+            "nexus_logs": OperationSpec(
+                "nexus_logs",
+                "Lifecycle-Status und begrenzte, korrelierte Logs zu einem Task, "
+                "Experiment, einer Session oder Issue-/PR-Nummer - in einem Aufruf, "
+                "ohne Log-Pfade oder journalctl-Kommandos (#188).",
+                [reference, limit50],
+                diagnostic_tags,
+                mutates_state=False,
+            ),
+            "nexus_status": OperationSpec(
+                "nexus_status",
+                "Nur der Lifecycle-Status (queued/running/failed/merged ...) inklusive "
+                "Branch, Commit, PR, Worker, letztem Fortschritt und letztem Fehler (#188).",
+                [reference],
+                diagnostic_tags,
+                mutates_state=False,
+            ),
+            "nexus_last_failure": OperationSpec(
+                "nexus_last_failure",
+                "Die zuletzt fehlgeschlagene oder stehengebliebene Arbeit samt Fehlerkontext. "
+                "Stehengeblieben zählt mit: ein mitten im Lauf gestorbener Prozess "
+                "schreibt nie einen failed-Status (#188).",
+                [limit50],
+                [*diagnostic_tags, "failure", "last failure", "error", "crash"],
+                mutates_state=False,
+            ),
             "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service], ["service", "status", "systemd", "health"], mutates_state=False),
             "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id], ["adoption", "status", "summary", "inspect"], mutates_state=False),
             "github_status": OperationSpec(
@@ -241,6 +280,24 @@ class OperationsRegistry:
             raise OperationValidationError("limit muss eine ganze Zahl sein.")
         if value < 1 or value > maximum:
             raise OperationValidationError(f"limit muss zwischen 1 und {maximum} liegen.")
+        return value
+
+    def _resolve_service(self, args: dict[str, Any]) -> str:
+        from modules.nexus_diagnostics import DiagnosticsError, resolve_service
+
+        try:
+            return resolve_service(self._service(args))
+        except DiagnosticsError as exc:
+            raise OperationValidationError(str(exc)) from exc
+
+    def _since_minutes(self, args: dict[str, Any]) -> int | None:
+        value = args.get("since_minutes")
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise OperationValidationError("since_minutes muss eine ganze Zahl sein.")
+        if value < 1 or value > 60 * 24 * 7:
+            raise OperationValidationError("since_minutes muss zwischen 1 und 10080 liegen.")
         return value
 
     def _service(self, args: dict[str, Any]) -> str:
@@ -399,7 +456,7 @@ class OperationsRegistry:
         return result
 
     def _op_service_status(self, args: dict[str, Any]) -> OperationResult:
-        service = self._service(args)
+        service = self._resolve_service(args)
         result = self._run_command(["systemctl", "status", service, "--no-pager", "-n", "0"], timeout=15)
         result.operation = "service_status"
         return result
@@ -456,11 +513,85 @@ class OperationsRegistry:
         )
 
     def _op_service_logs(self, args: dict[str, Any]) -> OperationResult:
-        service = self._service(args)
+        # Friendly names ("mailbox", "api", "llm") resolve to units through the
+        # same table the diagnostic backend uses, so a caller never has to know
+        # unit names here either (#188). An unrecognized name is still accepted
+        # but validated, so nothing shell-shaped reaches journalctl.
+        service = self._resolve_service(args)
         limit = self._limit(args, default=50, maximum=500)
-        result = self._run_command(["journalctl", "-u", service, "-n", str(limit), "--no-pager"], timeout=20)
+        command = ["journalctl", "-u", service, "-n", str(limit), "--no-pager"]
+        since_minutes = self._since_minutes(args)
+        if since_minutes is not None:
+            command.append(f"--since=-{since_minutes}m")
+        result = self._run_command(command, timeout=20)
         result.operation = "service_logs"
         return result
+
+    # ------------------------------------------------------------------
+    # Nexus diagnostics (#188): the same backend the API and the
+    # failure-analysis routine use, rendered as operation output lines so
+    # ChatGPT and the mailbox reach it through the existing catalog rather
+    # than by inventing shell commands.
+    # ------------------------------------------------------------------
+
+    def _diagnostics(self):
+        from modules.nexus_diagnostics import NexusDiagnostics
+
+        return NexusDiagnostics(
+            db_path=self.db_path,
+            log_dir=getattr(self.experiment_service, "experiment_log_dir", None),
+        )
+
+    def _reference(self, args: dict[str, Any]) -> str:
+        value = args.get("reference")
+        if not isinstance(value, str) or not value.strip():
+            raise OperationValidationError("reference ist erforderlich.")
+        return value.strip()
+
+    def _run_diagnostic(self, operation: str, build: Callable[[Any], Any]) -> OperationResult:
+        from modules.nexus_diagnostics import DiagnosticsError, render_report
+
+        started = time.perf_counter()
+        diagnostics = self._diagnostics()
+        try:
+            report = build(diagnostics)
+        except DiagnosticsError as exc:
+            # A reference that resolves to nothing is an answer, not a crash:
+            # "I looked and found nothing" is what an operator needs to hear,
+            # and a raised exception here would be recorded as an operation
+            # fault rather than as the diagnostic finding it is.
+            return OperationResult(
+                operation=operation,
+                success=False,
+                output_lines=[],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_summary=sanitized_reason(str(exc)),
+            )
+        finally:
+            diagnostics.close()
+        return OperationResult(
+            operation=operation,
+            success=True,
+            output_lines=render_report(report),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    def _op_nexus_logs(self, args: dict[str, Any]) -> OperationResult:
+        reference = self._reference(args)
+        limit = self._limit(args, default=50, maximum=500)
+        return self._run_diagnostic(
+            "nexus_logs", lambda d: d.diagnose(reference, lines=limit)
+        )
+
+    def _op_nexus_status(self, args: dict[str, Any]) -> OperationResult:
+        reference = self._reference(args)
+        return self._run_diagnostic("nexus_status", lambda d: d.status_report(reference))
+
+    def _op_nexus_last_failure(self, args: dict[str, Any]) -> OperationResult:
+        limit = self._limit(args, default=50, maximum=500)
+        return self._run_diagnostic(
+            "nexus_last_failure", lambda d: d.last_failure(lines=limit)
+        )
 
     def _op_inbox_refresh(self, args: dict[str, Any]) -> OperationResult:
         del args

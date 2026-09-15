@@ -84,6 +84,16 @@ SYSTEM_LOG_KEY = "system"
 # unexpected straight through to a filesystem path.
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
+
+def is_safe_log_id(value: object) -> bool:
+    """Is *value* usable as the id half of a log file name?
+
+    Exposed so callers that build log paths of their own (the diagnostic
+    backend, #188) validate against the very same allowlist this module uses,
+    rather than re-deriving a near-identical pattern that could drift from it.
+    """
+    return isinstance(value, str) and bool(_SAFE_ID_RE.fullmatch(value))
+
 # Per-entry bounds. Generous enough to stay diagnostically useful, small
 # enough that one bad loop cannot blow up the log file on its own (the
 # per-file ``max_bytes`` ceiling below is the actual hard backstop).

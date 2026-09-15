@@ -7,7 +7,7 @@ in api.py stay thin and data adapters in data_sources.py stay storage-only.
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class HealthResponse(BaseModel):
@@ -793,6 +793,94 @@ class NexusLivenessResponse(BaseModel):
     resting_statuses: list[str] = Field(default_factory=list)
     counts_by_status: dict[str, int] = Field(default_factory=dict)
     claims: list[NexusSessionClaim] = Field(default_factory=list)
+
+
+class DiagnosticProgress(BaseModel):
+    """Is this work still running, was it interrupted, or did it finish? (#188)
+
+    ``source`` names the signal ``last_progress_at`` came from - a controller
+    heartbeat, a structured log entry, or the row's own ``updated_at`` - so a
+    caller can tell an explicit "I am alive" from a merely witnessed side
+    effect. See ``modules.nexus_diagnostics``.
+    """
+
+    state: str
+    reason: str
+    last_progress_at: str | None = None
+    source: str | None = None
+    age_seconds: float | None = None
+    stale_after_seconds: int = 0
+    heartbeat_interval_seconds: int = 0
+
+
+class DiagnosticLifecycle(BaseModel):
+    """One unit of work's lifecycle state, joined across every subsystem.
+
+    Deliberately flat and stably named: a caller answering "where did this
+    stop?" should never need to know which of the mailbox, experiment,
+    adoption, GitHub-link or controller-session tables an answer came out of.
+    """
+
+    subject_type: str
+    subject_id: str
+    lifecycle: str
+    status: str | None = None
+    title: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    ended_at: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+    issue_number: int | None = None
+    pr_number: int | None = None
+    worker_id: str | None = None
+    service: str | None = None
+    last_error: str | None = None
+    progress: DiagnosticProgress | None = None
+    correlation_ids: dict[str, str] = Field(default_factory=dict)
+    related: dict[str, Any] = Field(default_factory=dict)
+
+
+class DiagnosticLogEntry(BaseModel):
+    """A log line compacted to what a diagnosis reads, redacted and bounded."""
+
+    model_config = ConfigDict(extra="allow")
+
+    timestamp: str = ""
+    level: str = ""
+    phase: str = ""
+    event: str = ""
+    message: str = ""
+    source: str = ""
+
+
+class DiagnosticReportResponse(BaseModel):
+    """``nexus logs <reference>``: lifecycle plus the logs that explain it."""
+
+    generated_at: str
+    reference: str
+    lifecycle: DiagnosticLifecycle
+    log_entries: list[DiagnosticLogEntry] = Field(default_factory=list)
+    log_sources: list[str] = Field(default_factory=list)
+    truncated: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+class DiagnosticServiceLogsResponse(BaseModel):
+    """``nexus logs service <name>``: a bounded journal slice.
+
+    ``error`` is populated rather than raised when the journal cannot be read
+    (no systemd, unknown unit, a timeout): an unreadable journal is itself a
+    finding, and which unit was consulted over what window still stands.
+    """
+
+    generated_at: str
+    service: str
+    requested: str
+    lines: int
+    since: str | None = None
+    entries: list[DiagnosticLogEntry] = Field(default_factory=list)
+    error: str | None = None
 
 
 class FailureAnalysesResponse(BaseModel):

@@ -53,6 +53,8 @@ from models import (
     CodexTaskListResponse,
     CodexTaskResponse,
     CodexTaskSummary,
+    DiagnosticReportResponse,
+    DiagnosticServiceLogsResponse,
     ExperimentAdoptionStatus,
     ExperimentDetail,
     ExperimentLogEntry,
@@ -108,6 +110,7 @@ from modules.outbox_publisher import OperationChainOutboxPublisher, TaskApproval
 from modules.redaction import sanitized_reason as _sanitized_reason
 from modules import central_logging as central_logging_module
 from modules import log_trace as log_trace_module
+from modules import nexus_diagnostics as nexus_diagnostics_module
 from modules.logging_config import configure_logging
 from modules.maintenance_service import (
     MaintenanceAuthError,
@@ -1790,6 +1793,139 @@ def get_nexus_liveness(
     return NexusLivenessResponse(
         **{**snapshot, "claims": [NexusSessionClaim(**c) for c in snapshot["claims"]]}
     )
+
+
+# ---------------------------------------------------------------------------
+# Nexus diagnostics (#188) — first-class, read-only answers to "what happened
+# to this work?", so diagnosing a failure never again means composing ad-hoc
+# shell commands through the mailbox. Every route here resolves a reference
+# through the one shared backend (modules/nexus_diagnostics.py), which the
+# operations catalog and the failure-analysis routine also use.
+# ---------------------------------------------------------------------------
+
+DIAGNOSTIC_LOG_DEFAULT_LINES = nexus_diagnostics_module.DEFAULT_LOG_LINES
+DIAGNOSTIC_LOG_MAX_LINES = nexus_diagnostics_module.MAX_LOG_LINES
+
+
+def get_nexus_diagnostics() -> Iterator[nexus_diagnostics_module.NexusDiagnostics]:
+    """Read-only diagnostic backend, opened and closed per request.
+
+    Per-request like ``get_nexus_task_store``, and for the same reason: this
+    serves occasional diagnostic reads, and a process-lifetime handle for them
+    would buy nothing. Overridable in tests via
+    ``app.dependency_overrides[get_nexus_diagnostics]``.
+    """
+    diagnostics = nexus_diagnostics_module.NexusDiagnostics(
+        log_dir=_resolve_experiment_service().experiment_log_dir,
+        stale_after_seconds=_STALE_HEARTBEAT_SECONDS,
+    )
+    try:
+        yield diagnostics
+    finally:
+        diagnostics.close()
+
+
+def _diagnostic_report_response(
+    report: nexus_diagnostics_module.DiagnosticReport,
+) -> DiagnosticReportResponse:
+    return DiagnosticReportResponse(**report.to_dict())
+
+
+@app.get("/diagnostics/logs/service/{service}", response_model=DiagnosticServiceLogsResponse)
+async def get_diagnostic_service_logs(
+    service: str,
+    x_api_key: str | None = Header(default=None),
+    lines: int = Query(
+        default=nexus_diagnostics_module.DEFAULT_SERVICE_LINES,
+        ge=LIMIT_MIN,
+        le=DIAGNOSTIC_LOG_MAX_LINES,
+    ),
+    since_minutes: int | None = Query(default=None, ge=1, le=60 * 24 * 7),
+    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
+    log_reader: LogReader = Depends(get_log_reader),
+) -> DiagnosticServiceLogsResponse:
+    """Recent logs for one Nexus service, without constructing ``journalctl``.
+
+    *service* may be a friendly name (``api``, ``mailbox``, ``llm``) or a unit
+    name; anything unrecognized is validated as a unit name before it is used,
+    so no caller can smuggle a shell fragment through this route.
+    """
+    authorize(x_api_key)
+    diagnostics.log_reader = log_reader
+    try:
+        result = await diagnostics.service_logs(
+            service, lines=lines, since_minutes=since_minutes
+        )
+    except nexus_diagnostics_module.DiagnosticsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DiagnosticServiceLogsResponse(**result.to_dict())
+
+
+@app.get("/diagnostics/logs/last-failure", response_model=DiagnosticReportResponse)
+def get_diagnostic_last_failure(
+    x_api_key: str | None = Header(default=None),
+    lines: int = Query(
+        default=DIAGNOSTIC_LOG_DEFAULT_LINES, ge=LIMIT_MIN, le=DIAGNOSTIC_LOG_MAX_LINES
+    ),
+    scan: int = Query(
+        default=nexus_diagnostics_module.DEFAULT_LAST_FAILURE_CANDIDATES,
+        ge=LIMIT_MIN,
+        le=nexus_diagnostics_module.MAX_LAST_FAILURE_CANDIDATES,
+    ),
+    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
+) -> DiagnosticReportResponse:
+    """The most recent failed *or stalled* work, with its error context.
+
+    Stalled counts: a process that died mid-run never wrote a ``failed`` row,
+    so a search for explicit failures alone would miss exactly the case this
+    endpoint exists for (#186/#187).
+    """
+    authorize(x_api_key)
+    try:
+        return _diagnostic_report_response(diagnostics.last_failure(lines=lines, scan=scan))
+    except nexus_diagnostics_module.DiagnosticsError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/diagnostics/status/{reference:path}", response_model=DiagnosticReportResponse)
+def get_diagnostic_status(
+    reference: str,
+    x_api_key: str | None = Header(default=None),
+    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
+) -> DiagnosticReportResponse:
+    """Lifecycle state for one piece of work, with no log bodies.
+
+    *reference* may be a mailbox task id, an experiment id, a controller
+    session id, an issue or PR number (``188``, ``#188``, ``PR #195``), an
+    inbox message filename, or a unique prefix of any id.
+    """
+    authorize(x_api_key)
+    try:
+        return _diagnostic_report_response(diagnostics.status_report(reference))
+    except nexus_diagnostics_module.DiagnosticsError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/diagnostics/logs/{reference:path}", response_model=DiagnosticReportResponse)
+def get_diagnostic_logs(
+    reference: str,
+    x_api_key: str | None = Header(default=None),
+    lines: int = Query(
+        default=DIAGNOSTIC_LOG_DEFAULT_LINES, ge=LIMIT_MIN, le=DIAGNOSTIC_LOG_MAX_LINES
+    ),
+    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
+) -> DiagnosticReportResponse:
+    """Lifecycle state *and* the bounded logs that explain it, for one reference.
+
+    Registered after the fixed ``/diagnostics/logs/service/...`` and
+    ``/diagnostics/logs/last-failure`` routes on purpose: a ``:path``
+    parameter would otherwise swallow both.
+    """
+    authorize(x_api_key)
+    try:
+        return _diagnostic_report_response(diagnostics.diagnose(reference, lines=lines))
+    except nexus_diagnostics_module.DiagnosticsError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/diagnostics/failure-analyses", response_model=FailureAnalysesResponse)

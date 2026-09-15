@@ -295,6 +295,44 @@ than a 404. The Logs tab exposes both: a free-text search box over the full
 history, and an "Auftrag verfolgen" field (plus a per-entry button) that renders
 the same trace with its summary.
 
+## Nexus diagnostic commands
+
+`/logs` and `/logs/trace` return log *entries*. The diagnostic commands answer
+the operator's actual question — *where did this stop, and is it still alive?* —
+by joining the lifecycle state onto those logs, so diagnosing a failure never
+means searching the filesystem or inventing shell commands (#188). They need
+`x-api-key`, and every one of them is read-only:
+
+```bash
+curl -sH "x-api-key: $KEY" "$BASE/diagnostics/status/<reference>"
+curl -sH "x-api-key: $KEY" "$BASE/diagnostics/logs/<reference>?lines=50"
+curl -sH "x-api-key: $KEY" "$BASE/diagnostics/logs/service/mailbox?lines=100"
+curl -sH "x-api-key: $KEY" "$BASE/diagnostics/logs/last-failure"
+```
+
+`<reference>` is whatever you have: a mailbox task id, an experiment id, a
+controller session id, a unique prefix of any of those, an issue or PR number
+(`188`, `%23188`, `PR%20%23195`), or an inbox message filename. `<service>`
+takes friendly names (`api`, `mailbox`, `llm`) as well as unit names — no
+`journalctl` to construct.
+
+The answer carries `lifecycle` (`queued`/`running`/`waiting`/`needs_review`/
+`succeeded`/`failed`/`rejected`/`merged`/`abandoned`) with branch, commit,
+issue, PR, worker, last error and the correlation ids, plus bounded log
+entries. And it carries `progress`: **running**, **interrupted**, **completed**
+or **not_started**. That last field is the one #188 exists for. A worker that
+dies mid-run never writes a `failed` status — its log just stops, which reads
+exactly like work still in flight — so liveness is derived from the newest
+progress signal: a controller heartbeat (#162) where there is one, otherwise
+the newest log entry, otherwise the row's `updated_at`. `progress.source` says
+which answered; `progress.reason` explains the verdict in one line. For the
+same reason `last-failure` treats a stalled subject as a failure.
+
+The identical commands are in the operations catalog as `nexus_status`,
+`nexus_logs` and `nexus_last_failure`, so ChatGPT and the chat interface reach
+them without HTTP — and the failure-analysis routine reads the same backend,
+so its diagnosis and your `nexus logs` see the same facts.
+
 ## Nexus activity API
 
 `GET /activity/public` returns the latest 100 sanitized lifecycle events without

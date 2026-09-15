@@ -308,6 +308,112 @@ If agent/API behavior regresses:
    the session.
 6. Log findings in `IDEAS.md`/`DECISIONS.md` before broad changes.
 
+Steps 1-2 above are the manual version of the diagnostic commands below; reach
+for those first.
+
+## Nexus diagnostic commands (#188)
+
+Diagnosing a Nexus failure should never require composing shell commands,
+knowing log file paths, or guessing systemd unit names. These endpoints answer
+the usual questions directly. All of them are **read-only** - they report
+staleness but never reap, retry or change state - and all require `x-api-key`.
+
+| Question | Command |
+| --- | --- |
+| Where is this piece of work now? | `GET /diagnostics/status/<reference>` |
+| ...and what do its logs say? | `GET /diagnostics/logs/<reference>?lines=50` |
+| What has this service been doing? | `GET /diagnostics/logs/service/<service>?lines=100&since_minutes=60` |
+| What broke or stalled most recently? | `GET /diagnostics/logs/last-failure` |
+
+### References
+
+`<reference>` is whatever you have to hand. All of these resolve:
+
+- a mailbox task id, an experiment id or a controller session id;
+- a unique **prefix** of any of those (`nexus status 3ef5b93`);
+- an **issue or PR number**: `188`, `%23188` (`#188` URL-encoded), `PR%20%23195`;
+- an **inbox message filename**: `2026-09-15-implement-188.md`.
+
+`<service>` accepts friendly names - `api`, `mailbox`, `llm` - as well as unit
+names. An unrecognized name is validated as a unit name before it is used, so
+nothing shell-shaped reaches `journalctl`.
+
+### What comes back
+
+One JSON envelope, the same for every route: `lifecycle` (the state), plus
+`log_entries`, `log_sources`, `truncated` and `notes`. The lifecycle object is
+flat and stably named, joined across the mailbox, experiment, adoption, GitHub
+link and controller-session tables:
+
+```
+lifecycle         queued | running | waiting | needs_review | succeeded
+                  | failed | rejected | merged | abandoned
+status            the owning subsystem's own status value
+branch, commit, issue_number, pr_number
+worker_id, service
+last_error
+correlation_ids   mailbox_task_id / experiment_id / session_id
+progress          running | interrupted | completed | not_started | unknown
+```
+
+`progress` is the part worth reading twice. A worker that died mid-run never
+wrote a `failed` status - its log simply stops, which looks exactly like work
+still in flight. So liveness is derived from the newest **progress signal**: a
+controller heartbeat (#162) when one exists, otherwise the newest log entry,
+otherwise the row's `updated_at`. `progress.source` says which of the three
+answered, and `progress.reason` is a one-line explanation you can quote. The
+staleness threshold is the clamped one from `NEXUS_STALE_HEARTBEAT_SECONDS`;
+no query can lower it far enough to call live work dead.
+
+`last-failure` counts a stalled subject as a failure for the same reason.
+
+Output is bounded by default (50 log entries; `lines=` up to 500).
+
+### Worked example: a branch appeared but nothing followed
+
+This is the #186/#187 shape - Nexus created the branch, then produced no
+implementation commit and no PR:
+
+```bash
+curl -sH "x-api-key: $AGENT_API_KEY" \
+  "https://<host>/diagnostics/logs/%23186" \
+  | jq '{lifecycle: .lifecycle.lifecycle,
+         progress: .lifecycle.progress.state,
+         branch: .lifecycle.branch,
+         pr: .lifecycle.pr_number,
+         worker: .lifecycle.worker_id,
+         last_event: .log_entries[-1].event}'
+```
+
+```json
+{
+  "lifecycle": "running",            // the row still claims to be working
+  "progress": "interrupted",         // ...but nothing has reported progress since
+  "branch": "nexus/issue-186",       // the branch exists
+  "pr": null,                        // and nothing came after it
+  "worker": "vm:1234:ab12",          // who owned it when it went quiet
+  "last_event": "branch_created"     // where execution stopped
+}
+```
+
+`lifecycle.progress.reason` spells the verdict out in one line, and
+`notes` repeats it at the top level when the subject is interrupted.
+
+### From the mailbox or chat
+
+The same backend is in the operations catalog, so ChatGPT and the chat
+interface reach it without HTTP:
+
+- `nexus_status` - `reference`
+- `nexus_logs` - `reference`, `limit`
+- `nexus_last_failure` - `limit`
+- `service_logs` - `service`, `limit`, `since_minutes`
+
+All four are catalogued `mutates_state=False`, which is what makes them
+available to the read-only diagnostic role. The failure-analysis routine reads
+the same backend, so a diagnosis and an operator looking at the same task see
+the same facts.
+
 ## Maintenance API (temporary remote-maintenance bridge)
 
 The maintenance API provides a fixed set of named operations for remote VM
