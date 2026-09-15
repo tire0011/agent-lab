@@ -23,9 +23,6 @@ from .models import ExperimentPlan
 # word-boundary and negation-aware _GIT_ACTION_REGEXES instead — see the
 # _GIT_ACTION_KEYWORDS frozenset below.
 _REJECT_KEYWORDS: tuple[str, ...] = (
-    "commit", "push", "merge",
-    "pip install", "npm install", "apt install", "apt-get install",
-    "package install", "install package",
     "drop table", "delete from", "truncate table", "rm -rf",
     "shell=true",
     # Paid/costly actions: only the action words themselves (never bare
@@ -347,15 +344,6 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
         if keyword in haystack:
             return f"plan mentions disallowed keyword: {keyword!r}"
 
-    for regex in _INFRA_ACTION_REGEXES:
-        for match in regex.finditer(haystack):
-            preceding = haystack[max(0, match.start() - 200):match.start()]
-            if _infra_action_match_is_false_positive(match.group(0), preceding):
-                continue
-            return (
-                "plan describes an actual infrastructure/deployment action "
-                f"with external effect: {match.group(0)!r}"
-            )
 
     for regex in _SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
@@ -426,29 +414,11 @@ def _check_goal_policy(goal: str) -> str | None:
     "handle commit message parsing".
     """
     haystack = (goal or "").lower()
-    # Plain substring check — skip git-action keywords; they are checked
-    # with word-boundary and context awareness below.
+    # Git commit/push/merge are normal experiment-branch workflow actions.
+    # Main/merge/deployment governance is enforced by the lifecycle layer.
     for keyword in _REJECT_KEYWORDS:
-        if keyword in _GIT_ACTION_KEYWORDS:
-            continue
         if keyword in haystack:
             return f"goal mentions disallowed keyword: {keyword!r}"
-    # Word-boundary + negation-aware git-action check.
-    for regex in _GIT_ACTION_REGEXES:
-        for match in regex.finditer(haystack):
-            preceding = haystack[max(0, match.start() - 200):match.start()]
-            if _infra_action_match_is_false_positive(match.group(0), preceding):
-                continue
-            return f"goal requests a disallowed git action: {match.group(0)!r}"
-    for regex in _INFRA_ACTION_REGEXES:
-        for match in regex.finditer(haystack):
-            preceding = haystack[max(0, match.start() - 200):match.start()]
-            if _infra_action_match_is_false_positive(match.group(0), preceding):
-                continue
-            return (
-                "goal describes an actual infrastructure/deployment action "
-                f"with external effect: {match.group(0)!r}"
-            )
     for regex in _SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
@@ -477,9 +447,6 @@ _POLICY_RULE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("agent found no suitable alternative improvement", "no_suitable_improvement"),
     ("plan mentions disallowed keyword", "disallowed_keyword"),
     ("goal mentions disallowed keyword", "disallowed_keyword"),
-    ("goal requests a disallowed git action", "disallowed_keyword"),
-    ("plan describes an actual infrastructure/deployment action", "infra_action"),
-    ("goal describes an actual infrastructure/deployment action", "infra_action"),
     ("plan describes an actual secret/credential action", "secret_action"),
     ("goal describes an actual secret/credential action", "secret_action"),
     ("plan title looks like a placeholder/intention-only statement", "placeholder_title"),
@@ -515,4 +482,3 @@ def _policy_rule_for_reason(reason: str | None) -> str | None:
         if lowered.startswith(prefix):
             return rule
     return "policy_check_failed"
-
