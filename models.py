@@ -95,6 +95,7 @@ class CodexTaskResponse(BaseModel):
     prompt: str
     working_dir: str
     sandbox: str
+    provider: str = "codex"
     timeout_seconds: int
     created_at: datetime
     started_at: datetime | None = None
@@ -118,6 +119,7 @@ class CodexTaskSummary(BaseModel):
     status: str
     working_dir: str
     sandbox: str
+    provider: str = "codex"
     timeout_seconds: int
     created_at: datetime
     started_at: datetime | None = None
@@ -268,6 +270,7 @@ class ExperimentSummary(BaseModel):
     created_at: str
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
+    implementation_provider: str | None = None
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
@@ -285,6 +288,7 @@ class ExperimentDetail(BaseModel):
     created_at: str
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
+    implementation_provider: str | None = None
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None

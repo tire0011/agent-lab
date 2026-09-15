@@ -72,7 +72,9 @@
     the file or clobber each other's entries.
   - `POST /codex/tasks`, `GET /codex/tasks`, `GET /codex/tasks/{id}`,
     `POST /codex/tasks/{id}/run` (all require `x-api-key`) — thin routes over
-    the existing `modules.codex_task_service.CodexTaskService`; no worker
+    the existing `modules.codex_task_service.CodexTaskService`. The path is
+    historical: a task created here runs on whichever coding agent was drawn
+    for it (section 13), and the response says which one in `provider`; no worker
     logic duplicated in `api.py`. `working_dir` (`/agent`) and `sandbox`
     (`read-only`) are fixed server-side; `timeout_seconds` is capped at
     120s. Synchronous only — no queue, no parallel execution, no chat/Web UI
@@ -269,8 +271,8 @@
 - Every feature that needs the local model submits a job and awaits it.
   Nobody calls llama-server directly: `LlamaCppClient` is the transport the
   job worker uses, not an interface features wire up themselves. External
-  delegates (`codex_readonly`, `azure_openai`) are a different resource and
-  keep their own paths.
+  delegates (`codex_readonly`, `claude_readonly`, `azure_openai`) are a
+  different resource and keep their own paths.
 - One service per database per process
   (`acquire_local_llm_job_service`/`release_local_llm_job_service`), so
   features in one process share a worker. Callers that inject their own
@@ -346,6 +348,45 @@
   a prompt, a log, the persisted analysis or the outbox. No available
   capability for what was asked is a valid outcome, and the diagnosis states
   the missing evidence instead of assuming either answer.
+
+### 13) Coding agents (one contract, drawn at random)
+
+- Modules: `modules/coding_worker.py` (shared contract), `modules/codex_worker.py`
+  (`CodexWorker`), `modules/claude_worker.py` (`ClaudeWorker`),
+  `modules/coding_provider.py` (the choice). Callers:
+  `modules/codex_task_service.py` (tasks and the `/codex/tasks` API),
+  `modules/experiment_service/service.py` (implementation + repair),
+  `modules/nexus_delegation.py` (named read-only consultation).
+- One contract, two CLIs. A worker takes a task, a working directory, a sandbox
+  mode and a timeout, runs its CLI as a subprocess (never `shell=True`), and
+  returns a `WorkerResult`: success, exit code, capped stdout/stderr with
+  truncation flags, runtime, session/thread id, final message, token usage,
+  error — and `provider`, the agent that produced it. Callers never branch on
+  which agent they got.
+- Sandbox modes mean the same thing for both agents: `read-only` (may inspect
+  the working directory, cannot change it), `workspace-write` (may change files
+  inside it — used for the experiment worktree), `danger-full-access` (never a
+  default). Codex gets these from its own sandbox flags; Claude gets them from
+  its tool set, since a non-interactive run has nobody to answer a permission
+  prompt: in read-only mode no write or shell tool exists at all, and anything
+  that would prompt is denied instead of waiting.
+- Neither agent is preferred. The provider is drawn uniformly at random per
+  unit of work, narrowed first by `AGENT_CODING_PROVIDER` (pin),
+  `AGENT_CODING_PROVIDERS` (allow list) and by which CLI is actually installed
+  (see D-022). Tasks draw at creation; experiments draw once per worktree, so
+  an implementation and its repair iterations stay on one agent.
+- A caller that names an agent gets that agent: the `codex_readonly` /
+  `claude_readonly` delegates and the router's `codex` provider pin their
+  choice, and an injected worker pins the whole service (tests,
+  single-provider deployments).
+- The result is recorded where it can be read back: `codex_tasks.provider`,
+  `experiments.implementation_provider`, and a `runs` audit row per call
+  (Claude's carries the CLI's reported cost as `actual_cost`). Rows from
+  before the second agent existed read back as `codex`.
+- Environment: `AGENT_CODEX_BIN`, `AGENT_CLAUDE_BIN`, `AGENT_CLAUDE_MODEL`,
+  `AGENT_CODING_PROVIDER`, `AGENT_CODING_PROVIDERS`. Neither worker ever
+  receives the full environment — only what its CLI needs, so `AGENT_API_KEY`
+  and other application secrets stay out of the subprocess.
 
 ## Near-term target architecture (planned, not complete)
 

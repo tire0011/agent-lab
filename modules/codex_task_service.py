@@ -42,7 +42,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from modules.coding_provider import (
+    KNOWN_PROVIDERS,
+    build_worker,
+    choose_provider,
+    provider_of,
+)
 from modules.codex_worker import CodexResult, CodexWorker, SANDBOX_MODES
+from modules.codex_worker import PROVIDER as PROVIDER_CODEX
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 # ---------------------------------------------------------------------------
@@ -102,6 +109,7 @@ class CodexTask:
     timeout_seconds: int
     status: str
     created_at: str
+    provider: str = PROVIDER_CODEX
     started_at: str | None = None
     ended_at: str | None = None
     thread_id: str | None = None
@@ -121,6 +129,7 @@ class CodexTask:
             "timeout_seconds": self.timeout_seconds,
             "status": self.status,
             "created_at": self.created_at,
+            "provider": self.provider,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "thread_id": self.thread_id,
@@ -137,6 +146,11 @@ def _row_to_task(row: sqlite3.Row) -> CodexTask:
     usage_json = row["usage_json"]
     usage = json.loads(usage_json) if usage_json else None
     timed_out = row["timed_out"]
+    # Rows written before the second coding agent existed carry no provider;
+    # they were all Codex runs.
+    provider = (
+        row["provider"] if "provider" in row.keys() and row["provider"] else PROVIDER_CODEX
+    )
     return CodexTask(
         id=row["id"],
         prompt=row["prompt"],
@@ -145,6 +159,7 @@ def _row_to_task(row: sqlite3.Row) -> CodexTask:
         timeout_seconds=row["timeout_seconds"],
         status=row["status"],
         created_at=row["created_at"],
+        provider=provider,
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         thread_id=row["thread_id"],
@@ -182,11 +197,17 @@ def _map_result_to_status(result: CodexResult) -> tuple[str, str | None]:
 
 
 class CodexTaskService:
-    """Creates, persists, and runs Codex coding tasks.
+    """Creates, persists, and runs external coding-agent tasks.
 
     Reuses the existing SQLite infrastructure (``modules.run_store``) and the
-    existing ``CodexWorker`` for execution. Does not add a queue, threads, or
+    existing workers for execution. Does not add a queue, threads, or
     parallelism: ``run_task`` executes synchronously in the caller's thread.
+
+    Which agent runs a task is decided **once, at creation time**, and stored
+    with the task: either the caller names it, or it is drawn at random from
+    the installed providers (see ``modules.coding_provider``). Injecting a
+    *worker* pins every task of this service to that worker instead, which is
+    what tests and single-provider deployments do.
     """
 
     def __init__(
@@ -196,8 +217,22 @@ class CodexTaskService:
         max_prompt_bytes: int = _DEFAULT_MAX_PROMPT_BYTES,
         max_final_message_bytes: int = _DEFAULT_MAX_FINAL_MESSAGE_BYTES,
         max_error_bytes: int = _DEFAULT_MAX_ERROR_BYTES,
+        rng: Any | None = None,
     ) -> None:
-        self.worker = worker if worker is not None else CodexWorker()
+        """
+        Parameters
+        ----------
+        worker:
+            Optional fixed worker. When given, every task of this service runs
+            on it and is recorded under its provider. When ``None`` (the
+            production default), each task draws its own provider and the
+            matching worker is built when the task runs.
+        rng:
+            Optional ``random.Random`` used for the provider draw, so a test
+            or a reproducible run can fix the sequence.
+        """
+        self.worker = worker
+        self.rng = rng
         self.db_path = db_path
         self.max_prompt_bytes = max_prompt_bytes
         self.max_final_message_bytes = max_final_message_bytes
@@ -227,15 +262,23 @@ class CodexTaskService:
         working_dir: str,
         sandbox: str = "read-only",
         timeout_seconds: int = 120,
+        provider: str | None = None,
     ) -> CodexTask:
-        """Persist a new task in status ``queued``. Does not execute it."""
+        """Persist a new task in status ``queued``. Does not execute it.
+
+        *provider* names the coding agent to use; omit it to let the service
+        decide (the injected worker's provider, otherwise a random draw).
+        """
         if not prompt or not prompt.strip():
             raise ValueError("prompt must not be empty")
         if sandbox not in SANDBOX_MODES:
             raise ValueError(f"invalid sandbox {sandbox!r}; must be one of {SANDBOX_MODES}")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if provider is not None and provider not in KNOWN_PROVIDERS:
+            raise ValueError(f"invalid provider {provider!r}; must be one of {KNOWN_PROVIDERS}")
 
+        resolved_provider = provider or self._provider_for_new_task()
         task_id = uuid.uuid4().hex
         created_at = _utcnow_iso()
         stored_prompt = _truncate_text(prompt, self.max_prompt_bytes) or ""
@@ -245,10 +288,10 @@ class CodexTaskService:
                 """
                 INSERT INTO codex_tasks (
                     id, prompt, working_dir, sandbox, timeout_seconds,
-                    status, created_at, started_at, ended_at, thread_id,
+                    status, created_at, provider, started_at, ended_at, thread_id,
                     exit_code, runtime_ms, timed_out, usage_json,
                     final_message, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
                           NULL, NULL, NULL, NULL, NULL, NULL)
                 """,
                 (
@@ -259,10 +302,26 @@ class CodexTaskService:
                     timeout_seconds,
                     STATUS_QUEUED,
                     created_at,
+                    resolved_provider,
                 ),
             )
 
         return self.get_task(task_id)
+
+    def _provider_for_new_task(self) -> str:
+        """Provider for a task whose caller did not name one."""
+        if self.worker is not None:
+            # A worker may be a test double without a usable provider name;
+            # anything other than a known provider is recorded as Codex, the
+            # only provider that existed when such callers were written.
+            return provider_of(self.worker, PROVIDER_CODEX) or PROVIDER_CODEX
+        return choose_provider(self.rng)
+
+    def _worker_for(self, task: CodexTask) -> Any:
+        """The worker that runs *task*: the injected one, or the task's own."""
+        if self.worker is not None:
+            return self.worker
+        return build_worker(task.provider)
 
     # ------------------------------------------------------------------
     # get_task / list_tasks
@@ -292,7 +351,7 @@ class CodexTaskService:
     # ------------------------------------------------------------------
 
     def run_task(self, task_id: str) -> CodexTask:
-        """Execute *task_id* via the injected ``CodexWorker``.
+        """Execute *task_id* via the worker for its recorded provider.
 
         Steps:
           1. Load the stored task (``TaskNotFoundError`` if missing).
@@ -320,7 +379,7 @@ class CodexTaskService:
             )
 
         try:
-            result = self.worker.run(
+            result = self._worker_for(task).run(
                 task=task.prompt,
                 working_dir=task.working_dir,
                 sandbox=task.sandbox,
@@ -469,6 +528,10 @@ def _build_cli_parser():
         "--db", default=DEFAULT_DB_PATH,
         help=f"SQLite db path (default: {DEFAULT_DB_PATH})",
     )
+    parser.add_argument(
+        "--provider", default=None, choices=list(KNOWN_PROVIDERS),
+        help="Coding agent to use (default: drawn at random from the installed ones)",
+    )
     return parser
 
 
@@ -481,8 +544,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
 
-    worker = CodexWorker()
-    service = CodexTaskService(worker=worker, db_path=args.db)
+    service = CodexTaskService(db_path=args.db)
     service.mark_interrupted_tasks_failed()
 
     task = service.create_task(
@@ -490,8 +552,9 @@ def main(argv: list[str] | None = None) -> int:
         working_dir=args.working_dir,
         sandbox=args.sandbox,
         timeout_seconds=args.timeout,
+        provider=args.provider,
     )
-    print(f"created task {task.id} (status={task.status})")
+    print(f"created task {task.id} (status={task.status}, provider={task.provider})")
 
     result_task = service.run_task(task.id)
     print(_json.dumps(result_task.to_dict(), ensure_ascii=False, indent=2))

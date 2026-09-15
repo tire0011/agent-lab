@@ -319,6 +319,7 @@ def _print_task_summary(task: dict[str, Any]) -> None:
     """Compact summary shown right after task creation."""
     print(f"  id:              {task.get('id')}")
     print(f"  status:          {task.get('status')}")
+    print(f"  provider:        {task.get('provider')}")
     print(f"  timeout_seconds: {task.get('timeout_seconds')}")
     print(f"  sandbox:         {task.get('sandbox')}")
     print(f"  working_dir:     {task.get('working_dir')}")
@@ -332,6 +333,7 @@ def _print_task_details(task: dict[str, Any]) -> None:
     fields = [
         ("id", task.get("id")),
         ("status", task.get("status")),
+        ("provider", task.get("provider")),
         ("prompt", task.get("prompt")),
         ("working_dir", task.get("working_dir")),
         ("sandbox", task.get("sandbox")),

@@ -30,10 +30,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+
+from modules.coding_worker import (
+    SANDBOX_MODES,
+    WorkerConfigError,
+    WorkerResult,
+    filtered_env,
+    truncate_output,
+    validate_worker_config,
+)
+
+#: This worker's provider name as recorded on every :class:`WorkerResult`.
+PROVIDER = "codex"
 
 _DEFAULT_CODEX_BIN: str = os.environ.get(
     "AGENT_CODEX_BIN", "/home/agent/.local/bin/codex"
@@ -42,55 +52,15 @@ _DEFAULT_MAX_OUTPUT_BYTES: int = 64 * 1024  # 64 KB
 _DEFAULT_TIMEOUT_SECONDS: int = 120
 _DEFAULT_SANDBOX: str = "read-only"
 
-SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
+# The result type is shared with every other coding-agent worker (see
+# ``modules.coding_worker.WorkerResult``) so a Codex and a Claude run are
+# interchangeable for their callers. ``CodexResult`` stays importable under
+# its original name.
+CodexResult = WorkerResult
 
-@dataclass
-class CodexResult:
-    success: bool
-    exit_code: int | None
-    stdout: str
-    stderr: str
-    runtime_ms: int
-    timed_out: bool
-    stdout_truncated: bool
-    stderr_truncated: bool
-    # Parsed from JSONL event stream
-    thread_id: str | None
-    final_message: str | None
-    usage: dict[str, int] | None  # keys: input_tokens, output_tokens, …
-    # Internal metadata
-    task: str
-    working_dir: str
-    sandbox: str
-    error: str | None  # worker-level error (binary not found, invalid dir, …)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "success": self.success,
-            "exit_code": self.exit_code,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-            "runtime_ms": self.runtime_ms,
-            "timed_out": self.timed_out,
-            "stdout_truncated": self.stdout_truncated,
-            "stderr_truncated": self.stderr_truncated,
-            "thread_id": self.thread_id,
-            "final_message": self.final_message,
-            "usage": self.usage,
-            "task": self.task,
-            "working_dir": self.working_dir,
-            "sandbox": self.sandbox,
-            "error": self.error,
-        }
-
-
-def _truncate(text: str, max_bytes: int) -> tuple[str, bool]:
-    encoded = text.encode("utf-8", errors="replace")
-    if len(encoded) <= max_bytes:
-        return text, False
-    truncated = encoded[:max_bytes].decode("utf-8", errors="replace")
-    return truncated + "\n[... output truncated]", True
+# Historical private alias kept for callers/tests importing it from here.
+_truncate = truncate_output
 
 
 def _parse_jsonl(stdout: str) -> tuple[str | None, str | None, dict[str, int] | None]:
@@ -133,10 +103,6 @@ def _parse_jsonl(stdout: str) -> tuple[str | None, str | None, dict[str, int] | 
     return thread_id, final_message, usage
 
 
-class WorkerConfigError(ValueError):
-    """Raised for invalid worker configuration (bad path, unknown sandbox, …)."""
-
-
 class CodexWorker:
     """Runs a coding task non-interactively via ``codex exec``.
 
@@ -152,6 +118,9 @@ class CodexWorker:
         Optional path to the SQLite run store for audit entries.
         Pass ``None`` to skip audit logging.
     """
+
+    #: Provider name recorded on every result this worker produces.
+    provider = PROVIDER
 
     def __init__(
         self,
@@ -246,6 +215,7 @@ class CodexWorker:
                 working_dir=working_dir,
                 sandbox=sandbox,
                 error=str(exc),
+                provider=PROVIDER,
             )
 
         schema_path: str | None = None
@@ -323,24 +293,7 @@ class CodexWorker:
     # ------------------------------------------------------------------
 
     def _validate(self, task: str, working_dir: str, sandbox: str) -> None:
-        if not task or not task.strip():
-            raise WorkerConfigError("task must not be empty")
-
-        if sandbox not in SANDBOX_MODES:
-            raise WorkerConfigError(
-                f"invalid sandbox {sandbox!r}; must be one of {SANDBOX_MODES}"
-            )
-
-        if not os.path.isabs(working_dir):
-            raise WorkerConfigError(
-                f"working_dir must be an absolute path, got: {working_dir!r}"
-            )
-
-        resolved = str(Path(working_dir).resolve())
-        if not os.path.isdir(resolved):
-            raise WorkerConfigError(
-                f"working_dir does not exist or is not a directory: {resolved!r}"
-            )
+        validate_worker_config(task, working_dir, sandbox)
 
     # ------------------------------------------------------------------
     # Command construction (no shell=True, no string composition)
@@ -449,6 +402,7 @@ class CodexWorker:
                 working_dir=working_dir,
                 sandbox=sandbox,
                 error=proc_error,
+                provider=PROVIDER,
             )
 
         thread_id, final_message, usage = _parse_jsonl(stdout_raw)
@@ -470,24 +424,27 @@ class CodexWorker:
             working_dir=working_dir,
             sandbox=sandbox,
             error=None,
+            provider=PROVIDER,
         )
 
-    @staticmethod
-    def _safe_env() -> dict[str, str]:
-        """Minimal env passed to the codex subprocess.
-
-        Passes only variables Codex requires to function. Never exposes
-        AGENT_API_KEY or other application secrets.
-        """
-        passthrough = {
-            "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM",
-            "LANG", "LC_ALL", "LC_CTYPE",
+    #: Codex-specific variables added to the shared base passthrough set.
+    _EXTRA_ENV_KEYS = frozenset(
+        {
             # Codex auth / config
             "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL",
             # Azure OpenAI (codex may use either)
             "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY",
         }
-        return {k: v for k, v in os.environ.items() if k in passthrough}
+    )
+
+    @classmethod
+    def _safe_env(cls) -> dict[str, str]:
+        """Minimal env passed to the codex subprocess.
+
+        Passes only variables Codex requires to function. Never exposes
+        AGENT_API_KEY or other application secrets.
+        """
+        return filtered_env(cls._EXTRA_ENV_KEYS)
 
     # ------------------------------------------------------------------
     # Audit logging
@@ -503,7 +460,7 @@ class CodexWorker:
             insert_run(
                 conn,
                 timestamp=timestamp,
-                provider="codex",
+                provider=PROVIDER,
                 model="codex",
                 input_description=result.task[:500],
                 input_tokens=usage.get("input_tokens", 0),

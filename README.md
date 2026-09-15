@@ -61,10 +61,10 @@ The VM normally sets `AGENT_CODE_REPO_PATH=/agent` and `AGENT_MAILBOX_REPO_PATH`
 	  existing data; see `data_sources.py` and `chat.py`)
 	- authenticated `POST /ideas` to append a new idea (state `new`) to
 	  `IDEAS.md`; see "Adding ideas" below
-	- authenticated Codex task endpoints (`POST /codex/tasks`,
+	- authenticated coding task endpoints (`POST /codex/tasks`,
 	  `GET /codex/tasks`, `GET /codex/tasks/{id}`,
 	  `POST /codex/tasks/{id}/run`) — synchronous, `read-only` sandbox,
-	  `working_dir` fixed to `/agent`; see "Codex task API" below
+	  `working_dir` fixed to `/agent`; see "Coding task API" below
 
 ## Current direction
 
@@ -189,12 +189,19 @@ Notes:
 - The Web UI's "Idee hinzufügen" field/button on `/` calls this endpoint
   and refreshes the ideas list on success.
 
-## Codex task API
+## Coding task API
 
 Small, authenticated FastAPI wrapper around `modules.codex_task_service.CodexTaskService`,
-which itself reuses `modules.codex_worker.CodexWorker` (`codex exec`, never
-`shell=True`). Currently synchronous only, no chat/Web UI integration, no
+which itself reuses the coding-agent workers — `modules.codex_worker.CodexWorker`
+(`codex exec`) and `modules.claude_worker.ClaudeWorker` (`claude --print`),
+never `shell=True`. Currently synchronous only, no chat/Web UI integration, no
 background queue, no parallel execution.
+
+Which agent runs a task is drawn at random when the task is created and
+reported back as `provider` (see ARCHITECTURE.md section 13 and DECISIONS.md
+D-022). The `/codex/tasks` paths are kept for compatibility; they are not
+Codex-only. `modules.codex_task_service`'s own CLI takes `--provider` to name
+one agent explicitly.
 
 Server-enforced boundaries (not client-selectable):
 
@@ -217,7 +224,7 @@ Example flow:
 curl -X POST -H "x-api-key: $AGENT_API_KEY" -H 'Content-Type: application/json' \
   -d '{"prompt": "Inspect README.md and summarize the project."}' \
   http://127.0.0.1:8000/codex/tasks
-# -> {"id": "...", "status": "queued", ...}
+# -> {"id": "...", "status": "queued", "provider": "claude", ...}
 
 curl -X POST -H "x-api-key: $AGENT_API_KEY" \
   http://127.0.0.1:8000/codex/tasks/<id>/run
@@ -384,7 +391,7 @@ Notes:
 
 ### Codex task commands
 
-Thin HTTP wrappers around the Codex task API (see "Codex task API" above).
+Thin HTTP wrappers around the coding task API (see "Coding task API" above).
 The client never invokes `CodexWorker`/`CodexTaskService` directly and cannot
 choose `working_dir` or `sandbox` — those remain server-enforced. All five
 commands require `x-api-key` (same auth as the other endpoints).

@@ -105,14 +105,21 @@ async def run_router_pipeline(task: str, db: Any) -> str:
         return response
 
     async def codex_run_fn(prompt: str) -> str:
-        """Delegate a sub-task to Codex via CodexTaskService."""
+        """Delegate a sub-task to Codex via CodexTaskService.
+
+        The router picked ``codex`` by name here, so the provider is pinned
+        rather than drawn: only callers that did not name an agent get the
+        random choice.
+        """
         from modules.codex_task_service import CodexTaskService, STATUS_SUCCEEDED
+        from modules.codex_worker import PROVIDER as PROVIDER_CODEX
         from modules.run_store import DEFAULT_DB_PATH
 
         service = CodexTaskService(db_path=DEFAULT_DB_PATH)
         codex_task = service.create_task(
             prompt=prompt,
             working_dir=os.getcwd(),
+            provider=PROVIDER_CODEX,
         )
         completed = service.run_task(codex_task.id)
         if completed.status == STATUS_SUCCEEDED:

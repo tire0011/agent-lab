@@ -13,11 +13,12 @@ module inside that inherited environment picked up the production key
 instead, and every API-auth test that asserted a 200/401 based on the
 *expected* test key failed unpredictably with unexpected 401s.
 
-This module is deliberately separate from
-``modules.codex_worker.CodexWorker._safe_env``, which builds the
-environment for the Codex/Copilot *implementation* phase and must keep
-passing through the LLM provider credentials that phase actually needs
-(``OPENAI_API_KEY``, ``AZURE_OPENAI_API_KEY``, ...). Verification test runs
+This module is deliberately separate from the coding agents' own
+environment minimisation (``modules.coding_worker.filtered_env``, used by
+``CodexWorker._safe_env`` and ``ClaudeWorker._safe_env``), which builds the
+environment for the *implementation* phase and must keep passing through the
+LLM provider credentials that phase actually needs (``OPENAI_API_KEY``,
+``AZURE_OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ...). Verification test runs
 need none of those, and must never see them.
 """
 
