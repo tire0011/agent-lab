@@ -6,8 +6,13 @@ return an observation; control always comes back to the local orchestrator.
 The ``local_worker`` delegate runs on the same shared local-LLM job path as
 every other local-model caller (#167/D-019): it is another role on the one
 queue, not a second way to reach llama-server. The external delegates
-(``codex_readonly``, ``azure_openai``) talk to their own services and are not
-affected by that rule.
+(``codex_readonly``, ``claude_readonly``, ``azure_openai``) talk to their own
+services and are not affected by that rule.
+
+The two CLI coding agents are offered as *named* delegates here: this is the
+controller deliberately consulting one of them, so nothing is drawn at random
+(that happens for tasks and experiments — see ``modules.coding_provider``).
+``claude_readonly`` is only advertised when the Claude CLI is installed.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from typing import Any
 
 import httpx
 
+from modules.coding_provider import PROVIDER_CLAUDE, PROVIDER_CODEX, is_available
 from modules.llama_cpp_client import LlamaCppClient
 from modules.local_llm_jobs import (
     ROLE_LOCAL_WORKER,
@@ -94,6 +100,15 @@ class NexusDelegationService:
                 "cost": "subscription/external",
             },
         ]
+        if is_available(PROVIDER_CLAUDE):
+            providers.append(
+                {
+                    "provider": "claude_readonly",
+                    "description": "Delegate difficult repository analysis/review to Claude Code in read-only mode; use new_experiment for implementation changes.",
+                    "writes_repo": False,
+                    "cost": "subscription/external",
+                }
+            )
         if os.environ.get("AZURE_OPENAI_ENDPOINT") and os.environ.get("AZURE_OPENAI_API_KEY"):
             providers.append(
                 {
@@ -110,7 +125,9 @@ class NexusDelegationService:
         if provider == "local_worker":
             return await self._local(task, context)
         if provider == "codex_readonly":
-            return await self._codex(task, context)
+            return await self._cli_agent(PROVIDER_CODEX, "codex_readonly", task, context)
+        if provider == "claude_readonly":
+            return await self._cli_agent(PROVIDER_CLAUDE, "claude_readonly", task, context)
         if provider == "azure_openai":
             return await self._azure(task, context)
         return DelegationResult(provider, False, f"Unknown delegation provider: {provider}", {})
@@ -140,7 +157,15 @@ class NexusDelegationService:
                 "local_worker", False, "", {"job_id": job_id, "error": type(exc).__name__}
             )
 
-    async def _codex(self, task: str, context: str) -> DelegationResult:
+    async def _cli_agent(
+        self, provider: str, delegate: str, task: str, context: str
+    ) -> DelegationResult:
+        """Consult one named CLI coding agent in read-only mode.
+
+        The task service is shared between both agents; the provider is passed
+        per task, so a delegate the controller asked for by name is never
+        swapped for the other one.
+        """
         try:
             service = self.codex_service
             if service is None:
@@ -154,17 +179,29 @@ class NexusDelegationService:
                 "sub-problem and return findings, evidence and a recommended next step.\n\n"
                 f"SUB-PROBLEM:\n{task[:6000]}\n\nKNOWN CONTEXT:\n{context[:6000]}"
             )
-            created = await asyncio.to_thread(service.create_task, prompt, self.repo_root, "read-only", 120)
+            created = await asyncio.to_thread(
+                service.create_task, prompt, self.repo_root, "read-only", 120, provider
+            )
             finished = await asyncio.to_thread(service.run_task, created.id)
-            content = finished.final_message or finished.error or f"Codex status: {finished.status}"
+            content = (
+                finished.final_message
+                or finished.error
+                or f"{provider} status: {finished.status}"
+            )
             return DelegationResult(
-                "codex_readonly",
+                delegate,
                 finished.status == "succeeded",
                 content,
-                {"task_id": finished.id, "status": finished.status, "runtime_ms": finished.runtime_ms, "usage": finished.usage},
+                {
+                    "task_id": finished.id,
+                    "status": finished.status,
+                    "runtime_ms": finished.runtime_ms,
+                    "usage": finished.usage,
+                    "provider": finished.provider,
+                },
             )
         except Exception as exc:  # noqa: BLE001
-            return DelegationResult("codex_readonly", False, "", {"error": type(exc).__name__})
+            return DelegationResult(delegate, False, "", {"error": type(exc).__name__})
 
     async def _azure(self, task: str, context: str) -> DelegationResult:
         endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")

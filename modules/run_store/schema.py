@@ -105,6 +105,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS codex_tasks (
             id TEXT PRIMARY KEY,
             prompt TEXT NOT NULL,
+            provider TEXT NULL,
             working_dir TEXT NOT NULL,
             sandbox TEXT NOT NULL,
             timeout_seconds INTEGER NOT NULL,
@@ -135,6 +136,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             research_usage_json TEXT NULL,
             research_raw_summary TEXT NULL,
             research_diagnostic_log TEXT NULL,
+            implementation_provider TEXT NULL,
             implementation_started_at TEXT NULL,
             implementation_ended_at TEXT NULL,
             ended_at TEXT NULL,
@@ -238,6 +240,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         """
     )
     _migrate_experiments_columns(conn)
+    _migrate_codex_tasks_columns(conn)
     _migrate_mailbox_messages_task_body(conn)
     _migrate_mailbox_messages_chain_columns(conn)
     _migrate_mailbox_task_approvals(conn)
@@ -270,6 +273,15 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("policy_replan_diagnostic_log", "TEXT"),
     ("policy_rule", "TEXT"),
     ("quality_evaluation_json", "TEXT"),
+    # Which coding agent ran the implementation phase (codex | claude).
+    ("implementation_provider", "TEXT"),
+]
+
+# Same additive treatment for ``codex_tasks``: the table predates the second
+# coding agent, so rows written before this column existed keep provider NULL
+# and are read back as the historical default (codex).
+_CODEX_TASKS_ADDITIVE_COLUMNS = [
+    ("provider", "TEXT"),
 ]
 
 
@@ -279,6 +291,15 @@ def _migrate_experiments_columns(conn: sqlite3.Connection) -> None:
         if column_name not in existing:
             conn.execute(
                 f"ALTER TABLE experiments ADD COLUMN {column_name} {column_type} NULL"
+            )
+
+
+def _migrate_codex_tasks_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(codex_tasks)")}
+    for column_name, column_type in _CODEX_TASKS_ADDITIVE_COLUMNS:
+        if column_name not in existing:
+            conn.execute(
+                f"ALTER TABLE codex_tasks ADD COLUMN {column_name} {column_type} NULL"
             )
 
 

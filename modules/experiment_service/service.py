@@ -13,6 +13,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.coding_provider import (
+    build_random_worker,
+    provider_of,
+    random_worker_factory,
+)
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.experiment_evaluation import parse_git_status_short
 from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
@@ -111,10 +116,16 @@ _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
 class ExperimentService:
     """Orchestrates one bounded self-development experiment at a time.
 
-    Reuses ``CodexWorker`` for both the read-only selection phase and the
-    isolated workspace-write implementation phase; no worker/subprocess
-    logic is duplicated here beyond git worktree management and the fixed
-    verification commands.
+    Reuses the external coding-agent workers (``CodexWorker`` /
+    ``ClaudeWorker``) for both the read-only selection phase and the isolated
+    workspace-write implementation phase; no worker/subprocess logic is
+    duplicated here beyond git worktree management and the fixed verification
+    commands.
+
+    Which agent runs an experiment is drawn at random per experiment (see
+    ``modules.coding_provider``) unless the caller injects its own worker or
+    factory. The drawn provider is recorded on the experiment as
+    ``implementation_provider``.
     """
 
     def __init__(
@@ -135,10 +146,15 @@ class ExperimentService:
         max_test_timeout_seconds: int = _MAX_TEST_TIMEOUT_SECONDS,
         test_timeout_backoff_factor: float = _TEST_TIMEOUT_BACKOFF_FACTOR,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
+        rng: Any | None = None,
     ) -> None:
         """
         Parameters
         ----------
+        rng:
+            Optional ``random.Random`` used to draw the coding agent for the
+            default worker factories, so a test or a reproducible run can fix
+            the sequence. Ignored when the factories are injected.
         selection_worker:
             ``CodexWorker`` used for the read-only *research* phase (the
             only phase that ever investigates the live repository).
@@ -146,8 +162,9 @@ class ExperimentService:
         worker_factory:
             Callable ``(worktree_path) -> CodexWorker`` used to build the
             implementation-phase worker, scoped (legacy worker root configuration) to that
-            single worktree path only. Defaults to constructing a real
-            ``CodexWorker()``.
+            single worktree path only. Defaults to a factory that draws the
+            coding agent at random once per worktree
+            (``modules.coding_provider.random_worker_factory``).
         plan_worker_factory:
             Callable ``(scratch_dir) -> CodexWorker`` used to build the
             *plan*-phase worker (and its one reformat retry), scoped
@@ -156,8 +173,8 @@ class ExperimentService:
             never sees ``repo_root`` and is given only the goal plus the
             research summary as input — it cannot perform any further
             repository research even if it tried to run a shell command,
-            since its working directory is empty. Defaults to constructing
-            a real ``CodexWorker()``.
+            since its working directory is empty. Defaults to a factory that
+            draws the coding agent at random once per scratch directory.
         repo_root:
             Root of the main repository (default ``/agent``). Never
             modified by this service.
@@ -192,15 +209,16 @@ class ExperimentService:
             Multiplier applied to the current verification test timeout
             each time a full run ends with ``test_timeout``.
         """
-        self.selection_worker = selection_worker if selection_worker is not None else CodexWorker(
-            
+        self.selection_worker = (
+            selection_worker
+            if selection_worker is not None
+            else build_random_worker()[1]
         )
-        self.worker_factory = worker_factory or (
-            lambda worktree_path: CodexWorker()
-        )
-        self.plan_worker_factory = plan_worker_factory or (
-            lambda scratch_dir: CodexWorker()
-        )
+        # One draw per worktree/scratch directory, i.e. one agent per
+        # experiment: the implementation call and any repair iteration run on
+        # the same provider, while the next experiment draws again.
+        self.worker_factory = worker_factory or random_worker_factory(rng=rng)
+        self.plan_worker_factory = plan_worker_factory or random_worker_factory(rng=rng)
         self.db_path = db_path
         self.repo_root = repo_root
         self.worktrees_root = worktrees_root or str(Path.home() / "agent-worktrees")
@@ -622,14 +640,15 @@ class ExperimentService:
         Phases (in order):
           1. Goal security check (deterministic, no LLM call).
           2. Isolated git worktree creation.
-          3. One Codex call — the worker analyses the repo, plans, and
-             implements the goal directly inside the worktree.
+          3. One coding-agent call (Codex or Claude, drawn per experiment) —
+             the worker analyses the repo, plans, and implements the goal
+             directly inside the worktree.
           4. Verification — git diff + tests + deterministic quality gate.
 
         The injected GitHub lifecycle publishes a checkpoint through a
         temporary index before verification; it never changes this worktree's
         HEAD/index and never merges or deploys from this service.
-        Reuses ``modules.codex_worker.CodexWorker`` (no duplicated
+        Reuses the external coding-agent workers (no duplicated
         subprocess/worker logic) and the existing SQLite store.
         """
         experiment = self.get_experiment(experiment_id)
@@ -704,11 +723,23 @@ class ExperimentService:
         # ---- Single Codex implementation call -----------------------------
         elog.info(
             "implementation", "implementation_started",
-            "Starting implementation (single Codex call: analyse, plan, implement)",
+            "Starting implementation (single coding-agent call: analyse, plan, implement)",
         )
         implementation_prompt = _build_direct_implementation_prompt(experiment.goal)
         implementation_task_id = uuid.uuid4().hex
         worker = self.worker_factory(worktree_path)
+        # Which coding agent got this experiment is recorded before the call,
+        # so a timeout or a crash still leaves the run attributable.
+        implementation_provider = provider_of(worker)
+        self._force_status(
+            experiment_id, STATUS_IMPLEMENTING,
+            implementation_provider=implementation_provider,
+        )
+        elog.info(
+            "implementation", "implementation_provider_selected",
+            f"Implementation runs on coding agent {implementation_provider or 'unknown'}",
+            provider=implementation_provider or "",
+        )
 
         implementation_timeout = getattr(
             self, "_implementation_timeout_seconds", _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
@@ -837,14 +868,18 @@ class ExperimentService:
                 )
                 break
 
-            self._force_status(experiment_id, STATUS_VERIFYING)
+            worker = self.worker_factory(worktree_path)
+            self._force_status(
+                experiment_id, STATUS_VERIFYING,
+                implementation_provider=provider_of(worker),
+            )
             elog.warning(
                 "implementing", "repair_started",
                 f"Starting focused repair iteration {repair_iteration}/"
                 f"{self.max_repair_iterations}",
                 iteration=repair_iteration,
+                provider=provider_of(worker) or "",
             )
-            worker = self.worker_factory(worktree_path)
             repair_result = worker.run(
                 task=_build_repair_implementation_prompt(result.goal, feedback),
                 working_dir=worktree_path,

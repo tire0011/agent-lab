@@ -53,6 +53,44 @@ Optional, for controller work liveness (see ARCHITECTURE.md section 10):
   fallback, which now only applies to sessions that never reported a
   heartbeat at all.
 
+Optional, for the coding agents that execute tasks and experiments (see
+ARCHITECTURE.md section 13 and D-022):
+
+- `AGENT_CODEX_BIN` (default `/home/agent/.local/bin/codex`) - path to the
+  Codex CLI.
+- `AGENT_CLAUDE_BIN` (default: `claude` as resolved on `PATH`) - path to the
+  Claude Code CLI. Requires a CLI that understands `--permission-prompts` and
+  `--tools` (Claude Code 2.x).
+- `AGENT_CLAUDE_MODEL` - optional model override for the Claude worker; unset
+  means the CLI's own configured model.
+- `AGENT_CODING_PROVIDERS` (default `codex,claude`) - which agents may be
+  drawn.
+- `AGENT_CODING_PROVIDER` - pin every task to one agent. Use this to stand an
+  agent down during an incident (quota exhausted, CLI broken); remove it to
+  return to the random draw.
+
+An agent whose CLI is not installed is never drawn, so adding the variables
+before installing the CLI is harmless. To check what the VM would draw from:
+
+```bash
+cd /agent && .venv/bin/python -c \
+  "from modules.coding_provider import available_providers; print(available_providers())"
+```
+
+A single task can be run against one agent by name, which is the quickest way
+to verify a freshly installed CLI without touching the random path:
+
+```bash
+cd /agent && .venv/bin/python -m modules.claude_worker \
+  --working-dir /agent "Summarize README.md. Do not change files."
+cd /agent && .venv/bin/python -m modules.codex_task_service \
+  --provider claude --working-dir /agent "Summarize README.md."
+```
+
+Which agent ran a given piece of work is recorded: `provider` on
+`GET /codex/tasks/{id}` and `implementation_provider` on
+`GET /experiments/{id}`.
+
 Both `agent-api.service` and `nexus-mailbox.service` already load this shared
 environment file. Missing configuration blocks only implementation/resume work;
 the API and read-only operations remain available and log an actionable startup

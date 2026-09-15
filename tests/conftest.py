@@ -37,3 +37,10 @@ os.environ.setdefault("AGENT_API_KEY", "test-api-key")
 # would otherwise hand the suite a working binary again. A test that needs a
 # codex path sets it through monkeypatch, which applies after this file runs.
 os.environ["AGENT_CODEX_BIN"] = str(Path(_LOG_DIR) / "no-codex-binary-in-tests")
+
+# Same isolation for the second coding agent: the claude CLI is installed on
+# the VM too, and a task whose provider was drawn at random would otherwise
+# spend a real Claude call. With both binaries unreachable, the provider draw
+# finds nothing installed and falls back to codex, which keeps the suite
+# deterministic as well.
+os.environ["AGENT_CLAUDE_BIN"] = str(Path(_LOG_DIR) / "no-claude-binary-in-tests")
