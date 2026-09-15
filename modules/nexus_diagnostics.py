@@ -13,10 +13,13 @@ This module is the missing first-class answer. It resolves any reference an
 operator plausibly has to hand, reads the lifecycle state out of the
 subsystem that owns it, and returns that together with a bounded slice of the
 relevant logs - structured JSONL and, where it helps, the service journal.
-Everything here is read-only by construction rather than by convention: the
-only statements issued are SELECTs, and there is no code path that writes,
-reaps or retries. That is what makes it safe to hand to the mailbox/chat
-interface, and safe to point at a suspect task without changing its state.
+Everything here is read-only by construction rather than by convention. The
+database is opened in SQLite's ``mode=ro`` and further pinned with
+``PRAGMA query_only``, so a write is refused by the connection itself rather
+than merely absent from the code; nothing here creates the file, applies a
+migration, runs a backfill, reaps or retries. That is what makes it safe to
+hand to the mailbox/chat interface, and safe to point at a suspect task
+without changing its state.
 
 Extending the heartbeat contract
 --------------------------------
@@ -64,7 +67,7 @@ from modules.heartbeat import (
     resolve_stale_timeout,
 )
 from modules.redaction import redact, sanitized_reason
-from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +196,15 @@ SERVICE_ALIASES: dict[str, str] = {
 }
 KNOWN_SERVICES: tuple[str, ...] = ("agent-api", "nexus-mailbox", "llama-server")
 
+# The id namespaces a bare reference is resolved against, in the order an
+# exact match is preferred. Prefix matches are gathered from all of them
+# before any verdict is reached (see NexusDiagnostics.resolve).
+_RESOLUTION_TABLES: tuple[tuple[str, str], ...] = (
+    (SUBJECT_TASK, "mailbox_task_approvals"),
+    (SUBJECT_EXPERIMENT, "experiments"),
+    (SUBJECT_SESSION, "nexus_task_sessions"),
+)
+
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SAFE_UNIT_RE = re.compile(r"^[A-Za-z0-9@._-]{1,128}$")
 _ISSUE_REF_RE = re.compile(r"^(?:issue[ _-]*)?#?(\d{1,9})$", re.IGNORECASE)
@@ -201,6 +213,40 @@ _PR_REF_RE = re.compile(r"^(?:pr|pull|pull[ _-]?request)[ _-]*#?(\d{1,9})$", re.
 
 class DiagnosticsError(ValueError):
     """A reference could not be resolved, or an argument was unusable."""
+
+
+def _connect_read_only(db_path: str) -> sqlite3.Connection:
+    """Open an existing Nexus database without being able to change it.
+
+    Deliberately *not* ``run_store.init_db``. That helper is the write path's
+    entry point: it creates the file and its parent directory, applies the
+    full schema and every additive migration, and runs the mailbox-approval
+    backfill - all of which are writes. Calling it here would have made a
+    diagnostic read mutate the very database it was asked to describe, which
+    is exactly what a read-only command must not do, and would have done it on
+    the databases most worth inspecting: the incomplete ones.
+
+    So the connection is opened in SQLite's ``mode=ro`` and pinned with
+    ``PRAGMA query_only``. The two are independent: the first refuses to open
+    the file for writing at all, the second refuses write statements on the
+    connection even if it were writable. Nothing is created, so a missing
+    database is reported rather than conjured, and a schema this build has
+    never seen is simply read as far as it goes - ``_fetchall`` already treats
+    a missing table or column as "nothing known about that".
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        raise DiagnosticsError(f"no Nexus database at {path}")
+    # as_uri() percent-encodes, so a path containing '?' or '#' cannot be
+    # misread as the start of the URI's query fragment.
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    except sqlite3.Error as exc:
+        raise DiagnosticsError(f"cannot read the Nexus database at {path}: {exc}") from exc
+    conn.execute("PRAGMA query_only = ON")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _like_escape(value: str) -> str:
@@ -501,9 +547,7 @@ class NexusDiagnostics:
         stale_after_seconds: object = None,
         now: Any = None,
     ) -> None:
-        conn = init_db(db_path)
-        conn.row_factory = sqlite3.Row
-        self._conn = conn
+        self._conn = _connect_read_only(db_path)
         self.db_path = db_path
         self.log_dir = Path(log_dir or central_logging.resolve_log_dir())
         # Public and rebindable: the API injects the process's shared
@@ -532,8 +576,11 @@ class NexusDiagnostics:
         Resolution is ordered by how specific a match is, not by how likely
         the caller is to have used that namespace: an exact id in any table
         beats a prefix in any other, so a full id is never shadowed by some
-        other row that happens to start with the same characters. Issue and
-        PR references resolve through the GitHub work links, which is the only
+        other row that happens to start with the same characters. A prefix
+        must then be unique across *every* namespace, not merely within the
+        first one that matches - otherwise the order of this list, rather than
+        the operator's input, would be deciding the answer. Issue and PR
+        references resolve through the GitHub work links, which is the only
         place that mapping is durably recorded.
         """
         candidate = (reference or "").strip()
@@ -569,26 +616,38 @@ class NexusDiagnostics:
                 return resolved
             raise DiagnosticsError(f"unusable reference: {candidate[:64]!r}")
 
-        for subject_type, table in (
-            (SUBJECT_TASK, "mailbox_task_approvals"),
-            (SUBJECT_EXPERIMENT, "experiments"),
-            (SUBJECT_SESSION, "nexus_task_sessions"),
-        ):
+        for subject_type, table in _RESOLUTION_TABLES:
             if self._exists(table, candidate):
                 return subject_type, candidate
 
-        for subject_type, table in (
-            (SUBJECT_TASK, "mailbox_task_approvals"),
-            (SUBJECT_EXPERIMENT, "experiments"),
-            (SUBJECT_SESSION, "nexus_task_sessions"),
-        ):
-            prefixed = self._prefix(table, candidate)
-            if prefixed:
-                return subject_type, prefixed
+        # Prefix uniqueness is judged across *all* namespaces at once, not one
+        # table at a time. Checking per table and returning the first hit would
+        # have let namespace order silently decide between a mailbox task and
+        # an experiment that share a prefix - which is precisely the guess the
+        # contract promises not to make.
+        matches: list[tuple[str, str]] = []
+        for subject_type, table in _RESOLUTION_TABLES:
+            matches.extend(
+                (subject_type, found) for found in self._prefix_matches(table, candidate)
+            )
+            if len(matches) > 1:
+                break
+        if len(matches) == 1:
+            return matches[0]
 
+        # An inbox filename can look like a safe id (dots and dashes are legal
+        # in both), so it is tried before either verdict below: a reference
+        # that names a real message is answerable even if it also happens to
+        # prefix something.
         resolved = self._resolve_inbox_filename(candidate)
         if resolved:
             return resolved
+        if matches:
+            kinds = ", ".join(sorted({subject_type for subject_type, _ in matches}))
+            raise DiagnosticsError(
+                f"{candidate[:64]!r} is an ambiguous prefix: it matches more than "
+                f"one subject ({kinds}). Use more of the id."
+            )
         raise DiagnosticsError(f"no task, experiment or session matches {candidate[:64]!r}")
 
     def _fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
@@ -623,20 +682,20 @@ class NexusDiagnostics:
             is not None
         )
 
-    def _prefix(self, table: str, identifier: str) -> str | None:
-        """Unique-prefix match, or nothing.
+    def _prefix_matches(self, table: str, identifier: str) -> list[str]:
+        """Ids in *table* starting with *identifier*, capped at two.
 
-        Two matches mean the operator's shorthand is ambiguous; answering for
-        one of them arbitrarily would be worse than saying so, so this returns
-        ``None`` and resolution moves on.
+        Two is all any caller needs: one match is a resolution, and two is
+        already "ambiguous" - counting the rest would only cost a bigger scan
+        to reach the same verdict. The caller sums these across namespaces,
+        because ambiguity is a property of the whole id space, not of one
+        table.
         """
         rows = self._fetchall(
-            f"SELECT id FROM {table} WHERE id LIKE ? ESCAPE '\\' LIMIT 2",  # noqa: S608
+            f"SELECT id FROM {table} WHERE id LIKE ? ESCAPE '\\' ORDER BY id LIMIT 2",  # noqa: S608
             (_like_prefix(identifier),),
         )
-        if len(rows) == 1:
-            return str(rows[0]["id"])
-        return None
+        return [str(row["id"]) for row in rows]
 
     def _resolve_github_number(self, column: str, number: int) -> tuple[str, str] | None:
         row = self._fetchone(

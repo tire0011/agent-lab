@@ -214,6 +214,60 @@ class DiagnosticsFixture(unittest.TestCase):
         }
 
 
+class ReadOnlyConnectionTests(DiagnosticsFixture):
+    """The read-only guarantee is enforced by the connection, not by habit.
+
+    The backend deliberately does not use ``run_store.init_db``: that is the
+    write path's entry point - it creates the file, applies every additive
+    migration and runs the mailbox-approval backfill - so constructing a
+    diagnostic through it would have mutated the database it was asked to
+    describe.
+    """
+
+    def test_the_connection_refuses_writes(self) -> None:
+        diagnostics = self.diagnostics()
+        with self.assertRaises(sqlite3.OperationalError):
+            diagnostics._conn.execute(
+                "INSERT INTO experiments (id, goal, status, created_at) "
+                "VALUES ('x', 'g', 'queued', 'now')"
+            )
+
+    def test_constructing_it_changes_nothing_on_disk(self) -> None:
+        before = Path(self.db_path).read_bytes()
+        diagnostics = self.diagnostics()
+        diagnostics.resolve  # constructed and usable
+        diagnostics.close()
+        self.assertEqual(before, Path(self.db_path).read_bytes())
+
+    def test_it_never_conjures_a_database_that_is_not_there(self) -> None:
+        missing = str(self.root / "definitely-absent.db")
+        with self.assertRaises(DiagnosticsError):
+            NexusDiagnostics(db_path=missing, log_dir=self.log_dir)
+        self.assertFalse(Path(missing).exists())
+
+    def test_a_database_missing_lazily_created_tables_still_answers(self) -> None:
+        """The incomplete databases are the ones most worth inspecting."""
+        bare = str(self.root / "bare.db")
+        conn = sqlite3.connect(bare)
+        conn.execute(
+            "CREATE TABLE experiments (id TEXT PRIMARY KEY, goal TEXT, status TEXT, "
+            "created_at TEXT, branch_name TEXT, error TEXT, ended_at TEXT, "
+            "test_exit_code INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO experiments (id, goal, status, created_at) "
+            "VALUES ('lonely1', 'goal', 'implementing', ?)",
+            (_iso(5),),
+        )
+        conn.commit()
+        conn.close()
+        diagnostics = NexusDiagnostics(db_path=bare, log_dir=self.log_dir)
+        self.addCleanup(diagnostics.close)
+        state = diagnostics.status("lonely1")
+        self.assertEqual(LIFECYCLE_RUNNING, state.lifecycle)
+        self.assertIsNone(state.pr_number)
+
+
 class ProgressVerdictTests(unittest.TestCase):
     """The heartbeat rule, extended to work that has no heartbeat of its own."""
 
@@ -347,6 +401,54 @@ class ReferenceResolutionTests(DiagnosticsFixture):
             )
         self.conn.commit()
         self.assertEqual(("experiment", "ab_cd1111"), self.diagnostics().resolve("ab_cd"))
+
+    def test_a_prefix_ambiguous_across_namespaces_is_refused(self) -> None:
+        """Ambiguity is a property of the whole id space, not of one table.
+
+        A prefix shared by a mailbox task and an experiment used to resolve to
+        the task purely because that namespace is checked first - the order of
+        an internal list deciding the answer instead of the operator's input.
+        """
+        self.conn.execute(
+            "INSERT INTO experiments (id, goal, status, created_at) "
+            "VALUES ('shared99experiment', 'goal', 'queued', ?)",
+            (_iso(10),),
+        )
+        self.conn.commit()
+        task_id = self.add_task()
+        self.conn.execute(
+            "UPDATE mailbox_task_approvals SET id = 'shared99task' WHERE id = ?",
+            (task_id,),
+        )
+        self.conn.commit()
+
+        with self.assertRaises(DiagnosticsError) as caught:
+            self.diagnostics().resolve("shared99")
+        message = str(caught.exception)
+        self.assertIn("ambiguous", message)
+        self.assertIn("experiment", message)
+        self.assertIn("task", message)
+
+        # More of the id disambiguates, in either namespace.
+        diagnostics = self.diagnostics()
+        self.assertEqual(("task", "shared99task"), diagnostics.resolve("shared99t"))
+        self.assertEqual(
+            ("experiment", "shared99experiment"), diagnostics.resolve("shared99e")
+        )
+
+    def test_an_exact_id_still_beats_a_prefix_in_another_namespace(self) -> None:
+        """Global ambiguity must not swallow a caller who typed the whole id."""
+        self.conn.execute(
+            "INSERT INTO experiments (id, goal, status, created_at) "
+            "VALUES ('abc123extra', 'goal', 'queued', ?)",
+            (_iso(10),),
+        )
+        task_id = self.add_task()
+        self.conn.execute(
+            "UPDATE mailbox_task_approvals SET id = 'abc123' WHERE id = ?", (task_id,)
+        )
+        self.conn.commit()
+        self.assertEqual(("task", "abc123"), self.diagnostics().resolve("abc123"))
 
     def test_an_ambiguous_prefix_is_refused_rather_than_guessed(self) -> None:
         for identifier in ("dupe1111", "dupe2222"):

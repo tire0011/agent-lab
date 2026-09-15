@@ -61,9 +61,12 @@
     number, or an inbox filename, reads the owning subsystem's row, and
     returns lifecycle, branch, commit, PR, worker, last error and a
     running/interrupted/completed progress verdict alongside bounded logs.
-    Read-only by construction (only SELECTs), which is what makes it safe to
-    expose through the mailbox/chat catalog as `nexus_status`/`nexus_logs`/
-    `nexus_last_failure`; `modules/failure_analysis_service.py` reads the same
+    Read-only by construction: the database is opened `mode=ro` with
+    `PRAGMA query_only` — deliberately not through `run_store.init_db`, which
+    is the write path's entry point and would have made a diagnostic read
+    apply migrations and backfills to the database it was asked to describe.
+    That is what makes it safe to expose through the mailbox/chat catalog as
+    `nexus_status`/`nexus_logs`/`nexus_last_failure`; `modules/failure_analysis_service.py` reads the same
     backend rather than a log lookup of its own.
   - `GET /logs/trace/{reference}` (no auth) — everything Nexus did for
     one order. `reference` may be an inbox message filename, an

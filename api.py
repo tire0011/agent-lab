@@ -1815,10 +1815,16 @@ def get_nexus_diagnostics() -> Iterator[nexus_diagnostics_module.NexusDiagnostic
     would buy nothing. Overridable in tests via
     ``app.dependency_overrides[get_nexus_diagnostics]``.
     """
-    diagnostics = nexus_diagnostics_module.NexusDiagnostics(
-        log_dir=_resolve_experiment_service().experiment_log_dir,
-        stale_after_seconds=_STALE_HEARTBEAT_SECONDS,
-    )
+    try:
+        diagnostics = nexus_diagnostics_module.NexusDiagnostics(
+            log_dir=_resolve_experiment_service().experiment_log_dir,
+            stale_after_seconds=_STALE_HEARTBEAT_SECONDS,
+        )
+    except nexus_diagnostics_module.DiagnosticsError as exc:
+        # The backend opens the database read-only and never creates it, so a
+        # deployment that has not written one yet has nothing to diagnose.
+        # That is a service condition with a plain cause, not a 500.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
         yield diagnostics
     finally:

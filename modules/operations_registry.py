@@ -552,14 +552,16 @@ class OperationsRegistry:
         from modules.nexus_diagnostics import DiagnosticsError, render_report
 
         started = time.perf_counter()
-        diagnostics = self._diagnostics()
+        diagnostics = None
         try:
+            diagnostics = self._diagnostics()
             report = build(diagnostics)
         except DiagnosticsError as exc:
-            # A reference that resolves to nothing is an answer, not a crash:
-            # "I looked and found nothing" is what an operator needs to hear,
-            # and a raised exception here would be recorded as an operation
-            # fault rather than as the diagnostic finding it is.
+            # A reference that resolves to nothing - or a database that cannot
+            # be read - is an answer, not a crash: "I looked and found
+            # nothing" is what an operator needs to hear, and a raised
+            # exception here would be recorded as an operation fault rather
+            # than as the diagnostic finding it is.
             return OperationResult(
                 operation=operation,
                 success=False,
@@ -568,7 +570,8 @@ class OperationsRegistry:
                 error_summary=sanitized_reason(str(exc)),
             )
         finally:
-            diagnostics.close()
+            if diagnostics is not None:
+                diagnostics.close()
         return OperationResult(
             operation=operation,
             success=True,

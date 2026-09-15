@@ -537,10 +537,19 @@ Decision log for architecture and operating choices.
   that died mid-run never wrote a `failed` status; its log simply stops, which
   reads identically to work still in flight. Searching for explicit failures
   alone would miss exactly the case the command exists for.
-- Read-only is structural, not a convention: the backend issues only SELECTs
-  and has no code path that writes, reaps or retries. That is what makes it
-  safe to hand to the mailbox/chat interface and safe to point at a suspect
-  task without changing its state.
+- Read-only is structural, not a convention: the database is opened in
+  SQLite's `mode=ro` and pinned with `PRAGMA query_only`, so a write is
+  refused by the connection rather than merely absent from the code. Notably
+  this means *not* using `run_store.init_db`, the write path's entry point,
+  which creates the file and applies every additive migration and the
+  mailbox-approval backfill — a diagnostic built on it would have mutated the
+  database it was asked to describe, and would have done so on the incomplete
+  databases most worth inspecting. Missing tables and columns degrade to
+  "nothing known about that" instead.
+- Prefix resolution refuses an ambiguous shorthand, and ambiguity is judged
+  across every id namespace at once. Checking one table at a time and taking
+  the first hit would let the order of an internal list, rather than the
+  operator's input, decide between a mailbox task and an experiment.
 - Revisit if: the lifecycle vocabulary stops fitting a subsystem, or the
   progress signal proves too coarse for a phase that is legitimately quiet for
   longer than the stale timeout. The fix there is a per-phase timeout, not

@@ -315,8 +315,11 @@ for those first.
 
 Diagnosing a Nexus failure should never require composing shell commands,
 knowing log file paths, or guessing systemd unit names. These endpoints answer
-the usual questions directly. All of them are **read-only** - they report
-staleness but never reap, retry or change state - and all require `x-api-key`.
+the usual questions directly. All of them are **read-only**: the backend opens the
+state database in SQLite's `mode=ro` and pins it with `PRAGMA query_only`, so
+a write is refused by the connection itself rather than merely absent from the
+code. Nothing here creates the database, applies a migration, reaps or
+retries. All require `x-api-key`.
 
 | Question | Command |
 | --- | --- |
@@ -410,7 +413,9 @@ interface reach it without HTTP:
 - `service_logs` - `service`, `limit`, `since_minutes`
 
 All four are catalogued `mutates_state=False`, which is what makes them
-available to the read-only diagnostic role. The failure-analysis routine reads
+available to the read-only diagnostic role. A reference that resolves to
+nothing - or a database that cannot be read - comes back as an unsuccessful
+result with a reason, not as an operation fault. The failure-analysis routine reads
 the same backend, so a diagnosis and an operator looking at the same task see
 the same facts.
 

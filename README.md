@@ -301,7 +301,9 @@ the same trace with its summary.
 the operator's actual question — *where did this stop, and is it still alive?* —
 by joining the lifecycle state onto those logs, so diagnosing a failure never
 means searching the filesystem or inventing shell commands (#188). They need
-`x-api-key`, and every one of them is read-only:
+`x-api-key`, and every one of them is read-only — the state database is opened
+`mode=ro` with `PRAGMA query_only`, so these commands cannot change what they
+describe:
 
 ```bash
 curl -sH "x-api-key: $KEY" "$BASE/diagnostics/status/<reference>"
