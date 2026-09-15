@@ -79,11 +79,12 @@ def temp_repo_root():
 
 
 @pytest.fixture
-def service(temp_db, temp_outbox, mock_registry, temp_repo_root):
+def service(temp_db, mock_registry, temp_repo_root):
     """Create a service instance."""
+    outbox = Path(temp_repo_root) / "communication" / "outbox"
     svc = OperationChainService(
         db_path=temp_db,
-        outbox_dir=temp_outbox,
+        outbox_dir=str(outbox),
         operations_registry=mock_registry,
         repo_root=temp_repo_root,
     )

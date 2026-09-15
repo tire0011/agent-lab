@@ -1,9 +1,9 @@
 """Shared, persistent publish lifecycle for all outbox results.
 
-Every asynchronous producer (MailboxTaskService, OperationChainService) writes
-its result file and persists a publish record to the DB.  This module owns the
-git side-effect: commit the exact file, push it, and persist the resulting
-state.
+Every asynchronous producer (MailboxTaskService, OperationChainService, and
+FailureAnalysisService) supplies only an :class:`OutboxMessage` (``id`` and
+``content``). This module derives the canonical path, atomically writes the
+file, commits the exact file, pushes it, and persists the resulting state.
 
 Lifecycle
 ---------
@@ -42,10 +42,11 @@ import logging
 import os
 import sqlite3
 import subprocess
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from modules.redaction import redact as _redact_full
 from modules.run_store import DEFAULT_DB_PATH, init_db
@@ -97,19 +98,33 @@ _ACTIONABLE_STATUSES = {
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class OutboxMessage:
+    """Producer-owned outbox payload.
+
+    Deliberately contains no filename or path.  The publisher is the sole
+    owner of mapping a message to a location in the configured outbox.
+    """
+
+    id: str
+    content: str
+
+
 @dataclass(slots=True)
 class PublishRecord:
-    """One outbox result that needs to be published."""
+    """Publisher-owned persistent lifecycle state for an outbox message."""
 
-    record_id: str
-    outbox_file: str  # relative path from mailbox_repo_root
+    message: OutboxMessage
     publish_status: str
     publish_commit_sha: str | None = None
     publish_retry_count: int = 0
-    # Optional: called when publish_status==pending_write and file is missing.
-    # Must return the UTF-8 content to write.  If None and file is missing the
-    # record is marked failed.
-    content_fn: Callable[[], str] | None = field(default=None, compare=False)
+    content_available: bool = True
+    # Read only for rows created before #180. New producers never supply paths.
+    legacy_outbox_file: str | None = field(default=None, compare=False)
+
+    @property
+    def record_id(self) -> str:
+        return self.message.id
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +258,7 @@ class OutboxPublisher:
         # ---- Stage 2: file written → commit + push ---------------------------
         if status in (PUBLISH_WRITTEN, _PENDING_COMPAT, PUBLISH_COMMITTING):
             try:
-                path = self._validate_outbox_path(record.outbox_file)
+                path = self._existing_path(record)
             except ValueError as exc:
                 self._on_error(record, str(exc))
                 logger.error("outbox publish rejected (%s): %s", record.record_id, _redact(str(exc)))
@@ -267,15 +282,16 @@ class OutboxPublisher:
 
     def _write_then_publish(self, record: PublishRecord) -> bool:
         """pending_write → write file → written → commit → push."""
-        # Validate before any filesystem access.
         try:
-            validated = self._validate_outbox_path_for_write(record.outbox_file)
+            path = (
+                self._validate_outbox_path_for_write(record.legacy_outbox_file)
+                if record.legacy_outbox_file
+                else self._canonical_path(record.message)
+            )
         except ValueError as exc:
             self._on_error(record, str(exc))
             logger.error("outbox publish rejected (%s): %s", record.record_id, _redact(str(exc)))
             return False
-
-        path = validated
 
         if path.is_symlink():
             self._on_error(record, "symlinks are not allowed")
@@ -284,37 +300,34 @@ class OutboxPublisher:
         if path.is_file():
             # File already exists (e.g. a previous run wrote it but crashed
             # before advancing the state).  Adopt as-is.
+            self._record_outbox_file(record, path)
             self._advance_status(record, PUBLISH_WRITTEN)
             try:
-                self._validate_outbox_path(record.outbox_file)
+                self._validate_path(path, require_file=True)
             except ValueError as exc:
                 self._on_error(record, str(exc))
                 return False
             return self._commit_and_push(record, path)
 
-        if record.content_fn is None:
-            self._on_error(record, "file missing and no content_fn to recreate it")
-            return False
-
-        try:
-            content = record.content_fn()
-        except Exception as exc:
-            self._on_error(record, f"content_fn raised: {exc!r}")
-            return False
-
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(path)
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                    tmp.write(record.message.content)
+                Path(tmp_name).replace(path)
+            except BaseException:
+                Path(tmp_name).unlink(missing_ok=True)
+                raise
         except OSError as exc:
             self._on_error(record, f"write failed: {exc!r}")
             return False
 
+        self._record_outbox_file(record, path)
         self._advance_status(record, PUBLISH_WRITTEN)
 
         try:
-            self._validate_outbox_path(record.outbox_file)
+            self._validate_path(path, require_file=True)
         except ValueError as exc:
             self._on_error(record, str(exc))
             return False
@@ -326,7 +339,8 @@ class OutboxPublisher:
         self._advance_status(record, PUBLISH_COMMITTING)
 
         # Check for foreign dirty files before touching the index
-        if self._has_foreign_dirty_files(record.outbox_file):
+        expected_rel = str(path.relative_to(self._repo_root))
+        if self._has_foreign_dirty_files(expected_rel):
             self._on_error(record, "foreign dirty files in mailbox repo; aborting")
             return False
 
@@ -371,46 +385,73 @@ class OutboxPublisher:
 
     def _recover_failed(self, record: PublishRecord) -> bool:
         """Best-effort recovery for a previously-failed record."""
-        rel = _safe_relative(record.outbox_file)
-        path = self._repo_root / rel
-
         if record.publish_commit_sha:
             # Commit exists → just retry push
             return self._push_and_record(record)
 
-        if path.is_file():
-            try:
-                validated = self._validate_outbox_path(record.outbox_file)
-            except ValueError as exc:
-                self._on_error(record, str(exc))
-                return False
+        try:
+            path = self._existing_path(record)
+        except ValueError:
+            path = None
+        if path is not None and path.is_file():
             # Synthesise a written record to resume the pipeline
             pseudo = PublishRecord(
-                record_id=record.record_id,
-                outbox_file=record.outbox_file,
+                message=record.message,
                 publish_status=PUBLISH_WRITTEN,
                 publish_commit_sha=None,
                 publish_retry_count=record.publish_retry_count,
-                content_fn=record.content_fn,
+                legacy_outbox_file=record.legacy_outbox_file,
             )
-            return self._commit_and_push(pseudo, validated)
+            return self._commit_and_push(pseudo, path)
 
-        if record.content_fn is not None:
+        if record.content_available:
             pseudo = PublishRecord(
-                record_id=record.record_id,
-                outbox_file=record.outbox_file,
+                message=record.message,
                 publish_status=PUBLISH_PENDING_WRITE,
                 publish_retry_count=record.publish_retry_count,
-                content_fn=record.content_fn,
+                content_available=record.content_available,
             )
             return self._write_then_publish(pseudo)
 
-        self._on_error(record, "failed: file missing and no content_fn")
+        self._on_error(record, "failed: file missing and no stored content")
         return False
 
     # ------------------------------------------------------------------
     # Git helpers
     # ------------------------------------------------------------------
+
+    def _canonical_path(self, message: OutboxMessage) -> Path:
+        if not message.id or message.id in {".", ".."} or ".." in Path(message.id).parts:
+            raise ValueError("outbox message id must not contain path traversal segments")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", message.id):
+            raise ValueError("outbox message id contains unsafe filename characters")
+        path = self._outbox_dir / self._canonical_filename(message.id)
+        return self._validate_path(path, require_file=False)
+
+    def _canonical_filename(self, message_id: str) -> str:
+        return f"outbox-{message_id}.md"
+
+    def _existing_path(self, record: PublishRecord) -> Path:
+        if record.legacy_outbox_file:
+            return self._validate_outbox_path(record.legacy_outbox_file)
+        return self._validate_path(self._canonical_path(record.message), require_file=True)
+
+    def _validate_path(self, path: Path, *, require_file: bool) -> Path:
+        """Validate containment and symlinks for publisher-owned paths."""
+        repo_resolved = self._repo_root.resolve()
+        outbox_resolved = self._outbox_dir.resolve()
+        if outbox_resolved != repo_resolved and not outbox_resolved.is_relative_to(repo_resolved):
+            raise ValueError("outbox directory escapes mailbox repository")
+        if self._outbox_dir.is_symlink():
+            raise ValueError("symlinks are not allowed")
+        resolved_parent = path.parent.resolve()
+        if resolved_parent != outbox_resolved and not resolved_parent.is_relative_to(outbox_resolved):
+            raise ValueError("outbox path escapes outbox directory")
+        if path.is_symlink():
+            raise ValueError("symlinks are not allowed")
+        if require_file and not path.is_file():
+            raise ValueError(f"outbox file missing: {path.name}")
+        return path
 
     def _validate_outbox_path_for_write(self, outbox_file: str) -> Path:
         """Validate path structure and containment *before* the file exists.
@@ -577,6 +618,9 @@ class OutboxPublisher:
         """Persist commit_sha and advance status to PUBLISH_COMMITTED."""
         self._advance_status(record, PUBLISH_COMMITTED)
 
+    def _record_outbox_file(self, record: PublishRecord, path: Path) -> None:
+        """Persist the canonical repo-relative path after the publisher chose it."""
+
     def _on_error(self, record: PublishRecord, error: str) -> None:
         """Persist a failure.  Subclasses override."""
         logger.error("outbox publish failed for %s: %s", record.record_id, _redact(error))
@@ -596,6 +640,42 @@ class _TablePublisher(OutboxPublisher):
     _TABLE: str = ""
     _ID_COLUMN: str = "request_id"
     _COMMIT_SHA_COLUMN: str = "publish_commit_sha"
+
+    def write_message(self, message: OutboxMessage) -> str:
+        """Atomically create the publisher-owned file for a producer payload.
+
+        The producer supplies only ``id`` and ``content``.  Persisting the
+        canonical path and advancing ``pending_write`` to ``written`` happen
+        under the same repository lock used by publication.
+        """
+        record = PublishRecord(message=message, publish_status=PUBLISH_PENDING_WRITE)
+        with self._repo_lock:
+            path = self._canonical_path(message)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                self._validate_path(path, require_file=True)
+            else:
+                fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                        tmp.write(message.content)
+                    Path(tmp_name).replace(path)
+                except BaseException:
+                    Path(tmp_name).unlink(missing_ok=True)
+                    raise
+            self._record_outbox_file(record, path)
+            self._advance_status(record, PUBLISH_WRITTEN)
+            return str(path.relative_to(self._repo_root))
+
+    def _record_outbox_file(self, record: PublishRecord, path: Path) -> None:
+        rel = str(path.relative_to(self._repo_root))
+        self._conn.execute(
+            f"""UPDATE {self._TABLE}
+                SET outbox_file = ?, updated_at = datetime('now')
+                WHERE {self._ID_COLUMN} = ?""",
+            (rel, record.record_id),
+        )
+        self._conn.commit()
 
     def _advance_status(self, record: PublishRecord, new_status: str) -> None:
         self._conn.execute(
@@ -639,12 +719,15 @@ class OperationChainOutboxPublisher(_TablePublisher):
     _ID_COLUMN = "request_id"
     _COMMIT_SHA_COLUMN = "publish_commit_sha"
 
+    def _canonical_filename(self, message_id: str) -> str:
+        return f"operation-chain-result-{message_id}.md"
+
     def fetch_pending(self) -> list[PublishRecord]:
         rows = self._conn.execute(
             """SELECT request_id, outbox_file, publish_status,
                       publish_commit_sha, publish_retry_count, outbox_content
                FROM operation_chains
-               WHERE outbox_file IS NOT NULL
+               WHERE (outbox_content IS NOT NULL OR outbox_file IS NOT NULL)
                  AND publish_status IN (?, ?, ?, ?, ?, ?)
                ORDER BY created_at ASC""",
             (
@@ -659,14 +742,13 @@ class OperationChainOutboxPublisher(_TablePublisher):
         records = []
         for row in rows:
             stored_content: str | None = row["outbox_content"]
-            content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
             records.append(PublishRecord(
-                record_id=row["request_id"],
-                outbox_file=row["outbox_file"],
+                message=OutboxMessage(id=row["request_id"], content=stored_content or ""),
                 publish_status=row["publish_status"],
                 publish_commit_sha=row["publish_commit_sha"],
                 publish_retry_count=row["publish_retry_count"] or 0,
-                content_fn=content_fn,
+                content_available=stored_content is not None,
+                legacy_outbox_file=row["outbox_file"],
             ))
         return records
 
@@ -681,12 +763,15 @@ class TaskApprovalOutboxPublisher(_TablePublisher):
     _ID_COLUMN = "id"
     _COMMIT_SHA_COLUMN = "publish_commit_sha"
 
+    def _canonical_filename(self, message_id: str) -> str:
+        return f"task-approval-result-{message_id}.md"
+
     def fetch_pending(self) -> list[PublishRecord]:
         rows = self._conn.execute(
             """SELECT id, outbox_file, publish_status,
                       publish_commit_sha, publish_retry_count, outbox_content
                FROM mailbox_task_approvals
-               WHERE outbox_file IS NOT NULL
+               WHERE (outbox_content IS NOT NULL OR outbox_file IS NOT NULL)
                  AND publish_status IN (?, ?, ?, ?, ?, ?)
                ORDER BY created_at ASC""",
             (
@@ -701,14 +786,13 @@ class TaskApprovalOutboxPublisher(_TablePublisher):
         records = []
         for row in rows:
             stored_content: str | None = row["outbox_content"]
-            content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
             records.append(PublishRecord(
-                record_id=row["id"],
-                outbox_file=row["outbox_file"],
+                message=OutboxMessage(id=row["id"], content=stored_content or ""),
                 publish_status=row["publish_status"],
                 publish_commit_sha=row["publish_commit_sha"],
                 publish_retry_count=row["publish_retry_count"] or 0,
-                content_fn=content_fn,
+                content_available=stored_content is not None,
+                legacy_outbox_file=row["outbox_file"],
             ))
         return records
 
@@ -720,8 +804,8 @@ class FailureAnalysisOutboxPublisher(_TablePublisher):
     """Publishes failure-analysis outbox notifications (#148).
 
     Same shared git lifecycle as the other producers: the analysis service
-    writes the file + a ``pending_write``/``written`` DB row, and this
-    publisher is responsible for committing and pushing it. A given
+    persists the message content, and this publisher owns the file path,
+    atomic write, commit, and push. A given
     analysis row is only ever picked up here once its ``publish_status``
     leaves ``pushed`` behind is impossible - ``fetch_pending`` simply never
     selects a ``pushed`` row again, so restart/re-polling cannot produce a
@@ -732,12 +816,15 @@ class FailureAnalysisOutboxPublisher(_TablePublisher):
     _ID_COLUMN = "id"
     _COMMIT_SHA_COLUMN = "publish_commit_sha"
 
+    def _canonical_filename(self, message_id: str) -> str:
+        return f"failure-analysis-{message_id}.md"
+
     def fetch_pending(self) -> list[PublishRecord]:
         rows = self._conn.execute(
             """SELECT id, outbox_file, publish_status,
                       publish_commit_sha, publish_retry_count, outbox_content
                FROM failure_analyses
-               WHERE outbox_file IS NOT NULL
+               WHERE (outbox_content IS NOT NULL OR outbox_file IS NOT NULL)
                  AND publish_status IN (?, ?, ?, ?, ?, ?)
                ORDER BY created_at ASC""",
             (
@@ -752,29 +839,18 @@ class FailureAnalysisOutboxPublisher(_TablePublisher):
         records = []
         for row in rows:
             stored_content: str | None = row["outbox_content"]
-            content_fn = (lambda c: lambda: c)(stored_content) if stored_content else None
             records.append(PublishRecord(
-                record_id=row["id"],
-                outbox_file=row["outbox_file"],
+                message=OutboxMessage(id=row["id"], content=stored_content or ""),
                 publish_status=row["publish_status"],
                 publish_commit_sha=row["publish_commit_sha"],
                 publish_retry_count=row["publish_retry_count"] or 0,
-                content_fn=content_fn,
+                content_available=stored_content is not None,
+                legacy_outbox_file=row["outbox_file"],
             ))
         return records
 
     def publish_pending(self) -> int:
         return self.publish_many(self.fetch_pending())
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-
-def _safe_relative(outbox_file: str) -> Path:
-    """Return a Path that is guaranteed to be relative (no absolute check)."""
-    return Path(outbox_file)
 
 
 def _redact(value: str) -> str:

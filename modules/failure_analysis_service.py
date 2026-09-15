@@ -59,6 +59,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from modules import central_logging
@@ -78,7 +79,11 @@ from modules.nexus_tool_router import (
     ToolResolverUnavailableError,
     ToolRouterError,
 )
-from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
+from modules.outbox_publisher import (
+    FailureAnalysisOutboxPublisher,
+    OutboxMessage,
+    PUBLISH_PENDING_WRITE,
+)
 from modules.redaction import redact
 from modules.run_store import DEFAULT_DB_PATH, init_db
 from modules.tool_loop_guard import PersistentToolLoopGuard
@@ -779,7 +784,6 @@ class FailureAnalysisService:
         else:
             self._outbox_dir = None
             self._repo_root = None
-        self._repo_lock = RepoLock(self._repo_root) if self._repo_root is not None else None
 
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
@@ -1768,36 +1772,26 @@ class FailureAnalysisService:
             )
 
     def _write_outbox_file(self, analysis: FailureAnalysis) -> None:
-        assert self._outbox_dir is not None and self._repo_root is not None and self._repo_lock is not None
-        self._outbox_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        filename = f"{ts}-failure-analysis-{analysis.id[:8]}.md"
-        path = self._outbox_dir / filename
+        assert self._outbox_dir is not None and self._repo_root is not None
         content = render_outbox_content(analysis)
-        rel_path = str(path.relative_to(self._repo_root))
-
-        with self._repo_lock:
-            # Persist publish intent + full content before the atomic write so
-            # a crash between write and the second DB update is recoverable
-            # via FailureAnalysisOutboxPublisher.content_fn (same recovery
-            # contract as modules.outbox_publisher.OutboxPublisher).
-            with self._conn:
-                self._conn.execute(
-                    """UPDATE failure_analyses
-                       SET outbox_file=?, outbox_content=?, publish_status=?, updated_at=?
-                       WHERE id=?""",
-                    (rel_path, content, PUBLISH_PENDING_WRITE, _utcnow_iso(), analysis.id),
-                )
-
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(path)
-
-            with self._conn:
-                self._conn.execute(
-                    "UPDATE failure_analyses SET publish_status=?, updated_at=? WHERE id=?",
-                    (PUBLISH_WRITTEN, _utcnow_iso(), analysis.id),
-                )
+        with self._conn:
+            self._conn.execute(
+                """UPDATE failure_analyses
+                   SET outbox_file=NULL, outbox_content=?, publish_status=?, updated_at=?
+                   WHERE id=?""",
+                (content, PUBLISH_PENDING_WRITE, _utcnow_iso(), analysis.id),
+            )
+        publisher = FailureAnalysisOutboxPublisher(
+            db_path=self.db_path,
+            mailbox_config=SimpleNamespace(
+                mailbox_repo_path=self._repo_root,
+                outbox_dir=self._outbox_dir,
+            ),
+        )
+        try:
+            publisher.write_message(OutboxMessage(analysis.id, content))
+        finally:
+            publisher.close()
 
     def get(self, analysis_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
