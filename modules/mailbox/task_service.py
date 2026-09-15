@@ -24,7 +24,11 @@ from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
-from modules.outbox_publisher import PUBLISH_PENDING_WRITE, PUBLISH_WRITTEN, RepoLock
+from modules.outbox_publisher import (
+    OutboxMessage,
+    PUBLISH_PENDING_WRITE,
+    TaskApprovalOutboxPublisher,
+)
 from modules.run_store import DEFAULT_DB_PATH, init_db
 # ``modules.task_orchestrator`` is imported lazily, not here. It imports
 # ``modules.mailbox.development``, which runs this package's ``__init__`` and
@@ -140,7 +144,6 @@ class MailboxTaskService:
             self.mailbox_repo_path = self.repo_path
 
         self._lock = threading.RLock()
-        self._repo_lock = RepoLock(self.mailbox_repo_path)
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -955,9 +958,6 @@ class MailboxTaskService:
         exp: Any | None,
     ) -> str | None:
         try:
-            self.outbox_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            filename = f"{ts}-task-approval-{approval.id[:8]}.md"
             experiment_id = exp.id if exp is not None else "none"
             test_result = ""
             if exp is not None and exp.test_exit_code is not None:
@@ -978,33 +978,25 @@ class MailboxTaskService:
                 f"**Status:** {status}\n\n"
                 f"{summary[:32000]}\n"
             )
-            path = self.outbox_dir / filename
-            rel_path = str(path.relative_to(self.mailbox_repo_path))
-            with self._repo_lock:
-                with self._lock:
-                    self._conn.execute(
-                        """UPDATE mailbox_task_approvals
-                           SET outbox_file=?, outbox_content=?, publish_status=?, updated_at=?
-                           WHERE id=?""",
-                        (
-                            rel_path,
-                            content,
-                            PUBLISH_PENDING_WRITE,
-                            _now_iso(),
-                            approval.id,
-                        ),
-                    )
-                    self._conn.commit()
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(content, encoding="utf-8")
-                tmp.replace(path)
-                with self._lock:
-                    self._conn.execute(
-                        "UPDATE mailbox_task_approvals SET publish_status=?, updated_at=? WHERE id=?",
-                        (PUBLISH_WRITTEN, _now_iso(), approval.id),
-                    )
-                    self._conn.commit()
-            return rel_path
+            with self._lock:
+                self._conn.execute(
+                    """UPDATE mailbox_task_approvals
+                       SET outbox_file=NULL, outbox_content=?, publish_status=?, updated_at=?
+                       WHERE id=?""",
+                    (content, PUBLISH_PENDING_WRITE, _now_iso(), approval.id),
+                )
+                self._conn.commit()
+            publisher = TaskApprovalOutboxPublisher(
+                db_path=self.db_path,
+                mailbox_config=SimpleNamespace(
+                    mailbox_repo_path=self.mailbox_repo_path,
+                    outbox_dir=self.outbox_dir,
+                ),
+            )
+            try:
+                return publisher.write_message(OutboxMessage(approval.id, content))
+            finally:
+                publisher.close()
         except Exception:
             logger.exception("mailbox_task: failed to write outbox for %s", approval.id)
             return None

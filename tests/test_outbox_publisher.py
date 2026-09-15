@@ -40,6 +40,7 @@ from modules.outbox_publisher import (
     PUBLISH_WRITTEN,
     FailureAnalysisOutboxPublisher,
     OperationChainOutboxPublisher,
+    OutboxMessage,
     PublishRecord,
     TaskApprovalOutboxPublisher,
 )
@@ -77,9 +78,11 @@ def _make_bare_remote(tmp: Path, name: str = "remote.git") -> Path:
     return remote
 
 
-def _make_repo_with_remote(tmp: Path) -> tuple[Path, Path]:
-    remote = _make_bare_remote(tmp)
-    repo = tmp / "repo"
+def _make_repo_with_remote(
+    tmp: Path, remote_name: str = "remote.git", repo_name: str = "repo"
+) -> tuple[Path, Path]:
+    remote = _make_bare_remote(tmp, remote_name)
+    repo = tmp / repo_name
     _make_repo(repo)
     (repo / "communication" / "outbox").mkdir(parents=True)
     (repo / "communication" / "inbox").mkdir(parents=True)
@@ -121,6 +124,21 @@ def _insert_chain(
            VALUES (?,?,  'completed','2026-01-01T00:00:00Z','{}','2026-01-01T00:00:00Z',
                    ?,?,?)""",
         (request_id, request_id, outbox_rel, publish_status, commit_sha),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _insert_chain_message(db_path: str, request_id: str, content: str) -> None:
+    """Persist the producer contract introduced by #180: id + content only."""
+    conn = init_db(db_path)
+    conn.execute(
+        """INSERT INTO operation_chains
+           (id, request_id, status, created_at, request_json, updated_at,
+            outbox_file, outbox_content, publish_status)
+           VALUES (?, ?, 'completed', '2026-01-01T00:00:00Z', '{}',
+                   '2026-01-01T00:00:00Z', NULL, ?, ?)""",
+        (request_id, request_id, content, PUBLISH_PENDING_WRITE),
     )
     conn.commit()
     conn.close()
@@ -290,6 +308,62 @@ class TestTaskApprovalPublishLifecycle(unittest.TestCase):
             self.assertEqual(_remote_head(remote2, outbox_rel), "external task\n")
         finally:
             ctx2.cleanup()
+
+
+class TestPublisherOwnedPaths(unittest.TestCase):
+    """Regression coverage for #180's separate-mailbox path failure."""
+
+    def setUp(self):
+        self.ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.ctx.name)
+        self.code = self.tmp / "code"
+        _make_repo(self.code)
+        self.mailbox, self.remote = _make_repo_with_remote(
+            self.tmp, "mailbox-remote.git", "mailbox"
+        )
+        (self.mailbox / "outbox").mkdir(exist_ok=True)
+        self.cfg = _external_config(self.code, self.mailbox)
+        self.db = str(self.tmp / "state.db")
+
+    def tearDown(self):
+        self.ctx.cleanup()
+
+    def test_pending_message_uses_configured_separate_mailbox_outbox(self):
+        _insert_chain_message(self.db, "separate-path", "result body\n")
+
+        pub = OperationChainOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
+        try:
+            self.assertEqual(pub.publish_pending(), 1)
+        finally:
+            pub.close()
+
+        expected = "outbox/operation-chain-result-separate-path.md"
+        row = _get_chain(self.db, "separate-path")
+        self.assertEqual(row["outbox_file"], expected)
+        self.assertEqual(row["publish_status"], PUBLISH_PUSHED)
+        self.assertEqual(_remote_head(self.remote, expected), "result body\n")
+        self.assertFalse((self.code / expected).exists())
+
+    def test_malicious_message_id_cannot_escape_outbox(self):
+        _insert_chain_message(self.db, "../escape", "must not escape\n")
+
+        pub = OperationChainOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
+        try:
+            self.assertEqual(pub.publish_pending(), 0)
+        finally:
+            pub.close()
+
+        row = _get_chain(self.db, "../escape")
+        self.assertEqual(row["publish_status"], PUBLISH_FAILED)
+        self.assertIn("path traversal", row["publish_last_error"])
+        self.assertFalse((self.mailbox / "escape.md").exists())
+        self.assertEqual(list(self.cfg.outbox_dir.glob("*.md")), [])
+
+    def test_producer_message_has_no_path_field(self):
+        self.assertEqual(
+            set(OutboxMessage.__dataclass_fields__),
+            {"id", "content"},
+        )
 
 
 # ============================================================================
@@ -750,10 +824,9 @@ class TestPendingWriteRecovery(unittest.TestCase):
         _insert_chain(self.db, "r-recreate", outbox_rel, publish_status=PUBLISH_PENDING_WRITE)
 
         record = PublishRecord(
-            record_id="r-recreate",
-            outbox_file=outbox_rel,
+            message=OutboxMessage("r-recreate", "recreated content\n"),
             publish_status=PUBLISH_PENDING_WRITE,
-            content_fn=lambda: "recreated content\n",
+            legacy_outbox_file=outbox_rel,
         )
 
         pub = OperationChainOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
@@ -944,12 +1017,11 @@ class TestPushErrorRedaction(unittest.TestCase):
 
     def _make_dummy_record(self, record_id: str, outbox_rel: str) -> "PublishRecord":
         return PublishRecord(
-            record_id=record_id,
-            outbox_file=outbox_rel,
+            message=OutboxMessage(record_id, ""),
             publish_status=PUBLISH_WRITTEN,
             publish_commit_sha=None,
             publish_retry_count=0,
-            content_fn=None,
+            legacy_outbox_file=outbox_rel,
         )
 
     def _check_no_secret(self, text: str | None, secret_fragment: str, label: str) -> None:
