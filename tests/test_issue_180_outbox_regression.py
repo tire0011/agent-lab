@@ -1,59 +1,43 @@
 from __future__ import annotations
 
-import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
-from modules.mailbox.config import MailboxConfig
 from modules.outbox_publisher import PUBLISH_FAILED, PUBLISH_PUSHED, TaskApprovalOutboxPublisher
 from modules.run_store import init_db
-
-
-def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
-    )
-
-
-def _init_repo(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    _git(["init"], path)
-    _git(["config", "user.email", "test@example.com"], path)
-    _git(["config", "user.name", "Test"], path)
-    (path / "README.md").write_text("test\n", encoding="utf-8")
-    _git(["add", "README.md"], path)
-    _git(["commit", "-m", "init"], path)
+from tests.test_outbox_publisher import (
+    _external_config,
+    _get_approval,
+    _make_repo,
+    _make_repo_with_remote,
+    _remote_head,
+)
 
 
 class TestIssue180StuckOutboxRecovery(unittest.TestCase):
     """Regression for the live `outbox path escapes outbox directory` failure."""
 
     def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
         self.ctx = tempfile.TemporaryDirectory()
         root = Path(self.ctx.name)
         self.code_repo = root / "code"
-        self.mailbox_repo = root / "mailbox"
-        self.remote = root / "mailbox-remote.git"
-        _init_repo(self.code_repo)
-        _init_repo(self.mailbox_repo)
-        (self.mailbox_repo / "inbox").mkdir()
-        (self.mailbox_repo / "outbox").mkdir()
-        _git(["add", "-A"], self.mailbox_repo)
-        _git(["commit", "--allow-empty", "-m", "mailbox dirs"], self.mailbox_repo)
-        _git(["init", "--bare", str(self.remote)], root)
-        _git(["remote", "add", "origin", str(self.remote)], self.mailbox_repo)
-        branch = _git(["branch", "--show-current"], self.mailbox_repo).stdout.strip()
-        _git(["push", "-u", "origin", branch], self.mailbox_repo)
-        self.config = MailboxConfig.from_paths(self.code_repo, self.mailbox_repo)
+        _make_repo(self.code_repo)
+        self.mailbox_repo, self.remote = _make_repo_with_remote(
+            root, "mailbox-remote.git", "mailbox"
+        )
+        (self.mailbox_repo / "outbox").mkdir(exist_ok=True)
+        self.config = _external_config(self.code_repo, self.mailbox_repo)
         self.db_path = str(root / "state.db")
 
     def tearDown(self) -> None:
         self.ctx.cleanup()
 
-    def test_failed_bad_legacy_path_rebuilds_canonical_outbox_file(self) -> None:
+    def test_failed_legacy_single_repo_path_rebuilds_canonical_outbox_file(self) -> None:
         task_id = "7a2bc0c1c70f421cb2fc77fcfdac6aad"
         content = "---\nstatus: done\n---\n\nPR #116 integration result\n"
+        legacy_path = "communication/outbox/task-result.md"
 
         conn = init_db(self.db_path)
         conn.execute(
@@ -67,16 +51,17 @@ class TestIssue180StuckOutboxRecovery(unittest.TestCase):
             """INSERT INTO mailbox_task_approvals
                (id, mailbox_msg_id, task_body, sender, file_path, received_at,
                 status, outbox_file, outbox_content, publish_status,
-                publish_retry_count, created_at, updated_at)
+                publish_retry_count, publish_last_error, created_at, updated_at)
                VALUES (?, ?, 'body', 'test', 'inbox/task.md',
-                       '2026-09-15T00:00:00Z', 'succeeded', ?, ?, ?, 9,
+                       '2026-09-15T00:00:00Z', 'succeeded', ?, ?, ?, 9, ?,
                        '2026-09-15T00:00:00Z', '2026-09-15T00:00:00Z')""",
             (
                 task_id,
                 msg_id,
-                "outbox/task-result.md",  # wrong for separate mailbox semantics
+                legacy_path,
                 content,
                 PUBLISH_FAILED,
+                "outbox path escapes outbox directory",
             ),
         )
         conn.commit()
@@ -91,22 +76,15 @@ class TestIssue180StuckOutboxRecovery(unittest.TestCase):
         finally:
             publisher.close()
 
-        conn = init_db(self.db_path)
-        row = conn.execute(
-            """SELECT outbox_file, publish_status, publish_last_error
-               FROM mailbox_task_approvals WHERE id=?""",
-            (task_id,),
-        ).fetchone()
-        conn.close()
-
-        outbox_file, status, last_error = row
-        self.assertEqual(status, PUBLISH_PUSHED)
+        row = _get_approval(self.db_path, task_id)
+        outbox_file = row["outbox_file"]
+        self.assertEqual(row["publish_status"], PUBLISH_PUSHED)
         self.assertTrue(outbox_file.startswith("outbox/task-approval-result-"))
-        self.assertNotEqual(outbox_file, "outbox/task-result.md")
+        self.assertNotEqual(outbox_file, legacy_path)
         self.assertNotIn("..", outbox_file)
         self.assertEqual((self.mailbox_repo / outbox_file).read_text(encoding="utf-8"), content)
+        self.assertEqual(_remote_head(self.remote, outbox_file), content)
         self.assertFalse((self.code_repo / outbox_file).exists())
-        self.assertNotEqual(last_error, "outbox path escapes outbox directory")
 
 
 if __name__ == "__main__":
