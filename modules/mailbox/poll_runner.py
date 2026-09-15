@@ -172,10 +172,6 @@ def _sync_mailbox_repo(
 ) -> bool:
     """Synchronize append-oriented mailbox commits without discarding local work."""
     run_name = threading.current_thread().name
-    # Preserve the original direct helper contract when no machine-managed
-    # untracked paths need to be tolerated.  The mailbox poller passes the
-    # configured outbox prefix explicitly; legacy/direct callers continue to
-    # use git_is_clean(), which also keeps their retry behavior unchanged.
     if ignored_untracked_prefixes:
         worktree_safe = _worktree_safe_for_mailbox_sync(
             mailbox_module, repo_path, ignored_untracked_prefixes
@@ -242,13 +238,14 @@ def run_mailbox_poll_once(
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
-    from modules.outbox_publisher import FailureAnalysisOutboxPublisher, TaskApprovalOutboxPublisher
+    from modules.outbox_message_publisher import (
+        FailureAnalysisMessagePublisher,
+        TaskApprovalMessagePublisher,
+    )
 
     run_name = threading.current_thread().name
     logger.info("Mailbox poll start run=%s dry_run=%s", run_name, dry_run)
 
-    # Register unrestricted mailbox commands before any inbox file is parsed.
-    # NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
     install_mailbox_development(mailbox_module)
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,11 +287,11 @@ def run_mailbox_poll_once(
             db_path=db_path,
             mailbox_config=mailbox_config,
         )
-        task_publisher = TaskApprovalOutboxPublisher(
+        task_publisher = TaskApprovalMessagePublisher(
             db_path=db_path,
             mailbox_config=mailbox_config,
         )
-        failure_analysis_publisher = FailureAnalysisOutboxPublisher(
+        failure_analysis_publisher = FailureAnalysisMessagePublisher(
             db_path=db_path,
             mailbox_config=mailbox_config,
         )
@@ -303,11 +300,6 @@ def run_mailbox_poll_once(
             task_publisher.publish_pending()
             failure_analysis_publisher.publish_pending()
             processor.retry_pending_git_commits()
-            # Prune only after pending commits have been retried: a file
-            # still needed to finalize one is protected, and retrying first
-            # lets those records reach `done` so they become prunable. The
-            # deletions are committed locally here and pushed by the sync
-            # below, rather than opening a second push path.
             try:
                 processor.prune_old_messages()
             except Exception as exc:  # noqa: BLE001 - never block the poll
