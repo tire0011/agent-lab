@@ -10,7 +10,12 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from modules.log_reader import LogReader, parse_journal_line
+from modules.log_reader import (
+    LogReader,
+    is_log_viewer_access_noise,
+    normalize_journal_output,
+    parse_journal_line,
+)
 
 
 class ParseJournalLineTests(unittest.TestCase):
@@ -48,6 +53,44 @@ class ParseJournalLineTests(unittest.TestCase):
     def test_unparsable_timestamp_is_kept_as_is(self):
         entry = parse_journal_line("agent-api", "not-a-timestamp host agent-api: hi there now")
         self.assertEqual(entry["timestamp"], "not-a-timestamp")
+
+
+class JournalToWebsiteBoundaryTests(unittest.TestCase):
+    """What journalctl sees vs what the website-facing feed receives."""
+
+    def test_detects_only_agent_api_log_viewer_access_noise(self):
+        access = (
+            '2026-09-15T15:48:59+00:00 host agent-api[1]: '
+            'INFO: 127.0.0.1:34624 - "GET /logs?limit=500 HTTP/1.0" 200 OK'
+        )
+        self.assertTrue(is_log_viewer_access_noise("agent-api", access))
+        self.assertFalse(is_log_viewer_access_noise("nexus-mailbox", access))
+        self.assertFalse(
+            is_log_viewer_access_noise(
+                "agent-api",
+                '2026-09-15T15:48:59+00:00 host agent-api[1]: '
+                'INFO: 127.0.0.1:34624 - "GET /health HTTP/1.0" 200 OK',
+            )
+        )
+
+    def test_useful_journal_entry_survives_while_logs_requests_are_removed(self):
+        raw = "\n".join([
+            "2026-09-15T15:48:50+00:00 host agent-api[1]: controller turn started",
+            '2026-09-15T15:48:58+00:00 host agent-api[1]: INFO: 127.0.0.1:34616 - "GET /logs?limit=500 HTTP/1.0" 200 OK',
+            '2026-09-15T15:48:59+00:00 host agent-api[1]: INFO: 127.0.0.1:34624 - "GET /logs?limit=500 HTTP/1.0" 200 OK',
+        ])
+        entries = normalize_journal_output("agent-api", raw, limit=100)
+        self.assertEqual([entry["message"] for entry in entries], ["controller turn started"])
+        self.assertEqual(entries[0]["source"], "agent-api")
+        self.assertEqual(entries[0]["event"], "journal:agent-api")
+
+    def test_normalized_boundary_keeps_newest_useful_limit(self):
+        raw = "\n".join(
+            f"2026-09-15T15:48:{second:02d}+00:00 host agent-api[1]: useful-{second}"
+            for second in range(5)
+        )
+        entries = normalize_journal_output("agent-api", raw, limit=2)
+        self.assertEqual([entry["message"] for entry in entries], ["useful-3", "useful-4"])
 
 
 class ReadAllJournalEntriesTests(unittest.TestCase):
@@ -100,7 +143,6 @@ class ReadAllJournalEntriesTests(unittest.TestCase):
             )
         self.assertEqual(seen_before, ["2026-08-17T12:00:00.000Z", "2026-08-17T12:00:00.000Z"])
 
-
     def test_tail_journal_entries_raises_on_nonzero_returncode(self):
         reader = LogReader()
         with patch("modules.log_reader._run_journalctl", new=AsyncMock(return_value=(1, ""))):
@@ -116,9 +158,29 @@ class ReadAllJournalEntriesTests(unittest.TestCase):
         with patch("modules.log_reader._run_journalctl", new=AsyncMock(return_value=(0, out))):
             entries = asyncio.run(reader.tail_journal_entries("agent-api"))
         self.assertEqual([e["_source"] for e in entries], ["journal:agent-api", "journal:agent-api"])
-        # Newest line (last in the batch) has the smallest _rseq (0),
-        # mirroring central_logging.read_log_entries's own convention.
         self.assertEqual([e["_rseq"] for e in entries], [1, 0])
+
+    def test_tail_journal_entries_scans_past_requested_count_for_useful_entries(self):
+        reader = LogReader()
+        run_mock = AsyncMock(return_value=(0, ""))
+        with patch("modules.log_reader._run_journalctl", new=run_mock):
+            asyncio.run(reader.tail_journal_entries("agent-api", lines=100))
+        args = run_mock.await_args.args[0]
+        self.assertIn("-n1000", args)
+
+    def test_tail_journal_entries_backfills_past_log_viewer_noise(self):
+        reader = LogReader()
+        out = "\n".join([
+            "2026-09-15T15:48:50+00:00 host agent-api[1]: important lifecycle event",
+            *[
+                f'2026-09-15T15:48:{51 + i:02d}+00:00 host agent-api[1]: INFO: 127.0.0.1:34{i:03d} - "GET /logs?limit=500 HTTP/1.0" 200 OK'
+                for i in range(9)
+            ],
+        ])
+        with patch("modules.log_reader._run_journalctl", new=AsyncMock(return_value=(0, out))):
+            entries = asyncio.run(reader.tail_journal_entries("agent-api", lines=1))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["message"], "important lifecycle event")
 
     def test_tail_journal_entries_passes_until_derived_from_before(self):
         reader = LogReader()
