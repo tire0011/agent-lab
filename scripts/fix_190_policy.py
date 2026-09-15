@@ -37,7 +37,7 @@ policy = policy.replace(
     '',
     1,
 )
-policy_path.write_text(policy)
+policy_path.write_text(policy.rstrip() + '\n')
 
 tests = tests_legacy.read_text()
 
@@ -102,7 +102,7 @@ class GitWorkflowPolicyRegressionTest(unittest.TestCase):
 if 'class GitWorkflowPolicyRegressionTest' not in tests:
     tests += regression
 
-tests_path.write_text(tests)
+tests_path.write_text(tests.rstrip() + '\n')
 
 # Remove temporary wrapper source files after restoring the real files.
 policy_legacy.unlink()
