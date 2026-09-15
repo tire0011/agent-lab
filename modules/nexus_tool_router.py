@@ -90,6 +90,7 @@ TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = {
             "operation": {"type": "string"},
             "reason": {"type": "string"},
             "related_tools": {"type": "array", "items": {"type": "string"}},
+            "arguments": {"type": "object"},
             "error": {"type": "string"},
             "guidance": {"type": "string"},
         },
@@ -287,6 +288,111 @@ def terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# A number the goal names must be consumed by some argument. If one is left
+# over while an integer argument stayed unbound, a value was missed - and the
+# unbound argument would silently fall back to its default.
+_GOAL_NUMBER_PATTERN = re.compile(r"\d+")
+
+
+def _coerce_argument(argument: Any, value: Any) -> tuple[Any, str]:
+    """One resolver-supplied value, checked against its declared schema."""
+    name = getattr(argument, "name", "argument")
+    if (getattr(argument, "type", "") or "").strip().lower() == "integer":
+        if isinstance(value, bool):
+            return None, f"{name} must be an integer"
+        if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+            value = int(value)
+        if not isinstance(value, int):
+            return None, f"{name} must be an integer"
+        minimum = getattr(argument, "minimum", None)
+        maximum = getattr(argument, "maximum", None)
+        if minimum is not None and value < minimum:
+            return None, f"{name} is below its minimum"
+        if maximum is not None and value > maximum:
+            return None, f"{name} is above its maximum"
+        return value, ""
+    if not isinstance(value, str) or not value.strip():
+        return None, f"{name} must be a non-empty string"
+    return value.strip(), ""
+
+
+def _evidenced_in_goal(value: Any, goal: str) -> bool:
+    """Whether *value* was read out of *goal* rather than invented.
+
+    The schema can say a value is well-formed; only the goal can say it is the
+    value that was asked for. ``service="agent-api"`` validates perfectly while
+    the goal said ``llama-server``, so well-formedness alone is not a check.
+    Numbers must match as whole tokens - otherwise ``limit=5`` would find its
+    evidence inside the ``50`` of "the last 50 commits".
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return re.search(rf"(?<!\d){value}(?!\d)", goal) is not None
+    text = str(value).strip().lower()
+    return bool(text) and text in goal.lower()
+
+
+def bind_resolved_arguments(
+    goal: str, spec: Any, raw: Any
+) -> tuple[dict[str, Any] | None, str]:
+    """Argument values a resolved operation may be executed with, or ``None``.
+
+    ``None`` means the values cannot be trusted to represent the goal, and the
+    caller must fall back to asking rather than run something plausible. Every
+    rule here exists because the alternative is evidence that looks right about
+    the wrong subject - which a diagnosis cannot detect (#177 review):
+
+    * an unknown argument name, or a value the declared schema rejects;
+    * a value that does not appear in the goal, i.e. one the resolver invented;
+    * a required argument left unbound;
+    * *nothing* bound for an operation that takes arguments. Binding nothing
+      would mean executing on defaults, and "the goal did not say" is not the
+      same claim as "the goal asked for the default": that is exactly how
+      ``service_status for llama-server`` would have read ``agent-api``;
+    * a number left over in the goal while an integer argument stayed unbound,
+      which says a value was named but not picked up.
+
+    An operation that declares no arguments binds ``{}`` and stays directly
+    executable, since there is nothing about it a goal could disagree with.
+    """
+    by_name = {
+        getattr(argument, "name", ""): argument
+        for argument in (getattr(spec, "arguments", None) or [])
+    }
+    supplied = raw if isinstance(raw, dict) else {}
+    unknown = sorted(name for name in supplied if name not in by_name)
+    if unknown:
+        return None, f"resolver returned arguments that do not exist: {', '.join(unknown[:5])}"
+    if not by_name:
+        return {}, ""
+
+    bound: dict[str, Any] = {}
+    for name, value in supplied.items():
+        coerced, error = _coerce_argument(by_name[name], value)
+        if error:
+            return None, error
+        if not _evidenced_in_goal(coerced, goal):
+            return None, f"the goal does not contain the resolved value for {name}"
+        bound[name] = coerced
+
+    missing = sorted(
+        name for name, argument in by_name.items()
+        if getattr(argument, "required", False) and name not in bound
+    )
+    if missing:
+        return None, f"required arguments were not bound: {', '.join(missing)}"
+    if not bound:
+        return None, "the operation takes arguments and the goal bound none of them"
+
+    leftover = set(_GOAL_NUMBER_PATTERN.findall(goal)) - {str(value) for value in bound.values()}
+    unbound_integers = [
+        name for name, argument in by_name.items()
+        if name not in bound and (getattr(argument, "type", "") or "").lower() == "integer"
+    ]
+    if leftover and unbound_integers:
+        return None, "the goal names a number that no argument accounted for"
+    return bound, ""
+
+
 def resolver_prompt(goal: str, candidates: list[Any]) -> str:
     candidate_summaries = [
         {
@@ -315,6 +421,11 @@ Rules:
 - Choose status "invalid_goal" when the goal is empty, generic, or clearly a placeholder/example rather than a concrete capability request.
 - Choose status "not_found" when none is suitable.
 - If found, set operation to the exact candidate operation name.
+- If found and the goal names concrete values for that candidate's arguments,
+  set "arguments" to exactly those values, keyed by the argument names in that
+  candidate's schema. Copy each value from the goal; never invent one, and
+  never fill one in from a default.
+- Leave "arguments" empty when the goal names no argument values.
 - If invalid_goal, leave operation empty, set error and guidance, and do not treat it as a missing capability.
 - If not_found, leave operation empty and list at most three related candidate names.
 """
@@ -585,12 +696,20 @@ class NexusToolRouter:
         resolver_llm_calls = 0 if provider_used == "none" else 1
         if status == "found" and operation in candidate_by_name:
             selected = candidate_by_name[operation].to_dict()
+            resolved_arguments, binding_reason = bind_resolved_arguments(
+                clean_goal, candidate_by_name[operation], parsed.get("arguments")
+            )
             observation = {
                 "tool": TOOL_FIND_TOOL,
                 "status": "found",
                 "goal": clean_goal,
                 "resolved_tool": operation,
                 "arguments_schema": selected.get("arguments", []),
+                # The values this operation may run with, or None when they
+                # could not be tied back to the goal. A caller that executes
+                # without asking first must consult this, not the schema.
+                "resolved_arguments": resolved_arguments,
+                "arguments_binding_reason": binding_reason,
                 "operation": selected,
                 "reason": reason,
                 "metrics": {
