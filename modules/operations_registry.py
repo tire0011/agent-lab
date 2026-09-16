@@ -192,6 +192,13 @@ class OperationsRegistry:
             "Inbox-Dateiname oder eindeutiges ID-Präfix.",
             required=True,
         )
+        issue_number = OperationArgSpec(
+            "issue_number",
+            "integer",
+            "GitHub-Issue-Nummer.",
+            required=True,
+            minimum=1,
+        )
         diagnostic_tags = [
             "diagnose", "diagnostics", "logs", "log", "status", "lifecycle", "state",
             "task", "experiment", "session", "issue", "pull request", "branch",
@@ -247,6 +254,16 @@ class OperationsRegistry:
                     "github", "lifecycle", "readiness", "ready", "credentials",
                     "token", "identity", "repository", "remote", "runtime",
                     "configuration", "environment", "diagnostics", "blocked",
+                ],
+                mutates_state=False,
+            ),
+            "github_issue": OperationSpec(
+                "github_issue",
+                "Ein GitHub Issue read-only abrufen: Nummer, Titel, Beschreibung, Status, URL und Metadaten.",
+                [issue_number],
+                [
+                    "github", "issue", "read", "fetch", "get", "details",
+                    "specification", "acceptance criteria", "task",
                 ],
                 mutates_state=False,
             ),
@@ -765,3 +782,49 @@ class OperationsRegistry:
                     close()
                 except Exception:  # noqa: BLE001
                     logger.warning("github_status: could not close tracking service", exc_info=True)
+
+    def _op_github_issue(self, args: dict[str, Any]) -> OperationResult:
+        unexpected = sorted(set(args) - {"issue_number"})
+        if unexpected:
+            raise OperationValidationError(
+                f"github_issue kennt diese Argumente nicht: {', '.join(unexpected)}"
+            )
+        issue_number = args.get("issue_number")
+        if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number < 1:
+            raise OperationValidationError("issue_number muss eine positive ganze Zahl sein.")
+
+        started = time.perf_counter()
+        service = self.github_work_tracking_factory(
+            db_path=self.db_path,
+            repo_root=str(self.repo_root),
+        )
+        try:
+            issue = service.get_issue(issue_number)
+            metadata = {
+                key: issue.get(key)
+                for key in (
+                    "number", "title", "state", "url", "author", "labels",
+                    "assignees", "created_at", "updated_at", "body_truncated",
+                )
+            }
+            lines = [
+                f"issue: {redact(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}"
+            ]
+            body = redact(str(issue.get("body") or ""))
+            for index in range(0, len(body), 450):
+                lines.append(f"body[{index // 450 + 1}]: {body[index:index + 450]}")
+            if not body:
+                lines.append("body: ")
+            return OperationResult(
+                operation="github_issue",
+                success=True,
+                output_lines=lines[:80],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+        finally:
+            close = getattr(service, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    logger.warning("github_issue: could not close tracking service", exc_info=True)
