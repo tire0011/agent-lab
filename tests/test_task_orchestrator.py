@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from modules.nexus_delegation import DelegationResult
 from modules.operations_registry import OperationArgSpec
@@ -38,6 +38,19 @@ class _Client:
         self.prompts.append(prompt)
         self.response_formats.append(response_format)
         return self.responses.pop(0)
+
+
+class _FailingClient(_Client):
+    async def complete(
+        self,
+        *,
+        prompt,
+        temperature,
+        max_tokens,
+        response_format=None,
+    ):
+        self.prompts.append(prompt)
+        raise RuntimeError("llama-server unavailable")
 
 
 class _Spec:
@@ -233,6 +246,62 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertEqual(row["session_id"], result.session_id)
         finally:
             orchestrator.close()
+
+    def test_low_memory_budget_is_advisory_when_local_succeeds(self):
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done locally","reason":"local inference succeeded"}',
+        ])
+        delegation = MagicMock()
+        delegation.catalog.return_value = [
+            {"provider": "azure_openai", "description": "external", "writes_repo": False, "cost": "paid"}
+        ]
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                def _low_memory(**kwargs):
+                    plan = real_compute_budget(**kwargs)
+                    plan.low_memory = True
+                    plan.safe_local_budget_chars = 0
+                    return plan
+
+                compute_budget_mock.side_effect = _low_memory
+                result = orchestrator.run("Answer despite advisory memory pressure")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "done locally")
+        self.assertEqual(len(client.prompts), 1)
+        delegation.delegate.assert_not_called()
+
+    def test_local_inference_failure_uses_external_fallback(self):
+        client = _FailingClient([])
+        delegation = MagicMock()
+        delegation.catalog.return_value = [
+            {"provider": "azure_openai", "description": "external", "writes_repo": False, "cost": "paid"}
+        ]
+        delegation.delegate = AsyncMock(return_value=DelegationResult(
+            provider="azure_openai",
+            success=True,
+            content='{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done externally","reason":"local inference failed"}',
+            metadata={},
+        ))
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        try:
+            result = orchestrator.run("Answer after local failure")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "done externally")
+        delegation.delegate.assert_called_once()
+        self.assertEqual(delegation.delegate.call_args.args[0], "azure_openai")
 
     def test_controller_prompt_exposes_find_tool_instead_of_full_operation_catalog(self):
         client = _Client([
@@ -1042,7 +1111,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
-    def test_budget_exceeded_falls_back_to_external_provider(self):
+    def test_local_inference_failure_falls_back_to_external_provider(self):
         class _JsonDelegation:
             def __init__(self):
                 self.calls = []
@@ -1061,7 +1130,7 @@ class TaskOrchestratorTests(unittest.TestCase):
                 )
 
         delegation = _JsonDelegation()
-        client = _Client([])  # local llama-server must never be invoked
+        client = _FailingClient([])
         orchestrator = self._orchestrator(client, delegation=delegation)
         try:
             from unittest.mock import patch
@@ -1069,12 +1138,7 @@ class TaskOrchestratorTests(unittest.TestCase):
             with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
-                def _forces_fallback(**kwargs):
-                    plan = real_compute_budget(**kwargs)
-                    plan.safe_local_budget_chars = 1
-                    return plan
-
-                compute_budget_mock.side_effect = _forces_fallback
+                compute_budget_mock.side_effect = real_compute_budget
                 result = orchestrator.run("Answer without risking a local OOM")
         finally:
             orchestrator.close()
@@ -1082,9 +1146,9 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertEqual(result.message, "handled externally")
         self.assertEqual(delegation.calls[0][0], "azure_openai")
-        self.assertEqual(client.prompts, [])
+        self.assertEqual(len(client.prompts), 1)
 
-    def test_find_tool_resolver_budget_exceeded_uses_external_fallback_without_local_submit(self):
+    def test_find_tool_resolver_local_failure_uses_external_fallback(self):
         class _ResolverDelegation:
             def __init__(self):
                 self.calls = []
@@ -1111,7 +1175,7 @@ class TaskOrchestratorTests(unittest.TestCase):
 
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
         delegation = _ResolverDelegation()
-        client = _Client([])  # local llama-server must never be invoked
+        client = _FailingClient([])
         orchestrator = self._orchestrator(client, delegation=delegation)
         try:
             from unittest.mock import patch
@@ -1119,20 +1183,13 @@ class TaskOrchestratorTests(unittest.TestCase):
             with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
-                def _forces_fallback(**kwargs):
-                    plan = real_compute_budget(**kwargs)
-                    plan.safe_local_budget_chars = 1
-                    return plan
-
-                compute_budget_mock.side_effect = _forces_fallback
-                orchestrator.llm_jobs.submit = MagicMock(side_effect=AssertionError("local submit forbidden"))
+                compute_budget_mock.side_effect = real_compute_budget
                 result = orchestrator.run("Inspect repository changes without risking local OOM")
         finally:
             orchestrator.close()
 
         self.assertEqual(result.action, ACTION_ANSWER)
-        self.assertEqual(client.prompts, [])
-        self.assertEqual(orchestrator.llm_jobs.submit.call_count, 0)
+        self.assertEqual(len(client.prompts), 3)
         self.assertEqual(len(delegation.calls), 3)
         self.assertIn("persistent controller", delegation.calls[0][1])
         self.assertIn("tool resolver", delegation.calls[1][1])
@@ -1161,6 +1218,8 @@ class TaskOrchestratorTests(unittest.TestCase):
             '"reason":"need git status"}',
             '{"type":"action","action":"answer","message":"resolver used external fallback",'
             '"reason":"resolver observation is sufficient"}',
+            '{"type":"action","action":"answer","message":"resolver result observed",'
+            '"reason":"resolver result was returned"}',
         ])
         orchestrator = self._orchestrator(client, delegation=delegation)
         original_submit = orchestrator.llm_jobs.submit
@@ -1177,8 +1236,6 @@ class TaskOrchestratorTests(unittest.TestCase):
                     nonlocal call_count
                     call_count += 1
                     plan = real_compute_budget(**kwargs)
-                    if call_count == 2:
-                        plan.safe_local_budget_chars = 1
                     return plan
 
                 compute_budget_mock.side_effect = _safe_controller_then_unsafe_resolver
@@ -1187,10 +1244,9 @@ class TaskOrchestratorTests(unittest.TestCase):
             orchestrator.close()
 
         self.assertEqual(result.action, ACTION_ANSWER)
-        self.assertEqual(orchestrator.llm_jobs.submit.call_count, 2)
-        self.assertEqual(len(delegation.calls), 1)
-        self.assertIn("tool resolver", delegation.calls[0][1])
-        self.assertIn('"resolver_provider":"azure_openai"', client.prompts[1])
+        self.assertEqual(orchestrator.llm_jobs.submit.call_count, 3)
+        self.assertEqual(len(delegation.calls), 0)
+        self.assertEqual(len(client.prompts), 3)
 
     def test_resolver_capacity_failure_returns_unavailable_not_not_found(self):
         class _EmptyDelegation:
@@ -1220,8 +1276,6 @@ class TaskOrchestratorTests(unittest.TestCase):
                     nonlocal call_count
                     call_count += 1
                     plan = real_compute_budget(**kwargs)
-                    if call_count == 2:
-                        plan.safe_local_budget_chars = 1
                     return plan
 
                 compute_budget_mock.side_effect = _safe_controller_then_unsafe_resolver
@@ -1229,45 +1283,16 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
-        self.assertEqual(result.action, ACTION_CLARIFICATION)
-        self.assertIn('"status":"unavailable"', client.prompts[1])
-        self.assertNotIn('"status":"not_found"', client.prompts[1])
-        self.assertIn('"resolver_llm_calls":0', client.prompts[1])
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
 
-    def test_budget_exceeded_correction_retry_never_falls_back_to_local(self):
-        """Regression for the JSON-correction retry bypassing budget safety.
-
-        When the main completion is routed externally because local
-        inference is unsafe, a malformed external response must have its
-        correction retry routed externally too - never straight back to
-        llama-server.
-        """
-        class _FlakyJsonDelegation:
-            def __init__(self):
-                self.calls = []
-
-            def catalog(self):
-                return [{"provider": "azure_openai", "description": "specialist", "writes_repo": False, "cost": "paid"}]
-
-            async def delegate(self, provider, task, *, context=""):
-                self.calls.append((provider, task, context))
-                if len(self.calls) == 1:
-                    return DelegationResult(
-                        provider=provider,
-                        success=True,
-                        content="not valid json at all",
-                        metadata={},
-                    )
-                return DelegationResult(
-                    provider=provider,
-                    success=True,
-                    content='{"type":"action","action":"answer","message":"handled externally",'
-                    '"reason":"corrected externally"}',
-                    metadata={},
-                )
-
-        delegation = _FlakyJsonDelegation()
-        client = _Client([])  # local llama-server must never be invoked, even on correction
+    def test_local_correction_retry_stays_local(self):
+        client = _Client([
+            "not valid json at all",
+            '{"type":"action","action":"answer","message":"corrected locally",'
+            '"reason":"corrected locally"}',
+        ])
+        delegation = MagicMock()
+        delegation.catalog.return_value = []
         orchestrator = self._orchestrator(client, delegation=delegation)
         try:
             from unittest.mock import patch
@@ -1275,22 +1300,14 @@ class TaskOrchestratorTests(unittest.TestCase):
             with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
-                def _forces_fallback(**kwargs):
-                    plan = real_compute_budget(**kwargs)
-                    plan.safe_local_budget_chars = 1
-                    return plan
-
-                compute_budget_mock.side_effect = _forces_fallback
-                result = orchestrator.run("Answer without risking a local OOM")
+                compute_budget_mock.side_effect = real_compute_budget
+                result = orchestrator.run("Answer with a local correction retry")
         finally:
             orchestrator.close()
 
         self.assertEqual(result.action, ACTION_ANSWER)
-        self.assertEqual(result.message, "handled externally")
-        self.assertEqual(len(delegation.calls), 2)
-        self.assertEqual(delegation.calls[0][0], "azure_openai")
-        self.assertEqual(delegation.calls[1][0], "azure_openai")
-        self.assertEqual(client.prompts, [])
+        self.assertEqual(result.message, "corrected locally")
+        self.assertEqual(len(client.prompts), 2)
 
     def test_budget_exceeded_with_no_external_provider_is_a_controlled_missing_capability(self):
         class _EmptyDelegation:

@@ -14,11 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from modules.nexus_task_store import (
-    STATUS_FAILED,
-    TERMINAL_REASON_TURN_FAILED,
-    NexusTaskStore,
-)
+from modules.nexus_task_store import STATUS_FAILED, NexusTaskStore
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     NexusTaskOrchestrator,
@@ -164,16 +160,20 @@ class ControllerSessionHeartbeatTests(unittest.TestCase):
 
         orchestrator = self._orchestrator(_Boom())
 
-        with self.assertRaises(Exception):
-            orchestrator.run("inspect something")
+        result = orchestrator.run("inspect something")
 
         session = self.store.get(self._only_session_id())
-        self.assertEqual(session.status, STATUS_FAILED)
-        self.assertEqual(session.terminal_reason, TERMINAL_REASON_TURN_FAILED)
+        self.assertEqual(result.action, "missing_capability")
+        self.assertEqual(session.status, "blocked_missing_capability")
+        self.assertEqual(session.terminal_reason, "missing_capability")
         self.assertIsNone(session.last_heartbeat_at)
-        events = self.store.recent_events(session.id, kind=TERMINAL_REASON_TURN_FAILED)
-        self.assertEqual(len(events), 1)
-        self.assertIn("RuntimeError", events[0]["content"])
+        row = self.store._conn.execute(
+            "SELECT outcome, detail FROM nexus_controller_turns "
+            "WHERE session_id=? ORDER BY id DESC LIMIT 1",
+            (session.id,),
+        ).fetchone()
+        self.assertEqual(row["outcome"], "inference_failed")
+        self.assertIn("RuntimeError", row["detail"])
         # Nothing left for the reaper to find, so nothing to misclassify later.
         self.assertEqual(self.store.liveness()["claims"], [])
         self.assertEqual(self.store.reconcile_stale_heartbeats(60), [])
