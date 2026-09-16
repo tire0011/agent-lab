@@ -120,7 +120,13 @@ class GitHubCIAuthorityPolicyTests(unittest.TestCase):
             branch_name="nexus/134-test",
         )
 
-    def _request(self, *, conclusion: str = "success", target_sha: str = "base-sha"):
+    def _request(
+        self,
+        *,
+        conclusion: str = "success",
+        target_sha: str = "base-sha",
+        event: str = "push",
+    ):
         def fake(method, path, payload=None):
             if path.endswith("/commits/checkpoint-sha"):
                 return {"parents": [{"sha": "base-sha"}]}
@@ -132,7 +138,7 @@ class GitHubCIAuthorityPolicyTests(unittest.TestCase):
                         {
                             "id": 42,
                             "head_sha": "checkpoint-sha",
-                            "event": "push",
+                            "event": event,
                             "status": "completed",
                             "conclusion": conclusion,
                             "html_url": "https://example.invalid/run/42",
@@ -156,7 +162,10 @@ class GitHubCIAuthorityPolicyTests(unittest.TestCase):
         self.assertEqual(result.commit_sha, "checkpoint-sha")
         self.assertEqual(result.conclusion, "success")
 
-    def test_moved_target_branch_requires_integration_fallback(self):
+    def test_repaired_checkpoint_with_non_main_parent_is_still_authoritative(self):
+        # A repair checkpoint's direct parent is the previous checkpoint
+        # commit, not `main` - that must never block recognizing CI for
+        # the exact checkpoint SHA (#210).
         with (
             patch.object(self.service, "ensure_for_experiment", return_value=self.ref),
             patch.object(self.service, "_request", side_effect=self._request(target_sha="new-main-sha")),
@@ -165,8 +174,21 @@ class GitHubCIAuthorityPolicyTests(unittest.TestCase):
                 "exp", start_timeout_seconds=0, completion_timeout_seconds=0, poll_interval_seconds=0.01
             )
 
-        self.assertEqual(result.status, "unavailable")
-        self.assertIn("target branch moved", result.reason)
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.commit_sha, "checkpoint-sha")
+        self.assertEqual(result.conclusion, "success")
+
+    def test_pull_request_event_ci_success_is_authoritative(self):
+        with (
+            patch.object(self.service, "ensure_for_experiment", return_value=self.ref),
+            patch.object(self.service, "_request", side_effect=self._request(event="pull_request")),
+        ):
+            result = self.service.wait_for_ci(
+                "exp", start_timeout_seconds=0, completion_timeout_seconds=0, poll_interval_seconds=0.01
+            )
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.commit_sha, "checkpoint-sha")
 
     def test_cancelled_ci_is_not_authoritative_failure(self):
         with (
