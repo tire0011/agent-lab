@@ -59,7 +59,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from modules import central_logging
+from modules import central_logging, verification_progress
 from modules.heartbeat import (
     heartbeat_age_seconds,
     parse_timestamp,
@@ -1030,14 +1030,47 @@ class NexusDiagnostics:
         }
 
     def _progress(self, state: LifecycleState, session: sqlite3.Row | None) -> ProgressVerdict:
+        session_heartbeat = _column(session, "last_heartbeat_at") if session else None
+        test_heartbeat = self._attach_test_progress(state)
+        # #209: while local verification is running, the test heartbeat is
+        # the strongest liveness signal there is - a suite can run for an
+        # hour between anything else being written, and judging that silence
+        # by the session heartbeat alone is what made a healthy run look
+        # dead. Newest of the two wins; both are heartbeat-grade evidence.
+        newest_heartbeat, _ = _newest(session_heartbeat, test_heartbeat)
         return assess_progress(
             state.lifecycle,
-            last_heartbeat_at=_column(session, "last_heartbeat_at") if session else None,
+            last_heartbeat_at=newest_heartbeat,
             last_log_at=self._last_log_timestamp(state.correlation_ids),
             updated_at=state.updated_at or state.created_at,
             stale_after_seconds=self.stale_after_seconds,
             now=self._now(),
         )
+
+    def _attach_test_progress(self, state: LifecycleState) -> str | None:
+        """Summarize the live test run, if any, and return its heartbeat time.
+
+        Only the summary is attached - current test, counts, last progress -
+        never the per-test entries themselves, which stay in their own log
+        precisely so this view does not drown in them.
+        """
+        experiment_id = state.correlation_ids.get("experiment_id")
+        if not experiment_id or not central_logging.is_safe_log_id(experiment_id):
+            return None
+        heartbeat = verification_progress.read_heartbeat(self.log_dir, experiment_id)
+        if not heartbeat:
+            return None
+        last_progress_at = heartbeat.get("last_progress_at")
+        state.related["test_progress"] = {
+            "current_test": heartbeat.get("current_test"),
+            "tests_completed": heartbeat.get("tests_completed"),
+            "tests_total": heartbeat.get("tests_total"),
+            "last_progress_at": last_progress_at,
+            "process_alive": heartbeat.get("process_alive"),
+            "pid": heartbeat.get("pid"),
+            "started_at": heartbeat.get("started_at"),
+        }
+        return last_progress_at if isinstance(last_progress_at, str) else None
 
     # ------------------------------------------------------------------
     # Logs

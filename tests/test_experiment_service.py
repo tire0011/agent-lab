@@ -21,6 +21,17 @@ from modules.codex_worker import CodexResult
 from modules.verification_runner import run_verification_test
 
 _ORIGINAL_SUBPROCESS_RUN = subprocess.run
+
+
+def _fixed_timeout_fallback():
+    """Run verification on the pre-#209 fixed-timeout path.
+
+    The progress watchdog is the default, and it drives the test subprocess
+    through ``Popen`` rather than ``subprocess.run``. Tests that assert on
+    the fixed timeout, its backoff, or the ``subprocess.run`` call itself
+    are asserting that fallback's behaviour, so they select it explicitly.
+    """
+    return patch.dict(os.environ, {"NEXUS_TEST_WATCHDOG": "0"})
 from modules.experiment_service import (
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
@@ -508,10 +519,23 @@ class ExperimentServiceTestCase(unittest.TestCase):
             self.implementation_worker.run.call_args_list[1].kwargs["task"],
         )
 
-    def test_default_test_command_uses_quiet_unittest_discover(self):
+    def test_default_test_command_uses_verbose_unittest_discover(self):
+        # #209: the watchdog reads per-test progress out of unittest's
+        # verbose output, so the default local command is now "-v". "-q"
+        # prints nothing per test and would leave the watchdog blind.
         self.service.test_python_executable = sys.executable
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
+        self.assertEqual(
+            result.test_command,
+            [self.service.test_python_executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+        )
+
+    def test_quiet_unittest_discover_is_used_when_the_watchdog_is_disabled(self):
+        self.service.test_python_executable = sys.executable
+        experiment = self.service.create_experiment(goal="g")
+        with _fixed_timeout_fallback():
+            result = self.service.run_experiment(experiment.id)
         self.assertEqual(
             result.test_command,
             [self.service.test_python_executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
@@ -530,9 +554,9 @@ class ExperimentServiceTestCase(unittest.TestCase):
         custom_command = ["python", "-m", "pytest", "tests/test_placeholder.py"]
         with patch.dict(
             "modules.experiment_service._TEST_COMMANDS",
-            {"unittest-discover": custom_command},
+            {"unittest-discover": custom_command, "unittest-discover-verbose": custom_command},
             clear=False,
-        ):
+        ), _fixed_timeout_fallback():
             experiment = self.service.create_experiment(goal="g")
             result = self.service.run_experiment(experiment.id)
 
@@ -577,7 +601,8 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
         mock_run.side_effect = fake_run
         experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
+        with _fixed_timeout_fallback():
+            result = self.service.run_experiment(experiment.id)
 
         test_calls = [
             c for c in mock_run.call_args_list
@@ -611,7 +636,8 @@ class ExperimentServiceTestCase(unittest.TestCase):
             },
         ):
             experiment = self.service.create_experiment(goal="g")
-            self.service.run_experiment(experiment.id)
+            with _fixed_timeout_fallback():
+                self.service.run_experiment(experiment.id)
 
         test_calls = [
             c for c in mock_run.call_args_list
@@ -2417,10 +2443,56 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         status_change = [e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_FAILED]
         self.assertTrue(status_change, "expected a status_forced -> failed entry")
 
+    def test_local_verification_writes_a_dedicated_per_test_log(self):
+        """#209: per-test detail is durable, and kept out of the unified feed."""
+        from modules import central_logging, verification_progress
+
+        experiment = self.service.create_experiment(goal="g")
+        result = self.service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+
+        records = [
+            json.loads(line)
+            for line in verification_progress.progress_log_path(self.log_dir, experiment.id)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line
+        ]
+        self.assertTrue(records, "no per-test records were written")
+        self.assertTrue(any(r["event"] == "test_started" for r in records))
+        completions = [r for r in records if r["event"] == "test_completed"]
+        self.assertTrue(completions)
+        self.assertTrue(all(r["duration_ms"] is not None for r in completions))
+
+        # The experiment's own log carries one bounded summary, never the
+        # per-test entries - that separation is the point of the dedicated log.
+        events = [entry["event"] for entry in self._read_log(experiment.id)]
+        self.assertIn("tests_progress_final", events)
+        self.assertNotIn("test_completed", events)
+
+        unified = central_logging.read_all_log_entries(str(self.log_dir))
+        self.assertNotIn("test_completed", [entry["event"] for entry in unified])
+
+    def test_finished_local_verification_leaves_no_live_heartbeat(self):
+        from modules import verification_progress
+
+        experiment = self.service.create_experiment(goal="g")
+        self.service.run_experiment(experiment.id)
+
+        self.assertIsNone(
+            verification_progress.read_heartbeat(self.log_dir, experiment.id),
+            "a finished run must not still look alive to the global heartbeat",
+        )
+
     def test_test_run_timeout_is_not_classified_as_a_test_failure(self):
         """A verification test run that hits the subprocess timeout must be
         reported as its own ``test_timeout`` case, never conflated with a
-        normal ``tests_failed`` (exit_code != 0) outcome."""
+        normal ``tests_failed`` (exit_code != 0) outcome.
+
+        Exercises the fixed-timeout fallback (``NEXUS_TEST_WATCHDOG=0``);
+        the progress watchdog that replaced it as the default is covered by
+        ``tests/test_issue_209_test_watchdog.py``.
+        """
 
         def _run_or_time_out(cmd, *args, **kwargs):
             if isinstance(cmd, list) and "unittest" in cmd and "discover" in cmd:
@@ -2428,7 +2500,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
             return _ORIGINAL_SUBPROCESS_RUN(cmd, *args, **kwargs)
 
         experiment = self.service.create_experiment(goal="g")
-        with patch("subprocess.run", side_effect=_run_or_time_out):
+        with _fixed_timeout_fallback(), patch("subprocess.run", side_effect=_run_or_time_out):
             result = self.service.run_experiment(experiment.id)
 
         self.assertEqual(result.status, STATUS_TIMED_OUT)
@@ -2481,7 +2553,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         self.assertEqual(service._get_test_timeout_seconds(), 10)
 
         experiment = service.create_experiment(goal="g")
-        with patch("subprocess.run", side_effect=self._always_time_out):
+        with _fixed_timeout_fallback(), patch("subprocess.run", side_effect=self._always_time_out):
             result = service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_TIMED_OUT)
 
@@ -2504,7 +2576,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         service = self._make_timeout_service(db_path)
 
         experiment = service.create_experiment(goal="g")
-        with patch("subprocess.run", side_effect=self._always_time_out):
+        with _fixed_timeout_fallback(), patch("subprocess.run", side_effect=self._always_time_out):
             service.run_experiment(experiment.id)
         self.assertEqual(service._get_test_timeout_seconds(), 20)
 
@@ -2514,7 +2586,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         self.assertEqual(other_service._get_test_timeout_seconds(), 20)
 
         experiment2 = other_service.create_experiment(goal="g2")
-        with patch("subprocess.run", side_effect=self._always_time_out):
+        with _fixed_timeout_fallback(), patch("subprocess.run", side_effect=self._always_time_out):
             other_service.run_experiment(experiment2.id)
         # 20 * 2.0 = 40, capped at 25.
         self.assertEqual(other_service._get_test_timeout_seconds(), 25)
@@ -2525,7 +2597,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
         for i in range(5):
             experiment = service.create_experiment(goal=f"g{i}")
-            with patch("subprocess.run", side_effect=self._always_time_out):
+            with _fixed_timeout_fallback(), patch("subprocess.run", side_effect=self._always_time_out):
                 result = service.run_experiment(experiment.id)
             self.assertEqual(result.status, STATUS_TIMED_OUT)
             self.assertLessEqual(service._get_test_timeout_seconds(), 25)

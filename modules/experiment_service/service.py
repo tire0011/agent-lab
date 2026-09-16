@@ -30,7 +30,8 @@ from modules.run_store import (
     list_activity,
     set_setting,
 )
-from modules.verification_runner import run_verification_test
+from modules.verification_progress import VerificationProgressTracker
+from modules.verification_runner import VerificationWatchdogConfig, run_verification_test
 
 from .git_utils import _run_git
 from .models import (
@@ -101,8 +102,27 @@ _TEST_TIMEOUT_SETTING_KEY = "verification_test_timeout_seconds"
 # without copying a .venv or installing any package into the worktree.
 _TEST_COMMANDS: dict[str, list[str]] = {
     "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+    # Verbose variant used whenever the progress watchdog runs (#209). The
+    # per-test lines "-v" emits *are* the progress signal: "-q" prints
+    # nothing per test, so a watchdog watching a quiet run would be blind
+    # and could only fall back to "the process is still alive".
+    "unittest-discover-verbose": [
+        "{python}", "-m", "unittest", "discover", "-s", "tests", "-v",
+    ],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
+_WATCHDOG_TEST_COMMAND_KEY = "unittest-discover-verbose"
+
+# Last observed size of the suite, so "842 / 1873" can be reported while the
+# next run is still going. unittest only announces its total when it is
+# already finished, which is too late to be a progress signal.
+_TEST_TOTAL_SETTING_KEY = "verification_test_count"
+
+# The watchdog replaces the fixed timeout for local verification. The switch
+# exists so an operator can fall back to the old fixed-timeout behaviour
+# without a deploy if the progress watching itself ever misbehaves.
+_WATCHDOG_ENV_VAR = "NEXUS_TEST_WATCHDOG"
+_WATCHDOG_DISABLED_VALUES = {"0", "false", "no", "off"}
 
 # Default interpreter used to run tests inside an experiment worktree.
 # Using the main repository's own virtualenv interpreter lets a fresh git
@@ -112,6 +132,23 @@ _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
 # ``python -m unittest``, since Python resolves ``tests/`` relative to cwd
 # while the interpreter and its installed packages come from the venv path.
 _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
+
+
+def _progress_fields(progress: dict[str, Any]) -> dict[str, Any]:
+    """The few progress fields worth carrying into the experiment log.
+
+    Deliberately a small fixed set: the per-test detail lives in the
+    dedicated test log, and copying it here is exactly the flooding #209
+    asks to avoid.
+    """
+    return {
+        "current_test": progress.get("current_test"),
+        "tests_completed": progress.get("tests_completed"),
+        "tests_total": progress.get("tests_total"),
+        "last_progress_at": progress.get("last_progress_at"),
+        "process_alive": progress.get("process_alive"),
+    }
+
 
 class ExperimentService:
     """Orchestrates one bounded self-development experiment at a time.
@@ -290,6 +327,53 @@ class ExperimentService:
                 updated_at=_utcnow_iso(),
             )
         return next_timeout
+
+    def _test_progress_reporter(self, elog: ExperimentLogger):
+        """One bounded progress line per watchdog tick, not one per test.
+
+        This is what makes the experiment's own log (and anything reading
+        it as a heartbeat) show that verification is alive and advancing,
+        without copying thousands of per-test entries into it (#209).
+        """
+
+        def report(snapshot) -> None:
+            elog.info(
+                "verifying", "tests_progress",
+                (
+                    f"Verification tests in progress: {snapshot.tests_completed}"
+                    + (f"/{snapshot.tests_total}" if snapshot.tests_total else "")
+                    + " completed"
+                ),
+                **_progress_fields(snapshot.to_dict()),
+            )
+
+        return report
+
+    def _test_watchdog_enabled(self) -> bool:
+        raw = (os.environ.get(_WATCHDOG_ENV_VAR) or "").strip().lower()
+        return raw not in _WATCHDOG_DISABLED_VALUES
+
+    def _get_expected_test_total(self) -> int | None:
+        """How many tests the suite had last time it finished, if known."""
+        with self._lock:
+            raw = get_setting(self._conn, _TEST_TOTAL_SETTING_KEY)
+        try:
+            value = int(str(raw))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _remember_test_total(self, total: object) -> None:
+        try:
+            value = int(str(total))
+        except (TypeError, ValueError):
+            return
+        if value <= 0:
+            return
+        with self._lock:
+            set_setting(
+                self._conn, _TEST_TOTAL_SETTING_KEY, str(value), updated_at=_utcnow_iso()
+            )
 
     # ------------------------------------------------------------------
     # create_experiment
@@ -1067,7 +1151,10 @@ class ExperimentService:
         else:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
-        test_command_key = _DEFAULT_TEST_COMMAND_KEY
+        watchdog_enabled = self._test_watchdog_enabled()
+        test_command_key = (
+            _WATCHDOG_TEST_COMMAND_KEY if watchdog_enabled else _DEFAULT_TEST_COMMAND_KEY
+        )
         test_command_template = _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
@@ -1103,28 +1190,67 @@ class ExperimentService:
             )
         else:
             test_timeout_seconds = self._get_test_timeout_seconds()
+            watchdog = VerificationWatchdogConfig.from_env() if watchdog_enabled else None
+            tracker = None
+            if watchdog is not None:
+                # Keyed by experiment id and written under <log_dir>/tests/,
+                # so per-test entries stay out of the unified Nexus feed
+                # while still being joinable with this experiment's log.
+                tracker = VerificationProgressTracker(
+                    log_dir=self.experiment_log_dir,
+                    key=experiment_id,
+                    tests_total=self._get_expected_test_total(),
+                )
             elog.info(
                 "verifying", "local_tests_fallback_started",
                 "Running local verification because matching GitHub CI was unavailable",
                 command=test_command, cwd=worktree_path,
-                timeout_seconds=test_timeout_seconds,
+                timeout_seconds=None if watchdog else test_timeout_seconds,
+                stall_seconds=watchdog.stall_seconds if watchdog else None,
+                safety_cap_seconds=watchdog.safety_cap_seconds if watchdog else None,
             )
             elog.info(
                 "verifying", "tests_started",
                 "Running verification test command",
                 command=test_command, cwd=worktree_path,
-                timeout_seconds=test_timeout_seconds,
+                timeout_seconds=None if watchdog else test_timeout_seconds,
             )
-            test_run = run_verification_test(
-                test_command,
-                cwd=worktree_path,
-                timeout_seconds=test_timeout_seconds,
-            )
+            try:
+                test_run = run_verification_test(
+                    test_command,
+                    cwd=worktree_path,
+                    timeout_seconds=None if watchdog else test_timeout_seconds,
+                    watchdog=watchdog,
+                    tracker=tracker,
+                    on_progress=(
+                        self._test_progress_reporter(elog) if watchdog else None
+                    ),
+                )
+            finally:
+                if tracker is not None:
+                    # Nothing may read this heartbeat as live once the run
+                    # is over, whatever the outcome was.
+                    tracker.clear_heartbeat()
             test_exit_code = test_run.exit_code
             test_output = test_run.output
             test_timed_out = test_run.timed_out
+            if test_run.progress:
+                self._remember_test_total(test_run.progress.get("tests_total"))
+                elog.info(
+                    "verifying", "tests_progress_final",
+                    "Verification test progress at end of run",
+                    **_progress_fields(test_run.progress),
+                )
+            if test_run.stalled:
+                elog.error(
+                    "verifying", "tests_stalled",
+                    f"Local verification stopped: {test_run.stall_reason}",
+                    stall_reason=test_run.stall_reason,
+                    diagnostics=test_run.diagnostics,
+                    **_progress_fields(test_run.progress or {}),
+                )
 
-        if use_local_tests and test_run.timed_out:
+        if use_local_tests and test_run.timed_out and not test_run.stalled:
             elog.log_process(
                 "verifying", "test_timeout",
                 "Test command timed out",
@@ -1147,7 +1273,10 @@ class ExperimentService:
                 "Exception while running test command", exc=test_run.exception,
                 command=sanitize_command(test_command), cwd=worktree_path,
             )
-        elif use_local_tests:
+        elif use_local_tests and not test_run.stalled:
+            # A stalled run never "finished": it already logged tests_stalled
+            # with the diagnostic, and a tests_completed entry alongside it
+            # would claim the suite reached an exit code it never reached.
             elog.log_process(
                 "verifying", "tests_completed",
                 f"Test command finished with exit code {test_exit_code}",
@@ -1173,7 +1302,17 @@ class ExperimentService:
             # into "tests failed". The distinct "test_timeout" event was
             # already logged above when the TimeoutExpired was caught.
             final_status = STATUS_TIMED_OUT
-            error = "tests timed out (no exit code, test command did not finish within the time limit)"
+            if getattr(test_run, "stalled", False):
+                # #209: the run was stopped for lack of progress, not for
+                # exceeding a fixed budget. Saying "timed out" here would
+                # hide the one fact that makes it actionable - which test
+                # was running when progress stopped.
+                error = (
+                    "tests stopped without finishing: "
+                    f"{test_run.stall_reason}\n{test_run.diagnostics or ''}"
+                ).strip()
+            else:
+                error = "tests timed out (no exit code, test command did not finish within the time limit)"
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"
