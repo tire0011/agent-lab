@@ -158,6 +158,23 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
             "experiment_id": {"type": ["string", "null"]},
             "message": {"type": "string"},
             "reason": {"type": "string"},
+            "information_gap": {"type": "string"},
+            "gap_kind": {
+                "type": "string",
+                "enum": [
+                    "user_intent",
+                    "user_preference",
+                    "user_authorization",
+                    "external_information",
+                    "missing_capability",
+                ],
+            },
+            "evidence_event_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "maxItems": 10,
+            },
+            "why_human_required": {"type": "string"},
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -776,6 +793,24 @@ class NexusTaskOrchestrator:
             if action not in _FINAL_ACTIONS:
                 raise TaskOrchestratorError(f"unknown final action {action!r}")
 
+            terminal_rejection = self._validate_evidence_sensitive_terminal(
+                session_id=session.id,
+                action=action,
+                decision=decision,
+                observations=observations,
+            )
+            if terminal_rejection is not None:
+                event_id = self.task_store.append_event(
+                    session.id,
+                    role="system",
+                    kind="terminal_decision_rejected",
+                    content=json.dumps(terminal_rejection, separators=(",", ":")),
+                    metadata={"controller_action": action},
+                )
+                terminal_rejection["event_id"] = event_id
+                observations.append(terminal_rejection)
+                continue
+
             experiment_id = decision.get("experiment_id")
             if action == ACTION_RESUME_EXPERIMENT:
                 if not experiment_id:
@@ -1257,7 +1292,8 @@ Controller-native capabilities:
 {{"action":"command","command":"<shell command>","reason":"..."}}
 {{"action":"python_run","script":"<repo-relative .py>","argv":["--version"],"reason":"..."}}
 Final action:
-{{"action":"new_experiment|resume_experiment|answer|missing_capability|clarification","experiment_id":null,"message":"...","reason":"..."}}
+{{"action":"new_experiment|resume_experiment|answer","experiment_id":null,"message":"...","reason":"..."}}
+{{"action":"clarification|missing_capability","message":"...","reason":"...","information_gap":"...","gap_kind":"user_intent|user_preference|user_authorization|external_information|missing_capability","evidence_event_ids":[123],"why_human_required":"..."}}
 
 Model policy:
 - `goal` for `find_tool` must describe the concrete capability needed for the current task; it must not be a generic placeholder or copied verbatim from an example.
@@ -1281,8 +1317,8 @@ Rules:
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
-- Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply.
-- If a capability is genuinely missing, choose missing_capability and describe exactly what is needed.
+- Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
+- If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
 - When an observation reports duplicate_tool_call, non_progressing_cycle or retry_reason_required, do not repeat it. Choose a materially different tool or a controlled final action.
 - Return JSON only.
@@ -1371,6 +1407,157 @@ Rules:
             pass
         payload = f"{current_input.strip()}\0{repo_state}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _is_resolution_evidence(observation: dict[str, Any]) -> bool:
+        """Whether an observation proves that Nexus actually tried to resolve a gap."""
+        tool = str(observation.get("tool", "")).strip()
+        if not tool:
+            return False
+        if tool == TOOL_FIND_TOOL:
+            return str(observation.get("status", "")).lower() in {
+                "not_found", "unavailable", "invalid_goal",
+            }
+        result = observation.get("result")
+        if isinstance(result, dict):
+            return True
+        return bool(
+            observation.get("error")
+            or observation.get("success") is False
+            or str(observation.get("status", "")).lower()
+            in {"failed", "failure", "error", "unavailable", "not_found"}
+            or tool in {"memory_search", "delegate", ACTION_COMMAND, TOOL_PYTHON_RUN}
+        )
+
+    @staticmethod
+    def _supports_missing_capability(observation: dict[str, Any]) -> bool:
+        if observation.get("tool") == TOOL_FIND_TOOL:
+            return str(observation.get("status", "")).lower() in {
+                "not_found", "unavailable",
+            }
+        result = observation.get("result")
+        if isinstance(result, dict) and result.get("success") is False:
+            return True
+        return bool(
+            observation.get("error")
+            or observation.get("success") is False
+            or str(observation.get("status", "")).lower()
+            in {"failed", "failure", "error", "unavailable", "not_found"}
+        )
+
+    def _terminal_evidence(
+        self,
+        session_id: str,
+        observations: list[dict[str, Any]],
+        requested_event_ids: list[int],
+    ) -> list[dict[str, Any]]:
+        """Return real in-run/persisted observations, optionally limited to cited IDs."""
+        by_id: dict[int, dict[str, Any]] = {}
+        uncited_current: list[dict[str, Any]] = []
+        for observation in observations:
+            event_id = observation.get("event_id")
+            if isinstance(event_id, int):
+                by_id[event_id] = observation
+            else:
+                uncited_current.append(observation)
+        for event in self.task_store.recent_events(session_id, role="tool", limit=50):
+            try:
+                payload = json.loads(event.get("content") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            payload = dict(payload)
+            payload["event_id"] = int(event["id"])
+            by_id.setdefault(int(event["id"]), payload)
+        if requested_event_ids:
+            return [by_id[event_id] for event_id in requested_event_ids if event_id in by_id]
+        return [*by_id.values(), *uncited_current]
+
+    @staticmethod
+    def _evidence_matches_gap(observation: dict[str, Any], information_gap: str) -> bool:
+        gap_tokens = tool_search_tokens(information_gap)
+        if not gap_tokens:
+            return False
+        observation_tokens = tool_search_tokens(
+            json.dumps(observation, ensure_ascii=False, sort_keys=True)
+        )
+        return bool(gap_tokens & observation_tokens)
+
+    def _validate_evidence_sensitive_terminal(
+        self,
+        *,
+        session_id: str,
+        action: str,
+        decision: dict[str, Any],
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Reject unsupported negative terminal claims while preserving user-only questions."""
+        if action not in {ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY}:
+            return None
+
+        gap_kind = str(decision.get("gap_kind", "")).strip().lower()
+        information_gap = str(
+            decision.get("information_gap")
+            or decision.get("message")
+            or decision.get("reason")
+            or ""
+        ).strip()[:1000]
+        why_human_required = str(decision.get("why_human_required", "")).strip()
+        user_only_kinds = {"user_intent", "user_preference", "user_authorization"}
+        if action == ACTION_CLARIFICATION and gap_kind in user_only_kinds:
+            if why_human_required:
+                return None
+            rejection_reason = "A user-only clarification must explain why only the user can decide."
+        else:
+            raw_ids = decision.get("evidence_event_ids")
+            requested_ids = [
+                value for value in (raw_ids if isinstance(raw_ids, list) else [])[:10]
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            ]
+            cited_evidence = self._terminal_evidence(session_id, observations, requested_ids)
+            evidence = [
+                item for item in cited_evidence
+                if self._evidence_matches_gap(item, information_gap)
+            ]
+            supported = (
+                any(self._supports_missing_capability(item) for item in evidence)
+                if action == ACTION_MISSING_CAPABILITY
+                else any(self._is_resolution_evidence(item) for item in evidence)
+            )
+            candidates = self.tool_router.candidate_operations(information_gap)
+            # An empty result from the authoritative read-only catalog is itself
+            # evidence that this capability class is not currently exposed.
+            catalog_rules_out_capability = action == ACTION_MISSING_CAPABILITY and not candidates
+            if supported or catalog_rules_out_capability or (
+                action == ACTION_CLARIFICATION and not candidates and not gap_kind
+            ):
+                return None
+            if requested_ids and len(evidence) != len(set(requested_ids)):
+                rejection_reason = "The cited evidence_event_ids do not all identify persisted tool observations."
+            elif candidates:
+                rejection_reason = (
+                    "The terminal claim is unsupported: a plausible read-only capability remains "
+                    "discoverable and no relevant attempted resolution was observed."
+                )
+            else:
+                rejection_reason = (
+                    "The terminal claim is unsupported by an actual tool, memory, or capability-search observation."
+                )
+
+        candidate_names = [
+            spec.name for spec in self.tool_router.candidate_operations(information_gap)
+        ][:3]
+        return {
+            "event": "terminal_decision_rejected",
+            "terminal_action": action,
+            "information_gap": information_gap,
+            "gap_kind": gap_kind or "unspecified",
+            "reason": rejection_reason[:1000],
+            "candidate_operations": candidate_names,
+            "retryable": True,
+            "recommended_next_action": TOOL_FIND_TOOL if candidate_names else "memory_search",
+        }
 
     def _loop_limit_result(
         self,
