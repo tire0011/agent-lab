@@ -734,22 +734,30 @@ class GitHubWorkTrackingService:
                 reason="experiment checkpoint SHA is missing",
             )
 
-        # The checkpoint's direct parent is recorded purely as informational
-        # evidence (used later to decide whether a *persisted* verdict can
-        # be reused without a live lookup, see recorded_ci_for). Repair
-        # commits legitimately build on the previous checkpoint commit
-        # rather than on `main` (#210), so a mismatch here must never block
-        # recognizing authoritative CI for the exact checkpoint SHA - only
-        # the later integration/adoption step cares whether the current
-        # base still matches.
-        checkpoint_base = ""
+        # The base persisted alongside a CI verdict must be the value
+        # adoption will later compare against - the target branch's own
+        # head SHA - not the checkpoint commit's direct git parent. A
+        # repair checkpoint's parent is the previous checkpoint commit,
+        # not `main` (#210); persisting that as `base_sha` would make
+        # `recorded_ci_for(checkpoint_sha, base_sha=integration_base)`
+        # reject a perfectly reusable verdict after every restart, even
+        # when `main` never moved. Recognizing checkpoint CI itself must
+        # never depend on this lookup succeeding or matching anything, so
+        # a failure here only means the verdict is persisted without a
+        # base (and so is not reused from the store later) - it never
+        # blocks the live CI check below.
+        integration_base = ""
         try:
-            checkpoint = self._request("GET", f"/repos/{self.repository}/commits/{sha}")
-            parents = checkpoint.get("parents") or []
-            checkpoint_base = str((parents[0] if parents else {}).get("sha") or "").strip()
+            target = self._request(
+                "GET",
+                f"/repos/{self.repository}/git/ref/heads/{urllib.parse.quote(self.target_branch, safe='')}",
+            )
+            integration_base = str(((target.get("object") or {}).get("sha") or "")).strip()
         except GitHubWorkTrackingError:
             logger.warning(
-                "could not resolve checkpoint parent for %s; continuing without it", sha,
+                "could not resolve current target-branch head while verifying %s; "
+                "verdict will be persisted without a base",
+                sha,
                 exc_info=True,
             )
 
@@ -820,19 +828,18 @@ class GitHubWorkTrackingService:
                     # evidence for this one.
                     if run_sha == sha:
                         try:
-                            # `checkpoint_base` is the checkpoint commit's
-                            # direct parent (recorded above, best-effort).
-                            # It may or may not equal the current target
-                            # head - repair checkpoints legitimately build
-                            # on a previous checkpoint commit (#210).
-                            # Storing it lets a later reader compare it
-                            # against the base it is about to integrate
-                            # onto without another GitHub round-trip.
+                            # `integration_base` is the target branch's own
+                            # head SHA at verification time (best-effort;
+                            # empty when it could not be resolved). Storing
+                            # it - not the checkpoint's git parent - is what
+                            # lets a later, credential-less reader decide
+                            # whether this verdict still applies to the
+                            # base it is about to integrate onto.
                             self.record_ci_verification(
                                 verification,
                                 experiment_id=experiment_id,
                                 workflow=workflow,
-                                base_sha=checkpoint_base,
+                                base_sha=integration_base,
                             )
                         except sqlite3.Error:
                             logger.warning(
