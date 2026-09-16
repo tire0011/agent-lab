@@ -35,6 +35,17 @@ from modules.local_llm_jobs import (
 )
 from modules.run_store import DEFAULT_DB_PATH
 
+_AZURE_ERROR_DETAIL_LIMIT = 1000
+
+
+def sanitize_azure_error_detail(raw: str, *, secrets: tuple[str, ...] = ()) -> str:
+    """Return bounded Azure error text with known credential values redacted."""
+    detail = raw[:_AZURE_ERROR_DETAIL_LIMIT]
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "[REDACTED]")
+    return detail
+
 
 @dataclass(slots=True)
 class DelegationResult:
@@ -224,7 +235,18 @@ class NexusDelegationService:
                     json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 900},
                 )
             if response.status_code != 200:
-                return DelegationResult("azure_openai", False, "", {"error": f"HTTP {response.status_code}"})
+                detail = sanitize_azure_error_detail(response.text, secrets=(api_key,))
+                return DelegationResult(
+                    "azure_openai",
+                    False,
+                    "",
+                    {
+                        "error": f"HTTP {response.status_code}",
+                        "http_status": response.status_code,
+                        "error_detail": detail,
+                        "deployment": deployment,
+                    },
+                )
             data = response.json()
             return DelegationResult(
                 "azure_openai",
