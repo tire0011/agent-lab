@@ -119,6 +119,7 @@ from modules.maintenance_service import (
     MaintenanceService,
 )
 from nexus_mcp import create_mcp_mount
+from nexus_version import VERSION
 
 _PROCESS_START_TIME = time.time()
 configure_logging()
@@ -508,9 +509,9 @@ def authorize(x_api_key: str | None):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(status="ok", version=VERSION)
 
 @app.get("/secure-health")
 def secure_health(x_api_key: str | None = Header(default=None)):

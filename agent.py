@@ -6,36 +6,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from agents import (
-    Agent,
-    Runner,
-    set_default_openai_api,
-    set_default_openai_client,
-    set_tracing_disabled,
-)
-from agents.model_settings import ModelSettings
-
-from modules.agent_clients import build_filesystem_server, build_openai_client
-from modules.agent_result import extract_tool_trace, extract_usage_totals
-from modules.cli_output import print_cost_summary, print_run_summary
-from modules.cost_monitor import AzureCostMonitor
-from modules.run_log import log_run
-from modules.run_store import (
-    calculate_estimated_cost,
-    get_applicable_price,
-    init_db,
-    insert_run,
-    insert_tool_calls,
-)
-from modules.logging_config import configure_logging
-from modules.serialization import to_json_string
-
-
-configure_logging()
+from nexus_version import VERSION
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Azure OpenAI task runner")
+    parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("task", nargs="+", help="Task prompt to send")
     parser.add_argument(
         "--use-router",
@@ -52,6 +28,19 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, Any]]]:
+    from agents import (
+        Agent,
+        Runner,
+        set_default_openai_api,
+        set_default_openai_client,
+        set_tracing_disabled,
+    )
+    from agents.model_settings import ModelSettings
+
+    from modules.agent_clients import build_filesystem_server, build_openai_client
+    from modules.agent_result import extract_tool_trace, extract_usage_totals
+    from modules.serialization import to_json_string
+
     model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
     set_tracing_disabled(True)
@@ -143,6 +132,23 @@ async def run_router_pipeline(task: str, db: Any) -> str:
 
 def main() -> int:
     args = parse_args()
+
+    # Keep runtime-only dependencies behind argument parsing so informational
+    # flags such as --version work in lightweight environments (including CI).
+    from modules.cli_output import print_cost_summary, print_run_summary
+    from modules.cost_monitor import AzureCostMonitor
+    from modules.logging_config import configure_logging
+    from modules.run_log import log_run
+    from modules.run_store import (
+        calculate_estimated_cost,
+        get_applicable_price,
+        init_db,
+        insert_run,
+        insert_tool_calls,
+    )
+
+    configure_logging()
+
     task = " ".join(args.task).strip()
     if not task:
         print("Task cannot be empty.", file=sys.stderr)
