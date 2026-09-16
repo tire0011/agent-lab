@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Manual Azure OpenAI diagnostic using the real Nexus delegation path."""
 
 from __future__ import annotations
