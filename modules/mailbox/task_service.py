@@ -627,6 +627,15 @@ class MailboxTaskService:
                 error=str(exc),
             )
             return
+        # Issue #184: make the chosen Issue visible at the moment it is
+        # chosen, so "did Nexus reuse #180 or open a duplicate?" is an
+        # answerable question rather than an inference from GitHub state.
+        task_log.info(
+            "queued", "github_work_tracking_linked",
+            f"work tracked on GitHub issue #{work_ref.issue_number}",
+            issue_number=work_ref.issue_number,
+            branch_name=work_ref.branch_name,
+        )
         with self._lock:
             current = self._conn.execute(
                 "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
@@ -926,9 +935,32 @@ class MailboxTaskService:
             )
             self._write_result_outbox(approval, status, summary, None)
 
-    @staticmethod
-    def _make_result_summary(exp: Any) -> str:
+    def _work_ref_for(self, exp: Any) -> Any | None:
+        """Best-effort GitHub link for a finished experiment (never fatal)."""
+        experiment_id = getattr(exp, "id", None)
+        lookup = getattr(self.github_work_tracking, "for_experiment", None)
+        if not experiment_id or not callable(lookup):
+            return None
+        try:
+            return lookup(str(experiment_id))
+        except Exception:
+            logger.debug(
+                "mailbox_task: could not resolve GitHub link for %s", experiment_id,
+                exc_info=True,
+            )
+            return None
+
+    def _make_result_summary(self, exp: Any) -> str:
         parts = [f"status={exp.status}"]
+        # Issue #184: report the Issue the work was tracked on so a reused
+        # Issue number is externally verifiable from the task result alone.
+        work_ref = self._work_ref_for(exp)
+        issue_number = getattr(work_ref, "issue_number", None)
+        if isinstance(issue_number, int):
+            parts.append(f"issue=#{issue_number}")
+            branch_name = getattr(work_ref, "branch_name", None)
+            if isinstance(branch_name, str) and branch_name:
+                parts.append(f"branch={branch_name}")
         command = " ".join(getattr(exp, "test_command", None) or [])
         if command:
             parts.append(f"test_command={command[:1000]}")

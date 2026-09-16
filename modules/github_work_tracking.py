@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.run_store import DEFAULT_DB_PATH, _connect
+from modules.work_directives import WorkDirectives, parse_work_directives
 
 logger = logging.getLogger(__name__)
 
@@ -309,24 +310,27 @@ class GitHubWorkTrackingService:
             self._ensure_branch(persisted.branch_name)
             return persisted
 
+        directives = parse_work_directives(f"{title}\n{content}")
+
         issue: dict[str, Any]
         if source_type in {"issue", "github_issue"} and source_id and source_id.isdigit():
-            issue = self._request("GET", f"/repos/{self.repository}/issues/{int(source_id)}")
-            if "pull_request" in issue:
-                raise GitHubWorkTrackingError(f"GitHub #{source_id} is a pull request, not an Issue")
-            if str(issue.get("state") or "").lower() == "closed":
-                issue = self._request(
-                    "PATCH",
-                    f"/repos/{self.repository}/issues/{int(source_id)}",
-                    {"state": "open"},
-                )
+            issue = self._reuse_issue(int(source_id))
+        elif directives.issue_number is not None:
+            # Issue #184: the task names the Issue to work on, so that Issue
+            # *is* the work-tracking record. Opening a second one here is how
+            # #181 was created alongside #180.
+            issue = self._reuse_requested_issue(directives.issue_number)
+        elif directives.forbid_new_issue:
+            # Explicitly told not to create one, and no single Issue to reuse:
+            # stop and say so instead of silently creating a replacement.
+            raise GitHubWorkTrackingError(self._unusable_reuse_message(directives))
         else:
             issue_title = self._issue_title(title, content)
             issue = self._find_exact_open_issue(issue_title) or self._create_issue(issue_title, content)
 
         issue_number = int(issue["number"])
         issue_title = str(issue.get("title") or f"Issue {issue_number}")
-        branch_name = f"nexus/{issue_number}-{_slug(issue_title)}"
+        branch_name = directives.branch_name or f"nexus/{issue_number}-{_slug(issue_title)}"
         ref = GitHubWorkRef(
             issue_number=issue_number,
             issue_title=issue_title,
@@ -337,6 +341,48 @@ class GitHubWorkTrackingService:
         self._persist_source(ref)
         self._ensure_branch(branch_name)
         return ref
+
+    def _reuse_issue(self, issue_number: int) -> dict[str, Any]:
+        """Adopt an existing Issue as the work record, reopening it if closed."""
+        issue = self._request("GET", f"/repos/{self.repository}/issues/{issue_number}")
+        if not isinstance(issue, dict) or not issue.get("number"):
+            raise GitHubWorkTrackingError(
+                f"GitHub #{issue_number} did not return a usable Issue"
+            )
+        if "pull_request" in issue:
+            raise GitHubWorkTrackingError(
+                f"GitHub #{issue_number} is a pull request, not an Issue"
+            )
+        if str(issue.get("state") or "").lower() == "closed":
+            issue = self._request(
+                "PATCH",
+                f"/repos/{self.repository}/issues/{issue_number}",
+                {"state": "open"},
+            )
+        return issue
+
+    def _reuse_requested_issue(self, issue_number: int) -> dict[str, Any]:
+        try:
+            return self._reuse_issue(issue_number)
+        except GitHubWorkTrackingError as exc:
+            raise GitHubWorkTrackingError(
+                f"task requires reusing GitHub issue #{issue_number}, but it cannot "
+                f"be used: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _unusable_reuse_message(directives: WorkDirectives) -> str:
+        mentioned = directives.mentioned_issue_numbers
+        if len(mentioned) > 1:
+            candidates = ", ".join(f"#{number}" for number in mentioned)
+            return (
+                "task forbids creating a new tracking issue but names more than one "
+                f"candidate ({candidates}); name the single issue to reuse"
+            )
+        return (
+            "task forbids creating a new tracking issue but names no issue to reuse; "
+            "reference the existing issue (for example 'implement issue #180')"
+        )
 
     def bind_experiment(self, ref: GitHubWorkRef, experiment_id: str) -> GitHubWorkRef:
         if not experiment_id:
