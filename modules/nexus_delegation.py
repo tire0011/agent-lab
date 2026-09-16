@@ -36,6 +36,20 @@ from modules.local_llm_jobs import (
 from modules.run_store import DEFAULT_DB_PATH
 
 
+_AZURE_ERROR_DETAIL_LIMIT = 2000
+
+
+def _sanitize_azure_error_detail(response: httpx.Response, api_key: str) -> str:
+    """Return bounded Azure failure details without leaking the configured key."""
+    try:
+        detail = response.text.strip()
+    except Exception:  # noqa: BLE001
+        detail = ""
+    if api_key:
+        detail = detail.replace(api_key, "[REDACTED]")
+    return detail[:_AZURE_ERROR_DETAIL_LIMIT]
+
+
 @dataclass(slots=True)
 class DelegationResult:
     provider: str
@@ -224,7 +238,15 @@ class NexusDelegationService:
                     json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 900},
                 )
             if response.status_code != 200:
-                return DelegationResult("azure_openai", False, "", {"error": f"HTTP {response.status_code}"})
+                metadata: dict[str, Any] = {
+                    "error": f"HTTP {response.status_code}",
+                    "http_status": response.status_code,
+                    "deployment": deployment,
+                }
+                detail = _sanitize_azure_error_detail(response, api_key)
+                if detail:
+                    metadata["error_detail"] = detail
+                return DelegationResult("azure_openai", False, "", metadata)
             data = response.json()
             return DelegationResult(
                 "azure_openai",
