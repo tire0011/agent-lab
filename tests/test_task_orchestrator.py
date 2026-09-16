@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from modules.nexus_delegation import DelegationResult
 from modules.operations_registry import OperationArgSpec
@@ -38,6 +38,19 @@ class _Client:
         self.prompts.append(prompt)
         self.response_formats.append(response_format)
         return self.responses.pop(0)
+
+
+class _FailingClient(_Client):
+    async def complete(
+        self,
+        *,
+        prompt,
+        temperature,
+        max_tokens,
+        response_format=None,
+    ):
+        self.prompts.append(prompt)
+        raise RuntimeError("llama-server unavailable")
 
 
 class _Spec:
@@ -233,6 +246,62 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertEqual(row["session_id"], result.session_id)
         finally:
             orchestrator.close()
+
+    def test_low_memory_budget_is_advisory_when_local_succeeds(self):
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done locally","reason":"local inference succeeded"}',
+        ])
+        delegation = MagicMock()
+        delegation.catalog.return_value = [
+            {"provider": "azure_openai", "description": "external", "writes_repo": False, "cost": "paid"}
+        ]
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        try:
+            from unittest.mock import patch
+
+            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+                from modules.prompt_budget import compute_budget as real_compute_budget
+
+                def _low_memory(**kwargs):
+                    plan = real_compute_budget(**kwargs)
+                    plan.low_memory = True
+                    plan.safe_local_budget_chars = 0
+                    return plan
+
+                compute_budget_mock.side_effect = _low_memory
+                result = orchestrator.run("Answer despite advisory memory pressure")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "done locally")
+        self.assertEqual(len(client.prompts), 1)
+        delegation.delegate.assert_not_called()
+
+    def test_local_inference_failure_uses_external_fallback(self):
+        client = _FailingClient([])
+        delegation = MagicMock()
+        delegation.catalog.return_value = [
+            {"provider": "azure_openai", "description": "external", "writes_repo": False, "cost": "paid"}
+        ]
+        delegation.delegate = AsyncMock(return_value=DelegationResult(
+            provider="azure_openai",
+            success=True,
+            content='{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done externally","reason":"local inference failed"}',
+            metadata={},
+        ))
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        try:
+            result = orchestrator.run("Answer after local failure")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "done externally")
+        delegation.delegate.assert_called_once()
+        self.assertEqual(delegation.delegate.call_args.args[0], "azure_openai")
 
     def test_controller_prompt_exposes_find_tool_instead_of_full_operation_catalog(self):
         client = _Client([

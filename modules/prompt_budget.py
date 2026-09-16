@@ -195,11 +195,11 @@ def compute_budget(
         effective_budget_chars = min(context_budget_chars, memory_budget_chars)
     effective_budget_chars = max(500, effective_budget_chars)
 
-    # The "safe local" budget is what may actually be sent to llama-server.
-    # Below the low-memory threshold, no amount of prompt compaction makes
-    # another local call safe, so this collapses to zero and every turn is
-    # forced through the external/needs_review path instead of silently
-    # allowing a call that could OOM the host.
+    # The "safe local" budget remains an advisory signal for callers to use
+    # when compacting prompts and reporting memory pressure. The local
+    # inference service may still be able to serve a request (for example
+    # when the model is already mmap-loaded), so this must not itself become
+    # a hard routing gate.
     safe_local_budget_chars = 0 if low_memory else effective_budget_chars
 
     instructions_chars = int(effective_budget_chars * 0.12)

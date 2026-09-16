@@ -89,10 +89,9 @@ TOOL_PYTHON_RUN = "python_run"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
 
-# Delegates the local controller may fall back to when its compacted prompt
-# still exceeds the safe local budget. ``local_worker`` is deliberately
-# excluded: it also calls the local llama-server and carries the same OOM
-# risk this fallback exists to avoid.
+# Delegates the local controller may fall back to after a local inference
+# failure. ``local_worker`` is deliberately excluded because it uses the same
+# local llama-server and cannot recover from that failure.
 _EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
 
 
@@ -879,11 +878,10 @@ class NexusTaskOrchestrator:
     ) -> tuple[str, str]:
         """Run one controller completion.
 
-        Returns ``(raw_response, provider_used)``. When ``budget_plan`` shows
-        the compacted prompt still exceeds the safe local budget, llama-server
-        is never invoked; the compact package is delegated to an available
-        external provider instead so a persistent session cannot OOM the
-        local model host.
+        Returns ``(raw_response, provider_used)``. The budget plan controls
+        prompt compaction and diagnostics, but does not preemptively block
+        llama-server. External providers are used only after a real local
+        inference failure.
         """
         return await self._schema_completion(
             prompt,
@@ -904,20 +902,20 @@ class NexusTaskOrchestrator:
         budget_plan: "PromptBudgetPlan",
         task_logger: Any | None,
         role: str = "controller",
+        local_failure: str = "",
     ) -> tuple[str, str]:
-        """Delegate a compact, still-over-budget local inference externally.
+        """Delegate externally after local inference has actually failed.
 
         Never falls back to ``local_worker``: that delegate also calls the
-        same local llama-server and would carry the same OOM risk this
-        fallback exists to avoid.
+        same local llama-server and cannot recover from the local failure.
         """
         available = {item["provider"] for item in self.delegation.catalog()}
         candidates = [p for p in _EXTERNAL_FALLBACK_ORDER if p in available]
         if not candidates:
             raise ControllerBudgetExceededError(
-                "compact controller prompt still exceeds the safe local budget "
-                f"({len(prompt)} chars > {budget_plan.safe_local_budget_chars}) and no "
-                "external provider is configured; refusing to risk a local OOM"
+                "local inference failed"
+                + (f": {local_failure}" if local_failure else "")
+                + "; no external provider is configured"
             )
         if role == "tool_resolver":
             task_text = (
@@ -946,7 +944,8 @@ class NexusTaskOrchestrator:
                 )
             if payload.get("success"):
                 logger.info(
-                    "llm_provider completed provider=%s role=%s_fallback session_id=%s "
+                    "llm_provider completed provider=%s role=%s_fallback_after_local_failure "
+                    "session_id=%s "
                     "prompt_chars=%s safe_local_budget_chars=%s",
                     provider,
                     role,
@@ -956,8 +955,9 @@ class NexusTaskOrchestrator:
                 )
                 return str(payload.get("content", "")), provider
         raise ControllerBudgetExceededError(
-            "compact controller prompt still exceeds the safe local budget and all "
-            f"external providers failed: {attempts}"
+            "local inference failed"
+            + (f": {local_failure}" if local_failure else "")
+            + f"; all external providers failed: {attempts}"
         )
 
     async def _schema_completion(
@@ -972,23 +972,19 @@ class NexusTaskOrchestrator:
         role: str = "controller",
         task_logger: Any | None = None,
     ) -> tuple[str, str]:
-        if budget_plan is not None and len(prompt) > budget_plan.safe_local_budget_chars:
+        if budget_plan is not None and (
+            len(prompt) > budget_plan.safe_local_budget_chars or budget_plan.low_memory
+        ):
             logger.warning(
-                "%s_budget_exceeded session_id=%s prompt_chars=%s safe_local_budget_chars=%s "
-                "low_memory=%s mem_available_kb=%s",
+                "%s_memory_budget_advisory session_id=%s prompt_chars=%s "
+                "safe_local_budget_chars=%s low_memory=%s mem_available_kb=%s "
+                "action=attempt_local_inference",
                 role,
                 session_id,
                 len(prompt),
                 budget_plan.safe_local_budget_chars,
                 budget_plan.low_memory,
                 budget_plan.mem_available_kb,
-            )
-            return await self._external_fallback_completion(
-                prompt,
-                session_id=session_id,
-                budget_plan=budget_plan,
-                task_logger=task_logger,
-                role=role,
             )
         job_id = self.llm_jobs.submit(
             prompt,
@@ -1002,7 +998,30 @@ class NexusTaskOrchestrator:
         try:
             return await self.llm_jobs.wait(job_id), "local"
         except LocalLlmJobError as exc:
-            raise TaskOrchestratorError(f"local LLM job failed: {exc}") from exc
+            failure = str(exc)[:1000]
+            logger.error(
+                "%s_local_inference_failed session_id=%s error=%s; attempting external fallback",
+                role,
+                session_id,
+                failure,
+            )
+            if task_logger is not None:
+                task_logger.error(
+                    "orchestration",
+                    f"{role}_local_inference_failed",
+                    failure,
+                    session_id=session_id,
+                )
+            if budget_plan is None:
+                raise TaskOrchestratorError(f"local LLM job failed: {failure}") from exc
+            return await self._external_fallback_completion(
+                prompt,
+                session_id=session_id,
+                budget_plan=budget_plan,
+                task_logger=task_logger,
+                role=role,
+                local_failure=failure,
+            )
         finally:
             self._claimed_status(session_id, "active")
 
@@ -1594,7 +1613,7 @@ Rules:
         reason: str,
         task_logger: Any | None,
     ) -> TaskDecision:
-        """Controlled, non-crashing outcome when no provider can safely take this turn.
+        """Controlled, non-crashing outcome when no provider can take this turn.
 
         The session and its full history/observations remain persisted so a
         human can resolve capacity/configuration and resume; nothing required
@@ -1605,16 +1624,16 @@ Rules:
         self.task_store.record_controller_turn(
             session_id,
             provider_used="none",
-            outcome="budget_exceeded",
+            outcome="inference_failed",
             detail=reason,
         )
         result = TaskDecision(
             action=ACTION_MISSING_CAPABILITY,
             reason=reason,
             message=(
-                "Nexus could not safely take this controller turn: the compact "
-                "prompt still exceeds the safe local budget and no external "
-                "provider is available. This needs human review before retrying."
+                "Nexus could not take this controller turn: local inference "
+                "failed and no external provider is available. This needs "
+                "human review before retrying."
             ),
             observations=observations,
             session_id=session_id,
@@ -1622,7 +1641,7 @@ Rules:
         if task_logger is not None:
             task_logger.warning(
                 "orchestration",
-                "controller_budget_exceeded",
+                "controller_inference_failed",
                 reason,
                 action=result.action,
                 reason=reason,
