@@ -7,7 +7,8 @@ import os
 import sys
 import traceback
 
-from .stdio_proxy import create_stdio_server
+from .config import BridgeConfig
+from .stdio_proxy import create_stdio_server, run_http_server
 
 
 def main() -> None:
@@ -18,7 +19,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        create_stdio_server().run(transport="stdio")
+        config = BridgeConfig.from_env()
+        server = create_stdio_server(config)
+        if config.transport == "streamable-http":
+            run_http_server(server, config)
+        else:
+            server.run(transport=config.transport)
     except Exception:
         details = traceback.format_exc()
         try:

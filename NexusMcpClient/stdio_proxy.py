@@ -127,10 +127,31 @@ def create_stdio_server(config: BridgeConfig | None = None) -> FastMCP:
 
     return FastMCP(
         name="nexus-stdio-bridge",
+        host=config.http_host,
+        port=config.http_port,
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
         instructions=(
-            "Forward tools to the configured remote Nexus MCP instance. "
+            "Forward tools to the configured remote Nexus MCP instance over stdio or Streamable HTTP. "
             "Use mailbox tools to send commands and inspect results. "
             "Mutating tools remain controlled by the remote MCP_WRITE_ENABLED gate."
         ),
         lifespan=lifespan,
     )
+
+
+def run_http_server(server: FastMCP, config: BridgeConfig) -> None:
+    """Serve the Streamable HTTP app with CORS enabled for browser-based MCP clients."""
+    import uvicorn
+    from starlette.middleware.cors import CORSMiddleware
+
+    app = server.streamable_http_app()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(config.http_cors_origins),
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["mcp-session-id"],
+    )
+    uvicorn.run(app, host=config.http_host, port=config.http_port, log_level="info")
