@@ -117,7 +117,7 @@ class _FailureAnalysisJobTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
         self.db_path = str(self.tmp / "agent.db")
-        self.cfg = MailboxConfig.legacy(self.tmp)
+        self.cfg = MailboxConfig.from_paths(self.tmp, self.tmp)
 
     def _jobs(self, client, **kwargs) -> LocalLlmJobService:
         jobs = LocalLlmJobService(db_path=self.db_path, llama_client=client, poll_interval=0.01, **kwargs)

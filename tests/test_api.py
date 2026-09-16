@@ -355,7 +355,7 @@ class MailboxTaskDetailEndpointTests(ApiTestsBase):
                 "mailbox_msg_id": 42,
                 "task_body": "Investigate failure",
                 "sender": "nexus",
-                "file_path": "communication/inbox/task.md",
+                "file_path": "inbox/task.md",
                 "received_at": "2026-08-16T00:00:00Z",
                 "status": "failed",
                 "approved_at": None,

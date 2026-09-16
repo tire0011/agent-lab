@@ -34,6 +34,12 @@ For API auth in `api.py`:
 - `AGENT_API_KEY`
 - `AGENT_GITHUB_WEBHOOK_SECRET` (only required when using `POST /mailbox/webhook/github`)
 
+For mailbox services:
+
+- `AGENT_MAILBOX_REPO_PATH` is required and names the dedicated mailbox checkout.
+  Its only supported layout is root-level `inbox/`, `outbox/`, and `archive/`;
+  there is no fallback to `/agent/communication/`.
+
 For the mandatory Nexus implementation lifecycle, `/etc/agent-lab/agent.env`
 must also provide:
 

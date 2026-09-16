@@ -24,6 +24,10 @@ os.environ.setdefault("AGENT_LOG_DIR", _LOG_DIR)
 # state database.
 os.environ.setdefault("AGENT_API_KEY", "test-api-key")
 
+# Mailbox configuration is required at import time by api.py. Point it at an
+# isolated canonical-layout checkout so tests can never fall back to /agent.
+os.environ.setdefault("AGENT_MAILBOX_REPO_PATH", str(Path(_LOG_DIR) / "mailbox-repo"))
+
 # The suite must never reach a real model provider. It could: the controller
 # escalates to `codex_readonly` when a prompt exceeds the local budget, and on
 # the VM the codex binary exists - so a test whose injected client was supposed

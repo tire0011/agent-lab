@@ -380,7 +380,7 @@ def _build_outbox_content(
     source = msg.file_path.name
     lines = [
         "---",
-        f"source: communication/inbox/{source}",
+        f"source: inbox/{source}",
         f"type: {msg.msg_type}",
         f"status: {status}",
         f"processed_at: {processed_at}",

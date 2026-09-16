@@ -34,8 +34,8 @@ def _make_repo(path: Path) -> None:
     _run_git(["config", "user.email", "test@test.com"], path)
     _run_git(["config", "user.name", "Test"], path)
     (path / "README.md").write_text("# test\n")
-    (path / "communication" / "outbox").mkdir(parents=True)
-    (path / "communication" / "inbox").mkdir(parents=True)
+    (path / "outbox").mkdir(parents=True)
+    (path / "inbox").mkdir(parents=True)
     _run_git(["add", "-A"], path)
     _run_git(["commit", "-m", "init"], path)
 
@@ -108,7 +108,7 @@ class PublisherCommitPushTests(unittest.TestCase):
         self.tmp_ctx.cleanup()
 
     def test_commits_and_pushes_pending_result(self):
-        outbox_rel = "communication/outbox/x.md"
+        outbox_rel = "outbox/x.md"
         (self.repo / outbox_rel).write_text("hello world\n")
         _insert_chain_row(self.db, "r1", outbox_rel)
 
@@ -129,7 +129,7 @@ class PublisherCommitPushTests(unittest.TestCase):
         self.assertTrue(git_is_clean(self.repo))
 
     def test_push_retry_reuses_same_commit_never_reruns_chain(self):
-        outbox_rel = "communication/outbox/y.md"
+        outbox_rel = "outbox/y.md"
         (self.repo / outbox_rel).write_text("result body\n")
         _insert_chain_row(self.db, "r2", outbox_rel)
 
@@ -164,7 +164,7 @@ class PublisherCommitPushTests(unittest.TestCase):
         The publisher must detect the file is already committed and recover
         the SHA instead of creating a duplicate commit or failing forever.
         """
-        outbox_rel = "communication/outbox/z.md"
+        outbox_rel = "outbox/z.md"
         (self.repo / outbox_rel).write_text("crash recovery body\n")
         _insert_chain_row(self.db, "r3", outbox_rel, publish_status="committing", publish_commit_sha=None)
 
@@ -188,7 +188,7 @@ class PublisherCommitPushTests(unittest.TestCase):
         self.assertEqual(_remote_head_content(self.remote, outbox_rel), "crash recovery body\n")
 
     def test_idempotent_second_run_is_a_noop(self):
-        outbox_rel = "communication/outbox/idem.md"
+        outbox_rel = "outbox/idem.md"
         (self.repo / outbox_rel).write_text("idempotent body\n")
         _insert_chain_row(self.db, "r4", outbox_rel)
 
@@ -209,7 +209,7 @@ class PublisherCommitPushTests(unittest.TestCase):
         self.assertEqual(_commit_count(self.repo), commits_after_first)
 
     def test_foreign_dirty_files_are_never_staged_or_committed(self):
-        outbox_rel = "communication/outbox/foreign.md"
+        outbox_rel = "outbox/foreign.md"
         (self.repo / outbox_rel).write_text("only me please\n")
         _insert_chain_row(self.db, "r5", outbox_rel)
 
@@ -245,8 +245,8 @@ class PublisherCommitPushTests(unittest.TestCase):
                 self.assertTrue(line.startswith("??"), line)
 
     def test_symlink_outbox_file_rejected(self):
-        outbox_rel = "communication/outbox/link.md"
-        target = self.repo / "communication" / "outbox" / "real.md"
+        outbox_rel = "outbox/link.md"
+        target = self.repo / "outbox" / "real.md"
         target.write_text("real content\n")
         link = self.repo / outbox_rel
         link.symlink_to(target)
@@ -272,10 +272,10 @@ class PublisherCommitPushTests(unittest.TestCase):
         # string hashes per process, and the same pattern in
         # test_outbox_publisher.py did collide on CI.
         for index, malicious in enumerate((
-            "communication/outbox/../../etc/passwd",
+            "outbox/../../etc/passwd",
             "/etc/passwd",
-            "communication/inbox/x.md",
-            "communication/outbox/../outbox/y.md/../../../secrets.md",
+            "inbox/x.md",
+            "outbox/../outbox/y.md/../../../secrets.md",
         )):
             with self.subTest(outbox_file=malicious):
                 request_id = f"traversal-{index}"
@@ -293,7 +293,7 @@ class PublisherCommitPushTests(unittest.TestCase):
         """Mirrors mailbox_processor.main(): publish_pending() runs before the
         clean-worktree guard, and after a successful publish the guard sees a
         clean tree and allows normal inbox processing to proceed."""
-        outbox_rel = "communication/outbox/poll.md"
+        outbox_rel = "outbox/poll.md"
         (self.repo / outbox_rel).write_text("poll cycle body\n")
         _insert_chain_row(self.db, "r7", outbox_rel)
 

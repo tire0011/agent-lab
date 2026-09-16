@@ -182,7 +182,7 @@ class OutboxPublisher:
     db_path:
         Path to the SQLite state database.
     repo_root:
-        Fallback when *mailbox_config* is ``None`` (legacy usage).
+        Mailbox repository root when *mailbox_config* is ``None``.
     """
 
     def __init__(
@@ -196,7 +196,7 @@ class OutboxPublisher:
             self._outbox_dir: Path = Path(mailbox_config.outbox_dir)
         elif repo_root is not None:
             self._repo_root = Path(repo_root)
-            self._outbox_dir = self._repo_root / "communication" / "outbox"
+            self._outbox_dir = self._repo_root / "outbox"
         else:
             raise ValueError("Either mailbox_config or repo_root must be provided")
 

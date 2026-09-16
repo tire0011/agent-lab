@@ -105,12 +105,12 @@ class _ChainProcessorBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name)
         _make_repo(self.repo)
-        (self.repo / "communication" / "inbox").mkdir(parents=True)
-        (self.repo / "communication" / "outbox").mkdir(parents=True)
+        (self.repo / "inbox").mkdir(parents=True)
+        (self.repo / "outbox").mkdir(parents=True)
         (self.repo / "IDEAS.md").write_text("# IDEAS\n\n## Ideas\n\n")
         (self.repo / "state").mkdir()
         self.db_path = str(self.repo / "state" / "agent.db")
-        self.outbox = self.repo / "communication" / "outbox"
+        self.outbox = self.repo / "outbox"
         self.chain_service = _make_chain_service(self.db_path, str(self.outbox), str(self.repo))
         self.processor = MailboxProcessor(
             repo_path=self.repo,
@@ -134,7 +134,7 @@ class _ChainProcessorBase(unittest.TestCase):
         self.tmp.cleanup()
 
     def _write(self, name: str, content: str) -> Path:
-        f = self.repo / "communication" / "inbox" / name
+        f = self.repo / "inbox" / name
         f.write_text(content, encoding="utf-8")
         return f
 
@@ -344,9 +344,9 @@ class TestSecretAndPathValidation(_ChainProcessorBase):
         self.assertEqual(results[0]["status"], "failed")
 
     def test_symlink_rejected(self):
-        real = self.repo / "communication" / "inbox" / "real.md"
+        real = self.repo / "inbox" / "real.md"
         real.write_text(_VALID_CHAIN_MSG)
-        link = self.repo / "communication" / "inbox" / "link.md"
+        link = self.repo / "inbox" / "link.md"
         link.symlink_to(real)
         # Only 'real.md' should succeed, link.md should fail
         results = self.processor.process_inbox()
@@ -386,19 +386,19 @@ class TestExactlyOneOutboxFile(_ChainProcessorBase):
         with tempfile.TemporaryDirectory() as tmp2:
             base2 = Path(tmp2)
             repo2, remote2 = _make_repo_with_remote(base2)
-            (repo2 / "communication" / "inbox").mkdir(parents=True)
-            (repo2 / "communication" / "outbox").mkdir(parents=True)
+            (repo2 / "inbox").mkdir(parents=True)
+            (repo2 / "outbox").mkdir(parents=True)
             (repo2 / "IDEAS.md").write_text("# I\n")
             (repo2 / "state").mkdir()
-            subprocess.run(["git", "add", "communication", "IDEAS.md"], cwd=str(repo2), check=True, capture_output=True)
+            subprocess.run(["git", "add", "IDEAS.md"], cwd=str(repo2), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "prep"], cwd=str(repo2), check=True, capture_output=True)
             subprocess.run(["git", "push"], cwd=str(repo2), check=True, capture_output=True)
             db2 = str(repo2 / "state" / "agent.db")
-            outbox2 = repo2 / "communication" / "outbox"
+            outbox2 = repo2 / "outbox"
 
-            inbox_file = repo2 / "communication" / "inbox" / "chain.md"
+            inbox_file = repo2 / "inbox" / "chain.md"
             inbox_file.write_text(_VALID_CHAIN_MSG, encoding="utf-8")
-            subprocess.run(["git", "add", "communication/inbox/chain.md"], cwd=str(repo2), check=True, capture_output=True)
+            subprocess.run(["git", "add", "inbox/chain.md"], cwd=str(repo2), check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "add chain"], cwd=str(repo2), check=True, capture_output=True)
             subprocess.run(["git", "push"], cwd=str(repo2), check=True, capture_output=True)
 
@@ -438,11 +438,11 @@ class TestPushRetryNoReExecution(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.repo, self.remote = _make_repo_with_remote(self.base)
-        (self.repo / "communication" / "inbox").mkdir(parents=True, exist_ok=True)
-        (self.repo / "communication" / "outbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "inbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "outbox").mkdir(parents=True, exist_ok=True)
         (self.repo / "IDEAS.md").write_text("# I\n")
         (self.repo / "state").mkdir()
-        subprocess.run(["git", "add", "communication", "IDEAS.md"], cwd=str(self.repo), check=True, capture_output=True)
+        subprocess.run(["git", "add", "IDEAS.md"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "prep"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
         self.db_path = str(self.repo / "state" / "agent.db")
@@ -452,7 +452,7 @@ class TestPushRetryNoReExecution(unittest.TestCase):
 
     def test_push_retry_does_not_rerun_chain(self):
         """After a failed push, retry only publishes existing result, no new chain execution."""
-        outbox = self.repo / "communication" / "outbox"
+        outbox = self.repo / "outbox"
         chain_start_count = [0]
         original_start = OperationChainService.start_chain
 
@@ -460,9 +460,9 @@ class TestPushRetryNoReExecution(unittest.TestCase):
             chain_start_count[0] += 1
             return original_start(self_svc, request)
 
-        inbox_file = self.repo / "communication" / "inbox" / "chain.md"
+        inbox_file = self.repo / "inbox" / "chain.md"
         inbox_file.write_text(_VALID_CHAIN_MSG, encoding="utf-8")
-        subprocess.run(["git", "add", "communication/inbox/chain.md"], cwd=str(self.repo), check=True, capture_output=True)
+        subprocess.run(["git", "add", "inbox/chain.md"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "add chain msg"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
 
@@ -514,7 +514,7 @@ class TestRecoveryUnpublishedResult(_ChainProcessorBase):
     def test_done_pending_commit_record_recovered_inbox_only(self):
         """A mailbox_messages operation_chain row in done_pending_commit is retried (inbox-only commit)."""
         from modules.mailbox import STATUS_DONE_PENDING_COMMIT
-        inbox_file = self.repo / "communication" / "inbox" / "chain.md"
+        inbox_file = self.repo / "inbox" / "chain.md"
         inbox_file.write_text(_VALID_CHAIN_MSG, encoding="utf-8")
 
         # Insert a done_pending_commit record with outbox_file=NULL (normal for accepted chains)
@@ -544,11 +544,11 @@ class TestInboxFileRemovedInCommit(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.repo, self.remote = _make_repo_with_remote(self.base)
-        (self.repo / "communication" / "inbox").mkdir(parents=True, exist_ok=True)
-        (self.repo / "communication" / "outbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "inbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "outbox").mkdir(parents=True, exist_ok=True)
         (self.repo / "IDEAS.md").write_text("# I\n")
         (self.repo / "state").mkdir()
-        subprocess.run(["git", "add", "communication", "IDEAS.md"], cwd=str(self.repo), check=True, capture_output=True)
+        subprocess.run(["git", "add", "IDEAS.md"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "prep"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
         self.db_path = str(self.repo / "state" / "agent.db")
@@ -558,13 +558,13 @@ class TestInboxFileRemovedInCommit(unittest.TestCase):
 
     def test_inbox_file_deleted_no_outbox_in_commit(self):
         """For accepted operation_chain: inbox deleted, outbox NOT in the same commit."""
-        inbox_file = self.repo / "communication" / "inbox" / "chain.md"
+        inbox_file = self.repo / "inbox" / "chain.md"
         inbox_file.write_text(_VALID_CHAIN_MSG, encoding="utf-8")
-        subprocess.run(["git", "add", "communication/inbox/chain.md"], cwd=str(self.repo), check=True, capture_output=True)
+        subprocess.run(["git", "add", "inbox/chain.md"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "add chain"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
 
-        outbox = self.repo / "communication" / "outbox"
+        outbox = self.repo / "outbox"
         svc = _make_chain_service(self.db_path, str(outbox), str(self.repo))
         proc = MailboxProcessor(
             repo_path=self.repo, db_path=self.db_path, dry_run=False, operation_chain_service=svc,
@@ -585,9 +585,9 @@ class TestInboxFileRemovedInCommit(unittest.TestCase):
             cwd=str(self.repo), check=True, capture_output=True, text=True,
         ).stdout
         # Inbox deleted
-        self.assertIn("D\tcommunication/inbox/chain.md", show)
+        self.assertIn("D\tinbox/chain.md", show)
         # No outbox addition in this commit
-        self.assertNotIn("A\tcommunication/outbox/", show)
+        self.assertNotIn("A\toutbox/", show)
 
 
 # ---------------------------------------------------------------------------
@@ -700,24 +700,24 @@ class TestFullInboxEndToEndWithBareRepo(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.repo, self.remote = _make_repo_with_remote(self.base)
-        (self.repo / "communication" / "inbox").mkdir(parents=True, exist_ok=True)
-        (self.repo / "communication" / "outbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "inbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "outbox").mkdir(parents=True, exist_ok=True)
         (self.repo / "IDEAS.md").write_text("# I\n")
         (self.repo / "state").mkdir()
-        subprocess.run(["git", "add", "communication", "IDEAS.md"], cwd=str(self.repo), check=True, capture_output=True)
+        subprocess.run(["git", "add", "IDEAS.md"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "prep"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
         self.db_path = str(self.repo / "state" / "agent.db")
-        self.outbox = self.repo / "communication" / "outbox"
+        self.outbox = self.repo / "outbox"
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def test_full_inbox_flow(self):
         """Inbox commit → processing → background execution → exactly one outbox result → push."""
-        inbox_file = self.repo / "communication" / "inbox" / "chain_e2e.md"
+        inbox_file = self.repo / "inbox" / "chain_e2e.md"
         inbox_file.write_text(_VALID_CHAIN_MSG, encoding="utf-8")
-        subprocess.run(["git", "add", "communication/inbox/chain_e2e.md"], cwd=str(self.repo), check=True, capture_output=True)
+        subprocess.run(["git", "add", "inbox/chain_e2e.md"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "add chain e2e"], cwd=str(self.repo), check=True, capture_output=True)
         subprocess.run(["git", "push"], cwd=str(self.repo), check=True, capture_output=True)
 
@@ -739,8 +739,8 @@ class TestFullInboxEndToEndWithBareRepo(unittest.TestCase):
             ["git", "--no-pager", "show", "--name-status", "--pretty=format:", "HEAD"],
             cwd=str(self.repo), check=True, capture_output=True, text=True,
         ).stdout
-        self.assertIn("D\tcommunication/inbox/chain_e2e.md", show_head)
-        self.assertNotIn("A\tcommunication/outbox/", show_head)
+        self.assertIn("D\tinbox/chain_e2e.md", show_head)
+        self.assertNotIn("A\toutbox/", show_head)
 
         # Wait for background chain execution
         for _ in range(50):

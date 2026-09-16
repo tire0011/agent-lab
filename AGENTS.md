@@ -82,7 +82,7 @@ Primary objective: learn how far the system can improve itself safely and measur
 
 ## Mailbox polling
 
-Nexus polls `communication/inbox/` every minute via a systemd timer (`deploy/nexus-mailbox.timer`). Drop a Markdown file with YAML front matter (`type`, `created_by`) to communicate with Nexus. Responses appear in `communication/outbox/`. See `README.md` "Mailbox" section and `OPERATIONS.md` "Mailbox systemd service" for full details.
+Nexus polls root-level `inbox/` in the external mailbox repository every minute via a systemd timer (`deploy/nexus-mailbox.timer`). Drop a Markdown file with YAML front matter (`type`, `created_by`) there to communicate with Nexus. Responses appear in that repository's root-level `outbox/`. See `README.md` "Mailbox" section and `OPERATIONS.md` "Mailbox systemd service" for full details.
 
 ## Unknowns to Resolve Early
 

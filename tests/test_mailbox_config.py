@@ -1,7 +1,7 @@
 """Tests for MailboxConfig and the separated mailbox/code repository paths.
 
 Acceptance criteria:
-1. Defaults reproduce the legacy layout under /agent/communication/*.
+1. Missing mailbox configuration is rejected instead of falling back.
 2. External config uses separate repos with direct inbox/ and outbox/.
 3. Mailbox git operations run exclusively in the mailbox repo.
 4. IDEAS.md and state/runs stay in the code repo.
@@ -59,22 +59,19 @@ def _make_ideas_md(code_repo: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. Defaults reproduce legacy layout
+# 1. Required external mailbox configuration
 # ---------------------------------------------------------------------------
 
 class TestMailboxConfigDefaults(unittest.TestCase):
-    """MailboxConfig.from_env() with no env vars set uses the legacy layout."""
+    """MailboxConfig.from_env() requires the external mailbox checkout."""
 
     def test_from_env_defaults(self):
         env = {k: v for k, v in os.environ.items()
                if k not in ("AGENT_CODE_REPO_PATH", "AGENT_MAILBOX_REPO_PATH")}
         old = {k: os.environ.pop(k, None) for k in ("AGENT_CODE_REPO_PATH", "AGENT_MAILBOX_REPO_PATH")}
         try:
-            cfg = MailboxConfig.from_env()
-            self.assertEqual(cfg.code_repo_path, Path("/agent"))
-            self.assertEqual(cfg.mailbox_repo_path, Path("/agent"))
-            self.assertEqual(cfg.inbox_dir, Path("/agent/communication/inbox"))
-            self.assertEqual(cfg.outbox_dir, Path("/agent/communication/outbox"))
+            with self.assertRaisesRegex(ValueError, "AGENT_MAILBOX_REPO_PATH is required"):
+                MailboxConfig.from_env()
         finally:
             for k, v in old.items():
                 if v is not None:
@@ -99,15 +96,6 @@ class TestMailboxConfigDefaults(unittest.TestCase):
                     os.environ[k] = v
                 else:
                     os.environ.pop(k, None)
-
-    def test_legacy_factory(self):
-        repo = Path("/tmp/myrepo")
-        cfg = MailboxConfig.legacy(repo)
-        self.assertEqual(cfg.code_repo_path, repo)
-        self.assertEqual(cfg.mailbox_repo_path, repo)
-        self.assertEqual(cfg.inbox_dir, repo / "communication" / "inbox")
-        self.assertEqual(cfg.outbox_dir, repo / "communication" / "outbox")
-        self.assertFalse(cfg.repos_are_separate)
 
     def test_repos_are_separate_property(self):
         cfg = MailboxConfig(
@@ -214,20 +202,13 @@ class TestMailboxGitOperationsIsolation(unittest.TestCase):
         self.mailbox_repo = self.tmp / "mailbox"
         _make_git_repo(self.code_repo)
         _make_git_repo(self.mailbox_repo)
-        (self.mailbox_repo / "communication" / "inbox").mkdir(parents=True)
-        (self.mailbox_repo / "communication" / "outbox").mkdir(parents=True)
-        (self.mailbox_repo / "communication" / "inbox" / ".gitkeep").write_text("")
-        (self.mailbox_repo / "communication" / "outbox" / ".gitkeep").write_text("")
+        (self.mailbox_repo / "inbox").mkdir(parents=True)
+        (self.mailbox_repo / "outbox").mkdir(parents=True)
+        (self.mailbox_repo / "inbox" / ".gitkeep").write_text("")
+        (self.mailbox_repo / "outbox" / ".gitkeep").write_text("")
         _run_git(["add", "-A"], self.mailbox_repo)
         _run_git(["commit", "-m", "add dirs"], self.mailbox_repo)
-        self.cfg = MailboxConfig.legacy(self.mailbox_repo)
-        # Override code_repo_path to be separate
-        self.cfg = MailboxConfig(
-            code_repo_path=self.code_repo,
-            mailbox_repo_path=self.mailbox_repo,
-            inbox_dir=self.mailbox_repo / "communication" / "inbox",
-            outbox_dir=self.mailbox_repo / "communication" / "outbox",
-        )
+        self.cfg = MailboxConfig.from_paths(self.code_repo, self.mailbox_repo)
         self.db_path = str(self.tmp / "test.db")
         init_db(self.db_path)
 
@@ -483,13 +464,13 @@ class TestPublisherOutboxValidationExternalLayout(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 10. Legacy single-repo mode is unaffected
+# 10. Same-repository callers still use the canonical root layout
 # ---------------------------------------------------------------------------
 
-class TestLegacySingleRepoMode(unittest.TestCase):
-    """With default config (same repo for code and mailbox), existing paths work."""
+class TestCanonicalSameRepoMode(unittest.TestCase):
+    """Equal code/mailbox roots do not activate another layout."""
 
-    def test_processor_legacy_paths(self):
+    def test_processor_root_paths(self):
         tmp = Path(tempfile.mkdtemp())
         _make_git_repo(tmp)
         db_path = str(tmp / "test.db")
@@ -498,12 +479,12 @@ class TestLegacySingleRepoMode(unittest.TestCase):
         try:
             self.assertEqual(proc._mailbox_repo_path, tmp)
             self.assertEqual(proc._code_repo_path, tmp)
-            self.assertEqual(proc.inbox, tmp / "communication" / "inbox")
-            self.assertEqual(proc.outbox, tmp / "communication" / "outbox")
+            self.assertEqual(proc.inbox, tmp / "inbox")
+            self.assertEqual(proc.outbox, tmp / "outbox")
         finally:
             proc.close()
 
-    def test_publisher_legacy_paths(self):
+    def test_publisher_root_paths(self):
         tmp = Path(tempfile.mkdtemp())
         _make_git_repo(tmp)
         db_path = str(tmp / "test.db")
@@ -511,22 +492,22 @@ class TestLegacySingleRepoMode(unittest.TestCase):
         pub = OperationChainPublisher(db_path=db_path, repo_root=str(tmp))
         try:
             self.assertEqual(pub.repo_root, tmp)
-            self.assertEqual(pub.outbox_dir, tmp / "communication" / "outbox")
+            self.assertEqual(pub.outbox_dir, tmp / "outbox")
         finally:
             pub.close()
 
-    def test_operation_chain_service_legacy_paths(self):
+    def test_operation_chain_service_root_paths(self):
         tmp = Path(tempfile.mkdtemp())
         db_path = str(tmp / "test.db")
         init_db(db_path)
         svc = OperationChainService(
             db_path=db_path,
             repo_root=str(tmp),
-            outbox_dir=str(tmp / "communication" / "outbox"),
+            outbox_dir=str(tmp / "outbox"),
         )
         try:
             self.assertEqual(svc.repo_root, tmp)
-            self.assertEqual(svc.outbox_dir, tmp / "communication" / "outbox")
+            self.assertEqual(svc.outbox_dir, tmp / "outbox")
         finally:
             svc.close()
 
@@ -587,13 +568,13 @@ class TestEnvVarDirectExternalPaths(unittest.TestCase):
         finally:
             self._restore_env()
 
-    def test_same_env_paths_produce_legacy_layout(self):
-        """When both env vars point to the same path, the legacy layout is used."""
+    def test_same_env_paths_still_produce_root_layout(self):
+        """Path equality never switches back to communication/* directories."""
         self._set_env("/agent", "/agent")
         try:
             cfg = MailboxConfig.from_env()
-            self.assertEqual(cfg.inbox_dir, Path("/agent/communication/inbox"))
-            self.assertEqual(cfg.outbox_dir, Path("/agent/communication/outbox"))
+            self.assertEqual(cfg.inbox_dir, Path("/agent/inbox"))
+            self.assertEqual(cfg.outbox_dir, Path("/agent/outbox"))
             self.assertFalse(cfg.repos_are_separate)
         finally:
             self._restore_env()
@@ -604,10 +585,10 @@ class TestEnvVarDirectExternalPaths(unittest.TestCase):
         self.assertEqual(cfg.outbox_dir, Path("/mailbox/outbox"))
         self.assertTrue(cfg.repos_are_separate)
 
-    def test_from_paths_same_gives_legacy_layout(self):
+    def test_from_paths_same_gives_root_layout(self):
         cfg = MailboxConfig.from_paths(Path("/agent"), Path("/agent"))
-        self.assertEqual(cfg.inbox_dir, Path("/agent/communication/inbox"))
-        self.assertEqual(cfg.outbox_dir, Path("/agent/communication/outbox"))
+        self.assertEqual(cfg.inbox_dir, Path("/agent/inbox"))
+        self.assertEqual(cfg.outbox_dir, Path("/agent/outbox"))
         self.assertFalse(cfg.repos_are_separate)
 
 
@@ -623,13 +604,23 @@ class TestCLIPathResolution(unittest.TestCase):
         self.assertEqual(cfg.inbox_dir, Path("/var/lib/nexus/mailbox-repo/inbox"))
         self.assertEqual(cfg.outbox_dir, Path("/var/lib/nexus/mailbox-repo/outbox"))
 
-    def test_repo_path_alias_produces_legacy_layout(self):
-        """--repo-path sets both paths identically → legacy layout."""
+    def test_repo_path_alias_produces_root_layout(self):
+        """--repo-path still uses the one canonical root layout."""
         from mailbox_processor import _resolve_repo_paths
         code, mailbox = _resolve_repo_paths(None, None, "/agent")
         cfg = MailboxConfig.from_paths(code, mailbox)
-        self.assertEqual(cfg.inbox_dir, Path("/agent/communication/inbox"))
-        self.assertEqual(cfg.outbox_dir, Path("/agent/communication/outbox"))
+        self.assertEqual(cfg.inbox_dir, Path("/agent/inbox"))
+        self.assertEqual(cfg.outbox_dir, Path("/agent/outbox"))
+
+    def test_missing_mailbox_env_is_rejected(self):
+        from mailbox_processor import _resolve_repo_paths
+        old = os.environ.pop("AGENT_MAILBOX_REPO_PATH", None)
+        try:
+            with self.assertRaisesRegex(ValueError, "mailbox repository path is required"):
+                _resolve_repo_paths(None, None, None)
+        finally:
+            if old is not None:
+                os.environ["AGENT_MAILBOX_REPO_PATH"] = old
 
     def test_env_fallback_separate_repos(self):
         """Env-only separate paths → external layout via _resolve_repo_paths."""
@@ -735,11 +726,10 @@ class TestTwoRepoEndToEndCommit(unittest.TestCase):
             self.assertNotIn("outbox", f.split("/"), msg=f"outbox file in code repo: {f}")
         self.assertIn("inbox/test-msg.md", mailbox_files)
 
-    def test_legacy_defaults_unchanged(self):
-        """MailboxConfig.from_paths with same path → legacy communication/* layout."""
+    def test_same_repo_uses_canonical_root_layout(self):
         cfg = MailboxConfig.from_paths(self.code_repo, self.code_repo)
-        self.assertEqual(cfg.inbox_dir, self.code_repo / "communication" / "inbox")
-        self.assertEqual(cfg.outbox_dir, self.code_repo / "communication" / "outbox")
+        self.assertEqual(cfg.inbox_dir, self.code_repo / "inbox")
+        self.assertEqual(cfg.outbox_dir, self.code_repo / "outbox")
         self.assertFalse(cfg.repos_are_separate)
 
 
@@ -826,6 +816,27 @@ class TestTwoRepoEndToEndProcessInbox(unittest.TestCase):
             parts = f.split("/")
             self.assertNotIn("inbox", parts, f"inbox path found in code repo commit: {f}")
             self.assertNotIn("outbox", parts, f"outbox path found in code repo commit: {f}")
+
+    def test_communication_inbox_is_ignored(self):
+        """Only root inbox/ is scanned, even if a legacy-looking file exists."""
+        legacy_dir = self.mailbox_repo / "communication" / "inbox"
+        legacy_dir.mkdir(parents=True)
+        legacy_file = legacy_dir / "ignored.md"
+        legacy_file.write_text(_MESSAGE_TMPL)
+
+        proc = MailboxProcessor(
+            repo_path=self.mailbox_repo,
+            db_path=self.db_path,
+            dry_run=True,
+            mailbox_config=MailboxConfig.from_paths(self.code_repo, self.mailbox_repo),
+        )
+        try:
+            results = proc.process_inbox()
+        finally:
+            proc.close()
+
+        self.assertEqual(results, [])
+        self.assertTrue(legacy_file.exists())
 
 
 if __name__ == "__main__":

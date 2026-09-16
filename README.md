@@ -9,13 +9,13 @@ Repository development and verification conventions are documented in
 
 Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed mailbox communication. GitHub push events affecting `inbox/` trigger immediate processing through `POST /mailbox/webhook/github`; the systemd timer remains as a one-minute fallback.
 
-**Inbox** (`agent-lab-mailbox/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus.
+**Inbox** (`<AGENT_MAILBOX_REPO_PATH>/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus. This root-level directory is the only supported inbox; the code repository's former `communication/inbox/` path is not scanned.
 
 Supported message types: `idea`, `task`, `question`, `context`.
 
 Example: `agent-lab-mailbox/examples/idea-template.md`.
 
-**Outbox** (`agent-lab-mailbox/outbox/`): Nexus writes responses here. Processed mailbox state is kept in the dedicated mailbox repository rather than under `agent-lab/communication/`.
+**Outbox** (`<AGENT_MAILBOX_REPO_PATH>/outbox/`): Nexus writes responses here. Processed mailbox state is kept in the dedicated mailbox repository rather than under `agent-lab/communication/`.
 
 **Retention:** each poll deletes outbox responses older than
 `NEXUS_MAILBOX_RETENTION_DAYS` days (default `5`; set `0` to disable), and drops
