@@ -305,12 +305,15 @@ class GitHubWorkTrackingService:
         title = (getattr(source, "title", None) or "").strip()
         content = (getattr(source, "content", None) or "").strip()
 
+        directives = parse_work_directives(f"{title}\n{content}")
+
         persisted = self._find_by_source(source_type, source_id) if source_id else None
         if persisted is not None:
+            # A link from an earlier run is no licence to re-create a branch
+            # that has since been deleted: the task's own constraint decides.
+            self._require_reusable_branch(persisted.branch_name, directives)
             self._ensure_branch(persisted.branch_name)
             return persisted
-
-        directives = parse_work_directives(f"{title}\n{content}")
 
         issue: dict[str, Any]
         if source_type in {"issue", "github_issue"} and source_id and source_id.isdigit():
@@ -331,6 +334,9 @@ class GitHubWorkTrackingService:
         issue_number = int(issue["number"])
         issue_title = str(issue.get("title") or f"Issue {issue_number}")
         branch_name = directives.branch_name or f"nexus/{issue_number}-{_slug(issue_title)}"
+        # Checked before the link is persisted, so a refused task leaves no
+        # record pointing at a branch it was never allowed to create.
+        self._require_reusable_branch(branch_name, directives)
         ref = GitHubWorkRef(
             issue_number=issue_number,
             issue_title=issue_title,
@@ -341,6 +347,38 @@ class GitHubWorkTrackingService:
         self._persist_source(ref)
         self._ensure_branch(branch_name)
         return ref
+
+    def _require_reusable_branch(self, branch_name: str, directives: WorkDirectives) -> None:
+        """Refuse to *create* a branch the task said to reuse or not to add.
+
+        Issue #184: honouring "use branch X" by creating X when it is missing
+        is the same silent substitution as opening a duplicate Issue - the
+        task ends up on a branch nobody asked for. Branch reuse fails closed.
+        """
+        if directives.branch_name is None and not directives.forbid_new_branch:
+            return
+        if self._branch_exists(branch_name):
+            return
+        if directives.branch_name is not None:
+            raise GitHubWorkTrackingError(
+                f"task requires reusing branch {branch_name!r}, but it does not "
+                f"exist in {self.repository}; push that branch or drop the reuse "
+                "instruction"
+            )
+        raise GitHubWorkTrackingError(
+            "task forbids creating a new branch but names none to reuse, and "
+            f"{branch_name!r} does not exist; name the existing branch to reuse"
+        )
+
+    def _branch_exists(self, branch_name: str) -> bool:
+        quoted = urllib.parse.quote(branch_name, safe="")
+        try:
+            self._request("GET", f"/repos/{self.repository}/git/ref/heads/{quoted}")
+        except GitHubWorkTrackingError as exc:
+            if "HTTP 404" in str(exc):
+                return False
+            raise
+        return True
 
     def _reuse_issue(self, issue_number: int) -> dict[str, Any]:
         """Adopt an existing Issue as the work record, reopening it if closed."""

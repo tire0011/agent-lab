@@ -93,6 +93,7 @@ class IssueReuseLifecycleTests(unittest.TestCase):
             "title": "Outbox message object",
             "state": "open",
         }
+        self.fake.refs["fix/180-outbox-message-object"] = "branch-sha"
         self.service = GitHubWorkTrackingService(
             db_path=str(Path(self.tmp.name) / "nexus.db"),
             repo_root=self.tmp.name,
@@ -111,6 +112,13 @@ class IssueReuseLifecycleTests(unittest.TestCase):
             title=f"Mailbox task {source_id[:8]}",
             content=content,
         )
+
+    def _created_branches(self):
+        return [
+            (payload or {}).get("ref")
+            for method, path, payload in self.fake.calls
+            if method == "POST" and path == "/repos/tire0011/agent-lab/git/refs"
+        ]
 
     def _created_issue_titles(self):
         return [
@@ -131,6 +139,58 @@ class IssueReuseLifecycleTests(unittest.TestCase):
 
         self.assertEqual(ref.branch_name, "fix/180-outbox-message-object")
         self.assertNotIn("nexus/180-outbox-message-object", self.fake.refs)
+        self.assertEqual(self._created_branches(), [])
+
+    def test_missing_supplied_branch_stops_instead_of_creating_it(self):
+        del self.fake.refs["fix/180-outbox-message-object"]
+
+        with self.assertRaises(GitHubWorkTrackingError) as ctx:
+            self.service.ensure_for_source(self._source(_ISSUE_180_TASK))
+
+        self.assertIn("fix/180-outbox-message-object", str(ctx.exception))
+        self.assertIn("does not exist", str(ctx.exception))
+        self.assertEqual(self._created_branches(), [])
+
+    def test_refused_branch_leaves_no_link_to_reanimate_it(self):
+        # The persisted link is the second way in: an earlier run's row must
+        # not let a later one re-create the branch behind the constraint.
+        del self.fake.refs["fix/180-outbox-message-object"]
+        with self.assertRaises(GitHubWorkTrackingError):
+            self.service.ensure_for_source(self._source(_ISSUE_180_TASK))
+
+        with self.assertRaises(GitHubWorkTrackingError):
+            self.service.ensure_for_source(self._source(_ISSUE_180_TASK))
+
+        self.assertEqual(self._created_branches(), [])
+
+    def test_deleted_branch_is_not_recreated_for_a_persisted_link(self):
+        self.service.ensure_for_source(self._source(_ISSUE_180_TASK))
+        del self.fake.refs["fix/180-outbox-message-object"]
+
+        with self.assertRaises(GitHubWorkTrackingError) as ctx:
+            self.service.ensure_for_source(self._source(_ISSUE_180_TASK))
+
+        self.assertIn("fix/180-outbox-message-object", str(ctx.exception))
+        self.assertEqual(self._created_branches(), [])
+
+    def test_branch_ban_reuses_the_existing_derived_branch(self):
+        self.fake.refs["nexus/180-outbox-message-object"] = "derived-sha"
+
+        ref = self.service.ensure_for_source(
+            self._source("Implement issue #180. Do not create another branch.")
+        )
+
+        self.assertEqual(ref.branch_name, "nexus/180-outbox-message-object")
+        self.assertEqual(self._created_branches(), [])
+
+    def test_branch_ban_without_a_reusable_branch_stops_and_reports(self):
+        with self.assertRaises(GitHubWorkTrackingError) as ctx:
+            self.service.ensure_for_source(
+                self._source("Implement issue #180. Do not create another branch.")
+            )
+
+        self.assertIn("forbids creating a new branch", str(ctx.exception))
+        self.assertEqual(self._created_branches(), [])
 
     def test_reused_identity_survives_a_second_lookup(self):
         first = self.service.ensure_for_source(self._source(_ISSUE_180_TASK))
@@ -195,6 +255,7 @@ class IssueReuseLifecycleTests(unittest.TestCase):
 
         self.assertEqual(self._created_issue_titles(), ["Mailbox task plain001"])
         self.assertTrue(ref.branch_name.startswith("nexus/"))
+        self.assertEqual(self._created_branches(), [f"refs/heads/{ref.branch_name}"])
 
 
 class MailboxTaskIssueReuseTests(unittest.TestCase):
@@ -208,6 +269,7 @@ class MailboxTaskIssueReuseTests(unittest.TestCase):
             "title": "Outbox message object",
             "state": "open",
         }
+        self.fake.refs["fix/180-outbox-message-object"] = "branch-sha"
         self.db_path = str(self.tmp / "test.db")
         conn = init_db(self.db_path)
         conn.close()
@@ -285,6 +347,16 @@ class MailboxTaskIssueReuseTests(unittest.TestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertIn("issue=#180", result.result_summary)
         self.assertIn("branch=fix/180-outbox-message-object", result.result_summary)
+
+    def test_missing_reused_branch_stops_the_task_for_review(self):
+        del self.fake.refs["fix/180-outbox-message-object"]
+
+        approval_id = self._run_task(_ISSUE_180_TASK)
+
+        result = self.service.get(approval_id)
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("fix/180-outbox-message-object", result.result_summary)
+        self.experiment_service.create_experiment.assert_not_called()
 
     def test_task_that_forbids_a_new_issue_without_one_stops_for_review(self):
         approval_id = self._run_task(
