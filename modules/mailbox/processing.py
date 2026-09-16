@@ -334,8 +334,8 @@ class MailboxProcessor:
             self._mailbox_repo_path = repo_path
             self._code_repo_path = repo_path
             self.repo_path = repo_path
-            self.inbox = repo_path / "communication" / "inbox"
-            self.outbox = repo_path / "communication" / "outbox"
+            self.inbox = repo_path / "inbox"
+            self.outbox = repo_path / "outbox"
         self._mailbox_commit_prefixes: frozenset[str] = frozenset(
             str(d.relative_to(self._mailbox_repo_path))
             for d in (self.inbox, self.outbox)

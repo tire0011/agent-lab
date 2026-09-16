@@ -37,7 +37,12 @@ The corresponding runtime setting in `/etc/agent-lab/agent.env` is:
 AGENT_MAILBOX_REPO_PATH=/var/lib/nexus/mailbox-repo
 ```
 
-The mailbox repository is intentionally separate from `/agent`. Inbox/outbox Git synchronization and mailbox clean-worktree checks must operate on `/var/lib/nexus/mailbox-repo`, not on the code repository.
+The mailbox repository is intentionally separate from `/agent`. Its canonical
+layout is root-level `inbox/`, `outbox/`, and `archive/`. Inbox/outbox Git
+synchronization and mailbox clean-worktree checks must operate on
+`/var/lib/nexus/mailbox-repo`, not on the code repository. The former
+`/agent/communication/inbox` and `/agent/communication/outbox` directories are
+not active mailbox locations.
 
 Useful check:
 
@@ -59,9 +64,11 @@ Mailbox lock:
 /var/lib/nexus/mailbox.lock
 ```
 
-## Important fallback behavior
+## Required mailbox configuration
 
-Mailbox path resolution currently falls back to `/agent` when `AGENT_MAILBOX_REPO_PATH` is missing. On the production VM this is not the intended layout. A missing mailbox path can therefore make unrelated local changes in `/agent` cause mailbox polling to report `dirty_worktree`.
+Mailbox path resolution fails when `AGENT_MAILBOX_REPO_PATH` is missing; it
+never falls back to the code checkout. This prevents messages from being
+silently written to a directory the live processor does not scan.
 
 When diagnosing `dirty_worktree`, first verify:
 

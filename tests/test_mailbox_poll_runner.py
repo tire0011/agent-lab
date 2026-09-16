@@ -132,8 +132,8 @@ class MailboxValidationFeedbackTests(unittest.TestCase):
                 text=True,
             )
             _configure_git(repo)
-            inbox = repo / "communication" / "inbox"
-            outbox = repo / "communication" / "outbox"
+            inbox = repo / "inbox"
+            outbox = repo / "outbox"
             state = repo / "state"
             inbox.mkdir(parents=True)
             outbox.mkdir(parents=True)

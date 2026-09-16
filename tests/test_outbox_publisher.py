@@ -231,12 +231,14 @@ def _get_approval(db_path: str, approval_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Helpers to build MailboxConfig for both layouts
+# Helpers to build MailboxConfig instances
 # ---------------------------------------------------------------------------
 
 
-def _legacy_config(repo: Path) -> MailboxConfig:
-    return MailboxConfig.legacy(repo)
+def _same_repo_config(repo: Path) -> MailboxConfig:
+    (repo / "outbox").mkdir(parents=True, exist_ok=True)
+    (repo / "inbox").mkdir(parents=True, exist_ok=True)
+    return MailboxConfig.from_paths(repo, repo)
 
 
 def _external_config(repo: Path, mailbox: Path) -> MailboxConfig:
@@ -258,13 +260,13 @@ class TestTaskApprovalPublishLifecycle(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_task_approval_written_committed_pushed(self):
-        outbox_rel = "communication/outbox/task-abc.md"
+        outbox_rel = "outbox/task-abc.md"
         (self.repo / outbox_rel).write_text("task result\n")
         _insert_approval(self.db, "apv1", outbox_rel)
 
@@ -379,13 +381,13 @@ class TestChainPublishLifecycle(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_chain_written_committed_pushed(self):
-        outbox_rel = "communication/outbox/chain-r1.md"
+        outbox_rel = "outbox/chain-r1.md"
         (self.repo / outbox_rel).write_text("chain result\n")
         _insert_chain(self.db, "r1", outbox_rel)
 
@@ -414,13 +416,13 @@ class TestRecoveryAfterWrite(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_recovery_written_file_not_committed(self):
-        outbox_rel = "communication/outbox/crash-after-write.md"
+        outbox_rel = "outbox/crash-after-write.md"
         (self.repo / outbox_rel).write_text("crash body\n")
         _insert_chain(self.db, "r-crash", outbox_rel, publish_status=PUBLISH_WRITTEN)
         commits_before = _commit_count(self.repo)
@@ -438,7 +440,7 @@ class TestRecoveryAfterWrite(unittest.TestCase):
 
     def test_recovery_committing_state_file_not_committed(self):
         """DB=committing, file exists → treat same as written: commit + push."""
-        outbox_rel = "communication/outbox/crash-committing.md"
+        outbox_rel = "outbox/crash-committing.md"
         (self.repo / outbox_rel).write_text("committing body\n")
         _insert_chain(self.db, "r-commt", outbox_rel, publish_status="committing")
 
@@ -465,13 +467,13 @@ class TestRecoveryAfterCommit(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_push_existing_commit(self):
-        outbox_rel = "communication/outbox/committed.md"
+        outbox_rel = "outbox/committed.md"
         (self.repo / outbox_rel).write_text("committed body\n")
         _git(["add", "--", outbox_rel], self.repo)
         _git(["commit", "--no-verify", "-m", "outbox: publish r-committed"], self.repo)
@@ -507,13 +509,13 @@ class TestPushFailureRetry(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_push_retry_reuses_same_commit(self):
-        outbox_rel = "communication/outbox/retry.md"
+        outbox_rel = "outbox/retry.md"
         (self.repo / outbox_rel).write_text("retry body\n")
         _insert_chain(self.db, "r-retry", outbox_rel)
 
@@ -556,13 +558,13 @@ class TestCrashAfterCommitBeforeDbUpdate(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_crash_after_commit_sha_recovered(self):
-        outbox_rel = "communication/outbox/crash-sha.md"
+        outbox_rel = "outbox/crash-sha.md"
         (self.repo / outbox_rel).write_text("sha recovery\n")
         # Manually commit as if the publisher committed but crashed before writing SHA to DB
         _git(["add", "--", outbox_rel], self.repo)
@@ -599,13 +601,13 @@ class TestAdoptExistingUntrackedFile(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_adopt_untracked_outbox_file(self):
-        outbox_rel = "communication/outbox/existing.md"
+        outbox_rel = "outbox/existing.md"
         (self.repo / outbox_rel).write_text("pre-existing content\n")
         # DB says pending_write (file was written but DB not advanced yet)
         _insert_chain(self.db, "r-adopt", outbox_rel, publish_status=PUBLISH_PENDING_WRITE)
@@ -634,13 +636,13 @@ class TestConcurrentPublishers(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_concurrent_publishers_single_commit(self):
-        outbox_rel = "communication/outbox/concurrent.md"
+        outbox_rel = "outbox/concurrent.md"
         (self.repo / outbox_rel).write_text("concurrent\n")
         _insert_chain(self.db, "r-conc", outbox_rel)
         commits_before = _commit_count(self.repo)
@@ -685,17 +687,17 @@ class TestForeignUntrackedFile(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_foreign_untracked_not_staged(self):
-        outbox_rel = "communication/outbox/target.md"
+        outbox_rel = "outbox/target.md"
         (self.repo / outbox_rel).write_text("only me\n")
         _insert_chain(self.db, "r-foreign", outbox_rel)
 
-        foreign = self.repo / "communication" / "outbox" / "foreign.md"
+        foreign = self.repo / "outbox" / "foreign.md"
         foreign.write_text("DO NOT STAGE\n")
         (self.repo / "scratch.txt").write_text("also untracked\n")
 
@@ -772,8 +774,8 @@ class TestCodeRepoUntouchedTwoRepoMode(unittest.TestCase):
 # ============================================================================
 
 
-class TestLegacyLayout(unittest.TestCase):
-    """AC #11: legacy single-repo layout works via MailboxConfig.legacy()."""
+class TestCanonicalSameRepoLayout(unittest.TestCase):
+    """Even equal repo paths use root-level mailbox directories."""
 
     def setUp(self):
         self.ctx = tempfile.TemporaryDirectory()
@@ -784,10 +786,11 @@ class TestLegacyLayout(unittest.TestCase):
     def tearDown(self):
         self.ctx.cleanup()
 
-    def test_legacy_config_publishes(self):
-        cfg = MailboxConfig.legacy(self.repo)
-        outbox_rel = "communication/outbox/legacy.md"
-        (self.repo / outbox_rel).write_text("legacy content\n")
+    def test_same_repo_config_publishes_from_root_outbox(self):
+        cfg = MailboxConfig.from_paths(self.repo, self.repo)
+        (cfg.outbox_dir).mkdir(parents=True, exist_ok=True)
+        outbox_rel = "outbox/result.md"
+        (self.repo / outbox_rel).write_text("result content\n")
         _insert_chain(self.db, "r-legacy", outbox_rel)
 
         pub = OperationChainOutboxPublisher(mailbox_config=cfg, db_path=self.db)
@@ -798,7 +801,7 @@ class TestLegacyLayout(unittest.TestCase):
 
         row = _get_chain(self.db, "r-legacy")
         self.assertEqual(row["publish_status"], PUBLISH_PUSHED)
-        self.assertEqual(_remote_head(self.remote, outbox_rel), "legacy content\n")
+        self.assertEqual(_remote_head(self.remote, outbox_rel), "result content\n")
 
 
 # ============================================================================
@@ -814,13 +817,13 @@ class TestPendingWriteRecovery(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_content_fn_recreates_missing_file(self):
-        outbox_rel = "communication/outbox/recreated.md"
+        outbox_rel = "outbox/recreated.md"
         _insert_chain(self.db, "r-recreate", outbox_rel, publish_status=PUBLISH_PENDING_WRITE)
 
         record = PublishRecord(
@@ -851,7 +854,7 @@ class TestSecurityRejections(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, _ = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
@@ -861,7 +864,7 @@ class TestSecurityRejections(unittest.TestCase):
         real.write_text("real\n")
         link = self.repo / "communication" / "outbox" / "link.md"
         link.symlink_to(real)
-        _insert_chain(self.db, "r-link", "communication/outbox/link.md")
+        _insert_chain(self.db, "r-link", "outbox/link.md")
 
         pub = OperationChainOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
         try:
@@ -879,9 +882,9 @@ class TestSecurityRejections(unittest.TestCase):
         # `UNIQUE constraint failed: operation_chains.request_id`. The loop
         # index is what the id actually needs to be: distinct and stable.
         for index, bad in enumerate([
-            "communication/outbox/../../README.md",
+            "outbox/../../README.md",
             "/etc/passwd",
-            "communication/inbox/x.md",
+            "inbox/x.md",
         ]):
             rid = f"traversal-{index}"
             _insert_chain(self.db, rid, bad)
@@ -907,20 +910,20 @@ class TestForeignStagedFileAbort(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, _ = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_foreign_staged_file_aborts(self):
-        outbox_rel = "communication/outbox/target2.md"
+        outbox_rel = "outbox/target2.md"
         (self.repo / outbox_rel).write_text("target\n")
         _insert_chain(self.db, "r-staged", outbox_rel)
 
         # Stage a foreign file before the publisher runs
-        foreign = self.repo / "communication" / "outbox" / "foreign2.md"
+        foreign = self.repo / "outbox" / "foreign2.md"
         foreign.write_text("STAGED BAD\n")
-        _git(["add", "--", "communication/outbox/foreign2.md"], self.repo)
+        _git(["add", "--", "outbox/foreign2.md"], self.repo)
 
         pub = OperationChainOutboxPublisher(mailbox_config=self.cfg, db_path=self.db)
         try:
@@ -948,13 +951,13 @@ class TestGitDiffCheckClean(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, _ = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
 
     def test_diff_check_clean(self):
-        outbox_rel = "communication/outbox/clean.md"
+        outbox_rel = "outbox/clean.md"
         (self.repo / outbox_rel).write_text("clean content\n")
         _insert_chain(self.db, "r-clean", outbox_rel)
 
@@ -1005,7 +1008,7 @@ class TestPushErrorRedaction(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, _ = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
 
     def tearDown(self):
         self.ctx.cleanup()
@@ -1042,7 +1045,7 @@ class TestPushErrorRedaction(unittest.TestCase):
 
         for i, (error_text, secret) in enumerate(self._CASES):
             record_id = f"r-cred-{i}"
-            outbox_rel = f"communication/outbox/cred{i}.md"
+            outbox_rel = f"outbox/cred{i}.md"
             _insert_chain(self.db, record_id, outbox_rel, publish_status=PUBLISH_WRITTEN)
 
             pub = self._make_chain_pub()
@@ -1071,7 +1074,7 @@ class TestPushErrorRedaction(unittest.TestCase):
 
         for i, (error_text, secret) in enumerate(self._CASES):
             record_id = f"r-log-{i}"
-            outbox_rel = f"communication/outbox/log{i}.md"
+            outbox_rel = f"outbox/log{i}.md"
             _insert_chain(self.db, record_id, outbox_rel, publish_status=PUBLISH_WRITTEN)
 
             pub = self._make_chain_pub()
@@ -1187,7 +1190,7 @@ class TestFailureAnalysisPublishLifecycle(unittest.TestCase):
         tmp = Path(self.ctx.name)
         self.repo, self.remote = _make_repo_with_remote(tmp)
         self.db = str(tmp / "state.db")
-        self.cfg = _legacy_config(self.repo)
+        self.cfg = _same_repo_config(self.repo)
         # Deliberately never construct a FailureAnalysisService here: the
         # failure_analyses table + its outbox columns must already exist on
         # any database that only ever went through run_store.init_db()
@@ -1214,7 +1217,7 @@ class TestFailureAnalysisPublishLifecycle(unittest.TestCase):
             pub.close()
 
     def test_failure_analysis_written_committed_pushed(self):
-        outbox_rel = "communication/outbox/failure-analysis-abc.md"
+        outbox_rel = "outbox/failure-analysis-abc.md"
         (self.repo / outbox_rel).write_text("failure analysis\n")
         _insert_failure_analysis(self.db, "fa1", outbox_rel)
 
@@ -1239,7 +1242,7 @@ class TestFailureAnalysisPublishLifecycle(unittest.TestCase):
         """Restart/re-polling must not duplicate the outbox message for the
         same analysis: a row already at PUBLISH_PUSHED is never selected
         again by fetch_pending, so a second poll produces no new commit."""
-        outbox_rel = "communication/outbox/failure-analysis-pushed.md"
+        outbox_rel = "outbox/failure-analysis-pushed.md"
         (self.repo / outbox_rel).write_text("already pushed\n")
         _git(["add", "--", outbox_rel], self.repo)
         _git(["commit", "--no-verify", "-m", "outbox: publish fa-pushed"], self.repo)
@@ -1268,7 +1271,7 @@ class TestFailureAnalysisPublishLifecycle(unittest.TestCase):
         """AC: 'Outbox publish failure must be logged but must not change
         the original task/finalization status' - here, the persisted
         diagnosis itself (category/confidence/etc)."""
-        outbox_rel = "communication/outbox/failure-analysis-retry.md"
+        outbox_rel = "outbox/failure-analysis-retry.md"
         (self.repo / outbox_rel).write_text("retry body\n")
         _insert_failure_analysis(
             self.db, "fa-retry", outbox_rel,

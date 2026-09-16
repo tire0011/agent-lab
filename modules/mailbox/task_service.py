@@ -115,7 +115,7 @@ class MailboxTaskService:
         self,
         db_path: str = DEFAULT_DB_PATH,
         experiment_service: "ExperimentService | None" = None,
-        outbox_dir: str = "/agent/communication/outbox",
+        outbox_dir: str = "/agent/outbox",
         repo_path: str = "/agent",
         mailbox_config: Any | None = None,
         operations_registry: Any | None = None,

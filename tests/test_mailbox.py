@@ -211,8 +211,8 @@ class _ProcessorTestBase(unittest.TestCase):
         _make_repo(self.repo)
 
         # Set up directory structure
-        (self.repo / "communication" / "inbox").mkdir(parents=True)
-        (self.repo / "communication" / "outbox").mkdir(parents=True)
+        (self.repo / "inbox").mkdir(parents=True)
+        (self.repo / "outbox").mkdir(parents=True)
         (self.repo / "state").mkdir()
 
         # IDEAS.md
@@ -234,11 +234,11 @@ class _ProcessorTestBase(unittest.TestCase):
 
     @property
     def inbox(self) -> Path:
-        return self.repo / "communication" / "inbox"
+        return self.repo / "inbox"
 
     @property
     def outbox(self) -> Path:
-        return self.repo / "communication" / "outbox"
+        return self.repo / "outbox"
 
     def _write(self, name: str, content: str) -> Path:
         return _make_inbox_file(self.inbox, name, content)
@@ -407,14 +407,14 @@ class TestMailboxGitCommitBehavior(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.repo, self.remote = _make_repo_with_remote(self.base)
-        (self.repo / "communication" / "inbox").mkdir(parents=True, exist_ok=True)
-        (self.repo / "communication" / "outbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "inbox").mkdir(parents=True, exist_ok=True)
+        (self.repo / "outbox").mkdir(parents=True, exist_ok=True)
         (self.repo / "state").mkdir(exist_ok=True)
         (self.repo / "IDEAS.md").write_text(
             "# IDEAS.md\n\n## Ideas\n\n### Existing\n\n- Old idea `new`\n"
         )
         subprocess.run(
-            ["git", "add", "communication", "IDEAS.md"],
+            ["git", "add", "IDEAS.md"],
             cwd=str(self.repo),
             check=True,
             capture_output=True,
@@ -440,12 +440,12 @@ class TestMailboxGitCommitBehavior(unittest.TestCase):
         return MailboxProcessor(repo_path=self.repo, db_path=self.db_path, dry_run=False)
 
     def test_inbox_deletion_is_in_same_commit(self):
-        inbox_file = self.repo / "communication" / "inbox" / "idea.md"
+        inbox_file = self.repo / "inbox" / "idea.md"
         inbox_file.write_text(
             "---\ntype: idea\ncreated_by: rene\n---\n\nCommit cleanup coverage."
         )
         subprocess.run(
-            ["git", "add", "communication/inbox/idea.md"],
+            ["git", "add", "inbox/idea.md"],
             cwd=str(self.repo),
             check=True,
             capture_output=True,
@@ -473,20 +473,20 @@ class TestMailboxGitCommitBehavior(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout
-        self.assertIn("D\tcommunication/inbox/idea.md", show)
-        self.assertIn("A\tcommunication/outbox/", show)
+        self.assertIn("D\tinbox/idea.md", show)
+        self.assertIn("A\toutbox/", show)
         self.assertIn("M\tIDEAS.md", show)
 
     def test_already_done_message_is_cleaned_from_inbox(self):
-        inbox_file = self.repo / "communication" / "inbox" / "q.md"
+        inbox_file = self.repo / "inbox" / "q.md"
         inbox_file.write_text(
             "---\ntype: question\ncreated_by: rene\n---\n\nIs cleanup safe?"
         )
         outbox_name = "20260101000000-question-aaaaaaaa.md"
-        outbox_file = self.repo / "communication" / "outbox" / outbox_name
+        outbox_file = self.repo / "outbox" / outbox_name
         outbox_file.write_text("done\n")
         subprocess.run(
-            ["git", "add", "communication/inbox/q.md", "communication/outbox/" + outbox_name],
+            ["git", "add", "inbox/q.md", "outbox/" + outbox_name],
             cwd=str(self.repo),
             check=True,
             capture_output=True,
@@ -524,13 +524,13 @@ class TestMailboxGitCommitBehavior(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout
-        self.assertIn("D\tcommunication/inbox/q.md", show)
+        self.assertIn("D\tinbox/q.md", show)
 
     def test_push_failure_recovery_retries_without_reprocessing(self):
-        inbox_file = self.repo / "communication" / "inbox" / "task.md"
+        inbox_file = self.repo / "inbox" / "task.md"
         inbox_file.write_text("---\ntype: task\ncreated_by: bot\n---\n\nDo thing.")
         subprocess.run(
-            ["git", "add", "communication/inbox/task.md"],
+            ["git", "add", "inbox/task.md"],
             cwd=str(self.repo),
             check=True,
             capture_output=True,
@@ -575,7 +575,7 @@ class TestMailboxGitCommitBehavior(unittest.TestCase):
             processor.close()
 
         self.assertEqual(results, [])
-        outbox_count = len(list((self.repo / "communication" / "outbox").glob("*.md")))
+        outbox_count = len(list((self.repo / "outbox").glob("*.md")))
         self.assertEqual(outbox_count, 1)
         local_head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -599,8 +599,8 @@ class TestMailboxProcessorCliGuards(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _make_repo(root)
-            (root / "communication" / "inbox").mkdir(parents=True)
-            (root / "communication" / "outbox").mkdir(parents=True)
+            (root / "inbox").mkdir(parents=True)
+            (root / "outbox").mkdir(parents=True)
             (root / "state").mkdir()
             (root / "IDEAS.md").write_text("# IDEAS.md\n\n## Ideas\n")
             (root / "dirty.txt").write_text("dirty")

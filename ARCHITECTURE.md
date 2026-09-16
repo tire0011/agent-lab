@@ -122,8 +122,9 @@
 ### 6) Mailbox
 
 - Files: `modules/mailbox/core.py` (parsing, validation, persistence, locks, and Git helpers), `modules/mailbox/processing.py` (inbox workflow), `modules/mailbox/__init__.py` (stable `modules.mailbox` public API), and `mailbox_processor.py` (CLI entry point)
-- Inbox: `communication/inbox/` — Markdown files with YAML front matter
-- Outbox: `communication/outbox/` — response files written per processed message
+- Mailbox repository: the checkout configured by `AGENT_MAILBOX_REPO_PATH`
+- Inbox: root-level `inbox/` — Markdown files with YAML front matter
+- Outbox: root-level `outbox/` — response files written per processed message
 - Message types: `idea` (appended to IDEAS.md), `task` (body stored, `pending_approval` record created in `mailbox_task_approvals`), `question` (acknowledged), `context` (stored in `knowledge` table)
 - Safety: max 64 KB, no binary/symlinks/path-traversal, secret pattern detection, max 3 retries
 - Git integration: commits outbox + IDEAS.md (idea type only), pushes to tracked branch

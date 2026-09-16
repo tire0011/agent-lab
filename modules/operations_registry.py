@@ -712,8 +712,9 @@ class OperationsRegistry:
 
     def _op_outbox_status(self, args: dict[str, Any]) -> OperationResult:
         del args
-        from pathlib import Path
-        outbox_dir = Path("/agent/communication/outbox")
+        from modules.mailbox.config import MailboxConfig
+
+        outbox_dir = MailboxConfig.from_env().outbox_dir
         if not outbox_dir.exists():
             return OperationResult("outbox_status", True, ["outbox_dir does not exist"], 0)
         files = sorted(outbox_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]

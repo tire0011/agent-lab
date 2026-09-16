@@ -72,7 +72,7 @@ class OutboxPublishGatingTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.cfg = MailboxConfig.legacy(self.tmp)
+        self.cfg = MailboxConfig.from_paths(self.tmp, self.tmp)
 
     def _service(self, client) -> FailureAnalysisService:
         return FailureAnalysisService(
@@ -171,7 +171,7 @@ class UnavailableAnalysisOutboxTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.cfg = MailboxConfig.legacy(self.tmp)
+        self.cfg = MailboxConfig.from_paths(self.tmp, self.tmp)
 
     def test_unavailable_analysis_publishes_a_notification_naming_the_reason(self):
         client = _FakeClient(RuntimeError("local model unreachable: connection refused"))
@@ -203,7 +203,7 @@ class UnavailableAnalysisOutboxTests(unittest.TestCase):
 class RedactionInOutboxTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.cfg = MailboxConfig.legacy(self.tmp)
+        self.cfg = MailboxConfig.from_paths(self.tmp, self.tmp)
 
     def test_outbox_content_never_contains_secrets(self):
         client = _FakeClient(_diagnosis_json(
@@ -233,7 +233,7 @@ class PublishFailureDoesNotAffectAnalysisTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.cfg = MailboxConfig.legacy(self.tmp)
+        self.cfg = MailboxConfig.from_paths(self.tmp, self.tmp)
 
     def test_write_failure_is_swallowed_and_analysis_is_unaffected(self):
         client = _FakeClient(_diagnosis_json(category="lifecycle_logic", confidence=0.77))

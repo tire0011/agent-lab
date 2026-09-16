@@ -39,8 +39,9 @@ def _resolve_repo_paths(
 ) -> tuple[Path, Path]:
     """Resolve code and mailbox repository paths from CLI arguments and env vars.
 
-    Priority: explicit flags > ``--repo-path`` alias > environment variables >
-    ``/agent`` default.  Raises :exc:`ValueError` if ``--repo-path`` is
+    Priority: explicit flags > ``--repo-path`` alias > environment variables.
+    The code repository defaults to ``/agent``; the mailbox repository must be
+    explicit. Raises :exc:`ValueError` if ``--repo-path`` is
     combined with ``--code-repo-path`` or ``--mailbox-repo-path``.
 
     Returns ``(code_repo_path, mailbox_repo_path)``.
@@ -59,9 +60,15 @@ def _resolve_repo_paths(
         p = Path(repo_path_arg)
         return p, p
 
+    mailbox_value = mailbox_repo_path_arg or os.environ.get("AGENT_MAILBOX_REPO_PATH")
+    if not mailbox_value or not mailbox_value.strip():
+        raise ValueError(
+            "mailbox repository path is required; use --mailbox-repo-path or "
+            "set AGENT_MAILBOX_REPO_PATH"
+        )
     return (
         Path(code_repo_path_arg or os.environ.get("AGENT_CODE_REPO_PATH", "/agent")),
-        Path(mailbox_repo_path_arg or os.environ.get("AGENT_MAILBOX_REPO_PATH", "/agent")),
+        Path(mailbox_value),
     )
 
 
@@ -86,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Path to the mailbox repository root "
-            "(default: AGENT_MAILBOX_REPO_PATH env var, or /agent). "
+            "(default: required AGENT_MAILBOX_REPO_PATH env var). "
             "Git operations for inbox/outbox messages run here."
         ),
     )

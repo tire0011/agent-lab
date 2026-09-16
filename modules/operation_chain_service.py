@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_REPO_ROOT = "/agent"
-_DEFAULT_OUTBOX_DIR = "/agent/communication/outbox"
+_DEFAULT_OUTBOX_DIR = "/agent/outbox"
 
 # Statuses
 STATUS_QUEUED = "queued"
