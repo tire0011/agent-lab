@@ -277,6 +277,68 @@ class PersistedCIEvidenceTests(unittest.TestCase):
         self.assertIsNone(self.fx.github_work_tracking.recorded_ci_for(self.checkpoint_sha))
         self.assertIsNone(self.fx.github_work_tracking.recorded_ci_for("e" * 40))
 
+    def _github_api_for_repair_checkpoint(self, *, checkpoint_parent_sha: str):
+        """A repair checkpoint whose direct git parent is not `main`.
+
+        Real repair commits build on the previous checkpoint commit, so
+        the stubbed `/commits/<sha>` response reports a parent that is
+        deliberately *not* the current `origin/main` head returned for
+        `/git/ref/heads/main` - the scenario review flagged for #210/#211.
+        """
+        target_sha = self._integration_base()
+
+        def _request(method, path, payload=None):
+            if "/actions/workflows/" in path:
+                return {
+                    "workflow_runs": [{
+                        "id": 33898643539,
+                        "head_sha": self.checkpoint_sha,
+                        "event": "push",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "run_attempt": 1,
+                        "html_url": "https://example.invalid/actions/runs/33898643539",
+                    }]
+                }
+            if f"/commits/{self.checkpoint_sha}" in path:
+                return {"parents": [{"sha": checkpoint_parent_sha}]}
+            if "/git/ref/heads/" in path:
+                return {"object": {"sha": target_sha}}
+            raise AssertionError(f"unexpected GitHub request: {method} {path}")
+
+        return _request
+
+    def test_repaired_checkpoint_evidence_survives_restart_when_main_unchanged(self):
+        """Regression for the #211 review finding.
+
+        A repair checkpoint's direct git parent is the previous checkpoint
+        commit, not `main`. `wait_for_ci` must persist the *actual* target-
+        branch head as `base_sha` (not that parent), so that after a
+        restart with no live GitHub access, `assess_failure` still finds
+        the persisted verdict reusable as long as `main` itself has not
+        moved.
+        """
+        self._stale_failed_adoption()
+        with patch.object(
+            self.fx.github_work_tracking,
+            "_request",
+            side_effect=self._github_api_for_repair_checkpoint(
+                checkpoint_parent_sha="previous-checkpoint-sha-not-main"
+            ),
+        ):
+            verification = self.fx.github_work_tracking.wait_for_ci(
+                self.experiment_id, **self._BOUNDED
+            )
+        self.assertEqual(verification.status, "passed")
+
+        # main has not moved since verification.
+        _, adoption_service = self._restarted_without_credentials()
+        assessment = adoption_service.assess_failure(self.experiment_id)
+
+        self.assertTrue(assessment.retryable, assessment.detail)
+        self.assertEqual(assessment.category, "superseded_local_verification")
+        self.assertEqual(assessment.evidence_commit_sha, self.checkpoint_sha)
+
     # ---- the adoption read path ---------------------------------------
 
     def test_assess_failure_uses_persisted_evidence_without_credentials(self):

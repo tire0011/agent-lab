@@ -707,7 +707,16 @@ class GitHubWorkTrackingService:
         completion_timeout_seconds: float = _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS,
         poll_interval_seconds: float = _DEFAULT_CI_POLL_INTERVAL_SECONDS,
     ) -> GitHubCIVerification:
-        """Return authoritative CI only when it verifies the tree adoption will use."""
+        """Return authoritative CI for the exact checkpoint commit SHA.
+
+        Whether GitHub Actions verified this exact SHA is the only
+        question this method answers (#210): it does not require the
+        checkpoint's direct parent to match the current target branch, and
+        it accepts both `push` and `pull_request` runs as authoritative.
+        Base/target compatibility is a separate concern for the
+        integration/adoption step, not a precondition for recognizing CI
+        here.
+        """
         try:
             ref = self.ensure_for_experiment(experiment_id)
         except GitHubWorkTrackingError as exc:
@@ -725,48 +734,37 @@ class GitHubWorkTrackingService:
                 reason="experiment checkpoint SHA is missing",
             )
 
-        # A checkpoint is built on the target-branch SHA that existed when
-        # verification ran. If target branch moved since then, the integrated
-        # tree is different from the CI'd tree even when cherry-pick is clean.
-        # In that case exact-checkpoint CI is not authoritative for adoption;
-        # callers must execute their integration fallback on the current base.
+        # The base persisted alongside a CI verdict must be the value
+        # adoption will later compare against - the target branch's own
+        # head SHA - not the checkpoint commit's direct git parent. A
+        # repair checkpoint's parent is the previous checkpoint commit,
+        # not `main` (#210); persisting that as `base_sha` would make
+        # `recorded_ci_for(checkpoint_sha, base_sha=integration_base)`
+        # reject a perfectly reusable verdict after every restart, even
+        # when `main` never moved. Recognizing checkpoint CI itself must
+        # never depend on this lookup succeeding or matching anything, so
+        # a failure here only means the verdict is persisted without a
+        # base (and so is not reused from the store later) - it never
+        # blocks the live CI check below.
+        integration_base = ""
         try:
-            checkpoint = self._request("GET", f"/repos/{self.repository}/commits/{sha}")
-            parents = checkpoint.get("parents") or []
-            checkpoint_base = str((parents[0] if parents else {}).get("sha") or "").strip()
             target = self._request(
                 "GET",
                 f"/repos/{self.repository}/git/ref/heads/{urllib.parse.quote(self.target_branch, safe='')}",
             )
-            target_sha = str(((target.get("object") or {}).get("sha") or "")).strip()
-        except GitHubWorkTrackingError as exc:
-            return GitHubCIVerification(
-                status="unavailable",
-                commit_sha=sha,
-                reason=f"GitHub integration-base lookup failed: {str(exc)[:1000]}",
-            )
-        if not checkpoint_base or not target_sha:
-            return GitHubCIVerification(
-                status="unavailable",
-                commit_sha=sha,
-                reason="GitHub integration-base evidence is incomplete",
-            )
-        if checkpoint_base != target_sha:
-            return GitHubCIVerification(
-                status="unavailable",
-                commit_sha=sha,
-                reason=(
-                    "target branch moved since checkpoint verification; "
-                    "integration fallback is required for the current base"
-                ),
+            integration_base = str(((target.get("object") or {}).get("sha") or "")).strip()
+        except GitHubWorkTrackingError:
+            logger.warning(
+                "could not resolve current target-branch head while verifying %s; "
+                "verdict will be persisted without a base",
+                sha,
+                exc_info=True,
             )
 
         started_deadline = time.monotonic() + max(0.0, start_timeout_seconds)
         completion_deadline: float | None = None
         encoded_workflow = urllib.parse.quote(workflow, safe="")
-        query = urllib.parse.urlencode(
-            {"head_sha": sha, "event": "push", "per_page": 20}
-        )
+        query = urllib.parse.urlencode({"head_sha": sha, "per_page": 20})
         path = (
             f"/repos/{self.repository}/actions/workflows/{encoded_workflow}/runs?{query}"
         )
@@ -781,11 +779,15 @@ class GitHubWorkTrackingService:
                     reason=f"GitHub Actions lookup failed: {str(exc)[:1000]}",
                 )
 
+            # Authoritative CI for the exact checkpoint SHA is accepted
+            # regardless of what triggered the run: a `pull_request` run
+            # (the common case once the checkpoint lives on a PR branch,
+            # #210) is just as authoritative as a `push` run.
             runs = [
                 run
                 for run in (response.get("workflow_runs") or [])
                 if str(run.get("head_sha") or "") == sha
-                and str(run.get("event") or "") == "push"
+                and str(run.get("event") or "") in ("push", "pull_request")
             ]
             runs.sort(
                 key=lambda run: (int(run.get("run_attempt") or 0), int(run.get("id") or 0)),
@@ -826,17 +828,18 @@ class GitHubWorkTrackingService:
                     # evidence for this one.
                     if run_sha == sha:
                         try:
-                            # `checkpoint_base` is the target-branch commit
-                            # this checkpoint was verified on top of, and
-                            # equals the current target head here - the
-                            # early return above guarantees it. Storing it
-                            # is what lets a later reader re-apply the same
-                            # base check without GitHub.
+                            # `integration_base` is the target branch's own
+                            # head SHA at verification time (best-effort;
+                            # empty when it could not be resolved). Storing
+                            # it - not the checkpoint's git parent - is what
+                            # lets a later, credential-less reader decide
+                            # whether this verdict still applies to the
+                            # base it is about to integrate onto.
                             self.record_ci_verification(
                                 verification,
                                 experiment_id=experiment_id,
                                 workflow=workflow,
-                                base_sha=checkpoint_base,
+                                base_sha=integration_base,
                             )
                         except sqlite3.Error:
                             logger.warning(
@@ -855,7 +858,7 @@ class GitHubWorkTrackingService:
                 return GitHubCIVerification(
                     status="unavailable",
                     commit_sha=sha,
-                    reason="no matching GitHub Actions push run started for the checkpoint SHA",
+                    reason="no matching GitHub Actions run started for the checkpoint SHA",
                 )
 
             time.sleep(max(0.01, poll_interval_seconds))

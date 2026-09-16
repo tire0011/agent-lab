@@ -373,6 +373,57 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.conclusion, "failure")
 
+    def test_repaired_checkpoint_parent_previous_checkpoint_is_authoritative(self):
+        # #210: a repair commit's direct parent is the previous checkpoint
+        # commit, not `main`. That must not stop wait_for_ci from
+        # recognizing CI for the exact repaired SHA.
+        ref = self._bind_checkpoint("repaired-sha")
+        self.fake.commit_parents["repaired-sha"] = "previous-checkpoint-sha"
+        self.fake.workflow_runs = [
+            {
+                "id": 21,
+                "run_attempt": 1,
+                "head_sha": ref.checkpoint_sha,
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+
+        result = self.service.wait_for_ci(ref.experiment_id, poll_interval_seconds=0.01)
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.commit_sha, ref.checkpoint_sha)
+
+    def test_repaired_checkpoint_persisted_evidence_reusable_when_main_unchanged(self):
+        # Review follow-up on #210/#211: the base persisted alongside a CI
+        # verdict must be the current target-branch head, not the
+        # checkpoint commit's git parent. A repair checkpoint's parent is
+        # the previous checkpoint commit - if that were persisted as
+        # `base_sha`, `recorded_ci_for` would reject the verdict on every
+        # restart even though `main` never moved.
+        ref = self._bind_checkpoint("repaired-sha-2")
+        self.fake.commit_parents["repaired-sha-2"] = "previous-checkpoint-sha-2"
+        self.fake.workflow_runs = [
+            {
+                "id": 24,
+                "run_attempt": 1,
+                "head_sha": ref.checkpoint_sha,
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+
+        result = self.service.wait_for_ci(ref.experiment_id, poll_interval_seconds=0.01)
+        self.assertEqual(result.status, "passed")
+
+        current_main = self.fake.refs["main"]
+        reused = self.service.recorded_ci_for(ref.checkpoint_sha, base_sha=current_main)
+
+        self.assertIsNotNone(reused)
+        self.assertEqual(reused.status, "passed")
+
     def test_ci_result_for_different_commit_is_ignored(self):
         ref = self._bind_checkpoint("wanted-sha")
         self.fake.workflow_runs = [
@@ -416,6 +467,58 @@ class GitHubWorkTrackingTests(unittest.TestCase):
 
         self.assertEqual(result.status, "unavailable")
         self.assertEqual(result.run_id, 20)
+
+    def test_pull_request_run_success_is_authoritative(self):
+        # #210: CI triggered by `pull_request` (the normal case once the
+        # checkpoint lives on a PR branch) is just as authoritative as
+        # `push`.
+        ref = self._bind_checkpoint("pr-triggered-sha")
+        self.fake.workflow_runs = [
+            {
+                "id": 22,
+                "run_attempt": 1,
+                "head_sha": ref.checkpoint_sha,
+                "event": "pull_request",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+
+        result = self.service.wait_for_ci(ref.experiment_id, poll_interval_seconds=0.01)
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.commit_sha, ref.checkpoint_sha)
+
+    def test_push_run_success_is_authoritative(self):
+        ref = self._bind_checkpoint("push-triggered-sha")
+        self.fake.workflow_runs = [
+            {
+                "id": 23,
+                "run_attempt": 1,
+                "head_sha": ref.checkpoint_sha,
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+
+        result = self.service.wait_for_ci(ref.experiment_id, poll_interval_seconds=0.01)
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.commit_sha, ref.checkpoint_sha)
+
+    def test_no_ci_run_within_start_timeout_is_unavailable_for_local_fallback(self):
+        ref = self._bind_checkpoint("no-run-sha")
+        self.fake.workflow_runs = []
+
+        result = self.service.wait_for_ci(
+            ref.experiment_id,
+            start_timeout_seconds=0,
+            poll_interval_seconds=0.01,
+        )
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("no matching", result.reason)
 
 
 if __name__ == "__main__":
