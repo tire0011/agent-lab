@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_BASE = "https://api.github.com"
 _DEFAULT_TARGET_BRANCH = "main"
+_MAX_ISSUE_BODY_CHARS = 16_000
 _DEFAULT_CI_WORKFLOW = "tests.yml"
 _DEFAULT_CI_START_TIMEOUT_SECONDS = 90.0
 _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS = 1500.0
@@ -158,6 +159,46 @@ class GitHubWorkTrackingService:
         message = self.readiness_error()
         if message:
             raise GitHubWorkTrackingError(message)
+
+    def get_issue(self, issue_number: int) -> dict[str, Any]:
+        """Fetch one Issue without mutating GitHub or exposing credentials."""
+        if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number < 1:
+            raise ValueError("issue_number must be a positive integer")
+        self.require_lifecycle_ready()
+        issue = self._request(
+            "GET",
+            f"/repos/{self.repository}/issues/{issue_number}",
+        )
+        if not isinstance(issue, dict):
+            raise GitHubWorkTrackingError("GitHub returned an invalid Issue response")
+        if "pull_request" in issue:
+            raise GitHubWorkTrackingError(
+                f"GitHub #{issue_number} is a pull request, not an Issue"
+            )
+
+        body = str(issue.get("body") or "")
+        labels = issue.get("labels") if isinstance(issue.get("labels"), list) else []
+        assignees = issue.get("assignees") if isinstance(issue.get("assignees"), list) else []
+        user = issue.get("user") if isinstance(issue.get("user"), dict) else {}
+        return {
+            "number": int(issue.get("number") or issue_number),
+            "title": str(issue.get("title") or ""),
+            "body": body[:_MAX_ISSUE_BODY_CHARS],
+            "body_truncated": len(body) > _MAX_ISSUE_BODY_CHARS,
+            "state": str(issue.get("state") or ""),
+            "url": str(issue.get("html_url") or issue.get("url") or ""),
+            "author": str(user.get("login") or ""),
+            "labels": [
+                str(label.get("name") if isinstance(label, dict) else label)
+                for label in labels[:20]
+            ],
+            "assignees": [
+                str(assignee.get("login") if isinstance(assignee, dict) else assignee)
+                for assignee in assignees[:20]
+            ],
+            "created_at": str(issue.get("created_at") or ""),
+            "updated_at": str(issue.get("updated_at") or ""),
+        }
 
     def close(self) -> None:
         self._conn.close()
