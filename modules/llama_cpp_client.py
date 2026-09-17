@@ -31,6 +31,27 @@ _DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 _DEFAULT_MODEL_NAME = "qwen2.5-coder-7b-instruct"
 
 
+def json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """The wire shape a JSON schema has to be sent in to actually be applied.
+
+    llama-server reads the schema from ``response_format.json_schema.schema``
+    and Azure OpenAI expects the same OpenAI-standard envelope. Nexus used to
+    send ``{"type": "json_schema", "schema": {...}}`` - the schema one level
+    too high - which neither server finds, so every schema was silently
+    ignored and every declared enum was a suggestion. That is how a tool
+    resolver constrained to four ``status`` values answered with a fifth,
+    fenced in Markdown, and had its otherwise correct selection thrown away
+    (#218).
+
+    Silently is the operative word: an ignored schema looks exactly like a
+    model that happens to comply, right up until it does not.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": name, "schema": schema, "strict": True},
+    }
+
+
 class LlamaCppClientError(Exception):
     """Raised when the llama-cpp server returns an unexpected response."""
 

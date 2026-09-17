@@ -87,7 +87,9 @@ class Issue111ControllerProtocolTests(unittest.TestCase):
             finally:
                 orchestrator.close()
         self.assertEqual(result.action, ACTION_ANSWER)
-        schema = client.response_formats[0]["schema"]
+        # Nested where llama-server and Azure actually read it (#218); a
+        # schema at the top level is silently ignored by both.
+        schema = client.response_formats[0]["json_schema"]["schema"]
         self.assertEqual(schema["required"], ["action"])
         self.assertNotIn("type", schema["properties"])
         self.assertIn("call_tool", schema["properties"]["action"]["enum"])

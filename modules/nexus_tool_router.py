@@ -44,7 +44,11 @@ import re
 import time
 from typing import Any, Callable, Protocol
 
-from modules.llama_cpp_client import LlamaCppClientError, extract_json
+from modules.llama_cpp_client import (
+    LlamaCppClientError,
+    extract_json,
+    json_schema_response_format,
+)
 from modules.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
@@ -133,23 +137,23 @@ TOOL_SEARCH_STOP_WORDS = {
     "whether",
 }
 
-TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "enum": ["found", "invalid_goal", "not_found", "unavailable"]},
-            "operation": {"type": "string"},
-            "reason": {"type": "string"},
-            "related_tools": {"type": "array", "items": {"type": "string"}},
-            "arguments": {"type": "object"},
-            "error": {"type": "string"},
-            "guidance": {"type": "string"},
-        },
-        "required": ["status", "reason"],
-        "additionalProperties": False,
+TOOL_RESOLVER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["found", "invalid_goal", "not_found", "unavailable"]},
+        "operation": {"type": "string"},
+        "reason": {"type": "string"},
+        "related_tools": {"type": "array", "items": {"type": "string"}},
+        "arguments": {"type": "object"},
+        "error": {"type": "string"},
+        "guidance": {"type": "string"},
     },
+    "required": ["status", "reason"],
+    "additionalProperties": False,
 }
+TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
+    "tool_resolver", TOOL_RESOLVER_SCHEMA
+)
 
 # A bare hex run is only a *candidate* experiment id: commit shas and dates match
 # it too, so every candidate is resolved against the experiment service before it

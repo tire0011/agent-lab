@@ -37,6 +37,7 @@ from modules.nexus_task_store import (
     TERMINAL_REASON_TURN_FAILED,
     NexusTaskStore,
 )
+from modules.llama_cpp_client import json_schema_response_format
 from modules.nexus_tool_router import (
     ACTION_CALL_TOOL,
     ACTION_COMMAND,
@@ -123,9 +124,7 @@ _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
     "codex_readonly": ("codex_readonly", "azure_openai", "local_worker"),
 }
 
-_ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "schema": {
+_ORCHESTRATOR_SCHEMA: dict[str, Any] = {
         "type": "object",
         "properties": {
             "action": {
@@ -178,10 +177,12 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
             },
             "why_human_required": {"type": "string"},
         },
-        "required": ["action"],
-        "additionalProperties": False,
-    },
+    "required": ["action"],
+    "additionalProperties": False,
 }
+_ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
+    "nexus_controller_decision", _ORCHESTRATOR_SCHEMA
+)
 
 # The shared tool mechanism owns the resolver schema, the read-only
 # boundary, candidate scoring and the not-found metadata (#172). Re-exported
@@ -1102,7 +1103,7 @@ class NexusTaskOrchestrator:
             "Return exactly one JSON object with no Markdown or prose.\n\n"
             f"VALIDATION ERROR:\n{str(error)[:1000]}\n\n"
             f"REQUIRED JSON SCHEMA:\n"
-            f"{json.dumps(_ORCHESTRATOR_RESPONSE_FORMAT['schema'], separators=(',', ':'))}\n\n"
+            f"{json.dumps(_ORCHESTRATOR_SCHEMA, separators=(',', ':'))}\n\n"
             f"INVALID RESPONSE:\n{raw[:6000]}"
         )
 

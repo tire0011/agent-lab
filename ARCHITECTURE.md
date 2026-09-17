@@ -370,6 +370,14 @@
   operation only when a `find_tool` result in the same session already
   returned its schema. Both rules apply to every role - a role never guesses
   a tool name, and never runs one it did not resolve.
+- Every JSON schema Nexus sends a model goes in the OpenAI envelope,
+  `response_format.json_schema.schema`, built by
+  `llama_cpp_client.json_schema_response_format`. It used to sit one level
+  higher, where neither llama-server nor Azure OpenAI looks, so every schema
+  was silently ignored and every declared enum was only a suggestion - which
+  is how the resolver answered with a `status` outside its four values and had
+  a correct selection discarded (#218). An ignored schema is invisible until a
+  model stops complying, so the shape is pinned by a test.
 - A terminal `not_found` is an answer, not a dead end (#218). It carries
   `related_operations` as descriptors built from the registry's own
   `OperationSpec` - operation, description, why it was offered, argument

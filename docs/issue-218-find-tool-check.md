@@ -133,6 +133,12 @@ shape, llama.cpp's own shape, and no schema at all as a control — and the
 verdict names a shape that works if one does. Exit 0 if today's shape is
 enforced, 1 if it is not.
 
+Run against the VM's llama-server on 2026-09-17, this found that the shape
+Nexus was sending was **not** enforced (it returned the forbidden value, fenced
+in Markdown) while both alternatives were. Nexus now sends the OpenAI envelope,
+which that probe showed working and which Azure OpenAI reads too; keep the
+probe for the next time a server or model is swapped.
+
 ## Related evaluation
 
 `python -m modules.tool_resolver_evaluation --mode local-llm` measures
