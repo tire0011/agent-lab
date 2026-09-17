@@ -114,6 +114,25 @@ A refused repeat that the session then recovers from is reported as a note, not
 a failure — the loop guard doing its job without ending the task is the
 intended last-resort behaviour.
 
+## Is the resolver's schema even enforced?
+
+`TOOL_RESOLVER_RESPONSE_FORMAT` declares `status` as an enum of four values,
+and the #218 manual run returned a status outside it. That is only possible if
+llama-server is not applying the schema, so `scripts/check_llama_json_schema.py`
+asks the server instead of reasoning about it:
+
+```bash
+cd /agent
+.venv/bin/python scripts/check_llama_json_schema.py
+```
+
+It sends a schema allowing exactly `"found"` together with a prompt asking for
+`"banana"`. A constrained decoder cannot emit banana, so the answer settles it.
+Four request shapes are compared — the one Nexus sends today, the OpenAI spec
+shape, llama.cpp's own shape, and no schema at all as a control — and the
+verdict names a shape that works if one does. Exit 0 if today's shape is
+enforced, 1 if it is not.
+
 ## Related evaluation
 
 `python -m modules.tool_resolver_evaluation --mode local-llm` measures
