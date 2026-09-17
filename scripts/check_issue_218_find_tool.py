@@ -72,8 +72,17 @@ def _describe(observation: dict) -> str:
         item.get("operation") if isinstance(item, dict) else item
         for item in observation.get("related_operations") or []
     ]
+    metrics = observation.get("metrics") or {}
+    # The reason is the only thing that separates "the resolver said none of
+    # these fit" from "the resolver's answer could not be used at all", and
+    # every status but `found` carries one. Printing it is not optional: a
+    # trace without it can say a lookup failed but never why.
     return (
         f"{line}\n"
+        f"      reason:                  {observation.get('reason')}\n"
+        f"      resolver_provider:       {metrics.get('resolver_provider', '-')}\n"
+        f"      selected_operation:      {metrics.get('selected_operation', '-')}\n"
+        f"      candidates offered:      {metrics.get('candidate_operations', [])}\n"
         f"      recommended_next_action: {observation.get('recommended_next_action')}\n"
         f"      recommended_operation:   {observation.get('recommended_operation', '-')}\n"
         f"      direct_capabilities:     {observation.get('direct_capabilities')}\n"
