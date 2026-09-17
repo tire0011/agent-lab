@@ -733,8 +733,15 @@ class NexusTaskOrchestrator:
                 }
                 # Still find_tool, so the redirected lookup goes through the
                 # loop guard like any other: a second redirect to the same
-                # related goal is a duplicate and is counted as one.
-                terminal_not_found = None
+                # related goal is a duplicate and is counted as one. What the
+                # guard would then refuse is the *redirect target*, so the
+                # guidance carried into its verdict has to be that goal's own
+                # terminal not_found, not the dead goal's. Nulling it instead
+                # would hand the controller the bare "duplicate_tool_call" that
+                # #164 exists to prevent.
+                terminal_not_found = self._terminal_not_found_observation(
+                    related_goal, observations, state_token
+                )
             # One durable row per turn (#158). Which model decided this turn was
             # previously recoverable only from a log line, so the question "does
             # the local controller produce usable decisions" could not be

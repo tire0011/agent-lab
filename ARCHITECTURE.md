@@ -375,15 +375,23 @@
   `OperationSpec` - operation, description, why it was offered, argument
   schema - plus `direct_capabilities` naming the controller action that owns
   the goal when `find_tool` structurally cannot (`command`, `python_run`),
-  a `recommended_next_action`, and the single `recommended_operation` to
-  resolve next. Bounded to the best three, because the reader is a small
-  local model working inside an already-budgeted prompt.
-- If the controller asks the identical dead goal again anyway, the turn is
-  redirected to a fresh lookup naming that recommended operation rather than
-  refused. The redirect is recorded as a `find_tool_redirected` event, stays
-  an ordinary `find_tool` call, and can only target an operation this
-  session was already offered - so the loop guard still counts repeats and
-  still ends a session that has genuinely run out of alternatives.
+  a `recommended_next_action`, and `guidance`. Bounded to the best three,
+  because the reader is a small local model working inside an
+  already-budgeted prompt.
+- A goal asking to *run* something is recommended the action that owns it
+  ahead of any related operation. The scorer produces candidates for such a
+  goal anyway, and answering "run the test suite" with `git_status` would be
+  right-looking evidence about the wrong subject.
+- Only when resolving a related operation really is the recommendation does
+  the response carry `recommended_operation`, and only then is a repeat of
+  the identical dead goal redirected - to a fresh lookup naming that
+  operation, rather than refused. The redirect is recorded as a
+  `find_tool_redirected` event and stays an ordinary `find_tool` call, so
+  the loop guard counts the redirected lookup like any other call and still
+  ends a session that has run out of alternatives; the dead goal's own
+  repeat is durably recorded as that event rather than as a duplicate.
+  A redirect never targets the goal it came from, and the guard's verdict on
+  a refused redirect still carries that lookup's own `not_found` guidance.
 - Roles differ only in permission. The controller additionally has
   `command`, `python_run`, `memory_search` and `delegate`; failure analysis
   has discovery and read-only execution and nothing else, so a diagnosis

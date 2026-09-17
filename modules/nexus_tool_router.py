@@ -92,14 +92,20 @@ NOT_FOUND_GUIDANCE = (
 # Nexus state. find_tool searches the read-only OperationsRegistry only, so it
 # can never resolve one of these - but the controller owns both natively, and
 # saying which one stops the caller searching for it a second time.
+#
+# Anchored on the verb, never on the noun. "inspect the python module versions
+# installed" and "show the command line arguments of the running process" are
+# read-only lookups that merely mention python and commands; answering either
+# with "execute this yourself" would turn a request to read state into a
+# request to run something, which is the one direction that must never be
+# guessed.
+_EXECUTION_VERBS = r"(?:run|runs|running|execute|executes|executing|invoke|invokes|invoking)"
 _SHELL_GOAL_PATTERN = re.compile(
-    r"\b(shell|bash|zsh|terminal|command[- ]line)\b"
-    r"|\b(?:run|execute|invoke)\b[^.]{0,24}\bcommands?\b",
+    rf"\b{_EXECUTION_VERBS}\b[^.]{{0,24}}\b(?:shell|bash|zsh|terminal|commands?|command[- ]line)\b",
     re.IGNORECASE,
 )
 _PYTHON_GOAL_PATTERN = re.compile(
-    r"\bpython\b[^.]{0,24}\b(script|module|code|interpreter)\b"
-    r"|\b(?:run|execute|invoke)\b[^.]{0,24}\bpython\b",
+    rf"\b{_EXECUTION_VERBS}\b[^.]{{0,24}}\bpython\b",
     re.IGNORECASE,
 )
 
@@ -701,10 +707,17 @@ class NexusToolRouter:
         descriptors = self.related_operation_descriptors(goal or "", list(related_operations))
         if ACTION_RESUME_EXPERIMENT in direct_capabilities:
             recommended_next_action = ACTION_RESUME_EXPERIMENT
+        elif native_capabilities:
+            # Ahead of the related operations on purpose. When the goal asks to
+            # run something, the action that owns it is the answer; the scorer
+            # will still have produced candidates ("run a shell command to
+            # execute the test suite" scores every git_* operation), and
+            # recommending one of those would answer a request to run the tests
+            # with the output of `git status` - right-looking evidence about the
+            # wrong subject.
+            recommended_next_action = native_capabilities[0]
         elif descriptors:
             recommended_next_action = ACTION_RESOLVE_RELATED_OPERATION
-        elif native_capabilities:
-            recommended_next_action = native_capabilities[0]
         else:
             recommended_next_action = ACTION_MISSING_CAPABILITY
         metadata: dict[str, Any] = {
@@ -714,10 +727,13 @@ class NexusToolRouter:
             "recommended_next_action": recommended_next_action,
             "guidance": NOT_FOUND_GUIDANCE,
         }
-        if descriptors:
+        if recommended_next_action == ACTION_RESOLVE_RELATED_OPERATION:
             # The single best alternative, named once. Whoever acts on
             # ``resolve_related_operation`` must not have to re-rank the list
-            # and must not be able to pick a name that is not on it.
+            # and must not be able to pick a name that is not on it. Set only
+            # when resolving one of them really is the recommendation, so a
+            # goal answered with a native capability cannot be redirected into
+            # an operation nobody recommended.
             metadata["recommended_operation"] = descriptors[0]["operation"]
         if ACTION_RESUME_EXPERIMENT in direct_capabilities:
             # The id the capability was offered for, already resolved. Whoever
