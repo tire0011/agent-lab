@@ -310,7 +310,7 @@ class CIEvidenceLoggingTests(unittest.TestCase):
         self._stale_failed_adoption()
         self._record_green()
 
-        with patch("modules.experiment_adoption_service.run_verification_test"):
+        with patch("modules.experiment_adoption_service.run_verification_test_monitored"):
             assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
             self.fx.adoption_service.start_adoption(
                 self.experiment_id, superseded=assessment
@@ -330,7 +330,7 @@ class CIEvidenceLoggingTests(unittest.TestCase):
         self._stale_failed_adoption()
         self._record_green()
 
-        with patch("modules.experiment_adoption_service.run_verification_test"):
+        with patch("modules.experiment_adoption_service.run_verification_test_monitored"):
             assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
             self.fx.adoption_service.start_adoption(
                 self.experiment_id, superseded=assessment

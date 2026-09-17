@@ -59,6 +59,33 @@ Optional, for controller work liveness (see ARCHITECTURE.md section 10):
   fallback, which now only applies to sessions that never reported a
   heartbeat at all.
 
+Optional, for the local verification test watchdog (issue #209). Local
+verification is bounded by *progress*, not by a fixed wall-clock timeout: the
+run continues for as long as tests keep starting and finishing.
+
+- `NEXUS_TEST_STALL_SECONDS` (default 900) - how long a run may go without a
+  single test starting or finishing before it is aborted as stalled. Clamped
+  to a 120 s floor, so a typo here cannot reintroduce a short fixed timeout.
+- `NEXUS_TEST_WATCHDOG_INTERVAL_SECONDS` (default 60) - how often progress is
+  checked, and therefore how often the test heartbeat reaches the experiment
+  log.
+- `NEXUS_TEST_SAFETY_CAP_SECONDS` (default 5400, i.e. 90 min) - the absolute
+  ceiling on one local verification run. This is a final guard against a
+  permanently orphaned process only; it must never be the mechanism that ends
+  a healthy run, so it is clamped to at least 30 min and always kept above the
+  stall timeout.
+- `NEXUS_TEST_LOG_DIR` (default `<AGENT_LOG_DIR>/test-runs`) - where the
+  dedicated per-test logs and heartbeat files are written. They are kept out
+  of the global Nexus feed deliberately: the feed would otherwise gain ~3800
+  entries per verification run.
+
+To see what a running verification is doing:
+
+```bash
+cat "${AGENT_LOG_DIR:-state/experiment-logs}/test-runs/test-<experiment-id>.heartbeat.json"
+tail -f "${AGENT_LOG_DIR:-state/experiment-logs}/test-runs/test-<experiment-id>.jsonl"
+```
+
 Optional, for the coding agents that execute tasks and experiments (see
 ARCHITECTURE.md section 13 and D-022):
 

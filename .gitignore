@@ -9,3 +9,6 @@ state/*.db
 state/*.db-*
 state/experiment-logs/*.jsonl
 state/experiment-logs/*.lock
+# Per-test verification logs and heartbeats (#209): one file per run,
+# written next to the experiment logs but never part of the repository.
+state/experiment-logs/test-runs/

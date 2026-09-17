@@ -40,7 +40,7 @@ from modules.run_store import (
     list_activity,
     set_setting,
 )
-from modules.verification_runner import run_verification_test
+from modules.verification_runner import run_verification_test_monitored
 
 annotations = __future__.annotations
 
@@ -131,13 +131,10 @@ from .service import (
     _DEFAULT_RESEARCH_TIMEOUT_SECONDS,
     _DEFAULT_TEST_COMMAND_KEY,
     _DEFAULT_TEST_PYTHON_EXECUTABLE,
-    _DEFAULT_TEST_TIMEOUT_SECONDS,
     _ERROR_STATUSES,
-    _MAX_TEST_TIMEOUT_SECONDS,
     _REFORMAT_RETRY_TIMEOUT_SECONDS,
     _TEST_COMMANDS,
-    _TEST_TIMEOUT_BACKOFF_FACTOR,
-    _TEST_TIMEOUT_SETTING_KEY,
+    _TEST_TOTAL_SETTING_KEY,
     _WARNING_STATUSES,
     ExperimentService,
     logger,

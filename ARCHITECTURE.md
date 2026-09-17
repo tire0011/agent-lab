@@ -289,6 +289,26 @@
   unchanged, floor and all, and the verdict reports which of the three
   sources answered - "a worker stopped beating 40 minutes ago" and "the last
   log line is 40 minutes old" are different strengths of the same claim.
+- Local verification tests carry that contract into the one place it was
+  missing (#209). Modules: `modules/test_progress.py` (parse the verbose
+  `unittest` stream into per-test events and a heartbeat),
+  `modules/test_run_log.py` (the dedicated per-test log, the heartbeat file,
+  and the bridge into the global feed), `modules/verification_runner.py` (the
+  watchdog). The test process's own progress - which test is running, how
+  many have finished, when anything last happened - *is* its heartbeat: the
+  watchdog wakes every `NEXUS_TEST_WATCHDOG_INTERVAL_SECONDS`, publishes one
+  summary entry into the experiment's log (so `assess_progress` above sees a
+  live subject), and aborts the run only when progress stops for
+  `NEXUS_TEST_STALL_SECONDS` - never merely because the suite has been
+  running a while. A fixed wall-clock timeout could not tell a healthy slow
+  suite from a stuck test, which is how experiment
+  `df97d67bc08e45b4bc5c573db0c84d85` became a `timed_out` with no exit code
+  and nothing to diagnose. `NEXUS_TEST_SAFETY_CAP_SECONDS` survives as a
+  final guard against an orphaned process only.
+- Per-test detail (two entries per test, timestamps, result and duration)
+  goes to `<AGENT_LOG_DIR>/test-runs/`, deliberately a subdirectory: the
+  unified feed globs `*.jsonl` in the log directory itself and does not
+  recurse, so ~3800 entries per run cannot drown the feed an operator reads.
 
 ### 11) Local-model execution (one shared job path)
 

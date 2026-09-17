@@ -352,6 +352,28 @@ class AdoptionRepoFixture:
         raise AssertionError(f"adoption did not finish for {experiment_id}")
 
 
+
+def _gate_the_verification_spawn():
+    """Hold the local verification run open until the test lets it go.
+
+    The verification test command is spawned with ``subprocess.Popen`` by the
+    monitored runner (#209), so that - not ``subprocess.run`` - is where an
+    adoption can be caught mid-verification. Git's own calls go through the
+    same patched attribute and must pass straight through.
+    """
+    gate = threading.Event()
+    ready = threading.Event()
+    original_popen = subprocess.Popen
+
+    def blocking_spawn(args, **kwargs):
+        if isinstance(args, list) and args[:3] == [sys.executable, "-m", "unittest"]:
+            ready.set()
+            gate.wait(5)
+        return original_popen(args, **kwargs)
+
+    return gate, ready, blocking_spawn
+
+
 class ExperimentAdoptionServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = AdoptionRepoFixture()
@@ -394,17 +416,9 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
     def test_background_thread_runs_after_start_returns(self):
         experiment_id = "b" * 32
         self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
-        gate = threading.Event()
-        ready = threading.Event()
-        original_run = subprocess.run
+        gate, ready, blocking_spawn = _gate_the_verification_spawn()
 
-        def blocking_run(args, **kwargs):
-            if isinstance(args, list) and args[:3] == [sys.executable, "-m", "unittest"]:
-                ready.set()
-                gate.wait(5)
-            return original_run(args, **kwargs)
-
-        with patch("modules.experiment_adoption_service.subprocess.run", side_effect=blocking_run):
+        with patch("modules.verification_runner.subprocess.Popen", side_effect=blocking_spawn):
             started = self.fx.adoption_service.start_adoption(experiment_id)
             self.assertIn(started.status, {STATUS_QUEUED, STATUS_ADOPTING})
             self.assertTrue(ready.wait(5))
@@ -801,17 +815,9 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         second_id = "02" * 16
         self.fx.create_experiment(experiment_id=first_id, changed_files=["app.py"])
         self.fx.create_experiment(experiment_id=second_id, changed_files=["app.py"])
-        gate = threading.Event()
-        ready = threading.Event()
-        original_run = subprocess.run
+        gate, ready, blocking_spawn = _gate_the_verification_spawn()
 
-        def blocking_run(args, **kwargs):
-            if isinstance(args, list) and args[:3] == [sys.executable, "-m", "unittest"]:
-                ready.set()
-                gate.wait(5)
-            return original_run(args, **kwargs)
-
-        with patch("modules.experiment_adoption_service.subprocess.run", side_effect=blocking_run):
+        with patch("modules.verification_runner.subprocess.Popen", side_effect=blocking_spawn):
             self.fx.adoption_service.start_adoption(first_id)
             self.assertTrue(ready.wait(5))
             with self.assertRaises(ExperimentAdoptionError):

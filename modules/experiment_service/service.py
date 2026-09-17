@@ -30,7 +30,11 @@ from modules.run_store import (
     list_activity,
     set_setting,
 )
-from modules.verification_runner import run_verification_test
+from modules.test_run_log import global_heartbeat_bridge
+from modules.verification_runner import (
+    WatchdogConfig,
+    run_verification_test_monitored,
+)
 
 from .git_utils import _run_git
 from .models import (
@@ -77,20 +81,25 @@ _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 1200  # 20 minutes
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
 
-# Adaptive verification test timeout. The subprocess running the test
-# command starts out bounded by ``_DEFAULT_TEST_TIMEOUT_SECONDS``; each time
-# a full verification run ends with ``test_timeout`` (the suite did not
-# finish in time, as opposed to a normal test failure), the timeout used for
-# the *next* run is multiplied by ``_TEST_TIMEOUT_BACKOFF_FACTOR`` and capped
-# at ``_MAX_TEST_TIMEOUT_SECONDS`` so a hanging test can never grow the
-# timeout without bound. The learned value is persisted in the
-# ``service_settings`` table (see ``modules.run_store``) so it survives
-# process restarts and is reused by later verification runs, not just later
-# calls on the same ``ExperimentService`` instance.
-_DEFAULT_TEST_TIMEOUT_SECONDS = 300  # 5 minutes
-_MAX_TEST_TIMEOUT_SECONDS = 1800  # 30 minutes
-_TEST_TIMEOUT_BACKOFF_FACTOR = 1.5
-_TEST_TIMEOUT_SETTING_KEY = "verification_test_timeout_seconds"
+# Progress-aware local verification (#209). The verification subprocess is no
+# longer bounded by a fixed wall-clock timeout, adaptive or not: a wall-clock
+# limit cannot tell a healthy-but-slow suite from a stuck test, which is how
+# experiment df97d67bc08e45b4bc5c573db0c84d85 came to be reported as
+# ``timed_out`` with no exit code and nothing to diagnose. Instead the run is
+# watched for *progress* (see ``modules.verification_runner``): it continues
+# for as long as tests keep starting and finishing, and is aborted when they
+# stop. The absolute cap below survives only as a final guard against a
+# permanently orphaned process, deliberately far too large to be the normal
+# mechanism for deciding whether a run is failing.
+#
+# The total test count the suite last reported is persisted in
+# ``service_settings`` (see ``modules.run_store``), so a run in progress can
+# report "842 / 1873" rather than a bare count from its very first minute.
+# The watchdog's own numbers (and their environment variables and floors)
+# live with the watchdog in ``modules.verification_runner``; leaving these
+# unset here is what lets an operator tune a deployment through the
+# environment without editing code.
+_TEST_TOTAL_SETTING_KEY = "verification_test_total"
 
 # Built-in default test command, keyed by a fixed identifier. The plan/LLM output
 # never supplies a raw shell string; the service only ever chooses one of
@@ -99,8 +108,15 @@ _TEST_TIMEOUT_SETTING_KEY = "verification_test_timeout_seconds"
 # so that worktrees without their own virtualenv can still run tests using
 # the main repository's already-installed interpreter/site-packages,
 # without copying a .venv or installing any package into the worktree.
+# ``-v`` rather than ``-q``: the verbose stream is the only in-band signal
+# that says which test is running right now, and the progress watchdog is
+# built on it. It does not make the persisted test output any larger - the
+# runner strips the per-test "... ok" lines back out again (see
+# ``modules.test_progress.UnittestStreamParser``), so what reaches
+# ``test_output`` (and its head-first truncation, and the failure tail the UI
+# shows) stays what ``-q`` produced, plus a one-liner per failing test.
 _TEST_COMMANDS: dict[str, list[str]] = {
-    "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+    "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-v"],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
 
@@ -142,9 +158,9 @@ class ExperimentService:
         max_diagnostic_log_bytes: int = _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES,
         test_python_executable: str = _DEFAULT_TEST_PYTHON_EXECUTABLE,
         experiment_log_dir: str | None = None,
-        default_test_timeout_seconds: int = _DEFAULT_TEST_TIMEOUT_SECONDS,
-        max_test_timeout_seconds: int = _MAX_TEST_TIMEOUT_SECONDS,
-        test_timeout_backoff_factor: float = _TEST_TIMEOUT_BACKOFF_FACTOR,
+        test_stall_timeout_seconds: float | None = None,
+        test_watchdog_interval_seconds: float | None = None,
+        test_safety_cap_seconds: float | None = None,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
         rng: Any | None = None,
     ) -> None:
@@ -198,16 +214,25 @@ class ExperimentService:
             experiment (``<experiment_log_dir>/<experiment_id>.jsonl``),
             written via ``modules.central_logging.ExperimentLogger``.
             Defaults to ``<repo_root>/state/experiment-logs``.
-        default_test_timeout_seconds:
-            Starting timeout (seconds) for the verification test subprocess
-            before any automatic increase has ever been learned/persisted.
-        max_test_timeout_seconds:
-            Hard cap on the automatically-increased verification test
-            timeout, so a hanging test can never grow the timeout without
-            bound.
-        test_timeout_backoff_factor:
-            Multiplier applied to the current verification test timeout
-            each time a full run ends with ``test_timeout``.
+        test_stall_timeout_seconds:
+            How long a local verification run may go without a single test
+            starting or finishing before the watchdog calls it stalled and
+            aborts it. This - not total runtime - is what decides whether a
+            run is failing. ``None`` (the default) resolves it from
+            ``NEXUS_TEST_STALL_SECONDS``, or the watchdog's own default.
+        test_watchdog_interval_seconds:
+            How often the watchdog checks progress, and therefore how often
+            the test heartbeat reaches this experiment's log. ``None``
+            resolves it from ``NEXUS_TEST_WATCHDOG_INTERVAL_SECONDS``.
+        test_safety_cap_seconds:
+            Absolute ceiling on one local verification run, as a final guard
+            against a permanently orphaned process. Deliberately large; it
+            must never be the mechanism that ends a healthy run. ``None``
+            resolves it from ``NEXUS_TEST_SAFETY_CAP_SECONDS``.
+
+            All three are passed through as written when set explicitly, and
+            clamped to safe floors when they come from the environment - see
+            ``WatchdogConfig.resolve``.
         """
         self.selection_worker = (
             selection_worker
@@ -227,9 +252,9 @@ class ExperimentService:
         self.max_raw_message_bytes = max_raw_message_bytes
         self.max_diagnostic_log_bytes = max_diagnostic_log_bytes
         self.test_python_executable = test_python_executable
-        self.default_test_timeout_seconds = default_test_timeout_seconds
-        self.max_test_timeout_seconds = max_test_timeout_seconds
-        self.test_timeout_backoff_factor = test_timeout_backoff_factor
+        self.test_stall_timeout_seconds = test_stall_timeout_seconds
+        self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
+        self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
@@ -249,47 +274,48 @@ class ExperimentService:
         self._conn.close()
 
     # ------------------------------------------------------------------
-    # adaptive verification test timeout
+    # verification test watchdog (#209)
     # ------------------------------------------------------------------
 
-    def _get_test_timeout_seconds(self) -> int:
-        """Return the timeout (seconds) to use for the *next* verification
-        test subprocess run, reusing any previously learned/persisted value
-        so a suite that has already required more time does not keep
-        hitting the same limit on later runs."""
+    def _get_test_watchdog_config(self) -> WatchdogConfig:
+        """Progress rules for the next local verification run.
+
+        Whatever this service was constructed with wins; anything left unset
+        falls through to the environment (clamped) and then to the watchdog's
+        defaults.
+        """
+        return WatchdogConfig.resolve(
+            stall_timeout_seconds=self.test_stall_timeout_seconds,
+            check_interval_seconds=self.test_watchdog_interval_seconds,
+            safety_cap_seconds=self.test_safety_cap_seconds,
+        )
+
+    def _get_expected_test_total(self) -> int | None:
+        """How many tests the suite reported last time, if it ever finished.
+
+        Only used to make progress readable ("842 / 1873"); a wrong or
+        missing value costs nothing, so every failure here is simply "we do
+        not know the total yet".
+        """
         with self._lock:
-            raw = get_setting(self._conn, _TEST_TIMEOUT_SETTING_KEY)
-        if raw is None:
-            return self.default_test_timeout_seconds
+            raw = get_setting(self._conn, _TEST_TOTAL_SETTING_KEY)
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return self.default_test_timeout_seconds
-        if value <= 0:
-            return self.default_test_timeout_seconds
-        return value
+            return None
+        return value if value > 0 else None
 
-    def _increase_test_timeout_seconds(self, current_timeout: int) -> int:
-        """Persist a larger timeout after a ``test_timeout`` and return it.
-
-        ``next_timeout = min(current_timeout * factor, max_timeout)``. The
-        new value is stored in ``service_settings`` so subsequent
-        verification runs (including in later processes) start from it
-        instead of the original default.
-        """
-        next_timeout = min(
-            int(current_timeout * self.test_timeout_backoff_factor),
-            self.max_test_timeout_seconds,
-        )
-        next_timeout = max(next_timeout, current_timeout)
+    def _remember_test_total(self, total: int | None) -> None:
+        """Persist the total a completed run reported, for the next run."""
+        if not total or total <= 0:
+            return
         with self._lock:
             set_setting(
                 self._conn,
-                _TEST_TIMEOUT_SETTING_KEY,
-                str(next_timeout),
+                _TEST_TOTAL_SETTING_KEY,
+                str(int(total)),
                 updated_at=_utcnow_iso(),
             )
-        return next_timeout
 
     # ------------------------------------------------------------------
     # create_experiment
@@ -1102,45 +1128,64 @@ class ExperimentService:
                 + (f" {ci_verification.url}" if ci_verification.url else "")
             )
         else:
-            test_timeout_seconds = self._get_test_timeout_seconds()
+            watchdog = self._get_test_watchdog_config()
+            expected_total = self._get_expected_test_total()
             elog.info(
                 "verifying", "local_tests_fallback_started",
                 "Running local verification because matching GitHub CI was unavailable",
                 command=test_command, cwd=worktree_path,
-                timeout_seconds=test_timeout_seconds,
+                stall_timeout_seconds=watchdog.stall_timeout_seconds,
+                safety_cap_seconds=watchdog.safety_cap_seconds,
             )
             elog.info(
                 "verifying", "tests_started",
-                "Running verification test command",
+                "Running verification test command under the progress watchdog",
                 command=test_command, cwd=worktree_path,
-                timeout_seconds=test_timeout_seconds,
+                stall_timeout_seconds=watchdog.stall_timeout_seconds,
+                watchdog_interval_seconds=watchdog.check_interval_seconds,
+                safety_cap_seconds=watchdog.safety_cap_seconds,
+                expected_total_tests=expected_total,
             )
-            test_run = run_verification_test(
+            test_run = run_verification_test_monitored(
                 test_command,
                 cwd=worktree_path,
-                timeout_seconds=test_timeout_seconds,
+                run_id=experiment_id,
+                config=watchdog,
+                expected_total=expected_total,
+                # Publishing the test heartbeat into this experiment's own log
+                # is what keeps the global Nexus heartbeat alive while a long
+                # suite runs; the per-test entries stay in the dedicated test
+                # log rather than flooding this one.
+                on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
             )
             test_exit_code = test_run.exit_code
             test_output = test_run.output
             test_timed_out = test_run.timed_out
+            self._remember_test_total(test_run.tests_total)
 
         if use_local_tests and test_run.timed_out:
             elog.log_process(
-                "verifying", "test_timeout",
-                "Test command timed out",
+                "verifying",
+                "test_stalled" if test_run.stalled else "test_safety_cap_exceeded",
+                test_run.stall_diagnostics or "Test run aborted by the progress watchdog",
                 command=test_command, cwd=worktree_path,
                 duration_ms=test_run.duration_ms,
-                timed_out=True, level="ERROR", timeout_seconds=test_timeout_seconds,
+                timed_out=True, level="ERROR",
+                stall_timeout_seconds=watchdog.stall_timeout_seconds,
+                safety_cap_seconds=watchdog.safety_cap_seconds,
+                test_log_path=test_run.test_log_path,
+                **(test_run.progress or {}),
             )
-            next_timeout_seconds = self._increase_test_timeout_seconds(test_timeout_seconds)
-            if next_timeout_seconds > test_timeout_seconds:
-                elog.warning(
-                    "verifying", "test_timeout_increased",
-                    f"Verification test timeout increased from {test_timeout_seconds}s to "
-                    f"{next_timeout_seconds}s for future runs",
-                    previous_timeout_seconds=test_timeout_seconds,
-                    new_timeout_seconds=next_timeout_seconds,
-                )
+        elif use_local_tests and test_run.process_died:
+            elog.log_process(
+                "verifying", "test_process_died",
+                test_run.stall_diagnostics or "Test process was killed before it could finish",
+                command=test_command, cwd=worktree_path,
+                duration_ms=test_run.duration_ms,
+                level="ERROR",
+                test_log_path=test_run.test_log_path,
+                **(test_run.progress or {}),
+            )
         elif use_local_tests and test_run.exception is not None:
             elog.error(
                 "verifying", "tests_exception",
@@ -1154,6 +1199,9 @@ class ExperimentService:
                 command=test_command, cwd=worktree_path,
                 duration_ms=test_run.duration_ms,
                 exit_code=test_exit_code, stdout=test_run.stdout, stderr=test_run.stderr,
+                test_log_path=test_run.test_log_path,
+                tests_completed=(test_run.progress or {}).get("tests_completed"),
+                tests_total=test_run.tests_total,
             )
 
         test_output_capped = _truncate_text(test_output, self.max_test_output_bytes, label="test output")
@@ -1166,14 +1214,35 @@ class ExperimentService:
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
             elog.warning("verifying", "diff_check_issue", f"git diff --check reported issues: {diff_check_issue}")
         elif test_timed_out:
-            # A timed-out test run is not a normal test failure: the tests
+            # An aborted test run is not a normal test failure: the tests
             # never finished (exit_code=None is expected and must not be
             # mistaken for a real failing exit status). Keep this branch
             # ahead of the exit-code check below so it can never be folded
-            # into "tests failed". The distinct "test_timeout" event was
-            # already logged above when the TimeoutExpired was caught.
+            # into "tests failed". The distinct "test_stalled" /
+            # "test_safety_cap_exceeded" event was already logged above,
+            # with the diagnostics naming the test progress stopped on.
             final_status = STATUS_TIMED_OUT
-            error = "tests timed out (no exit code, test command did not finish within the time limit)"
+            if use_local_tests and test_run.stalled:
+                error = (
+                    "tests stalled (no exit code, no test started or finished for "
+                    f"{int(watchdog.stall_timeout_seconds)}s)"
+                )
+            elif use_local_tests and test_run.safety_cap_exceeded:
+                error = (
+                    "tests hit the absolute safety cap (no exit code, run exceeded "
+                    f"{int(watchdog.safety_cap_seconds)}s)"
+                )
+            else:
+                error = "tests timed out (no exit code, test command did not finish within the time limit)"
+            if use_local_tests and test_run.stall_diagnostics:
+                error = f"{error}\n{test_run.stall_diagnostics}"
+        elif use_local_tests and test_run.process_died:
+            # Killed by a signal (OOM, an operator, the host): the suite never
+            # reached a verdict, so it must not be filed as a test failure.
+            final_status = STATUS_NEEDS_REVIEW
+            error = "test process died before finishing (killed by a signal, no exit code)"
+            if test_run.stall_diagnostics:
+                error = f"{error}\n{test_run.stall_diagnostics}"
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"
