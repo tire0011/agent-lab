@@ -322,6 +322,7 @@ _STUB_IDENTITY_FIELDS = (
     "operation",
     "recommended_next_action",
     "recommended_operation",
+    "already_resolved_operation",
     "event",
 )
 _STUB_FIELD_CHARS = 200

@@ -631,6 +631,27 @@ class Issue218ObservedRunRegressionTests(unittest.TestCase):
         self.assertEqual(compacted[1]["resolved_tool"], "git_status")
         self.assertEqual(compacted[2]["operation"], "git_status")
 
+    def test_a_stubbed_refusal_still_says_the_operation_was_already_run(self):
+        # The one field that turns "try this" into "you already did this" has
+        # to survive compaction too, or the refusal is unreadable exactly when
+        # the controller most needs it.
+        from modules.prompt_budget import compact_observations
+
+        refusal = {
+            "tool": "find_tool",
+            "event": "duplicate_tool_call",
+            "goal": INSPECT_GOAL,
+            "status": "not_found",
+            "retryable": False,
+            "already_resolved_operation": "git_status",
+            "related_operations": [{"operation": "git_status", "description": "x" * 400}],
+        }
+        compacted, omitted = compact_observations([refusal], budget_chars=150)
+
+        self.assertEqual(omitted, [0])
+        self.assertEqual(compacted[0]["already_resolved_operation"], "git_status")
+        self.assertEqual(compacted[0]["event"], "duplicate_tool_call")
+
     def test_the_prompt_example_goal_is_rejected_before_it_costs_a_call(self):
         from modules.nexus_tool_router import (
             FIND_TOOL_GOAL_PLACEHOLDER,
