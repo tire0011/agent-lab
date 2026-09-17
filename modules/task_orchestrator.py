@@ -46,6 +46,7 @@ from modules.nexus_tool_router import (
     ACTION_RESUME_EXPERIMENT,
     EXPERIMENT_ID_PATTERN,
     FIND_TOOL_GOAL_EXAMPLE,
+    FIND_TOOL_GOAL_PLACEHOLDER,
     MAX_EXPERIMENT_ID_CANDIDATES,
     MAX_RESOLVER_CANDIDATES,
     RESUME_INTENT_PATTERN,
@@ -60,6 +61,7 @@ from modules.nexus_tool_router import (
     ToolResolverUnavailableError,
     ToolRouterError,
     invalid_find_tool_goal,
+    operation_already_resolved,
     related_operation_lookup_goal,
     resolver_prompt,
     selection_correctness,
@@ -647,6 +649,16 @@ class NexusTaskOrchestrator:
                 # guard unchanged - which is the point at which there really is
                 # nothing left to offer.
                 related_goal = ""
+            already_resolved = operation_already_resolved(
+                str((terminal_not_found or {}).get("recommended_operation") or ""),
+                observations,
+            )
+            if already_resolved is not None:
+                # The redirect has already done its job for this goal once. Doing
+                # it again re-asks a question this run answered, and the guard
+                # refuses that as a duplicate - the same loop, one step later.
+                # The refusal below says what was resolved instead.
+                related_goal = ""
             if terminal_not_found is not None and resume_experiment_id:
                 # The lookup is terminal and the resolver already established -
                 # against the experiment service, not against a regex - which
@@ -786,7 +798,9 @@ class NexusTaskOrchestrator:
                         # verdict actionable instead (#164).
                         observation = {
                             **observation,
-                            **self._terminal_not_found_guidance(terminal_not_found),
+                            **self._terminal_not_found_guidance(
+                                terminal_not_found, already_resolved
+                            ),
                         }
                     logger.warning(
                         "tool loop detected session_id=%s signature=%s previous_call_id=%s recovery=%s",
@@ -1164,8 +1178,11 @@ class NexusTaskOrchestrator:
         return terminal_not_found_observation(goal, observations, state_token)
 
     @staticmethod
-    def _terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
-        return terminal_not_found_guidance(prior)
+    def _terminal_not_found_guidance(
+        prior: dict[str, Any],
+        resolved: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return terminal_not_found_guidance(prior, resolved)
 
     async def _resolve_find_tool(
         self,
@@ -1372,7 +1389,7 @@ OBSERVATIONS FROM TOOLS USED IN THIS RUN:
 
 Choose exactly one next step using ONE unambiguous `action` field.
 Tool discovery/execution:
-{{"action":"find_tool","goal":"{FIND_TOOL_GOAL_EXAMPLE}","reason":"<why this task needs that capability>"}}
+{{"action":"find_tool","goal":"{FIND_TOOL_GOAL_PLACEHOLDER}","reason":"<why this task needs that capability>"}}
 {{"action":"call_tool","tool":"<tool returned by find_tool>","arguments":{{...}},"reason":"..."}}
 Controller-native capabilities:
 {{"action":"memory_search","query":"...","limit":6,"reason":"..."}}

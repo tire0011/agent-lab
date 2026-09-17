@@ -83,6 +83,12 @@ MAX_WHY_RELEVANT_TERMS = 5
 # a controller-native action that the read-only OperationsRegistry will never
 # contain - so the illustration itself guaranteed a not_found.
 FIND_TOOL_GOAL_EXAMPLE = "inspect the repository status and working tree changes"
+# What the controller prompt shows in its place. The small local model copies
+# the example goal verbatim - it did so with the old one, and it did so again
+# with this one, which the resolver then rejected as too generic after a
+# three-minute call. A placeholder that cannot be mistaken for a goal is caught
+# here instead, in microseconds, with guidance to describe the real capability.
+FIND_TOOL_GOAL_PLACEHOLDER = "<the concrete capability this task needs>"
 FIND_TOOL_GOAL_GUIDANCE = (
     f"Describe the operation you need, e.g. '{FIND_TOOL_GOAL_EXAMPLE}'."
 )
@@ -254,6 +260,7 @@ def invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
         return True, "The goal is empty or whitespace only.", FIND_TOOL_GOAL_GUIDANCE
 
     placeholder_values = {
+        "the concrete capability this task needs",
         "plain language capability needed",
         "plain-language capability needed",
         "capability needed",
@@ -363,7 +370,10 @@ def terminal_not_found_observation(
     )
 
 
-def terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
+def terminal_not_found_guidance(
+    prior: dict[str, Any],
+    resolved: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Turn a refused repeat into an answer the caller can act on.
 
     The loop guard says "you already called this"; on its own that leaves
@@ -387,7 +397,44 @@ def terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
     recommended_operation = str(prior.get("recommended_operation") or "").strip()
     if recommended_operation:
         guidance["recommended_operation"] = recommended_operation
+    if resolved is not None:
+        # The alternative is not merely suggested any more - it was resolved,
+        # and in the ordinary path already executed. Saying so is the
+        # difference between "try this" and "you have already done this".
+        guidance["already_resolved_operation"] = str(resolved.get("resolved_tool", ""))
+        guidance["already_resolved_event_id"] = resolved.get("event_id")
+        guidance["reason"] = (
+            "An identical find_tool lookup already returned not_found, and the "
+            f"operation it recommended ({resolved.get('resolved_tool')}) has already "
+            "been resolved in this run. Use that result instead of looking again."
+        )
     return guidance
+
+
+def operation_already_resolved(
+    operation: str,
+    observations: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The lookup that already resolved *operation* in this run, if any.
+
+    A redirect exists to turn a dead question into an answerable one. Once the
+    operation it points at has been resolved - and, in the ordinary path, run -
+    pointing at it again asks a question this run has already answered, and the
+    loop guard refuses the repeat as a duplicate. That is the loop the redirect
+    was supposed to prevent, arriving one step later (#218).
+    """
+    if not operation:
+        return None
+    return next(
+        (
+            observation
+            for observation in reversed(observations)
+            if observation.get("tool") == TOOL_FIND_TOOL
+            and observation.get("status") == "found"
+            and str(observation.get("resolved_tool", "")) == operation
+        ),
+        None,
+    )
 
 
 def related_operation_lookup_goal(prior: dict[str, Any]) -> str:

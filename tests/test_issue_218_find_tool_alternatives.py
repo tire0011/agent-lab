@@ -541,3 +541,103 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Issue218ObservedRunRegressionTests(unittest.TestCase):
+    """What the 2026-09-17 run on the VM actually did, and must stop doing.
+
+    The redirect worked: the dead goal was narrowed to git_status, resolved,
+    and executed. Then the controller asked the dead goal a third and fourth
+    time, the redirect fired again into the goal it had already answered, and
+    the loop guard ended the task - the loop it exists to prevent, arriving one
+    step later.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_redirect_does_not_re_ask_what_it_already_resolved(self):
+        registry = _SpyRegistry(str(Path(self.tmp.name) / "state.db"), self.tmp.name)
+        client = _Client([
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            _resolver_not_found(),
+            # repeat -> redirected to git_status, resolved, executed
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"status":"found","operation":"git_status","reason":"named directly",'
+            '"related_tools":[]}',
+            # and the controller asks the dead goal again anyway
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"action":"answer","message":"Repository inspected.","reason":"done"}',
+        ])
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=registry,
+            experiment_service=_ExperimentService(),
+            llama_client=client,
+        )
+        try:
+            result = orchestrator.run(
+                TASK, source_type="task", source_id="issue-218-observed-run"
+            )
+            redirects = orchestrator.task_store.recent_events(
+                result.session_id, kind="find_tool_redirected"
+            )
+        finally:
+            orchestrator.close()
+
+        # Exactly one redirect: the second is what turned into a duplicate.
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual([call[0] for call in registry.calls], ["git_status"])
+        # The refused repeat says the operation is already resolved, rather
+        # than offering it again as though it were untried.
+        blocked = next(
+            observation for observation in result.observations
+            if observation.get("event") in {"duplicate_tool_call", "non_progressing_cycle"}
+        )
+        self.assertEqual(blocked["already_resolved_operation"], "git_status")
+        self.assertIn("already been resolved", blocked["reason"])
+        self.assertEqual(result.action, ACTION_ANSWER)
+
+    def test_a_stub_still_says_which_goal_and_what_came_of_it(self):
+        # On a small box the observation budget collapses to a few hundred
+        # characters, so every observation is stubbed. A stub that drops the
+        # goal makes "never repeat the identical lookup" unfollowable.
+        from modules.prompt_budget import compact_observations
+
+        observations = [
+            {
+                "tool": "find_tool",
+                "goal": INSPECT_GOAL,
+                "status": "not_found",
+                "retryable": False,
+                "recommended_operation": "git_status",
+                "related_operations": [{"operation": "git_status", "description": "x" * 400}],
+            },
+            {
+                "tool": "find_tool",
+                "goal": NARROWED_GOAL,
+                "status": "found",
+                "resolved_tool": "git_status",
+                "operation": {"operation": "git_status", "description": "y" * 400},
+            },
+            {"tool": "operation", "operation": "git_status", "result": {"output_lines": ["z" * 400]}},
+        ]
+        compacted, omitted = compact_observations(observations, budget_chars=150)
+
+        self.assertEqual(omitted, [0, 1, 2])
+        self.assertEqual(compacted[0]["goal"], INSPECT_GOAL)
+        self.assertEqual(compacted[0]["status"], "not_found")
+        self.assertIs(compacted[0]["retryable"], False)
+        self.assertEqual(compacted[1]["resolved_tool"], "git_status")
+        self.assertEqual(compacted[2]["operation"], "git_status")
+
+    def test_the_prompt_example_goal_is_rejected_before_it_costs_a_call(self):
+        from modules.nexus_tool_router import (
+            FIND_TOOL_GOAL_PLACEHOLDER,
+            invalid_find_tool_goal,
+        )
+
+        invalid, error, guidance = invalid_find_tool_goal(FIND_TOOL_GOAL_PLACEHOLDER)
+        self.assertTrue(invalid)
+        self.assertIn("placeholder", error)
+        self.assertIn("Describe the operation you need", guidance)
