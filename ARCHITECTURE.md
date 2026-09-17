@@ -377,7 +377,11 @@
   was silently ignored and every declared enum was only a suggestion - which
   is how the resolver answered with a `status` outside its four values and had
   a correct selection discarded (#218). An ignored schema is invisible until a
-  model stops complying, so the shape is pinned by a test.
+  model stops complying, so the shape is pinned by a test and checkable at
+  runtime: `local_model_schema_check` is a read-only capability that asks the
+  server whether it applies Nexus's own schema, using a schema the answer
+  cannot satisfy by accident plus an unconstrained control request - without
+  which a pass would be coincidence rather than evidence.
 - A terminal `not_found` is an answer, not a dead end (#218). It carries
   `related_operations` as descriptors built from the registry's own
   `OperationSpec` - operation, description, why it was offered, argument

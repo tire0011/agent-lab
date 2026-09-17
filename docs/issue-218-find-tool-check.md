@@ -139,6 +139,36 @@ in Markdown) while both alternatives were. Nexus now sends the OpenAI envelope,
 which that probe showed working and which Azure OpenAI reads too; keep the
 probe for the next time a server or model is swapped.
 
+## Running it through Nexus instead of over SSH
+
+The mailbox's `command` channel runs a shell command on the VM and puts the
+result in the outbox, so neither of these checks needs an SSH session. Drop a
+file in the mailbox repository's `inbox/`:
+
+```markdown
+---
+type: command
+created_by: <you>
+---
+
+set -eu
+/agent/.venv/bin/python /agent/scripts/check_llama_json_schema.py
+```
+
+A push to `inbox/` triggers processing immediately through the GitHub webhook;
+the one-minute timer is the fallback. The command runs detached, so a check
+that takes minutes is fine — `timeout:` in the front matter is not read by
+anything.
+
+`inbox/20260917-1500-check-issue218-schema-claude.md` in the mailbox repository
+runs both checks against this branch from a temporary worktree, so `/agent`'s
+deployed checkout and its HEAD are never touched.
+
+Nexus can also run the schema check itself: `local_model_schema_check` is a
+read-only operation, so `find_tool` can resolve it and the controller can call
+it without anyone dropping a file anywhere. It probes only the shape Nexus
+sends plus the control — two model calls rather than four.
+
 ## Related evaluation
 
 `python -m modules.tool_resolver_evaluation --mode local-llm` measures

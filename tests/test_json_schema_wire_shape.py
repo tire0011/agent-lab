@@ -71,3 +71,45 @@ class JsonSchemaWireShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalModelSchemaCheckOperationTests(unittest.TestCase):
+    """The operation exists, is read-only, and is discoverable by find_tool."""
+
+    def _registry(self):
+        from types import SimpleNamespace
+
+        from modules.operations_registry import OperationsRegistry
+
+        return OperationsRegistry(
+            experiment_service=SimpleNamespace(resolve_experiment=lambda i: None)
+        )
+
+    def test_the_check_is_a_declared_read_only_capability(self):
+        spec = {s.name: s for s in self._registry().catalog()}["local_model_schema_check"]
+        self.assertFalse(spec.mutates_state)
+        self.assertEqual(spec.arguments, [])
+
+    def test_it_is_reachable_through_the_read_only_tool_surface(self):
+        # find_tool only offers capabilities that declare themselves read-only,
+        # so a wrong declaration would make it invisible to Nexus itself.
+        from modules.nexus_tool_router import is_read_only
+
+        spec = {s.name: s for s in self._registry().catalog()}["local_model_schema_check"]
+        self.assertTrue(is_read_only(spec))
+
+    def test_an_unreachable_server_fails_the_operation_without_claiming_more(self):
+        import os
+
+        previous = os.environ.get("LOCAL_MODEL_URL")
+        os.environ["LOCAL_MODEL_URL"] = "http://127.0.0.1:9/v1"
+        try:
+            result = self._registry().execute("local_model_schema_check", {}, caller="test")
+        finally:
+            if previous is None:
+                os.environ.pop("LOCAL_MODEL_URL", None)
+            else:
+                os.environ["LOCAL_MODEL_URL"] = previous
+
+        self.assertFalse(result.success)
+        self.assertIn("UNDETERMINED", "\n".join(result.output_lines))
