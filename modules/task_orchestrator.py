@@ -1369,6 +1369,24 @@ class NexusTaskOrchestrator:
         return prompt, meta
 
     def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
+        """Render one controller prompt, stable parts first.
+
+        The order is a cost decision, not a style one. llama-server reuses the
+        KV cache for the longest prefix a request shares with the previous one,
+        and stops at the first difference - so everything *after* the first
+        changed byte is recomputed. Within a run, only the observations change
+        between turns; source, input, history and the capability catalog do
+        not. With the observations in the middle, every turn re-processed them
+        *and* the whole policy/rules block behind them: measured on the VM,
+        1222 tokens at 7.18 tokens/second, about 170 seconds of the ~190 a turn
+        took (#218).
+
+        With them at the end, the reusable prefix covers the rules too, and
+        only the observations and the closing line are new. The closing
+        instruction stays last on purpose: a small model handed a wall of JSON
+        as the final thing it reads is measurably worse at answering in the
+        requested shape, and those few tokens are cheap to recompute.
+        """
         return f"""You are Nexus, the LOCAL persistent controller. You decide WHAT Nexus does next.
 You are not merely an intent classifier. Work on the request yourself when practical, use tools and memory, consult other LLMs when that is valuable, and keep control after every observation.
 
@@ -1383,9 +1401,6 @@ PERSISTENT TASK/DISCUSSION HISTORY:
 
 AVAILABLE CAPABILITIES:
 {json.dumps(self._capabilities(), separators=(',', ':'))}
-
-OBSERVATIONS FROM TOOLS USED IN THIS RUN:
-{json.dumps(observations, separators=(',', ':'))}
 
 Choose exactly one next step using ONE unambiguous `action` field.
 Tool discovery/execution:
@@ -1428,7 +1443,11 @@ Rules:
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
 - When an observation reports duplicate_tool_call, non_progressing_cycle or retry_reason_required, do not repeat it. Choose a materially different tool or a controlled final action.
-- Return JSON only.
+
+OBSERVATIONS FROM TOOLS USED IN THIS RUN:
+{json.dumps(observations, separators=(',', ':'))}
+
+Decide the next step now. Return JSON only.
 """
 
     def _action_to_tool_decision(self, decision: dict[str, Any]) -> dict[str, Any]:

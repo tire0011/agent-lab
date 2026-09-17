@@ -662,3 +662,65 @@ class Issue218ObservedRunRegressionTests(unittest.TestCase):
         self.assertTrue(invalid)
         self.assertIn("placeholder", error)
         self.assertIn("Describe the operation you need", guidance)
+
+
+class ControllerPromptOrderTests(unittest.TestCase):
+    """The stable part of the prompt must come before the volatile part.
+
+    llama-server reuses the KV cache for the longest prefix a request shares
+    with the previous one and recomputes everything after the first difference.
+    Only the observations change between turns of a run, so anything stable
+    placed behind them is re-processed every turn for nothing - measured at
+    ~170 of the ~190 seconds one turn took on the VM (#218).
+
+    A future edit that moves a rule below the observations would give that cost
+    back silently, which is why it is pinned here rather than left to review.
+    """
+
+    def _prompt(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        registry = _SpyRegistry(str(Path(tmp.name) / "state.db"), tmp.name)
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=registry,
+            experiment_service=_ExperimentService(),
+            llama_client=_Client([]),
+        )
+        self.addCleanup(orchestrator.close)
+        session = SimpleNamespace(
+            source_type="task", source_id="prompt-order", title="t"
+        )
+        return orchestrator._prompt(
+            session,
+            TASK,
+            [{"role": "user", "content": "earlier"}],
+            [{"tool": "find_tool", "goal": INSPECT_GOAL, "status": "not_found"}],
+        )
+
+    def test_everything_reusable_precedes_the_observations(self):
+        prompt = self._prompt()
+        observations_at = prompt.index("OBSERVATIONS FROM TOOLS USED IN THIS RUN:")
+        for stable in (
+            "SOURCE:",
+            "CURRENT INPUT:",
+            "PERSISTENT TASK/DISCUSSION HISTORY:",
+            "AVAILABLE CAPABILITIES:",
+            "Model policy:",
+            "Rules:",
+            # The single rule most likely to be edited, and the one whose
+            # position decides whether the whole block is cached.
+            "- Return JSON only" if "- Return JSON only" in prompt else "Rules:",
+        ):
+            with self.subTest(section=stable):
+                self.assertLess(prompt.index(stable), observations_at)
+
+    def test_the_closing_instruction_is_still_the_last_thing_read(self):
+        # Observations last would maximise cache reuse, but a small model whose
+        # final input is a wall of JSON answers in the wrong shape. The closing
+        # line costs a handful of tokens to recompute.
+        prompt = self._prompt().rstrip()
+        self.assertTrue(prompt.endswith("Return JSON only."))
+        self.assertLess(
+            prompt.index("OBSERVATIONS FROM TOOLS USED IN THIS RUN:"),
+            prompt.index("Decide the next step now."),
+        )
