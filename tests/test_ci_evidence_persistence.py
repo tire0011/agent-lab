@@ -514,7 +514,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
                 "wait_for_ci",
                 side_effect=AssertionError("must not re-derive CI evidence"),
             ),
-            patch("modules.experiment_adoption_service.run_verification_test") as local_tests,
+            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(
                 self.experiment_id, superseded=assessment

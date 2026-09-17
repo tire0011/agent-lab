@@ -13,7 +13,9 @@ from modules.experiment_adoption_service import STATUS_ADOPTED, STATUS_FAILED
 from modules.experiment_service import _truncate_text
 from modules.github_work_tracking import GitHubCIVerification
 from modules.task_finalization import TaskFinalizationCoordinator
-from modules.verification_runner import run_verification_test as real_run_verification_test
+from modules.verification_runner import (
+    run_verification_test_monitored as real_run_verification_test,
+)
 from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 
@@ -218,7 +220,7 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
                 return_value=unavailable,
             ),
             patch(
-                "modules.experiment_adoption_service.run_verification_test",
+                "modules.experiment_adoption_service.run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):
@@ -251,7 +253,7 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
                 return_value=unavailable,
             ),
             patch(
-                "modules.experiment_adoption_service.run_verification_test",
+                "modules.experiment_adoption_service.run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):
@@ -297,7 +299,7 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
                 return_value=unavailable,
             ),
             patch(
-                "modules.experiment_adoption_service.run_verification_test",
+                "modules.experiment_adoption_service.run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):

@@ -262,7 +262,7 @@ class StaleFailureAssessmentTests(unittest.TestCase):
 
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=green),
-            patch("modules.experiment_adoption_service.run_verification_test"),
+            patch("modules.experiment_adoption_service.run_verification_test_monitored"),
         ):
             assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
             self.fx.adoption_service.start_adoption(
@@ -311,7 +311,7 @@ class StaleFailureAssessmentTests(unittest.TestCase):
             patch.object(
                 self.fx.github_work_tracking, "wait_for_ci", return_value=self._green_ci()
             ),
-            patch("modules.experiment_adoption_service.run_verification_test") as local_tests,
+            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(self.experiment_id)
             adoption = self.fx.wait_terminal(self.experiment_id)

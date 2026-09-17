@@ -18,9 +18,20 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from modules.codex_worker import CodexResult
-from modules.verification_runner import run_verification_test
+from modules.verification_runner import run_verification_test_monitored
 
-_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+def _only_test_spawn(case, mock_popen):
+    """The single verification-test spawn among a mock's Popen calls.
+
+    ``subprocess.Popen`` is one shared attribute, so patching it also catches
+    every git call ``subprocess.run`` makes underneath.
+    """
+    spawns = [
+        spawn for spawn in mock_popen.call_args_list
+        if spawn.args and spawn.args[0] and spawn.args[0][0] != "git"
+    ]
+    case.assertEqual(len(spawns), 1, f"expected one test spawn, got {spawns}")
+    return spawns[0]
 from modules.experiment_service import (
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
@@ -508,26 +519,20 @@ class ExperimentServiceTestCase(unittest.TestCase):
             self.implementation_worker.run.call_args_list[1].kwargs["task"],
         )
 
-    def test_default_test_command_uses_quiet_unittest_discover(self):
+    def test_default_test_command_uses_verbose_unittest_discover(self):
+        """Verbose, because the progress watchdog (#209) reads the per-test
+        stream to know which test is running; the runner strips those lines
+        back out of the persisted output again."""
         self.service.test_python_executable = sys.executable
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(
             result.test_command,
-            [self.service.test_python_executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+            [self.service.test_python_executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
         )
 
-    @patch("subprocess.run")
-    def test_explicit_custom_test_command_is_unchanged(self, mock_run):
-        real_run = _ORIGINAL_SUBPROCESS_RUN
-
-        def fake_run(args, **kwargs):
-            if args and args[0] == "git":
-                return real_run(args, **kwargs)
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout="custom\n", stderr="")
-
-        mock_run.side_effect = fake_run
-        custom_command = ["python", "-m", "pytest", "tests/test_placeholder.py"]
+    def test_explicit_custom_test_command_is_unchanged(self):
+        custom_command = [sys.executable, "-c", "print('custom')"]
         with patch.dict(
             "modules.experiment_service._TEST_COMMANDS",
             {"unittest-discover": custom_command},
@@ -563,46 +568,28 @@ class ExperimentServiceTestCase(unittest.TestCase):
         result = service.run_experiment(experiment.id)
         self.assertEqual(result.test_command[0], custom_python)
 
-    @patch("subprocess.run")
-    def test_test_command_runs_with_worktree_as_cwd(self, mock_run):
-        # Route only git subprocess calls to the real binary; assert the
-        # final (test) subprocess.run call uses the worktree as cwd and
-        # the configured interpreter, without invoking any real command.
-        real_run = _ORIGINAL_SUBPROCESS_RUN
-
-        def fake_run(args, **kwargs):
-            if args and args[0] == "git":
-                return real_run(args, **kwargs)
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout="OK", stderr="")
-
-        mock_run.side_effect = fake_run
+    @patch("modules.verification_runner.subprocess.Popen", wraps=subprocess.Popen)
+    def test_test_command_runs_with_worktree_as_cwd(self, mock_popen):
+        # Spy on the real spawn rather than replacing it: the monitored runner
+        # streams the process's output, so a stubbed process would only test
+        # the stub. ``subprocess.Popen`` is shared with git's own calls, hence
+        # the filter for the verification command.
+        self.service.test_python_executable = sys.executable
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
 
-        test_calls = [
-            c for c in mock_run.call_args_list
-            if c.args and c.args[0] and c.args[0][0] != "git"
-        ]
-        self.assertEqual(len(test_calls), 1)
-        _, kwargs = test_calls[0]
+        _, kwargs = _only_test_spawn(self, mock_popen)
         self.assertEqual(kwargs["cwd"], result.worktree_path)
+        self.assertFalse(kwargs["shell"])
 
-    @patch("subprocess.run")
-    def test_test_command_uses_isolated_env_not_full_parent_env(self, mock_run):
+    @patch("modules.verification_runner.subprocess.Popen", wraps=subprocess.Popen)
+    def test_test_command_uses_isolated_env_not_full_parent_env(self, mock_popen):
         """Regression test for the leaked-production-secret bug: the test
         subprocess must receive the isolated verification environment
         (AGENT_API_KEY=test-key), never a copy of the parent process
         environment, even when the parent has a fake production key and
         other secrets set."""
-        real_run = _ORIGINAL_SUBPROCESS_RUN
-
-        def fake_run(args, **kwargs):
-            if args and args[0] == "git":
-                return real_run(args, **kwargs)
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout="OK", stderr="")
-
-        mock_run.side_effect = fake_run
-
+        self.service.test_python_executable = sys.executable
         with patch.dict(
             os.environ,
             {
@@ -613,12 +600,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
             experiment = self.service.create_experiment(goal="g")
             self.service.run_experiment(experiment.id)
 
-        test_calls = [
-            c for c in mock_run.call_args_list
-            if c.args and c.args[0] and c.args[0][0] != "git"
-        ]
-        self.assertEqual(len(test_calls), 1)
-        _, kwargs = test_calls[0]
+        _, kwargs = _only_test_spawn(self, mock_popen)
         env = kwargs.get("env")
         self.assertIsNotNone(env, "test subprocess must be given an explicit isolated env")
         self.assertEqual(env["AGENT_API_KEY"], "test-key")
@@ -2319,7 +2301,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch("modules.experiment_service.service.run_verification_test") as local_tests:
+        with patch("modules.experiment_service.service.run_verification_test_monitored") as local_tests:
             result = self.service.run_experiment(
                 experiment.id, github_work_tracking=github
             )
@@ -2353,7 +2335,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch("modules.experiment_service.service.run_verification_test") as local_tests:
+        with patch("modules.experiment_service.service.run_verification_test_monitored") as local_tests:
             result = self.service.run_experiment(
                 experiment.id, github_work_tracking=github
             )
@@ -2379,8 +2361,8 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
         with patch(
-            "modules.experiment_service.service.run_verification_test",
-            wraps=run_verification_test,
+            "modules.experiment_service.service.run_verification_test_monitored",
+            wraps=run_verification_test_monitored,
         ) as local_tests:
             result = self.service.run_experiment(
                 experiment.id, github_work_tracking=github
@@ -2417,29 +2399,33 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         status_change = [e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_FAILED]
         self.assertTrue(status_change, "expected a status_forced -> failed entry")
 
-    def test_test_run_timeout_is_not_classified_as_a_test_failure(self):
-        """A verification test run that hits the subprocess timeout must be
-        reported as its own ``test_timeout`` case, never conflated with a
-        normal ``tests_failed`` (exit_code != 0) outcome."""
-
-        def _run_or_time_out(cmd, *args, **kwargs):
-            if isinstance(cmd, list) and "unittest" in cmd and "discover" in cmd:
-                raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 300))
-            return _ORIGINAL_SUBPROCESS_RUN(cmd, *args, **kwargs)
-
-        experiment = self.service.create_experiment(goal="g")
-        with patch("subprocess.run", side_effect=_run_or_time_out):
-            result = self.service.run_experiment(experiment.id)
+    def test_stalled_test_run_is_not_classified_as_a_test_failure(self):
+        """A verification run the watchdog aborts must be reported as its own
+        stall case, never conflated with a normal ``tests_failed``
+        (exit_code != 0) outcome (#209)."""
+        self._write_test_file(
+            "import time, unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_hangs(self):\n"
+            "        time.sleep(600)\n"
+        )
+        service = self._make_watchdog_service(str(Path(self.tmp.name) / "stall.db"))
+        experiment = service.create_experiment(goal="g")
+        result = service.run_experiment(experiment.id)
 
         self.assertEqual(result.status, STATUS_TIMED_OUT)
         self.assertIsNone(result.test_exit_code)
+        self.assertIn("stalled", result.error)
+        # The diagnostics must name the test progress stopped on.
+        self.assertIn("test_hangs", result.error)
 
         entries = self._read_log(experiment.id)
-        timeouts = [e for e in entries if e["event"] == "test_timeout"]
-        self.assertEqual(len(timeouts), 1)
-        self.assertEqual(timeouts[0]["level"], "ERROR")
-        self.assertEqual(timeouts[0]["phase"], "verifying")
-        self.assertTrue(timeouts[0].get("timed_out"))
+        stalls = [e for e in entries if e["event"] == "test_stalled"]
+        self.assertEqual(len(stalls), 1)
+        self.assertEqual(stalls[0]["level"], "ERROR")
+        self.assertEqual(stalls[0]["phase"], "verifying")
+        self.assertTrue(stalls[0].get("timed_out"))
+        self.assertIn("test_hangs", str(stalls[0].get("current_test")))
 
         # Never classified as a plain test failure.
         self.assertEqual([e for e in entries if e["event"] == "tests_failed"], [])
@@ -2448,7 +2434,90 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         ]
         self.assertTrue(status_change, "expected a status_forced -> timed_out entry")
 
-    def _make_timeout_service(self, db_path: str, **overrides) -> ExperimentService:
+    def test_progressing_suite_is_not_aborted_by_a_long_total_runtime(self):
+        """The whole point of #209: a suite that keeps finishing tests must be
+        allowed to run past any single watchdog interval."""
+        self._write_test_file(
+            "import time, unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_a(self):\n"
+            "        time.sleep(0.4)\n"
+            "    def test_b(self):\n"
+            "        time.sleep(0.4)\n"
+            "    def test_c(self):\n"
+            "        time.sleep(0.4)\n"
+        )
+        service = self._make_watchdog_service(
+            str(Path(self.tmp.name) / "progressing.db"),
+            test_stall_timeout_seconds=5,
+            test_watchdog_interval_seconds=0.2,
+        )
+        experiment = service.create_experiment(goal="g")
+        result = service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.assertEqual(result.test_exit_code, 0)
+        entries = self._read_log(experiment.id)
+        self.assertEqual([e for e in entries if e["event"] == "test_stalled"], [])
+
+    def test_test_heartbeat_reaches_the_global_experiment_log(self):
+        """The global Nexus heartbeat has to see that verification is alive -
+        one progress entry per watchdog tick, not one per test."""
+        self._write_test_file(
+            "import time, unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_slow(self):\n"
+            "        time.sleep(1.0)\n"
+        )
+        service = self._make_watchdog_service(
+            str(Path(self.tmp.name) / "heartbeat.db"),
+            test_stall_timeout_seconds=30,
+            test_watchdog_interval_seconds=0.1,
+        )
+        experiment = service.create_experiment(goal="g")
+        result = service.run_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+
+        entries = self._read_log(experiment.id)
+        progress = [e for e in entries if e["event"] == "test_progress"]
+        self.assertTrue(progress, "expected test heartbeat entries in the experiment log")
+        self.assertIn("current_test", progress[-1])
+        self.assertIn("last_progress_age_seconds", progress[-1])
+
+        # Per-test detail must NOT be duplicated into the global log.
+        self.assertEqual([e for e in entries if e["event"] == "test_started"], [])
+        self.assertEqual([e for e in entries if e["event"] == "test_finished"], [])
+
+    def test_reported_test_total_is_remembered_for_the_next_run(self):
+        self._write_test_file(
+            "import unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_a(self):\n"
+            "        pass\n"
+            "    def test_b(self):\n"
+            "        pass\n"
+        )
+        db_path = str(Path(self.tmp.name) / "total.db")
+        service = self._make_watchdog_service(db_path)
+        self.assertIsNone(service._get_expected_test_total())
+
+        experiment = service.create_experiment(goal="g")
+        self.assertEqual(service.run_experiment(experiment.id).status, STATUS_SUCCEEDED)
+        self.assertEqual(service._get_expected_test_total(), 2)
+
+        # Persisted, so a restart still knows the size of the suite.
+        other = self._make_watchdog_service(db_path)
+        self.assertEqual(other._get_expected_test_total(), 2)
+
+    def _write_test_file(self, source: str) -> None:
+        (self.repo_root / "tests" / "test_placeholder.py").write_text(source)
+        subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo_root), "commit", "-q", "-m", "test fixture"],
+            check=True,
+        )
+
+    def _make_watchdog_service(self, db_path: str, **overrides) -> ExperimentService:
         kwargs = dict(
             selection_worker=self.selection_worker,
             plan_worker_factory=lambda scratch_dir: self.plan_worker,
@@ -2458,110 +2527,17 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
             worktrees_root=str(self.worktrees_root),
             experiment_log_dir=str(self.log_dir),
             test_python_executable=sys.executable,
-            default_test_timeout_seconds=10,
-            max_test_timeout_seconds=25,
-            test_timeout_backoff_factor=2.0,
+            # Small enough that a stalled run is caught in seconds. Values
+            # passed explicitly are trusted as written; only what
+            # WatchdogConfig.resolve reads from the environment is clamped.
+            test_stall_timeout_seconds=2,
+            test_watchdog_interval_seconds=0.2,
+            test_safety_cap_seconds=120,
         )
         kwargs.update(overrides)
         service = ExperimentService(**kwargs)
         self.addCleanup(service.close)
         return service
-
-    @staticmethod
-    def _always_time_out(cmd, *args, **kwargs):
-        if isinstance(cmd, list) and "unittest" in cmd and "discover" in cmd:
-            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 300))
-        return _ORIGINAL_SUBPROCESS_RUN(cmd, *args, **kwargs)
-
-    def test_test_timeout_increases_next_run_timeout(self):
-        """A ``test_timeout`` must grow the timeout for the next run using
-        ``min(current * factor, max)`` and log the increase."""
-        db_path = str(Path(self.tmp.name) / "timeout-increase.db")
-        service = self._make_timeout_service(db_path)
-        self.assertEqual(service._get_test_timeout_seconds(), 10)
-
-        experiment = service.create_experiment(goal="g")
-        with patch("subprocess.run", side_effect=self._always_time_out):
-            result = service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_TIMED_OUT)
-
-        # 10 * 2.0 = 20, still below the 25 cap.
-        self.assertEqual(service._get_test_timeout_seconds(), 20)
-
-        entries = self._read_log(experiment.id)
-        increases = [e for e in entries if e["event"] == "test_timeout_increased"]
-        self.assertEqual(len(increases), 1)
-        self.assertEqual(increases[0]["previous_timeout_seconds"], 10)
-        self.assertEqual(increases[0]["new_timeout_seconds"], 20)
-        started = [e for e in entries if e["event"] == "tests_started"]
-        self.assertEqual(started[0]["timeout_seconds"], 10)
-
-    def test_increased_timeout_is_persisted_and_reused_across_instances(self):
-        """The learned timeout must be reused by later runs, including from
-        a brand-new ``ExperimentService`` instance pointed at the same DB
-        (simulating a process restart), not just within one process."""
-        db_path = str(Path(self.tmp.name) / "timeout-reuse.db")
-        service = self._make_timeout_service(db_path)
-
-        experiment = service.create_experiment(goal="g")
-        with patch("subprocess.run", side_effect=self._always_time_out):
-            service.run_experiment(experiment.id)
-        self.assertEqual(service._get_test_timeout_seconds(), 20)
-
-        # A fresh instance (default_test_timeout_seconds=10 again) must
-        # still see the persisted, increased value.
-        other_service = self._make_timeout_service(db_path)
-        self.assertEqual(other_service._get_test_timeout_seconds(), 20)
-
-        experiment2 = other_service.create_experiment(goal="g2")
-        with patch("subprocess.run", side_effect=self._always_time_out):
-            other_service.run_experiment(experiment2.id)
-        # 20 * 2.0 = 40, capped at 25.
-        self.assertEqual(other_service._get_test_timeout_seconds(), 25)
-
-    def test_timeout_growth_is_capped_at_maximum(self):
-        db_path = str(Path(self.tmp.name) / "timeout-cap.db")
-        service = self._make_timeout_service(db_path)
-
-        for i in range(5):
-            experiment = service.create_experiment(goal=f"g{i}")
-            with patch("subprocess.run", side_effect=self._always_time_out):
-                result = service.run_experiment(experiment.id)
-            self.assertEqual(result.status, STATUS_TIMED_OUT)
-            self.assertLessEqual(service._get_test_timeout_seconds(), 25)
-
-        self.assertEqual(service._get_test_timeout_seconds(), 25)
-
-    def test_successful_run_does_not_increase_timeout(self):
-        db_path = str(Path(self.tmp.name) / "timeout-success.db")
-        service = self._make_timeout_service(db_path)
-        experiment = service.create_experiment(goal="g")
-        result = service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-        self.assertEqual(service._get_test_timeout_seconds(), 10)
-
-        entries = self._read_log(experiment.id)
-        self.assertEqual([e for e in entries if e["event"] == "test_timeout_increased"], [])
-
-    def test_normal_test_failure_does_not_increase_timeout(self):
-        (self.repo_root / "tests" / "test_placeholder.py").write_text(
-            "import unittest\n\n"
-            "class T(unittest.TestCase):\n"
-            "    def test_fail(self):\n"
-            "        self.assertTrue(False)\n"
-        )
-        subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(self.repo_root), "commit", "-q", "-m", "failing test"], check=True)
-
-        db_path = str(Path(self.tmp.name) / "timeout-failure.db")
-        service = self._make_timeout_service(db_path)
-        experiment = service.create_experiment(goal="g")
-        result = service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_FAILED)
-        self.assertEqual(service._get_test_timeout_seconds(), 10)
-
-        entries = self._read_log(experiment.id)
-        self.assertEqual([e for e in entries if e["event"] == "test_timeout_increased"], [])
 
     def test_unhandled_exception_is_logged_with_stacktrace(self):
         self.implementation_worker.run.side_effect = RuntimeError("impl boom")

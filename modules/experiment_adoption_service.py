@@ -31,7 +31,8 @@ from modules.github_work_tracking import (
 from modules.mailbox import MailboxLock
 from modules.redaction import bounded_lines, redact, sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db
-from modules.verification_runner import run_verification_test
+from modules.test_run_log import global_heartbeat_bridge
+from modules.verification_runner import run_verification_test_monitored
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,6 @@ STATUS_INTERRUPTED = "interrupted"
 _TERMINAL_STATUSES = {STATUS_ADOPTED, STATUS_NEEDS_REVIEW, STATUS_FAILED, STATUS_INTERRUPTED}
 _ACTIVE_STATUSES = {STATUS_QUEUED, STATUS_ADOPTING}
 
-_DEFAULT_TEST_TIMEOUT_SECONDS = 300
 _DEFAULT_GIT_TIMEOUT_SECONDS = 60
 _DEFAULT_TARGET_BRANCH = "main"
 
@@ -264,7 +264,6 @@ class ExperimentAdoptionService:
         repo_root: str = "/agent",
         worktrees_root: str | None = None,
         lock_path: str = _DEFAULT_LOCK_PATH,
-        test_timeout_seconds: int = _DEFAULT_TEST_TIMEOUT_SECONDS,
         github_work_tracking: GitHubWorkTrackingService | None = None,
     ) -> None:
         self.experiment_service = experiment_service
@@ -272,7 +271,6 @@ class ExperimentAdoptionService:
         self.repo_root = Path(repo_root)
         self.worktrees_root = Path(worktrees_root or getattr(experiment_service, "worktrees_root", str(Path.home() / "agent-worktrees")))
         self.lock_path = Path(lock_path)
-        self.test_timeout_seconds = test_timeout_seconds
         self.github_work_tracking = github_work_tracking or GitHubWorkTrackingService(
             db_path=db_path,
             repo_root=str(self.repo_root),
@@ -289,7 +287,14 @@ class ExperimentAdoptionService:
         # while a thread is still active can corrupt sqlite state or crash the
         # interpreter. Join all known workers before closing the connection.
         for thread in list(self._threads.values()):
-            thread.join(timeout=self.test_timeout_seconds + _DEFAULT_GIT_TIMEOUT_SECONDS)
+            # An adoption thread may be inside a local verification run, which
+            # the progress watchdog bounds by the absolute safety cap rather
+            # than by a five-minute timeout - so wait for that, not for a
+            # value the run can legitimately exceed.
+            thread.join(
+                timeout=self.experiment_service._get_test_watchdog_config().safety_cap_seconds
+                + _DEFAULT_GIT_TIMEOUT_SECONDS
+            )
         self._conn.close()
 
     def get(self, experiment_id: str) -> ExperimentAdoption:
@@ -1756,34 +1761,47 @@ class ExperimentAdoptionService:
                     )
                 test_command_template = _TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
                 test_command = [part.format(python=self.experiment_service.test_python_executable) for part in test_command_template]
-                test_timeout_seconds = self.experiment_service._get_test_timeout_seconds()
-                test_run = run_verification_test(
+                watchdog = self.experiment_service._get_test_watchdog_config()
+                expected_total = self.experiment_service._get_expected_test_total()
+                test_run = run_verification_test_monitored(
                     test_command,
                     cwd=str(integration_path),
-                    timeout_seconds=test_timeout_seconds,
+                    run_id=f"adoption-{experiment_id}",
+                    config=watchdog,
+                    expected_total=expected_total,
+                    # Same heartbeat propagation as experiment verification:
+                    # one progress entry per watchdog tick in the global log,
+                    # every per-test entry in the dedicated test log.
+                    on_heartbeat=global_heartbeat_bridge(elog, "adoption"),
                 )
+                self.experiment_service._remember_test_total(test_run.tests_total)
                 test_exit_code = test_run.exit_code
                 test_output = test_run.output
                 verification_summary = f"local fallback integration tests passed (exit code {test_exit_code})"
                 if test_run.timed_out:
                     keep_integration = True
                     elog.log_process(
-                        "adoption", "integration_tests_timeout",
-                        "Integration test command timed out",
+                        "adoption",
+                        "integration_tests_stalled" if test_run.stalled else "integration_tests_safety_cap_exceeded",
+                        test_run.stall_diagnostics or "Integration test run aborted by the progress watchdog",
                         command=test_command, cwd=str(integration_path),
                         duration_ms=test_run.duration_ms,
                         timed_out=True, level="ERROR",
-                        timeout_seconds=test_timeout_seconds,
+                        stall_timeout_seconds=watchdog.stall_timeout_seconds,
+                        safety_cap_seconds=watchdog.safety_cap_seconds,
+                        test_log_path=test_run.test_log_path,
+                        **(test_run.progress or {}),
                     )
-                    next_timeout_seconds = self.experiment_service._increase_test_timeout_seconds(test_timeout_seconds)
-                    if next_timeout_seconds > test_timeout_seconds:
-                        elog.warning(
-                            "adoption", "test_timeout_increased",
-                            f"Verification test timeout increased from {test_timeout_seconds}s to "
-                            f"{next_timeout_seconds}s for future runs",
-                            previous_timeout_seconds=test_timeout_seconds,
-                            new_timeout_seconds=next_timeout_seconds,
-                        )
+                elif test_run.process_died:
+                    keep_integration = True
+                    elog.log_process(
+                        "adoption", "integration_tests_process_died",
+                        test_run.stall_diagnostics or "Integration test process was killed before it could finish",
+                        command=test_command, cwd=str(integration_path),
+                        duration_ms=test_run.duration_ms, level="ERROR",
+                        test_log_path=test_run.test_log_path,
+                        **(test_run.progress or {}),
+                    )
                 elif test_run.exception is not None:
                     keep_integration = True
                     elog.error(

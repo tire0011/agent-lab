@@ -12,7 +12,9 @@ from modules.github_work_tracking import (
     GitHubWorkTrackingError,
     GitHubWorkTrackingService,
 )
-from modules.verification_runner import run_verification_test as real_run_verification_test
+from modules.verification_runner import (
+    run_verification_test_monitored as real_run_verification_test,
+)
 from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 
@@ -42,7 +44,7 @@ class AdoptionAuthoritativeCIReuseTests(unittest.TestCase):
 
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=ci) as wait_ci,
-            patch("modules.experiment_adoption_service.run_verification_test") as local_tests,
+            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(experiment_id)
             adoption = self.fx.wait_terminal(experiment_id)
@@ -68,7 +70,7 @@ class AdoptionAuthoritativeCIReuseTests(unittest.TestCase):
 
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=ci),
-            patch("modules.experiment_adoption_service.run_verification_test") as local_tests,
+            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(experiment_id)
             adoption = self.fx.wait_terminal(experiment_id)
@@ -92,7 +94,7 @@ class AdoptionAuthoritativeCIReuseTests(unittest.TestCase):
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=ci),
             patch(
-                "modules.experiment_adoption_service.run_verification_test",
+                "modules.experiment_adoption_service.run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):
