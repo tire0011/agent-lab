@@ -39,6 +39,24 @@ It returns the same exit codes as the Python check. Useful switches:
 | `-MaxSteps` | `4` | controller turns before it must finish |
 | `-Json` | off | also dump the raw observations |
 
+## Asking the resolver one question
+
+A full controller run costs several minutes per turn. To ask only "can the
+resolver resolve this goal at all?", which is one model call:
+
+```bash
+cd /agent
+.venv/bin/python scripts/check_issue_218_find_tool.py --resolver-only "I need to know the git state"
+```
+
+It prints the status, the reason, the candidates that were offered, the
+described alternatives — and `what the model actually answered`, the raw
+response. When an answer cannot be used, that raw text is the only thing that
+explains why. Exit 0 if the resolver resolved the goal or deliberately rejected
+the candidates, 1 if it produced no usable answer at all.
+
+## Running the full check
+
 To run the Python check on its own:
 
 ```bash

@@ -829,7 +829,7 @@ class NexusTaskOrchestrator:
                     )
                     if (
                         tool == TOOL_FIND_TOOL
-                        and observation.get("status") == "not_found"
+                        and observation.get("status") in {"not_found", "unavailable"}
                     ):
                         observation = dict(observation)
                         observation["state_token"] = state_token

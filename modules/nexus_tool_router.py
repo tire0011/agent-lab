@@ -45,6 +45,7 @@ import time
 from typing import Any, Callable, Protocol
 
 from modules.llama_cpp_client import LlamaCppClientError, extract_json
+from modules.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ MAX_RESOLVER_CANDIDATES = 5
 # an already-budgeted prompt, so "everything we know" would push the rest of
 # the observations out; the best few, fully described, are what it can act on.
 MAX_RELATED_OPERATIONS = 3
+MAX_RESOLVER_RAW_CHARS = 600
 MAX_RELATED_DESCRIPTION_CHARS = 300
 MAX_WHY_RELEVANT_TERMS = 5
 
@@ -335,14 +337,21 @@ def terminal_not_found_observation(
     observations: list[dict[str, Any]],
     state_token: str,
 ) -> dict[str, Any] | None:
-    """The terminal ``not_found`` this exact lookup already produced, if any."""
+    """The unresolved answer this exact lookup already produced, if any.
+
+    ``not_found`` and ``unavailable`` both count. Only the first is settled,
+    but the caller reaches this function having asked the identical question a
+    second time with nothing about the state changed - which the loop guard
+    refuses either way. Recognising both is what lets that refusal carry the
+    alternatives instead of a bare verdict, and what lets the repeat be
+    redirected rather than spent.
+    """
     return next(
         (
             observation
             for observation in reversed(observations)
             if observation.get("tool") == TOOL_FIND_TOOL
-            and observation.get("status") == "not_found"
-            and observation.get("retryable") is False
+            and observation.get("status") in {"not_found", "unavailable"}
             and observation.get("state_token") == state_token
             and str(observation.get("goal", "")).strip() == goal
         ),
@@ -866,7 +875,10 @@ class NexusToolRouter:
                 "related_tools": [spec.name for spec in candidates[:3]],
             }
             resolver_unavailable = True
-        status = str(parsed.get("status", "")).strip()
+        # Case-folded: a small local model that answers "Found" has given the
+        # same answer as one that answers "found", and throwing its correct
+        # selection away over the spelling is not a safety property.
+        status = str(parsed.get("status", "")).strip().lower()
         operation = str(parsed.get("operation", "")).strip()
         reason = str(parsed.get("reason", "")).strip()[:1000] or "Tool resolver did not provide a reason."
         resolver_output_chars = len(raw)
@@ -928,11 +940,33 @@ class NexusToolRouter:
             final_error = parsed.get("error") or final_reason
         else:
             final_status = "not_found" if status == "not_found" and not resolver_unavailable else "unavailable"
-            final_reason = (
-                reason
-                if final_status == "not_found" or resolver_unavailable
-                else f"Resolver selected unavailable operation {operation!r}."
-            )
+            if final_status == "not_found" or resolver_unavailable:
+                final_reason = reason
+            elif operation and operation not in candidate_by_name:
+                # The one case the old wording described. Kept exact, because
+                # "it named something that does not exist" is a real and
+                # different failure from the one below.
+                final_reason = (
+                    f"Resolver selected {operation!r}, which was not among the "
+                    f"candidates it was offered."
+                )
+            elif operation:
+                # What actually happened in #218's manual run: the resolver
+                # named a perfectly available operation, but its status field
+                # was not one this contract accepts. The old wording blamed the
+                # operation - "Resolver selected unavailable operation
+                # 'git_status'" - while git_status was right there in the
+                # candidate list, which sent the diagnosis after the wrong bug.
+                final_reason = (
+                    f"Resolver returned status {status!r}, which is not one of "
+                    f"found/not_found/invalid_goal, while naming the available "
+                    f"operation {operation!r}. Its answer could not be used."
+                )
+            else:
+                final_reason = (
+                    f"Resolver returned status {status!r}, which is not one of "
+                    f"found/not_found/invalid_goal, and named no operation."
+                )
             final_guidance = FIND_TOOL_GOAL_GUIDANCE
             final_error = None
         return {
@@ -943,9 +977,27 @@ class NexusToolRouter:
             "error": final_error,
             "guidance": final_guidance,
             "related_tools": related_tools,
+            # Both unresolved outcomes carry the alternatives. A caller handed
+            # "unavailable" with nothing but a bare name list has exactly the
+            # dead end #218 was about - it cannot tell what git_status does or
+            # what it takes - and the resolver having produced an unusable
+            # answer is no reason to withhold the candidates it was choosing
+            # between. `retryable` is what separates them: not_found is settled
+            # for this goal, unavailable may yet succeed on a fresh attempt.
             **(
-                self.find_tool_not_found_metadata(current_task, clean_goal, related_tools)
-                if final_status == "not_found"
+                {
+                    **self.find_tool_not_found_metadata(current_task, clean_goal, related_tools),
+                    **({"retryable": True} if final_status == "unavailable" else {}),
+                }
+                if final_status in {"not_found", "unavailable"}
+                else {}
+            ),
+            # Bounded and redacted: when an answer could not be used, what the
+            # model actually said is the only thing that explains why, and
+            # reconstructing it from a reason string is guesswork.
+            **(
+                {"resolver_raw": redact_secrets(raw)[:MAX_RESOLVER_RAW_CHARS]}
+                if final_status != "found"
                 else {}
             ),
             "metrics": {

@@ -289,7 +289,88 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
         self.assertEqual(metadata["recommended_next_action"], ACTION_MISSING_CAPABILITY)
 
     # ------------------------------------------------------------------
-    # 2. the controller path
+    # 2. an answer that could not be used
+    # ------------------------------------------------------------------
+
+    def test_a_valid_operation_named_with_an_odd_status_is_not_blamed(self):
+        # The real #218 manual run: the resolver named git_status, which was in
+        # the candidate list, but its status field was not one the contract
+        # accepts. The response said "Resolver selected unavailable operation
+        # 'git_status'" - blaming an operation that was available and offered,
+        # which sent the diagnosis after the wrong bug.
+        orchestrator = self._orchestrator([
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"status":"complete","operation":"git_status","reason":"this one fits"}',
+            '{"action":"answer","message":"done","reason":"done"}',
+        ])
+        result = orchestrator.run(TASK, source_type="task", source_id="issue-218-odd-status")
+        observation = result.observations[0]
+
+        self.assertEqual(observation["status"], "unavailable")
+        self.assertIn("status 'complete'", observation["reason"])
+        self.assertIn("git_status", observation["reason"])
+        self.assertNotIn("unavailable operation", observation["reason"])
+        # What the model actually said, for the next person diagnosing this.
+        self.assertIn("complete", observation["resolver_raw"])
+
+    def test_a_status_that_only_differs_in_case_is_the_same_answer(self):
+        orchestrator = self._orchestrator([
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"status":"FOUND","operation":"git_status","reason":"this one fits"}',
+            '{"action":"answer","message":"done","reason":"done"}',
+        ])
+        result = orchestrator.run(TASK, source_type="task", source_id="issue-218-case")
+
+        self.assertEqual(result.observations[0]["status"], "found")
+        self.assertEqual([call[0] for call in self.registry.calls], ["git_status"])
+
+    def test_an_unusable_answer_still_describes_the_alternatives(self):
+        # `related_tools` was a bare name list, and the descriptors were only
+        # attached to not_found - so an unavailable answer told the controller
+        # nothing about what any of the candidates do.
+        orchestrator = self._orchestrator([
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"status":"complete","operation":"git_status","reason":"this one fits"}',
+            '{"action":"answer","message":"done","reason":"done"}',
+        ])
+        result = orchestrator.run(TASK, source_type="task", source_id="issue-218-unavailable-alts")
+        observation = result.observations[0]
+
+        # The resolver named no related tools, so the candidates it was
+        # choosing between are what the caller gets - described, not as names.
+        self.assertEqual(
+            [item["operation"] for item in observation["related_operations"]],
+            ["git_status", "git_log", "git_worktrees"],
+        )
+        self.assertEqual(
+            observation["related_operations"][0]["description"],
+            "Inspect the current repository state, branch and working tree changes.",
+        )
+        self.assertEqual(
+            observation["recommended_next_action"], ACTION_RESOLVE_RELATED_OPERATION
+        )
+        self.assertIn("Do not repeat find_tool with the same goal", observation["guidance"])
+        # Unlike not_found, a resolver that failed may yet succeed: settled and
+        # unusable are different claims.
+        self.assertTrue(observation["retryable"])
+
+    def test_a_repeated_unusable_lookup_is_redirected_like_any_other(self):
+        orchestrator = self._orchestrator([
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"status":"complete","operation":"git_status","reason":"this one fits"}',
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"status":"found","operation":"git_status","reason":"named directly",'
+            '"related_tools":[]}',
+            '{"action":"answer","message":"Repository inspected.","reason":"done"}',
+        ])
+        result = orchestrator.run(TASK, source_type="task", source_id="issue-218-unavailable-redirect")
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual([call[0] for call in self.registry.calls], ["git_status"])
+        self.assertNotIn("duplicate_tool_call", str(result.observations))
+
+    # ------------------------------------------------------------------
+    # 3. the controller path
     # ------------------------------------------------------------------
 
     def test_controller_that_reads_the_alternatives_calls_one_of_them(self):

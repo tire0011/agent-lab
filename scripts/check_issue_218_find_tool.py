@@ -90,6 +90,61 @@ def _describe(observation: dict) -> str:
     )
 
 
+def _resolver_only(args) -> int:
+    """One find_tool lookup against the real resolver, and what it answered.
+
+    A whole controller run costs several minutes per turn on the VM, and most
+    questions about the resolver ("can it resolve this goal at all?") need only
+    this. Prints the raw model answer too, because when a response cannot be
+    used, what it actually said is the only thing that explains why.
+    """
+    import asyncio
+
+    registry = OperationsRegistry(
+        experiment_service=_experiment_service(),
+        db_path=str(args.db_path),
+        repo_root=str(args.repo_root),
+    )
+    orchestrator = NexusTaskOrchestrator(
+        operations_registry=registry,
+        experiment_service=_experiment_service(),
+    )
+    print("#218 resolver probe")
+    print(f"goal:     {args.resolver_only!r}")
+    print(f"database: {args.db_path} (scratch)")
+    print()
+    try:
+        session = orchestrator.task_store.get_or_create(
+            source_type="task", source_id="issue-218-resolver-probe"
+        )
+        observation = asyncio.run(
+            orchestrator._resolve_find_tool(args.resolver_only, session_id=session.id)
+        )
+    finally:
+        orchestrator.close()
+
+    print(_describe(observation))
+    raw = observation.get("resolver_raw")
+    if raw:
+        print()
+        print("what the model actually answered:")
+        print(f"  {raw}")
+    if args.json:
+        print()
+        print(json.dumps(observation, indent=2, sort_keys=True))
+
+    status = observation.get("status")
+    print()
+    if status == "found":
+        print(f"PASS: resolved to {observation.get('resolved_tool')}")
+        return 0
+    if status == "not_found":
+        print("not_found: the resolver considered the candidates and rejected them")
+        return 0
+    print(f"FAIL: the resolver produced no usable answer (status={status})")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--task", default=DEFAULT_TASK, help="task text to drive the controller with")
@@ -97,6 +152,14 @@ def main() -> int:
     parser.add_argument("--repo-root", type=Path, default=Path("/agent"))
     parser.add_argument("--max-steps", type=int, default=4, help="controller turns before it must finish")
     parser.add_argument("--json", action="store_true", help="also dump the raw observations")
+    parser.add_argument(
+        "--resolver-only",
+        metavar="GOAL",
+        help=(
+            "ask the tool resolver this one goal and print what came back, then stop. "
+            "One model call instead of a whole controller run - seconds, not minutes."
+        ),
+    )
     args = parser.parse_args()
 
     if args.db_path.exists():
@@ -112,6 +175,9 @@ def main() -> int:
         experiment_service=_experiment_service(),
         max_steps=args.max_steps,
     )
+
+    if args.resolver_only:
+        return _resolver_only(args)
 
     print("#218 manual check")
     print(f"task:      {args.task!r}")
