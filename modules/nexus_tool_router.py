@@ -49,6 +49,7 @@ from modules.llama_cpp_client import (
     extract_json,
     json_schema_response_format,
 )
+from modules.prompt_budget import prompt_json
 from modules.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
@@ -593,7 +594,7 @@ GOAL:
 {goal[:1000]}
 
 CANDIDATE READ-ONLY OPERATIONS:
-{json.dumps(candidate_summaries, separators=(',', ':'))}
+{prompt_json(candidate_summaries)}
 
 Rules:
 - Choose status "found" only when one candidate directly satisfies the goal.
@@ -1106,11 +1107,22 @@ class NexusToolRouter:
                     "for the same persistent Nexus session."
                 ),
             }
-        result = self.operations_registry.execute(
-            operation,
-            args,
-            caller=self.caller,
-        )
+        try:
+            result = self.operations_registry.execute(
+                operation,
+                args,
+                caller=self.caller,
+            )
+        except ValueError as exc:
+            # The registry answers a failing operation with a failed result and
+            # re-raises only argument validation, which is `OperationValidationError`
+            # - a ValueError. Caught by base class rather than by import, to keep
+            # the dependency running one way (registry is injected, never imported).
+            #
+            # "issue_number must be a positive integer" is a fact the caller can
+            # act on: call it again with a real number. Letting it escape ended a
+            # whole Nexus task with a traceback (#218).
+            raise ToolRouterError(str(exc)) from exc
         payload = result.to_dict()
         payload["output_lines"] = [
             str(line)[:500]

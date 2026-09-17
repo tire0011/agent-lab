@@ -34,6 +34,7 @@ from modules.task_orchestrator import (
     ACTION_CLARIFICATION,
     ACTION_MISSING_CAPABILITY,
     NexusTaskOrchestrator,
+    TaskOrchestratorError,
 )
 
 TASK = "fix github issue #196"
@@ -743,3 +744,119 @@ class ControllerPromptOrderTests(unittest.TestCase):
             prompt.index("OBSERVATIONS FROM TOOLS USED IN THIS RUN:"),
             prompt.index("Decide the next step now."),
         )
+
+
+class RejectedToolCallTests(unittest.TestCase):
+    """A tool that refuses a call must not end the task.
+
+    The #218 run on the VM reasoned its way to `github_issue` for "fix github
+    issue #196" - the right capability - then called it with an issue number
+    the registry rejected. `OperationValidationError` escaped through
+    `_execute_tool` and killed the run with a traceback, losing every
+    observation gathered before it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    class _RejectingRegistry(_SpyRegistry):
+        def execute(self, operation, args, *, caller):
+            from modules.operations_registry import OperationValidationError
+
+            self.calls.append((operation, dict(args), caller))
+            raise OperationValidationError(
+                "issue_number muss eine positive ganze Zahl sein."
+            )
+
+    def test_a_rejected_argument_becomes_an_observation(self):
+        registry = self._RejectingRegistry(
+            str(Path(self.tmp.name) / "state.db"), self.tmp.name
+        )
+        client = _Client([
+            _controller_find_tool(INSPECT_GOAL, SHELL_REASON),
+            '{"status":"found","operation":"git_status","reason":"fits","related_tools":[]}',
+            '{"action":"call_tool","tool":"git_status","arguments":{"issue_number":"abc"},'
+            '"reason":"inspect"}',
+            '{"action":"answer","message":"could not read it","reason":"done"}',
+        ])
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=registry,
+            experiment_service=_ExperimentService(),
+            llama_client=client,
+        )
+        try:
+            result = orchestrator.run(
+                TASK, source_type="task", source_id="issue-218-rejected-call"
+            )
+        finally:
+            orchestrator.close()
+
+        # The run finished on a decision, not on a traceback.
+        self.assertEqual(result.action, ACTION_ANSWER)
+        rejected = [
+            observation for observation in result.observations
+            if observation.get("error") == "invalid_tool_request"
+        ]
+        # Both paths that can run an operation - the auto-execution after a
+        # resolution, and an explicit call_tool - report the refusal the same
+        # way. The controller should not have to recognise two spellings of
+        # one answer depending on which path ran it.
+        self.assertEqual(len(rejected), 2)
+        for observation in rejected:
+            with self.subTest(tool=observation.get("tool")):
+                self.assertIn("positive ganze Zahl", observation["reason"])
+                self.assertIn("correct the arguments", observation["recovery"])
+
+    def test_a_sandbox_boundary_still_stops_the_run(self):
+        # The narrow scope matters: python_run refusing a working directory
+        # outside the repository is a boundary being tested, not an argument
+        # being corrected, and must not be softened into "try again".
+        registry = _SpyRegistry(str(Path(self.tmp.name) / "boundary.db"), self.tmp.name)
+        client = _Client([
+            '{"action":"python_run","script":"agent.py","cwd":"../elsewhere",'
+            '"reason":"escape"}',
+        ])
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=registry,
+            experiment_service=_ExperimentService(),
+            llama_client=client,
+        )
+        try:
+            with self.assertRaises(TaskOrchestratorError):
+                orchestrator.run(
+                    "Run outside the repository",
+                    source_type="task",
+                    source_id="issue-218-boundary",
+                )
+        finally:
+            orchestrator.close()
+
+    def test_the_router_reports_a_rejected_argument_as_a_caller_error(self):
+        from modules.nexus_tool_router import (
+            InMemoryToolGrantLedger,
+            NexusToolRouter,
+            ToolRouterError,
+        )
+
+        registry = self._RejectingRegistry(
+            str(Path(self.tmp.name) / "router.db"), self.tmp.name
+        )
+        ledger = InMemoryToolGrantLedger()
+        ledger.record_grant(
+            "s1",
+            {
+                "status": "found",
+                "operation": {"operation": "git_status", "description": "d", "arguments": []},
+            },
+        )
+        router = NexusToolRouter(
+            operations_registry=registry,
+            schema_completion=lambda *a, **k: None,
+            grant_ledger=ledger,
+        )
+        with self.assertRaises(ToolRouterError) as caught:
+            router.execute_operation(
+                {"operation": "git_status", "args": {}, "session_id": "s1"}
+            )
+        self.assertIn("positive ganze Zahl", str(caught.exception))

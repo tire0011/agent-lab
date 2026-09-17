@@ -113,3 +113,50 @@ class LocalModelSchemaCheckOperationTests(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertIn("UNDETERMINED", "\n".join(result.output_lines))
+
+
+class PromptJsonTests(unittest.TestCase):
+    """Empty values are dropped on the way into a prompt, and only there."""
+
+    def test_nulls_and_empty_containers_are_dropped(self):
+        from modules.prompt_budget import prompt_json
+
+        rendered = prompt_json(
+            {"operation": "git_status", "arguments": [], "default": None, "tags": {}}
+        )
+        self.assertEqual(rendered, '{"operation":"git_status"}')
+
+    def test_false_and_zero_are_values_not_emptiness(self):
+        # `retryable: false` is the whole point of a terminal not_found, and a
+        # `minimum: 0` is a real bound. Dropping either would change meaning.
+        from modules.prompt_budget import prompt_json
+
+        rendered = prompt_json({"retryable": False, "minimum": 0, "name": ""})
+        self.assertIn('"retryable":false', rendered)
+        self.assertIn('"minimum":0', rendered)
+        self.assertIn('"name":""', rendered)
+
+    def test_the_observation_itself_is_not_modified(self):
+        # An observation that loses a key between being recorded and being read
+        # is a different kind of bug; this only affects rendering.
+        from modules.prompt_budget import prompt_json
+
+        observation = {"tool": "find_tool", "direct_capabilities": [], "error": None}
+        prompt_json(observation)
+        self.assertEqual(
+            observation, {"tool": "find_tool", "direct_capabilities": [], "error": None}
+        )
+
+    def test_the_catalog_response_shape_is_untouched(self):
+        # OperationSpec.to_dict also answers GET /operations/catalog, where a
+        # stable shape is the contract.
+        from types import SimpleNamespace
+
+        from modules.operations_registry import OperationsRegistry
+
+        registry = OperationsRegistry(
+            experiment_service=SimpleNamespace(resolve_experiment=lambda i: None)
+        )
+        spec = {s.name: s for s in registry.catalog()}["git_status"]
+        self.assertEqual(spec.to_dict()["arguments"], [])
+        self.assertIn("mutates_state", spec.to_dict())

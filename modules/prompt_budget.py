@@ -243,6 +243,34 @@ def truncate_text(text: str, max_chars: int, *, note: str = "truncated") -> tupl
     return f"{text[:keep]}{marker}", True
 
 
+def prompt_json(value: Any) -> str:
+    """Serialise for a model prompt, without the parts that carry no meaning.
+
+    ``"arguments":[]``, ``"default":null`` and ``"maximum":null`` say exactly
+    what their absence says, and on a host processing about seven tokens per
+    second every one of them is paid for in wall-clock time.
+
+    Applied only when rendering a prompt, never to the observation or the
+    catalog itself: ``OperationSpec.to_dict`` also answers
+    ``GET /operations/catalog``, where a stable shape is the contract, and an
+    observation that loses a key between being recorded and being read is a
+    different kind of bug entirely.
+    """
+    return json.dumps(_without_empties(value), separators=(",", ":"))
+
+
+def _without_empties(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_empties(item)
+            for key, item in value.items()
+            if item is not None and item != [] and item != {}
+        }
+    if isinstance(value, list):
+        return [_without_empties(item) for item in value]
+    return value
+
+
 def compact_observations(
     observations: list[dict[str, Any]],
     *,

@@ -75,6 +75,7 @@ from modules.prompt_budget import (
     compact_observations,
     compute_budget,
     dedupe_nested_results,
+    prompt_json,
     read_mem_available_kb,
     read_swap_free_kb,
     read_swap_total_kb,
@@ -1404,7 +1405,7 @@ PERSISTENT TASK/DISCUSSION HISTORY:
 {json.dumps(history, separators=(',', ':'))}
 
 AVAILABLE CAPABILITIES:
-{json.dumps(self._capabilities(), separators=(',', ':'))}
+{prompt_json(self._capabilities())}
 
 Choose exactly one next step using ONE unambiguous `action` field.
 Tool discovery/execution:
@@ -1449,7 +1450,7 @@ Rules:
 - When an observation reports duplicate_tool_call, non_progressing_cycle or retry_reason_required, do not repeat it. Choose a materially different tool or a controlled final action.
 
 OBSERVATIONS FROM TOOLS USED IN THIS RUN:
-{json.dumps(observations, separators=(',', ':'))}
+{prompt_json(observations)}
 
 Decide the next step now. Return JSON only.
 """
@@ -2133,12 +2134,16 @@ Decide the next step now. Return JSON only.
         except TaskOrchestratorError as exc:
             # A refused execution is an observation about this turn, not a
             # failure of it: the model still sees why and can choose again.
+            # Same shape as a refused call_tool, `recovery` included: the
+            # controller should not have to recognise two spellings of one
+            # answer depending on which path ran the operation.
             result = {
                 "tool": "operation",
                 "operation": operation,
                 "args": dict(arguments),
                 "error": "invalid_tool_request",
                 "reason": str(exc)[:1000],
+                "recovery": "correct the arguments or choose another capability",
             }
         self.loop_guard.record_result(check.call_id, result)
         if task_logger is not None:
@@ -2161,10 +2166,35 @@ Decide the next step now. Return JSON only.
         return result
 
     def _execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
+        """Run one resolved capability, reporting a refusal rather than raising.
+
+        A capability that rejects its arguments is answering the caller:
+        "issue_number must be a positive integer" is a fact the controller can
+        act on by calling again with a real number. Raising instead ended a
+        whole Nexus task with a traceback and lost every observation gathered
+        before it (#218).
+
+        Deliberately narrower than catching every tool error. ``python_run``
+        refusing a working directory outside the repository is a boundary being
+        tested, not an argument being corrected, and that still stops the run.
+        """
         try:
             return self.tool_router.execute_operation(decision)
         except ToolRouterError as exc:
-            raise TaskOrchestratorError(str(exc)) from exc
+            operation = str(decision.get("operation", "")).strip()
+            logger.warning(
+                "operation call rejected operation=%s error=%s",
+                operation,
+                str(exc)[:500],
+            )
+            return {
+                "tool": "operation",
+                "operation": operation,
+                "args": decision.get("args") or {},
+                "error": "invalid_tool_request",
+                "reason": str(exc)[:1000],
+                "recovery": "correct the arguments or choose another capability",
+            }
 
     def _persist_final(self, session_id: str, task: str, decision: TaskDecision) -> None:
         if decision.action == ACTION_CLARIFICATION:
