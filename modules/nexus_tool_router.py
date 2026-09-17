@@ -56,8 +56,52 @@ ACTION_CALL_TOOL = "call_tool"
 # way only (orchestrator -> router); the orchestrator re-exports them.
 ACTION_RESUME_EXPERIMENT = "resume_experiment"
 ACTION_MISSING_CAPABILITY = "missing_capability"
+ACTION_COMMAND = "command"
+TOOL_PYTHON_RUN = "python_run"
+ACTION_RESOLVE_RELATED_OPERATION = "resolve_related_operation"
 
 MAX_RESOLVER_CANDIDATES = 5
+
+# How many alternatives a terminal not_found carries, and how much of each
+# description it keeps. The caller is a small local model reading this inside
+# an already-budgeted prompt, so "everything we know" would push the rest of
+# the observations out; the best few, fully described, are what it can act on.
+MAX_RELATED_OPERATIONS = 3
+MAX_RELATED_DESCRIPTION_CHARS = 300
+MAX_WHY_RELEVANT_TERMS = 5
+
+# The example a caller is pointed at when its goal was unusable. It must name
+# a capability find_tool can actually resolve: the goal that produced #218
+# ("run a shell command in the repository") was copied verbatim out of this
+# guidance and out of the controller prompt's example, and shell execution is
+# a controller-native action that the read-only OperationsRegistry will never
+# contain - so the illustration itself guaranteed a not_found.
+FIND_TOOL_GOAL_EXAMPLE = "inspect the repository status and working tree changes"
+FIND_TOOL_GOAL_GUIDANCE = (
+    f"Describe the operation you need, e.g. '{FIND_TOOL_GOAL_EXAMPLE}'."
+)
+
+# What a terminal not_found tells the caller to do instead of asking again.
+NOT_FOUND_GUIDANCE = (
+    "Do not repeat find_tool with the same goal. Choose one of related_operations "
+    "by its description and argument schema, or a listed direct capability, or "
+    "choose missing_capability when none of them can satisfy the need."
+)
+
+# A goal that asks to *run* something rather than to read a specific piece of
+# Nexus state. find_tool searches the read-only OperationsRegistry only, so it
+# can never resolve one of these - but the controller owns both natively, and
+# saying which one stops the caller searching for it a second time.
+_SHELL_GOAL_PATTERN = re.compile(
+    r"\b(shell|bash|zsh|terminal|command[- ]line)\b"
+    r"|\b(?:run|execute|invoke)\b[^.]{0,24}\bcommands?\b",
+    re.IGNORECASE,
+)
+_PYTHON_GOAL_PATTERN = re.compile(
+    r"\bpython\b[^.]{0,24}\b(script|module|code|interpreter)\b"
+    r"|\b(?:run|execute|invoke)\b[^.]{0,24}\bpython\b",
+    re.IGNORECASE,
+)
 
 TOOL_ACCURACY_UNKNOWN = "unknown"
 TOOL_ACCURACY_CORRECT = "correct"
@@ -195,7 +239,7 @@ def tokens(text: str) -> set[str]:
 def invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
     normalized = re.sub(r"[^a-z0-9]+", " ", str(goal or "").lower()).strip()
     if not normalized:
-        return True, "The goal is empty or whitespace only.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+        return True, "The goal is empty or whitespace only.", FIND_TOOL_GOAL_GUIDANCE
 
     placeholder_values = {
         "plain language capability needed",
@@ -210,22 +254,56 @@ def invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
         "tool goal",
     }
     if normalized in placeholder_values:
-        return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+        return True, "The goal is a placeholder, not a concrete capability request.", FIND_TOOL_GOAL_GUIDANCE
 
     if "plain language" in normalized or "plain-language" in normalized:
         if "capability needed" in normalized or "goal" in normalized:
-            return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+            return True, "The goal is a placeholder, not a concrete capability request.", FIND_TOOL_GOAL_GUIDANCE
     if "placeholder" in normalized or "example" in normalized:
         if "goal" in normalized or "capability" in normalized or "request" in normalized:
-            return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+            return True, "The goal is a placeholder, not a concrete capability request.", FIND_TOOL_GOAL_GUIDANCE
     if "capability needed" in normalized and ("plain" in normalized or "placeholder" in normalized or "example" in normalized):
-        return True, "The goal is a placeholder, not a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+        return True, "The goal is a placeholder, not a concrete capability request.", FIND_TOOL_GOAL_GUIDANCE
 
     generic_tokens = {"capability", "goal", "operation", "request", "tool", "task", "need", "needs"}
     goal_tokens = normalized.split()
     if len(goal_tokens) <= 2 and set(goal_tokens) <= generic_tokens:
-        return True, "The goal is too generic to describe a concrete capability request.", "Describe the operation you need, e.g. 'run a shell command in the repository'."
+        return True, "The goal is too generic to describe a concrete capability request.", FIND_TOOL_GOAL_GUIDANCE
     return False, None, None
+
+
+def controller_native_capabilities(goal: str) -> list[str]:
+    """Controller actions a goal is asking for that find_tool cannot resolve.
+
+    ``find_tool`` only ever searches the read-only OperationsRegistry, so a
+    goal about *running* a shell command or a Python script is unresolvable by
+    construction however it is worded. Naming the action that does own it turns
+    a dead end into a next step - and it is exactly the step missing from #218,
+    where the controller asked for shell execution, was told "not found", and
+    asked again.
+    """
+    text = str(goal or "")
+    native: list[str] = []
+    if _PYTHON_GOAL_PATTERN.search(text):
+        native.append(TOOL_PYTHON_RUN)
+    if _SHELL_GOAL_PATTERN.search(text):
+        native.append(ACTION_COMMAND)
+    return native
+
+
+def why_relevant(goal: str, spec: Any) -> str:
+    """Why this alternative was offered, in terms the caller can check.
+
+    Derived from the overlap the candidate scorer itself used, so the answer is
+    the real reason the operation is on the list rather than a rationalisation
+    written afterwards.
+    """
+    spec_tags = " ".join(str(tag) for tag in getattr(spec, "tags", []) or [])
+    haystack = f"{spec.name} {spec.description} {spec_tags}"
+    shared = sorted(tokens(goal) & tokens(haystack))[:MAX_WHY_RELEVANT_TERMS]
+    if shared:
+        return "Matches the requested goal on: " + ", ".join(shared) + "."
+    return "Offered by the tool resolver as one of the closest available capabilities."
 
 
 def selection_correctness(
@@ -273,7 +351,7 @@ def terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
     the caller to guess what else to do, which is how the loop in #164
     kept going. This carries the terminal lookup's alternatives back.
     """
-    return {
+    guidance: dict[str, Any] = {
         "status": "not_found",
         "retryable": False,
         "goal": str(prior.get("goal", "")),
@@ -281,11 +359,40 @@ def terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
         "related_operations": list(prior.get("related_operations") or []),
         "direct_capabilities": list(prior.get("direct_capabilities") or []),
         "recommended_next_action": prior.get("recommended_next_action"),
+        "guidance": str(prior.get("guidance") or NOT_FOUND_GUIDANCE),
         "reason": (
             "An identical find_tool lookup already returned not_found "
             "without a relevant state change."
         ),
     }
+    recommended_operation = str(prior.get("recommended_operation") or "").strip()
+    if recommended_operation:
+        guidance["recommended_operation"] = recommended_operation
+    return guidance
+
+
+def related_operation_lookup_goal(prior: dict[str, Any]) -> str:
+    """A concrete find_tool goal aimed at the alternative already offered.
+
+    The dead goal cannot be asked again, but the operation it was answered with
+    can be looked up on its own terms. Built from the descriptor the terminal
+    lookup already returned, so the redirected lookup can only ever target an
+    operation this session was actually offered.
+    """
+    operation = str(prior.get("recommended_operation") or "").strip()
+    if not operation:
+        return ""
+    descriptor = next(
+        (
+            item
+            for item in prior.get("related_operations") or []
+            if isinstance(item, dict) and str(item.get("operation", "")) == operation
+        ),
+        None,
+    )
+    description = str((descriptor or {}).get("description") or "").strip()
+    goal = f"{operation}: {description}" if description else operation
+    return goal[:1000]
 
 
 # A number the goal names must be consumed by some argument. If one is left
@@ -524,6 +631,42 @@ class NexusToolRouter:
                 resolved.append(experiment_id)
         return resolved
 
+    def related_operation_descriptors(
+        self,
+        goal: str,
+        related_operations: list[str],
+    ) -> list[dict[str, Any]]:
+        """The alternatives, described well enough to be chosen between.
+
+        A bare name is not an alternative: a small local model handed
+        ``["git_status", "git_log"]`` has nothing to compare against the goal
+        it just failed to resolve, which is why #218's controller asked the
+        same dead question again instead of picking one. The description,
+        the relevance and the argument schema all come from the registry's own
+        :class:`~modules.operations_registry.OperationSpec`, so they cannot
+        drift from what the operation actually does or actually takes - and a
+        name with no spec behind it is dropped rather than described from
+        guesswork.
+        """
+        specs = {spec.name: spec for spec in self.read_only_operation_specs()}
+        descriptors: list[dict[str, Any]] = []
+        for name in list(related_operations)[:MAX_RELATED_OPERATIONS]:
+            spec = specs.get(str(name))
+            if spec is None:
+                continue
+            descriptors.append(
+                {
+                    "operation": spec.name,
+                    "description": str(spec.description or "")[:MAX_RELATED_DESCRIPTION_CHARS],
+                    "why_relevant": why_relevant(goal, spec),
+                    "arguments": [
+                        argument.to_dict()
+                        for argument in getattr(spec, "arguments", []) or []
+                    ],
+                }
+            )
+        return descriptors
+
     def find_tool_not_found_metadata(
         self,
         task_text: str,
@@ -546,19 +689,37 @@ class NexusToolRouter:
             if len(experiment_ids) == 1 and resume_relevant
             else []
         )
+        # Read out of the goal alone. The task text describes the work, not the
+        # lookup, and "fix github issue #196" mentioning a command somewhere in
+        # its body says nothing about what this find_tool asked for.
+        native_capabilities = [
+            capability
+            for capability in controller_native_capabilities(goal)
+            if capability not in direct_capabilities
+        ]
+        direct_capabilities = direct_capabilities + native_capabilities
+        descriptors = self.related_operation_descriptors(goal or "", list(related_operations))
         if ACTION_RESUME_EXPERIMENT in direct_capabilities:
             recommended_next_action = ACTION_RESUME_EXPERIMENT
-        elif related_operations:
-            recommended_next_action = "resolve_related_operation"
+        elif descriptors:
+            recommended_next_action = ACTION_RESOLVE_RELATED_OPERATION
+        elif native_capabilities:
+            recommended_next_action = native_capabilities[0]
         else:
             recommended_next_action = ACTION_MISSING_CAPABILITY
         metadata: dict[str, Any] = {
             "retryable": False,
-            "related_operations": list(related_operations),
+            "related_operations": descriptors,
             "direct_capabilities": direct_capabilities,
             "recommended_next_action": recommended_next_action,
+            "guidance": NOT_FOUND_GUIDANCE,
         }
-        if direct_capabilities:
+        if descriptors:
+            # The single best alternative, named once. Whoever acts on
+            # ``resolve_related_operation`` must not have to re-rank the list
+            # and must not be able to pick a name that is not on it.
+            metadata["recommended_operation"] = descriptors[0]["operation"]
+        if ACTION_RESUME_EXPERIMENT in direct_capabilities:
             # The id the capability was offered for, already resolved. Whoever
             # acts on it must not have to guess which token was meant, and must
             # never re-derive it from different text.
@@ -747,7 +908,7 @@ class NexusToolRouter:
         if status == "invalid_goal":
             final_status = "invalid_goal"
             final_reason = parsed.get("error") or reason or "The goal is not a concrete capability request."
-            final_guidance = parsed.get("guidance") or "Describe the operation you need, e.g. 'run a shell command in the repository'."
+            final_guidance = parsed.get("guidance") or FIND_TOOL_GOAL_GUIDANCE
             final_error = parsed.get("error") or final_reason
         else:
             final_status = "not_found" if status == "not_found" and not resolver_unavailable else "unavailable"
@@ -756,7 +917,7 @@ class NexusToolRouter:
                 if final_status == "not_found" or resolver_unavailable
                 else f"Resolver selected unavailable operation {operation!r}."
             )
-            final_guidance = "Describe the operation you need, e.g. 'run a shell command in the repository'."
+            final_guidance = FIND_TOOL_GOAL_GUIDANCE
             final_error = None
         return {
             "tool": TOOL_FIND_TOOL,

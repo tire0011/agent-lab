@@ -370,6 +370,20 @@
   operation only when a `find_tool` result in the same session already
   returned its schema. Both rules apply to every role - a role never guesses
   a tool name, and never runs one it did not resolve.
+- A terminal `not_found` is an answer, not a dead end (#218). It carries
+  `related_operations` as descriptors built from the registry's own
+  `OperationSpec` - operation, description, why it was offered, argument
+  schema - plus `direct_capabilities` naming the controller action that owns
+  the goal when `find_tool` structurally cannot (`command`, `python_run`),
+  a `recommended_next_action`, and the single `recommended_operation` to
+  resolve next. Bounded to the best three, because the reader is a small
+  local model working inside an already-budgeted prompt.
+- If the controller asks the identical dead goal again anyway, the turn is
+  redirected to a fresh lookup naming that recommended operation rather than
+  refused. The redirect is recorded as a `find_tool_redirected` event, stays
+  an ordinary `find_tool` call, and can only target an operation this
+  session was already offered - so the loop guard still counts repeats and
+  still ends a session that has genuinely run out of alternatives.
 - Roles differ only in permission. The controller additionally has
   `command`, `python_run`, `memory_search` and `delegate`; failure analysis
   has discovery and read-only execution and nothing else, so a diagnosis

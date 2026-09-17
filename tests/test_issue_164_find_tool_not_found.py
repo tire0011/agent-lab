@@ -119,7 +119,7 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
         self.assertFalse(observation["retryable"])
         self.assertTrue(observation["state_token"])
         self.assertEqual(
-            observation["related_operations"],
+            [item["operation"] for item in observation["related_operations"]],
             ["git_status", "git_log", "git_worktrees"],
         )
         self.assertIn(ACTION_RESUME_EXPERIMENT, observation["direct_capabilities"])
@@ -170,6 +170,10 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
                     '{"status":"not_found","operation":"","reason":"no lifecycle tool",'
                     '"related_tools":["git_status"]}',
                     '{"action":"find_tool","goal":"' + goal + '","reason":"try again"}',
+                    # The repeat is redirected to the related operation, so the
+                    # resolver is asked about git_status by name (#218).
+                    '{"status":"found","operation":"git_status","reason":"named directly",'
+                    '"related_tools":[]}',
                     '{"action":"answer","message":"reviewed","reason":"done"}',
                 ],
             )
@@ -235,9 +239,13 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
 
     def test_a_repeated_terminal_lookup_still_reaches_the_loop_guard(self):
         # The pre-emption used to `continue` before loop_guard.check, so repeats
-        # were never counted and the guard could no longer stop the loop.
+        # were never counted and the guard could no longer stop the loop. The
+        # #218 redirect must not reintroduce that: it narrows the first repeat
+        # to the related operation, and once the narrowed lookup is itself
+        # terminal there is nothing left to offer and the guard takes over.
         service = _ExperimentService()
         goal = "inspect repository lifecycle state"
+        narrowed = "git_status: Show repository status"
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "state.db")
             orchestrator = self._orchestrator(
@@ -248,7 +256,10 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
                     '{"status":"not_found","operation":"","reason":"no lifecycle tool",'
                     '"related_tools":["git_status"]}',
                     '{"action":"find_tool","goal":"' + goal + '","reason":"try again"}',
-                    '{"action":"find_tool","goal":"' + goal + '","reason":"and again"}',
+                    '{"status":"not_found","operation":"","reason":"not this one either",'
+                    '"related_tools":["git_status"]}',
+                    '{"action":"find_tool","goal":"' + narrowed + '","reason":"and again"}',
+                    '{"action":"find_tool","goal":"' + narrowed + '","reason":"once more"}',
                 ],
             )
             try:
@@ -276,7 +287,10 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
         # The refused repeat still tells the controller what it can do instead.
         blocked = result.observations[-1]
         self.assertFalse(blocked["retryable"])
-        self.assertEqual(blocked["related_operations"], ["git_status"])
+        self.assertEqual(
+            [item["operation"] for item in blocked["related_operations"]],
+            ["git_status"],
+        )
         self.assertEqual(blocked["recommended_next_action"], "resolve_related_operation")
 
     def test_a_redirected_turn_is_recorded_as_the_controller_decided_it(self):
