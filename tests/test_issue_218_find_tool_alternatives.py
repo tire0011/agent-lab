@@ -714,6 +714,25 @@ class ControllerPromptOrderTests(unittest.TestCase):
             with self.subTest(section=stable):
                 self.assertLess(prompt.index(stable), observations_at)
 
+    def test_the_prompt_offers_no_goal_that_can_be_copied(self):
+        # Three runs on the VM, three times the controller used whatever
+        # concrete goal the prompt showed it - the decision example, then the
+        # capability's argument example - rather than describing what the task
+        # needed. A prompt that shows no usable goal cannot be copied from.
+        from modules.nexus_tool_router import (
+            FIND_TOOL_GOAL_EXAMPLE,
+            FIND_TOOL_GOAL_PLACEHOLDER,
+            invalid_find_tool_goal,
+        )
+
+        prompt = self._prompt()
+        self.assertNotIn(FIND_TOOL_GOAL_EXAMPLE, prompt)
+        self.assertIn(FIND_TOOL_GOAL_PLACEHOLDER, prompt)
+        # And the corrective example, shown only after a rejection, has to be a
+        # goal that actually resolves - the previous one was rejected by the
+        # resolver as too generic, so the correction led nowhere either.
+        self.assertFalse(invalid_find_tool_goal(FIND_TOOL_GOAL_EXAMPLE)[0])
+
     def test_the_closing_instruction_is_still_the_last_thing_read(self):
         # Observations last would maximise cache reuse, but a small model whose
         # final input is a wall of JSON answers in the wrong shape. The closing

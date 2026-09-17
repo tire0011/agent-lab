@@ -1265,7 +1265,11 @@ class NexusTaskOrchestrator:
                     "controller capabilities that own the goal instead; it never implements "
                     "missing tools and never resolves shell or Python execution."
                 ),
-                "arguments": {"goal": FIND_TOOL_GOAL_EXAMPLE},
+                # A description, never a usable goal. The local model copies
+                # whatever concrete goal this prompt shows it - twice over, in
+                # two different runs, with two different examples - and this
+                # was the last place still offering one (#218).
+                "arguments": {"goal": FIND_TOOL_GOAL_PLACEHOLDER},
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
             },
             {

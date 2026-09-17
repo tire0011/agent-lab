@@ -82,7 +82,12 @@ MAX_WHY_RELEVANT_TERMS = 5
 # guidance and out of the controller prompt's example, and shell execution is
 # a controller-native action that the read-only OperationsRegistry will never
 # contain - so the illustration itself guaranteed a not_found.
-FIND_TOOL_GOAL_EXAMPLE = "inspect the repository status and working tree changes"
+# Shown only *after* a goal was rejected, as the corrective example. It has to
+# be a goal the resolver actually resolves: the previous one was rejected by
+# the resolver itself as "too generic", so the correction pointed at another
+# dead end. This wording is one of the standing evaluation cases and resolves
+# to git_status.
+FIND_TOOL_GOAL_EXAMPLE = "inspect whether the Nexus repository has local changes"
 # What the controller prompt shows in its place. The small local model copies
 # the example goal verbatim - it did so with the old one, and it did so again
 # with this one, which the resolver then rejected as too generic after a
@@ -261,6 +266,7 @@ def invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
 
     placeholder_values = {
         "the concrete capability this task needs",
+        "one concrete capability this task needs in your own words",
         "plain language capability needed",
         "plain-language capability needed",
         "capability needed",
