@@ -13,7 +13,10 @@ The failure signature is:
 * ``find_tool`` resolved more than once for the identical goal, or
 * the task ended because the loop guard stopped it.
 
-Either one exits non-zero.
+Either one exits 1. A run that never reached ``find_tool`` at all - because
+llama-server was unreachable, or because the controller went straight to a
+final action - exits 2: it verified nothing, and reporting that as a pass
+would be the same mistake as trusting a test that never ran.
 
 This is a real controller turn, so the controller may run read-only
 operations and shell commands exactly as it would for any task. It writes to
@@ -165,6 +168,19 @@ def main() -> int:
         for failure in failures:
             print(f"FAIL: {failure}")
         return 1
+
+    # A run that never got as far as find_tool proves nothing about the path
+    # this check exists to exercise, and must not be reported as a pass.
+    if not resolved_goals:
+        print("INCONCLUSIVE: the controller never reached find_tool, so nothing was verified")
+        if "local inference failed" in result.reason:
+            print("  local inference failed - is llama-server running?")
+            print("    systemctl status llama-server --no-pager")
+            print("    journalctl -u llama-server -n 50 --no-pager")
+        else:
+            print(f"  it went straight to {result.action}: {result.reason}")
+            print("  try a larger --max-steps, or a --task that needs a capability lookup")
+        return 2
 
     if guard_events:
         # Refused but recovered from: worth seeing, not a failure by itself.

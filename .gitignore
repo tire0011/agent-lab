@@ -12,3 +12,7 @@ state/experiment-logs/*.lock
 # Per-test verification logs and heartbeats (#209): one file per run,
 # written next to the experiment logs but never part of the repository.
 state/experiment-logs/test-runs/
+# Structured requirements written by a missing_capability decision. Runtime
+# output of whichever controller turn produced it - including a local
+# scripts/check_issue_218_find_tool.py run - never repository content.
+state/requirements/*.json
