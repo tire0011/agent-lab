@@ -142,14 +142,25 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if result.status == "busy":
-        logger.error("Another mailbox processor is running; exiting")
-        return 1
+        # Lock contention is the timer doing its job, not a failure: the
+        # processor that holds the lock rescans the inbox before exiting, so
+        # this invocation has nothing to do.  Exiting non-zero here made
+        # systemd report "Failed to start Nexus mailbox processor" for a
+        # perfectly healthy mailbox.
+        logger.info("Mailbox poll skipped: another processor is already running")
+        return 0
     if result.status == "dirty_worktree":
         logger.error("Working tree is dirty; refusing mailbox processing")
         return 1
     if result.status == "pull_failed":
         logger.error("git pull --ff-only failed; refusing mailbox processing")
         return 1
+    if result.status == "sync_failed":
+        # Reported below rather than here: a sync that failed partway through
+        # the drain still leaves completed messages worth logging.  Unlike a
+        # held lock, this one is a real fault - the mailbox checkout is out of
+        # step with its remote, so messages are not being delivered.
+        logger.error("Mailbox sync with the remote failed; remaining work is left for the next run")
     if result.status == "error":
         logger.error("Mailbox processing failed: %s", sanitized_reason(result.error) or "unknown")
         return 1
@@ -178,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         "Processed %d message(s): %d done, %d failed, %d skipped",
         len(result.results), done, failed, skipped,
     )
-    return 0
+    return 1 if result.status == "sync_failed" else 0
 
 
 if __name__ == "__main__":

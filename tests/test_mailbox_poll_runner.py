@@ -99,7 +99,10 @@ class _FakeMailboxProcessor:
     def ensure_clean_worktree(self) -> bool:
         return True
 
-    def process_inbox(self) -> list[dict[str, str]]:
+    def list_inbox_files(self) -> list[Path]:
+        return []
+
+    def process_inbox(self, files: list[Path] | None = None) -> list[dict[str, str]]:
         return [{"status": "done"}]
 
     def close(self) -> None:

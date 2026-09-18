@@ -555,6 +555,45 @@ Decision log for architecture and operating choices.
   longer than the stale timeout. The fix there is a per-phase timeout, not
   dropping the derivation.
 
+### D-024: The mailbox inbox is the queue, and lock contention is not a failure
+
+- Status: Accepted
+- Why: The mailbox processor is a `Type=oneshot` unit on a one-minute timer
+  guarded by a single-process lock. A timer invocation that started while
+  another processor was working returned `busy` and exited 1, so systemd
+  recorded `Failed to start Nexus mailbox processor` for a mailbox that was
+  perfectly healthy and actively being drained. Worse, that exit lost work: a
+  message that arrived while a processor was running had no one to pick it up —
+  the invocation that would have seen it could not take the lock, and the
+  active processor had already listed the inbox.
+- Decision: `busy` is a successful outcome. The CLI and the webhook path log
+  that another processor is already running and exit 0; only real faults
+  (dirty worktree, failed sync with the remote, processing error) exit
+  non-zero. A sync that fails partway through the drain is one of those
+  faults, not a quiet early stop: the completed batches are still reported,
+  but the run's status is `sync_failed`, the same as an initial sync failure.
+  Anything else would let a mailbox checkout that is out of step with its
+  remote — so not delivering messages at all — exit as a clean poll.
+- The processor that owns the lock is therefore the only one that can notice
+  new work, so it re-scans the inbox after each batch and keeps going until a
+  scan turns up nothing new. The inbox stays the queue: no pending-work flag,
+  no second queue, nothing to keep in sync with the files that are already the
+  source of truth. Each pass resyncs the mailbox checkout first, because new
+  messages reach this worker as commits, not as local writes.
+- Only files no earlier pass has seen are processed again. A message left in
+  the inbox deliberately — deferred, awaiting a retry, or out of retries — must
+  not be re-run within the same invocation, or the drain would spin on it and
+  burn its retry budget in seconds.
+- The loop is bounded (`MailboxDrainLimits` in `modules/mailbox/config.py`:
+  5 passes, 60 s, both overridable by environment variable), because continuous
+  inbox traffic would otherwise pin one worker forever. Both bounds are checked
+  *between* passes, never inside one, so the batch in flight always finishes
+  and whatever is left is simply still in the inbox when the next timer run
+  starts. Hitting a bound is logged and still exits 0.
+- Evidence: `tests/test_mailbox_drain.py`.
+- Revisit if: a single message's processing routinely outruns the timer period.
+  The fix there is bounding per-message work, not removing the drain.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

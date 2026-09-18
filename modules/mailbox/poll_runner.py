@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from modules.central_logging import DEFAULT_LOG_DIR
-from .config import MailboxConfig
+from .config import MailboxConfig, MailboxDrainLimits
 
 
 logger = logging.getLogger(__name__)
@@ -228,12 +230,119 @@ def _sync_mailbox_repo(
     return False
 
 
+@dataclass
+class _DrainOutcome:
+    """What a drain loop produced, and whether it ended on a fault.
+
+    Work already finished is kept in ``results`` whatever ended the loop, but
+    the reason still has to reach the caller: reaching a drain bound is a
+    normal, successful stop, while a resync that failed mid-drain is the same
+    real fault the initial sync reports as ``sync_failed``.  Returning results
+    alone would let a broken mailbox checkout exit as a clean poll.
+    """
+
+    results: list[dict[str, Any]]
+    status: str = "processed"
+
+
+def _drain_inbox(
+    *,
+    processor: Any,
+    mailbox_module: Any,
+    dry_run: bool,
+    limits: MailboxDrainLimits,
+    resync: Callable[[], bool] | None,
+    run_name: str,
+) -> _DrainOutcome:
+    """Process the inbox, then keep re-scanning it until no new work appears.
+
+    The inbox is the queue.  A timer invocation that finds the lock held does
+    no work at all, so the processor holding the lock is the only one that can
+    notice a message which arrived while it was busy - hence the rescan instead
+    of a second queue or a pending-work flag.
+
+    Only files that no earlier pass has seen are processed again.  A message
+    left in the inbox on purpose - deferred, awaiting a retry, or out of
+    retries - therefore waits for a later invocation rather than being re-run
+    in a tight loop.
+
+    ``resync`` refreshes the mailbox checkout between passes; new inbox
+    messages reach this worker as commits, so without it a rescan could only
+    ever see what was already on disk.  A failed resync ends the drain and is
+    reported as ``sync_failed``: the work already done stands, but the run is
+    a fault, not a clean poll.
+
+    ``limits`` bounds the loop so continuous inbox traffic cannot keep one
+    worker running forever.  Both bounds are checked between passes, never
+    inside one, so the batch in flight always finishes before the worker stops.
+    """
+    started = time.monotonic()
+
+    # Snapshot before processing: a message that lands between this scan and
+    # the processor's own scan is then merely rescanned (and skipped as already
+    # done) instead of being missed for a whole timer period.
+    seen = {str(path) for path in processor.list_inbox_files()}
+    results = _finalize_terminal_validation_errors(
+        processor=processor,
+        results=processor.process_inbox(),
+        mailbox_module=mailbox_module,
+        dry_run=dry_run,
+    )
+
+    passes = 1
+    status = "processed"
+    while True:
+        if resync is not None and not resync():
+            logger.warning("Mailbox drain stopped run=%s reason=sync_failed pass=%d", run_name, passes)
+            status = "sync_failed"
+            break
+
+        new_files = [path for path in processor.list_inbox_files() if str(path) not in seen]
+        if not new_files:
+            break
+
+        if passes >= limits.max_passes:
+            logger.info(
+                "Mailbox drain stopped run=%s reason=max_passes passes=%d remaining=%d",
+                run_name,
+                passes,
+                len(new_files),
+            )
+            break
+        elapsed = time.monotonic() - started
+        if elapsed >= limits.max_seconds:
+            logger.info(
+                "Mailbox drain stopped run=%s reason=max_seconds elapsed=%.1f remaining=%d",
+                run_name,
+                elapsed,
+                len(new_files),
+            )
+            break
+
+        seen.update(str(path) for path in new_files)
+        passes += 1
+        logger.info(
+            "Mailbox drain pass run=%s pass=%d new=%d", run_name, passes, len(new_files)
+        )
+        results.extend(
+            _finalize_terminal_validation_errors(
+                processor=processor,
+                results=processor.process_inbox(new_files),
+                mailbox_module=mailbox_module,
+                dry_run=dry_run,
+            )
+        )
+
+    return _DrainOutcome(results=results, status=status)
+
+
 def run_mailbox_poll_once(
     *,
     db_path: str,
     mailbox_config: MailboxConfig,
     lock_path: Path,
     dry_run: bool,
+    drain_limits: MailboxDrainLimits | None = None,
 ) -> MailboxPollRunResult:
     from modules.experiment_service import ExperimentService
     from modules import mailbox as mailbox_module
@@ -245,6 +354,7 @@ def run_mailbox_poll_once(
     from modules.outbox_publisher import FailureAnalysisOutboxPublisher, TaskApprovalOutboxPublisher
 
     run_name = threading.current_thread().name
+    limits = drain_limits if drain_limits is not None else MailboxDrainLimits.from_env()
     logger.info("Mailbox poll start run=%s dry_run=%s", run_name, dry_run)
 
     # Register unrestricted mailbox commands before any inbox file is parsed.
@@ -254,7 +364,13 @@ def run_mailbox_poll_once(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = MailboxLock(lock_path)
     if not lock.acquire():
-        logger.warning("Mailbox poll skipped run=%s reason=busy", run_name)
+        # Normal contention, not a fault: the processor that owns the lock
+        # rescans the inbox before it exits, so whatever triggered this run is
+        # still picked up.  Callers translate `busy` into a successful exit.
+        logger.info(
+            "Mailbox poll skipped run=%s reason=busy: another processor is already running",
+            run_name,
+        )
         return MailboxPollRunResult(status="busy")
 
     result = MailboxPollRunResult(status="error", error="unknown mailbox processing failure")
@@ -336,33 +452,51 @@ def run_mailbox_poll_once(
             ):
                 result = MailboxPollRunResult(status="sync_failed")
             else:
-                results = _finalize_terminal_validation_errors(
+                outcome = _drain_inbox(
                     processor=processor,
-                    results=processor.process_inbox(),
                     mailbox_module=mailbox_module,
                     dry_run=False,
+                    limits=limits,
+                    resync=lambda: _sync_mailbox_repo(
+                        mailbox_module,
+                        mailbox_config.mailbox_repo_path,
+                        ignored_untracked_prefixes=ignored_untracked,
+                    ),
+                    run_name=run_name,
                 )
                 logger.info(
-                    "Mailbox poll processed run=%s count=%d results=%s",
+                    "Mailbox poll processed run=%s status=%s count=%d results=%s",
                     run_name,
-                    len(results),
-                    _safe_result_summary(results),
+                    outcome.status,
+                    len(outcome.results),
+                    _safe_result_summary(outcome.results),
                 )
-                result = MailboxPollRunResult(status="processed", results=results)
+                # A resync that failed mid-drain keeps the completed work but
+                # still reports the fault, exactly as the initial sync does.
+                result = MailboxPollRunResult(
+                    status=outcome.status, results=outcome.results
+                )
         else:
-            results = _finalize_terminal_validation_errors(
+            # A dry run touches neither git nor the inbox, so there is nothing
+            # to resync between passes; the rescan still catches a message that
+            # lands while this run is working.
+            outcome = _drain_inbox(
                 processor=processor,
-                results=processor.process_inbox(),
                 mailbox_module=mailbox_module,
                 dry_run=True,
+                limits=limits,
+                resync=None,
+                run_name=run_name,
             )
             logger.info(
                 "Mailbox poll processed run=%s count=%d results=%s",
                 run_name,
-                len(results),
-                _safe_result_summary(results),
+                len(outcome.results),
+                _safe_result_summary(outcome.results),
             )
-            result = MailboxPollRunResult(status="processed", results=results)
+            result = MailboxPollRunResult(
+                status=outcome.status, results=outcome.results
+            )
     except Exception as exc:
         logger.error("Mailbox poll exception run=%s type=%s", run_name, type(exc).__name__)
         result = MailboxPollRunResult(status="error", error=str(exc))

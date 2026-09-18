@@ -475,7 +475,9 @@ def _run_mailbox_poll_once_for_webhook() -> None:
         dry_run=False,
     )
     if result.status == "busy":
-        _logger.warning("mailbox_webhook busy")
+        # The active processor rescans the inbox before releasing the lock, so
+        # the message this webhook announced is still picked up.
+        _logger.info("mailbox_webhook busy: another processor is already running")
         return
     if result.status == "processed":
         _logger.info("mailbox_webhook accepted")
@@ -485,6 +487,9 @@ def _run_mailbox_poll_once_for_webhook() -> None:
         return
     if result.status == "pull_failed":
         _logger.error("mailbox_webhook failed reason=pull_failed")
+        return
+    if result.status == "sync_failed":
+        _logger.error("mailbox_webhook failed reason=sync_failed count=%d", len(result.results))
         return
     if result.status == "error":
         _logger.error("mailbox_webhook failed reason=%s", _sanitized_reason(result.error) or "unknown")

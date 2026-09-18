@@ -226,6 +226,42 @@ Runtime state now defaults outside the Git worktree:
 - SQLite DB: `/var/lib/nexus/agent.db`
 - Mailbox lock: `/var/lib/nexus/mailbox.lock`
 
+### Lock contention and inbox drain
+
+Only one processor works the mailbox at a time. A timer invocation that finds
+the lock already held logs
+
+```
+Mailbox poll skipped: another processor is already running
+```
+
+and **exits 0**, so normal contention never shows up as
+`Failed to start Nexus mailbox processor`.
+
+Nothing is lost by that early exit: the processor holding the lock re-scans the
+inbox after each batch and keeps processing whatever arrived while it was busy,
+until the inbox has no new messages. The inbox itself is the queue — there is no
+separate pending-work flag.
+
+The drain loop is bounded so continuous traffic cannot pin one worker forever.
+Both bounds are checked *between* passes, so a batch in flight always finishes;
+whatever is left stays in the inbox for the next timer run.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AGENT_MAILBOX_DRAIN_MAX_PASSES` | `5` | Processing passes per invocation, including the first |
+| `AGENT_MAILBOX_DRAIN_MAX_SECONDS` | `60` | How long a worker may keep starting new passes |
+
+Reaching either bound is logged (`Mailbox drain stopped ... reason=max_passes`
+or `reason=max_seconds`) and still exits 0. Defaults are defined in
+`modules/mailbox/config.py` (`MailboxDrainLimits`).
+
+A failed resync is different: it ends the drain, keeps and reports the work
+already committed, and the run exits **non-zero** with status `sync_failed`.
+Unlike a held lock, that means the checkout is out of step with its remote and
+messages are not being delivered — check the mailbox repo and network before
+assuming the next timer run will recover.
+
 ### Service unit (`deploy/nexus-mailbox.service`)
 
 ```
