@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from modules.operations_registry import OperationValidationError, OperationsRegistry
+from modules.nexus_tool_router import bind_resolved_arguments
+from modules.operations_registry import OperationArgSpec, OperationValidationError, OperationsRegistry
 
 
 class _IssueService:
@@ -89,6 +90,21 @@ class IntegerArgumentCoercionTests(unittest.TestCase):
     def test_unrelated_argument_types_keep_existing_strict_validation(self):
         with self.assertRaises(OperationValidationError):
             self.registry.execute("nexus_status", {"reference": 196})
+
+    def test_resolver_path_rejects_ambiguous_signs_without_raising(self):
+        spec = SimpleNamespace(arguments=[
+            OperationArgSpec("issue_number", "integer", "GitHub issue.", required=True, minimum=1)
+        ])
+
+        for value in ("+-5", "--5", "1" * 5000):
+            with self.subTest(value=value):
+                bound, error = bind_resolved_arguments(
+                    "read github issue 5",
+                    spec,
+                    {"issue_number": value},
+                )
+                self.assertIsNone(bound)
+                self.assertTrue(error)
 
 
 if __name__ == "__main__":
