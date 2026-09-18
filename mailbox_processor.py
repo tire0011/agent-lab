@@ -142,8 +142,13 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if result.status == "busy":
-        logger.error("Another mailbox processor is running; exiting")
-        return 1
+        # Lock contention is the timer doing its job, not a failure: the
+        # processor that holds the lock rescans the inbox before exiting, so
+        # this invocation has nothing to do.  Exiting non-zero here made
+        # systemd report "Failed to start Nexus mailbox processor" for a
+        # perfectly healthy mailbox.
+        logger.info("Mailbox poll skipped: another processor is already running")
+        return 0
     if result.status == "dirty_worktree":
         logger.error("Working tree is dirty; refusing mailbox processing")
         return 1

@@ -37,7 +37,14 @@ them.
 
 - Files over 64 KB, binary files, symlinks, path traversals, unknown types, and files containing secrets (e.g. `sk-`, `API_KEY=`) are rejected.
 - Maximum 3 retries per message.
-- Single-process lock prevents concurrent runs.
+- Single-process lock prevents concurrent runs. A run that finds the lock held
+  logs `Mailbox poll skipped: another processor is already running` and exits
+  successfully — the processor that holds the lock re-scans the inbox after
+  every batch, so a message that arrives mid-run is handled by that same worker
+  instead of waiting for the next poll. The drain is bounded by
+  `AGENT_MAILBOX_DRAIN_MAX_PASSES` (default `5`) and
+  `AGENT_MAILBOX_DRAIN_MAX_SECONDS` (default `60`); anything left over stays in
+  the inbox for the next poll. See `OPERATIONS.md`.
 
 **Run manually:**
 

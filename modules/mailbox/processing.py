@@ -474,12 +474,28 @@ class MailboxProcessor:
             else:
                 self._finalize_git_commit(msg)
 
-    def process_inbox(self) -> list[dict[str, Any]]:
-        files = self._get_inbox_files()
+    def process_inbox(self, files: list[Path] | None = None) -> list[dict[str, Any]]:
+        """Process inbox messages, by default every message currently present.
+
+        ``files`` restricts the run to an explicit batch.  The inbox drain loop
+        uses it to process only the messages that arrived after an earlier
+        pass, so a message deliberately left behind — deferred, awaiting a
+        retry, or out of retries — is not re-run within the same invocation.
+        """
+        if files is None:
+            files = self._get_inbox_files()
         results = []
         for f in files:
             results.append(self._process_file(f))
         return results
+
+    def list_inbox_files(self) -> list[Path]:
+        """Inbox messages currently on disk, oldest first.
+
+        Public so a caller can compare two scans of the queue without reaching
+        into the processor internals.
+        """
+        return self._get_inbox_files()
 
     def _get_inbox_files(self) -> list[Path]:
         if not self.inbox.exists():
