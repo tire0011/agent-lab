@@ -67,9 +67,15 @@ class IntegerArgumentCoercionTests(unittest.TestCase):
         self.assertEqual(self.issue_service.calls, [])
 
     def test_invalid_integer_strings_are_rejected(self):
-        for value in ("abc", "1.5", "196x", ""):
+        for value in ("abc", "1.5", "196x", "", "+-5", "--5"):
             with self.subTest(value=value), self.assertRaises(OperationValidationError):
                 self.registry.execute("github_issue", {"issue_number": value})
+
+        self.assertEqual(self.issue_service.calls, [])
+
+    def test_extremely_long_integer_string_is_validation_error(self):
+        with self.assertRaises(OperationValidationError):
+            self.registry.execute("github_issue", {"issue_number": "1" * 5000})
 
         self.assertEqual(self.issue_service.calls, [])
 
