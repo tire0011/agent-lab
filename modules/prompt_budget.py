@@ -243,6 +243,34 @@ def truncate_text(text: str, max_chars: int, *, note: str = "truncated") -> tupl
     return f"{text[:keep]}{marker}", True
 
 
+def prompt_json(value: Any) -> str:
+    """Serialise for a model prompt, without the parts that carry no meaning.
+
+    ``"arguments":[]``, ``"default":null`` and ``"maximum":null`` say exactly
+    what their absence says, and on a host processing about seven tokens per
+    second every one of them is paid for in wall-clock time.
+
+    Applied only when rendering a prompt, never to the observation or the
+    catalog itself: ``OperationSpec.to_dict`` also answers
+    ``GET /operations/catalog``, where a stable shape is the contract, and an
+    observation that loses a key between being recorded and being read is a
+    different kind of bug entirely.
+    """
+    return json.dumps(_without_empties(value), separators=(",", ":"))
+
+
+def _without_empties(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_empties(item)
+            for key, item in value.items()
+            if item is not None and item != [] and item != {}
+        }
+    if isinstance(value, list):
+        return [_without_empties(item) for item in value]
+    return value
+
+
 def compact_observations(
     observations: list[dict[str, Any]],
     *,
@@ -303,6 +331,31 @@ def compact_observations(
     return [item for item in result if item is not None], sorted(omitted)
 
 
+# What a next decision depends on, kept even when the body is dropped.
+#
+# A stub saying only "a find_tool happened here" cannot stop the controller
+# asking the identical question again: the rule it has to follow is about
+# *that exact goal*, and the goal was the first thing compacted away. On a
+# small box the observation budget collapses to a few hundred characters, so
+# every observation becomes a stub and the controller decides each turn with
+# no memory of what it just did - which is how a session resolved git_status,
+# ran it, and then asked for it twice more (#218).
+#
+# These fields are tens of characters. The body is what is expensive.
+_STUB_IDENTITY_FIELDS = (
+    "goal",
+    "status",
+    "retryable",
+    "resolved_tool",
+    "operation",
+    "recommended_next_action",
+    "recommended_operation",
+    "already_resolved_operation",
+    "event",
+)
+_STUB_FIELD_CHARS = 200
+
+
 def _stub(obs: dict[str, Any]) -> dict[str, Any]:
     serialized = json.dumps(obs, separators=(",", ":"))
     stub: dict[str, Any] = {
@@ -310,6 +363,20 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
         "truncated": True,
         "original_chars": len(serialized),
     }
+    for field in _STUB_IDENTITY_FIELDS:
+        if field not in obs:
+            continue
+        value = obs[field]
+        if isinstance(value, str):
+            value = value[:_STUB_FIELD_CHARS]
+        elif isinstance(value, dict):
+            # `operation` is a full schema on a found result; its name is the
+            # part a decision needs.
+            value = str(value.get("operation", ""))[:_STUB_FIELD_CHARS] or None
+        elif not isinstance(value, (bool, int, float, type(None))):
+            continue
+        if value is not None:
+            stub[field] = value
     event_id = obs.get("event_id")
     if event_id is not None:
         stub["event_id"] = event_id

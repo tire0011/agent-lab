@@ -216,6 +216,20 @@ class OperationsRegistry:
             "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo.", tags=["memory", "ram", "host", "usage"], mutates_state=False),
             "mailbox_status": OperationSpec("mailbox_status", "Status des Nexus-Mailbox-Service und -Timers.", tags=["mailbox", "status", "timer", "service"], mutates_state=False),
             "local_model_status": OperationSpec("local_model_status", "Status und Modellliste des lokalen llama.cpp-Servers.", tags=["local model", "llama", "llm", "server", "models"], mutates_state=False),
+            "local_model_schema_check": OperationSpec(
+                "local_model_schema_check",
+                "Prüft, ob der lokale Modellserver die JSON-Schemas von Nexus "
+                "tatsächlich erzwingt. Ein ignoriertes Schema ist unsichtbar - es "
+                "sieht aus wie ein Modell, das zufällig richtig antwortet - und "
+                "führt dazu, dass eine korrekte Tool-Auswahl verworfen wird (#218). "
+                "Kostet zwei echte Modellaufrufe und dauert daher Minuten.",
+                tags=[
+                    "local model", "llama", "llm", "schema", "json schema",
+                    "response format", "grammar", "constraint", "enforcement",
+                    "tool resolver", "diagnostics", "self check",
+                ],
+                mutates_state=False,
+            ),
             "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20], ["process", "memory", "rss", "host"], mutates_state=False),
             "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50, since_minutes], ["service", "logs", "journalctl", "systemd"], mutates_state=False),
             "nexus_logs": OperationSpec(
@@ -421,6 +435,48 @@ class OperationsRegistry:
             for entry in entries
         ]
         return OperationResult("experiment_logs", True, lines, 0)
+
+    def _op_local_model_schema_check(self, args: dict[str, Any]) -> OperationResult:
+        """Ask the model server whether it applies Nexus's own JSON schema.
+
+        Read-only in the sense that matters here: it changes no Nexus state and
+        touches no repository. It is not cheap - two real completions - but a
+        capability that silently stopped working is worth minutes to detect.
+        """
+        if args:
+            raise OperationValidationError(
+                "local_model_schema_check akzeptiert keine Argumente."
+            )
+        from modules.llm_schema_probe import SHAPE_LABELS, probe, verdict
+
+        started = time.perf_counter()
+        base_url = (
+            os.getenv("LOCAL_MODEL_URL")
+            or os.getenv("LLAMA_CPP_BASE_URL")
+            or "http://127.0.0.1:8080/v1"
+        ).rstrip("/")
+        model = (
+            os.getenv("LOCAL_MODEL_NAME")
+            or os.getenv("LLAMA_CPP_MODEL")
+            or "qwen2.5-coder-7b-instruct"
+        )
+        results = probe(base_url=base_url, model=model, timeout=180.0, nexus_only=True)
+        healthy, lines = verdict(results)
+        detail = [
+            f"{SHAPE_LABELS.get(key, key)}: {outcome} - {text}"
+            for key, outcome, text in results
+        ]
+        return OperationResult(
+            operation="local_model_schema_check",
+            success=healthy,
+            output_lines=bounded_lines(
+                redact("\n".join([f"model: {model}", *detail, "", *lines])),
+                max_lines=40,
+            ),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            exit_code=0 if healthy else 1,
+            error_summary=None if healthy else lines[0][:300],
+        )
 
     def _op_local_model_status(self, args: dict[str, Any]) -> OperationResult:
         if args:

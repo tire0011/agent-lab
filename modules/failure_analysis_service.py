@@ -63,7 +63,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from modules import central_logging
-from modules.llama_cpp_client import LlamaCppClientError, extract_json
+from modules.llama_cpp_client import (
+    LlamaCppClientError,
+    extract_json,
+    json_schema_response_format,
+)
 from modules.local_llm_jobs import (
     ROLE_FAILURE_ANALYSIS,
     LocalLlmJobError,
@@ -357,21 +361,21 @@ _TOOL_SYSTEM_PROMPT = (
     "you stop as soon as you have it or no capability can supply it."
 )
 
-_TOOL_DECISION_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "action": {"type": "string", "enum": [TOOL_FIND_TOOL, ACTION_CALL_TOOL, "done"]},
-            "goal": {"type": "string"},
-            "tool": {"type": "string"},
-            "arguments": {"type": "object", "additionalProperties": True},
-            "reason": {"type": "string"},
-        },
-        "required": ["action"],
-        "additionalProperties": False,
+_TOOL_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": [TOOL_FIND_TOOL, ACTION_CALL_TOOL, "done"]},
+        "goal": {"type": "string"},
+        "tool": {"type": "string"},
+        "arguments": {"type": "object", "additionalProperties": True},
+        "reason": {"type": "string"},
     },
+    "required": ["action"],
+    "additionalProperties": False,
 }
+_TOOL_DECISION_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
+    "failure_analysis_tool_decision", _TOOL_DECISION_SCHEMA
+)
 
 _RESPONSE_SCHEMA_HINT = """Respond with ONLY a single JSON object (no prose, no markdown fences) with this shape:
 {

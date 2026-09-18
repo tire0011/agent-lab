@@ -37,11 +37,16 @@ from modules.nexus_task_store import (
     TERMINAL_REASON_TURN_FAILED,
     NexusTaskStore,
 )
+from modules.llama_cpp_client import json_schema_response_format
 from modules.nexus_tool_router import (
     ACTION_CALL_TOOL,
+    ACTION_COMMAND,
     ACTION_MISSING_CAPABILITY,
+    ACTION_RESOLVE_RELATED_OPERATION,
     ACTION_RESUME_EXPERIMENT,
     EXPERIMENT_ID_PATTERN,
+    FIND_TOOL_GOAL_EXAMPLE,
+    FIND_TOOL_GOAL_PLACEHOLDER,
     MAX_EXPERIMENT_ID_CANDIDATES,
     MAX_RESOLVER_CANDIDATES,
     RESUME_INTENT_PATTERN,
@@ -49,12 +54,15 @@ from modules.nexus_tool_router import (
     TOOL_ACCURACY_INCORRECT,
     TOOL_ACCURACY_UNKNOWN,
     TOOL_FIND_TOOL,
+    TOOL_PYTHON_RUN,
     TOOL_RESOLVER_RESPONSE_FORMAT,
     TOOL_SEARCH_STOP_WORDS,
     NexusToolRouter,
     ToolResolverUnavailableError,
     ToolRouterError,
     invalid_find_tool_goal,
+    operation_already_resolved,
+    related_operation_lookup_goal,
     resolver_prompt,
     selection_correctness,
     terminal_not_found_guidance,
@@ -67,6 +75,7 @@ from modules.prompt_budget import (
     compact_observations,
     compute_budget,
     dedupe_nested_results,
+    prompt_json,
     read_mem_available_kb,
     read_swap_free_kb,
     read_swap_total_kb,
@@ -84,8 +93,6 @@ from modules.runtime_execution import (
 from modules.tool_loop_guard import PersistentToolLoopGuard
 
 ACTION_NEW_EXPERIMENT = "new_experiment"
-ACTION_COMMAND = "command"
-TOOL_PYTHON_RUN = "python_run"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
 
@@ -120,9 +127,7 @@ _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
     "codex_readonly": ("codex_readonly", "azure_openai", "local_worker"),
 }
 
-_ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "schema": {
+_ORCHESTRATOR_SCHEMA: dict[str, Any] = {
         "type": "object",
         "properties": {
             "action": {
@@ -175,10 +180,12 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = {
             },
             "why_human_required": {"type": "string"},
         },
-        "required": ["action"],
-        "additionalProperties": False,
-    },
+    "required": ["action"],
+    "additionalProperties": False,
 }
+_ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
+    "nexus_controller_decision", _ORCHESTRATOR_SCHEMA
+)
 
 # The shared tool mechanism owns the resolver schema, the read-only
 # boundary, candidate scoring and the not-found metadata (#172). Re-exported
@@ -636,6 +643,23 @@ class NexusTaskOrchestrator:
             resume_experiment_id = str(
                 (terminal_not_found or {}).get("resume_experiment_id") or ""
             )
+            related_goal = related_operation_lookup_goal(terminal_not_found or {})
+            if related_goal == str(decision.get("goal", "")).strip():
+                # The dead lookup already *was* the narrowed one. Redirecting it
+                # to itself would only relabel the repeat, so it goes to the loop
+                # guard unchanged - which is the point at which there really is
+                # nothing left to offer.
+                related_goal = ""
+            already_resolved = operation_already_resolved(
+                str((terminal_not_found or {}).get("recommended_operation") or ""),
+                observations,
+            )
+            if already_resolved is not None:
+                # The redirect has already done its job for this goal once. Doing
+                # it again re-asks a question this run answered, and the guard
+                # refuses that as a duplicate - the same loop, one step later.
+                # The refusal below says what was resolved instead.
+                related_goal = ""
             if terminal_not_found is not None and resume_experiment_id:
                 # The lookup is terminal and the resolver already established -
                 # against the experiment service, not against a regex - which
@@ -676,6 +700,62 @@ class NexusTaskOrchestrator:
                 }
                 action = ACTION_RESUME_EXPERIMENT
                 terminal_not_found = None
+            elif terminal_not_found is not None and related_goal:
+                # The lookup is dead but its answer was not empty: the terminal
+                # not_found already described an operation that fits. Asking for
+                # that operation by name is a different, answerable question, so
+                # the session moves on instead of spending its remaining turns
+                # re-asking the dead one until the loop guard ends it (#218).
+                recommended_operation = str(
+                    terminal_not_found.get("recommended_operation") or ""
+                )
+                turn_detail = (
+                    f"repeated terminal {TOOL_FIND_TOOL} lookup redirected to the "
+                    f"related operation {recommended_operation}"
+                )
+                logger.info(
+                    "find_tool terminal not_found redirected session_id=%s goal=%s "
+                    "next_action=%s operation=%s",
+                    session.id,
+                    str(decision.get("goal", ""))[:500],
+                    ACTION_RESOLVE_RELATED_OPERATION,
+                    recommended_operation,
+                    extra={"session_id": session.id},
+                )
+                self.task_store.append_event(
+                    session.id,
+                    role="system",
+                    kind="find_tool_redirected",
+                    content=turn_detail,
+                    metadata={
+                        "controller_action": controller_action,
+                        "controller_reason": str(decision.get("reason", ""))[:1000],
+                        "goal": str(decision.get("goal", ""))[:500],
+                        "next_action": ACTION_RESOLVE_RELATED_OPERATION,
+                        "operation": recommended_operation,
+                        "related_goal": related_goal[:500],
+                    },
+                )
+                decision = {
+                    "action": TOOL_FIND_TOOL,
+                    "goal": related_goal,
+                    "reason": (
+                        "identical find_tool lookup was terminal after not_found; "
+                        f"resolving the related operation {recommended_operation} "
+                        "it offered instead"
+                    ),
+                }
+                # Still find_tool, so the redirected lookup goes through the
+                # loop guard like any other: a second redirect to the same
+                # related goal is a duplicate and is counted as one. What the
+                # guard would then refuse is the *redirect target*, so the
+                # guidance carried into its verdict has to be that goal's own
+                # terminal not_found, not the dead goal's. Nulling it instead
+                # would hand the controller the bare "duplicate_tool_call" that
+                # #164 exists to prevent.
+                terminal_not_found = self._terminal_not_found_observation(
+                    related_goal, observations, state_token
+                )
             # One durable row per turn (#158). Which model decided this turn was
             # previously recoverable only from a log line, so the question "does
             # the local controller produce usable decisions" could not be
@@ -719,7 +799,9 @@ class NexusTaskOrchestrator:
                         # verdict actionable instead (#164).
                         observation = {
                             **observation,
-                            **self._terminal_not_found_guidance(terminal_not_found),
+                            **self._terminal_not_found_guidance(
+                                terminal_not_found, already_resolved
+                            ),
                         }
                     logger.warning(
                         "tool loop detected session_id=%s signature=%s previous_call_id=%s recovery=%s",
@@ -763,7 +845,7 @@ class NexusTaskOrchestrator:
                     )
                     if (
                         tool == TOOL_FIND_TOOL
-                        and observation.get("status") == "not_found"
+                        and observation.get("status") in {"not_found", "unavailable"}
                     ):
                         observation = dict(observation)
                         observation["state_token"] = state_token
@@ -1036,7 +1118,7 @@ class NexusTaskOrchestrator:
             "Return exactly one JSON object with no Markdown or prose.\n\n"
             f"VALIDATION ERROR:\n{str(error)[:1000]}\n\n"
             f"REQUIRED JSON SCHEMA:\n"
-            f"{json.dumps(_ORCHESTRATOR_RESPONSE_FORMAT['schema'], separators=(',', ':'))}\n\n"
+            f"{json.dumps(_ORCHESTRATOR_SCHEMA, separators=(',', ':'))}\n\n"
             f"INVALID RESPONSE:\n{raw[:6000]}"
         )
 
@@ -1097,8 +1179,11 @@ class NexusTaskOrchestrator:
         return terminal_not_found_observation(goal, observations, state_token)
 
     @staticmethod
-    def _terminal_not_found_guidance(prior: dict[str, Any]) -> dict[str, Any]:
-        return terminal_not_found_guidance(prior)
+    def _terminal_not_found_guidance(
+        prior: dict[str, Any],
+        resolved: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return terminal_not_found_guidance(prior, resolved)
 
     async def _resolve_find_tool(
         self,
@@ -1176,10 +1261,16 @@ class NexusTaskOrchestrator:
                 "description": (
                     "Resolve one needed read-only Nexus operation by goal. Returns either "
                     "one full operation schema, invalid_goal for placeholder/generic requests, "
-                    "or actionable non-retryable not_found with related operations and direct "
-                    "controller capabilities; it never implements missing tools."
+                    "or a non-retryable not_found carrying described related operations "
+                    "(operation, description, why_relevant, arguments) and the direct "
+                    "controller capabilities that own the goal instead; it never implements "
+                    "missing tools and never resolves shell or Python execution."
                 ),
-                "arguments": {"goal": "run a shell command in the repository"},
+                # A description, never a usable goal. The local model copies
+                # whatever concrete goal this prompt shows it - twice over, in
+                # two different runs, with two different examples - and this
+                # was the last place still offering one (#218).
+                "arguments": {"goal": FIND_TOOL_GOAL_PLACEHOLDER},
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
             },
             {
@@ -1283,6 +1374,24 @@ class NexusTaskOrchestrator:
         return prompt, meta
 
     def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
+        """Render one controller prompt, stable parts first.
+
+        The order is a cost decision, not a style one. llama-server reuses the
+        KV cache for the longest prefix a request shares with the previous one,
+        and stops at the first difference - so everything *after* the first
+        changed byte is recomputed. Within a run, only the observations change
+        between turns; source, input, history and the capability catalog do
+        not. With the observations in the middle, every turn re-processed them
+        *and* the whole policy/rules block behind them: measured on the VM,
+        1222 tokens at 7.18 tokens/second, about 170 seconds of the ~190 a turn
+        took (#218).
+
+        With them at the end, the reusable prefix covers the rules too, and
+        only the observations and the closing line are new. The closing
+        instruction stays last on purpose: a small model handed a wall of JSON
+        as the final thing it reads is measurably worse at answering in the
+        requested shape, and those few tokens are cheap to recompute.
+        """
         return f"""You are Nexus, the LOCAL persistent controller. You decide WHAT Nexus does next.
 You are not merely an intent classifier. Work on the request yourself when practical, use tools and memory, consult other LLMs when that is valuable, and keep control after every observation.
 
@@ -1296,14 +1405,11 @@ PERSISTENT TASK/DISCUSSION HISTORY:
 {json.dumps(history, separators=(',', ':'))}
 
 AVAILABLE CAPABILITIES:
-{json.dumps(self._capabilities(), separators=(',', ':'))}
-
-OBSERVATIONS FROM TOOLS USED IN THIS RUN:
-{json.dumps(observations, separators=(',', ':'))}
+{prompt_json(self._capabilities())}
 
 Choose exactly one next step using ONE unambiguous `action` field.
 Tool discovery/execution:
-{{"action":"find_tool","goal":"run a shell command in the repository","reason":"I need to inspect the repository state"}}
+{{"action":"find_tool","goal":"{FIND_TOOL_GOAL_PLACEHOLDER}","reason":"<why this task needs that capability>"}}
 {{"action":"call_tool","tool":"<tool returned by find_tool>","arguments":{{...}},"reason":"..."}}
 Controller-native capabilities:
 {{"action":"memory_search","query":"...","limit":6,"reason":"..."}}
@@ -1328,7 +1434,9 @@ Rules:
 - Search memory when previous project decisions, experiments, discussions or ideas may materially help; do not search mechanically.
 - Use find_tool when you need an OperationsRegistry capability that has not already been resolved in this session; then invoke only the returned identifier with call_tool. Never guess concrete tool names.
 - Name the concrete values a capability needs inside the find_tool goal ("the service_logs of llama-server"). When they can be read straight out of the goal, that operation is executed for you and its result is the next observation - do not call it again. A goal that names none, for a capability that takes some, comes back with the reason and is yours to call with explicit arguments.
-- A find_tool observation with status=not_found and retryable=false is terminal for that exact goal while state is unchanged. Never repeat the identical lookup. Prefer its direct_capabilities/recommended_next_action, resolve a more specific related operation, use command/python_run, or choose missing_capability. related_operations are suggestions only and are not call_tool grants.
+- A find_tool observation with status=not_found and retryable=false is terminal for that exact goal while state is unchanged. Never repeat the identical lookup, and never re-word it into the same request.
+- Read that observation's `related_operations` before deciding: each is a full descriptor with `operation`, `description`, `why_relevant` and the `arguments` schema. If one of those descriptions satisfies the reason you gave, resolve it with a new find_tool goal that names that operation, then call it. Otherwise follow `recommended_next_action`/`direct_capabilities`, use command/python_run, or choose missing_capability. related_operations are suggestions only and are not call_tool grants.
+- find_tool only searches read-only OperationsRegistry capabilities. Running a shell command or a Python script is never one of them: use the `command` and `python_run` actions directly instead of searching for them.
 - Prefer cheap/local reasoning and existing tools first. Delegate only when another model materially improves a difficult analysis, review or research step.
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
@@ -1340,7 +1448,11 @@ Rules:
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
 - When an observation reports duplicate_tool_call, non_progressing_cycle or retry_reason_required, do not repeat it. Choose a materially different tool or a controlled final action.
-- Return JSON only.
+
+OBSERVATIONS FROM TOOLS USED IN THIS RUN:
+{prompt_json(observations)}
+
+Decide the next step now. Return JSON only.
 """
 
     def _action_to_tool_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
@@ -2022,12 +2134,16 @@ Rules:
         except TaskOrchestratorError as exc:
             # A refused execution is an observation about this turn, not a
             # failure of it: the model still sees why and can choose again.
+            # Same shape as a refused call_tool, `recovery` included: the
+            # controller should not have to recognise two spellings of one
+            # answer depending on which path ran the operation.
             result = {
                 "tool": "operation",
                 "operation": operation,
                 "args": dict(arguments),
                 "error": "invalid_tool_request",
                 "reason": str(exc)[:1000],
+                "recovery": "correct the arguments or choose another capability",
             }
         self.loop_guard.record_result(check.call_id, result)
         if task_logger is not None:
@@ -2050,10 +2166,35 @@ Rules:
         return result
 
     def _execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
+        """Run one resolved capability, reporting a refusal rather than raising.
+
+        A capability that rejects its arguments is answering the caller:
+        "issue_number must be a positive integer" is a fact the controller can
+        act on by calling again with a real number. Raising instead ended a
+        whole Nexus task with a traceback and lost every observation gathered
+        before it (#218).
+
+        Deliberately narrower than catching every tool error. ``python_run``
+        refusing a working directory outside the repository is a boundary being
+        tested, not an argument being corrected, and that still stops the run.
+        """
         try:
             return self.tool_router.execute_operation(decision)
         except ToolRouterError as exc:
-            raise TaskOrchestratorError(str(exc)) from exc
+            operation = str(decision.get("operation", "")).strip()
+            logger.warning(
+                "operation call rejected operation=%s error=%s",
+                operation,
+                str(exc)[:500],
+            )
+            return {
+                "tool": "operation",
+                "operation": operation,
+                "args": decision.get("args") or {},
+                "error": "invalid_tool_request",
+                "reason": str(exc)[:1000],
+                "recovery": "correct the arguments or choose another capability",
+            }
 
     def _persist_final(self, session_id: str, task: str, decision: TaskDecision) -> None:
         if decision.action == ACTION_CLARIFICATION:

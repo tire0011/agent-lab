@@ -370,6 +370,40 @@
   operation only when a `find_tool` result in the same session already
   returned its schema. Both rules apply to every role - a role never guesses
   a tool name, and never runs one it did not resolve.
+- Every JSON schema Nexus sends a model goes in the OpenAI envelope,
+  `response_format.json_schema.schema`, built by
+  `llama_cpp_client.json_schema_response_format`. It used to sit one level
+  higher, where neither llama-server nor Azure OpenAI looks, so every schema
+  was silently ignored and every declared enum was only a suggestion - which
+  is how the resolver answered with a `status` outside its four values and had
+  a correct selection discarded (#218). An ignored schema is invisible until a
+  model stops complying, so the shape is pinned by a test and checkable at
+  runtime: `local_model_schema_check` is a read-only capability that asks the
+  server whether it applies Nexus's own schema, using a schema the answer
+  cannot satisfy by accident plus an unconstrained control request - without
+  which a pass would be coincidence rather than evidence.
+- A terminal `not_found` is an answer, not a dead end (#218). It carries
+  `related_operations` as descriptors built from the registry's own
+  `OperationSpec` - operation, description, why it was offered, argument
+  schema - plus `direct_capabilities` naming the controller action that owns
+  the goal when `find_tool` structurally cannot (`command`, `python_run`),
+  a `recommended_next_action`, and `guidance`. Bounded to the best three,
+  because the reader is a small local model working inside an
+  already-budgeted prompt.
+- A goal asking to *run* something is recommended the action that owns it
+  ahead of any related operation. The scorer produces candidates for such a
+  goal anyway, and answering "run the test suite" with `git_status` would be
+  right-looking evidence about the wrong subject.
+- Only when resolving a related operation really is the recommendation does
+  the response carry `recommended_operation`, and only then is a repeat of
+  the identical dead goal redirected - to a fresh lookup naming that
+  operation, rather than refused. The redirect is recorded as a
+  `find_tool_redirected` event and stays an ordinary `find_tool` call, so
+  the loop guard counts the redirected lookup like any other call and still
+  ends a session that has run out of alternatives; the dead goal's own
+  repeat is durably recorded as that event rather than as a duplicate.
+  A redirect never targets the goal it came from, and the guard's verdict on
+  a refused redirect still carries that lookup's own `not_found` guidance.
 - Roles differ only in permission. The controller additionally has
   `command`, `python_run`, `memory_search` and `delegate`; failure analysis
   has discovery and read-only execution and nothing else, so a diagnosis
