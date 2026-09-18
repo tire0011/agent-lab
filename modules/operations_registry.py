@@ -114,6 +114,36 @@ class OperationResult:
         }
 
 
+def normalize_integer_argument(spec: OperationArgSpec, value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
+    if isinstance(value, str):
+        text = value.strip()
+        digits = text[1:] if text[:1] in {"+", "-"} else text
+        if not digits or not digits.isascii() or not digits.isdigit():
+            raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
+        try:
+            value = int(text, 10)
+        except ValueError as exc:
+            raise OperationValidationError(
+                f"{spec.name} muss eine ganze Zahl sein."
+            ) from exc
+    elif not isinstance(value, int):
+        raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
+
+    if spec.minimum is not None and value < spec.minimum:
+        raise OperationValidationError(
+            f"{spec.name} muss mindestens {spec.minimum} sein."
+        )
+    if spec.maximum is not None and value > spec.maximum:
+        raise OperationValidationError(
+            f"{spec.name} darf höchstens {spec.maximum} sein."
+        )
+    return value
+
+
 class OperationsRegistry:
     def __init__(
         self,
@@ -152,30 +182,6 @@ class OperationsRegistry:
     def catalog(self) -> list[OperationSpec]:
         return [self._specs[name] for name in sorted(self._specs)]
 
-    def _normalize_integer_argument(self, spec: OperationArgSpec, value: Any) -> Any:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
-        if isinstance(value, str):
-            text = value.strip()
-            digits = text[1:] if text[:1] in {"+", "-"} else text
-            if not digits or not digits.isascii() or not digits.isdigit():
-                raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
-            value = int(text, 10)
-        elif not isinstance(value, int):
-            raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
-
-        if spec.minimum is not None and value < spec.minimum:
-            raise OperationValidationError(
-                f"{spec.name} muss mindestens {spec.minimum} sein."
-            )
-        if spec.maximum is not None and value > spec.maximum:
-            raise OperationValidationError(
-                f"{spec.name} darf höchstens {spec.maximum} sein."
-            )
-        return value
-
     def _normalize_args(self, operation: str, args: dict[str, Any]) -> dict[str, Any]:
         spec = self._specs.get(operation)
         if spec is None:
@@ -185,7 +191,7 @@ class OperationsRegistry:
         for argument in spec.arguments:
             if argument.name not in normalized or argument.type != "integer":
                 continue
-            normalized[argument.name] = self._normalize_integer_argument(
+            normalized[argument.name] = normalize_integer_argument(
                 argument,
                 normalized[argument.name],
             )
