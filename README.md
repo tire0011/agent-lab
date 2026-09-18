@@ -44,7 +44,9 @@ them.
   instead of waiting for the next poll. The drain is bounded by
   `AGENT_MAILBOX_DRAIN_MAX_PASSES` (default `5`) and
   `AGENT_MAILBOX_DRAIN_MAX_SECONDS` (default `60`); anything left over stays in
-  the inbox for the next poll. See `OPERATIONS.md`.
+  the inbox for the next poll. A failed sync with the remote is still a real
+  fault and exits non-zero, even if earlier batches succeeded. See
+  `OPERATIONS.md`.
 
 **Run manually:**
 

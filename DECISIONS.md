@@ -568,7 +568,12 @@ Decision log for architecture and operating choices.
   active processor had already listed the inbox.
 - Decision: `busy` is a successful outcome. The CLI and the webhook path log
   that another processor is already running and exit 0; only real faults
-  (dirty worktree, failed pull, processing error) exit non-zero.
+  (dirty worktree, failed sync with the remote, processing error) exit
+  non-zero. A sync that fails partway through the drain is one of those
+  faults, not a quiet early stop: the completed batches are still reported,
+  but the run's status is `sync_failed`, the same as an initial sync failure.
+  Anything else would let a mailbox checkout that is out of step with its
+  remote — so not delivering messages at all — exit as a clean poll.
 - The processor that owns the lock is therefore the only one that can notice
   new work, so it re-scans the inbox after each batch and keeps going until a
   scan turns up nothing new. The inbox stays the queue: no pending-work flag,

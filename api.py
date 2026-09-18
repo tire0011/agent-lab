@@ -488,6 +488,9 @@ def _run_mailbox_poll_once_for_webhook() -> None:
     if result.status == "pull_failed":
         _logger.error("mailbox_webhook failed reason=pull_failed")
         return
+    if result.status == "sync_failed":
+        _logger.error("mailbox_webhook failed reason=sync_failed count=%d", len(result.results))
+        return
     if result.status == "error":
         _logger.error("mailbox_webhook failed reason=%s", _sanitized_reason(result.error) or "unknown")
         return

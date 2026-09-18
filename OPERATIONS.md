@@ -256,6 +256,12 @@ Reaching either bound is logged (`Mailbox drain stopped ... reason=max_passes`
 or `reason=max_seconds`) and still exits 0. Defaults are defined in
 `modules/mailbox/config.py` (`MailboxDrainLimits`).
 
+A failed resync is different: it ends the drain, keeps and reports the work
+already committed, and the run exits **non-zero** with status `sync_failed`.
+Unlike a held lock, that means the checkout is out of step with its remote and
+messages are not being delivered — check the mailbox repo and network before
+assuming the next timer run will recover.
+
 ### Service unit (`deploy/nexus-mailbox.service`)
 
 ```

@@ -17,6 +17,7 @@ from unittest.mock import patch
 import mailbox_processor
 import modules.experiment_service as experiment_service_module
 import modules.mailbox as mailbox_module
+import modules.mailbox.poll_runner as poll_runner_module
 from modules.mailbox.config import MailboxConfig, MailboxDrainLimits
 from modules.mailbox.core import MailboxLock
 from modules.mailbox.poll_runner import (
@@ -85,7 +86,7 @@ def _write(inbox: Path, name: str) -> Path:
     return path
 
 
-def _drain(processor: _DrainProcessor, **kwargs: Any) -> list[dict[str, Any]]:
+def _drain(processor: _DrainProcessor, **kwargs: Any) -> Any:
     params: dict[str, Any] = {
         "processor": processor,
         "mailbox_module": mailbox_module,
@@ -103,9 +104,10 @@ class InboxDrainTests(unittest.TestCase):
         with _InboxTempDir() as inbox:
             processor = _DrainProcessor(inbox)
 
-            results = _drain(processor)
+            outcome = _drain(processor)
 
-            self.assertEqual(results, [])
+            self.assertEqual(outcome.results, [])
+            self.assertEqual(outcome.status, "processed")
             self.assertEqual(processor.passes, [[]])
 
     def test_single_batch_run_is_one_pass(self) -> None:
@@ -115,10 +117,11 @@ class InboxDrainTests(unittest.TestCase):
             _write(inbox, "b.md")
             processor = _DrainProcessor(inbox)
 
-            results = _drain(processor)
+            outcome = _drain(processor)
 
             self.assertEqual(processor.passes, [["a.md", "b.md"]])
-            self.assertEqual([r["status"] for r in results], ["done", "done"])
+            self.assertEqual([r["status"] for r in outcome.results], ["done", "done"])
+            self.assertEqual(outcome.status, "processed")
 
     def test_active_processor_rescans_after_processing_a_batch(self) -> None:
         with _InboxTempDir() as inbox:
@@ -139,10 +142,11 @@ class InboxDrainTests(unittest.TestCase):
             _write(inbox, "a.md")
             processor = _DrainProcessor(inbox, on_pass=arrive)
 
-            results = _drain(processor)
+            outcome = _drain(processor)
 
             self.assertEqual(processor.passes, [["a.md"], ["b.md"]])
-            self.assertEqual([r["file"] for r in results], ["a.md", "b.md"])
+            self.assertEqual([r["file"] for r in outcome.results], ["a.md", "b.md"])
+            self.assertEqual(outcome.status, "processed")
             self.assertEqual(list(inbox.iterdir()), [])
 
     def test_message_left_in_inbox_is_not_reprocessed_in_same_run(self) -> None:
@@ -183,10 +187,13 @@ class InboxDrainTests(unittest.TestCase):
             _write(inbox, "a.md")
             processor = _DrainProcessor(inbox, on_pass=arrive)
 
-            results = _drain(processor, resync=lambda: False)
+            outcome = _drain(processor, resync=lambda: False)
 
+            # The work already done is kept, but the run is a fault - not a
+            # clean poll that happened to stop early.
             self.assertEqual(processor.passes, [["a.md"]])
-            self.assertEqual([r["file"] for r in results], ["a.md"])
+            self.assertEqual([r["file"] for r in outcome.results], ["a.md"])
+            self.assertEqual(outcome.status, "sync_failed")
             self.assertTrue((inbox / "later-1.md").exists())
 
 
@@ -199,8 +206,12 @@ class InboxDrainLimitTests(unittest.TestCase):
             _write(inbox, "a.md")
             processor = _DrainProcessor(inbox, on_pass=always_more)
 
-            _drain(processor, limits=MailboxDrainLimits(max_passes=3, max_seconds=3600.0))
+            outcome = _drain(
+                processor, limits=MailboxDrainLimits(max_passes=3, max_seconds=3600.0)
+            )
 
+            # Reaching a bound is a successful stop, unlike a failed resync.
+            self.assertEqual(outcome.status, "processed")
             self.assertEqual(len(processor.passes), 3)
             remaining = [p.name for p in inbox.iterdir()]
             self.assertEqual(remaining, ["next-3.md"])
@@ -213,8 +224,11 @@ class InboxDrainLimitTests(unittest.TestCase):
             _write(inbox, "a.md")
             processor = _DrainProcessor(inbox, on_pass=always_more)
 
-            _drain(processor, limits=MailboxDrainLimits(max_passes=100, max_seconds=0.0))
+            outcome = _drain(
+                processor, limits=MailboxDrainLimits(max_passes=100, max_seconds=0.0)
+            )
 
+            self.assertEqual(outcome.status, "processed")
             self.assertEqual(len(processor.passes), 1)
             self.assertEqual([p.name for p in inbox.iterdir()], ["next-1.md"])
 
@@ -309,7 +323,7 @@ class InboxDrainIntegrationTests(unittest.TestCase):
                 arrived.append(self._message("second.md"))
             return True
 
-        results = _drain_inbox(
+        outcome = _drain_inbox(
             processor=self.processor,
             mailbox_module=mailbox_module,
             dry_run=False,
@@ -318,6 +332,8 @@ class InboxDrainIntegrationTests(unittest.TestCase):
             run_name="integration",
         )
 
+        results = outcome.results
+        self.assertEqual(outcome.status, "processed")
         self.assertEqual([r["status"] for r in results], ["done", "done"])
         self.assertEqual(
             sorted(Path(r["file"]).name for r in results), ["first.md", "second.md"]
@@ -332,7 +348,7 @@ class InboxDrainIntegrationTests(unittest.TestCase):
     def test_single_message_run_is_unchanged(self) -> None:
         self._message("only.md")
 
-        results = _drain_inbox(
+        outcome = _drain_inbox(
             processor=self.processor,
             mailbox_module=mailbox_module,
             dry_run=False,
@@ -341,8 +357,9 @@ class InboxDrainIntegrationTests(unittest.TestCase):
             run_name="integration",
         )
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["status"], "done")
+        self.assertEqual(outcome.status, "processed")
+        self.assertEqual(len(outcome.results), 1)
+        self.assertEqual(outcome.results[0]["status"], "done")
         self.assertFalse((self.repo / "inbox" / "only.md").exists())
 
 
@@ -389,6 +406,94 @@ class MailboxLockContentionTests(unittest.TestCase):
             follower.release()
 
 
+class _StubService:
+    def __init__(self, **_kwargs: Any) -> None:
+        pass
+
+    def publish_pending(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _TwoBatchProcessor(_StubService):
+    """Processes one message, then finds a second one on the next scan."""
+
+    def __init__(self, **_kwargs: Any) -> None:
+        self.scans = 0
+        self.batches: list[list[str]] = []
+
+    def retry_pending_git_commits(self) -> None:
+        pass
+
+    def prune_old_messages(self) -> None:
+        pass
+
+    def list_inbox_files(self) -> list[Path]:
+        self.scans += 1
+        # Nothing on the pre-processing snapshot; a message has landed by the
+        # time the drain re-scans.
+        return [] if self.scans == 1 else [Path("/mailbox/inbox/second.md")]
+
+    def process_inbox(self, files: list[Path] | None = None) -> list[dict[str, Any]]:
+        names = ["first.md"] if files is None else [p.name for p in files]
+        self.batches.append(names)
+        return [{"file": f"inbox/{name}", "status": "done"} for name in names]
+
+
+class MidDrainSyncFailureTests(unittest.TestCase):
+    """A resync failing mid-drain is a fault, not a clean poll.
+
+    Regression test for the drain loop swallowing a real mailbox sync failure
+    after the first batch and reporting the run as `processed`.
+    """
+
+    def _poll(self, sync_results: list[bool]) -> Any:
+        processors: list[_TwoBatchProcessor] = []
+
+        def make_processor(**kwargs: Any) -> _TwoBatchProcessor:
+            processors.append(_TwoBatchProcessor(**kwargs))
+            return processors[-1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(experiment_service_module, "ExperimentService", _StubService), \
+                patch("modules.operations_registry.OperationsRegistry", _StubService), \
+                patch("modules.operation_chain_service.OperationChainService", _StubService), \
+                patch("modules.operation_chain_publisher.OperationChainPublisher", _StubService), \
+                patch("modules.outbox_publisher.TaskApprovalOutboxPublisher", _StubService), \
+                patch("modules.outbox_publisher.FailureAnalysisOutboxPublisher", _StubService), \
+                patch.object(mailbox_module, "MailboxProcessor", make_processor), \
+                patch.object(poll_runner_module, "_worktree_safe_for_mailbox_sync", return_value=True), \
+                patch.object(poll_runner_module, "_sync_mailbox_repo", side_effect=sync_results):
+                result = run_mailbox_poll_once(
+                    db_path=str(root / "agent.db"),
+                    mailbox_config=MailboxConfig.from_paths(root / "code", root / "mailbox"),
+                    lock_path=root / "mailbox.lock",
+                    dry_run=False,
+                )
+        return result, processors[0]
+
+    def test_failed_resync_after_first_batch_reports_sync_failed(self) -> None:
+        # Initial sync succeeds, the drain's resync fails.
+        result, processor = self._poll([True, False])
+
+        self.assertEqual(result.status, "sync_failed")
+        # The completed first batch is still reported, not discarded.
+        self.assertEqual([r["file"] for r in result.results], ["inbox/first.md"])
+        self.assertEqual(processor.batches, [["first.md"]])
+
+    def test_successful_resync_drains_and_reports_processed(self) -> None:
+        result, processor = self._poll([True, True, True])
+
+        self.assertEqual(result.status, "processed")
+        self.assertEqual(
+            [r["file"] for r in result.results], ["inbox/first.md", "inbox/second.md"]
+        )
+        self.assertEqual(processor.batches, [["first.md"], ["second.md"]])
+
+
 class MailboxProcessorExitCodeTests(unittest.TestCase):
     """A oneshot systemd unit must not be marked failed by lock contention."""
 
@@ -416,7 +521,7 @@ class MailboxProcessorExitCodeTests(unittest.TestCase):
         self.assertEqual(self._run_cli("processed"), 0)
 
     def test_real_failures_still_exit_non_zero(self) -> None:
-        for status in ("dirty_worktree", "pull_failed", "error"):
+        for status in ("dirty_worktree", "pull_failed", "sync_failed", "error"):
             with self.subTest(status=status):
                 self.assertEqual(self._run_cli(status), 1)
 
