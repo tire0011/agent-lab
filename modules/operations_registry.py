@@ -152,8 +152,47 @@ class OperationsRegistry:
     def catalog(self) -> list[OperationSpec]:
         return [self._specs[name] for name in sorted(self._specs)]
 
+    def _normalize_integer_argument(self, spec: OperationArgSpec, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
+        if isinstance(value, str):
+            text = value.strip()
+            digits = text[1:] if text[:1] in {"+", "-"} else text
+            if not digits or not digits.isascii() or not digits.isdigit():
+                raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
+            value = int(text, 10)
+        elif not isinstance(value, int):
+            raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
+
+        if spec.minimum is not None and value < spec.minimum:
+            raise OperationValidationError(
+                f"{spec.name} muss mindestens {spec.minimum} sein."
+            )
+        if spec.maximum is not None and value > spec.maximum:
+            raise OperationValidationError(
+                f"{spec.name} darf höchstens {spec.maximum} sein."
+            )
+        return value
+
+    def _normalize_args(self, operation: str, args: dict[str, Any]) -> dict[str, Any]:
+        spec = self._specs.get(operation)
+        if spec is None:
+            return args
+
+        normalized = dict(args)
+        for argument in spec.arguments:
+            if argument.name not in normalized or argument.type != "integer":
+                continue
+            normalized[argument.name] = self._normalize_integer_argument(
+                argument,
+                normalized[argument.name],
+            )
+        return normalized
+
     def execute(self, operation: str, args: dict[str, Any] | None = None, *, caller: str = "authenticated caller") -> OperationResult:
-        params = dict(args or {})
+        params = self._normalize_args(operation, dict(args or {}))
         started = time.perf_counter()
         try:
             # Executability is defined by an implemented handler, not by the
