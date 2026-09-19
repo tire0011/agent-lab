@@ -480,9 +480,16 @@ def _coerce_argument(argument: Any, value: Any) -> tuple[Any, str]:
     name = getattr(argument, "name", "argument")
     if (getattr(argument, "type", "") or "").strip().lower() == "integer":
         try:
-            return normalize_integer_argument(argument, value), ""
-        except OperationValidationError as exc:
-            return None, str(exc)
+            coerced = normalize_integer_argument(argument, value)
+        except OperationValidationError:
+            return None, f"{name} must be an integer"
+        minimum = getattr(argument, "minimum", None)
+        maximum = getattr(argument, "maximum", None)
+        if minimum is not None and coerced < minimum:
+            return None, f"{name} is below its minimum"
+        if maximum is not None and coerced > maximum:
+            return None, f"{name} is above its maximum"
+        return coerced, ""
     if not isinstance(value, str) or not value.strip():
         return None, f"{name} must be a non-empty string"
     return value.strip(), ""
