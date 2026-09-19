@@ -114,7 +114,12 @@ class OperationResult:
         }
 
 
-def normalize_integer_argument(spec: OperationArgSpec, value: Any) -> Any:
+def normalize_integer_argument(
+    spec: OperationArgSpec,
+    value: Any,
+    *,
+    validate_bounds: bool = True,
+) -> Any:
     if value is None:
         return None
     if isinstance(value, bool):
@@ -133,14 +138,15 @@ def normalize_integer_argument(spec: OperationArgSpec, value: Any) -> Any:
     elif not isinstance(value, int):
         raise OperationValidationError(f"{spec.name} muss eine ganze Zahl sein.")
 
-    if spec.minimum is not None and value < spec.minimum:
-        raise OperationValidationError(
-            f"{spec.name} muss mindestens {spec.minimum} sein."
-        )
-    if spec.maximum is not None and value > spec.maximum:
-        raise OperationValidationError(
-            f"{spec.name} darf höchstens {spec.maximum} sein."
-        )
+    if validate_bounds:
+        if spec.minimum is not None and value < spec.minimum:
+            raise OperationValidationError(
+                f"{spec.name} muss mindestens {spec.minimum} sein."
+            )
+        if spec.maximum is not None and value > spec.maximum:
+            raise OperationValidationError(
+                f"{spec.name} darf höchstens {spec.maximum} sein."
+            )
     return value
 
 
