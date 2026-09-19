@@ -480,7 +480,7 @@ def _coerce_argument(argument: Any, value: Any) -> tuple[Any, str]:
     name = getattr(argument, "name", "argument")
     if (getattr(argument, "type", "") or "").strip().lower() == "integer":
         try:
-            coerced = normalize_integer_argument(argument, value)
+            coerced = normalize_integer_argument(argument, value, validate_bounds=False)
         except OperationValidationError:
             return None, f"{name} must be an integer"
         minimum = getattr(argument, "minimum", None)
