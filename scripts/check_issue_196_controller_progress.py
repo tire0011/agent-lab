@@ -482,12 +482,20 @@ def report_and_judge(
     # Position in the whole observation list, kept alongside, so "what came
     # after the success" can be counted without searching by value.
     execution_positions = []
+    # A loop-guard refusal carries `tool: "operation"` and, since #223, the
+    # operation and args too - but nothing ran. Counting it as an execution
+    # reported "executed 1 more time(s)" for a call the guard had just
+    # refused, which overstates what happened and points at the wrong layer.
+    refused_repeats: list[dict[str, Any]] = []
     for position, observation in enumerate(observations):
         if observation.get("tool") != "operation":
             continue
         if not _is_target_operation(
             str(observation.get("operation", "")), observation.get("args"), target
         ):
+            continue
+        if str(observation.get("event", "")) in LOOP_GUARD_EVENTS:
+            refused_repeats.append(observation)
             continue
         executions.append(observation)
         execution_positions.append(position)
@@ -559,6 +567,14 @@ def report_and_judge(
     if repeated_executions:
         failures.append(
             f"{target} executed {len(repeated_executions)} more time(s) after it succeeded"
+        )
+    if first_success_at is not None and refused_repeats:
+        # The controller asked again and the guard stopped it. The result was
+        # not re-fetched, but the controller still failed to use what it had -
+        # which is the behaviour #223 is about.
+        failures.append(
+            f"the controller asked for {target} again after it succeeded; "
+            f"the loop guard refused it ({len(refused_repeats)}x)"
         )
     if ended_on_guard:
         failures.append("the loop guard is what ended the task")

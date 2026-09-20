@@ -242,6 +242,31 @@ class RecordedSessionTests(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("loop guard", out)
 
+    def test_a_refusal_is_not_reported_as_an_execution(self):
+        """Nothing ran; saying it did overstates what happened.
+
+        The real VM run reported "executed 1 more time(s)" for a call the
+        guard had just refused, which points the reader at the wrong layer -
+        the operation was never re-run, the controller merely asked.
+        """
+        refusal = {
+            "tool": "operation",
+            "operation": "github_issue",
+            "args": {"issue_number": 196},
+            "event": "non_progressing_cycle",
+        }
+        code, out = self._judge(
+            self._session(
+                [SUCCESS, refusal],
+                kind="clarification",
+                reason="tool loop limit reached after non_progressing_cycle",
+            )
+        )
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("executed 1 more time", out)
+        self.assertIn("asked for", out)
+        self.assertIn("refused", out)
+
     def test_a_call_that_never_succeeded_is_inconclusive(self):
         code, out = self._judge(self._session([REJECTED]))
         self.assertEqual(code, 2, out)
