@@ -247,6 +247,35 @@ class RecordedSessionTests(unittest.TestCase):
         self.assertEqual(code, 2, out)
         self.assertIn("INCONCLUSIVE", out)
 
+    def test_a_refused_argument_is_not_blamed_on_the_credential(self):
+        """Naming the wrong cause sends the next reader to the wrong place.
+
+        The canonical VM run failed with `invalid_tool_request` because the
+        deployed checkout predated the integer-coercion fix, and the check
+        said a missing token looks exactly like this. It does not.
+        """
+        code, out = self._judge(self._session([REJECTED]))
+        self.assertEqual(code, 2, out)
+        self.assertIn("not a credential problem", out)
+        self.assertNotIn("missing or expired", out)
+
+    def test_a_capability_failure_does_point_at_the_credential(self):
+        failed = {
+            "tool": "operation",
+            "operation": "github_issue",
+            "args": {"issue_number": 196},
+            "result": {
+                "operation": "github_issue",
+                "success": False,
+                "output_lines": [],
+                "error_summary": "GitHub lifecycle is required",
+            },
+        }
+        code, out = self._judge(self._session([failed]))
+        self.assertEqual(code, 2, out)
+        self.assertIn("GITHUB_TOKEN", out)
+        self.assertNotIn("not a credential problem", out)
+
     def test_an_unknown_session_is_inconclusive_not_a_crash(self):
         code, out = self._judge("no-such-session")
         self.assertEqual(code, 2, out)

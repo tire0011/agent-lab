@@ -598,7 +598,17 @@ def report_and_judge(
             print("  it was executed but did not succeed:")
             for observation in executions:
                 print(f"    {_describe_observation(observation)}")
-            print("  a missing/expired GitHub token looks exactly like this")
+            # Naming the wrong cause is worse than naming none. An argument the
+            # capability refused and a credential it never had look nothing
+            # alike in the observation, and a run that said "token" for a
+            # rejected argument sent the next reader to the wrong place.
+            if any(obs.get("error") == "invalid_tool_request" for obs in executions):
+                print("  the arguments were refused, so this is not a credential problem.")
+                print("  a string where an integer was required is the usual cause; check")
+                print("  that the deployed checkout has the integer-coercion fix (#222).")
+            else:
+                print("  the capability ran and reported failure; a missing or expired")
+                print("  GITHUB_TOKEN/GH_TOKEN reads like this in its error_summary.")
         else:
             print(f"  the controller went to {final_action} without ever fetching the issue")
             print("  try a larger --max-steps")
