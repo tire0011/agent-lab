@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
+from .refresh import process_refresh as _process_refresh
 
 from .core import (
     MAX_RETRY,
@@ -309,6 +310,8 @@ _PROCESSORS = {
     "task": _process_task,
     "question": _process_question,
     "context": _process_context,
+    # Moving the deployment to a branch, with no shell in the message (#228).
+    "refresh": _process_refresh,
 }
 
 

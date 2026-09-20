@@ -11,7 +11,7 @@ Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed m
 
 **Inbox** (`<AGENT_MAILBOX_REPO_PATH>/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus. This root-level directory is the only supported inbox; the code repository's former `communication/inbox/` path is not scanned.
 
-Supported message types: `idea`, `task`, `question`, `context`.
+Supported message types: `idea`, `task`, `question`, `context`, `refresh`.
 
 Example: `agent-lab-mailbox/examples/idea-template.md`.
 
@@ -32,6 +32,19 @@ them.
 - `task` — body stored in SQLite and submitted through the mailbox task/experiment workflow.
 - `question` — acknowledged; response placed in outbox.
 - `context` — stored in the `knowledge` table under category `mailbox_context`.
+- `refresh` — moves the deployment checkout to the branch named in the front
+  matter and restarts the allowlisted services. Carries no shell: the body is
+  ignored, and `branch` is the only thing the message can influence — not the
+  repository, the remote, or which services restart. An invalid branch name is
+  rejected with a reason and nothing is touched. See issue #228.
+
+  ```markdown
+  ---
+  type: refresh
+  created_by: rene
+  branch: main
+  ---
+  ```
 
 **Safety:**
 
