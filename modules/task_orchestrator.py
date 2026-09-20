@@ -73,6 +73,7 @@ from modules.prompt_budget import (
     CHARS_PER_TOKEN,
     PromptBudgetPlan,
     compact_observations,
+    controller_observation_view,
     compute_budget,
     dedupe_nested_results,
     prompt_json,
@@ -792,6 +793,13 @@ class NexusTaskOrchestrator:
                 )
                 if not check.allowed:
                     observation = check.observation or {"event": "duplicate_tool_call"}
+                    if tool == "operation":
+                        # The guard identifies a call by hash, so its refusal
+                        # names no operation. The controller needs the name and
+                        # arguments to recognise which answer it already holds,
+                        # and the prompt view uses them to point at the event
+                        # that carries it (#223).
+                        observation = {**observation, **arguments}
                     if terminal_not_found is not None:
                         # The guard already refuses the repeat and counts it, so
                         # pre-empting it would only hide the repeat from the
@@ -1358,8 +1366,14 @@ class NexusTaskOrchestrator:
             if content:
                 seen.add(content)
         deduped_observations = dedupe_nested_results(observations, already_seen=seen)
+        # Narrow to what a decision needs *before* budgeting it. Dropping the
+        # grant id, the already-bound operation schema and the resolver's
+        # telemetry buys room for the result itself, so the observation that
+        # answers the task survives the budget instead of being stubbed out
+        # behind the metadata that recorded how it was obtained (#223).
+        viewed_observations = controller_observation_view(deduped_observations)
         compacted_observations, omitted_indices = compact_observations(
-            deduped_observations,
+            viewed_observations,
             budget_chars=budget_plan.observation_chars,
             keep_recent_full=2,
         )

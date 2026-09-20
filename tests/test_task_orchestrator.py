@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from modules.nexus_delegation import DelegationResult
+from modules.nexus_task_store import NexusTaskStore
 from modules.operations_registry import OperationArgSpec
 from modules.runtime_execution import resolve_python_interpreter
 from modules.central_logging import get_task_logger, read_log_entries
@@ -348,10 +350,25 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn('"tool":"find_tool"', client.prompts[2])
         self.assertIn('"status":"found"', client.prompts[2])
         self.assertIn('"operation":"git_status"', client.prompts[2])
-        self.assertIn('"main_selected_schema_chars"', client.prompts[2])
-        self.assertIn('"legacy_catalog_schema_chars"', client.prompts[2])
-        self.assertIn('"selection_correctness":"unknown"', client.prompts[2])
-        self.assertIn('"grant_event_id"', client.prompts[3])
+        # The controller is shown what the lookup answered, not what the
+        # resolver measured doing it, and not the grant that authorised the
+        # call (#223). All of it is still recorded - see the journal
+        # assertions below.
+        # Scoped to the observation section: `legacy_catalog_schema_chars`
+        # also describes the find_tool capability itself in the catalog above,
+        # which is a different field with the same name.
+        for prompt in (client.prompts[2], client.prompts[3]):
+            section = prompt.partition("OBSERVATIONS FROM TOOLS USED IN THIS RUN:\n")[2]
+            for internal in (
+                '"main_selected_schema_chars"',
+                '"legacy_catalog_schema_chars"',
+                '"selection_correctness"',
+                '"grant_event_id"',
+                '"operation_schema"',
+            ):
+                self.assertNotIn(internal, section)
+        self.assertIn('"resolved_tool":"git_status"', client.prompts[2])
+        self.assertIn('"status":"succeeded"', client.prompts[3])
 
     def test_guessed_operation_without_find_tool_grant_is_rejected(self):
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
@@ -405,7 +422,21 @@ class TaskOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(second.action, ACTION_ANSWER)
         self.assertEqual(self.registry.calls[0][0], "git_status")
-        self.assertIn('"grant_event_id"', client2.prompts[1])
+        # The grant survived, which is what this test is about: the operation
+        # ran in a second process without a fresh find_tool. It is proven by
+        # the journal, where the grant id is recorded, rather than by the
+        # controller prompt, which no longer carries execution metadata (#223).
+        store = NexusTaskStore(db_path=self.db_path)
+        try:
+            events = store.recent_events(first.session_id, kind="operation")
+        finally:
+            store.close()
+        persisted = [json.loads(event["content"]) for event in events]
+        self.assertTrue(
+            any(entry.get("grant_event_id") for entry in persisted),
+            "the persisted operation event must still carry its grant",
+        )
+        self.assertNotIn('"grant_event_id"', client2.prompts[1])
 
     def test_find_tool_rejects_placeholder_goals_and_distinguishes_not_found(self):
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)

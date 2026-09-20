@@ -342,12 +342,20 @@ def compact_observations(
 # ran it, and then asked for it twice more (#218).
 #
 # These fields are tens of characters. The body is what is expensive.
+#
+# `args` is here for the same reason. On a memory-pressured VM the observation
+# budget collapses to about 150 characters, so every observation becomes a
+# stub - and a stub naming `github_issue` without saying *which issue* cannot
+# stop a controller asking for #196 again when it already has the answer
+# (#223). With `args` and `status`, the stub reads as "github_issue(196)
+# succeeded, event 158", which is the whole decision.
 _STUB_IDENTITY_FIELDS = (
     "goal",
     "status",
     "retryable",
     "resolved_tool",
     "operation",
+    "args",
     "recommended_next_action",
     "recommended_operation",
     "already_resolved_operation",
@@ -369,6 +377,12 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
         value = obs[field]
         if isinstance(value, str):
             value = value[:_STUB_FIELD_CHARS]
+        elif field == "args" and isinstance(value, dict):
+            # The values the call ran with, which is what makes one call
+            # distinguishable from another. Kept whole or not at all: half an
+            # argument list identifies nothing, and a stub is meant to be small.
+            rendered = json.dumps(value, separators=(",", ":"), default=str)
+            value = value if len(rendered) <= _STUB_FIELD_CHARS else None
         elif isinstance(value, dict):
             # `operation` is a full schema on a found result; its name is the
             # part a decision needs.
@@ -444,3 +458,201 @@ def dedupe_nested_results(
             new_obs["deduped"] = len(obs["results"]) - len(kept_results)
         deduped.append(new_obs)
     return deduped
+
+
+# --- controller-facing observation view (#223) -----------------------------
+#
+# A tool observation is written once and read twice, for two different
+# purposes. ``nexus_task_events`` keeps the full envelope because a diagnosis
+# weeks later needs to know which grant authorised a call, which schema it was
+# bound against and what the resolver measured. The next controller turn needs
+# none of that: it needs to know what the call answered, so it does not ask
+# again.
+#
+# Session 3e2e565e49134703934e59bd57ad9118 is what the difference costs. The
+# controller fetched GitHub issue #196 successfully and then asked for the
+# identical ``github_issue(196)`` again - the issue text was in the prompt, but
+# wrapped in a tool wrapper, a grant id, a full operation schema and a nested
+# result object. For a 7B local model the answer it already had was buried in
+# the record of how it had been obtained.
+#
+# This is a view, not an edit. The persisted journal is untouched; only the
+# copy rendered into the prompt is narrowed.
+
+# Authorisation and telemetry: real audit fields, and never an input to
+# "what should I do next".
+_EXECUTION_METADATA_FIELDS = ("grant_event_id", "operation_schema", "metrics")
+
+# A refusal, not a result. These carry the call's identity but nothing it
+# returned, so they are read for the pointer they can be given.
+_LOOP_GUARD_EVENTS = frozenset(
+    {"duplicate_tool_call", "non_progressing_cycle", "retry_reason_required"}
+)
+
+# What a successful operation result actually says, in the order a reader
+# wants it. `operation` and `success` are lifted into the outer view instead.
+_RESULT_PAYLOAD_FIELDS = ("output_lines", "exit_code", "error_summary")
+
+
+def _args_signature(operation: str, args: Any) -> str:
+    """Identity of one operation call, tolerant of how a number was written.
+
+    ``{"issue_number": 196}`` and ``{"issue_number": "196"}`` are one call as
+    far as the next decision is concerned: the registry coerces the string, and
+    a rejected first attempt followed by a corrected one is the "previous
+    transient validation attempt" that should not still be in the prompt after
+    the call succeeded.
+    """
+    if not isinstance(args, dict):
+        return f"{operation}|{args!r}"
+    normalized: dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, str):
+            # Only a value int() actually accepts. Stripping every leading sign
+            # and then converting turns "--196" into a ValueError raised while
+            # building a prompt, which would end the turn over a typo.
+            try:
+                value = int(value.strip(), 10)
+            except ValueError:
+                pass
+        normalized[str(key)] = value
+    return f"{operation}|{json.dumps(normalized, sort_keys=True, separators=(',', ':'), default=str)}"
+
+
+def _operation_view(obs: dict[str, Any]) -> dict[str, Any]:
+    view = {key: value for key, value in obs.items() if key not in _EXECUTION_METADATA_FIELDS}
+    result = obs.get("result")
+    if not isinstance(result, dict):
+        # A refused call: `error`, `reason` and `recovery` are already the
+        # whole message, and there is no result to unwrap.
+        return view
+    view.pop("result", None)
+    view["status"] = "succeeded" if result.get("success") else "failed"
+    for field in _RESULT_PAYLOAD_FIELDS:
+        value = result.get(field)
+        if value not in (None, [], ""):
+            view[field] = value
+    return view
+
+
+def _find_tool_view(obs: dict[str, Any]) -> dict[str, Any]:
+    view = {key: value for key, value in obs.items() if key not in _EXECUTION_METADATA_FIELDS}
+    if obs.get("status") != "found":
+        # not_found/unavailable carry the guidance the prompt rules tell the
+        # controller to read - `related_operations`, `recommended_next_action`,
+        # `retryable`, and what the resolver actually said. All of it stays.
+        return view
+    # `operation` is the full selected schema, which the router has already
+    # bound this call against.
+    view.pop("operation", None)
+    if isinstance(obs.get("resolved_arguments"), dict):
+        # The operation ran with those arguments; its result is the next
+        # observation. Nothing here is left for the controller to fill in.
+        view.pop("arguments_schema", None)
+    return view
+
+
+def controller_observation_view(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Narrow tool observations to what the next controller decision needs.
+
+    Three reductions, in one pass so they see each other's outcome:
+
+    * execution metadata (grant id, already-bound operation schema, resolver
+      telemetry) is dropped, and a successful operation's nested result is
+      flattened to ``status`` plus its payload;
+    * a failed attempt at an operation that a later call then completed with
+      the same arguments is dropped, since the controller's next step is
+      decided by the result, not by how many tries it took;
+    * a duplicate-call refusal names the event that already answered it, so
+      "you asked this before" becomes "that answer is in event 158".
+
+    Never mutates its input: the persisted journal and the in-memory
+    observation list keep the full envelope.
+    """
+    # Where each operation call first succeeded, by call identity.
+    succeeded_in: dict[str, Any] = {}
+    for obs in observations:
+        if not isinstance(obs, dict) or obs.get("tool") != "operation":
+            continue
+        result = obs.get("result")
+        if not (isinstance(result, dict) and result.get("success")):
+            continue
+        signature = _args_signature(str(obs.get("operation", "")), obs.get("args"))
+        succeeded_in.setdefault(signature, obs.get("event_id"))
+
+    viewed: list[dict[str, Any]] = []
+    for index, obs in enumerate(observations):
+        if not isinstance(obs, dict):
+            viewed.append(obs)
+            continue
+        tool = obs.get("tool")
+
+        # Checked before the tool branches: a refused operation call carries
+        # `tool: "operation"` too, but it has no result to unwrap - what it
+        # needs is a pointer to the one that does.
+        event = str(obs.get("event", ""))
+        if event in _LOOP_GUARD_EVENTS:
+            viewed.append(_duplicate_call_view(obs, succeeded_in))
+            continue
+
+        if tool == "operation":
+            signature = _args_signature(str(obs.get("operation", "")), obs.get("args"))
+            result = obs.get("result")
+            failed = obs.get("error") is not None or not (
+                isinstance(result, dict) and result.get("success")
+            )
+            if failed and _superseded_later(observations, index, signature):
+                continue
+            viewed.append(_operation_view(obs))
+            continue
+
+        if tool == "find_tool":
+            viewed.append(_find_tool_view(obs))
+            continue
+
+        # command, python_run, memory_search, delegate and anything added
+        # later pass through unchanged. Compaction that guessed at the shape of
+        # a tool it does not know would be a worse failure than a long prompt.
+        viewed.append(obs)
+    return viewed
+
+
+def _superseded_later(observations: list[dict[str, Any]], index: int, signature: str) -> bool:
+    """Did a later call complete this exact operation successfully?
+
+    Only *later*: a failure after the success is new information (the
+    capability stopped working), not a superseded attempt.
+    """
+    for obs in observations[index + 1:]:
+        if not isinstance(obs, dict) or obs.get("tool") != "operation":
+            continue
+        result = obs.get("result")
+        if not (isinstance(result, dict) and result.get("success")):
+            continue
+        if _args_signature(str(obs.get("operation", "")), obs.get("args")) == signature:
+            return True
+    return False
+
+
+def _duplicate_call_view(obs: dict[str, Any], succeeded_in: dict[str, Any]) -> dict[str, Any]:
+    """Point a refusal at the result that already answered the question.
+
+    ``duplicate_tool_call`` on its own says only that a repeat was refused;
+    ``recovery`` then tells the controller to pick something else without
+    saying why it does not need this one. Naming the event turns the refusal
+    into the answer.
+    """
+    view = dict(obs)
+    operation = str(obs.get("operation", "")).strip()
+    if not operation:
+        return view
+    event_id = succeeded_in.get(_args_signature(operation, obs.get("args")))
+    if event_id is None:
+        return view
+    arguments = json.dumps(obs.get("args") or {}, sort_keys=True, separators=(",", ":"), default=str)
+    view["already_succeeded_in_event"] = event_id
+    view["recovery"] = (
+        f"{operation}{arguments} already succeeded in event {event_id}; "
+        "use that result and choose the next action"
+    )
+    return view
