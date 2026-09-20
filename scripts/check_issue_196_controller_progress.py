@@ -203,7 +203,12 @@ def _print_prompt_observations(prompts: list[dict[str, Any]]) -> None:
     """
     for turn, record in enumerate(prompts, start=1):
         section = record.get("observations_section") or "(no observations yet)"
-        print(f"  turn {turn}: prompt {record['prompt_chars']} chars, "
+        size = (
+            f"prompt {record['prompt_chars']} chars"
+            if record.get("prompt_chars") is not None
+            else f"replayed at a {record.get('budget_chars')}-char observation budget"
+        )
+        print(f"  turn {turn}: {size}, "
               f"{record['observation_count']} observations, "
               f"omitted {record['omitted']}")
         for line in redact_secrets(section).splitlines():
@@ -426,10 +431,60 @@ def judge_recorded_session(args, target: "_Target") -> int:
         target=target,
         final_action=final_action,
         final_reason=final_reason,
-        prompts=[],
-        show_prompts=False,
+        prompts=_replay_prompts(observations),
+        show_prompts=args.show_prompts,
         dump_json=args.json,
     )
+
+
+def _replay_prompts(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rebuild the observation section the controller read on each turn.
+
+    Prompts are not journalled, but they are a pure function of the
+    observations so far and the budget, and the observations *are* journalled.
+    Replaying them is the only way this mode can show the thing #223 is about:
+    the gap between what was stored and what the model was given.
+
+    Leaving it out is what made the first canonical run so slow to diagnose -
+    the check reported that the controller had asked again and could not show
+    that the successful result had reached it as a bare stub, with the issue
+    body compacted away.
+
+    The budget is recomputed here rather than read back from the run, so a
+    host under different memory pressure than at the time will reconstruct
+    different prompts. The header says so.
+    """
+    from modules.prompt_budget import (
+        compact_observations,
+        compute_budget,
+        controller_observation_view,
+        prompt_json,
+        read_mem_available_kb,
+        read_swap_free_kb,
+        read_swap_total_kb,
+    )
+
+    plan = compute_budget(
+        mem_available_kb=read_mem_available_kb(),
+        swap_free_kb=read_swap_free_kb(),
+        swap_total_kb=read_swap_total_kb(),
+    )
+    replayed: list[dict[str, Any]] = []
+    for turn in range(1, len(observations) + 1):
+        viewed = controller_observation_view(observations[:turn])
+        compacted, omitted = compact_observations(
+            viewed, budget_chars=plan.observation_chars, keep_recent_full=2
+        )
+        replayed.append(
+            {
+                "prompt_chars": None,
+                "observation_count": turn,
+                "omitted": omitted,
+                "observations_section": prompt_json(compacted),
+                "budget_chars": plan.observation_chars,
+            }
+        )
+    return replayed
 
 
 def report_and_judge(

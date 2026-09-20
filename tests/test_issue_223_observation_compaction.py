@@ -309,16 +309,19 @@ class NonOperationToolsTests(unittest.TestCase):
         self.assertEqual(controller_observation_view([None, "x"]), [None, "x"])
 
 
-class StubbedUnderRealVmBudgetTests(unittest.TestCase):
-    """The VM budget is the path that actually decides this.
+class VmBudgetTests(unittest.TestCase):
+    """What the VM's own numbers produce, before and after the budget fix.
 
-    On the memory-pressured Nexus VM ``observation_chars`` collapses to about
-    150, so every observation is reduced to a stub. A fix that only improves
-    the full-fidelity rendering would never reach the run it was written for.
+    These tests used to assert the opposite: that the VM budget stubs
+    everything, with 150 characters for observations. That was true, and it
+    was the bug - `compute_budget` subtracted the resident model's footprint
+    from MemAvailable, asking the host for room to load an already-running
+    model a second time. Writing it down as expected behaviour is how a
+    regression test can end up defending the regression.
     """
 
     def _vm_budget(self):
-        # The plan the VM reported during the #223 check run.
+        # The plan the VM reported during the canonical #223 run.
         return compute_budget(
             mem_available_kb=2_405_376,
             swap_free_kb=7_456_444,
@@ -326,14 +329,45 @@ class StubbedUnderRealVmBudgetTests(unittest.TestCase):
             mem_limit_mb=2048,
         )
 
-    def test_the_vm_budget_really_does_stub_everything(self):
-        self.assertLess(self._vm_budget().observation_chars, 300)
+    def test_the_vm_budget_now_has_room_for_a_real_result(self):
+        plan = self._vm_budget()
+        self.assertFalse(plan.low_memory)
+        # A github_issue result runs to a few thousand characters.
+        self.assertGreater(plan.observation_chars, 3000)
 
-    def test_a_stubbed_success_still_names_the_operation_its_args_and_outcome(self):
+    def test_a_successful_result_reaches_the_controller_whole(self):
         plan = self._vm_budget()
         views = controller_observation_view([_github_issue_success()])
         compacted, omitted = compact_observations(
             views, budget_chars=plan.observation_chars, keep_recent_full=2
+        )
+        self.assertEqual(omitted, [], "the result must not be stubbed away")
+        self.assertIn(
+            "Issue #196: Publish Nexus Outbox messages",
+            json.dumps(compacted),
+        )
+
+
+class StubbedUnderARealSqueezeTests(unittest.TestCase):
+    """The stub path still matters where memory really is exhausted.
+
+    A host with a few hundred MB free is genuinely in trouble, and there the
+    budget still collapses. A stub naming the operation without saying which
+    issue cannot stop a controller asking for #196 again, so the identity
+    fields stay.
+    """
+
+    SQUEEZED = 150
+
+    def test_a_starved_host_still_collapses_the_budget(self):
+        plan = compute_budget(mem_available_kb=100_000, swap_free_kb=0, swap_total_kb=8_388_604)
+        self.assertTrue(plan.low_memory)
+        self.assertLess(plan.observation_chars, 300)
+
+    def test_a_stubbed_success_still_names_the_operation_its_args_and_outcome(self):
+        views = controller_observation_view([_github_issue_success()])
+        compacted, omitted = compact_observations(
+            views, budget_chars=self.SQUEEZED, keep_recent_full=2
         )
         self.assertEqual(omitted, [0])  # it is a stub, not full content
         stub = compacted[0]

@@ -311,6 +311,37 @@ class RecordedSessionTests(unittest.TestCase):
         self.assertEqual(code, 2, out)
         self.assertIn("no tool observations", out)
 
+    def test_a_failure_shows_what_the_controller_actually_read(self):
+        """Without this the mode cannot show the thing #223 is about.
+
+        The first canonical run reported that the controller had asked again
+        and showed nothing of the prompt, so it could not show that the
+        successful result had arrived as a bare stub with the issue body
+        compacted away. Prompts are not journalled, but they are a function
+        of the observations, which are.
+        """
+        session = self._session(
+            [SUCCESS, dict(SUCCESS, event_id=180)],
+            kind="clarification",
+            reason="tool loop limit reached after duplicate_tool_call",
+        )
+        code, out = self._judge(session)
+        self.assertEqual(code, 1, out)
+        self.assertIn("compact observations given to the controller", out)
+        # The replayed section must carry the real observation, not a header.
+        self.assertIn('"operation":"github_issue"', out)
+
+    def test_show_prompts_works_on_a_passing_session_too(self):
+        code, out = self._judge(self._session([SUCCESS]), extra=["--show-prompts"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("compact observations given to the controller", out)
+
+    def test_a_replayed_prompt_is_not_labelled_as_a_measured_one(self):
+        """It is reconstructed at this host's budget, and says so."""
+        code, out = self._judge(self._session([SUCCESS]), extra=["--show-prompts"])
+        self.assertIn("replayed at a", out)
+        self.assertNotIn("prompt None chars", out)
+
     def test_the_production_database_is_never_deleted(self):
         """The driving mode unlinks its scratch db; this one must not."""
         session = self._session([SUCCESS])

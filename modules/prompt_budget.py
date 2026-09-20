@@ -161,12 +161,26 @@ def compute_budget(
     low_memory = False
     memory_budget_chars: int | None = None
     if mem_available_kb is not None:
-        # ``mem_limit_kb`` is what the configured local model already needs
-        # just to run (weights + baseline KV cache). Anything below that
-        # requirement plus an additional safety headroom means the host
-        # cannot safely serve one more local inference call at all, no
-        # matter how small the resulting prompt is.
-        required_kb = mem_limit_kb + inference_headroom_kb
+        # What this budget bounds is one *prompt*, against a llama-server that
+        # is already running - so the model's own footprint must not be
+        # subtracted here. Those bytes are already allocated: they are in
+        # `used`, not in `MemAvailable`, and llama-server sizes its KV cache
+        # up front from its configured context, not per request. Requiring
+        # `MemAvailable >= mem_limit + headroom` asked the host for room to
+        # load the model a *second* time, so on any host where the model is
+        # resident - which is the normal case - the budget collapsed to the
+        # 500-char floor and left 150 characters for observations.
+        #
+        # Measured on the VM: MemAvailable 2.53 GiB against a required 2.5 GiB
+        # gave a surplus of -24 MiB, so a successful github_issue result of
+        # 3005 characters reached the controller as a bare stub. It could see
+        # that the call had succeeded and not what it returned, and asked for
+        # it again - which is #223.
+        #
+        # What a prompt actually costs beyond what is already allocated is its
+        # own tokens, and that is what the surplus is divided by below. The
+        # cushion is what we decline to spend, not a second copy of the model.
+        required_kb = inference_headroom_kb
         surplus_kb = mem_available_kb - required_kb
         if surplus_kb <= 0:
             low_memory = True
