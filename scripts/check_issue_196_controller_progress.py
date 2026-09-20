@@ -14,7 +14,8 @@ model decides. This runs the genuine path - real ``NexusTaskOrchestrator``,
 real ``OperationsRegistry``, real llama-server - over the same task text and
 reports whether the failure signature is back.
 
-The failure signature is:
+The failure signature, all of it measured only once the operation has
+succeeded at least once, is:
 
 * ``github_issue`` executed more than once with the same arguments, or
 * the controller requesting that identical operation again after it
@@ -38,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -55,8 +57,8 @@ from modules.operations_registry import OperationsRegistry  # noqa: E402
 from modules.redaction import redact_secrets  # noqa: E402
 
 DEFAULT_TASK = "solve github issue #196"
-TARGET_OPERATION = "github_issue"
-TARGET_ISSUE = 196
+DEFAULT_OPERATION = "github_issue"
+DEFAULT_EXPECTED_ARGS = {"issue_number": 196}
 LOOP_GUARD_EVENTS = {"duplicate_tool_call", "non_progressing_cycle", "retry_reason_required"}
 
 
@@ -86,22 +88,57 @@ def _normalized_args(args: Any) -> str:
         return json.dumps(args, sort_keys=True, default=str)
     normalized = {}
     for key, value in args.items():
-        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-            value = int(value)
+        if isinstance(value, str):
+            try:
+                value = int(value.strip(), 10)
+            except ValueError:
+                pass
         normalized[str(key)] = value
     return json.dumps(normalized, sort_keys=True, default=str)
 
 
-def _is_target_operation(operation: str, args: Any) -> bool:
-    if operation != TARGET_OPERATION:
+def _is_target_operation(operation: str, args: Any, target: "_Target") -> bool:
+    """Is this the call the run is watching?
+
+    Argument matching is a subset test, not equality: a capability may be
+    called with extra defaults the check has no opinion about, and requiring
+    an exact match would quietly stop recognising the call it exists to watch.
+    """
+    if operation != target.operation:
         return False
+    if not target.expected_args:
+        return True
     if not isinstance(args, dict):
         return False
-    raw = args.get("issue_number", args.get("number"))
-    try:
-        return int(str(raw).strip()) == TARGET_ISSUE
-    except (TypeError, ValueError):
-        return False
+    for key, expected in target.expected_args.items():
+        if key not in args:
+            return False
+        if _coerce(args[key]) != _coerce(expected):
+            return False
+    return True
+
+
+def _coerce(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 10)
+        except ValueError:
+            return value.strip()
+    return value
+
+
+@dataclass(frozen=True)
+class _Target:
+    """The operation this run watches, and how it is named in output."""
+
+    operation: str
+    expected_args: dict[str, Any]
+
+    def __str__(self) -> str:
+        if not self.expected_args:
+            return f"{self.operation}()"
+        rendered = ", ".join(f"{k}={v!r}" for k, v in sorted(self.expected_args.items()))
+        return f"{self.operation}({rendered})"
 
 
 def _operation_succeeded(observation: dict[str, Any]) -> bool:
@@ -178,6 +215,25 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--task", default=DEFAULT_TASK, help="task text to drive the controller with")
+    parser.add_argument(
+        "--operation",
+        default=DEFAULT_OPERATION,
+        help=(
+            "the operation whose repetition is the regression. The default is the "
+            "one #223 describes; another read-only capability lets the same path be "
+            "exercised where github_issue cannot succeed (no GITHUB_TOKEN on the host)."
+        ),
+    )
+    parser.add_argument(
+        "--expect-arg",
+        action="append",
+        metavar="KEY=VALUE",
+        help=(
+            "only count calls carrying this argument; repeatable. Defaults to "
+            "issue_number=196 when --operation is left at its default, and to no "
+            "filter otherwise."
+        ),
+    )
     parser.add_argument("--db-path", type=Path, default=Path("/tmp/nexus-issue-196-check.db"))
     parser.add_argument("--repo-root", type=Path, default=Path("/agent"))
     parser.add_argument("--max-steps", type=int, default=8, help="controller turns before it must finish")
@@ -188,6 +244,21 @@ def main() -> int:
         help="print the observation section of every controller prompt (redacted)",
     )
     args = parser.parse_args()
+
+    if args.expect_arg:
+        expected: dict[str, Any] = {}
+        for pair in args.expect_arg:
+            key, _, raw = pair.partition("=")
+            if not key or not _:
+                parser.error(f"--expect-arg must be KEY=VALUE, got {pair!r}")
+            expected[key.strip()] = _coerce(raw)
+    elif args.operation == DEFAULT_OPERATION:
+        expected = dict(DEFAULT_EXPECTED_ARGS)
+    else:
+        # A substitute capability has no issue number; watching the operation
+        # itself is the whole filter.
+        expected = {}
+    target = _Target(args.operation, expected)
 
     if args.db_path.exists():
         args.db_path.unlink()
@@ -235,8 +306,9 @@ def main() -> int:
 
     orchestrator._build_prompt = _recording_build_prompt  # type: ignore[method-assign]
 
-    print("#223 manual check: controller reuse of a successful github_issue result")
+    print("#223 manual check: controller reuse of a successful tool result")
     print(f"task:      {args.task!r}")
+    print(f"watching:  {target}")
     print(f"repo root: {args.repo_root}")
     print(f"database:  {args.db_path} (scratch)")
     print("provider:  local llama-server (the real controller path)")
@@ -284,7 +356,7 @@ def main() -> int:
         observation
         for observation in result.observations
         if observation.get("tool") == "operation"
-        and _is_target_operation(str(observation.get("operation", "")), observation.get("args"))
+        and _is_target_operation(str(observation.get("operation", "")), observation.get("args"), target)
     ]
     successes = [obs for obs in executions if _operation_succeeded(obs)]
 
@@ -303,7 +375,7 @@ def main() -> int:
             if requested is None:
                 continue
             tool, arguments = requested
-            if not _is_target_operation(tool, arguments):
+            if not _is_target_operation(tool, arguments, target):
                 continue
             if not seen_success:
                 # The call that produced the success itself is not a repeat.
@@ -312,7 +384,12 @@ def main() -> int:
             if _normalized_args(arguments) == success_signature:
                 repeated_requests.append(decision)
 
-    repeated_executions = [obs for obs in executions[1:] if _operation_succeeded(obs) or obs.get("result")]
+    # Only counted once something succeeded. Repeating a call that keeps
+    # failing is a loop, but not this one: there is no result to reuse, so it
+    # says nothing about whether the controller reuses one. That run is
+    # inconclusive, and reporting it as the #223 regression would send the
+    # next reader looking for a prompt bug behind a broken GitHub token.
+    repeated_executions = executions[1:] if successes else []
     guard_events = sorted(
         {
             str(observation.get("event"))
@@ -329,17 +406,17 @@ def main() -> int:
     failures = []
     if repeated_requests:
         failures.append(
-            f"the controller asked for {TARGET_OPERATION}({TARGET_ISSUE}) again after it succeeded "
+            f"the controller asked for {target} again after it succeeded "
             f"({len(repeated_requests)}x)"
         )
     if repeated_executions:
         failures.append(
-            f"{TARGET_OPERATION}({TARGET_ISSUE}) executed {len(executions)} times with the same arguments"
+            f"{target} executed {len(executions)} times with the same arguments"
         )
     if ended_on_guard:
         failures.append("the loop guard is what ended the task")
 
-    if failures:
+    if failures and successes:
         for failure in failures:
             print(f"FAIL: {failure}")
         for decision in repeated_requests:
@@ -351,7 +428,21 @@ def main() -> int:
         return 1
 
     if not successes:
-        print(f"INCONCLUSIVE: {TARGET_OPERATION}({TARGET_ISSUE}) never succeeded, so nothing was verified")
+        print(f"INCONCLUSIVE: {target} never succeeded, so nothing was verified")
+        repeats = [
+            decision
+            for decision in decisions
+            if (requested := _requested_operation(decision)) is not None
+            and _is_target_operation(*requested, target)
+        ]
+        if len(repeats) > 1 or ended_on_guard:
+            # Still worth saying loudly: the controller looping on a failing
+            # call is a real problem, just not the one this check decides.
+            print(
+                f"  note: the controller requested {target} "
+                f"{len(repeats)} times"
+                + (" and the loop guard ended the task" if ended_on_guard else "")
+            )
         if "local inference failed" in result.reason:
             print("  local inference failed - is llama-server running?")
             print("    systemctl status llama-server --no-pager")
@@ -370,7 +461,7 @@ def main() -> int:
         # Refused but recovered from: worth seeing, not a failure by itself.
         print(f"note: loop guard refused a repeat ({', '.join(guard_events)}) but did not end the task")
     print(
-        f"PASS: {TARGET_OPERATION}({TARGET_ISSUE}) succeeded in event "
+        f"PASS: {target} succeeded in event "
         f"{successes[0].get('event_id')} and was not requested again; "
         f"the controller continued with {len(result.observations) - (first_success_index or 0) - 1} "
         "further observation(s)"
