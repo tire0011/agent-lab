@@ -30,7 +30,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from modules.checkout_rescue import (
     CheckoutRescue,
@@ -50,6 +50,9 @@ DEFAULT_REMOTE = "origin"
 _FETCH_TIMEOUT = 120
 _SERVICE_TIMEOUT = 60
 DEFAULT_SERVICES: tuple[str, ...] = ("agent-api", "nexus-mailbox")
+
+#: Distinguishes "detect my unit" from an explicit "I am in no unit".
+_UNSET: Any = object()
 
 
 #: A refresh must never end in a traceback: git can time out or the checkout
@@ -121,17 +124,54 @@ class RefreshResult:
         return lines
 
 
+def own_unit(cgroup_path: str = "/proc/self/cgroup") -> str | None:
+    """The systemd unit this process runs inside, if it can be determined.
+
+    Restarting one's own unit is not the same operation as restarting someone
+    else's, and the difference has to be known before the command is built -
+    see ``systemd_restarter``.
+    """
+    try:
+        text = Path(cgroup_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for piece in reversed(text.replace("\n", "/").split("/")):
+        name = piece.strip()
+        if name.endswith(".service"):
+            return name[: -len(".service")]
+    return None
+
+
 def systemd_restarter(
     services: Sequence[str] = DEFAULT_SERVICES,
     *,
     use_sudo: bool = True,
+    current_unit: str | None = _UNSET,
 ) -> Callable[[], dict[str, str]]:
-    """Restarter that asks systemd to restart *services*, one report per unit."""
+    """Restarter that asks systemd to restart *services*, one report per unit.
+
+    Restarting the unit this process runs inside needs ``--no-block``. Without
+    it systemd tears the caller down while it is still waiting for its own
+    ``systemctl`` to return, so the call comes back non-zero with both streams
+    empty - and a restart that *worked* is reported as a failure. That is
+    exactly what happened the first time a mailbox refresh restarted
+    ``agent-api`` from inside ``agent-api``: the journal shows the unit
+    stopping and starting cleanly while the report said ``error:``.
+
+    ``--no-block`` returns as soon as the job is queued, so the outcome is
+    genuinely unknown to us. It is reported as requested rather than as done,
+    because claiming either would be a guess.
+    """
+    unit = own_unit() if current_unit is _UNSET else current_unit
 
     def restart() -> dict[str, str]:
         results: dict[str, str] = {}
         for service in services:
-            command = (["sudo"] if use_sudo else []) + ["systemctl", "restart", service]
+            replacing_self = unit is not None and service == unit
+            command = (["sudo"] if use_sudo else []) + ["systemctl", "restart"]
+            if replacing_self:
+                command.append("--no-block")
+            command.append(service)
             try:
                 completed = subprocess.run(
                     command,
@@ -144,7 +184,11 @@ def systemd_restarter(
                 results[service] = f"error: {redact_secrets(str(exc))[:200]}"
                 continue
             if completed.returncode == 0:
-                results[service] = "restarted"
+                results[service] = (
+                    "restart requested (this process is being replaced)"
+                    if replacing_self
+                    else "restarted"
+                )
             else:
                 # The exit code always goes in. systemctl can fail writing
                 # nothing at all to either stream - a refresh reported

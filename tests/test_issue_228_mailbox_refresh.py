@@ -249,6 +249,85 @@ class SystemdRestarterTests(unittest.TestCase):
         self.assertIn("run it by hand", result["agent-api"])
 
 
+class SelfRestartTests(unittest.TestCase):
+    """Restarting the unit you are running inside is a different operation.
+
+    The first mailbox refresh restarted `agent-api` from inside `agent-api`.
+    systemd tore the caller down while it was still waiting for its own
+    `systemctl` to return, so the call came back non-zero with both streams
+    empty and a restart that *worked* was reported as a failure - the journal
+    shows the unit stopping and starting cleanly at the same second.
+    """
+
+    def _run(self, services, current_unit):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        seen = []
+
+        def fake_run(command, **kwargs):
+            seen.append(command)
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with patch.object(refresh_module.subprocess, "run", side_effect=fake_run):
+            result = refresh_module.systemd_restarter(
+                services, current_unit=current_unit
+            )()
+        return result, seen
+
+    def test_restarting_our_own_unit_does_not_block(self):
+        result, commands = self._run(("agent-api",), "agent-api")
+        self.assertIn("--no-block", commands[0])
+        self.assertIn("requested", result["agent-api"])
+
+    def test_restarting_another_unit_still_blocks_and_reports_the_outcome(self):
+        result, commands = self._run(("nginx",), "agent-api")
+        self.assertNotIn("--no-block", commands[0])
+        self.assertEqual(result["nginx"], "restarted")
+
+    def test_outside_a_unit_nothing_is_treated_as_self(self):
+        result, commands = self._run(("agent-api",), None)
+        self.assertNotIn("--no-block", commands[0])
+        self.assertEqual(result["agent-api"], "restarted")
+
+    def test_a_queued_restart_is_not_reported_as_done(self):
+        """--no-block returns before the outcome exists; say so, do not guess."""
+        result, _ = self._run(("agent-api",), "agent-api")
+        self.assertNotEqual(result["agent-api"], "restarted")
+
+
+class OwnUnitTests(unittest.TestCase):
+    def _own_unit(self, text):
+        from modules.nexus_refresh import own_unit
+
+        path = Path(self._tmp.name) / "cgroup"
+        path.write_text(text, encoding="utf-8")
+        return own_unit(str(path))
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_a_systemd_service_cgroup_is_recognised(self):
+        self.assertEqual(
+            self._own_unit("0::/system.slice/agent-api.service\n"), "agent-api"
+        )
+
+    def test_a_nested_scope_still_finds_the_service(self):
+        self.assertEqual(
+            self._own_unit("0::/system.slice/agent-api.service/somescope\n"),
+            "agent-api",
+        )
+
+    def test_no_service_in_the_cgroup_is_not_a_guess(self):
+        self.assertIsNone(self._own_unit("0::/user.slice/user-1000.slice\n"))
+
+    def test_an_unreadable_cgroup_is_not_an_error(self):
+        from modules.nexus_refresh import own_unit
+
+        self.assertIsNone(own_unit(str(Path(self._tmp.name) / "missing")))
+
+
 class MessageCannotWidenTheOperationTests(unittest.TestCase):
     """What the front matter must NOT be able to influence."""
 
