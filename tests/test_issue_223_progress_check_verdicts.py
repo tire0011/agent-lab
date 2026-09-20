@@ -342,6 +342,40 @@ class RecordedSessionTests(unittest.TestCase):
         self.assertIn("replayed at a", out)
         self.assertNotIn("prompt None chars", out)
 
+    def test_the_budget_that_bounded_the_prompt_is_reported(self):
+        """The number that decided whether the result arrived at all.
+
+        Finding this cost a journal grep for `controller_prompt_budget`: the
+        canonical run showed a controller asking again, and not that a
+        150-character observation budget had stubbed a 3005-character result
+        away. A check about what the controller reads has to show what
+        bounded it.
+        """
+        code, out = self._judge(self._session([SUCCESS]))
+        self.assertEqual(code, 0, out)
+        self.assertIn("observation_chars", out)
+        self.assertIn("low_memory", out)
+
+    def test_a_squeezed_budget_says_what_it_costs(self):
+        """150 characters is not a number a reader can price on sight."""
+        plan = check._live_budget()
+        plan.observation_chars = 150
+
+        with patch.object(check, "_live_budget", return_value=plan):
+            _code, out = self._judge(self._session([SUCCESS]))
+
+        self.assertIn("stubbed away", out)
+        self.assertIn("not what it returned", out)
+
+    def test_a_healthy_budget_carries_no_warning(self):
+        plan = check._live_budget()
+        plan.observation_chars = 9000
+
+        with patch.object(check, "_live_budget", return_value=plan):
+            _code, out = self._judge(self._session([SUCCESS]))
+
+        self.assertNotIn("stubbed away", out)
+
     def test_the_production_database_is_never_deleted(self):
         """The driving mode unlinks its scratch db; this one must not."""
         session = self._session([SUCCESS])

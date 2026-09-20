@@ -308,9 +308,11 @@ def main() -> int:
     orchestrator._parse = _recording_parse  # type: ignore[method-assign]
 
     prompts: list[dict[str, Any]] = []
+    budget_seen: list[Any] = []
     original_build_prompt = orchestrator._build_prompt
 
     def _recording_build_prompt(session, current_input, history, observations, budget_plan):
+        budget_seen.append(budget_plan)
         prompt, meta = original_build_prompt(session, current_input, history, observations, budget_plan)
         _, _, tail = prompt.partition("OBSERVATIONS FROM TOOLS USED IN THIS RUN:\n")
         prompts.append(
@@ -344,6 +346,10 @@ def main() -> int:
 
     print(f"session id:   {result.session_id}")
     print()
+    if budget_seen:
+        for line in _describe_budget(budget_seen[-1], measured_now=False):
+            print(line)
+        print()
 
     return report_and_judge(
         observations=result.observations,
@@ -417,6 +423,9 @@ def judge_recorded_session(args, target: "_Target") -> int:
     print()
     print(f"session id:   {session_id}")
     print()
+    for line in _describe_budget(_live_budget(), measured_now=True):
+        print(line)
+    print()
 
     if not observations:
         print("INCONCLUSIVE: that session journalled no tool observations")
@@ -434,6 +443,46 @@ def judge_recorded_session(args, target: "_Target") -> int:
         prompts=_replay_prompts(observations),
         show_prompts=args.show_prompts,
         dump_json=args.json,
+    )
+
+
+def _describe_budget(plan: Any, *, measured_now: bool) -> list[str]:
+    """The numbers that decide whether a result reaches the controller at all.
+
+    Printed because leaving them out cost real time: the canonical run showed
+    a controller asking again, and the reason - a 150-character observation
+    budget that stubbed a 3005-character result away - was only visible by
+    grepping `controller_prompt_budget` out of the journal. A check about what
+    the controller reads has to show what bounded it.
+    """
+    where = "measured on this host now" if measured_now else "as the run reported"
+    lines = [
+        f"budget ({where})",
+        f"  observation_chars:      {plan.observation_chars}",
+        f"  effective_budget_chars: {plan.effective_budget_chars}",
+        f"  context_budget_chars:   {plan.context_budget_chars}",
+        f"  low_memory:             {plan.low_memory}",
+    ]
+    if plan.observation_chars < 1000:
+        # Small enough that any real tool result becomes a bare reference.
+        lines.append(
+            "  NOTE: at this budget a real tool result is stubbed away, so the"
+        )
+        lines.append(
+            "        controller sees that a call succeeded and not what it returned."
+        )
+    return lines
+
+
+def _live_budget() -> Any:
+    from modules.prompt_budget import (
+        compute_budget, read_mem_available_kb, read_swap_free_kb, read_swap_total_kb,
+    )
+
+    return compute_budget(
+        mem_available_kb=read_mem_available_kb(),
+        swap_free_kb=read_swap_free_kb(),
+        swap_total_kb=read_swap_total_kb(),
     )
 
 
@@ -456,19 +505,11 @@ def _replay_prompts(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     from modules.prompt_budget import (
         compact_observations,
-        compute_budget,
         controller_observation_view,
         prompt_json,
-        read_mem_available_kb,
-        read_swap_free_kb,
-        read_swap_total_kb,
     )
 
-    plan = compute_budget(
-        mem_available_kb=read_mem_available_kb(),
-        swap_free_kb=read_swap_free_kb(),
-        swap_total_kb=read_swap_total_kb(),
-    )
+    plan = _live_budget()
     replayed: list[dict[str, Any]] = []
     for turn in range(1, len(observations) + 1):
         viewed = controller_observation_view(observations[:turn])

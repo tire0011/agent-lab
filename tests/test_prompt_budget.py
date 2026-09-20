@@ -42,11 +42,17 @@ class ComputeBudgetTests(unittest.TestCase):
         # not just re-apply the value effective_budget_chars already used.
         self.assertEqual(starved.safe_local_budget_chars, 0)
 
-    def test_realistic_low_memory_range_blocks_local_calls(self):
-        # A host with only 100-500MB free is already dangerously low when
-        # the configured local model needs ~2048MB just to run; the old
-        # heuristic only tripped below ~15MB and let these values through
-        # with the full context budget still allowed.
+    def test_realistic_low_memory_range_is_flagged_but_never_blocks_local_calls(self):
+        # The name matters: nothing here blocks anything. `low_memory` and
+        # `safe_local_budget_chars` are advisory - the controller still calls
+        # llama-server, and an external provider is used only after a real
+        # local failure (see test_task_orchestrator's
+        # test_low_memory_budget_is_advisory_when_local_succeeds). The model is
+        # already loaded on the second call, so an attempt can well succeed
+        # where a prediction said it would not.
+        #
+        # A host with only 100-500MB free is genuinely thin, and saying so is
+        # worth doing; the old heuristic only tripped below ~15MB.
         for mem_available_kb in (100_000, 250_000, 500_000):
             with self.subTest(mem_available_kb=mem_available_kb):
                 plan = compute_budget(
@@ -57,6 +63,9 @@ class ComputeBudgetTests(unittest.TestCase):
                 )
                 self.assertTrue(plan.low_memory)
                 self.assertEqual(plan.safe_local_budget_chars, 0)
+                # Advisory, not a gate: there is still a prompt to send.
+                self.assertGreater(plan.effective_budget_chars, 0)
+                self.assertGreater(plan.observation_chars, 0)
 
     def test_no_swap_configured_does_not_trigger_low_memory(self):
         # /proc/meminfo always reports "SwapFree: 0" when no swap device is
