@@ -131,12 +131,10 @@ class TestOperationChainService:
         request = OperationChainRequest(steps=[OperationChainStep(id="step1", action="local_model_status")])
         result = service.start_chain(request)
         assert result.overall_status == STATUS_QUEUED
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            current = service.get_chain(result.request_id)
-            if current and current.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS):
-                break
-            time.sleep(0.01)
+        assert service.wait_for_chain(result.request_id)
+        current = service.get_chain(result.request_id)
+        assert current is not None
+        assert current.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS)
         mock_registry.execute.assert_called_with("local_model_status", {})
 
     def test_max_ten_steps_limit_rejected(self):
@@ -281,15 +279,14 @@ class TestOperationChainService:
         )
         
         result = service.start_chain(request)
-        # Wait for background thread
-        time.sleep(0.5)
-        
-        # Get updated result
+        assert service.wait_for_chain(result.request_id)
+
         result = service.get_chain(result.request_id)
-        # Step 3 should be skipped
+        # Step 3 must be there and must be skipped. `if step3:` used to guard
+        # this, so a chain that had not got that far yet passed silently.
         step3 = next((s for s in result.steps if s.id == "step3"), None)
-        if step3:
-            assert step3.status == "skipped"
+        assert step3 is not None, "step3 missing from a finished chain"
+        assert step3.status == "skipped"
 
     def test_successful_chain_execution(self, service):
         """Test successful chain execution."""
@@ -302,14 +299,14 @@ class TestOperationChainService:
         
         result = service.start_chain(request)
         request_id = result.request_id
-        
-        # Wait for execution
-        time.sleep(1)
-        
-        # Get final result
+
+        assert service.wait_for_chain(request_id)
+
         final = service.get_chain(request_id)
         assert final is not None
-        assert final.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS, STATUS_RUNNING)
+        # STATUS_RUNNING used to be accepted here, which made the assertion
+        # hold whether or not the chain had run at all.
+        assert final.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS)
 
     def test_timeout_handled(self, service):
         """Test operation timeout is handled."""
@@ -323,11 +320,12 @@ class TestOperationChainService:
         )
         
         result = service.start_chain(request)
-        time.sleep(0.5)
-        
+        assert service.wait_for_chain(result.request_id)
+
         final = service.get_chain(result.request_id)
-        # Should complete with error despite timeout
-        assert final.overall_status in (STATUS_COMPLETED_WITH_ERRORS, STATUS_RUNNING, STATUS_FAILED)
+        # Should complete with error despite timeout. STATUS_RUNNING is no
+        # longer accepted: the chain has finished by the time we look.
+        assert final.overall_status in (STATUS_COMPLETED_WITH_ERRORS, STATUS_FAILED)
 
     def test_output_truncation(self, service):
         """Test output is truncated in results."""
@@ -345,14 +343,15 @@ class TestOperationChainService:
         )
         
         result = service.start_chain(request)
-        time.sleep(0.5)
-        
+        assert service.wait_for_chain(result.request_id)
+
         final = service.get_chain(result.request_id)
-        if final.steps:
-            step = final.steps[0]
-            # Should be truncated
-            assert len(step.output) <= 100
-            assert all(len(line) <= 500 for line in step.output)
+        # `if final.steps:` used to guard this, so a chain that had not
+        # produced a step yet passed without checking any truncation.
+        assert final.steps, "a finished chain produced no steps"
+        step = final.steps[0]
+        assert len(step.output) <= 100
+        assert all(len(line) <= 500 for line in step.output)
 
     def test_outbox_file_written(self, service):
         """Test that outbox file is written."""
@@ -498,15 +497,8 @@ class TestOperationChainServiceRealRegistryIntegration:
                 request = OperationChainRequest(steps=steps)
                 result = service.start_chain(request)
 
-                deadline = time.time() + 15
+                assert service.wait_for_chain(result.request_id, timeout=15)
                 final = service.get_chain(result.request_id)
-                while final is not None and final.overall_status not in (
-                    STATUS_COMPLETED,
-                    STATUS_COMPLETED_WITH_ERRORS,
-                    STATUS_FAILED,
-                ) and time.time() < deadline:
-                    time.sleep(0.05)
-                    final = service.get_chain(result.request_id)
                 return final
             finally:
                 service.close()
