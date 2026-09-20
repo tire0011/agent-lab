@@ -463,8 +463,11 @@ class TestMigration(unittest.TestCase):
 
 class TestApiAuth(unittest.TestCase):
     def test_list_pending_auth(self):
-        import os
-        os.environ.setdefault("AGENT_API_KEY", "test-key-abc")
+        # No AGENT_API_KEY set here: conftest has already set it, this request
+        # deliberately sends no key, and 401 is the assertion. The setdefault
+        # that used to sit here named a third key nothing else used, which is
+        # how the suite drifted into disagreeing with itself about the one
+        # value every API test depends on.
         from fastapi.testclient import TestClient
         svc = MagicMock()
         svc.list_recent.return_value = []

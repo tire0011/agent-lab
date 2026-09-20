@@ -22,7 +22,15 @@ os.environ.setdefault("AGENT_LOG_DIR", _LOG_DIR)
 # api.py reads this at module level, and several service defaults resolve the
 # database path at import time. Without it a suite run can touch the real
 # state database.
-os.environ.setdefault("AGENT_API_KEY", "test-api-key")
+#
+# The value is not arbitrary. Every API test module sends `x-api-key:
+# test-key`, and .github/workflows/tests.yml exports `AGENT_API_KEY: test-key`
+# - so in CI this setdefault never fires and the suite is green. Anywhere the
+# variable is unset, which is every developer machine and the VM, this line
+# won the race with a *different* key and ~90 authenticated tests answered 401
+# instead of 200. A suite that passes only under the one environment that
+# happens to override it is not passing.
+os.environ.setdefault("AGENT_API_KEY", "test-key")
 
 # Mailbox configuration is required at import time by api.py. Point it at an
 # isolated canonical-layout checkout so tests can never fall back to /agent.

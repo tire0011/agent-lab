@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # Must be set before api.py is imported (it reads os.environ["AGENT_API_KEY"] at module level).
-os.environ.setdefault("AGENT_API_KEY", "test-api-key")
+# conftest has already set it by the time this runs, so this is a fallback for
+# importing the module directly - and it has to name the same key the rest of
+# the suite uses, or it reintroduces the mismatch it looks like it is avoiding.
+# The endpoint tests below do not rely on it: they monkeypatch api.API_KEY to
+# _MAINT_API_KEY, deliberately a different value, to prove the override works.
+os.environ.setdefault("AGENT_API_KEY", "test-key")
 
 from modules.maintenance_service import (
     MaintenanceAuthError,
