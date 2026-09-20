@@ -25,26 +25,74 @@ Exit 2 is deliberately not a pass. A run that never obtained a successful
 result cannot say whether the controller reuses one, and reporting it as a pass
 would be the same mistake as trusting a test that never ran.
 
+**#223 counts as verified only when the canonical `github_issue(196)` run
+exits 0** — see "Verifying the canonical scenario on the VM" below. The
+`git_status` variant is a secondary smoke test.
+
 Repeating a call that keeps *failing* is a loop, but it is not this one, so it
 reports 2 rather than 1 — with the repeats printed. There is no result to
 reuse, and calling it the #223 regression would send the next reader hunting
 for a prompt bug behind a broken token.
 
-## The GitHub token, and why the default task cannot pass on the VM
+## Verifying the canonical scenario on the VM
 
 `github_issue` refuses without a credential:
 
 > GitHub lifecycle is required for Nexus implementation work. Configure
 > `GITHUB_TOKEN`/`GH_TOKEN` before starting or resuming implementation.
 
-The mailbox command channel has `GITHUB_REPOSITORY` but no token, and
-`/etc/agent-lab/agent.env` is root-owned by design (see `scripts/nexus.ps1`) so
-the `agent` user cannot source it. Measured on the VM on 2026-09-20, both
-`github_issue(196)` calls in a real controller run failed for this reason, and
-the run could only ever report INCONCLUSIVE.
+The mailbox **`command`** channel cannot supply one, and that is deliberate:
+`modules/mailbox/development.py` drops every variable whose name contains
+`TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL` or `AZURE_OPENAI` from the
+child environment, so a shell command can never exfiltrate a credential. Do
+not work around it. Copying the token into the mailbox, or printing it, is
+exactly what that filter exists to prevent.
 
-Until a token reaches that environment, drive the same code path with a
-capability that needs no credentials:
+The mailbox **`task`** channel has no such problem. `modules/mailbox/
+task_service.py` builds the orchestrator *in-process*, inside a service whose
+unit carries `EnvironmentFile=/etc/agent-lab/agent.env`, so the controller
+reaches GitHub with the real credential and nothing is copied anywhere. So the
+canonical run happens there, and the check reads back what it did.
+
+### Step 1 — run the canonical task
+
+```markdown
+---
+type: task
+created_by: <you>
+---
+
+solve github issue #196
+```
+
+### Step 2 — judge that session
+
+Take the session id from the outbox response (or `GET /logs/trace/{id}`) and:
+
+```markdown
+---
+type: command
+created_by: <you>
+---
+
+cd /agent
+/agent/.venv/bin/python scripts/check_issue_196_controller_progress.py \
+    --session-id <session id> \
+    --db-path /var/lib/nexus/agent.db
+```
+
+`--session-id` judges a run that already happened instead of driving one. It
+opens the database read-only and never deletes it, unlike the scratch database
+the driving mode uses. Exit codes are the same, and **this is the run whose 0
+means #223 is verified**.
+
+What the journal carries is enough for the verdict: every tool observation is
+recorded as it happens, loop-guard refusals included. The one thing it does not
+carry is a request the guard refused *before* execution, which is why the
+verdict also reads the guard's own refusal events rather than relying on the
+controller's decisions.
+
+### The `git_status` variant
 
 ```bash
 cd /agent
@@ -53,8 +101,12 @@ cd /agent
     --operation git_status
 ```
 
-`--operation` changes only which call the check watches for repetition. The
-controller, the prompt construction and the compaction under test are the same.
+This runs entirely through the `command` channel, needs no credential, and
+exercises the same compaction and loop-guard path. It is a **secondary smoke
+test**: it does not carry the shape that produced the bug - a large issue body,
+the `issue_number` argument identity, and how those compact under the VM's
+observation budget. A green `git_status` run does not on its own mean #223 is
+verified.
 
 ## Running it on the VM
 
@@ -150,6 +202,7 @@ sample of a small model; re-run it a few times before concluding anything.
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
+| `--session-id` | – | judge a recorded session instead of driving one |
 | `--task` | `solve github issue #196` | the task text to drive the controller with |
 | `--operation` | `github_issue` | the call whose repetition is the regression |
 | `--expect-arg` | `issue_number=196` | only count calls carrying this argument; repeatable |

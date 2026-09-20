@@ -21,6 +21,7 @@ import importlib.util
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -156,6 +157,111 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         code, out = _run([git_status], [call, call, ANSWER], argv=["--operation", "git_status"])
         self.assertEqual(code, 1, out)
+
+
+class RecordedSessionTests(unittest.TestCase):
+    """Judging a run that already happened, from the journal.
+
+    This is the mode that verifies the canonical #223 scenario on the VM. The
+    mailbox `command` channel strips TOKEN/KEY/SECRET from the child
+    environment by design, so `github_issue` cannot authenticate when the
+    check drives the controller there. The `task` channel builds the
+    orchestrator in-process inside a service that has the credential, so the
+    canonical run happens there and this reads back what it did.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = str(Path(self._tmp.name) / "agent.db")
+
+    def _session(self, observations, *, kind="answer", reason="done"):
+        from modules.nexus_task_store import NexusTaskStore
+
+        store = NexusTaskStore(db_path=self.db_path)
+        try:
+            session = store.get_or_create(
+                source_type="task", source_id="s", title="solve github issue #196"
+            )
+            store.claim_session(session.id, worker_id="w1")
+            for observation in observations:
+                store.append_event(
+                    session.id,
+                    role="tool",
+                    kind=observation.get("tool", "tool"),
+                    content=json.dumps(observation),
+                    metadata={},
+                )
+            store.append_event(
+                session.id, role="assistant", kind=kind, content="x",
+                metadata={"reason": reason},
+            )
+        finally:
+            store.close()
+        return session.id
+
+    def _judge(self, session_id, extra=None):
+        argv = ["--session-id", session_id, "--db-path", self.db_path] + (extra or [])
+        with patch.object(sys, "argv", ["check"] + argv):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                code = check.main()
+        return code, captured.getvalue()
+
+    def test_a_successful_unrepeated_call_passes(self):
+        code, out = self._judge(self._session([SUCCESS]))
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS", out)
+
+    def test_the_same_call_executed_twice_fails(self):
+        session = self._session(
+            [SUCCESS, dict(SUCCESS)],
+            kind="clarification",
+            reason="tool loop limit reached after duplicate_tool_call",
+        )
+        code, out = self._judge(session)
+        self.assertEqual(code, 1, out)
+        self.assertIn("after it succeeded", out)
+
+    def test_a_loop_guard_refusal_of_the_same_call_is_seen(self):
+        """The guard's refusal is journalled even though the request is not."""
+        refusal = {
+            "tool": "operation",
+            "operation": "github_issue",
+            "args": {"issue_number": 196},
+            "event": "duplicate_tool_call",
+            "recovery": "choose_different_tool_or_controlled_final_action",
+        }
+        code, out = self._judge(
+            self._session(
+                [SUCCESS, refusal],
+                kind="clarification",
+                reason="tool loop limit reached after duplicate_tool_call",
+            )
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("loop guard", out)
+
+    def test_a_call_that_never_succeeded_is_inconclusive(self):
+        code, out = self._judge(self._session([REJECTED]))
+        self.assertEqual(code, 2, out)
+        self.assertIn("INCONCLUSIVE", out)
+
+    def test_an_unknown_session_is_inconclusive_not_a_crash(self):
+        code, out = self._judge("no-such-session")
+        self.assertEqual(code, 2, out)
+        self.assertIn("no session", out)
+
+    def test_a_session_with_no_tool_events_is_inconclusive(self):
+        code, out = self._judge(self._session([]))
+        self.assertEqual(code, 2, out)
+        self.assertIn("no tool observations", out)
+
+    def test_the_production_database_is_never_deleted(self):
+        """The driving mode unlinks its scratch db; this one must not."""
+        session = self._session([SUCCESS])
+        self._judge(session)
+        self.assertTrue(Path(self.db_path).exists())
 
 
 class TargetMatchingTests(unittest.TestCase):

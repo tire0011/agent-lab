@@ -14,6 +14,14 @@ param(
     # -Operation git_status decides the reuse question on a host without one.
     [string]$Operation = 'github_issue',
 
+    # Judge a controller run that already happened instead of driving one.
+    # This is how the canonical github_issue(196) scenario is verified: the
+    # mailbox `task` channel runs it in-process with the real credential.
+    [string]$SessionId = '',
+
+    # The database that service writes; only meaningful with -SessionId.
+    [string]$DbPath = '/var/lib/nexus/agent.db',
+
     [ValidateRange(1, 10)]
     [int]$MaxSteps = 8,
 
@@ -92,11 +100,15 @@ catch {
 # Said up front rather than discovered in a two-minute run's verdict: without a
 # token github_issue refuses, so the canonical task can only ever report
 # INCONCLUSIVE.
-if ($Operation -eq 'github_issue' -and -not ($env:GITHUB_TOKEN -or $env:GH_TOKEN)) {
+if (-not $SessionId -and $Operation -eq 'github_issue' -and -not ($env:GITHUB_TOKEN -or $env:GH_TOKEN)) {
     Write-Section 'Credentials'
     Write-Host "No GITHUB_TOKEN/GH_TOKEN in this environment." -ForegroundColor Yellow
     Write-Host "github_issue will refuse, so this run can only report INCONCLUSIVE."
-    Write-Host "To decide the reuse question anyway, re-run with:" -ForegroundColor Yellow
+    Write-Host "To verify the canonical scenario, send the task through the mailbox" -ForegroundColor Yellow
+    Write-Host "`task` channel - which runs it in-process with the real credential -"
+    Write-Host "and judge the session it produced:"
+    Write-Host "  pwsh scripts/nexus-check-223.ps1 -SessionId <session id>"
+    Write-Host "For a credential-free smoke test instead:"
     Write-Host "  -Operation git_status -Task 'report whether the repository has uncommitted changes'"
 }
 
@@ -127,13 +139,20 @@ try {
     Write-Host "python: $Python"
     Write-Host ""
 
-    $Arguments = @(
-        (Join-Path $RepoRoot 'scripts/check_issue_196_controller_progress.py'),
-        '--task', $Task,
-        '--operation', $Operation,
-        '--repo-root', $RepoRoot,
-        '--max-steps', $MaxSteps.ToString()
-    )
+    $Script = Join-Path $RepoRoot 'scripts/check_issue_196_controller_progress.py'
+    if ($SessionId) {
+        # Reads the real database; the driving arguments do not apply.
+        $Arguments = @($Script, '--session-id', $SessionId, '--db-path', $DbPath, '--operation', $Operation)
+    }
+    else {
+        $Arguments = @(
+            $Script,
+            '--task', $Task,
+            '--operation', $Operation,
+            '--repo-root', $RepoRoot,
+            '--max-steps', $MaxSteps.ToString()
+        )
+    }
     if ($ShowPrompts) { $Arguments += '--show-prompts' }
     if ($Json) { $Arguments += '--json' }
 

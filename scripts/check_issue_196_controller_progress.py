@@ -234,6 +234,15 @@ def main() -> int:
             "filter otherwise."
         ),
     )
+    parser.add_argument(
+        "--session-id",
+        help=(
+            "judge a controller run that already happened instead of driving one. "
+            "This is how the canonical github_issue(196) scenario is verified on the "
+            "VM: the mailbox `task` channel runs the controller in-process with the "
+            "real GitHub credential, and this reads back what it did."
+        ),
+    )
     parser.add_argument("--db-path", type=Path, default=Path("/tmp/nexus-issue-196-check.db"))
     parser.add_argument("--repo-root", type=Path, default=Path("/agent"))
     parser.add_argument("--max-steps", type=int, default=8, help="controller turns before it must finish")
@@ -259,6 +268,11 @@ def main() -> int:
         # itself is the whole filter.
         expected = {}
     target = _Target(args.operation, expected)
+
+    if args.session_id:
+        # Reading a real session, so the production database is the input and
+        # must not be deleted the way the scratch one below is.
+        return judge_recorded_session(args, target)
 
     if args.db_path.exists():
         args.db_path.unlink()
@@ -326,6 +340,118 @@ def main() -> int:
     print(f"session id:   {result.session_id}")
     print()
 
+    return report_and_judge(
+        observations=result.observations,
+        decisions=decisions,
+        target=target,
+        final_action=result.action,
+        final_reason=result.reason,
+        prompts=prompts,
+        show_prompts=args.show_prompts,
+        dump_json=args.json,
+    )
+
+
+def judge_recorded_session(args, target: "_Target") -> int:
+    """Judge a controller run that already happened, from its journal.
+
+    This is how the canonical #223 scenario gets verified on the VM. The
+    mailbox `command` channel strips every variable whose name contains
+    TOKEN/KEY/SECRET from the child environment - deliberately, so a shell
+    command can never exfiltrate a credential - which is why `github_issue`
+    cannot authenticate when the check drives the controller itself there.
+
+    The `task` channel has no such problem: `modules.mailbox.task_service`
+    builds the orchestrator in-process, inside a service whose unit carries
+    `EnvironmentFile=/etc/agent-lab/agent.env`, so that run reaches GitHub
+    with the real credential and nothing has to be copied anywhere. What is
+    left is to read back what it did, which is what this does.
+
+    Every tool observation is journalled as it happens, loop-guard refusals
+    included, so the record carries what the verdict needs. The one thing it
+    does not carry is a decision the guard refused before execution - which
+    is why the verdict also reads the guard's own refusal events.
+    """
+    from modules.nexus_task_store import NexusTaskStore
+
+    store = NexusTaskStore(db_path=str(args.db_path))
+    try:
+        session_id = args.session_id
+        if session_id is None:
+            raise SystemExit("--session-id is required in --from-session mode")
+        session = store.get(session_id)
+        if session is None:
+            print(f"INCONCLUSIVE: no session {session_id!r} in {args.db_path}")
+            print("  is --db-path the database the service writes? usually /var/lib/nexus/agent.db")
+            return 2
+        events = sorted(store.recent_events(session_id, limit=100), key=lambda e: e["id"])
+    finally:
+        store.close()
+
+    observations: list[dict[str, Any]] = []
+    final_action = session.status or "?"
+    final_reason = ""
+    for event in events:
+        if event["role"] == "tool":
+            try:
+                observation = json.loads(event["content"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(observation, dict):
+                observation.setdefault("event_id", event["id"])
+                observations.append(observation)
+        elif event["role"] == "assistant":
+            final_action = str(event["kind"] or final_action)
+            final_reason = str((event["metadata"] or {}).get("reason") or event["content"] or "")
+
+    print("#223 manual check: controller reuse of a successful tool result")
+    print(f"mode:       reading session {session_id} back from the journal")
+    print(f"watching:   {target}")
+    print(f"database:   {args.db_path} (read only)")
+    print(f"task:       {redact_secrets(str(session.title or session.source_id or ''))[:200]!r}")
+    print()
+    print(f"session id:   {session_id}")
+    print()
+
+    if not observations:
+        print("INCONCLUSIVE: that session journalled no tool observations")
+        print("  it may still be running - check again once it has finished")
+        return 2
+
+    return report_and_judge(
+        observations=observations,
+        # Not recorded: the controller's rejected requests never reach the
+        # journal. The verdict falls back to executions and guard refusals.
+        decisions=[],
+        target=target,
+        final_action=final_action,
+        final_reason=final_reason,
+        prompts=[],
+        show_prompts=False,
+        dump_json=args.json,
+    )
+
+
+def report_and_judge(
+    *,
+    observations: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    target: "_Target",
+    final_action: str,
+    final_reason: str,
+    prompts: list[dict[str, Any]],
+    show_prompts: bool,
+    dump_json: bool,
+) -> int:
+    """Print the trace and return the exit code.
+
+    Shared by both modes. A run driven here has the decisions in hand; a
+    session read back from the journal has only what was durably recorded,
+    and passes an empty ``decisions`` list. The verdict has to hold either
+    way, which is why a repeat is also detected from the executions and the
+    loop guard's own refusals - those are journalled, the model's rejected
+    request is not.
+    """
     print("controller decisions")
     for index, decision in enumerate(decisions, start=1):
         action = str(decision.get("action", "?"))
@@ -338,17 +464,17 @@ def main() -> int:
     print()
 
     print("tool events")
-    for index, observation in enumerate(result.observations, start=1):
+    for index, observation in enumerate(observations, start=1):
         print(f"  {index}. {_describe_observation(observation)}")
     print()
 
-    if args.show_prompts:
+    if show_prompts:
         print("compact observations given to the controller")
         _print_prompt_observations(prompts)
         print()
 
-    print(f"final action: {result.action}")
-    print(f"reason:       {redact_secrets(result.reason)}")
+    print(f"final action: {final_action}")
+    print(f"reason:       {redact_secrets(final_reason)}")
     print()
 
     # --- verdict -----------------------------------------------------------
@@ -356,7 +482,7 @@ def main() -> int:
     # Position in the whole observation list, kept alongside, so "what came
     # after the success" can be counted without searching by value.
     execution_positions = []
-    for position, observation in enumerate(result.observations):
+    for position, observation in enumerate(observations):
         if observation.get("tool") != "operation":
             continue
         if not _is_target_operation(
@@ -414,14 +540,14 @@ def main() -> int:
     guard_events = sorted(
         {
             str(observation.get("event"))
-            for observation in result.observations
+            for observation in observations
             if str(observation.get("event", "")) in LOOP_GUARD_EVENTS
         }
     )
-    ended_on_guard = result.action == ACTION_CLARIFICATION and "tool loop limit" in result.reason
+    ended_on_guard = final_action == ACTION_CLARIFICATION and "tool loop limit" in final_reason
 
-    if args.json:
-        print(json.dumps(result.observations, indent=2, sort_keys=True, default=str))
+    if dump_json:
+        print(json.dumps(observations, indent=2, sort_keys=True, default=str))
         print()
 
     failures = []
@@ -442,7 +568,7 @@ def main() -> int:
             print(f"FAIL: {failure}")
         for decision in repeated_requests:
             print(f"  repeated request: {redact_secrets(json.dumps(decision, sort_keys=True, default=str))[:500]}")
-        if not args.show_prompts:
+        if not show_prompts:
             print()
             print("compact observations given to the controller")
             _print_prompt_observations(prompts)
@@ -464,7 +590,7 @@ def main() -> int:
                 f"{len(repeats)} times"
                 + (" and the loop guard ended the task" if ended_on_guard else "")
             )
-        if "local inference failed" in result.reason:
+        if "local inference failed" in final_reason:
             print("  local inference failed - is llama-server running?")
             print("    systemctl status llama-server --no-pager")
             print("    journalctl -u llama-server -n 50 --no-pager")
@@ -474,7 +600,7 @@ def main() -> int:
                 print(f"    {_describe_observation(observation)}")
             print("  a missing/expired GitHub token looks exactly like this")
         else:
-            print(f"  the controller went to {result.action} without ever fetching the issue")
+            print(f"  the controller went to {final_action} without ever fetching the issue")
             print("  try a larger --max-steps")
         return 2
 
@@ -485,11 +611,10 @@ def main() -> int:
         f"PASS: {target} succeeded in event "
         f"{successes[0].get('event_id')} and was not requested again; "
         f"the controller continued with "
-        f"{len(result.observations) - execution_positions[first_success_at] - 1} "
+        f"{len(observations) - execution_positions[first_success_at] - 1} "
         "further observation(s)"
     )
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
