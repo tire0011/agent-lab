@@ -146,8 +146,14 @@ def systemd_restarter(
             if completed.returncode == 0:
                 results[service] = "restarted"
             else:
+                # The exit code always goes in. systemctl can fail writing
+                # nothing at all to either stream - a refresh reported
+                # "service agent-api: error: " with no reason after it, which
+                # says only that something went wrong somewhere.
                 detail = redact_secrets(completed.stderr or completed.stdout).strip()[:200]
-                results[service] = f"error: {detail}"
+                if not detail:
+                    detail = "no output; run it by hand to see why"
+                results[service] = f"error: exit {completed.returncode}: {detail}"
         return results
 
     return restart

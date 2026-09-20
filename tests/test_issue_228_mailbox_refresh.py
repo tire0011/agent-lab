@@ -181,6 +181,74 @@ class ProcessRefreshTests(unittest.TestCase):
         self.assertIn("No services were restarted", body)
 
 
+class ServiceRestartReportingTests(unittest.TestCase):
+    """A deploy that did not restart is not a deploy.
+
+    The first real refresh moved the checkout and reported
+    `service agent-api: error: ` - no reason - under the heading "Refresh
+    complete". Both halves were wrong: the reason was missing, and the new
+    code was on disk while the old code kept serving.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+
+    def _body(self, services):
+        body, _ = process_refresh(
+            _message(branch="main"), self.repo, self.conn, 1,
+            refresher=lambda b, r: _result(branch=b, services=services),
+            repo_root=self.repo,
+        )
+        return body
+
+    def test_a_failed_restart_is_not_called_complete(self):
+        body = self._body({"agent-api": "error: exit 1: permission denied"})
+        self.assertIn("incomplete", body)
+        self.assertNotIn("Refresh complete", body)
+
+    def test_a_failed_restart_names_the_service_that_is_not_running_new_code(self):
+        body = self._body({"agent-api": "error: exit 1: nope"})
+        self.assertIn("Not running the new code", body)
+        self.assertIn("agent-api", body)
+
+    def test_an_all_restarted_refresh_is_complete(self):
+        body = self._body({"agent-api": "restarted"})
+        self.assertIn("Refresh complete", body)
+        self.assertNotIn("incomplete", body)
+        self.assertNotIn("Not running the new code", body)
+
+
+class SystemdRestarterTests(unittest.TestCase):
+    """The reason for a failure must survive into the report."""
+
+    def _restart(self, returncode, stderr="", stdout=""):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        completed = SimpleNamespace(returncode=returncode, stderr=stderr, stdout=stdout)
+        with patch.object(refresh_module.subprocess, "run", return_value=completed):
+            return refresh_module.systemd_restarter(("agent-api",))()
+
+    def test_a_successful_restart_says_so(self):
+        self.assertEqual(self._restart(0), {"agent-api": "restarted"})
+
+    def test_a_failure_carries_the_exit_code_and_the_message(self):
+        result = self._restart(1, stderr="Interactive authentication required.")
+        self.assertIn("exit 1", result["agent-api"])
+        self.assertIn("Interactive authentication required", result["agent-api"])
+
+    def test_a_silent_failure_still_says_something_actionable(self):
+        # This is the one that happened: non-zero with both streams empty.
+        result = self._restart(1)
+        self.assertIn("exit 1", result["agent-api"])
+        self.assertNotEqual(result["agent-api"].strip(), "error:")
+        self.assertIn("run it by hand", result["agent-api"])
+
+
 class MessageCannotWidenTheOperationTests(unittest.TestCase):
     """What the front matter must NOT be able to influence."""
 
