@@ -352,24 +352,41 @@ def main() -> int:
     print()
 
     # --- verdict -----------------------------------------------------------
-    executions = [
-        observation
-        for observation in result.observations
-        if observation.get("tool") == "operation"
-        and _is_target_operation(str(observation.get("operation", "")), observation.get("args"), target)
-    ]
+    executions = []
+    # Position in the whole observation list, kept alongside, so "what came
+    # after the success" can be counted without searching by value.
+    execution_positions = []
+    for position, observation in enumerate(result.observations):
+        if observation.get("tool") != "operation":
+            continue
+        if not _is_target_operation(
+            str(observation.get("operation", "")), observation.get("args"), target
+        ):
+            continue
+        executions.append(observation)
+        execution_positions.append(position)
     successes = [obs for obs in executions if _operation_succeeded(obs)]
 
-    first_success_index = None
-    for index, observation in enumerate(result.observations):
-        if observation in successes:
-            first_success_index = index
-            break
+    # Position of the first success within `executions`, so "after it
+    # succeeded" can be measured. Tracked by index rather than by value: two
+    # identical calls produce two equal dicts, and `in` would find the wrong one.
+    first_success_at = next(
+        (index for index, obs in enumerate(executions) if _operation_succeeded(obs)),
+        None,
+    )
 
     repeated_requests: list[dict[str, Any]] = []
-    if successes:
-        success_signature = _normalized_args(successes[0].get("args"))
-        seen_success = False
+    if first_success_at is not None:
+        success_signature = _normalized_args(executions[first_success_at].get("args"))
+        # Every matching request up to and including the one that produced the
+        # success is part of getting there - a rejected attempt and its
+        # corrected retry included. Only what comes after is a repeat.
+        #
+        # `first_success_at` counts the target executions before the success,
+        # so that many requests plus the successful one are skipped. Requests
+        # the loop guard refused never became executions, which is why this
+        # counts requests separately rather than trusting the two to align.
+        to_skip = first_success_at + 1
         for decision in decisions:
             requested = _requested_operation(decision)
             if requested is None:
@@ -377,19 +394,23 @@ def main() -> int:
             tool, arguments = requested
             if not _is_target_operation(tool, arguments, target):
                 continue
-            if not seen_success:
-                # The call that produced the success itself is not a repeat.
-                seen_success = True
+            if to_skip > 0:
+                to_skip -= 1
                 continue
             if _normalized_args(arguments) == success_signature:
                 repeated_requests.append(decision)
 
-    # Only counted once something succeeded. Repeating a call that keeps
-    # failing is a loop, but not this one: there is no result to reuse, so it
-    # says nothing about whether the controller reuses one. That run is
+    # Executions *after* the first success, which is the regression. Not
+    # `executions[1:]`: a rejected first attempt followed by a corrected one
+    # that worked is the controller recovering, and calling that a repeat
+    # would fail the very behaviour this check wants.
+    #
+    # Empty while nothing has succeeded. Repeating a call that keeps failing
+    # is a loop, but not this one: there is no result to reuse, so it says
+    # nothing about whether the controller reuses one. That run is
     # inconclusive, and reporting it as the #223 regression would send the
     # next reader looking for a prompt bug behind a broken GitHub token.
-    repeated_executions = executions[1:] if successes else []
+    repeated_executions = executions[first_success_at + 1:] if first_success_at is not None else []
     guard_events = sorted(
         {
             str(observation.get("event"))
@@ -411,7 +432,7 @@ def main() -> int:
         )
     if repeated_executions:
         failures.append(
-            f"{target} executed {len(executions)} times with the same arguments"
+            f"{target} executed {len(repeated_executions)} more time(s) after it succeeded"
         )
     if ended_on_guard:
         failures.append("the loop guard is what ended the task")
@@ -463,7 +484,8 @@ def main() -> int:
     print(
         f"PASS: {target} succeeded in event "
         f"{successes[0].get('event_id')} and was not requested again; "
-        f"the controller continued with {len(result.observations) - (first_success_index or 0) - 1} "
+        f"the controller continued with "
+        f"{len(result.observations) - execution_positions[first_success_at] - 1} "
         "further observation(s)"
     )
     return 0
