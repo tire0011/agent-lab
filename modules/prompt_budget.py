@@ -527,11 +527,19 @@ def _operation_view(obs: dict[str, Any]) -> dict[str, Any]:
         # whole message, and there is no result to unwrap.
         return view
     view.pop("result", None)
-    view["status"] = "succeeded" if result.get("success") else "failed"
+    succeeded = bool(result.get("success"))
+    view["status"] = "succeeded" if succeeded else "failed"
     for field in _RESULT_PAYLOAD_FIELDS:
         value = result.get(field)
         if value not in (None, [], ""):
             view[field] = value
+    if succeeded and not view.get("output_lines"):
+        # "Succeeded and returned nothing" is an answer - a clean worktree,
+        # an empty list - but an absent `output_lines` is indistinguishable
+        # from one that compaction dropped, and `prompt_json` strips an empty
+        # list anyway. Measured on the VM: git_status succeeded with no
+        # output, and the controller's next decision ran it again (#223).
+        view["output"] = "none"
     return view
 
 

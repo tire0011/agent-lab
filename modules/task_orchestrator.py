@@ -2139,10 +2139,18 @@ Decide the next step now. Return JSON only.
         if not operation or not isinstance(arguments, dict):
             return None
 
+        # The same identity `_tool_identity` gives a controller `call_tool`.
+        # The guard recognises a repeat by hashing (tool, arguments), so
+        # spelling this call `call_tool {"tool":..., "arguments":...}` while the
+        # controller's own spells it `operation {"operation":..., "args":...}`
+        # made one call hash two ways: the guard could not see that a
+        # subsequent call_tool was re-running what this already ran. Measured
+        # on the VM, git_status resolved here, ran, and the controller's next
+        # decision ran it again unrefused (#223).
         check = self.loop_guard.check(
             session_id,
-            ACTION_CALL_TOOL,
-            {"tool": operation, "arguments": dict(arguments)},
+            "operation",
+            {"operation": operation, "args": dict(arguments)},
             state_token=state_token,
             reason=f"executing the read-only operation find_tool resolved: {reason}"[:1000],
         )

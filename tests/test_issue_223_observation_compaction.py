@@ -24,6 +24,7 @@ from modules.prompt_budget import (
     compact_observations,
     compute_budget,
     controller_observation_view,
+    prompt_json,
 )
 from modules.task_orchestrator import NexusTaskOrchestrator
 
@@ -94,6 +95,56 @@ class SuccessfulOperationViewTests(unittest.TestCase):
         before = json.dumps(raw, sort_keys=True)
         controller_observation_view([raw])
         self.assertEqual(json.dumps(raw, sort_keys=True), before)
+
+
+class EmptySuccessfulResultTests(unittest.TestCase):
+    """A success that returned nothing still has to read as an answer.
+
+    On the VM, git_status succeeded on a clean worktree with zero output
+    lines, and the controller's very next decision ran it again. An absent
+    `output_lines` is indistinguishable from one compaction dropped - and
+    `prompt_json` strips an empty list regardless.
+    """
+
+    def _empty_success(self):
+        return {
+            "tool": "operation",
+            "operation": "git_status",
+            "args": {},
+            "grant_event_id": 3,
+            "result": {
+                "operation": "git_status",
+                "success": True,
+                "output_lines": [],
+                "exit_code": 0,
+                "error_summary": None,
+            },
+            "event_id": 4,
+        }
+
+    def test_an_empty_success_says_so_explicitly(self):
+        [view] = controller_observation_view([self._empty_success()])
+        self.assertEqual(view["status"], "succeeded")
+        self.assertEqual(view["output"], "none")
+
+    def test_the_marker_survives_prompt_rendering(self):
+        [view] = controller_observation_view([self._empty_success()])
+        self.assertIn('"output":"none"', prompt_json([view]))
+
+    def test_a_success_with_output_is_not_given_the_marker(self):
+        observation = self._empty_success()
+        observation["result"]["output_lines"] = ["M README.md"]
+        [view] = controller_observation_view([observation])
+        self.assertNotIn("output", view)
+        self.assertEqual(view["output_lines"], ["M README.md"])
+
+    def test_a_failure_is_not_given_the_marker(self):
+        observation = self._empty_success()
+        observation["result"]["success"] = False
+        observation["result"]["error_summary"] = "boom"
+        [view] = controller_observation_view([observation])
+        self.assertNotIn("output", view)
+        self.assertEqual(view["status"], "failed")
 
 
 class FindToolViewTests(unittest.TestCase):
@@ -391,6 +442,79 @@ class PromptRenderingTests(unittest.TestCase):
             ]
         )
         self.assertIn("already succeeded in event 158", section)
+
+
+class LoopGuardCallIdentityTests(unittest.TestCase):
+    """One call must hash one way, whichever path ran it.
+
+    `find_tool` executing the operation it resolved and the controller's own
+    `call_tool` are the same call against the same capability. They were
+    registered with the loop guard under different shapes - `call_tool` with
+    {"tool", "arguments"} versus `operation` with {"operation", "args"} - so
+    the guard hashed them differently and could not see the second as a repeat
+    of the first.
+
+    Measured on the VM on 2026-09-20: git_status resolved, ran, and the very
+    next controller decision ran it again without the guard objecting (#223).
+    """
+
+    def test_both_paths_produce_the_same_signature(self):
+        from modules.tool_loop_guard import call_signature
+
+        controller_side = call_signature("operation", {"operation": "git_status", "args": {}})
+        resolved_side = call_signature("operation", {"operation": "git_status", "args": {}})
+        self.assertEqual(controller_side, resolved_side)
+        # The shape that used to be used for the resolved path must NOT be
+        # what either side registers any more.
+        self.assertNotEqual(
+            controller_side,
+            call_signature("call_tool", {"tool": "git_status", "arguments": {}}),
+        )
+
+    def test_the_guard_refuses_a_call_tool_repeating_what_find_tool_ran(self):
+        """The behaviour, not the spelling: does the guard catch the repeat?"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "nexus.db")
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=SimpleNamespace(
+                    read_only_specs=lambda: [],
+                    catalog=lambda: [],
+                    repo_root=tmp,
+                ),
+                experiment_service=SimpleNamespace(resolve_experiment=lambda _id: None),
+                task_store=NexusTaskStore(db_path=db_path),
+            )
+            try:
+                session = orchestrator.task_store.get_or_create(
+                    source_type="task", source_id="issue-223-guard-identity"
+                )
+                orchestrator._execute_resolved_tool(
+                    session_id=session.id,
+                    state_token="token",
+                    observation={
+                        "tool": "find_tool",
+                        "status": "found",
+                        "resolved_tool": "git_status",
+                        "resolved_arguments": {},
+                    },
+                    reason="inspect the repository",
+                    task_logger=None,
+                )
+                # Exactly what the controller's own call_tool registers.
+                repeat = orchestrator.loop_guard.check(
+                    session.id,
+                    "operation",
+                    {"operation": "git_status", "args": {}},
+                    state_token="token",
+                    reason="use the operation returned by find_tool",
+                )
+            finally:
+                orchestrator.close()
+        self.assertFalse(
+            repeat.allowed,
+            "the guard did not recognise the controller's call_tool as a repeat "
+            "of the operation find_tool had already executed",
+        )
 
 
 if __name__ == "__main__":
