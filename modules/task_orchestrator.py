@@ -558,13 +558,15 @@ class NexusTaskOrchestrator:
             prompt, prompt_meta = self._build_prompt(session, task, history, observations, budget_plan)
             logger.info(
                 "controller_prompt_budget session_id=%s prompt_chars=%s estimated_tokens=%s "
-                "history_events=%s observation_count=%s omitted_observations=%s %s",
+                "history_events=%s observation_count=%s omitted_observations=%s "
+                "superseded_observations=%s %s",
                 session.id,
                 len(prompt),
                 len(prompt) // CHARS_PER_TOKEN,
                 len(history),
                 len(observations),
                 prompt_meta["omitted_observation_indices"],
+                prompt_meta["superseded_observation_count"],
                 budget_plan.as_log_fields(),
             )
             logger.info(
@@ -1380,7 +1382,12 @@ class NexusTaskOrchestrator:
         prompt = self._prompt(session, truncated_input, history, compacted_observations)
         meta = {
             "input_truncated": input_truncated,
+            # Positions in the *viewed* list, which is what was budgeted. The
+            # view can drop a superseded failed attempt, so these are not
+            # positions in ``observations``; `superseded_observation_count`
+            # says how far the two have diverged.
             "omitted_observation_indices": omitted_indices,
+            "superseded_observation_count": len(deduped_observations) - len(viewed_observations),
             "deduped_observation_count": sum(
                 int(obs.get("deduped", 0)) for obs in deduped_observations if isinstance(obs, dict)
             ),
