@@ -187,6 +187,12 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
                 "maxItems": 10,
             },
             "why_human_required": {"type": "string"},
+            "capability": {"type": "string"},
+            "required_inputs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+            },
         },
     "required": ["action"],
     "additionalProperties": False,
@@ -217,6 +223,8 @@ class TaskDecision:
     command: str | None = None
     observations: list[dict[str, Any]] = field(default_factory=list)
     session_id: str | None = None
+    capability: str | None = None
+    required_inputs: list[str] = field(default_factory=list)
 
 
 class TaskOrchestratorError(RuntimeError):
@@ -427,6 +435,65 @@ class NexusTaskOrchestrator:
             task_logger=task_logger,
         )
 
+    def resume_available_capabilities(self) -> list[TaskDecision]:
+        """Resume blocked sessions whose required registry capability now exists."""
+        resumed: list[TaskDecision] = []
+        for blocker in self.task_store.blocked_missing_capabilities():
+            capability = str(blocker["capability"])
+            if not self.tool_router.candidate_operations(capability):
+                continue
+            session = blocker["session"]
+            resumed.append(
+                asyncio.run(
+                    self._resume_blocked_session_async(
+                        session,
+                        str(blocker["trigger_task"]),
+                        capability,
+                        int(blocker["blocker_event_id"]),
+                    )
+                )
+            )
+        return resumed
+
+    async def _resume_blocked_session_async(
+        self,
+        session: Any,
+        task: str,
+        capability: str,
+        blocker_event_id: int,
+    ) -> TaskDecision:
+        worker = heartbeat_worker_id()
+        if not self.task_store.claim_session(session.id, worker_id=worker):
+            raise TaskOrchestratorError(
+                f"could not claim Nexus task session {session.id!r} for capability resume"
+            )
+        self._claims[session.id] = worker
+        heartbeat = Heartbeat(
+            lambda: self.task_store.heartbeat(session.id, worker_id=worker),
+            name=f"nexus-heartbeat-{session.id[:8]}",
+        )
+        heartbeat.start()
+        try:
+            return await self._run_claimed(
+                session,
+                task,
+                resume_capability=capability,
+                blocker_event_id=blocker_event_id,
+            )
+        except asyncio.CancelledError:
+            self._abort_turn(session.id, TERMINAL_REASON_TURN_CANCELLED, "cancelled")
+            raise
+        except BaseException as exc:
+            self._abort_turn(
+                session.id,
+                TERMINAL_REASON_TURN_FAILED,
+                f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            heartbeat.stop()
+            self._claims.pop(session.id, None)
+
     async def run_async(
         self,
         task: str,
@@ -524,20 +591,29 @@ class NexusTaskOrchestrator:
         task: str,
         *,
         task_logger: Any | None = None,
+        resume_capability: str | None = None,
+        blocker_event_id: int | None = None,
     ) -> TaskDecision:
         self._claimed_status(session.id, "active")
-        # This event id anchors "prior" history: persisted history is never
-        # re-read past this point, since every tool observation produced by
-        # this run is already tracked (and budgeted) via ``observations``
-        # in-memory. Without this boundary, persisted history and in-memory
-        # observations duplicate each other and the prompt grows on every step.
-        run_start_event_id = self.task_store.append_event(
-            session.id,
-            role="user",
-            kind="input",
-            content=task.strip(),
-            metadata={"source_type": session.source_type, "source_id": session.source_id},
-        )
+        if resume_capability:
+            run_start_event_id = self.task_store.append_event(
+                session.id,
+                role="system",
+                kind="capability_available",
+                content=f"Capability now available: {resume_capability}",
+                metadata={
+                    "capability": resume_capability,
+                    "blocker_event_id": blocker_event_id,
+                },
+            )
+        else:
+            run_start_event_id = self.task_store.append_event(
+                session.id,
+                role="user",
+                kind="input",
+                content=task.strip(),
+                metadata={"source_type": session.source_type, "source_id": session.source_id},
+            )
         observations: list[dict[str, Any]] = []
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
@@ -978,6 +1054,18 @@ class NexusTaskOrchestrator:
                 )
 
             self._log_result_reuse(session.id, observations, redundant_requests)
+            required_inputs = [
+                str(item)[:200]
+                for item in (decision.get("required_inputs") or [])[:20]
+                if str(item).strip()
+            ]
+            capability = None
+            if action == ACTION_MISSING_CAPABILITY:
+                capability = str(
+                    decision.get("capability")
+                    or decision.get("information_gap")
+                    or ""
+                ).strip()[:300] or None
             result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
@@ -985,6 +1073,8 @@ class NexusTaskOrchestrator:
                 experiment_id=experiment_id,
                 observations=observations,
                 session_id=session.id,
+                capability=capability,
+                required_inputs=required_inputs,
             )
             if task_logger is not None:
                 task_logger.info(
@@ -1494,7 +1584,7 @@ Controller-native capabilities:
 {{"action":"python_run","script":"<repo-relative .py>","argv":["--version"],"reason":"..."}}
 Final action:
 {{"action":"new_experiment|resume_experiment|answer","experiment_id":null,"message":"...","reason":"..."}}
-{{"action":"clarification|missing_capability","message":"...","reason":"...","information_gap":"...","gap_kind":"user_intent|user_preference|user_authorization|external_information|missing_capability","evidence_event_ids":[123],"why_human_required":"..."}}
+{{"action":"clarification|missing_capability","message":"...","reason":"...","information_gap":"...","gap_kind":"user_intent|user_preference|user_authorization|external_information|missing_capability","evidence_event_ids":[123],"why_human_required":"...","capability":"stable capability identifier","required_inputs":["input_name"]}}
 
 Model policy:
 - `goal` for `find_tool` must describe the concrete capability needed for the current task; it must not be a generic placeholder or copied verbatim from an example.
@@ -1522,7 +1612,7 @@ Rules:
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
-- If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
+- If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Set capability to a stable identifier for the missing capability and required_inputs to the values it needs. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
 - When an observation reports duplicate_tool_call, non_progressing_cycle or retry_reason_required, do not repeat it. Choose a materially different tool or a controlled final action.
 
@@ -1613,7 +1703,15 @@ Decide the next step now. Return JSON only.
                 repo_state = f"{head.stdout.strip()}\n{completed.stdout}"
         except (OSError, subprocess.SubprocessError):
             pass
-        payload = f"{current_input.strip()}\0{repo_state}"
+        capability_names = sorted(
+            str(getattr(spec, "name", "")).strip()
+            for spec in self.operations_registry.catalog()
+            if str(getattr(spec, "name", "")).strip()
+        )
+        payload = (
+            f"{current_input.strip()}\0{repo_state}\0"
+            f"{json.dumps(capability_names, separators=(',', ':'))}"
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -2435,6 +2533,9 @@ Decide the next step now. Return JSON only.
                 "reason": decision.reason,
                 "experiment_id": decision.experiment_id,
                 "has_command": bool(decision.command),
+                "capability": decision.capability,
+                "required_inputs": decision.required_inputs,
+                "trigger_task": task[:4000] if decision.action == ACTION_MISSING_CAPABILITY else None,
             },
         )
         if not recorded:
