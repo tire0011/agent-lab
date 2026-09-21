@@ -500,6 +500,26 @@ class NexusTaskStore:
     # alive.
     # ------------------------------------------------------------------
 
+    def claim_blocked_missing_capability(
+        self,
+        session_id: str,
+        *,
+        worker_id: str,
+    ) -> bool:
+        """Atomically claim a resting capability-blocked session exactly once."""
+        now = _now()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE nexus_task_sessions
+                   SET worker_id=?, claimed_at=?, last_heartbeat_at=?,
+                       terminal_reason=NULL, status='active', updated_at=?
+                   WHERE id=? AND status='blocked_missing_capability'
+                     AND last_heartbeat_at IS NULL""",
+                (str(worker_id)[:128], now, now, now, session_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
     def claim_session(self, session_id: str, *, worker_id: str) -> bool:
         """Record who owns this session now, and start its heartbeat.
 
@@ -787,6 +807,46 @@ class NexusTaskStore:
             "counts_by_status": counts,
             "claims": claims,
         }
+
+    def blocked_missing_capabilities(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return blocked sessions with their latest structured capability requirement."""
+        limit = max(1, min(limit, 500))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM nexus_task_sessions
+                   WHERE status='blocked_missing_capability'
+                   ORDER BY updated_at"""
+            ).fetchall()
+
+        blocked: list[dict[str, Any]] = []
+        for row in rows:
+            session = self._row(row)
+            events = self.recent_events(
+                session.id,
+                role="assistant",
+                kind="missing_capability",
+                limit=1,
+            )
+            if not events:
+                continue
+            metadata = events[0].get("metadata") or {}
+            capability = str(metadata.get("capability") or "").strip()
+            trigger_task = str(metadata.get("trigger_task") or "").strip()
+            if not capability or not trigger_task:
+                continue
+            blocked.append(
+                {
+                    "session": session,
+                    "capability": capability,
+                    "required_inputs": list(metadata.get("required_inputs") or []),
+                    "catalog_at_block": list(metadata.get("catalog_at_block") or []),
+                    "trigger_task": trigger_task,
+                    "blocker_event_id": events[0]["id"],
+                }
+            )
+            if len(blocked) >= limit:
+                break
+        return blocked
 
     def set_status(self, session_id: str, status: str, *, worker_id: str | None = None) -> bool:
         """Move a session's status, optionally only while ``worker_id`` owns it.

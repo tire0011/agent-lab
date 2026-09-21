@@ -148,6 +148,18 @@ def main(argv: list[str] | None = None) -> int:
 
     service = _build_service(args)
     try:
+        if not args.dry_run and service.controller is not None:
+            resume = service.resume_blocked_capability()
+            if resume.decision == "dispatched":
+                logger.info(
+                    "resumed blocked controller session %s",
+                    resume.candidate.ref if resume.candidate else "?",
+                )
+                return 0
+            if resume.decision in {"busy", "budget_exhausted", "error"}:
+                logger.info("capability resume not started (%s): %s", resume.decision, resume.detail)
+                return 0 if resume.decision != "error" else 1
+
         for entry in service.abandoned_work():
             logger.warning(
                 "abandoned rows left in a running state: %s x%s",

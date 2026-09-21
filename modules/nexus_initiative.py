@@ -50,6 +50,7 @@ _UNFINISHED_ADOPTION_STATUSES = ("not_started", "needs_review", "interrupted")
 # the one-item-at-a-time guarantee.
 _DEFAULT_STALE_AFTER_SECONDS = 6 * 60 * 60
 
+KIND_CAPABILITY_RESUME = "capability_resume"
 KIND_INTEGRATION = "integration_backlog"
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
@@ -349,6 +350,81 @@ class NexusInitiativeService:
                 )
             )
         return candidates
+
+    def resume_blocked_capability(self) -> InitiativeDecision:
+        """Resume at most one capability-blocked session behind normal initiative gates."""
+        tick_id = uuid.uuid4().hex
+        if self.controller is None:
+            return self._record(
+                InitiativeDecision("idle", detail="no controller configured", tick_id=tick_id)
+            )
+
+        busy = self.busy_reason()
+        if busy is not None:
+            return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
+
+        if self.daily_budget and self._spent_today() >= self.daily_budget:
+            return self._record(
+                InitiativeDecision(
+                    "budget_exhausted",
+                    detail=f"{self.daily_budget} self-started items in the last 24h",
+                    tick_id=tick_id,
+                )
+            )
+
+        blockers = self.controller.orchestrator.task_store.blocked_missing_capabilities()
+        if not blockers:
+            return self._record(
+                InitiativeDecision("idle", detail="no structured capability blocker", tick_id=tick_id)
+            )
+
+        current_catalog = {
+            str(getattr(spec, "name", "")).strip()
+            for spec in self.controller.orchestrator.operations_registry.catalog()
+            if str(getattr(spec, "name", "")).strip()
+        }
+        candidate = next(
+            (
+                blocker
+                for blocker in blockers
+                if str(blocker["capability"]).strip() in current_catalog
+                and str(blocker["capability"]).strip()
+                not in {
+                    str(name).strip()
+                    for name in blocker.get("catalog_at_block") or []
+                    if str(name).strip()
+                }
+            ),
+            None,
+        )
+        if candidate is None:
+            return self._record(
+                InitiativeDecision("idle", detail="no newly available blocked capability", tick_id=tick_id)
+            )
+
+        chosen = Candidate(
+            kind=KIND_CAPABILITY_RESUME,
+            ref=str(candidate["session"].id),
+            title=f"Resume {candidate['capability']}"[:200],
+            reason=f"capability {candidate['capability']} became available",
+            payload={"capability": str(candidate["capability"])},
+        )
+        decision = InitiativeDecision(
+            "dispatched", candidate=chosen, considered=[chosen], tick_id=tick_id
+        )
+        self._record(decision)
+        try:
+            resumed = self.controller.resume_available_capabilities(limit=1)
+            if not resumed:
+                decision.decision = "idle"
+                decision.detail = "capability blocker was claimed elsewhere"
+                self._record(decision, update=True)
+        except Exception as exc:  # noqa: BLE001 - failed unattended work is recorded
+            logger.exception("initiative: capability resume failed for %s", chosen.ref)
+            decision.decision = "error"
+            decision.detail = f"{type(exc).__name__}: {exc}"[:1000]
+            self._record(decision, update=True)
+        return decision
 
     def candidates(self) -> list[Candidate]:
         """All *dispatchable* work, best first.
