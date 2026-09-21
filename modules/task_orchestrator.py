@@ -463,7 +463,9 @@ class NexusTaskOrchestrator:
         blocker_event_id: int,
     ) -> TaskDecision:
         worker = heartbeat_worker_id()
-        if not self.task_store.claim_session(session.id, worker_id=worker):
+        if not self.task_store.claim_blocked_missing_capability(
+            session.id, worker_id=worker
+        ):
             raise TaskOrchestratorError(
                 f"could not claim Nexus task session {session.id!r} for capability resume"
             )
