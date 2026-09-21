@@ -147,6 +147,70 @@ class EmptySuccessfulResultTests(unittest.TestCase):
         self.assertEqual(view["status"], "failed")
 
 
+class ChunkedOutputTests(unittest.TestCase):
+    """A body cut every 450 characters is for a log, not for a reader.
+
+    `github_issue` emits the issue body as `body[1]:`, `body[2]:` and so on,
+    and the cut is blind to words - the controller read "...Prefer the e",
+    "xisting PR #194...". Measured in the canonical session: the whole issue
+    reached the model in that shape, JSON-escaped, and it asked for the issue
+    again anyway.
+    """
+
+    def _view(self, output_lines):
+        [view] = controller_observation_view([
+            {
+                "tool": "operation",
+                "operation": "github_issue",
+                "args": {"issue_number": 196},
+                "result": {
+                    "operation": "github_issue",
+                    "success": True,
+                    "output_lines": output_lines,
+                },
+                "event_id": 1,
+            }
+        ])
+        return view["output_lines"]
+
+    def test_slices_are_joined_back_into_one_field(self):
+        self.assertEqual(
+            self._view(["body[1]: Prefer the e", "body[2]: xisting PR #194."]),
+            ["body: Prefer the existing PR #194."],
+        )
+
+    def test_a_word_split_across_the_cut_is_made_whole(self):
+        [line] = self._view(["body[1]: ...Prefer the e", "body[2]: xisting PR"])
+        self.assertIn("existing", line)
+        self.assertNotIn("body[", line)
+
+    def test_unchunked_lines_are_left_exactly_as_they_are(self):
+        lines = ['issue: {"number": 196}', "State: open"]
+        self.assertEqual(self._view(lines), lines)
+
+    def test_slices_keep_their_place_among_other_lines(self):
+        self.assertEqual(
+            self._view(["issue: meta", "body[1]: a", "body[2]: b", "trailer: z"]),
+            ["issue: meta", "body: ab", "trailer: z"],
+        )
+
+    def test_two_chunked_fields_do_not_run_into_each_other(self):
+        self.assertEqual(
+            self._view(["a[1]: one", "a[2]: two", "b[1]: three", "b[2]: four"]),
+            ["a: onetwo", "b: threefour"],
+        )
+
+    def test_a_restarting_index_starts_a_new_field(self):
+        # Two results of the same shape in one list must not be merged.
+        self.assertEqual(
+            self._view(["body[1]: one", "body[2]: two", "body[1]: other"]),
+            ["body: onetwo", "body: other"],
+        )
+
+    def test_non_string_entries_survive(self):
+        self.assertEqual(self._view(["body[1]: a", 42]), ["body: a", 42])
+
+
 class FindToolViewTests(unittest.TestCase):
     def test_resolver_metrics_and_bound_schema_are_omitted_on_success(self):
         observation = {

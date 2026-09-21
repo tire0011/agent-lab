@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -547,6 +548,8 @@ def _operation_view(obs: dict[str, Any]) -> dict[str, Any]:
         value = result.get(field)
         if value not in (None, [], ""):
             view[field] = value
+    if isinstance(view.get("output_lines"), list):
+        view["output_lines"] = _reassembled(view["output_lines"])
     if succeeded and not view.get("output_lines"):
         # "Succeeded and returned nothing" is an answer - a clean worktree,
         # an empty list - but an absent `output_lines` is indistinguishable
@@ -555,6 +558,43 @@ def _operation_view(obs: dict[str, Any]) -> dict[str, Any]:
         # output, and the controller's next decision ran it again (#223).
         view["output"] = "none"
     return view
+
+
+# Operations that return a long text field emit it as numbered slices, so a
+# line-oriented consumer can print it: `github_issue` cuts the issue body every
+# 450 characters into `body[1]:`, `body[2]:` and so on. The cut is blind to
+# words, so the controller reads "...Prefer the e", "xisting PR #194...".
+#
+# That shape is for a log, not for a reader. Putting it back together costs
+# nothing and is what the prompt wants: one field, one continuous text.
+_CHUNKED_FIELD = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]:\s?(.*)$", re.DOTALL)
+
+
+def _reassembled(output_lines: list[Any]) -> list[Any]:
+    """Join `name[1]:`, `name[2]:` ... slices back into one `name:` line."""
+    rebuilt: list[Any] = []
+    pending_name: str | None = None
+    pending_parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal pending_name, pending_parts
+        if pending_name is not None:
+            rebuilt.append(f"{pending_name}: {''.join(pending_parts)}")
+        pending_name, pending_parts = None, []
+
+    for line in output_lines:
+        match = _CHUNKED_FIELD.match(line) if isinstance(line, str) else None
+        if match is None:
+            flush()
+            rebuilt.append(line)
+            continue
+        name, index, text = match.group(1), int(match.group(2)), match.group(3)
+        if name != pending_name or index == 1:
+            flush()
+            pending_name = name
+        pending_parts.append(text)
+    flush()
+    return rebuilt
 
 
 def _find_tool_view(obs: dict[str, Any]) -> dict[str, Any]:
