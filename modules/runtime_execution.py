@@ -245,6 +245,15 @@ def _is_executable(path: str) -> bool:
         return False
 
 
+def exit_code_of(text: str) -> int | None:
+    """Public alias of :func:`_exit_code` for callers outside this module.
+
+    The tolerant pattern is the only one that matches what ``process_command``
+    actually renders, so consumers share it instead of writing their own.
+    """
+    return _exit_code(text)
+
+
 def _exit_code(text: str) -> int | None:
     match = _EXIT_CODE_RE.search(text)
     if match is None:

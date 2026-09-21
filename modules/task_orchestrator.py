@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -89,6 +90,7 @@ from modules.runtime_execution import (
     build_python_command,
     classify_command_failure,
     corrected_command,
+    exit_code_of,
     resolve_python_interpreter,
 )
 from modules.tool_loop_guard import PersistentToolLoopGuard
@@ -167,8 +169,10 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
             "module": {"type": "string"},
             "argv": {"type": "array", "items": {"type": "string"}},
             "cwd": {"type": "string"},
+            "effect": {"type": "string", "enum": ["read", "change", "verify"]},
             "experiment_id": {"type": ["string", "null"]},
             "message": {"type": "string"},
+            "verified_noop": {"type": "boolean"},
             "reason": {"type": "string"},
             "information_gap": {"type": "string"},
             "gap_kind": {
@@ -487,6 +491,7 @@ class NexusTaskOrchestrator:
                 f"could not claim Nexus task session {session.id!r} for capability resume"
             )
         self._claims[session.id] = worker
+        self._apply_completion_requirement(session, task)
         heartbeat = Heartbeat(
             lambda: self.task_store.heartbeat(session.id, worker_id=worker),
             name=f"nexus-heartbeat-{session.id[:8]}",
@@ -516,6 +521,30 @@ class NexusTaskOrchestrator:
         finally:
             heartbeat.stop()
             self._claims.pop(session.id, None)
+
+    def _apply_completion_requirement(self, session: Any, task: str) -> None:
+        """Record that *task* owes completion evidence, once this worker owns it.
+
+        Called only after the claim succeeds: writing the requirement first
+        would mutate a session another worker holds whenever the claim then
+        fails.
+
+        The key is refreshed on every new implementation request, so a
+        follow-up that is not itself a request ("yes, go ahead") keeps the
+        original requirement together with the evidence already gathered for
+        it, while a genuinely new request arriving in the same session starts
+        from no evidence.
+        """
+        if not self._is_implementation_intent(task):
+            return
+        intent_key = self._intent_key(task)
+        if session.completion_intent_key == intent_key:
+            return
+        self.task_store.set_requires_completion_evidence(
+            session.id, True, intent_key=intent_key
+        )
+        session.requires_completion_evidence = True
+        session.completion_intent_key = intent_key
 
     async def run_async(
         self,
@@ -561,6 +590,7 @@ class NexusTaskOrchestrator:
                 "the session is no longer there to claim"
             )
         self._claims[session.id] = worker
+        self._apply_completion_requirement(session, task)
         heartbeat = Heartbeat(
             lambda: self.task_store.heartbeat(session.id, worker_id=worker),
             name=f"nexus-heartbeat-{session.id[:8]}",
@@ -1006,11 +1036,44 @@ class NexusTaskOrchestrator:
                     # find_tool decides its not_found guidance from what this
                     # task is about, so it needs the task itself.
                     execution_decision["current_task"] = task
+                    # Completion evidence is measured, never accepted on the
+                    # controller's word: `effect` says what the call is meant
+                    # to do, and the snapshots either bear that out or do not.
+                    # Only executions can change anything, so only they are
+                    # measured.
+                    measured = tool in {ACTION_COMMAND, TOOL_PYTHON_RUN}
+                    before = self._worktree_snapshot(
+                        self._decision_cwd(execution_decision)
+                    ) if measured else None
                     observation = await self._execute_tool(
                         execution_decision,
                         budget_plan=budget_plan,
                         task_logger=task_logger,
                     )
+                    if measured and self._execution_succeeded(observation):
+                        after = self._worktree_snapshot(
+                            self._decision_cwd(execution_decision)
+                        )
+                        # An execution that changed the checkout is completion
+                        # evidence. One that succeeded without changing it -
+                        # or whose effect this process cannot see, such as a
+                        # restarted service or a remote call - is recorded as
+                        # a verification instead, which sends the completion
+                        # claim to the user rather than closing the task.
+                        kind = (
+                            "change"
+                            if self._observed_state_change(before, after)
+                            else "verify"
+                        )
+                        observation = dict(observation)
+                        observation[
+                            "completion_evidence" if kind == "change"
+                            else "verification_evidence"
+                        ] = self._record_evidence(
+                            session,
+                            kind=kind,
+                            source=str(observation.get("tool", tool)),
+                        )
                     if (
                         tool == TOOL_FIND_TOOL
                         and observation.get("status") in {"not_found", "unavailable"}
@@ -1655,6 +1718,7 @@ Rules:
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
+- For implementation/state-change tasks, a successful read-only lookup is context only, not proof that work is complete. For command or python_run, set effect to read, change, or verify to say what the call is for. Completion evidence is what the executor observes: a command that succeeds and leaves the checkout actually changed. Declaring effect=change does not by itself complete anything, and a command that changes nothing (for example `true`) never will. If you believe no change is required, say so as a clarification that asks the user to confirm, citing the verification output. If the required change cannot be performed, use missing_capability instead of claiming completion.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Set capability to a stable identifier for the missing capability and required_inputs to the values it needs. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
@@ -1705,6 +1769,10 @@ Decide the next step now. Return JSON only.
                 "context": str(decision.get("context", "")),
             }
         if tool == ACTION_COMMAND:
+            # `effect` is the controller's claim about the call, not part of
+            # its identity: including it would let the same command run twice
+            # by relabelling it read -> change, which both defeats the #164
+            # loop guard and mints completion evidence from a read-only call.
             return tool, {"command": str(decision.get("command", "")).strip()}
         if tool == TOOL_PYTHON_RUN:
             # The working directory changes module/script resolution, so two
@@ -1834,6 +1902,169 @@ Decide the next step now. Return JSON only.
         )
         return bool(gap_tokens & observation_tokens)
 
+    # A request for news about work is not a request to do it. These are
+    # matched anywhere in the text, unlike the start-anchored informational
+    # openers, because "... and please update me on #42" reads as a status
+    # request wherever it sits.
+    _STATUS_REQUEST_RE = re.compile(
+        r"\b(?:status\s+update|update\s+(?:me|us)\b|keep\s+(?:me|us)\s+posted)"
+    )
+    _INFORMATIONAL_OPENER_RE = re.compile(
+        r"^(?:#*\s*)?(?:how|why|what|explain|summarize|inspect|show|read|describe)\b"
+    )
+    _CHANGE_INTENT_RE = re.compile(
+        r"\b(?:solve|fix|implement|resolve|address|apply|update)\b|"
+        r"\bmake\b.{0,80}\bwork\b|\bwork\s+on\b"
+    )
+
+    @classmethod
+    def _is_implementation_intent(cls, task: str) -> bool:
+        """Recognize explicit requests whose requested outcome is a state change."""
+        normalized = " ".join(str(task or "").strip().lower().split())
+        if not normalized:
+            return False
+        if cls._INFORMATIONAL_OPENER_RE.match(normalized):
+            return False
+        if cls._STATUS_REQUEST_RE.search(normalized):
+            return False
+        return bool(cls._CHANGE_INTENT_RE.search(normalized))
+
+    @staticmethod
+    def _intent_key(task: str) -> str:
+        """Stable identity of one implementation request within a session."""
+        normalized = " ".join(str(task or "").strip().lower().split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _command_exit_code(output: Any) -> int | None:
+        """Read the exit code out of a command result.
+
+        Delegates to the shared parser rather than matching a second format:
+        ``process_command`` renders ``**Exit code:** 0`` (Markdown, capitalised,
+        spaced), so a stricter pattern of this module's own would silently
+        never match and no evidence would ever be recorded.
+        """
+        return exit_code_of(str(output or ""))
+
+    # Paths inside the code checkout that this process and its loggers write
+    # on their own. A turn touches them whether or not it changed anything,
+    # so they can never stand as evidence of requested work.
+    _RUNTIME_OWNED_PREFIXES = ("state/", "logs/", ".git/")
+
+    def _decision_cwd(self, decision: dict[str, Any]) -> Path | None:
+        """Working directory of an execution decision, or None when unusable."""
+        try:
+            return self._resolve_cwd(decision.get("cwd"))
+        except (TaskOrchestratorError, OSError):
+            return None
+
+    def _execution_succeeded(self, observation: dict[str, Any]) -> bool:
+        """Whether a command/python action ran and reported success."""
+        tool = str(observation.get("tool", "")).strip()
+        if tool not in {ACTION_COMMAND, TOOL_PYTHON_RUN}:
+            return False
+        if observation.get("error") or observation.get("event") == "command_not_found":
+            return False
+        return self._command_exit_code(observation.get("result")) == 0
+
+    def _worktree_snapshot(self, cwd: Path | None = None) -> str | None:
+        """Executor-side view of the code checkout, scoped to *cwd*.
+
+        Deliberately narrow. The comparison is only ever made across a single
+        command execution, over the subtree that command ran in, and with this
+        process's own artefacts excluded - a whole-repository fingerprint taken
+        around every tool call credits any concurrent writer's work to the call
+        in flight. The mailbox daemons write their own separate checkout
+        (`AGENT_MAILBOX_REPO_PATH`), so they are outside this view entirely.
+
+        Returns ``None`` when the state cannot be read, which is never treated
+        as evidence.
+        """
+        root = self._repo_root()
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if status.returncode != 0 or head.returncode != 0:
+            return None
+        try:
+            scope = str(Path(cwd or root).resolve().relative_to(Path(root).resolve()))
+        except ValueError:
+            scope = ""
+        scope = "" if scope == "." else f"{scope}/"
+        entries = []
+        for line in status.stdout.splitlines():
+            path = line[3:].strip().strip('"')
+            if not path.startswith(scope):
+                continue
+            relative = path[len(scope):]
+            if relative.startswith(self._RUNTIME_OWNED_PREFIXES) or path.startswith(
+                self._RUNTIME_OWNED_PREFIXES
+            ):
+                continue
+            entries.append(line)
+        return "\n".join([head.stdout.strip(), *sorted(entries)])
+
+    @staticmethod
+    def _observed_state_change(before: str | None, after: str | None) -> bool:
+        """Whether the executor itself saw the checkout change."""
+        return before is not None and after is not None and before != after
+
+    _EVIDENCE_LABELS = {"change": "state_change", "verify": "verified_state"}
+
+    def _record_evidence(self, session: Any, *, kind: str, source: str) -> dict[str, Any]:
+        """Persist evidence of *kind* for the session's current request.
+
+        Persisted only for a session that owes evidence; for any other session
+        the observation still carries the record, but there is no requirement
+        for it to answer.
+        """
+        intent_key = getattr(session, "completion_intent_key", None) or ""
+        if intent_key:
+            self.task_store.record_completion_evidence(session.id, intent_key, kind)
+            if kind == "change":
+                session.completion_evidence_key = intent_key
+            else:
+                session.verification_evidence_key = intent_key
+        return {
+            "kind": self._EVIDENCE_LABELS[kind],
+            "effect": kind,
+            "source": source,
+            "intent_key": intent_key,
+        }
+
+    @staticmethod
+    def _evidence_satisfies(session: Any, *, kind: str) -> bool:
+        """Whether recorded evidence belongs to the request now in force.
+
+        Read from the session row rather than re-scanned out of the event log:
+        the log view is bounded, so evidence in a long session would age out
+        and leave it unable to ever finish. Comparing intent keys is also what
+        stops one task's evidence from completing a later, different one that
+        arrived through ``continue_session``.
+        """
+        required = getattr(session, "completion_intent_key", None) or ""
+        column = (
+            "completion_evidence_key" if kind == "change" else "verification_evidence_key"
+        )
+        observed = getattr(session, column, None) or ""
+        return bool(required) and observed == required
+
     def _validate_evidence_sensitive_terminal(
         self,
         *,
@@ -1842,7 +2073,52 @@ Decide the next step now. Return JSON only.
         decision: dict[str, Any],
         observations: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        """Reject unsupported negative terminal claims while preserving user-only questions."""
+        """Reject terminal decisions that are unsupported by the session's evidence."""
+        session = self.task_store.get(session_id)
+        requires_completion = bool(
+            session is not None and session.requires_completion_evidence
+        )
+        if action == ACTION_ANSWER and requires_completion:
+            if self._evidence_satisfies(session, kind="change"):
+                return None
+            # A run that succeeded without changing anything the executor can
+            # see is not completion: `true` does exactly that, and so does a
+            # genuine check of work that was already done. The two are
+            # indistinguishable from here, and an effect this process cannot
+            # observe - a restarted service, a remote call - looks the same
+            # again. All three go to the user to confirm, carrying the output,
+            # instead of the controller certifying its own claim or the turn
+            # burning its remaining steps.
+            if self._evidence_satisfies(session, kind="verify"):
+                return {
+                    "event": "terminal_decision_rejected",
+                    "terminal_action": action,
+                    "information_gap": "human confirmation that no change is required",
+                    "gap_kind": "user_intent",
+                    "reason": (
+                        "A completion with no observed state change cannot be "
+                        "self-certified: the run only shows that a command succeeded "
+                        "without changing anything this process can see. Ask the user "
+                        "to confirm the requested outcome, citing the command output."
+                    ),
+                    "candidate_operations": [],
+                    "retryable": True,
+                    "recommended_next_action": ACTION_CLARIFICATION,
+                }
+            return {
+                "event": "terminal_decision_rejected",
+                "terminal_action": action,
+                "information_gap": "implementation completion evidence",
+                "gap_kind": "completion_evidence",
+                "reason": (
+                    "Implementation-intent tasks cannot finish from read-only context alone; "
+                    "no state change was observed by the executor after any command."
+                ),
+                "candidate_operations": [],
+                "retryable": True,
+                "recommended_next_action": ACTION_MISSING_CAPABILITY,
+            }
+
         if action not in {ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY}:
             return None
 

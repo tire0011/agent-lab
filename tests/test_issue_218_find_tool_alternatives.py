@@ -37,7 +37,7 @@ from modules.task_orchestrator import (
     TaskOrchestratorError,
 )
 
-TASK = "fix github issue #196"
+TASK = "inspect repository state for github issue #196"
 # The goal and reason the failing session actually produced.
 SHELL_GOAL = "run a shell command in the repository"
 SHELL_REASON = "I need to inspect the repository state"

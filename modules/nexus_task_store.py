@@ -68,6 +68,14 @@ class NexusTaskSession:
     claimed_at: str | None = None
     last_heartbeat_at: str | None = None
     terminal_reason: str | None = None
+    requires_completion_evidence: bool = False
+    # Identity of the implementation request currently in force, and the
+    # requests for which evidence has actually been observed. Comparing keys
+    # is what keeps one task's evidence from completing a later, different
+    # one, and it survives any event-window limit.
+    completion_intent_key: str | None = None
+    completion_evidence_key: str | None = None
+    verification_evidence_key: str | None = None
 
 
 class NexusTaskStore:
@@ -133,9 +141,9 @@ class NexusTaskStore:
                     ON nexus_controller_turns(created_at);
                 """
             )
-            self._migrate_heartbeat_columns()
+            self._migrate_session_columns()
 
-    def _migrate_heartbeat_columns(self) -> None:
+    def _migrate_session_columns(self) -> None:
         """Add the explicit ownership/liveness columns (#162).
 
         ``updated_at`` moves whenever anything touches the row, which is why it
@@ -147,6 +155,20 @@ class NexusTaskStore:
             row[1] for row in self._conn.execute("PRAGMA table_info(nexus_task_sessions)")
         }
         for column in ("worker_id", "claimed_at", "last_heartbeat_at", "terminal_reason"):
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE nexus_task_sessions ADD COLUMN {column} TEXT NULL"
+                )
+        if "requires_completion_evidence" not in existing:
+            self._conn.execute(
+                "ALTER TABLE nexus_task_sessions "
+                "ADD COLUMN requires_completion_evidence INTEGER NOT NULL DEFAULT 0"
+            )
+        for column in (
+            "completion_intent_key",
+            "completion_evidence_key",
+            "verification_evidence_key",
+        ):
             if column not in existing:
                 self._conn.execute(
                     f"ALTER TABLE nexus_task_sessions ADD COLUMN {column} TEXT NULL"
@@ -848,6 +870,51 @@ class NexusTaskStore:
                 break
         return blocked
 
+    def set_requires_completion_evidence(
+        self,
+        session_id: str,
+        required: bool,
+        *,
+        intent_key: str | None = None,
+    ) -> None:
+        """Persist that this session owes completion evidence for *intent_key*.
+
+        The key identifies which implementation request is in force. A new
+        request in the same session replaces it, which is what stops evidence
+        produced for the previous one from satisfying the new one.
+        """
+        with self._lock:
+            self._conn.execute(
+                """UPDATE nexus_task_sessions
+                   SET requires_completion_evidence=?, completion_intent_key=?, updated_at=?
+                   WHERE id=?""",
+                (1 if required else 0, intent_key, _now(), session_id),
+            )
+            self._conn.commit()
+
+    def record_completion_evidence(self, session_id: str, intent_key: str, kind: str) -> None:
+        """Record that evidence of *kind* was observed for *intent_key*.
+
+        Written on the session row rather than left to be re-read from the
+        event log: a long session scrolls old tool events out of any bounded
+        window, and evidence that ages out would leave the session unable to
+        ever finish.
+        """
+        column = {
+            "change": "completion_evidence_key",
+            "verify": "verification_evidence_key",
+        }.get(kind)
+        if column is None:
+            raise ValueError(f"unknown evidence kind: {kind!r}")
+        with self._lock:
+            self._conn.execute(
+                f"""UPDATE nexus_task_sessions
+                   SET {column}=?, updated_at=?
+                   WHERE id=?""",
+                (intent_key, _now(), session_id),
+            )
+            self._conn.commit()
+
     def set_status(self, session_id: str, status: str, *, worker_id: str | None = None) -> bool:
         """Move a session's status, optionally only while ``worker_id`` owns it.
 
@@ -890,4 +957,20 @@ class NexusTaskStore:
             claimed_at=row["claimed_at"] if "claimed_at" in keys else None,
             last_heartbeat_at=row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None,
             terminal_reason=row["terminal_reason"] if "terminal_reason" in keys else None,
+            requires_completion_evidence=(
+                bool(row["requires_completion_evidence"])
+                if "requires_completion_evidence" in keys
+                else False
+            ),
+            completion_intent_key=(
+                row["completion_intent_key"] if "completion_intent_key" in keys else None
+            ),
+            completion_evidence_key=(
+                row["completion_evidence_key"] if "completion_evidence_key" in keys else None
+            ),
+            verification_evidence_key=(
+                row["verification_evidence_key"]
+                if "verification_evidence_key" in keys
+                else None
+            ),
         )
