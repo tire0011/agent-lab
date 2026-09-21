@@ -138,26 +138,35 @@ class MissingCapabilityResumeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             registry = _MutableRegistry(tmp)
             registry.enabled = True
-            client = _Client([
-                '{"action":"missing_capability","message":"Need test_missing_capability.",'
-                '"reason":"another prerequisite is still unresolved",'
-                '"information_gap":"test_missing_capability",'
-                '"gap_kind":"missing_capability","capability":"test_missing_capability"}',
-            ])
             orchestrator = NexusTaskOrchestrator(
                 operations_registry=registry,
                 experiment_service=SimpleNamespace(),
-                llama_client=client,
-                max_steps=1,
+                llama_client=_Client([]),
             )
             self.addCleanup(orchestrator.close)
 
-            blocked = orchestrator.run("Need the test capability")
-            self.assertEqual(blocked.action, ACTION_MISSING_CAPABILITY)
+            session = orchestrator.task_store.get_or_create(
+                source_type="task", source_id="already-present"
+            )
+            orchestrator.task_store.set_status(
+                session.id, "blocked_missing_capability"
+            )
+            orchestrator.task_store.append_event(
+                session.id,
+                role="assistant",
+                kind="missing_capability",
+                content="Need test_missing_capability.",
+                metadata={
+                    "capability": "test_missing_capability",
+                    "required_inputs": [],
+                    "trigger_task": "Need the test capability",
+                    "catalog_at_block": ["test_missing_capability"],
+                },
+            )
 
             self.assertEqual(orchestrator.resume_available_capabilities(), [])
             self.assertEqual(
-                orchestrator.task_store.get(blocked.session_id).status,
+                orchestrator.task_store.get(session.id).status,
                 "blocked_missing_capability",
             )
 
