@@ -149,22 +149,16 @@ def main(argv: list[str] | None = None) -> int:
     service = _build_service(args)
     try:
         if not args.dry_run and service.controller is not None:
-            try:
-                resumed = service.controller.resume_available_capabilities()
-            except Exception as exc:  # noqa: BLE001 - do not start new work beside a failed resume
-                logger.error("blocked capability resume failed: %s", exc)
-                return 1
-            if resumed:
+            resume = service.resume_blocked_capability()
+            if resume.decision == "dispatched":
                 logger.info(
-                    "resumed %d blocked controller session(s): %s",
-                    len(resumed),
-                    ", ".join(
-                        str(decision.session_id)
-                        for decision in resumed
-                        if decision.session_id
-                    ),
+                    "resumed blocked controller session %s",
+                    resume.candidate.ref if resume.candidate else "?",
                 )
                 return 0
+            if resume.decision in {"busy", "budget_exhausted", "error"}:
+                logger.info("capability resume not started (%s): %s", resume.decision, resume.detail)
+                return 0 if resume.decision != "error" else 1
 
         for entry in service.abandoned_work():
             logger.warning(
