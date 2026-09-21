@@ -1470,6 +1470,7 @@ Rules:
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
 - Use `python_run` for every Python execution; Nexus supplies the interpreter. Never write an interpreter name or path in a command.
+- An observation with `"status":"succeeded"` already carries that call's result, in the same observation. Never call that operation again with the same arguments - there is nothing further to fetch. Read the result you already have and choose a different next step: another capability if something is still missing, or `answer` if the request is now satisfied.
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.

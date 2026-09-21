@@ -498,6 +498,62 @@ class RawEventStillHoldsTheFullEnvelopeTests(unittest.TestCase):
         self.assertTrue(persisted["result"]["success"])
 
 
+class SuccessRuleTests(unittest.TestCase):
+    """The rules covered every failure and not the success.
+
+    Session 9744145ddf1c49d298af9ac580d5a6f9 is what that cost. The model read
+    the observation correctly and said so in its own reason:
+
+        "The issue has already been analyzed and succeeded in event 188.
+         Reusing the result and choosing the next action."
+
+    and then emitted `call_tool github_issue` again. It had the right intent
+    and no rule naming the move. Nineteen rules covered not_found,
+    command_not_found, duplicate_tool_call *after* the fact, and
+    missing_capability - the whole failure surface - while the common case, an
+    operation that worked, was unwritten.
+    """
+
+    def _rules(self) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=SimpleNamespace(
+                    read_only_specs=lambda: [], catalog=lambda: [], repo_root=tmp
+                ),
+                experiment_service=SimpleNamespace(resolve_experiment=lambda _i: None),
+                task_store=NexusTaskStore(db_path=str(Path(tmp) / "n.db")),
+            )
+            try:
+                prompt, _meta = orchestrator._build_prompt(
+                    SimpleNamespace(id="s", source_type="task", source_id="1", title="t"),
+                    "solve github issue #196",
+                    [],
+                    [_github_issue_success()],
+                    compute_budget(mem_available_kb=None),
+                )
+            finally:
+                orchestrator.close()
+        return prompt.partition("Rules:")[2].partition("OBSERVATIONS FROM")[0]
+
+    def test_a_succeeded_observation_is_addressed_by_a_rule(self):
+        rules = self._rules()
+        self.assertIn('"status":"succeeded"', rules)
+
+    def test_the_rule_says_not_to_call_it_again(self):
+        rules = self._rules()
+        line = next(
+            (l for l in rules.splitlines() if '"status":"succeeded"' in l), ""
+        )
+        self.assertIn("Never call that operation again", line)
+
+    def test_the_rule_names_the_move_instead_of_only_forbidding_one(self):
+        """A prohibition without an alternative is what the model already had."""
+        line = next(
+            (l for l in self._rules().splitlines() if '"status":"succeeded"' in l), ""
+        )
+        self.assertIn("answer", line)
+
+
 class PromptRenderingTests(unittest.TestCase):
     """End to end through ``_build_prompt``: what the model actually reads."""
 
