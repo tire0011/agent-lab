@@ -1007,11 +1007,20 @@ class NexusTaskOrchestrator:
                     # find_tool decides its not_found guidance from what this
                     # task is about, so it needs the task itself.
                     execution_decision["current_task"] = task
+                    repository_state_before = self._repository_state_fingerprint()
                     observation = await self._execute_tool(
                         execution_decision,
                         budget_plan=budget_plan,
                         task_logger=task_logger,
                     )
+                    repository_state_after = self._repository_state_fingerprint()
+                    if (
+                        repository_state_before
+                        and repository_state_after
+                        and repository_state_before != repository_state_after
+                    ):
+                        observation = dict(observation)
+                        observation["state_changed"] = True
                     if (
                         tool == TOOL_FIND_TOOL
                         and observation.get("status") in {"not_found", "unavailable"}
@@ -1726,6 +1735,41 @@ Decide the next step now. Return JSON only.
             }
         return tool, dict(decision.get("args") or {})
 
+    def _repository_state_fingerprint(self) -> str:
+        """Stable local repository state used to detect actual implementation effects."""
+        root = self._repo_root()
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if status.returncode != 0 or head.returncode != 0:
+            return ""
+        payload = f"{head.stdout.strip()}\n{branch.stdout.strip()}\n{status.stdout}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def _state_token(self, current_input: str) -> str:
         root = Path(getattr(self.operations_registry, "repo_root", "/agent"))
         repo_state = "not-a-git-repository"
@@ -1852,6 +1896,8 @@ Decide the next step now. Return JSON only.
             and bool(getattr(spec, "mutates_state", True))
         }
         for observation in observations:
+            if observation.get("state_changed") and not observation.get("error"):
+                return True
             if observation.get("tool") != "operation" or observation.get("event"):
                 continue
             operation = str(observation.get("operation", "")).strip()
