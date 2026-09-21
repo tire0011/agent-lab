@@ -168,10 +168,31 @@ def systemd_restarter(
         results: dict[str, str] = {}
         for service in services:
             replacing_self = unit is not None and service == unit
-            command = (["sudo"] if use_sudo else []) + ["systemctl", "restart"]
+            prefix = ["sudo"] if use_sudo else []
             if replacing_self:
-                command.append("--no-block")
-            command.append(service)
+                # Hand the restart to systemd as a transient unit of its own.
+                #
+                # `--no-block` was not enough, and the reason is where the
+                # caller lives: stopping a unit kills its whole control group,
+                # and our `systemctl` is a child of the process being stopped,
+                # so it is in that group. Returning early is still a race
+                # against our own teardown, and we lost it - the refresh
+                # reported `exit -15`, SIGTERM, for a restart that had in fact
+                # succeeded.
+                #
+                # A transient unit is owned by systemd, not by us, so stopping
+                # our own unit cannot take it with us. The delay gives this
+                # process time to finish writing its report first.
+                command = prefix + [
+                    "systemd-run",
+                    "--collect",
+                    "--on-active=2",
+                    "systemctl",
+                    "restart",
+                    service,
+                ]
+            else:
+                command = prefix + ["systemctl", "restart", service]
             try:
                 completed = subprocess.run(
                     command,
@@ -185,7 +206,7 @@ def systemd_restarter(
                 continue
             if completed.returncode == 0:
                 results[service] = (
-                    "restart requested (this process is being replaced)"
+                    "restart scheduled (this process is being replaced)"
                     if replacing_self
                     else "restarted"
                 )

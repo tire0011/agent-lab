@@ -144,8 +144,16 @@ def _format(branch: str, result: Any) -> str:
     """Render the refresh report: what it is on now, and whether it moved."""
     success = bool(getattr(result, "success", False))
     services = getattr(result, "services", None) or {}
+    # A restart this process handed to systemd and will not survive to see is
+    # neither done nor failed. Calling it failed was the mirror of the bug it
+    # replaced: the service does restart, we are simply not around to watch.
+    pending_services = sorted(
+        name for name, state in services.items() if str(state).startswith("restart ")
+    )
     failed_services = sorted(
-        name for name, state in services.items() if str(state) != "restarted"
+        name
+        for name, state in services.items()
+        if str(state) != "restarted" and name not in pending_services
     )
     if not success:
         heading = "failed"
@@ -165,6 +173,12 @@ def _format(branch: str, result: Any) -> str:
     if failed_services:
         lines.append(
             f"**Not running the new code:** {', '.join(f'`{n}`' for n in failed_services)}"
+        )
+    if pending_services:
+        lines.append(
+            "**Restarting shortly:** "
+            + ", ".join(f"`{n}`" for n in pending_services)
+            + " (handed to systemd; this process is being replaced)"
         )
     previous = getattr(result, "previous_head", None)
     new_head = getattr(result, "new_head", None)

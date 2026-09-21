@@ -215,6 +215,18 @@ class ServiceRestartReportingTests(unittest.TestCase):
         self.assertIn("Not running the new code", body)
         self.assertIn("agent-api", body)
 
+    def test_a_scheduled_restart_is_pending_not_failed(self):
+        """The mirror of the bug it replaced.
+
+        The service does restart; this process simply does not survive to
+        watch it. Reporting that as "not running the new code" is as wrong as
+        reporting it as complete.
+        """
+        body = self._body({"agent-api": "restart scheduled (this process is being replaced)"})
+        self.assertIn("Restarting shortly", body)
+        self.assertNotIn("Not running the new code", body)
+        self.assertNotIn("incomplete", body)
+
     def test_an_all_restarted_refresh_is_complete(self):
         body = self._body({"agent-api": "restarted"})
         self.assertIn("Refresh complete", body)
@@ -275,10 +287,28 @@ class SelfRestartTests(unittest.TestCase):
             )()
         return result, seen
 
-    def test_restarting_our_own_unit_does_not_block(self):
+    def test_restarting_our_own_unit_leaves_our_control_group(self):
+        """--no-block was not enough, and the VM proved it.
+
+        Stopping a unit kills its whole control group, and our `systemctl` is
+        a child of the process being stopped. Returning early is still a race
+        against our own teardown, and the refresh lost it: `exit -15`,
+        SIGTERM, reported for a restart that had in fact succeeded. A
+        transient unit is owned by systemd, so it survives us.
+        """
         result, commands = self._run(("agent-api",), "agent-api")
-        self.assertIn("--no-block", commands[0])
-        self.assertIn("requested", result["agent-api"])
+        self.assertIn("systemd-run", commands[0])
+        self.assertIn("scheduled", result["agent-api"])
+
+    def test_the_transient_unit_is_cleaned_up_and_delayed(self):
+        # --collect so it does not linger; a delay so this process can finish
+        # writing its report before it is replaced.
+        _result, commands = self._run(("agent-api",), "agent-api")
+        self.assertIn("--collect", commands[0])
+        self.assertTrue(
+            any(str(part).startswith("--on-active=") for part in commands[0]),
+            commands[0],
+        )
 
     def test_restarting_another_unit_still_blocks_and_reports_the_outcome(self):
         result, commands = self._run(("nginx",), "agent-api")
@@ -291,7 +321,7 @@ class SelfRestartTests(unittest.TestCase):
         self.assertEqual(result["agent-api"], "restarted")
 
     def test_a_queued_restart_is_not_reported_as_done(self):
-        """--no-block returns before the outcome exists; say so, do not guess."""
+        """It returns before the outcome exists; say so, do not guess."""
         result, _ = self._run(("agent-api",), "agent-api")
         self.assertNotEqual(result["agent-api"], "restarted")
 
