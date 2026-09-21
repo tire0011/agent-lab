@@ -815,8 +815,7 @@ class NexusTaskStore:
             rows = self._conn.execute(
                 """SELECT * FROM nexus_task_sessions
                    WHERE status='blocked_missing_capability'
-                   ORDER BY updated_at LIMIT ?""",
-                (limit,),
+                   ORDER BY updated_at"""
             ).fetchall()
 
         blocked: list[dict[str, Any]] = []
@@ -840,10 +839,13 @@ class NexusTaskStore:
                     "session": session,
                     "capability": capability,
                     "required_inputs": list(metadata.get("required_inputs") or []),
+                    "catalog_at_block": list(metadata.get("catalog_at_block") or []),
                     "trigger_task": trigger_task,
                     "blocker_event_id": events[0]["id"],
                 }
             )
+            if len(blocked) >= limit:
+                break
         return blocked
 
     def set_status(self, session_id: str, status: str, *, worker_id: str | None = None) -> bool:
