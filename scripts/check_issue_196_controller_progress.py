@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -211,8 +212,15 @@ def _print_prompt_observations(prompts: list[dict[str, Any]]) -> None:
         print(f"  turn {turn}: {size}, "
               f"{record['observation_count']} observations, "
               f"omitted {record['omitted']}")
+        # Wrapped, never cut. Cutting at 400 characters hid the one thing this
+        # section exists to show: whether the tool result itself reached the
+        # controller. The canonical run had to be re-read because the
+        # `output_lines` sat past that cut.
         for line in redact_secrets(section).splitlines():
-            print(f"      {line[:400]}")
+            for chunk in textwrap.wrap(
+                line, width=110, subsequent_indent="        ", drop_whitespace=False
+            ) or [""]:
+                print(f"      {chunk}")
 
 
 def main() -> int:

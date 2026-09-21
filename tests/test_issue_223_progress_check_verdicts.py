@@ -342,6 +342,17 @@ class RecordedSessionTests(unittest.TestCase):
         self.assertIn("replayed at a", out)
         self.assertNotIn("prompt None chars", out)
 
+    def test_the_tool_result_itself_is_printed_not_cut_off(self):
+        """The one thing the section exists to show.
+
+        The printer cut every line at 400 characters, so the `output_lines` -
+        the actual result the controller did or did not receive - sat past the
+        cut. The canonical run had to be judged twice because of it.
+        """
+        code, out = self._judge(self._session([SUCCESS]), extra=["--show-prompts"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("Issue #196", out)
+
     def test_the_budget_that_bounded_the_prompt_is_reported(self):
         """The number that decided whether the result arrived at all.
 
