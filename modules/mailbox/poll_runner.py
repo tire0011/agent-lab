@@ -351,6 +351,7 @@ def run_mailbox_poll_once(
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
     from modules.operations_registry import OperationsRegistry
+    from modules.outbox_pr_notifier import notifier_from_env
     from modules.outbox_publisher import FailureAnalysisOutboxPublisher, TaskApprovalOutboxPublisher
 
     run_name = threading.current_thread().name
@@ -380,6 +381,7 @@ def run_mailbox_poll_once(
     publisher = None
     task_publisher = None
     failure_analysis_publisher = None
+    outbox_notifier = None
     operations_registry = None
     experiment_service = None
     try:
@@ -402,22 +404,45 @@ def run_mailbox_poll_once(
             mailbox_config=mailbox_config,
             task_log_dir=getattr(experiment_service, "experiment_log_dir", DEFAULT_LOG_DIR),
         )
+        # Outbox messages are also announced on the persistent communication
+        # PR (#196). Unconfigured GitHub credentials leave this None and the
+        # outbox itself keeps working unchanged.
+        try:
+            outbox_notifier = notifier_from_env(db_path=db_path)
+        except Exception as exc:  # noqa: BLE001 - never block the poll
+            logger.warning(
+                "Outbox PR notifier unavailable run=%s type=%s", run_name, type(exc).__name__
+            )
         publisher = OperationChainPublisher(
             db_path=db_path,
             mailbox_config=mailbox_config,
+            notifier=outbox_notifier,
         )
         task_publisher = TaskApprovalOutboxPublisher(
             db_path=db_path,
             mailbox_config=mailbox_config,
+            notifier=outbox_notifier,
         )
         failure_analysis_publisher = FailureAnalysisOutboxPublisher(
             db_path=db_path,
             mailbox_config=mailbox_config,
+            notifier=outbox_notifier,
         )
         if not dry_run:
             publisher.publish_pending()
             task_publisher.publish_pending()
             failure_analysis_publisher.publish_pending()
+            if outbox_notifier is not None:
+                # Retry notifications whose GitHub call failed earlier; the
+                # outbox entries themselves are already pushed and intact.
+                try:
+                    outbox_notifier.deliver_pending()
+                except Exception as exc:  # noqa: BLE001 - never block the poll
+                    logger.warning(
+                        "Outbox PR notification retry failed run=%s type=%s",
+                        run_name,
+                        type(exc).__name__,
+                    )
             processor.retry_pending_git_commits()
             # Prune only after pending commits have been retried: a file
             # still needed to finalize one is protected, and retrying first
@@ -508,6 +533,7 @@ def run_mailbox_poll_once(
                 ("operation_chain_publisher", publisher),
                 ("task_approval_outbox_publisher", task_publisher),
                 ("failure_analysis_outbox_publisher", failure_analysis_publisher),
+                ("outbox_pr_notifier", outbox_notifier),
                 ("operations_registry", operations_registry),
                 ("experiment_service", experiment_service),
             ):

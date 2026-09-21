@@ -190,6 +190,7 @@ class OutboxPublisher:
         mailbox_config: Any = None,
         db_path: str = DEFAULT_DB_PATH,
         repo_root: str | Path | None = None,
+        notifier: Any = None,
     ) -> None:
         if mailbox_config is not None:
             self._repo_root: Path = Path(mailbox_config.mailbox_repo_path)
@@ -204,6 +205,7 @@ class OutboxPublisher:
         self._conn.row_factory = sqlite3.Row
         self._db_path = db_path
         self._repo_lock = RepoLock(self._repo_root)
+        self._notifier = notifier
 
     def close(self) -> None:
         self._conn.close()
@@ -231,7 +233,28 @@ class OutboxPublisher:
         The caller's business-logic state is never changed by this method.
         """
         with self._repo_lock:
-            return self._publish_locked(record)
+            published = self._publish_locked(record)
+        if published:
+            self._notify(record)
+        return published
+
+    def _notify(self, record: PublishRecord) -> None:
+        """Announce a published message on the communication PR (#196).
+
+        Best-effort by construction: the notifier persists its own pending
+        state and retries later, and any unexpected error here must never
+        undo a successfully pushed outbox message.
+        """
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.notify(record.record_id, record.message.content)
+        except Exception as exc:  # noqa: BLE001 - publication already succeeded
+            logger.warning(
+                "outbox PR notification failed for %s: %s",
+                record.record_id,
+                _redact(str(exc)),
+            )
 
     def publish_many(self, records: list[PublishRecord]) -> int:
         """Publish a list of records; return count of successfully pushed."""
