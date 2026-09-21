@@ -239,5 +239,52 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
 
 
+    def test_verified_noop_can_finish_after_explicit_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"action":"command","command":"test -f existing.txt","effect":"verify",'
+                    '"reason":"verify requested state already exists"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Already implemented.","reason":"verified existing state",'
+                    '"verified_noop":true}',
+                ],
+            )
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    return_value=("exit_code: 0\nstdout:\n", None),
+                ):
+                    result = orchestrator.run("fix the repository behavior")
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertTrue(
+            any(item.get("verification_evidence") for item in result.observations)
+        )
+
+    def test_unverified_already_done_claim_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Already implemented.","reason":"I think it is done",'
+                    '"verified_noop":true}',
+                    '{"type":"action","action":"missing_capability","experiment_id":null,'
+                    '"message":"No verification was performed.",'
+                    '"reason":"verification evidence is missing"}',
+                ],
+            )
+            try:
+                result = orchestrator.run("fix the repository behavior")
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+
+
 if __name__ == "__main__":
     unittest.main()
