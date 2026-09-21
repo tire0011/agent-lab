@@ -124,13 +124,8 @@ class RefreshResult:
         return lines
 
 
-def own_unit(cgroup_path: str = "/proc/self/cgroup") -> str | None:
-    """The systemd unit this process runs inside, if it can be determined.
-
-    Restarting one's own unit is not the same operation as restarting someone
-    else's, and the difference has to be known before the command is built -
-    see ``systemd_restarter``.
-    """
+def get_current_systemd_unit(cgroup_path: str = "/proc/self/cgroup") -> str | None:
+    """The systemd unit this process runs inside, or None."""
     try:
         text = Path(cgroup_path).read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -150,19 +145,10 @@ def systemd_restarter(
 ) -> Callable[[], dict[str, str]]:
     """Restarter that asks systemd to restart *services*, one report per unit.
 
-    Restarting the unit this process runs inside needs ``--no-block``. Without
-    it systemd tears the caller down while it is still waiting for its own
-    ``systemctl`` to return, so the call comes back non-zero with both streams
-    empty - and a restart that *worked* is reported as a failure. That is
-    exactly what happened the first time a mailbox refresh restarted
-    ``agent-api`` from inside ``agent-api``: the journal shows the unit
-    stopping and starting cleanly while the report said ``error:``.
-
-    ``--no-block`` returns as soon as the job is queued, so the outcome is
-    genuinely unknown to us. It is reported as requested rather than as done,
-    because claiming either would be a guess.
+    Restarting our own unit is handed to a transient unit, so the outcome is
+    unknown to us and is reported as scheduled rather than as done.
     """
-    unit = own_unit() if current_unit is _UNSET else current_unit
+    unit = get_current_systemd_unit() if current_unit is _UNSET else current_unit
 
     def restart() -> dict[str, str]:
         results: dict[str, str] = {}
@@ -170,19 +156,10 @@ def systemd_restarter(
             replacing_self = unit is not None and service == unit
             prefix = ["sudo"] if use_sudo else []
             if replacing_self:
-                # Hand the restart to systemd as a transient unit of its own.
-                #
-                # `--no-block` was not enough, and the reason is where the
-                # caller lives: stopping a unit kills its whole control group,
-                # and our `systemctl` is a child of the process being stopped,
-                # so it is in that group. Returning early is still a race
-                # against our own teardown, and we lost it - the refresh
-                # reported `exit -15`, SIGTERM, for a restart that had in fact
-                # succeeded.
-                #
-                # A transient unit is owned by systemd, not by us, so stopping
-                # our own unit cannot take it with us. The delay gives this
-                # process time to finish writing its report first.
+                # Stopping a unit kills its whole control group, and a
+                # plain `systemctl` would be a child inside that group -
+                # killed mid-restart, reported as `exit -15` for a restart
+                # that worked. A transient unit is systemd's, not ours.
                 command = prefix + [
                     "systemd-run",
                     "--collect",
@@ -211,10 +188,8 @@ def systemd_restarter(
                     else "restarted"
                 )
             else:
-                # The exit code always goes in. systemctl can fail writing
-                # nothing at all to either stream - a refresh reported
-                # "service agent-api: error: " with no reason after it, which
-                # says only that something went wrong somewhere.
+                # systemctl can fail with both streams empty, so the exit
+                # code is the only thing always worth reporting.
                 detail = redact_secrets(completed.stderr or completed.stdout).strip()[:200]
                 if not detail:
                     detail = "no output; run it by hand to see why"

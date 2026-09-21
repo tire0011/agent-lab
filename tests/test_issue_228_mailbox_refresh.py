@@ -328,11 +328,11 @@ class SelfRestartTests(unittest.TestCase):
 
 class OwnUnitTests(unittest.TestCase):
     def _own_unit(self, text):
-        from modules.nexus_refresh import own_unit
+        from modules.nexus_refresh import get_current_systemd_unit
 
         path = Path(self._tmp.name) / "cgroup"
         path.write_text(text, encoding="utf-8")
-        return own_unit(str(path))
+        return get_current_systemd_unit(str(path))
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -353,9 +353,9 @@ class OwnUnitTests(unittest.TestCase):
         self.assertIsNone(self._own_unit("0::/user.slice/user-1000.slice\n"))
 
     def test_an_unreadable_cgroup_is_not_an_error(self):
-        from modules.nexus_refresh import own_unit
+        from modules.nexus_refresh import get_current_systemd_unit
 
-        self.assertIsNone(own_unit(str(Path(self._tmp.name) / "missing")))
+        self.assertIsNone(get_current_systemd_unit(str(Path(self._tmp.name) / "missing")))
 
 
 class MessageCannotWidenTheOperationTests(unittest.TestCase):
