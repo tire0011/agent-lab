@@ -788,6 +788,44 @@ class NexusTaskStore:
             "claims": claims,
         }
 
+    def blocked_missing_capabilities(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return blocked sessions with their latest structured capability requirement."""
+        limit = max(1, min(limit, 500))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM nexus_task_sessions
+                   WHERE status='blocked_missing_capability'
+                   ORDER BY updated_at LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+        blocked: list[dict[str, Any]] = []
+        for row in rows:
+            session = self._row(row)
+            events = self.recent_events(
+                session.id,
+                role="assistant",
+                kind="missing_capability",
+                limit=1,
+            )
+            if not events:
+                continue
+            metadata = events[0].get("metadata") or {}
+            capability = str(metadata.get("capability") or "").strip()
+            trigger_task = str(metadata.get("trigger_task") or "").strip()
+            if not capability or not trigger_task:
+                continue
+            blocked.append(
+                {
+                    "session": session,
+                    "capability": capability,
+                    "required_inputs": list(metadata.get("required_inputs") or []),
+                    "trigger_task": trigger_task,
+                    "blocker_event_id": events[0]["id"],
+                }
+            )
+        return blocked
+
     def set_status(self, session_id: str, status: str, *, worker_id: str | None = None) -> bool:
         """Move a session's status, optionally only while ``worker_id`` owns it.
 
