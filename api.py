@@ -334,7 +334,7 @@ def _resolve_nexus_chat_job_service() -> NexusChatJobService:
 
 
 def _resume_blocked_capabilities_after_startup() -> None:
-    """Resume capability-blocked controller sessions after a deployment refresh."""
+    """Resume one eligible capability blocker behind normal initiative gates."""
     store = None
     try:
         store = NexusTaskStore()
@@ -349,10 +349,12 @@ def _resume_blocked_capabilities_after_startup() -> None:
 
     def run() -> None:
         from modules.nexus_controller_service import NexusControllerService
+        from modules.nexus_initiative import NexusInitiativeService
         from modules.task_orchestrator import NexusTaskOrchestrator
 
         registry = None
         orchestrator = None
+        initiative = None
         try:
             experiment_service = _resolve_experiment_service()
             registry = OperationsRegistry(experiment_service=experiment_service)
@@ -360,17 +362,30 @@ def _resume_blocked_capabilities_after_startup() -> None:
                 operations_registry=registry,
                 experiment_service=experiment_service,
             )
-            resumed = NexusControllerService(
-                orchestrator=orchestrator
-            ).resume_available_capabilities()
-            if resumed:
+            controller = NexusControllerService(orchestrator=orchestrator)
+            initiative = NexusInitiativeService(
+                db_path=DEFAULT_DB_PATH,
+                experiment_service=experiment_service,
+                adoption_service=_resolve_experiment_adoption_service(),
+                controller=controller,
+            )
+            decision = initiative.resume_blocked_capability()
+            if decision.decision == "dispatched":
                 _logger.info(
-                    "resumed %d capability-blocked controller session(s) after startup",
-                    len(resumed),
+                    "resumed capability-blocked controller session %s after startup",
+                    decision.candidate.ref if decision.candidate else "?",
+                )
+            elif decision.decision not in {"idle", "busy", "budget_exhausted"}:
+                _logger.warning(
+                    "capability-blocked startup resume ended as %s: %s",
+                    decision.decision,
+                    decision.detail,
                 )
         except Exception as exc:  # noqa: BLE001 - never block API startup
             _logger.error("capability-blocked session resume failed: %s", exc)
         finally:
+            if initiative is not None:
+                initiative.close()
             if orchestrator is not None:
                 orchestrator.close()
             if registry is not None:
