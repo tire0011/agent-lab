@@ -134,6 +134,79 @@ class MissingCapabilityResumeTests(unittest.TestCase):
                 "action_selected",
             )
 
+    def test_capability_already_present_at_block_time_does_not_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _MutableRegistry(tmp)
+            registry.enabled = True
+            client = _Client([
+                '{"action":"missing_capability","message":"Need test_missing_capability.",'
+                '"reason":"another prerequisite is still unresolved",'
+                '"information_gap":"test_missing_capability",'
+                '"gap_kind":"missing_capability","capability":"test_missing_capability"}',
+            ])
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=registry,
+                experiment_service=SimpleNamespace(),
+                llama_client=client,
+                max_steps=1,
+            )
+            self.addCleanup(orchestrator.close)
+
+            blocked = orchestrator.run("Need the test capability")
+            self.assertEqual(blocked.action, ACTION_MISSING_CAPABILITY)
+
+            self.assertEqual(orchestrator.resume_available_capabilities(), [])
+            self.assertEqual(
+                orchestrator.task_store.get(blocked.session_id).status,
+                "blocked_missing_capability",
+            )
+
+    def test_legacy_blocker_does_not_hide_later_structured_blocker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _MutableRegistry(tmp)
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=registry,
+                experiment_service=SimpleNamespace(),
+                llama_client=_Client([]),
+            )
+            self.addCleanup(orchestrator.close)
+
+            legacy = orchestrator.task_store.get_or_create(
+                source_type="task", source_id="legacy"
+            )
+            orchestrator.task_store.set_status(
+                legacy.id, "blocked_missing_capability"
+            )
+            orchestrator.task_store.append_event(
+                legacy.id,
+                role="assistant",
+                kind="missing_capability",
+                content="legacy blocker",
+                metadata={},
+            )
+
+            structured = orchestrator.task_store.get_or_create(
+                source_type="task", source_id="structured"
+            )
+            orchestrator.task_store.set_status(
+                structured.id, "blocked_missing_capability"
+            )
+            orchestrator.task_store.append_event(
+                structured.id,
+                role="assistant",
+                kind="missing_capability",
+                content="structured blocker",
+                metadata={
+                    "capability": "test_missing_capability",
+                    "trigger_task": "original task",
+                    "catalog_at_block": [],
+                },
+            )
+
+            blockers = orchestrator.task_store.blocked_missing_capabilities(limit=1)
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["session"].id, structured.id)
+
     def test_unavailable_capability_does_not_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = _MutableRegistry(tmp)
