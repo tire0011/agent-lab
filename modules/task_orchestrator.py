@@ -126,7 +126,7 @@ logger = logging.getLogger(__name__)
 # be a page of prose and adds nothing to "why did it choose this".
 _DECISION_FIELDS = (
     "tool", "goal", "query", "operation", "provider", "command",
-    "script", "module", "experiment_id",
+    "script", "module", "experiment_id", "capability",
 )
 
 _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
