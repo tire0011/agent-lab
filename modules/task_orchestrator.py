@@ -168,6 +168,7 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
             "module": {"type": "string"},
             "argv": {"type": "array", "items": {"type": "string"}},
             "cwd": {"type": "string"},
+            "effect": {"type": "string", "enum": ["read", "change", "verify"]},
             "experiment_id": {"type": ["string", "null"]},
             "message": {"type": "string"},
             "reason": {"type": "string"},
@@ -536,6 +537,9 @@ class NexusTaskOrchestrator:
             title=title,
             session_id=session_id,
         )
+        if not session.requires_completion_evidence and self._is_implementation_intent(task):
+            self.task_store.set_requires_completion_evidence(session.id, True)
+            session.requires_completion_evidence = True
         # Claim the session and report this worker alive for as long as the
         # turn runs (#162). A turn can legitimately spend minutes inside one
         # local inference call without writing anything, so the heartbeat - not
@@ -1007,20 +1011,18 @@ class NexusTaskOrchestrator:
                     # find_tool decides its not_found guidance from what this
                     # task is about, so it needs the task itself.
                     execution_decision["current_task"] = task
-                    repository_state_before = self._repository_state_fingerprint()
                     observation = await self._execute_tool(
                         execution_decision,
                         budget_plan=budget_plan,
                         task_logger=task_logger,
                     )
-                    repository_state_after = self._repository_state_fingerprint()
-                    if (
-                        repository_state_before
-                        and repository_state_after
-                        and repository_state_before != repository_state_after
-                    ):
+                    if self._is_completion_evidence(execution_decision, observation):
                         observation = dict(observation)
-                        observation["state_changed"] = True
+                        observation["completion_evidence"] = {
+                            "kind": "state_change",
+                            "effect": "change",
+                            "source": str(observation.get("tool", tool)),
+                        }
                     if (
                         tool == TOOL_FIND_TOOL
                         and observation.get("status") in {"not_found", "unavailable"}
@@ -1666,7 +1668,7 @@ Rules:
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
-- For implementation-intent tasks such as solve/fix/implement/work on, a successful read-only lookup is context only, not proof that the requested change is complete. Do not answer as completed until the run contains state-changing completion evidence; if the needed capability is unavailable, use missing_capability instead.
+- For implementation/state-change tasks, a successful read-only lookup is context only, not proof that work is complete. For command or python_run, set effect to read, change, or verify. A successful effect=change execution is completion evidence; read/verify are not. If the required change cannot be performed, use missing_capability instead of claiming completion.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Set capability to a stable identifier for the missing capability and required_inputs to the values it needs. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
@@ -1717,7 +1719,10 @@ Decide the next step now. Return JSON only.
                 "context": str(decision.get("context", "")),
             }
         if tool == ACTION_COMMAND:
-            return tool, {"command": str(decision.get("command", "")).strip()}
+            return tool, {
+                "command": str(decision.get("command", "")).strip(),
+                "effect": str(decision.get("effect", "")).strip().lower(),
+            }
         if tool == TOOL_PYTHON_RUN:
             # The working directory changes module/script resolution, so two
             # otherwise identical python_run calls in different directories are
@@ -1732,43 +1737,9 @@ Decide the next step now. Return JSON only.
                 "module": str(decision.get("module", "")).strip(),
                 "argv": [str(item) for item in (decision.get("argv") or [])],
                 "cwd": cwd,
+                "effect": str(decision.get("effect", "")).strip().lower(),
             }
         return tool, dict(decision.get("args") or {})
-
-    def _repository_state_fingerprint(self) -> str:
-        """Stable local repository state used to detect actual implementation effects."""
-        root = self._repo_root()
-        try:
-            status = subprocess.run(
-                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            head = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            branch = subprocess.run(
-                ["git", "branch", "--show-current"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        if status.returncode != 0 or head.returncode != 0:
-            return ""
-        payload = f"{head.stdout.strip()}\n{branch.stdout.strip()}\n{status.stdout}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _state_token(self, current_input: str) -> str:
         root = Path(getattr(self.operations_registry, "repo_root", "/agent"))
@@ -1883,32 +1854,65 @@ Decide the next step now. Return JSON only.
 
     @staticmethod
     def _is_implementation_intent(task: str) -> bool:
-        """Recognize tasks whose requested outcome is a change, not information."""
+        """Recognize explicit requests whose requested outcome is a state change."""
         normalized = " ".join(str(task or "").strip().lower().split())
-        return bool(re.match(r"^(?:please\s+)?(?:solve|fix|implement|work\s+on)\b", normalized))
+        if not normalized:
+            return False
+        informational = re.match(
+            r"^(?:#*\s*)?(?:how|why|what|explain|summarize|inspect|show|read|describe)\b",
+            normalized,
+        )
+        if informational:
+            return False
+        return bool(
+            re.search(
+                r"\b(?:solve|fix|implement|resolve|address|apply|update)\b|"
+                r"\bmake\b.{0,80}\bwork\b|\bwork\s+on\b",
+                normalized,
+            )
+        )
 
-    def _has_completion_evidence(self, observations: list[dict[str, Any]]) -> bool:
-        """Whether this run contains a successful state-changing operation."""
-        mutating_operations = {
-            str(getattr(spec, "name", "")).strip()
-            for spec in self.operations_registry.catalog()
-            if str(getattr(spec, "name", "")).strip()
-            and bool(getattr(spec, "mutates_state", True))
-        }
-        for observation in observations:
-            if observation.get("state_changed") and not observation.get("error"):
-                return True
-            if observation.get("tool") != "operation" or observation.get("event"):
-                continue
-            operation = str(observation.get("operation", "")).strip()
+    @staticmethod
+    def _command_exit_code(output: Any) -> int | None:
+        match = re.search(r"(?m)^exit_code:\s*(-?\d+)\s*$", str(output or ""))
+        return int(match.group(1)) if match else None
+
+    def _operation_mutates_state(self, operation: str) -> bool:
+        for spec in self.operations_registry.catalog():
+            if str(getattr(spec, "name", "")).strip() == operation:
+                return bool(getattr(spec, "mutates_state", False))
+        return False
+
+    def _is_completion_evidence(
+        self,
+        decision: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> bool:
+        """Classify evidence from this action's own declared/returned effect."""
+        tool = str(observation.get("tool", "")).strip()
+        if tool == "operation":
             result = observation.get("result")
-            if (
-                operation in mutating_operations
+            return (
+                self._operation_mutates_state(str(observation.get("operation", "")).strip())
                 and isinstance(result, dict)
                 and bool(result.get("success"))
-            ):
-                return True
-        return False
+            )
+        if tool not in {ACTION_COMMAND, TOOL_PYTHON_RUN}:
+            return False
+        if str(decision.get("effect", "")).strip().lower() != "change":
+            return False
+        if observation.get("error") or observation.get("event") == "command_not_found":
+            return False
+        return self._command_exit_code(observation.get("result")) == 0
+
+    def _has_completion_evidence(
+        self,
+        session_id: str,
+        observations: list[dict[str, Any]],
+    ) -> bool:
+        """Read explicit completion evidence from this run or persisted session history."""
+        evidence = self._terminal_evidence(session_id, observations, [])
+        return any(bool(item.get("completion_evidence")) for item in evidence)
 
     def _validate_evidence_sensitive_terminal(
         self,
@@ -1919,9 +1923,13 @@ Decide the next step now. Return JSON only.
         decision: dict[str, Any],
         observations: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        """Reject terminal decisions that are unsupported by the run's evidence."""
-        if action == ACTION_ANSWER and self._is_implementation_intent(task):
-            if self._has_completion_evidence(observations):
+        """Reject terminal decisions that are unsupported by the session's evidence."""
+        session = self.task_store.get(session_id)
+        requires_completion = bool(
+            session is not None and session.requires_completion_evidence
+        )
+        if action == ACTION_ANSWER and requires_completion:
+            if self._has_completion_evidence(session_id, observations):
                 return None
             return {
                 "event": "terminal_decision_rejected",
@@ -1934,7 +1942,7 @@ Decide the next step now. Return JSON only.
                 ),
                 "candidate_operations": [],
                 "retryable": True,
-                "recommended_next_action": TOOL_FIND_TOOL,
+                "recommended_next_action": ACTION_MISSING_CAPABILITY,
             }
 
         if action not in {ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY}:
