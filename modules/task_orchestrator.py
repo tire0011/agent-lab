@@ -438,13 +438,23 @@ class NexusTaskOrchestrator:
     def resume_available_capabilities(self) -> list[TaskDecision]:
         """Resume blocked sessions whose required registry capability now exists."""
         resumed: list[TaskDecision] = []
+        current_catalog = {
+            str(getattr(spec, "name", "")).strip()
+            for spec in self.operations_registry.catalog()
+            if str(getattr(spec, "name", "")).strip()
+        }
         for blocker in self.task_store.blocked_missing_capabilities():
-            capability = str(blocker["capability"])
-            if not self.tool_router.candidate_operations(capability):
+            capability = str(blocker["capability"]).strip()
+            catalog_at_block = {
+                str(name).strip()
+                for name in blocker.get("catalog_at_block") or []
+                if str(name).strip()
+            }
+            if capability not in current_catalog or capability in catalog_at_block:
                 continue
             session = blocker["session"]
-            resumed.append(
-                asyncio.run(
+            try:
+                decision = asyncio.run(
                     self._resume_blocked_session_async(
                         session,
                         str(blocker["trigger_task"]),
@@ -452,7 +462,11 @@ class NexusTaskOrchestrator:
                         int(blocker["blocker_event_id"]),
                     )
                 )
-            )
+            except TaskOrchestratorError as exc:
+                if "could not claim Nexus task session" in str(exc):
+                    continue
+                raise
+            resumed.append(decision)
         return resumed
 
     async def _resume_blocked_session_async(
@@ -483,12 +497,16 @@ class NexusTaskOrchestrator:
                 blocker_event_id=blocker_event_id,
             )
         except asyncio.CancelledError:
-            self._abort_turn(session.id, TERMINAL_REASON_TURN_CANCELLED, "cancelled")
+            self._restore_missing_capability_block(
+                session.id,
+                capability,
+                "resume cancelled",
+            )
             raise
         except BaseException as exc:
-            self._abort_turn(
+            self._restore_missing_capability_block(
                 session.id,
-                TERMINAL_REASON_TURN_FAILED,
+                capability,
                 f"{type(exc).__name__}: {exc}",
             )
             raise
@@ -560,6 +578,26 @@ class NexusTaskOrchestrator:
         finally:
             heartbeat.stop()
             self._claims.pop(session.id, None)
+
+    def _restore_missing_capability_block(
+        self,
+        session_id: str,
+        capability: str,
+        detail: str,
+    ) -> None:
+        owner = self._claim_owner(session_id)
+        if owner is None:
+            return
+        self.task_store.finalize_turn(
+            session_id,
+            worker_id=owner,
+            status="blocked_missing_capability",
+            reason=ACTION_MISSING_CAPABILITY,
+            event_role="system",
+            event_kind="capability_resume_failed",
+            event_content=detail[:2000],
+            event_metadata={"capability": capability},
+        )
 
     def _abort_turn(self, session_id: str, reason: str, detail: str) -> None:
         """Record a turn that died in the open, instead of letting it go quiet.
@@ -1056,18 +1094,19 @@ class NexusTaskOrchestrator:
                 )
 
             self._log_result_reuse(session.id, observations, redundant_requests)
+            raw_required_inputs = decision.get("required_inputs")
             required_inputs = [
                 str(item)[:200]
-                for item in (decision.get("required_inputs") or [])[:20]
+                for item in (
+                    raw_required_inputs[:20]
+                    if isinstance(raw_required_inputs, list)
+                    else []
+                )
                 if str(item).strip()
             ]
             capability = None
             if action == ACTION_MISSING_CAPABILITY:
-                capability = str(
-                    decision.get("capability")
-                    or decision.get("information_gap")
-                    or ""
-                ).strip()[:300] or None
+                capability = str(decision.get("capability") or "").strip()[:300] or None
             result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
@@ -2538,6 +2577,15 @@ Decide the next step now. Return JSON only.
                 "capability": decision.capability,
                 "required_inputs": decision.required_inputs,
                 "trigger_task": task[:4000] if decision.action == ACTION_MISSING_CAPABILITY else None,
+                "catalog_at_block": (
+                    sorted(
+                        str(getattr(spec, "name", "")).strip()
+                        for spec in self.operations_registry.catalog()
+                        if str(getattr(spec, "name", "")).strip()
+                    )
+                    if decision.action == ACTION_MISSING_CAPABILITY
+                    else None
+                ),
             },
         )
         if not recorded:
