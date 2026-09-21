@@ -1206,7 +1206,7 @@ class TaskOrchestratorTests(unittest.TestCase):
     def test_invalid_json_escape_gets_one_schema_constrained_correction(self):
         client = _Client([
             r'''{"type":"tool","tool":"command","command":"echo Don\'t stop","reason":"implement"}''',
-            '{"type":"tool","tool":"command","command":"printf repaired","effect":"change",'
+            '{"type":"tool","tool":"command","command":"printf repaired",'
             '"reason":"corrected syntax"}',
             '{"type":"action","action":"answer","experiment_id":null,'
             '"message":"Implemented.","reason":"command succeeded"}',
@@ -1218,7 +1218,11 @@ class TaskOrchestratorTests(unittest.TestCase):
                 "modules.task_orchestrator.process_command",
                 return_value=("exit_code: 0\nstdout:\nrepaired\n", None),
             ) as command_mock:
-                result = orchestrator.run("Implement the change")
+                # Read-only wording on purpose: this test is about repairing
+                # one invalid JSON reply, and an implementation-intent task
+                # would additionally have to satisfy the #234 completion gate,
+                # which a mocked command that changes nothing cannot.
+                result = orchestrator.run("Show the repaired command output")
 
             self.assertEqual(result.action, ACTION_ANSWER)
             command_mock.assert_called_once()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,7 +96,38 @@ class _IssueRegistry:
         )
 
 
+def _init_repo(path: str) -> None:
+    """Give the orchestrator a real checkout to observe.
+
+    Evidence is now whatever the executor sees change in the working tree,
+    so a fixture that only returns a rendered string proves nothing - the
+    command has to actually do something.
+    """
+    for args in (
+        ["init"],
+        ["config", "user.email", "test@test.com"],
+        ["config", "user.name", "Test"],
+    ):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    Path(path, "README.md").write_text("# fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True
+    )
+
+
+def _writes(path: Path, exit_code: int = 0, output: str = "changed"):
+    """A patched ``process_command`` that really changes the checkout."""
+
+    def _run(*_args, **_kwargs):
+        path.write_text("changed\n", encoding="utf-8")
+        return (_command_result(exit_code, output), None)
+
+    return _run
+
+
 def _orchestrator(tmp: str, responses):
+    _init_repo(tmp)
     registry = _IssueRegistry(str(Path(tmp) / "state.db"), tmp)
     client = _Client(responses)
     return (
@@ -176,7 +208,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
             try:
                 with patch(
                     "modules.task_orchestrator.process_command",
-                    return_value=(_command_result(0, "changed"), None),
+                    side_effect=_writes(Path(tmp) / "applied.txt"),
                 ):
                     result = orchestrator.run("fix the repository behavior")
                 events = orchestrator.task_store.recent_events(
@@ -263,7 +295,13 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
 
 
-    def test_verified_noop_can_finish_after_explicit_verification(self):
+    def test_verified_noop_goes_to_the_user_instead_of_self_completing(self):
+        """A check that changes nothing cannot certify "it was already done".
+
+        `true` exits 0 and changes nothing, exactly like a real verification,
+        so the claim that the requested state already exists is the user's to
+        confirm - it is the #234 failure mode itself.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator, _, _ = _orchestrator(
                 tmp,
@@ -273,6 +311,12 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                     '{"type":"action","action":"answer","experiment_id":null,'
                     '"message":"Already implemented.","reason":"verified existing state",'
                     '"verified_noop":true}',
+                    '{"type":"action","action":"clarification","experiment_id":null,'
+                    '"message":"Verification shows the change is already in place. '
+                    'Please confirm no further work is needed.",'
+                    '"reason":"a no-op completion needs user confirmation",'
+                    '"gap_kind":"user_intent","information_gap":"confirmation that nothing is left",'
+                    '"why_human_required":"Only the user can confirm the request is satisfied."}',
                 ],
             )
             try:
@@ -284,7 +328,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
             finally:
                 orchestrator.close()
 
-        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.action, ACTION_CLARIFICATION)
         self.assertTrue(
             any(item.get("verification_evidence") for item in result.observations)
         )
@@ -357,7 +401,7 @@ class Issue234EvidenceIntegrityTests(unittest.TestCase):
             try:
                 with patch(
                     "modules.task_orchestrator.process_command",
-                    return_value=(_command_result(0, "changed"), None),
+                    side_effect=_writes(Path(tmp) / "first.txt"),
                 ):
                     first = orchestrator.run("fix issue 196", source_id="stale-evidence")
                 self.assertEqual(first.action, ACTION_ANSWER)
@@ -446,6 +490,105 @@ class Issue234EvidenceIntegrityTests(unittest.TestCase):
 
         self.assertFalse(refreshed.requires_completion_evidence)
         self.assertIsNone(refreshed.completion_intent_key)
+
+
+
+class Issue234SelfCertificationTests(unittest.TestCase):
+    """The controller labels its own calls, so a label can never be evidence."""
+
+    def test_true_labelled_as_change_is_not_completion_evidence(self):
+        """The reviewer's case: `{"command":"true","effect":"change"}`, exit 0.
+
+        The command succeeds and the label claims a change, but the executor
+        sees the checkout untouched, so nothing is certified.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"action":"command","command":"true","effect":"change",'
+                    '"reason":"apply the requested change"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Implemented.","reason":"the command succeeded"}',
+                    '{"type":"action","action":"missing_capability","experiment_id":null,'
+                    '"message":"Nothing changed; a state-changing capability is needed.",'
+                    '"reason":"no observed change"}',
+                ],
+            )
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    return_value=(_command_result(0, ""), None),
+                ):
+                    result = orchestrator.run("fix the repository behavior")
+                session = orchestrator.task_store.get(result.session_id)
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+        self.assertIsNone(session.completion_evidence_key)
+        self.assertFalse(
+            any(item.get("completion_evidence") for item in result.observations)
+        )
+
+    def test_change_is_recorded_from_the_observed_worktree_not_the_label(self):
+        """A call labelled `read` that really changes the tree still counts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"action":"command","command":"./apply.sh","effect":"read",'
+                    '"reason":"inspect the repository"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Implemented.","reason":"the change is in place"}',
+                ],
+            )
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    side_effect=_writes(Path(tmp) / "mislabelled.txt"),
+                ):
+                    result = orchestrator.run("fix the repository behavior")
+                session = orchestrator.task_store.get(result.session_id)
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(
+            session.completion_evidence_key, session.completion_intent_key
+        )
+
+    def test_runtime_owned_paths_are_not_evidence(self):
+        """This process writes state/ and logs/ on every turn by itself."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"action":"command","command":"true","effect":"change",'
+                    '"reason":"apply the requested change"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Implemented.","reason":"the command succeeded"}',
+                    '{"type":"action","action":"missing_capability","experiment_id":null,'
+                    '"message":"Nothing changed.","reason":"no observed change"}',
+                ],
+            )
+
+            def _writes_runtime_artifacts(*_args, **_kwargs):
+                state = Path(tmp) / "state"
+                state.mkdir(exist_ok=True)
+                (state / "runs.json").write_text("{}", encoding="utf-8")
+                return (_command_result(0, ""), None)
+
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    side_effect=_writes_runtime_artifacts,
+                ):
+                    result = orchestrator.run("fix the repository behavior")
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
 
 
 if __name__ == "__main__":

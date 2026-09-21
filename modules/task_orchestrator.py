@@ -1036,23 +1036,42 @@ class NexusTaskOrchestrator:
                     # find_tool decides its not_found guidance from what this
                     # task is about, so it needs the task itself.
                     execution_decision["current_task"] = task
+                    # Completion evidence is measured, never accepted on the
+                    # controller's word: `effect` says what the call is meant
+                    # to do, and the snapshots either bear that out or do not.
+                    # Only executions can change anything, so only they are
+                    # measured.
+                    measured = tool in {ACTION_COMMAND, TOOL_PYTHON_RUN}
+                    before = self._worktree_snapshot(
+                        self._decision_cwd(execution_decision)
+                    ) if measured else None
                     observation = await self._execute_tool(
                         execution_decision,
                         budget_plan=budget_plan,
                         task_logger=task_logger,
                     )
-                    if self._successful_effect(execution_decision, observation, "change"):
-                        observation = dict(observation)
-                        observation["completion_evidence"] = self._record_evidence(
-                            session,
-                            kind="change",
-                            source=str(observation.get("tool", tool)),
+                    if measured and self._execution_succeeded(observation):
+                        after = self._worktree_snapshot(
+                            self._decision_cwd(execution_decision)
                         )
-                    elif self._successful_effect(execution_decision, observation, "verify"):
+                        # An execution that changed the checkout is completion
+                        # evidence. One that succeeded without changing it -
+                        # or whose effect this process cannot see, such as a
+                        # restarted service or a remote call - is recorded as
+                        # a verification instead, which sends the completion
+                        # claim to the user rather than closing the task.
+                        kind = (
+                            "change"
+                            if self._observed_state_change(before, after)
+                            else "verify"
+                        )
                         observation = dict(observation)
-                        observation["verification_evidence"] = self._record_evidence(
+                        observation[
+                            "completion_evidence" if kind == "change"
+                            else "verification_evidence"
+                        ] = self._record_evidence(
                             session,
-                            kind="verify",
+                            kind=kind,
                             source=str(observation.get("tool", tool)),
                         )
                     if (
@@ -1699,7 +1718,7 @@ Rules:
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
-- For implementation/state-change tasks, a successful read-only lookup is context only, not proof that work is complete. For command or python_run, set effect to read, change, or verify. A successful effect=change execution is completion evidence. If verification proves the requested state already exists and no change is required, use effect=verify and only then answer with verified_noop=true. If the required change cannot be performed or verified, use missing_capability instead of claiming completion.
+- For implementation/state-change tasks, a successful read-only lookup is context only, not proof that work is complete. For command or python_run, set effect to read, change, or verify to say what the call is for. Completion evidence is what the executor observes: a command that succeeds and leaves the checkout actually changed. Declaring effect=change does not by itself complete anything, and a command that changes nothing (for example `true`) never will. If you believe no change is required, say so as a clarification that asks the user to confirm, citing the verification output. If the required change cannot be performed, use missing_capability instead of claiming completion.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Set capability to a stable identifier for the missing capability and required_inputs to the values it needs. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
@@ -1927,21 +1946,84 @@ Decide the next step now. Return JSON only.
         """
         return exit_code_of(str(output or ""))
 
-    def _successful_effect(
-        self,
-        decision: dict[str, Any],
-        observation: dict[str, Any],
-        effect: str,
-    ) -> bool:
-        """Whether a command/python action reported the requested successful effect."""
+    # Paths inside the code checkout that this process and its loggers write
+    # on their own. A turn touches them whether or not it changed anything,
+    # so they can never stand as evidence of requested work.
+    _RUNTIME_OWNED_PREFIXES = ("state/", "logs/", ".git/")
+
+    def _decision_cwd(self, decision: dict[str, Any]) -> Path | None:
+        """Working directory of an execution decision, or None when unusable."""
+        try:
+            return self._resolve_cwd(decision.get("cwd"))
+        except (TaskOrchestratorError, OSError):
+            return None
+
+    def _execution_succeeded(self, observation: dict[str, Any]) -> bool:
+        """Whether a command/python action ran and reported success."""
         tool = str(observation.get("tool", "")).strip()
         if tool not in {ACTION_COMMAND, TOOL_PYTHON_RUN}:
-            return False
-        if str(decision.get("effect", "")).strip().lower() != effect:
             return False
         if observation.get("error") or observation.get("event") == "command_not_found":
             return False
         return self._command_exit_code(observation.get("result")) == 0
+
+    def _worktree_snapshot(self, cwd: Path | None = None) -> str | None:
+        """Executor-side view of the code checkout, scoped to *cwd*.
+
+        Deliberately narrow. The comparison is only ever made across a single
+        command execution, over the subtree that command ran in, and with this
+        process's own artefacts excluded - a whole-repository fingerprint taken
+        around every tool call credits any concurrent writer's work to the call
+        in flight. The mailbox daemons write their own separate checkout
+        (`AGENT_MAILBOX_REPO_PATH`), so they are outside this view entirely.
+
+        Returns ``None`` when the state cannot be read, which is never treated
+        as evidence.
+        """
+        root = self._repo_root()
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if status.returncode != 0 or head.returncode != 0:
+            return None
+        try:
+            scope = str(Path(cwd or root).resolve().relative_to(Path(root).resolve()))
+        except ValueError:
+            scope = ""
+        scope = "" if scope == "." else f"{scope}/"
+        entries = []
+        for line in status.stdout.splitlines():
+            path = line[3:].strip().strip('"')
+            if not path.startswith(scope):
+                continue
+            relative = path[len(scope):]
+            if relative.startswith(self._RUNTIME_OWNED_PREFIXES) or path.startswith(
+                self._RUNTIME_OWNED_PREFIXES
+            ):
+                continue
+            entries.append(line)
+        return "\n".join([head.stdout.strip(), *sorted(entries)])
+
+    @staticmethod
+    def _observed_state_change(before: str | None, after: str | None) -> bool:
+        """Whether the executor itself saw the checkout change."""
+        return before is not None and after is not None and before != after
 
     _EVIDENCE_LABELS = {"change": "state_change", "verify": "verified_state"}
 
@@ -1999,10 +2081,30 @@ Decide the next step now. Return JSON only.
         if action == ACTION_ANSWER and requires_completion:
             if self._evidence_satisfies(session, kind="change"):
                 return None
-            if bool(decision.get("verified_noop")) and self._evidence_satisfies(
-                session, kind="verify"
-            ):
-                return None
+            # A run that succeeded without changing anything the executor can
+            # see is not completion: `true` does exactly that, and so does a
+            # genuine check of work that was already done. The two are
+            # indistinguishable from here, and an effect this process cannot
+            # observe - a restarted service, a remote call - looks the same
+            # again. All three go to the user to confirm, carrying the output,
+            # instead of the controller certifying its own claim or the turn
+            # burning its remaining steps.
+            if self._evidence_satisfies(session, kind="verify"):
+                return {
+                    "event": "terminal_decision_rejected",
+                    "terminal_action": action,
+                    "information_gap": "human confirmation that no change is required",
+                    "gap_kind": "user_intent",
+                    "reason": (
+                        "A completion with no observed state change cannot be "
+                        "self-certified: the run only shows that a command succeeded "
+                        "without changing anything this process can see. Ask the user "
+                        "to confirm the requested outcome, citing the command output."
+                    ),
+                    "candidate_operations": [],
+                    "retryable": True,
+                    "recommended_next_action": ACTION_CLARIFICATION,
+                }
             return {
                 "event": "terminal_decision_rejected",
                 "terminal_action": action,
@@ -2010,7 +2112,7 @@ Decide the next step now. Return JSON only.
                 "gap_kind": "completion_evidence",
                 "reason": (
                     "Implementation-intent tasks cannot finish from read-only context alone; "
-                    "no successful state-changing operation was observed."
+                    "no state change was observed by the executor after any command."
                 ),
                 "candidate_operations": [],
                 "retryable": True,
