@@ -86,6 +86,8 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                     '"reason":"need the issue details"}',
                     '{"status":"found","operation":"github_issue",'
                     '"reason":"github_issue reads an issue","related_tools":[]}',
+                    '{"action":"call_tool","tool":"github_issue",'
+                    '"arguments":{"issue_number":196},"reason":"read the issue"}',
                     '{"type":"action","action":"answer","experiment_id":null,'
                     '"message":"The issue is already resolved. No further action is needed.",'
                     '"reason":"issue was inspected"}',
@@ -108,7 +110,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(registry.calls[0][0], "github_issue")
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
         self.assertNotEqual(result.action, ACTION_ANSWER)
-        self.assertEqual(len(client.prompts), 4)
+        self.assertEqual(len(client.prompts), 5)
 
 
 if __name__ == "__main__":
