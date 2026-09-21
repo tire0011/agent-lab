@@ -19,6 +19,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from modules.nexus_diagnostics import (
     assess_progress,
 )
 from modules.test_progress import (
+    EVENT_START,
     RESULT_ERROR,
     RESULT_FAILED,
     RESULT_PASSED,
@@ -464,7 +466,13 @@ class MonitoredRunTests(unittest.TestCase):
             results,
             {"test_pass": RESULT_PASSED, "test_fail": RESULT_FAILED, "test_skip": RESULT_SKIPPED},
         )
-        self.assertGreaterEqual(finished["test_subject.Mixed.test_pass"]["duration_ms"], 40)
+        # `duration_ms` is the interval between this process *observing* the
+        # start marker and the result, not the child's execution time. Under a
+        # loaded runner the reader thread can miss the gap entirely and see
+        # both in one read, so only the arithmetic is asserted here; the
+        # measurement itself is pinned deterministically in
+        # `DurationMeasurementTests` below.
+        self.assertGreaterEqual(finished["test_subject.Mixed.test_pass"]["duration_ms"], 0)
 
     def test_per_test_detail_stays_out_of_the_global_log(self):
         """The dedicated log must be the only place per-test entries land."""
@@ -566,6 +574,32 @@ class WatchdogConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.stall_timeout_seconds, 2)
         self.assertEqual(config.check_interval_seconds, 0.1)
+
+
+
+class DurationMeasurementTests(unittest.TestCase):
+    """Pin the duration arithmetic without depending on runner scheduling."""
+
+    def test_duration_is_measured_on_the_monotonic_clock(self):
+        parser = UnittestStreamParser()
+        with patch("modules.test_progress.time.monotonic", side_effect=[100.0, 100.25]):
+            started = parser.feed("test_pass (test_subject.Mixed.test_pass) ... ")
+            finished = parser.feed("ok\n")
+
+        self.assertEqual([event.kind for event in started], [EVENT_START])
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].duration_ms, 250)
+        self.assertEqual(finished[0].result, RESULT_PASSED)
+
+    def test_markers_arriving_together_still_report_a_duration(self):
+        """The CI case: one read carries both the description and the result."""
+        parser = UnittestStreamParser()
+        with patch("modules.test_progress.time.monotonic", side_effect=[100.0, 100.0]):
+            events = parser.feed("test_pass (test_subject.Mixed.test_pass) ... ok\n")
+
+        finished = [event for event in events if event.duration_ms is not None]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].duration_ms, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover
