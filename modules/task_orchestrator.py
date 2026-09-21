@@ -435,8 +435,9 @@ class NexusTaskOrchestrator:
             task_logger=task_logger,
         )
 
-    def resume_available_capabilities(self) -> list[TaskDecision]:
-        """Resume blocked sessions whose required registry capability now exists."""
+    def resume_available_capabilities(self, *, limit: int = 1) -> list[TaskDecision]:
+        """Resume blocked sessions whose exact registry capability newly appeared."""
+        limit = max(1, min(limit, 20))
         resumed: list[TaskDecision] = []
         current_catalog = {
             str(getattr(spec, "name", "")).strip()
@@ -467,6 +468,8 @@ class NexusTaskOrchestrator:
                     continue
                 raise
             resumed.append(decision)
+            if len(resumed) >= limit:
+                break
         return resumed
 
     async def _resume_blocked_session_async(
