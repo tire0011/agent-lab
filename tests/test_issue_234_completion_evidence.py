@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from modules.operations_registry import OperationArgSpec
 from modules.task_orchestrator import (
@@ -158,16 +158,12 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertEqual(len(registry.calls), 1)
 
-    def test_implementation_can_finish_after_mutating_operation(self):
+    def test_implementation_can_finish_after_repository_state_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = _IssueRegistry(str(Path(tmp) / "state.db"), tmp)
             client = _Client(
                 [
-                    '{"type":"tool","tool":"find_tool","goal":"apply repository fix",'
-                    '"reason":"need to change the repository"}',
-                    '{"status":"found","operation":"apply_fix",'
-                    '"reason":"apply_fix changes the repository","related_tools":[]}',
-                    '{"action":"call_tool","tool":"apply_fix","arguments":{},'
+                    '{"action":"command","command":"echo changed > result.txt",'
                     '"reason":"apply the requested change"}',
                     '{"type":"action","action":"answer","experiment_id":null,'
                     '"message":"Implemented.","reason":"change completed"}',
@@ -179,13 +175,22 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 llama_client=client,
             )
             try:
-                result = orchestrator.run("fix the repository behavior")
+                with patch.object(
+                    orchestrator,
+                    "_repository_state_fingerprint",
+                    side_effect=["before", "after"],
+                ), patch(
+                    "modules.task_orchestrator.process_command",
+                    return_value=("exit_code: 0\nstdout:\n", None),
+                ):
+                    result = orchestrator.run("fix the repository behavior")
             finally:
                 orchestrator.close()
 
         self.assertEqual(result.action, ACTION_ANSWER)
-        self.assertEqual(len(registry.calls), 1)
-        self.assertEqual(registry.calls[0][0], "apply_fix")
+        changed = [item for item in result.observations if item.get("state_changed")]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0].get("tool"), "command")
 
 
 if __name__ == "__main__":
