@@ -16,7 +16,7 @@ _LOOP_GUARD_EVENTS = frozenset(
     {"duplicate_tool_call", "non_progressing_cycle", "retry_reason_required"}
 )
 _RESULT_PAYLOAD_FIELDS = ("output_lines", "exit_code", "error_summary")
-_CHUNKED_FIELD = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\\[(\\d+)\\]:\\s?(.*)$", re.DOTALL)
+_CHUNKED_FIELD = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]:\s?(.*)$", re.DOTALL)
 
 
 def _args_signature(operation: str, args: Any) -> str:
