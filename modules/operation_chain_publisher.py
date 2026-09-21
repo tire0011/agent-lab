@@ -50,11 +50,13 @@ class OperationChainPublisher:
         db_path: str = DEFAULT_DB_PATH,
         repo_root: str = "/agent",
         mailbox_config: Any = None,
+        notifier: Any = None,
     ) -> None:
         self._inner = OperationChainOutboxPublisher(
             mailbox_config=mailbox_config,
             db_path=db_path,
             repo_root=repo_root,
+            notifier=notifier,
         )
 
     def close(self) -> None:

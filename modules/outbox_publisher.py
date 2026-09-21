@@ -190,6 +190,7 @@ class OutboxPublisher:
         mailbox_config: Any = None,
         db_path: str = DEFAULT_DB_PATH,
         repo_root: str | Path | None = None,
+        notifier: Any = None,
     ) -> None:
         if mailbox_config is not None:
             self._repo_root: Path = Path(mailbox_config.mailbox_repo_path)
@@ -204,6 +205,7 @@ class OutboxPublisher:
         self._conn.row_factory = sqlite3.Row
         self._db_path = db_path
         self._repo_lock = RepoLock(self._repo_root)
+        self._notifier = notifier
 
     def close(self) -> None:
         self._conn.close()
@@ -231,7 +233,54 @@ class OutboxPublisher:
         The caller's business-logic state is never changed by this method.
         """
         with self._repo_lock:
-            return self._publish_locked(record)
+            self._enqueue_notification(record)
+            published = self._publish_locked(record)
+        if published:
+            self._notify(record)
+        return published
+
+    def _enqueue_notification(self, record: PublishRecord) -> None:
+        """Persist the intent to announce this message *before* pushing it.
+
+        The enqueue has to precede the ``pushed`` transition, not follow it.
+        A record that reaches ``pushed`` is never selected by ``fetch_pending``
+        again, so a crash between the push and the enqueue would strand that
+        message with no notification row for ``deliver_pending`` to recover -
+        the one outcome the notification contract does not allow.
+
+        Enqueuing first trades that for a weaker, self-healing failure mode:
+        a message whose publish then fails is announced from content the
+        producer had already committed to SQLite, while the file itself is
+        still retried by the next poll.
+        """
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.enqueue(record.record_id, record.message.content)
+        except Exception as exc:  # noqa: BLE001 - publishing must not depend on it
+            logger.warning(
+                "outbox PR notification enqueue failed for %s: %s",
+                record.record_id,
+                _redact(str(exc)),
+            )
+
+    def _notify(self, record: PublishRecord) -> None:
+        """Announce a published message on the communication PR (#196).
+
+        Best-effort by construction: the row enqueued above is already
+        durable, so a failure here only delays delivery to the next
+        ``deliver_pending`` sweep and never undoes a pushed outbox message.
+        """
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.notify(record.record_id, record.message.content)
+        except Exception as exc:  # noqa: BLE001 - publication already succeeded
+            logger.warning(
+                "outbox PR notification failed for %s: %s",
+                record.record_id,
+                _redact(str(exc)),
+            )
 
     def publish_many(self, records: list[PublishRecord]) -> int:
         """Publish a list of records; return count of successfully pushed."""

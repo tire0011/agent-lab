@@ -146,6 +146,29 @@
   SQLite state) rather than in an external cron or `git rm` job. Deletions
   are committed with explicit pathspecs and pushed by the poll's existing
   fetch/rebase/push sync; a poll with nothing to prune makes no commit.
+- Communication PR notification (`modules/outbox_pr_notifier.py`, Issue #196):
+  once an outbox message is pushed, `OutboxPublisher` hands it to the
+  notifier, which posts one top-level comment carrying the `[NEXUS-OUTBOX]`
+  marker, the message id, its timestamp, and the content to the persistent
+  *Nexus communication* PR (#194, override with `NEXUS_COMMUNICATION_PR`).
+  That comment is what wakes the external ChatGPT Work trigger. Delivery is
+  keyed by message id in `outbox_pr_notifications`, so reprocessing never
+  comments twice, and a GitHub failure only leaves the notification
+  `pending` — the outbox entry itself is already committed and pushed. The
+  notification row is written *before* the push, not after: a record that
+  reaches `pushed` is never selected by `fetch_pending()` again, so a crash
+  in that window would otherwise strand the message with no row for the
+  retry sweep to find. The cost is that a message whose publish then fails
+  is still announced, from content the producer had already committed to
+  SQLite, while the file itself is retried by the next poll. The poll
+  retries pending notifications with bounded exponential backoff. A
+  closed PR is reopened (recreating its head branch first if GitHub deleted
+  it); only a genuinely unusable PR causes an equivalent channel to be
+  recreated — on a freshly cut branch with its own commit, because after a
+  merge the old branch is identical to base and GitHub refuses a PR with no
+  commits between them — which is logged at ERROR with the new number and URL because
+  the external trigger is still scoped to #194. The PR is never merged from
+  here.
 - Command channel restart recovery (`modules/mailbox/development.py` +
   `modules/mailbox/command_recovery.py`, Issue #123): the trusted `command`
   message type runs the shell command as a detached background job so
