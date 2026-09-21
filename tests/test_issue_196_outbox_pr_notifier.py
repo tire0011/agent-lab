@@ -8,6 +8,7 @@ network call is made.
 
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,8 +30,21 @@ from modules.outbox_pr_notifier import (
 )
 
 
+def _not_found() -> RuntimeError:
+    from modules.outbox_pr_notifier import OutboxPRNotifyError
+
+    return OutboxPRNotifyError("GitHub HTTP 404: Not Found")
+
+
 class _FakeGitHub:
-    """Minimal GitHub double recording every call the notifier makes."""
+    """GitHub double that models branches and file contents, not just calls.
+
+    Branch/file state is tracked because the interesting recovery paths turn
+    on it: a PR cannot be opened from a branch identical to its base, and a
+    file that already exists can only be written with its blob sha.
+    """
+
+    COMM_FILE = "docs/nexus-communication.md"
 
     def __init__(
         self,
@@ -41,6 +55,7 @@ class _FakeGitHub:
         merged: bool = False,
         pr_missing: bool = False,
         fail_comments: int = 0,
+        base_file: str | None = None,
     ) -> None:
         self.pr_state = pr_state
         self.pr_number = pr_number
@@ -48,10 +63,21 @@ class _FakeGitHub:
         self.merged = merged
         self.pr_missing = pr_missing
         self.fail_comments = fail_comments
+        # Content of the channel file on the base branch; set when a previous
+        # communication PR was merged into main.
+        self.base_file = base_file
+        self.branch_files: dict[str, str | None] = {}
+        if branch_exists:
+            self.branch_files["nexus-communication"] = base_file
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.comments: list[dict[str, Any]] = []
         self.created_pulls: list[dict[str, Any]] = []
         self._next_comment_id = 1000
+
+    # -- helpers ------------------------------------------------------
+    @staticmethod
+    def _branch_of(path: str) -> str:
+        return path.rsplit("/", 1)[-1].split("?")[0]
 
     def __call__(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         self.calls.append((method, path, payload))
@@ -71,26 +97,48 @@ class _FakeGitHub:
             return {"number": self.pr_number, "state": "open"}
 
         if method == "GET" and "/git/ref/heads/" in path:
-            if path.endswith("/main"):
+            branch = self._branch_of(path)
+            if branch == "main":
                 return {"object": {"sha": "basesha"}}
-            if not self.branch_exists:
+            if branch == "nexus-communication" and not self.branch_exists:
+                raise _not_found()
+            if branch != "nexus-communication" and branch not in self.branch_files:
                 raise _not_found()
             return {"object": {"sha": "headsha"}}
 
         if method == "POST" and path.endswith("/git/refs"):
-            self.branch_exists = True
+            branch = payload["ref"].removeprefix("refs/heads/")
+            if branch in self.branch_files:
+                raise RuntimeError("GitHub HTTP 422: Reference already exists")
+            # A fresh branch starts out identical to the base branch.
+            self.branch_files[branch] = self.base_file
+            if branch == "nexus-communication":
+                self.branch_exists = True
             return {"ref": payload["ref"]}
 
         if method == "GET" and "/contents/" in path:
-            raise _not_found()
+            branch = path.split("?ref=")[1]
+            content = self.branch_files.get(branch)
+            if content is None:
+                raise _not_found()
+            return {"sha": f"blob-{branch}", "content": content}
 
         if method == "PUT" and "/contents/" in path:
-            return {"commit": {"sha": "filesha"}}
+            branch = payload["branch"]
+            existing = self.branch_files.get(branch)
+            if existing is not None and not payload.get("sha"):
+                raise RuntimeError("GitHub HTTP 422: sha wasn't supplied")
+            self.branch_files[branch] = base64.b64decode(payload["content"]).decode("utf-8")
+            return {"commit": {"sha": f"commit-{branch}"}}
 
         if method == "POST" and path.endswith("/pulls"):
+            head = payload["head"]
+            if self.branch_files.get(head) == self.base_file:
+                raise RuntimeError("GitHub HTTP 422: No commits between main and " + head)
             self.pr_number = 900
             self.pr_state = "open"
             self.pr_missing = False
+            self.merged = False
             pull = {"number": 900, "html_url": "https://github.com/o/r/pull/900"}
             self.created_pulls.append(pull)
             return pull
@@ -105,12 +153,6 @@ class _FakeGitHub:
             return comment
 
         raise AssertionError(f"unexpected GitHub call: {method} {path}")
-
-
-def _not_found() -> RuntimeError:
-    from modules.outbox_pr_notifier import OutboxPRNotifyError
-
-    return OutboxPRNotifyError("GitHub HTTP 404: Not Found")
 
 
 class _Clock:
@@ -256,6 +298,39 @@ class OutboxPRNotifierTests(unittest.TestCase):
             any(m == "PATCH" for m, _, _ in github.calls), "a merged PR must not be reopened"
         )
 
+    def test_recreation_after_a_merge_gets_its_own_branch_and_commit(self) -> None:
+        """The merged channel file is already in base, so reusing the old
+        branch would leave nothing to open a PR from."""
+        merged_file = "# Nexus communication\n\nalready merged into main\n"
+        github = _FakeGitHub(pr_state="closed", merged=True, base_file=merged_file)
+        notifier = self._notifier(github)
+
+        with self.assertLogs("modules.outbox_pr_notifier", level="ERROR"):
+            self.assertTrue(notifier.notify("msg-1", "hello"))
+
+        self.assertEqual(len(github.created_pulls), 1)
+        head = [p for m, p, pl in github.calls if m == "POST" and p.endswith("/pulls")]
+        created = [pl for m, p, pl in github.calls if m == "POST" and p.endswith("/pulls")][0]
+        self.assertTrue(head)
+        self.assertNotEqual(
+            created["head"], "nexus-communication", "recreation must cut a fresh branch"
+        )
+        self.assertTrue(created["head"].startswith("nexus-communication-"))
+        # The fresh branch carries a commit, so it differs from the base.
+        self.assertNotEqual(github.branch_files[created["head"]], merged_file)
+        self.assertEqual(len(github.comments), 1)
+
+    def test_reusing_the_merged_branch_would_have_been_rejected(self) -> None:
+        """Guards the test above: the fake rejects a no-diff pull request,
+        which is what the previous implementation would have produced."""
+        merged_file = "# Nexus communication\n\nalready merged into main\n"
+        github = _FakeGitHub(base_file=merged_file)
+
+        with self.assertRaises(RuntimeError) as raised:
+            github("POST", "/repos/o/r/pulls", {"head": "nexus-communication", "base": "main"})
+
+        self.assertIn("No commits between", str(raised.exception))
+
     def test_unconfigured_notifier_never_raises(self) -> None:
         notifier = OutboxPRNotifier(db_path=self.db_path, repository=None, token=None)
         self.addCleanup(notifier.close)
@@ -283,7 +358,11 @@ class CommentBodyTests(unittest.TestCase):
 class _StubNotifier:
     def __init__(self, error: Exception | None = None) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.enqueued: list[tuple[str, str]] = []
         self.error = error
+
+    def enqueue(self, message_id: str, content: str, created_at: str | None = None) -> None:
+        self.enqueued.append((message_id, content))
 
     def notify(self, message_id: str, content: str) -> bool:
         self.calls.append((message_id, content))
@@ -324,10 +403,77 @@ class PublisherNotificationTests(unittest.TestCase):
         self.assertTrue(self._publisher(notifier, published=True).publish(self._record()))
         self.assertEqual(notifier.calls, [("msg-1", "hello")])
 
-    def test_unpublished_message_is_not_announced(self) -> None:
+    def test_unpublished_message_is_not_announced_yet(self) -> None:
         notifier = _StubNotifier()
         self.assertFalse(self._publisher(notifier, published=False).publish(self._record()))
         self.assertEqual(notifier.calls, [])
+        # The intent is still durable: the publish is retried by the next
+        # poll, and the pending notification is delivered either way.
+        self.assertEqual(notifier.enqueued, [("msg-1", "hello")])
+
+    def test_notification_is_enqueued_before_the_push(self) -> None:
+        """A crash after `pushed` must not be able to strand the message.
+
+        A pushed record is never selected by `fetch_pending` again, so the
+        enqueue cannot wait until after the push.
+        """
+        order: list[str] = []
+        notifier = _StubNotifier()
+        notifier.enqueue = lambda *a, **k: order.append("enqueue")  # type: ignore[assignment]
+        publisher = OutboxPublisher(
+            repo_root=self.repo_root, db_path=self.db_path, notifier=notifier
+        )
+        self.addCleanup(publisher.close)
+
+        def _publish(record: PublishRecord) -> bool:
+            order.append("push")
+            return True
+
+        publisher._publish_locked = _publish  # type: ignore[assignment]
+        publisher.publish(self._record())
+
+        self.assertEqual(order, ["enqueue", "push"])
+
+    def test_crash_after_push_still_delivers_exactly_one_comment(self) -> None:
+        """The regression the review asked for: outbox reaches `pushed`, the
+        process dies before delivery, and the next poll posts one comment."""
+        github = _FakeGitHub()
+        notifier = OutboxPRNotifier(
+            db_path=self.db_path,
+            repository="tire0011/agent-lab",
+            transport=github,
+            pr_number=194,
+            base_backoff_seconds=0.0,
+        )
+        self.addCleanup(notifier.close)
+        publisher = OutboxPublisher(
+            repo_root=self.repo_root, db_path=self.db_path, notifier=notifier
+        )
+        self.addCleanup(publisher.close)
+        publisher._publish_locked = lambda record: True  # type: ignore[assignment]
+        # The process dies between the push and the delivery attempt: the
+        # delivery simply never runs.
+        notifier.notify = lambda *a, **k: None  # type: ignore[assignment]
+
+        self.assertTrue(publisher.publish(self._record()))
+        self.assertEqual(github.comments, [], "nothing was delivered before the crash")
+
+        # Restart: a fresh notifier on the same database recovers the message,
+        # even though the producer row will never be published again.
+        restarted = OutboxPRNotifier(
+            db_path=self.db_path,
+            repository="tire0011/agent-lab",
+            transport=github,
+            pr_number=194,
+        )
+        self.addCleanup(restarted.close)
+        self.assertEqual(restarted.deliver_pending(), 1)
+        self.assertEqual(len(github.comments), 1)
+        self.assertIn("msg-1", github.comments[0]["body"])
+
+        # And the recovery is itself idempotent.
+        self.assertEqual(restarted.deliver_pending(), 0)
+        self.assertEqual(len(github.comments), 1)
 
     def test_notifier_failure_never_loses_the_published_message(self) -> None:
         notifier = _StubNotifier(error=RuntimeError("github down"))

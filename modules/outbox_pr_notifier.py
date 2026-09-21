@@ -142,6 +142,18 @@ class OutboxPRNotifier:
     # Public API
     # ------------------------------------------------------------------
 
+    def enqueue(self, message_id: str, content: str, created_at: str | None = None) -> None:
+        """Durably record that this message must be announced.
+
+        Separate from :meth:`notify` so a producer can persist the intent
+        before the step that would otherwise be able to lose it (see
+        ``OutboxPublisher._enqueue_notification``). Repeat calls for the
+        same id are no-ops, which is what keeps delivery single-comment.
+        """
+        if not message_id:
+            return
+        self._enqueue(message_id, content, created_at or _utcnow_iso())
+
     def notify(self, message_id: str, content: str, created_at: str | None = None) -> bool:
         """Record and try to deliver one Outbox message. Never raises."""
         if not message_id:
@@ -289,10 +301,21 @@ class OutboxPRNotifier:
         return str(sha)
 
     def _recreate_channel(self) -> int:
-        """Last resort: build an equivalent channel and shout about the new number."""
-        branch = self.communication_branch
-        self._ensure_branch(branch, "")
-        self._ensure_communication_file(branch)
+        """Last resort: build an equivalent channel and shout about the new number.
+
+        The replacement always gets its own branch cut from the base head and
+        its own commit on top. Reusing ``communication_branch`` would fail
+        exactly when recreation is most likely - after the old PR was merged,
+        the branch still exists and its file is already in base, so GitHub
+        rejects the new PR with "No commits between base and head".
+        """
+        branch = f"{self.communication_branch}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+        self._request(
+            "POST",
+            f"/repos/{self.repository}/git/refs",
+            {"ref": f"refs/heads/{branch}", "sha": self._base_sha()},
+        )
+        self._write_communication_file(branch)
         pull = self._request(
             "POST",
             f"/repos/{self.repository}/pulls",
@@ -320,27 +343,37 @@ class OutboxPRNotifier:
         )
         return new_number
 
-    def _ensure_communication_file(self, branch: str) -> None:
-        """Guarantee the branch differs from base, so a PR can be opened."""
-        path = f"/repos/{self.repository}/contents/{COMMUNICATION_FILE}?ref={branch}"
+    def _write_communication_file(self, branch: str) -> None:
+        """Commit the channel file on *branch* so it differs from the base.
+
+        Written unconditionally, and updated in place when the file is
+        already there (the merged-PR case): a branch identical to its base
+        cannot become a pull request.
+        """
+        existing_sha: str | None = None
         try:
-            self._request("GET", path)
-            return
+            current = self._request(
+                "GET", f"/repos/{self.repository}/contents/{COMMUNICATION_FILE}?ref={branch}"
+            )
+            if isinstance(current, dict):
+                existing_sha = current.get("sha")
         except OutboxPRNotifyError as exc:
             if not _is_not_found(str(exc)):
                 raise
         content = (
             "# Nexus communication\n\n"
-            "Persistent channel between Nexus and ChatGPT Work. Do not merge this PR.\n"
+            "Persistent channel between Nexus and ChatGPT Work. Do not merge this PR.\n\n"
+            f"Channel restored at {_utcnow_iso()}.\n"
         )
+        payload: dict[str, Any] = {
+            "message": "chore: restore Nexus communication channel",
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+            "branch": branch,
+        }
+        if existing_sha:
+            payload["sha"] = existing_sha
         self._request(
-            "PUT",
-            f"/repos/{self.repository}/contents/{COMMUNICATION_FILE}",
-            {
-                "message": "chore: restore Nexus communication channel",
-                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-                "branch": branch,
-            },
+            "PUT", f"/repos/{self.repository}/contents/{COMMUNICATION_FILE}", payload
         )
 
     # ------------------------------------------------------------------

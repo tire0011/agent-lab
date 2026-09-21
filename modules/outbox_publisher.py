@@ -233,17 +233,43 @@ class OutboxPublisher:
         The caller's business-logic state is never changed by this method.
         """
         with self._repo_lock:
+            self._enqueue_notification(record)
             published = self._publish_locked(record)
         if published:
             self._notify(record)
         return published
 
+    def _enqueue_notification(self, record: PublishRecord) -> None:
+        """Persist the intent to announce this message *before* pushing it.
+
+        The enqueue has to precede the ``pushed`` transition, not follow it.
+        A record that reaches ``pushed`` is never selected by ``fetch_pending``
+        again, so a crash between the push and the enqueue would strand that
+        message with no notification row for ``deliver_pending`` to recover -
+        the one outcome the notification contract does not allow.
+
+        Enqueuing first trades that for a weaker, self-healing failure mode:
+        a message whose publish then fails is announced from content the
+        producer had already committed to SQLite, while the file itself is
+        still retried by the next poll.
+        """
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.enqueue(record.record_id, record.message.content)
+        except Exception as exc:  # noqa: BLE001 - publishing must not depend on it
+            logger.warning(
+                "outbox PR notification enqueue failed for %s: %s",
+                record.record_id,
+                _redact(str(exc)),
+            )
+
     def _notify(self, record: PublishRecord) -> None:
         """Announce a published message on the communication PR (#196).
 
-        Best-effort by construction: the notifier persists its own pending
-        state and retries later, and any unexpected error here must never
-        undo a successfully pushed outbox message.
+        Best-effort by construction: the row enqueued above is already
+        durable, so a failure here only delays delivery to the next
+        ``deliver_pending`` sweep and never undoes a pushed outbox message.
         """
         if self._notifier is None:
             return

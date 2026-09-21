@@ -155,10 +155,18 @@
   keyed by message id in `outbox_pr_notifications`, so reprocessing never
   comments twice, and a GitHub failure only leaves the notification
   `pending` — the outbox entry itself is already committed and pushed. The
-  poll retries pending notifications with bounded exponential backoff. A
+  notification row is written *before* the push, not after: a record that
+  reaches `pushed` is never selected by `fetch_pending()` again, so a crash
+  in that window would otherwise strand the message with no row for the
+  retry sweep to find. The cost is that a message whose publish then fails
+  is still announced, from content the producer had already committed to
+  SQLite, while the file itself is retried by the next poll. The poll
+  retries pending notifications with bounded exponential backoff. A
   closed PR is reopened (recreating its head branch first if GitHub deleted
   it); only a genuinely unusable PR causes an equivalent channel to be
-  recreated, which is logged at ERROR with the new number and URL because
+  recreated — on a freshly cut branch with its own commit, because after a
+  merge the old branch is identical to base and GitHub refuses a PR with no
+  commits between them — which is logged at ERROR with the new number and URL because
   the external trigger is still scoped to #194. The PR is never merged from
   here.
 - Command channel restart recovery (`modules/mailbox/development.py` +
