@@ -90,6 +90,7 @@ from modules.runtime_execution import (
     build_python_command,
     classify_command_failure,
     corrected_command,
+    exit_code_of,
     resolve_python_interpreter,
 )
 from modules.tool_loop_guard import PersistentToolLoopGuard
@@ -490,6 +491,7 @@ class NexusTaskOrchestrator:
                 f"could not claim Nexus task session {session.id!r} for capability resume"
             )
         self._claims[session.id] = worker
+        self._apply_completion_requirement(session, task)
         heartbeat = Heartbeat(
             lambda: self.task_store.heartbeat(session.id, worker_id=worker),
             name=f"nexus-heartbeat-{session.id[:8]}",
@@ -520,6 +522,30 @@ class NexusTaskOrchestrator:
             heartbeat.stop()
             self._claims.pop(session.id, None)
 
+    def _apply_completion_requirement(self, session: Any, task: str) -> None:
+        """Record that *task* owes completion evidence, once this worker owns it.
+
+        Called only after the claim succeeds: writing the requirement first
+        would mutate a session another worker holds whenever the claim then
+        fails.
+
+        The key is refreshed on every new implementation request, so a
+        follow-up that is not itself a request ("yes, go ahead") keeps the
+        original requirement together with the evidence already gathered for
+        it, while a genuinely new request arriving in the same session starts
+        from no evidence.
+        """
+        if not self._is_implementation_intent(task):
+            return
+        intent_key = self._intent_key(task)
+        if session.completion_intent_key == intent_key:
+            return
+        self.task_store.set_requires_completion_evidence(
+            session.id, True, intent_key=intent_key
+        )
+        session.requires_completion_evidence = True
+        session.completion_intent_key = intent_key
+
     async def run_async(
         self,
         task: str,
@@ -538,9 +564,6 @@ class NexusTaskOrchestrator:
             title=title,
             session_id=session_id,
         )
-        if not session.requires_completion_evidence and self._is_implementation_intent(task):
-            self.task_store.set_requires_completion_evidence(session.id, True)
-            session.requires_completion_evidence = True
         # Claim the session and report this worker alive for as long as the
         # turn runs (#162). A turn can legitimately spend minutes inside one
         # local inference call without writing anything, so the heartbeat - not
@@ -567,6 +590,7 @@ class NexusTaskOrchestrator:
                 "the session is no longer there to claim"
             )
         self._claims[session.id] = worker
+        self._apply_completion_requirement(session, task)
         heartbeat = Heartbeat(
             lambda: self.task_store.heartbeat(session.id, worker_id=worker),
             name=f"nexus-heartbeat-{session.id[:8]}",
@@ -1019,18 +1043,18 @@ class NexusTaskOrchestrator:
                     )
                     if self._successful_effect(execution_decision, observation, "change"):
                         observation = dict(observation)
-                        observation["completion_evidence"] = {
-                            "kind": "state_change",
-                            "effect": "change",
-                            "source": str(observation.get("tool", tool)),
-                        }
+                        observation["completion_evidence"] = self._record_evidence(
+                            session,
+                            kind="change",
+                            source=str(observation.get("tool", tool)),
+                        )
                     elif self._successful_effect(execution_decision, observation, "verify"):
                         observation = dict(observation)
-                        observation["verification_evidence"] = {
-                            "kind": "verified_state",
-                            "effect": "verify",
-                            "source": str(observation.get("tool", tool)),
-                        }
+                        observation["verification_evidence"] = self._record_evidence(
+                            session,
+                            kind="verify",
+                            source=str(observation.get("tool", tool)),
+                        )
                     if (
                         tool == TOOL_FIND_TOOL
                         and observation.get("status") in {"not_found", "unavailable"}
@@ -1082,7 +1106,6 @@ class NexusTaskOrchestrator:
 
             terminal_rejection = self._validate_evidence_sensitive_terminal(
                 session_id=session.id,
-                task=task,
                 action=action,
                 decision=decision,
                 observations=observations,
@@ -1727,10 +1750,11 @@ Decide the next step now. Return JSON only.
                 "context": str(decision.get("context", "")),
             }
         if tool == ACTION_COMMAND:
-            return tool, {
-                "command": str(decision.get("command", "")).strip(),
-                "effect": str(decision.get("effect", "")).strip().lower(),
-            }
+            # `effect` is the controller's claim about the call, not part of
+            # its identity: including it would let the same command run twice
+            # by relabelling it read -> change, which both defeats the #164
+            # loop guard and mints completion evidence from a read-only call.
+            return tool, {"command": str(decision.get("command", "")).strip()}
         if tool == TOOL_PYTHON_RUN:
             # The working directory changes module/script resolution, so two
             # otherwise identical python_run calls in different directories are
@@ -1745,7 +1769,6 @@ Decide the next step now. Return JSON only.
                 "module": str(decision.get("module", "")).strip(),
                 "argv": [str(item) for item in (decision.get("argv") or [])],
                 "cwd": cwd,
-                "effect": str(decision.get("effect", "")).strip().lower(),
             }
         return tool, dict(decision.get("args") or {})
 
@@ -1860,30 +1883,49 @@ Decide the next step now. Return JSON only.
         )
         return bool(gap_tokens & observation_tokens)
 
-    @staticmethod
-    def _is_implementation_intent(task: str) -> bool:
+    # A request for news about work is not a request to do it. These are
+    # matched anywhere in the text, unlike the start-anchored informational
+    # openers, because "... and please update me on #42" reads as a status
+    # request wherever it sits.
+    _STATUS_REQUEST_RE = re.compile(
+        r"\b(?:status\s+update|update\s+(?:me|us)\b|keep\s+(?:me|us)\s+posted)"
+    )
+    _INFORMATIONAL_OPENER_RE = re.compile(
+        r"^(?:#*\s*)?(?:how|why|what|explain|summarize|inspect|show|read|describe)\b"
+    )
+    _CHANGE_INTENT_RE = re.compile(
+        r"\b(?:solve|fix|implement|resolve|address|apply|update)\b|"
+        r"\bmake\b.{0,80}\bwork\b|\bwork\s+on\b"
+    )
+
+    @classmethod
+    def _is_implementation_intent(cls, task: str) -> bool:
         """Recognize explicit requests whose requested outcome is a state change."""
         normalized = " ".join(str(task or "").strip().lower().split())
         if not normalized:
             return False
-        informational = re.match(
-            r"^(?:#*\s*)?(?:how|why|what|explain|summarize|inspect|show|read|describe)\b",
-            normalized,
-        )
-        if informational:
+        if cls._INFORMATIONAL_OPENER_RE.match(normalized):
             return False
-        return bool(
-            re.search(
-                r"\b(?:solve|fix|implement|resolve|address|apply|update)\b|"
-                r"\bmake\b.{0,80}\bwork\b|\bwork\s+on\b",
-                normalized,
-            )
-        )
+        if cls._STATUS_REQUEST_RE.search(normalized):
+            return False
+        return bool(cls._CHANGE_INTENT_RE.search(normalized))
+
+    @staticmethod
+    def _intent_key(task: str) -> str:
+        """Stable identity of one implementation request within a session."""
+        normalized = " ".join(str(task or "").strip().lower().split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
 
     @staticmethod
     def _command_exit_code(output: Any) -> int | None:
-        match = re.search(r"(?m)^exit_code:\s*(-?\d+)\s*$", str(output or ""))
-        return int(match.group(1)) if match else None
+        """Read the exit code out of a command result.
+
+        Delegates to the shared parser rather than matching a second format:
+        ``process_command`` renders ``**Exit code:** 0`` (Markdown, capitalised,
+        spaced), so a stricter pattern of this module's own would silently
+        never match and no evidence would ever be recorded.
+        """
+        return exit_code_of(str(output or ""))
 
     def _successful_effect(
         self,
@@ -1901,29 +1943,50 @@ Decide the next step now. Return JSON only.
             return False
         return self._command_exit_code(observation.get("result")) == 0
 
-    def _has_completion_evidence(
-        self,
-        session_id: str,
-        observations: list[dict[str, Any]],
-    ) -> bool:
-        """Read explicit completion evidence from this run or persisted session history."""
-        evidence = self._terminal_evidence(session_id, observations, [])
-        return any(bool(item.get("completion_evidence")) for item in evidence)
+    _EVIDENCE_LABELS = {"change": "state_change", "verify": "verified_state"}
 
-    def _has_verification_evidence(
-        self,
-        session_id: str,
-        observations: list[dict[str, Any]],
-    ) -> bool:
-        """Read explicit no-op verification evidence from current/persisted history."""
-        evidence = self._terminal_evidence(session_id, observations, [])
-        return any(bool(item.get("verification_evidence")) for item in evidence)
+    def _record_evidence(self, session: Any, *, kind: str, source: str) -> dict[str, Any]:
+        """Persist evidence of *kind* for the session's current request.
+
+        Persisted only for a session that owes evidence; for any other session
+        the observation still carries the record, but there is no requirement
+        for it to answer.
+        """
+        intent_key = getattr(session, "completion_intent_key", None) or ""
+        if intent_key:
+            self.task_store.record_completion_evidence(session.id, intent_key, kind)
+            if kind == "change":
+                session.completion_evidence_key = intent_key
+            else:
+                session.verification_evidence_key = intent_key
+        return {
+            "kind": self._EVIDENCE_LABELS[kind],
+            "effect": kind,
+            "source": source,
+            "intent_key": intent_key,
+        }
+
+    @staticmethod
+    def _evidence_satisfies(session: Any, *, kind: str) -> bool:
+        """Whether recorded evidence belongs to the request now in force.
+
+        Read from the session row rather than re-scanned out of the event log:
+        the log view is bounded, so evidence in a long session would age out
+        and leave it unable to ever finish. Comparing intent keys is also what
+        stops one task's evidence from completing a later, different one that
+        arrived through ``continue_session``.
+        """
+        required = getattr(session, "completion_intent_key", None) or ""
+        column = (
+            "completion_evidence_key" if kind == "change" else "verification_evidence_key"
+        )
+        observed = getattr(session, column, None) or ""
+        return bool(required) and observed == required
 
     def _validate_evidence_sensitive_terminal(
         self,
         *,
         session_id: str,
-        task: str,
         action: str,
         decision: dict[str, Any],
         observations: list[dict[str, Any]],
@@ -1934,10 +1997,10 @@ Decide the next step now. Return JSON only.
             session is not None and session.requires_completion_evidence
         )
         if action == ACTION_ANSWER and requires_completion:
-            if self._has_completion_evidence(session_id, observations):
+            if self._evidence_satisfies(session, kind="change"):
                 return None
-            if bool(decision.get("verified_noop")) and self._has_verification_evidence(
-                session_id, observations
+            if bool(decision.get("verified_noop")) and self._evidence_satisfies(
+                session, kind="verify"
             ):
                 return None
             return {

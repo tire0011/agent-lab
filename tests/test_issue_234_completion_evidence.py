@@ -15,6 +15,30 @@ from modules.task_orchestrator import (
 )
 
 
+
+def _command_result(exit_code: int, output: str) -> str:
+    """Render a command result the way ``process_command`` really does.
+
+    Fixtures used to invent ``exit_code: 0``, a format the runner never emits
+    (`modules/mailbox/development.py` writes ``**Exit code:** 0``). The whole
+    suite stayed green while the evidence parser could not match a single real
+    result, so the shape under test has to come from the real renderer - see
+    ``test_exit_code_parser_matches_the_real_command_runner``.
+    """
+    return "\n".join(
+        [
+            f"**Exit code:** {exit_code}",
+            "**Duration:** 0.001s",
+            "",
+            "### stdout",
+            "",
+            "```text",
+            output,
+            "```",
+        ]
+    )
+
+
 class _Client:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -152,7 +176,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
             try:
                 with patch(
                     "modules.task_orchestrator.process_command",
-                    return_value=("exit_code: 0\nstdout:\nchanged\n", None),
+                    return_value=(_command_result(0, "changed"), None),
                 ):
                     result = orchestrator.run("fix the repository behavior")
                 events = orchestrator.task_store.recent_events(
@@ -181,7 +205,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
             try:
                 with patch(
                     "modules.task_orchestrator.process_command",
-                    return_value=("exit_code: 1\nstderr:\nfailed\n", None),
+                    return_value=(_command_result(1, "failed"), None),
                 ):
                     result = orchestrator.run("implement the requested change")
             finally:
@@ -254,7 +278,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
             try:
                 with patch(
                     "modules.task_orchestrator.process_command",
-                    return_value=("exit_code: 0\nstdout:\n", None),
+                    return_value=(_command_result(0, ""), None),
                 ):
                     result = orchestrator.run("fix the repository behavior")
             finally:
@@ -284,6 +308,144 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 orchestrator.close()
 
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+
+
+
+class Issue234EvidenceIntegrityTests(unittest.TestCase):
+    """Fixes from the second review round: the gate has to work against the
+    real command runner, and evidence must belong to the request in force."""
+
+    def test_exit_code_parser_matches_the_real_command_runner(self):
+        """The parser and the renderer must agree, or no evidence is ever seen.
+
+        Runs the actual `process_command` rather than a fixture: the earlier
+        parser matched an invented `exit_code: 0` shape, so every
+        implementation task was silently rejected while the suite stayed green.
+        """
+        from modules.mailbox.development import process_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rendered, error = process_command(
+                SimpleNamespace(body="printf changed", meta={}), tmp, None, 0
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(NexusTaskOrchestrator._command_exit_code(rendered), 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            failed, _ = process_command(SimpleNamespace(body="exit 3", meta={}), tmp, None, 0)
+
+        self.assertEqual(NexusTaskOrchestrator._command_exit_code(failed), 3)
+
+    def test_new_request_in_the_same_session_does_not_inherit_evidence(self):
+        """Evidence proves one request was done, not the next one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"action":"command","command":"printf changed","effect":"change",'
+                    '"reason":"apply the requested change"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Implemented.","reason":"change completed"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Already done.","reason":"reusing earlier work"}',
+                    '{"type":"action","action":"missing_capability","experiment_id":null,'
+                    '"message":"No state-changing action completed for this request.",'
+                    '"reason":"completion evidence is still missing"}',
+                ],
+            )
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    return_value=(_command_result(0, "changed"), None),
+                ):
+                    first = orchestrator.run("fix issue 196", source_id="stale-evidence")
+                self.assertEqual(first.action, ACTION_ANSWER)
+                second = orchestrator.continue_session(first.session_id, "fix issue 9")
+                session = orchestrator.task_store.get(first.session_id)
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(second.action, ACTION_MISSING_CAPABILITY)
+        self.assertTrue(session.requires_completion_evidence)
+
+    def test_status_request_does_not_arm_the_gate(self):
+        """"Update me on ..." asks for news, not for a change."""
+        for task in (
+            "please update me on issue 42",
+            "status update on the mailbox work",
+            "keep me posted on the fix",
+        ):
+            with self.subTest(task=task):
+                self.assertFalse(NexusTaskOrchestrator._is_implementation_intent(task))
+
+        for task in ("fix issue 42", "# Fix issue #196", "please update the retry limit"):
+            with self.subTest(task=task):
+                self.assertTrue(NexusTaskOrchestrator._is_implementation_intent(task))
+
+    def test_effect_is_not_part_of_the_call_signature(self):
+        """Relabelling a command must not buy it a second run, or evidence."""
+        orchestrator = NexusTaskOrchestrator.__new__(NexusTaskOrchestrator)
+        read_tool, read_args = NexusTaskOrchestrator._tool_identity(
+            orchestrator, {"tool": "command", "command": "ls -la", "effect": "read"}
+        )
+        change_tool, change_args = NexusTaskOrchestrator._tool_identity(
+            orchestrator, {"tool": "command", "command": "ls -la", "effect": "change"}
+        )
+
+        self.assertEqual(read_tool, change_tool)
+        self.assertEqual(read_args, change_args)
+        self.assertNotIn("effect", read_args)
+
+    def test_evidence_survives_beyond_the_recent_event_window(self):
+        """A long session must not lose its evidence and lock itself out."""
+        from modules.nexus_task_store import NexusTaskStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = NexusTaskStore(db_path=str(Path(tmp) / "state.db"))
+            session = store.get_or_create(
+                source_type="task", source_id="long-session", title="long"
+            )
+            store.set_requires_completion_evidence(session.id, True, intent_key="key-1")
+            store.record_completion_evidence(session.id, "key-1", "change")
+            for index in range(120):
+                store.append_event(
+                    session.id,
+                    role="tool",
+                    kind="observation",
+                    content=f'{{"step": {index}}}',
+                )
+
+            refreshed = store.get(session.id)
+
+        self.assertTrue(
+            NexusTaskOrchestrator._evidence_satisfies(refreshed, kind="change")
+        )
+        self.assertFalse(
+            NexusTaskOrchestrator._evidence_satisfies(refreshed, kind="verify")
+        )
+
+    def test_requirement_is_written_only_after_the_claim_succeeds(self):
+        """A lost claim must not mutate the session another worker owns."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(tmp, [])
+            try:
+                session = orchestrator.task_store.get_or_create(
+                    source_type="task", source_id="claim-order", title="claim"
+                )
+                with patch.object(
+                    orchestrator.task_store, "claim_session", return_value=False
+                ):
+                    with self.assertRaises(Exception):
+                        orchestrator.run(
+                            "fix the claim ordering", session_id=session.id
+                        )
+                refreshed = orchestrator.task_store.get(session.id)
+            finally:
+                orchestrator.close()
+
+        self.assertFalse(refreshed.requires_completion_evidence)
+        self.assertIsNone(refreshed.completion_intent_key)
 
 
 if __name__ == "__main__":

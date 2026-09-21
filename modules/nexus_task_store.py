@@ -69,6 +69,13 @@ class NexusTaskSession:
     last_heartbeat_at: str | None = None
     terminal_reason: str | None = None
     requires_completion_evidence: bool = False
+    # Identity of the implementation request currently in force, and the
+    # requests for which evidence has actually been observed. Comparing keys
+    # is what keeps one task's evidence from completing a later, different
+    # one, and it survives any event-window limit.
+    completion_intent_key: str | None = None
+    completion_evidence_key: str | None = None
+    verification_evidence_key: str | None = None
 
 
 class NexusTaskStore:
@@ -157,6 +164,15 @@ class NexusTaskStore:
                 "ALTER TABLE nexus_task_sessions "
                 "ADD COLUMN requires_completion_evidence INTEGER NOT NULL DEFAULT 0"
             )
+        for column in (
+            "completion_intent_key",
+            "completion_evidence_key",
+            "verification_evidence_key",
+        ):
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE nexus_task_sessions ADD COLUMN {column} TEXT NULL"
+                )
         self._conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_nexus_task_heartbeat
                    ON nexus_task_sessions(status, last_heartbeat_at)"""
@@ -854,14 +870,48 @@ class NexusTaskStore:
                 break
         return blocked
 
-    def set_requires_completion_evidence(self, session_id: str, required: bool) -> None:
-        """Persist whether this session represents an implementation/state-change task."""
+    def set_requires_completion_evidence(
+        self,
+        session_id: str,
+        required: bool,
+        *,
+        intent_key: str | None = None,
+    ) -> None:
+        """Persist that this session owes completion evidence for *intent_key*.
+
+        The key identifies which implementation request is in force. A new
+        request in the same session replaces it, which is what stops evidence
+        produced for the previous one from satisfying the new one.
+        """
         with self._lock:
             self._conn.execute(
                 """UPDATE nexus_task_sessions
-                   SET requires_completion_evidence=?, updated_at=?
+                   SET requires_completion_evidence=?, completion_intent_key=?, updated_at=?
                    WHERE id=?""",
-                (1 if required else 0, _now(), session_id),
+                (1 if required else 0, intent_key, _now(), session_id),
+            )
+            self._conn.commit()
+
+    def record_completion_evidence(self, session_id: str, intent_key: str, kind: str) -> None:
+        """Record that evidence of *kind* was observed for *intent_key*.
+
+        Written on the session row rather than left to be re-read from the
+        event log: a long session scrolls old tool events out of any bounded
+        window, and evidence that ages out would leave the session unable to
+        ever finish.
+        """
+        column = {
+            "change": "completion_evidence_key",
+            "verify": "verification_evidence_key",
+        }.get(kind)
+        if column is None:
+            raise ValueError(f"unknown evidence kind: {kind!r}")
+        with self._lock:
+            self._conn.execute(
+                f"""UPDATE nexus_task_sessions
+                   SET {column}=?, updated_at=?
+                   WHERE id=?""",
+                (intent_key, _now(), session_id),
             )
             self._conn.commit()
 
@@ -911,5 +961,16 @@ class NexusTaskStore:
                 bool(row["requires_completion_evidence"])
                 if "requires_completion_evidence" in keys
                 else False
+            ),
+            completion_intent_key=(
+                row["completion_intent_key"] if "completion_intent_key" in keys else None
+            ),
+            completion_evidence_key=(
+                row["completion_evidence_key"] if "completion_evidence_key" in keys else None
+            ),
+            verification_evidence_key=(
+                row["verification_evidence_key"]
+                if "verification_evidence_key" in keys
+                else None
             ),
         )
