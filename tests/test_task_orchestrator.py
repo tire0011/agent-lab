@@ -1206,7 +1206,7 @@ class TaskOrchestratorTests(unittest.TestCase):
     def test_invalid_json_escape_gets_one_schema_constrained_correction(self):
         client = _Client([
             r'''{"type":"tool","tool":"command","command":"echo Don\'t stop","reason":"implement"}''',
-            '{"type":"tool","tool":"command","command":"printf repaired",'
+            '{"type":"tool","tool":"command","command":"printf repaired","effect":"change",'
             '"reason":"corrected syntax"}',
             '{"type":"action","action":"answer","experiment_id":null,'
             '"message":"Implemented.","reason":"command succeeded"}',
