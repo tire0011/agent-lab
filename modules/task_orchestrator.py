@@ -886,6 +886,24 @@ class NexusTaskOrchestrator:
                     task_logger=task_logger,
                 )
                 if executed is not None:
+                    # Say on the lookup itself that it already ran, and where
+                    # the result is. The controller follows "find_tool then
+                    # call_tool", and a lookup that reports `resolved_tool`
+                    # and nothing else reads as an invitation to make that
+                    # call - so it does, and the guard refuses a call that
+                    # was never needed. Measured in session
+                    # e33be32780f747de8c6a85f0ba6af00d: find_tool ran the
+                    # operation, the controller called it anyway, and only
+                    # after the refusal did it use the result it already had.
+                    observations[-1] = {
+                        **observations[-1],
+                        "already_executed": True,
+                        "result_in_event": executed.get("event_id"),
+                        "next_step": (
+                            "this operation has already run; read its result below "
+                            "and choose a different next step"
+                        ),
+                    }
                     observations.append(executed)
                 continue
 

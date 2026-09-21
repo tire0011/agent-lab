@@ -498,6 +498,55 @@ class RawEventStillHoldsTheFullEnvelopeTests(unittest.TestCase):
         self.assertTrue(persisted["result"]["success"])
 
 
+class AutoExecutedLookupTests(unittest.TestCase):
+    """A lookup that already ran must not read as an invitation to call it.
+
+    Session e33be32780f747de8c6a85f0ba6af00d: `find_tool` resolved
+    `github_issue` and executed it, the observation reported `resolved_tool`
+    and nothing else, and the controller - following the documented
+    "find_tool then call_tool" - called it anyway. The guard refused a call
+    that was never needed, and only then did the model use the result it had.
+    """
+
+    def _run(self, resolved_arguments):
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=SimpleNamespace(
+                    read_only_specs=lambda: [], catalog=lambda: [], repo_root=tmp
+                ),
+                experiment_service=SimpleNamespace(resolve_experiment=lambda _i: None),
+                task_store=NexusTaskStore(db_path=str(Path(tmp) / "n.db")),
+            )
+            try:
+                session = orchestrator.task_store.get_or_create(
+                    source_type="task", source_id="auto-exec"
+                )
+                lookup = {
+                    "tool": "find_tool",
+                    "status": "found",
+                    "goal": "read github issue 196",
+                    "resolved_tool": "github_issue",
+                    "resolved_arguments": resolved_arguments,
+                }
+                executed = orchestrator._execute_resolved_tool(
+                    session_id=session.id,
+                    state_token="token",
+                    observation=lookup,
+                    reason="analyse the issue",
+                    task_logger=None,
+                )
+            finally:
+                orchestrator.close()
+        return lookup, executed
+
+    def test_nothing_is_annotated_when_the_lookup_did_not_run(self):
+        # `resolved_arguments` of None means the caller must supply them, so
+        # the invitation to call it is correct there.
+        lookup, executed = self._run(None)
+        self.assertIsNone(executed)
+        self.assertNotIn("already_executed", lookup)
+
+
 class SuccessRuleTests(unittest.TestCase):
     """The rules covered every failure and not the success.
 

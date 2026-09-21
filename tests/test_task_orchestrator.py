@@ -249,6 +249,62 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_a_lookup_that_already_ran_says_so_on_itself(self):
+        """Otherwise it reads as an invitation to make the call it just made.
+
+        Session e33be32780f747de8c6a85f0ba6af00d: find_tool resolved and
+        executed github_issue, the observation said only `resolved_tool`, and
+        the controller followed the documented "find_tool then call_tool" and
+        called it. The guard refused a call that was never needed.
+        """
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need a git inspection capability"}',
+            '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
+            '"related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"Repository inspected.","reason":"the result is already here"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+        finally:
+            orchestrator.close()
+
+        lookups = [o for o in result.observations if o.get("tool") == "find_tool"]
+        self.assertTrue(lookups, result.observations)
+        lookup = lookups[0]
+        self.assertTrue(lookup.get("already_executed"))
+        self.assertIn("already run", lookup.get("next_step", ""))
+        # And it names where the result is, so "read it below" is checkable.
+        executed = [
+            o for o in result.observations
+            if o.get("tool") == "operation" and o.get("operation") == "git_status"
+        ]
+        self.assertEqual(lookup.get("result_in_event"), executed[0]["event_id"])
+
+    def test_the_annotation_reaches_the_controller_prompt(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need a git inspection capability"}',
+            '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
+            '"related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"the result is already here"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            orchestrator.run("Inspect local repository changes")
+        finally:
+            orchestrator.close()
+
+        # The turn after the lookup is the one that used to call it again.
+        section = client.prompts[2].partition("OBSERVATIONS FROM TOOLS USED IN THIS RUN:")[2]
+        self.assertIn("already_executed", section)
+        self.assertIn("already run", section)
+
     def test_every_controller_decision_is_journalled_with_its_reason(self):
         """Reading a session back has to answer "why", not only "what".
 
