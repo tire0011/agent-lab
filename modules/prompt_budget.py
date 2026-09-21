@@ -409,7 +409,15 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
     event_id = obs.get("event_id")
     if event_id is not None:
         stub["event_id"] = event_id
-        stub["note"] = "full result stored durably; fetch by event_id if needed"
+        # Says what is missing, not what to do about it. The previous wording
+        # - "fetch by event_id if needed" - told the controller to retrieve a
+        # result through a capability that does not exist. Sending a model
+        # after something unreachable is worse than saying plainly that the
+        # payload is not here: it invites exactly the sort of doomed retry
+        # this compaction exists to prevent.
+        stub["note"] = (
+            f"the result is not in this prompt; it is stored in event {event_id}"
+        )
     return stub
 
 

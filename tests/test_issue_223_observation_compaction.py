@@ -440,6 +440,23 @@ class StubbedUnderARealSqueezeTests(unittest.TestCase):
         self.assertEqual(stub["status"], "succeeded")
         self.assertEqual(stub["event_id"], 158)
 
+    def test_a_stub_says_the_payload_is_missing_not_how_to_fetch_it(self):
+        """A stub must not send the controller after something unreachable.
+
+        It used to read "full result stored durably; fetch by event_id if
+        needed" - an instruction to use a capability that does not exist.
+        Pointing a model at an unreachable thing invites exactly the doomed
+        retry this compaction exists to prevent.
+        """
+        views = controller_observation_view([_github_issue_success()])
+        compacted, _omitted = compact_observations(
+            views, budget_chars=self.SQUEEZED, keep_recent_full=2
+        )
+        note = compacted[0]["note"]
+        self.assertIn("not in this prompt", note)
+        self.assertIn("158", note)  # names where it is
+        self.assertNotIn("fetch", note)
+
     def test_an_oversized_argument_list_is_dropped_rather_than_half_rendered(self):
         stub = _stub(
             {
