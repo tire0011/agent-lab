@@ -1062,6 +1062,7 @@ class NexusTaskOrchestrator:
 
             terminal_rejection = self._validate_evidence_sensitive_terminal(
                 session_id=session.id,
+                task=task,
                 action=action,
                 decision=decision,
                 observations=observations,
@@ -1655,6 +1656,7 @@ Rules:
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
+- For implementation-intent tasks such as solve/fix/implement/work on, a successful read-only lookup is context only, not proof that the requested change is complete. Do not answer as completed until the run contains state-changing completion evidence; if the needed capability is unavailable, use missing_capability instead.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Set capability to a stable identifier for the missing capability and required_inputs to the values it needs. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
@@ -1834,15 +1836,60 @@ Decide the next step now. Return JSON only.
         )
         return bool(gap_tokens & observation_tokens)
 
+    @staticmethod
+    def _is_implementation_intent(task: str) -> bool:
+        """Recognize tasks whose requested outcome is a change, not information."""
+        normalized = " ".join(str(task or "").strip().lower().split())
+        return bool(re.match(r"^(?:please\s+)?(?:solve|fix|implement|work\s+on)\b", normalized))
+
+    def _has_completion_evidence(self, observations: list[dict[str, Any]]) -> bool:
+        """Whether this run contains a successful state-changing operation."""
+        mutating_operations = {
+            str(getattr(spec, "name", "")).strip()
+            for spec in self.operations_registry.catalog()
+            if str(getattr(spec, "name", "")).strip()
+            and bool(getattr(spec, "mutates_state", True))
+        }
+        for observation in observations:
+            if observation.get("tool") != "operation" or observation.get("event"):
+                continue
+            operation = str(observation.get("operation", "")).strip()
+            result = observation.get("result")
+            if (
+                operation in mutating_operations
+                and isinstance(result, dict)
+                and bool(result.get("success"))
+            ):
+                return True
+        return False
+
     def _validate_evidence_sensitive_terminal(
         self,
         *,
         session_id: str,
+        task: str,
         action: str,
         decision: dict[str, Any],
         observations: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        """Reject unsupported negative terminal claims while preserving user-only questions."""
+        """Reject terminal decisions that are unsupported by the run's evidence."""
+        if action == ACTION_ANSWER and self._is_implementation_intent(task):
+            if self._has_completion_evidence(observations):
+                return None
+            return {
+                "event": "terminal_decision_rejected",
+                "terminal_action": action,
+                "information_gap": "implementation completion evidence",
+                "gap_kind": "completion_evidence",
+                "reason": (
+                    "Implementation-intent tasks cannot finish from read-only context alone; "
+                    "no successful state-changing operation was observed."
+                ),
+                "candidate_operations": [],
+                "retryable": True,
+                "recommended_next_action": TOOL_FIND_TOOL,
+            }
+
         if action not in {ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY}:
             return None
 
