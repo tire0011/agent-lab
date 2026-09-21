@@ -113,6 +113,7 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
             "Use memory/inspection only when it materially helps. Commands are tools, never final actions. After any tool result, decide again. Never invent tool results or IDs.",
             'Tool JSON: {"type":"tool","tool":"' + "|".join(tool_names) + '",...}',
             'Final JSON: {"type":"action","action":"' + "|".join(final_actions) + '","experiment_id":null,"message":"...","reason":"..."}',
+            'For missing_capability also include "information_gap":"...", "gap_kind":"missing_capability", "capability":"stable identifier", and "required_inputs":["input_name"].',
             "Return JSON only.",
         ])
 
