@@ -69,12 +69,11 @@ from modules.nexus_tool_router import (
     terminal_not_found_observation,
     tokens as tool_search_tokens,
 )
+from modules.controller_observations import _args_signature, controller_observation_view
 from modules.prompt_budget import (
     CHARS_PER_TOKEN,
     PromptBudgetPlan,
     compact_observations,
-    controller_observation_view,
-    _args_signature,
     compute_budget,
     dedupe_nested_results,
     prompt_json,
@@ -1428,11 +1427,7 @@ class NexusTaskOrchestrator:
             if content:
                 seen.add(content)
         deduped_observations = dedupe_nested_results(observations, already_seen=seen)
-        # Narrow to what a decision needs *before* budgeting it. Dropping the
-        # grant id, the already-bound operation schema and the resolver's
-        # telemetry buys room for the result itself, so the observation that
-        # answers the task survives the budget instead of being stubbed out
-        # behind the metadata that recorded how it was obtained (#223).
+        # Prepare semantic content before applying the size budget.
         viewed_observations = controller_observation_view(deduped_observations)
         compacted_observations, omitted_indices = compact_observations(
             viewed_observations,

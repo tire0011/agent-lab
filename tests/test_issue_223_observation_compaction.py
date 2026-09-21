@@ -1,14 +1,4 @@
-"""#223: the controller prompt shows the result, not how it was obtained.
-
-Session ``3e2e565e49134703934e59bd57ad9118`` fetched GitHub issue #196 and
-then asked for the identical ``github_issue(196)`` again. The answer was in
-the prompt, inside a tool wrapper, a grant id, a full operation schema and a
-nested result object.
-
-These tests pin the two halves of the fix that must not drift apart: the
-persisted event keeps the whole envelope, and the view rendered into the next
-prompt keeps the answer.
-"""
+"""Regression coverage for controller observation semantics and prompt compaction."""
 
 from __future__ import annotations
 
@@ -19,18 +9,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from modules.nexus_task_store import NexusTaskStore
+from modules.controller_observations import controller_observation_view
 from modules.prompt_budget import (
     _stub,
     compact_observations,
     compute_budget,
-    controller_observation_view,
     prompt_json,
 )
 from modules.task_orchestrator import NexusTaskOrchestrator
 
 
 def _github_issue_success(event_id: int = 158) -> dict:
-    """The raw observation ``execute_operation`` builds, envelope and all."""
     return {
         "tool": "operation",
         "operation": "github_issue",
