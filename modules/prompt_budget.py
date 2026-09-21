@@ -1,17 +1,11 @@
 """Configurable prompt/token budget for the persistent Nexus controller.
 
-The persistent local controller previously resent the complete accumulated
-task/discussion history and every previous tool observation on every turn,
-so prompt size grew roughly linearly (in practice compounding, since the
-observations were *also* duplicated through the persisted history view).
-Left unbounded this eventually produces prompts large enough to have
-llama-server killed by the Linux OOM killer.
+The controller resends its observations every turn, so an unbounded prompt
+grows until llama-server is killed by the OOM killer. This computes a
+character budget from the model's context window, its reserved output and
+host memory, then compacts observations deterministically to fit it.
 
-This module keeps the budgeting logic small, dependency-free and unit
-testable: it computes a conservative effective character budget from the
-selected model's context window, reserved output tokens and available host
-memory, then exposes helpers to deterministically compact/truncate
-observations so a compacted prompt always fits inside that budget.
+Kept dependency-free so it stays unit testable.
 """
 
 from __future__ import annotations
@@ -162,25 +156,12 @@ def compute_budget(
     low_memory = False
     memory_budget_chars: int | None = None
     if mem_available_kb is not None:
-        # What this budget bounds is one *prompt*, against a llama-server that
-        # is already running - so the model's own footprint must not be
-        # subtracted here. Those bytes are already allocated: they are in
-        # `used`, not in `MemAvailable`, and llama-server sizes its KV cache
-        # up front from its configured context, not per request. Requiring
-        # `MemAvailable >= mem_limit + headroom` asked the host for room to
-        # load the model a *second* time, so on any host where the model is
-        # resident - which is the normal case - the budget collapsed to the
-        # 500-char floor and left 150 characters for observations.
-        #
-        # Measured on the VM: MemAvailable 2.53 GiB against a required 2.5 GiB
-        # gave a surplus of -24 MiB, so a successful github_issue result of
-        # 3005 characters reached the controller as a bare stub. It could see
-        # that the call had succeeded and not what it returned, and asked for
-        # it again - which is #223.
-        #
-        # What a prompt actually costs beyond what is already allocated is its
-        # own tokens, and that is what the surplus is divided by below. The
-        # cushion is what we decline to spend, not a second copy of the model.
+        # The model is already resident: its bytes are in `used`, not in
+        # `MemAvailable`, and its KV cache is sized up front from the
+        # configured context, not per request. Adding `mem_limit_kb` here
+        # asked the host for room to load the model a second time, which
+        # collapsed the budget to its floor on every host where it was
+        # running (#223). A prompt costs its own tokens and nothing else.
         required_kb = inference_headroom_kb
         surplus_kb = mem_available_kb - required_kb
         if surplus_kb <= 0:
@@ -189,17 +170,11 @@ def compute_budget(
         else:
             memory_tokens_available = surplus_kb // kb_per_input_token
             memory_budget_chars = int(memory_tokens_available) * chars_per_token
-        # A host with no swap configured at all always reports
-        # ``SwapFree: 0``, which is not a low-memory signal by itself.
-        # Only treat exhausted swap as pressure when swap actually exists
-        # (``swap_total_kb > 0``) *and* RAM headroom is already thin, since
-        # a host with abundant MemAvailable doesn't need swap as a cushion.
+        # A host with no swap reports ``SwapFree: 0`` forever, so exhausted
+        # swap is only pressure when swap exists and RAM is thin too.
         swap_configured = swap_total_kb is not None and swap_total_kb > 0
         ram_pressure = surplus_kb < inference_headroom_kb
         if swap_configured and swap_free_kb is not None and swap_free_kb < inference_headroom_kb and ram_pressure:
-            # Near-exhausted swap alongside thin RAM headroom means an
-            # inference spike would have no cushion left to be absorbed by
-            # the kernel.
             low_memory = True
             memory_budget_chars = 0
 
@@ -210,11 +185,8 @@ def compute_budget(
         effective_budget_chars = min(context_budget_chars, memory_budget_chars)
     effective_budget_chars = max(500, effective_budget_chars)
 
-    # The "safe local" budget remains an advisory signal for callers to use
-    # when compacting prompts and reporting memory pressure. The local
-    # inference service may still be able to serve a request (for example
-    # when the model is already mmap-loaded), so this must not itself become
-    # a hard routing gate.
+    # Advisory only. A resident model can still serve a request under
+    # pressure, so this must never become a hard routing gate.
     safe_local_budget_chars = 0 if low_memory else effective_budget_chars
 
     instructions_chars = int(effective_budget_chars * 0.12)
@@ -261,15 +233,11 @@ def truncate_text(text: str, max_chars: int, *, note: str = "truncated") -> tupl
 def prompt_json(value: Any) -> str:
     """Serialise for a model prompt, without the parts that carry no meaning.
 
-    ``"arguments":[]``, ``"default":null`` and ``"maximum":null`` say exactly
-    what their absence says, and on a host processing about seven tokens per
-    second every one of them is paid for in wall-clock time.
+    ``"arguments":[]`` and ``"default":null`` say what their absence says,
+    and at seven tokens a second each is paid for in wall-clock time.
 
-    Applied only when rendering a prompt, never to the observation or the
-    catalog itself: ``OperationSpec.to_dict`` also answers
-    ``GET /operations/catalog``, where a stable shape is the contract, and an
-    observation that loses a key between being recorded and being read is a
-    different kind of bug entirely.
+    Prompts only. ``OperationSpec.to_dict`` also answers the catalog
+    endpoint, where a stable shape is the contract.
     """
     return json.dumps(_without_empties(value), separators=(",", ":"))
 
@@ -324,12 +292,7 @@ def compact_observations(
             remaining = max(0, remaining - len(serialized))
             continue
         if is_recent and remaining > 500:
-            # Still compress the observation's largest text fields rather
-            # than dropping it outright, since recent observations are the
-            # most likely to matter for the immediate next decision. This is
-            # tracked separately from ``omitted``: the observation still
-            # carries real (if truncated) content, it is not reduced to a
-            # bare stub reference.
+            # Not counted as omitted: this still carries real content.
             compacted, truncated = _shrink(obs, remaining)
             if truncated:
                 compacted["truncated"] = True
@@ -346,24 +309,11 @@ def compact_observations(
     return [item for item in result if item is not None], sorted(omitted)
 
 
-# What a next decision depends on, kept even when the body is dropped.
-#
-# A stub saying only "a find_tool happened here" cannot stop the controller
-# asking the identical question again: the rule it has to follow is about
-# *that exact goal*, and the goal was the first thing compacted away. On a
-# small box the observation budget collapses to a few hundred characters, so
-# every observation becomes a stub and the controller decides each turn with
-# no memory of what it just did - which is how a session resolved git_status,
-# ran it, and then asked for it twice more (#218).
-#
-# These fields are tens of characters. The body is what is expensive.
-#
-# `args` is here for the same reason. On a memory-pressured VM the observation
-# budget collapses to about 150 characters, so every observation becomes a
-# stub - and a stub naming `github_issue` without saying *which issue* cannot
-# stop a controller asking for #196 again when it already has the answer
-# (#223). With `args` and `status`, the stub reads as "github_issue(196)
-# succeeded, event 158", which is the whole decision.
+# What a next decision depends on, kept even when the body is dropped. These
+# cost tens of characters; the body is what is expensive. A stub without them
+# reads "a github_issue happened here", which cannot stop the controller
+# asking the identical question again (#218, #223). With them it reads
+# "github_issue(196) succeeded, event 158" - the whole decision.
 _STUB_IDENTITY_FIELDS = (
     "goal",
     "status",
@@ -409,12 +359,8 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
     event_id = obs.get("event_id")
     if event_id is not None:
         stub["event_id"] = event_id
-        # Says what is missing, not what to do about it. The previous wording
-        # - "fetch by event_id if needed" - told the controller to retrieve a
-        # result through a capability that does not exist. Sending a model
-        # after something unreachable is worse than saying plainly that the
-        # payload is not here: it invites exactly the sort of doomed retry
-        # this compaction exists to prevent.
+        # Says what is missing, never what to do about it: there is no
+        # capability that fetches an event, so inviting one invites a retry.
         stub["note"] = (
             f"the result is not in this prompt; it is stored in event {event_id}"
         )
@@ -485,22 +431,13 @@ def dedupe_nested_results(
 
 # --- controller-facing observation view (#223) -----------------------------
 #
-# A tool observation is written once and read twice, for two different
-# purposes. ``nexus_task_events`` keeps the full envelope because a diagnosis
-# weeks later needs to know which grant authorised a call, which schema it was
-# bound against and what the resolver measured. The next controller turn needs
-# none of that: it needs to know what the call answered, so it does not ask
-# again.
+# An observation is written once and read twice. ``nexus_task_events`` keeps
+# the full envelope because a diagnosis needs the grant, the schema and what
+# the resolver measured. The next controller turn needs none of it - and with
+# it, a 7B model could not find the issue text it already had underneath the
+# record of how it was obtained (#223).
 #
-# Session 3e2e565e49134703934e59bd57ad9118 is what the difference costs. The
-# controller fetched GitHub issue #196 successfully and then asked for the
-# identical ``github_issue(196)`` again - the issue text was in the prompt, but
-# wrapped in a tool wrapper, a grant id, a full operation schema and a nested
-# result object. For a 7B local model the answer it already had was buried in
-# the record of how it had been obtained.
-#
-# This is a view, not an edit. The persisted journal is untouched; only the
-# copy rendered into the prompt is narrowed.
+# A view, not an edit: the journal is untouched.
 
 # Authorisation and telemetry: real audit fields, and never an input to
 # "what should I do next".
@@ -520,11 +457,9 @@ _RESULT_PAYLOAD_FIELDS = ("output_lines", "exit_code", "error_summary")
 def _args_signature(operation: str, args: Any) -> str:
     """Identity of one operation call, tolerant of how a number was written.
 
-    ``{"issue_number": 196}`` and ``{"issue_number": "196"}`` are one call as
-    far as the next decision is concerned: the registry coerces the string, and
-    a rejected first attempt followed by a corrected one is the "previous
-    transient validation attempt" that should not still be in the prompt after
-    the call succeeded.
+    The registry coerces ``"196"`` to ``196``, so a rejected first attempt
+    and its corrected retry must compare equal or the failure stays in the
+    prompt after the call has succeeded.
     """
     if not isinstance(args, dict):
         return f"{operation}|{args!r}"
@@ -559,22 +494,15 @@ def _operation_view(obs: dict[str, Any]) -> dict[str, Any]:
     if isinstance(view.get("output_lines"), list):
         view["output_lines"] = _reassembled(view["output_lines"])
     if succeeded and not view.get("output_lines"):
-        # "Succeeded and returned nothing" is an answer - a clean worktree,
-        # an empty list - but an absent `output_lines` is indistinguishable
-        # from one that compaction dropped, and `prompt_json` strips an empty
-        # list anyway. Measured on the VM: git_status succeeded with no
-        # output, and the controller's next decision ran it again (#223).
+        # "Succeeded, returned nothing" is an answer - a clean worktree -
+        # but an empty list is stripped and then reads as a dropped one.
         view["output"] = "none"
     return view
 
 
-# Operations that return a long text field emit it as numbered slices, so a
-# line-oriented consumer can print it: `github_issue` cuts the issue body every
-# 450 characters into `body[1]:`, `body[2]:` and so on. The cut is blind to
-# words, so the controller reads "...Prefer the e", "xisting PR #194...".
-#
-# That shape is for a log, not for a reader. Putting it back together costs
-# nothing and is what the prompt wants: one field, one continuous text.
+# Operations emit a long text field as numbered slices for a line-oriented
+# log: `body[1]:`, `body[2]:`, cut every 450 characters blind to words. The
+# prompt wants the opposite - one field, one continuous text.
 _CHUNKED_FIELD = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]:\s?(.*)$", re.DOTALL)
 
 
@@ -627,17 +555,13 @@ def controller_observation_view(observations: list[dict[str, Any]]) -> list[dict
 
     Three reductions, in one pass so they see each other's outcome:
 
-    * execution metadata (grant id, already-bound operation schema, resolver
-      telemetry) is dropped, and a successful operation's nested result is
-      flattened to ``status`` plus its payload;
-    * a failed attempt at an operation that a later call then completed with
-      the same arguments is dropped, since the controller's next step is
-      decided by the result, not by how many tries it took;
-    * a duplicate-call refusal names the event that already answered it, so
-      "you asked this before" becomes "that answer is in event 158".
+    * execution metadata is dropped and a successful result flattened to
+      ``status`` plus its payload;
+    * a failed attempt a later call completed with the same arguments is
+      dropped - the next step follows from the result, not the retry count;
+    * a duplicate-call refusal names the event that already answered it.
 
-    Never mutates its input: the persisted journal and the in-memory
-    observation list keep the full envelope.
+    Never mutates its input.
     """
     # Where each operation call first succeeded, by call identity.
     succeeded_in: dict[str, Any] = {}
