@@ -101,6 +101,18 @@ class NexusControllerService:
         self._execute(decision, self._execution_goal(session_id, message))
         return decision
 
+    def resume_available_capabilities(self) -> list[TaskDecision]:
+        """Continue blocked sessions when their required capability is now present."""
+        decisions = self.orchestrator.resume_available_capabilities()
+        for decision in decisions:
+            if not decision.session_id:
+                continue
+            self._execute(
+                decision,
+                self._execution_goal(decision.session_id, ""),
+            )
+        return decisions
+
     def _execution_goal(self, session_id: str, fallback: str) -> str:
         """Reconstruct the user-visible task across clarification replies.
 
