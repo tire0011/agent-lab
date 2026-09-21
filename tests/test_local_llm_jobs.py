@@ -266,7 +266,14 @@ class JobRoleAndLivenessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(raised.exception.status, STATUS_CANCELLED)
 
                 release.set()
-                time.sleep(0.2)
+                # "Stays cancelled" is a negative, so there is nothing to wait
+                # for directly. The worker is a single thread, so a later job
+                # reaching a terminal state proves it has already finished
+                # handling this one's late result - an ordering guarantee,
+                # where the sleep here before was a guess that got weaker the
+                # busier the host was.
+                await service.wait(service.submit("after", role=ROLE_FAILURE_ANALYSIS))
+
                 self.assertEqual(service.get(job_id).status, STATUS_CANCELLED)
                 self.assertFalse(service.cancel(job_id))
             finally:

@@ -181,6 +181,183 @@ class ProcessRefreshTests(unittest.TestCase):
         self.assertIn("No services were restarted", body)
 
 
+class ServiceRestartReportingTests(unittest.TestCase):
+    """A deploy that did not restart is not a deploy.
+
+    The first real refresh moved the checkout and reported
+    `service agent-api: error: ` - no reason - under the heading "Refresh
+    complete". Both halves were wrong: the reason was missing, and the new
+    code was on disk while the old code kept serving.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+
+    def _body(self, services):
+        body, _ = process_refresh(
+            _message(branch="main"), self.repo, self.conn, 1,
+            refresher=lambda b, r: _result(branch=b, services=services),
+            repo_root=self.repo,
+        )
+        return body
+
+    def test_a_failed_restart_is_not_called_complete(self):
+        body = self._body({"agent-api": "error: exit 1: permission denied"})
+        self.assertIn("incomplete", body)
+        self.assertNotIn("Refresh complete", body)
+
+    def test_a_failed_restart_names_the_service_that_is_not_running_new_code(self):
+        body = self._body({"agent-api": "error: exit 1: nope"})
+        self.assertIn("Not running the new code", body)
+        self.assertIn("agent-api", body)
+
+    def test_a_scheduled_restart_is_pending_not_failed(self):
+        """The mirror of the bug it replaced.
+
+        The service does restart; this process simply does not survive to
+        watch it. Reporting that as "not running the new code" is as wrong as
+        reporting it as complete.
+        """
+        body = self._body({"agent-api": "restart scheduled (this process is being replaced)"})
+        self.assertIn("Restarting shortly", body)
+        self.assertNotIn("Not running the new code", body)
+        self.assertNotIn("incomplete", body)
+
+    def test_an_all_restarted_refresh_is_complete(self):
+        body = self._body({"agent-api": "restarted"})
+        self.assertIn("Refresh complete", body)
+        self.assertNotIn("incomplete", body)
+        self.assertNotIn("Not running the new code", body)
+
+
+class SystemdRestarterTests(unittest.TestCase):
+    """The reason for a failure must survive into the report."""
+
+    def _restart(self, returncode, stderr="", stdout=""):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        completed = SimpleNamespace(returncode=returncode, stderr=stderr, stdout=stdout)
+        with patch.object(refresh_module.subprocess, "run", return_value=completed):
+            return refresh_module.systemd_restarter(("agent-api",))()
+
+    def test_a_successful_restart_says_so(self):
+        self.assertEqual(self._restart(0), {"agent-api": "restarted"})
+
+    def test_a_failure_carries_the_exit_code_and_the_message(self):
+        result = self._restart(1, stderr="Interactive authentication required.")
+        self.assertIn("exit 1", result["agent-api"])
+        self.assertIn("Interactive authentication required", result["agent-api"])
+
+    def test_a_silent_failure_still_says_something_actionable(self):
+        # This is the one that happened: non-zero with both streams empty.
+        result = self._restart(1)
+        self.assertIn("exit 1", result["agent-api"])
+        self.assertNotEqual(result["agent-api"].strip(), "error:")
+        self.assertIn("run it by hand", result["agent-api"])
+
+
+class SelfRestartTests(unittest.TestCase):
+    """Restarting the unit you are running inside is a different operation.
+
+    The first mailbox refresh restarted `agent-api` from inside `agent-api`.
+    systemd tore the caller down while it was still waiting for its own
+    `systemctl` to return, so the call came back non-zero with both streams
+    empty and a restart that *worked* was reported as a failure - the journal
+    shows the unit stopping and starting cleanly at the same second.
+    """
+
+    def _run(self, services, current_unit):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        seen = []
+
+        def fake_run(command, **kwargs):
+            seen.append(command)
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with patch.object(refresh_module.subprocess, "run", side_effect=fake_run):
+            result = refresh_module.systemd_restarter(
+                services, current_unit=current_unit
+            )()
+        return result, seen
+
+    def test_restarting_our_own_unit_leaves_our_control_group(self):
+        """--no-block was not enough, and the VM proved it.
+
+        Stopping a unit kills its whole control group, and our `systemctl` is
+        a child of the process being stopped. Returning early is still a race
+        against our own teardown, and the refresh lost it: `exit -15`,
+        SIGTERM, reported for a restart that had in fact succeeded. A
+        transient unit is owned by systemd, so it survives us.
+        """
+        result, commands = self._run(("agent-api",), "agent-api")
+        self.assertIn("systemd-run", commands[0])
+        self.assertIn("scheduled", result["agent-api"])
+
+    def test_the_transient_unit_is_cleaned_up_and_delayed(self):
+        # --collect so it does not linger; a delay so this process can finish
+        # writing its report before it is replaced.
+        _result, commands = self._run(("agent-api",), "agent-api")
+        self.assertIn("--collect", commands[0])
+        self.assertTrue(
+            any(str(part).startswith("--on-active=") for part in commands[0]),
+            commands[0],
+        )
+
+    def test_restarting_another_unit_still_blocks_and_reports_the_outcome(self):
+        result, commands = self._run(("nginx",), "agent-api")
+        self.assertNotIn("--no-block", commands[0])
+        self.assertEqual(result["nginx"], "restarted")
+
+    def test_outside_a_unit_nothing_is_treated_as_self(self):
+        result, commands = self._run(("agent-api",), None)
+        self.assertNotIn("--no-block", commands[0])
+        self.assertEqual(result["agent-api"], "restarted")
+
+    def test_a_queued_restart_is_not_reported_as_done(self):
+        """It returns before the outcome exists; say so, do not guess."""
+        result, _ = self._run(("agent-api",), "agent-api")
+        self.assertNotEqual(result["agent-api"], "restarted")
+
+
+class OwnUnitTests(unittest.TestCase):
+    def _own_unit(self, text):
+        from modules.nexus_refresh import get_current_systemd_unit
+
+        path = Path(self._tmp.name) / "cgroup"
+        path.write_text(text, encoding="utf-8")
+        return get_current_systemd_unit(str(path))
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_a_systemd_service_cgroup_is_recognised(self):
+        self.assertEqual(
+            self._own_unit("0::/system.slice/agent-api.service\n"), "agent-api"
+        )
+
+    def test_a_nested_scope_still_finds_the_service(self):
+        self.assertEqual(
+            self._own_unit("0::/system.slice/agent-api.service/somescope\n"),
+            "agent-api",
+        )
+
+    def test_no_service_in_the_cgroup_is_not_a_guess(self):
+        self.assertIsNone(self._own_unit("0::/user.slice/user-1000.slice\n"))
+
+    def test_an_unreadable_cgroup_is_not_an_error(self):
+        from modules.nexus_refresh import get_current_systemd_unit
+
+        self.assertIsNone(get_current_systemd_unit(str(Path(self._tmp.name) / "missing")))
+
+
 class MessageCannotWidenTheOperationTests(unittest.TestCase):
     """What the front matter must NOT be able to influence."""
 

@@ -124,7 +124,11 @@ class Issue111ControllerProtocolTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertEqual(registry.calls[0][0], "git_status")
         self.assertIn('"resolved_tool":"git_status"', client.prompts[2])
-        self.assertIn('"grant_event_id"', client.prompts[3])
+        # The protocol still requires a grant before an operation runs - the
+        # execution above is what proves it. The controller prompt shows the
+        # result instead of the grant that authorised it (#223).
+        self.assertIn('"status":"succeeded"', client.prompts[3])
+        self.assertNotIn('"grant_event_id"', client.prompts[3])
 
     def test_call_tool_requires_arguments(self):
         with self.assertRaisesRegex(TaskOrchestratorError, "call_tool requires arguments"):

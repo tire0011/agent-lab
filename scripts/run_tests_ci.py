@@ -14,24 +14,59 @@ pytest runs both styles, so nothing that ran before stops running.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
 
-TEST_COMMAND = [
-    sys.executable, "-m", "pytest",
-    "-q",
-    "--tb=short",
-    # One line per failure at the end, so a long log stays diagnosable.
-    "-rf",
-]
-
 _MAX_OUTPUT_CHARS = 24000
+
+# How many pytest processes to run the suite across.
+#
+# The suite is dominated by spawning and waiting, not by computation: 146 git
+# invocations across 32 test files, plus service threads the tests wait on. That
+# overlaps well, so workers help even past the core count. Measured on a 4-core
+# box: 228s serial, 119s at 2, 73s at 4.
+#
+# "auto" is one worker per core. Lower it - or set it to 1 - where memory is the
+# binding constraint rather than CPU: each worker is a full interpreter with the
+# project imported, and on a host already swapping, more workers make it slower,
+# not faster. 1 disables xdist entirely and runs in this process, which is also
+# what you want when bisecting a failure, since it restores a single ordered
+# output stream.
+_WORKERS_ENV_VAR = "NEXUS_TEST_WORKERS"
+_DEFAULT_WORKERS = "auto"
+
+
+def _workers() -> str:
+    return (os.environ.get(_WORKERS_ENV_VAR) or _DEFAULT_WORKERS).strip() or _DEFAULT_WORKERS
+
+
+def _test_command() -> list[str]:
+    command = [
+        sys.executable, "-m", "pytest",
+        "-q",
+        "--tb=short",
+        # One line per failure at the end, so a long log stays diagnosable.
+        "-rf",
+    ]
+    workers = _workers()
+    if workers not in {"1", "0", "serial", "off"}:
+        command += ["-n", workers]
+        # Keep every test in a file on one worker. Test modules here carry
+        # real import-time state - os.environ.setdefault calls, module-level
+        # clients, api.py imported once - and splitting a file across
+        # processes would make which worker ran a test part of its setup.
+        # Measured at the same speed as the default per-test distribution
+        # (72.5s vs 72.9s), so the isolation is free.
+        command += ["--dist", "loadfile"]
+    return command
 
 
 def main() -> int:
+    command = _test_command()
     proc = subprocess.run(
-        TEST_COMMAND,
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

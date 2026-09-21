@@ -515,6 +515,23 @@ class MaintenanceService:
         t.start()
         return task_id
 
+    def wait_for_task(self, task_id: str, *, timeout: float = 10.0) -> bool:
+        """Block until that background task's worker thread has finished.
+
+        Returns True once it is done, False if still running at *timeout*.
+        ``execute`` returns as soon as the task is queued, so without this a
+        caller wanting the outcome can only sleep for a guessed duration -
+        which is a guess that gets slower and less reliable the busier the
+        host is.
+        """
+        task = self._get_task(task_id)
+        with self._lock:
+            thread = task._thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
     def _get_task(self, task_id: str) -> BackgroundTask:
         with self._lock:
             task = self._tasks.get(task_id)

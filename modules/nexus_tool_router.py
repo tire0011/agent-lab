@@ -51,7 +51,10 @@ from modules.llama_cpp_client import (
 )
 from modules.prompt_budget import prompt_json
 from modules.redaction import redact_secrets
-from modules.operations_registry import OperationValidationError, normalize_integer_argument
+# From the leaf, never from `operations_registry` itself: that module imports
+# mailbox_processor, which reaches back here, so importing it from this side
+# closes the cycle and half-builds whichever module loaded first.
+from modules.operation_contract import OperationValidationError, normalize_integer_argument
 
 logger = logging.getLogger(__name__)
 

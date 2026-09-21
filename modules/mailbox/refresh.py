@@ -143,19 +143,49 @@ def _deployment_root() -> Path:
 def _format(branch: str, result: Any) -> str:
     """Render the refresh report: what it is on now, and whether it moved."""
     success = bool(getattr(result, "success", False))
+    services = getattr(result, "services", None) or {}
+    # A restart this process handed to systemd and will not survive to see is
+    # neither done nor failed. Calling it failed was the mirror of the bug it
+    # replaced: the service does restart, we are simply not around to watch.
+    pending_services = sorted(
+        name for name, state in services.items() if str(state).startswith("restart ")
+    )
+    failed_services = sorted(
+        name
+        for name, state in services.items()
+        if str(state) != "restarted" and name not in pending_services
+    )
+    if not success:
+        heading = "failed"
+    elif failed_services:
+        # The checkout moved but the process did not: the new code is on disk
+        # and the old code is still serving. Calling that "complete" is how a
+        # deploy gets believed before it has happened.
+        heading = "incomplete - code updated but a service did not restart"
+    else:
+        heading = "complete"
     lines = [
-        "## Refresh " + ("complete" if success else "failed"),
+        "## Refresh " + heading,
         "",
         f"**Branch:** `{branch}`",
         f"**Success:** {success}",
     ]
+    if failed_services:
+        lines.append(
+            f"**Not running the new code:** {', '.join(f'`{n}`' for n in failed_services)}"
+        )
+    if pending_services:
+        lines.append(
+            "**Restarting shortly:** "
+            + ", ".join(f"`{n}`" for n in pending_services)
+            + " (handed to systemd; this process is being replaced)"
+        )
     previous = getattr(result, "previous_head", None)
     new_head = getattr(result, "new_head", None)
     if previous or new_head:
         lines.append(f"**Head:** `{previous or '?'}` -> `{new_head or '?'}`")
     lines.append(f"**Updated:** {bool(getattr(result, 'updated', False))}")
 
-    services = getattr(result, "services", None)
     if services:
         lines += ["", "### Services", ""]
         lines += [f"- `{name}`: {state}" for name, state in sorted(services.items())]

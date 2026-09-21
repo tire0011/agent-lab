@@ -30,7 +30,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from modules.checkout_rescue import (
     CheckoutRescue,
@@ -50,6 +50,9 @@ DEFAULT_REMOTE = "origin"
 _FETCH_TIMEOUT = 120
 _SERVICE_TIMEOUT = 60
 DEFAULT_SERVICES: tuple[str, ...] = ("agent-api", "nexus-mailbox")
+
+#: Distinguishes "detect my unit" from an explicit "I am in no unit".
+_UNSET: Any = object()
 
 
 #: A refresh must never end in a traceback: git can time out or the checkout
@@ -121,17 +124,52 @@ class RefreshResult:
         return lines
 
 
+def get_current_systemd_unit(cgroup_path: str = "/proc/self/cgroup") -> str | None:
+    """The systemd unit this process runs inside, or None."""
+    try:
+        text = Path(cgroup_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for piece in reversed(text.replace("\n", "/").split("/")):
+        name = piece.strip()
+        if name.endswith(".service"):
+            return name[: -len(".service")]
+    return None
+
+
 def systemd_restarter(
     services: Sequence[str] = DEFAULT_SERVICES,
     *,
     use_sudo: bool = True,
+    current_unit: str | None = _UNSET,
 ) -> Callable[[], dict[str, str]]:
-    """Restarter that asks systemd to restart *services*, one report per unit."""
+    """Restarter that asks systemd to restart *services*, one report per unit.
+
+    Restarting our own unit is handed to a transient unit, so the outcome is
+    unknown to us and is reported as scheduled rather than as done.
+    """
+    unit = get_current_systemd_unit() if current_unit is _UNSET else current_unit
 
     def restart() -> dict[str, str]:
         results: dict[str, str] = {}
         for service in services:
-            command = (["sudo"] if use_sudo else []) + ["systemctl", "restart", service]
+            replacing_self = unit is not None and service == unit
+            prefix = ["sudo"] if use_sudo else []
+            if replacing_self:
+                # Stopping a unit kills its whole control group, and a
+                # plain `systemctl` would be a child inside that group -
+                # killed mid-restart, reported as `exit -15` for a restart
+                # that worked. A transient unit is systemd's, not ours.
+                command = prefix + [
+                    "systemd-run",
+                    "--collect",
+                    "--on-active=2",
+                    "systemctl",
+                    "restart",
+                    service,
+                ]
+            else:
+                command = prefix + ["systemctl", "restart", service]
             try:
                 completed = subprocess.run(
                     command,
@@ -144,10 +182,18 @@ def systemd_restarter(
                 results[service] = f"error: {redact_secrets(str(exc))[:200]}"
                 continue
             if completed.returncode == 0:
-                results[service] = "restarted"
+                results[service] = (
+                    "restart scheduled (this process is being replaced)"
+                    if replacing_self
+                    else "restarted"
+                )
             else:
+                # systemctl can fail with both streams empty, so the exit
+                # code is the only thing always worth reporting.
                 detail = redact_secrets(completed.stderr or completed.stdout).strip()[:200]
-                results[service] = f"error: {detail}"
+                if not detail:
+                    detail = "no output; run it by hand to see why"
+                results[service] = f"error: exit {completed.returncode}: {detail}"
         return results
 
     return restart

@@ -4,3 +4,9 @@ pytest==8.4.2
 # executes them was never installed. Without it every async test errors under
 # pytest and is skipped entirely by unittest - see DECISIONS.md D-018.
 pytest-asyncio==0.24.0
+
+# Runs the suite across several processes. The work is dominated by process
+# spawning and waiting - 146 git invocations across 32 files - so it overlaps
+# well: 228s -> 73s on a 4-core box. Worker count is NEXUS_TEST_WORKERS in
+# scripts/run_tests_ci.py, which also explains when to lower it.
+pytest-xdist==3.8.0

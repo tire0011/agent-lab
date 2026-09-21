@@ -73,6 +73,8 @@ from modules.prompt_budget import (
     CHARS_PER_TOKEN,
     PromptBudgetPlan,
     compact_observations,
+    controller_observation_view,
+    _args_signature,
     compute_budget,
     dedupe_nested_results,
     prompt_json,
@@ -120,6 +122,13 @@ _ORCHESTRATOR_TOOLS = {
 }
 
 logger = logging.getLogger(__name__)
+
+# Decision fields worth journalling. Not the whole decision: `message` can
+# be a page of prose and adds nothing to "why did it choose this".
+_DECISION_FIELDS = (
+    "tool", "goal", "query", "operation", "provider", "command",
+    "script", "module", "experiment_id",
+)
 
 _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
     "local_worker": ("local_worker", "azure_openai", "codex_readonly"),
@@ -531,6 +540,11 @@ class NexusTaskOrchestrator:
             metadata={"source_type": session.source_type, "source_id": session.source_id},
         )
         observations: list[dict[str, Any]] = []
+        # Counted so a finished run says plainly whether the controller used
+        # the results it already had. See `_log_result_reuse`.
+        redundant_requests = 0
+        # The budget is logged when it changes, not every turn; see below.
+        last_budget_shape: tuple[Any, ...] | None = None
 
         for _ in range(self.max_steps):
             state_token = self._state_token(task)
@@ -555,16 +569,37 @@ class NexusTaskOrchestrator:
                 max_event_id=run_start_event_id,
             )
             prompt, prompt_meta = self._build_prompt(session, task, history, observations, budget_plan)
+            # The plan is a dozen numbers, and repeating them every turn buries
+            # the two that actually change. It goes out once, and again only
+            # when the budget really shifts.
+            #
+            # Compared on what was decided, not on what was measured:
+            # `mem_available_kb` moves every read, so comparing the whole plan
+            # would log on every turn again while looking like it does not.
+            budget_shape = (
+                budget_plan.effective_budget_chars,
+                budget_plan.observation_chars,
+                budget_plan.history_chars,
+                budget_plan.low_memory,
+            )
+            if budget_shape != last_budget_shape:
+                logger.info(
+                    "controller_prompt_budget session_id=%s %s",
+                    session.id,
+                    budget_plan.as_log_fields(),
+                )
+                last_budget_shape = budget_shape
             logger.info(
-                "controller_prompt_budget session_id=%s prompt_chars=%s estimated_tokens=%s "
-                "history_events=%s observation_count=%s omitted_observations=%s %s",
+                "controller_prompt session_id=%s prompt_chars=%s estimated_tokens=%s "
+                "history_events=%s observation_count=%s omitted_observations=%s "
+                "superseded_observations=%s",
                 session.id,
                 len(prompt),
                 len(prompt) // CHARS_PER_TOKEN,
                 len(history),
                 len(observations),
                 prompt_meta["omitted_observation_indices"],
-                budget_plan.as_log_fields(),
+                prompt_meta["superseded_observation_count"],
             )
             logger.info(
                 "llm_provider selected provider=local role=controller session_id=%s reason=persistent_controller",
@@ -632,6 +667,11 @@ class NexusTaskOrchestrator:
             # action this turn executes, but the turn record has to keep saying
             # which decision the model actually produced (#158).
             controller_action = action
+            self._journal_decision(session.id, decision)
+            satisfied_by = self._already_satisfied(decision, observations)
+            if satisfied_by is not None:
+                redundant_requests += 1
+                self._journal_redundant_request(session.id, decision, satisfied_by)
             turn_detail: str | None = None
             terminal_not_found = (
                 self._terminal_not_found_observation(
@@ -792,6 +832,13 @@ class NexusTaskOrchestrator:
                 )
                 if not check.allowed:
                     observation = check.observation or {"event": "duplicate_tool_call"}
+                    if tool == "operation":
+                        # The guard identifies a call by hash, so its refusal
+                        # names no operation. The controller needs the name and
+                        # arguments to recognise which answer it already holds,
+                        # and the prompt view uses them to point at the event
+                        # that carries it (#223).
+                        observation = {**observation, **arguments}
                     if terminal_not_found is not None:
                         # The guard already refuses the repeat and counts it, so
                         # pre-empting it would only hide the repeat from the
@@ -826,6 +873,9 @@ class NexusTaskOrchestrator:
                             recovery=str(observation.get("recovery", "")),
                         )
                     if check.stop:
+                        self._log_result_reuse(
+                            session.id, observations, redundant_requests
+                        )
                         return self._loop_limit_result(
                             session.id,
                             task,
@@ -868,6 +918,24 @@ class NexusTaskOrchestrator:
                     task_logger=task_logger,
                 )
                 if executed is not None:
+                    # Say on the lookup itself that it already ran, and where
+                    # the result is. The controller follows "find_tool then
+                    # call_tool", and a lookup that reports `resolved_tool`
+                    # and nothing else reads as an invitation to make that
+                    # call - so it does, and the guard refuses a call that
+                    # was never needed. Measured in session
+                    # e33be32780f747de8c6a85f0ba6af00d: find_tool ran the
+                    # operation, the controller called it anyway, and only
+                    # after the refusal did it use the result it already had.
+                    observations[-1] = {
+                        **observations[-1],
+                        "already_executed": True,
+                        "result_in_event": executed.get("event_id"),
+                        "next_step": (
+                            "this operation has already run; read its result below "
+                            "and choose a different next step"
+                        ),
+                    }
                     observations.append(executed)
                 continue
 
@@ -910,6 +978,7 @@ class NexusTaskOrchestrator:
                     str(decision.get("reason", ""))[:500],
                 )
 
+            self._log_result_reuse(session.id, observations, redundant_requests)
             result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
@@ -930,6 +999,7 @@ class NexusTaskOrchestrator:
             self._persist_final(session.id, task, result)
             return result
 
+        self._log_result_reuse(session.id, observations, redundant_requests)
         result = TaskDecision(
             action=ACTION_CLARIFICATION,
             reason="local orchestrator reached its bounded decision-step limit",
@@ -1358,15 +1428,26 @@ class NexusTaskOrchestrator:
             if content:
                 seen.add(content)
         deduped_observations = dedupe_nested_results(observations, already_seen=seen)
+        # Narrow to what a decision needs *before* budgeting it. Dropping the
+        # grant id, the already-bound operation schema and the resolver's
+        # telemetry buys room for the result itself, so the observation that
+        # answers the task survives the budget instead of being stubbed out
+        # behind the metadata that recorded how it was obtained (#223).
+        viewed_observations = controller_observation_view(deduped_observations)
         compacted_observations, omitted_indices = compact_observations(
-            deduped_observations,
+            viewed_observations,
             budget_chars=budget_plan.observation_chars,
             keep_recent_full=2,
         )
         prompt = self._prompt(session, truncated_input, history, compacted_observations)
         meta = {
             "input_truncated": input_truncated,
+            # Positions in the *viewed* list, which is what was budgeted. The
+            # view can drop a superseded failed attempt, so these are not
+            # positions in ``observations``; `superseded_observation_count`
+            # says how far the two have diverged.
             "omitted_observation_indices": omitted_indices,
+            "superseded_observation_count": len(deduped_observations) - len(viewed_observations),
             "deduped_observation_count": sum(
                 int(obs.get("deduped", 0)) for obs in deduped_observations if isinstance(obs, dict)
             ),
@@ -1441,6 +1522,7 @@ Rules:
 - Delegation is a tool call, never a transfer of control. Inspect its result and decide again.
 - Commands are tool calls, never final actions. Inspect command output and decide again before finishing.
 - Use `python_run` for every Python execution; Nexus supplies the interpreter. Never write an interpreter name or path in a command.
+- An observation with `"status":"succeeded"` already carries that call's result, in the same observation. Never call that operation again with the same arguments - there is nothing further to fetch. Read the result you already have and choose a different next step: another capability if something is still missing, or `answer` if the request is now satisfied.
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
@@ -2118,10 +2200,18 @@ Decide the next step now. Return JSON only.
         if not operation or not isinstance(arguments, dict):
             return None
 
+        # The same identity `_tool_identity` gives a controller `call_tool`.
+        # The guard recognises a repeat by hashing (tool, arguments), so
+        # spelling this call `call_tool {"tool":..., "arguments":...}` while the
+        # controller's own spells it `operation {"operation":..., "args":...}`
+        # made one call hash two ways: the guard could not see that a
+        # subsequent call_tool was re-running what this already ran. Measured
+        # on the VM, git_status resolved here, ran, and the controller's next
+        # decision ran it again unrefused (#223).
         check = self.loop_guard.check(
             session_id,
-            ACTION_CALL_TOOL,
-            {"tool": operation, "arguments": dict(arguments)},
+            "operation",
+            {"operation": operation, "args": dict(arguments)},
             state_token=state_token,
             reason=f"executing the read-only operation find_tool resolved: {reason}"[:1000],
         )
@@ -2195,6 +2285,133 @@ Decide the next step now. Return JSON only.
                 "reason": str(exc)[:1000],
                 "recovery": "correct the arguments or choose another capability",
             }
+
+    @staticmethod
+    def _already_satisfied(
+        decision: dict[str, Any], observations: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """The successful observation this decision asks to produce again.
+
+        Distinct from what the loop guard catches. The guard refuses any
+        repeat, including a retry of something that failed - a legitimate
+        move. This names the one case #223 is about: asking for a result that
+        is already in hand, which is never progress and never necessary.
+        """
+        if str(decision.get("action", "")).strip().lower() != ACTION_CALL_TOOL:
+            return None
+        operation = str(decision.get("tool", "")).strip()
+        if not operation:
+            return None
+        arguments = decision.get("arguments")
+        wanted = _args_signature(operation, arguments if isinstance(arguments, dict) else {})
+        for observation in reversed(observations):
+            if observation.get("tool") != "operation" or observation.get("event"):
+                continue
+            result = observation.get("result")
+            if not (isinstance(result, dict) and result.get("success")):
+                continue
+            if _args_signature(str(observation.get("operation", "")), observation.get("args")) == wanted:
+                return observation
+        return None
+
+    def _journal_redundant_request(
+        self,
+        session_id: str,
+        decision: dict[str, Any],
+        satisfied_by: dict[str, Any],
+    ) -> None:
+        """Record that the controller asked for something it already had."""
+        operation = str(decision.get("tool", ""))
+        event_id = satisfied_by.get("event_id")
+        logger.warning(
+            "controller_redundant_request session_id=%s operation=%s "
+            "already_succeeded_in_event=%s reason=%s",
+            session_id,
+            operation[:120],
+            event_id,
+            redact_secrets(str(decision.get("reason", "")))[:300],
+            extra={"session_id": session_id, "event": "controller_redundant_request"},
+        )
+        try:
+            self.task_store.append_event(
+                session_id,
+                role="system",
+                kind="redundant_tool_request",
+                content=(
+                    f"{operation} was requested again although event {event_id} "
+                    "already holds its result"
+                ),
+                metadata={
+                    "operation": operation[:120],
+                    "arguments": decision.get("arguments") or {},
+                    "already_succeeded_in_event": event_id,
+                    "controller_reason": redact_secrets(str(decision.get("reason", "")))[:500],
+                },
+            )
+        except Exception:  # noqa: BLE001 - instrumentation never breaks a turn
+            logger.debug("could not journal the redundant request", exc_info=True)
+
+    @staticmethod
+    def _log_result_reuse(
+        session_id: str, observations: list[dict[str, Any]], redundant_requests: int
+    ) -> None:
+        """One line per run saying whether results were reused.
+
+        Green has to be observable, not only red. Without this a correct run
+        is silent and indistinguishable from one nobody looked at, so the only
+        way to know was to read the journal back with a script afterwards.
+        """
+        successes = sum(
+            1
+            for observation in observations
+            if observation.get("tool") == "operation"
+            and not observation.get("event")
+            and isinstance(observation.get("result"), dict)
+            and observation["result"].get("success")
+        )
+        logger.info(
+            "controller_result_reuse session_id=%s successful_operations=%s "
+            "redundant_requests=%s verdict=%s",
+            session_id,
+            successes,
+            redundant_requests,
+            "clean" if redundant_requests == 0 else "reused_nothing",
+            extra={"session_id": session_id, "event": "controller_result_reuse"},
+        )
+
+    def _journal_decision(self, session_id: str, decision: dict[str, Any]) -> None:
+        """Record what the controller chose and the reason it gave.
+
+        `nexus_controller_turns` keeps the outcome of a turn; the model's own
+        stated reason was not kept anywhere. Reading a finished session back
+        therefore showed which tools ran and nothing about why - so a
+        controller that asked for a result it already had could be observed
+        doing it, and never asked what it thought it was doing.
+
+        Best-effort, like every other piece of instrumentation here: this must
+        never be the reason a turn fails.
+        """
+        try:
+            metadata: dict[str, Any] = {"action": str(decision.get("action", ""))[:64]}
+            for field in _DECISION_FIELDS:
+                value = decision.get(field)
+                if value in (None, "", {}, []):
+                    continue
+                metadata[field] = (
+                    redact_secrets(str(value))[:300] if isinstance(value, str) else value
+                )
+            arguments = decision.get("arguments")
+            if isinstance(arguments, dict) and arguments:
+                metadata["arguments"] = arguments
+            self.task_store.append_event(
+                session_id,
+                role="system",
+                kind="controller_decision",
+                content=redact_secrets(str(decision.get("reason", "")))[:1000],
+                metadata=metadata,
+            )
+        except Exception:  # noqa: BLE001 - instrumentation never breaks a turn
+            logger.debug("could not journal the controller decision", exc_info=True)
 
     def _persist_final(self, session_id: str, task: str, decision: TaskDecision) -> None:
         if decision.action == ACTION_CLARIFICATION:

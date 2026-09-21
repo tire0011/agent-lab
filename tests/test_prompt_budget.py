@@ -42,11 +42,17 @@ class ComputeBudgetTests(unittest.TestCase):
         # not just re-apply the value effective_budget_chars already used.
         self.assertEqual(starved.safe_local_budget_chars, 0)
 
-    def test_realistic_low_memory_range_blocks_local_calls(self):
-        # A host with only 100-500MB free is already dangerously low when
-        # the configured local model needs ~2048MB just to run; the old
-        # heuristic only tripped below ~15MB and let these values through
-        # with the full context budget still allowed.
+    def test_realistic_low_memory_range_is_flagged_but_never_blocks_local_calls(self):
+        # The name matters: nothing here blocks anything. `low_memory` and
+        # `safe_local_budget_chars` are advisory - the controller still calls
+        # llama-server, and an external provider is used only after a real
+        # local failure (see test_task_orchestrator's
+        # test_low_memory_budget_is_advisory_when_local_succeeds). The model is
+        # already loaded on the second call, so an attempt can well succeed
+        # where a prediction said it would not.
+        #
+        # A host with only 100-500MB free is genuinely thin, and saying so is
+        # worth doing; the old heuristic only tripped below ~15MB.
         for mem_available_kb in (100_000, 250_000, 500_000):
             with self.subTest(mem_available_kb=mem_available_kb):
                 plan = compute_budget(
@@ -57,6 +63,9 @@ class ComputeBudgetTests(unittest.TestCase):
                 )
                 self.assertTrue(plan.low_memory)
                 self.assertEqual(plan.safe_local_budget_chars, 0)
+                # Advisory, not a gate: there is still a prompt to send.
+                self.assertGreater(plan.effective_budget_chars, 0)
+                self.assertGreater(plan.observation_chars, 0)
 
     def test_no_swap_configured_does_not_trigger_low_memory(self):
         # /proc/meminfo always reports "SwapFree: 0" when no swap device is
@@ -87,21 +96,50 @@ class ComputeBudgetTests(unittest.TestCase):
 
     def test_exhausted_swap_with_thin_ram_headroom_triggers_low_memory(self):
         # Swap actually configured and nearly exhausted, combined with RAM
-        # headroom barely above the required footprint, is real pressure.
-        mem_limit_mb = 2048
+        # headroom barely above the cushion, is real pressure.
+        #
+        # "Thin" is measured against the cushion alone. It used to be measured
+        # against the model's footprint plus the cushion, which asked the host
+        # for room to load an already-running model a second time - so this
+        # fired on hosts that were fine, and the budget collapsed to its floor.
         inference_headroom_mb = 512
-        required_kb = mem_limit_mb * 1024 + inference_headroom_mb * 1024
+        headroom_kb = inference_headroom_mb * 1024
         plan = compute_budget(
             model_context_tokens=8192,
             reserved_output_tokens=700,
-            mem_available_kb=required_kb + 100_000,  # thin surplus over the required footprint
+            # A surplus smaller than the cushion itself: genuinely thin.
+            mem_available_kb=headroom_kb + 100_000,
             swap_free_kb=1024,
             swap_total_kb=1_000_000,
-            mem_limit_mb=mem_limit_mb,
+            mem_limit_mb=2048,
             inference_headroom_mb=inference_headroom_mb,
         )
         self.assertTrue(plan.low_memory)
         self.assertEqual(plan.safe_local_budget_chars, 0)
+
+    def test_a_running_model_does_not_count_against_the_prompt_budget(self):
+        """The regression behind #223, in one assertion.
+
+        These are the VM's real numbers from session
+        eed2f731e16548578afca48c0dc8b47a. The model was resident in llama-server
+        - already allocated, so counted in `used`, not in `MemAvailable` - and
+        subtracting it again left a surplus of -24 MiB. The budget fell to its
+        500-char floor, leaving 150 characters for observations, and a
+        successful 3005-character github_issue result reached the controller as
+        a bare stub: it could see that the call had succeeded and not what it
+        returned.
+        """
+        plan = compute_budget(
+            mem_available_kb=2_596_688,
+            swap_free_kb=5_559_572,
+            swap_total_kb=8_388_604,
+        )
+
+        self.assertFalse(plan.low_memory)
+        # The context window is the binding limit here, as it should be.
+        self.assertEqual(plan.effective_budget_chars, plan.context_budget_chars)
+        # Room for a real tool result, not just a reference to one.
+        self.assertGreater(plan.observation_chars, 3005)
 
     def test_sections_sum_to_effective_budget(self):
         plan = compute_budget(model_context_tokens=8192, reserved_output_tokens=700, mem_available_kb=None)

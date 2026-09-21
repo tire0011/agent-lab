@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from modules.nexus_delegation import DelegationResult
+from modules.nexus_task_store import NexusTaskStore
 from modules.operations_registry import OperationArgSpec
 from modules.runtime_execution import resolve_python_interpreter
 from modules.central_logging import get_task_logger, read_log_entries
@@ -247,6 +249,272 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_a_request_for_an_already_held_result_is_named_as_such(self):
+        """The loop guard refuses every repeat; this names the one #223 is about.
+
+        A retry of a call that *failed* is legitimate. Asking for a result
+        already in hand is never progress, and the two were indistinguishable
+        in the journal - both arrived as `duplicate_tool_call`.
+        """
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need git status"}',
+            '{"status":"found","operation":"git_status","reason":"reports changes","related_tools":[]}',
+            '{"action":"call_tool","tool":"git_status","arguments":{},'
+            '"reason":"the result is already there but I will fetch it again"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"finished"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+            events = orchestrator.task_store.recent_events(
+                result.session_id, kind="redundant_tool_request"
+            )
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(len(events), 1, events)
+        metadata = events[0]["metadata"]
+        self.assertEqual(metadata["operation"], "git_status")
+        self.assertIsNotNone(metadata["already_succeeded_in_event"])
+        # The model's own words for it, which is what makes the record useful.
+        self.assertIn("fetch it again", metadata["controller_reason"])
+
+    def test_the_budget_is_logged_once_not_every_turn(self):
+        """A dozen numbers that do not move bury the two that do.
+
+        The budget plan carries host memory, the context window and the
+        section split. None of it changes within a run, and repeating it on
+        every turn pushed prompt_chars and omitted_observations - the values
+        worth watching - into the noise.
+        """
+        from unittest.mock import patch
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"memory_search","query":"one","limit":3,"reason":"look"}',
+            '{"action":"memory_search","query":"two","limit":3,"reason":"look again"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"enough"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        with patch("modules.task_orchestrator.logger") as log:
+            try:
+                orchestrator.run("Search memory twice")
+            finally:
+                orchestrator.close()
+
+        lines = [str(c.args[0]) for c in log.info.call_args_list if c.args]
+        budgets = [l for l in lines if "controller_prompt_budget" in l]
+        prompts = [l for l in lines if l.startswith("controller_prompt session_id")]
+        self.assertEqual(len(budgets), 1, "the unchanged budget goes out once")
+        self.assertEqual(len(prompts), 3, "what changes is still logged per turn")
+
+    def test_a_jittering_memory_reading_does_not_relog_the_budget(self):
+        """MemAvailable moves on every read; the budget it produces does not.
+
+        Comparing the whole plan would log every turn again while looking like
+        it does not.
+        """
+        from unittest.mock import patch
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"memory_search","query":"one","limit":3,"reason":"look"}',
+            '{"action":"memory_search","query":"two","limit":3,"reason":"look again"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"enough"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        readings = iter([8_000_000, 7_999_100, 8_000_300, 7_998_800])
+
+        with patch("modules.task_orchestrator.read_mem_available_kb",
+                   side_effect=lambda *a, **k: next(readings, 8_000_000)), \
+             patch("modules.task_orchestrator.logger") as log:
+            try:
+                orchestrator.run("Search memory twice")
+            finally:
+                orchestrator.close()
+
+        budgets = [
+            str(c.args[0]) for c in log.info.call_args_list
+            if c.args and "controller_prompt_budget" in str(c.args[0])
+        ]
+        self.assertEqual(len(budgets), 1, "a moving reading is not a moving budget")
+
+    def test_a_finished_run_states_its_reuse_verdict(self):
+        """Green must be observable, not only red.
+
+        Without a line per run, a correct run is silent and indistinguishable
+        from one nobody looked at - so the only way to know was to read the
+        journal back with a script afterwards.
+        """
+        from unittest.mock import patch
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need git status"}',
+            '{"status":"found","operation":"git_status","reason":"reports changes","related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"the result is already here"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        with patch("modules.task_orchestrator.logger") as log:
+            try:
+                orchestrator.run("Inspect local repository changes")
+            finally:
+                orchestrator.close()
+
+        verdicts = [
+            call for call in log.info.call_args_list
+            if call.args and "controller_result_reuse" in str(call.args[0])
+        ]
+        self.assertEqual(len(verdicts), 1, "exactly one verdict per run")
+        rendered = str(verdicts[0].args)
+        self.assertIn("clean", rendered)
+        self.assertIn("0", rendered)  # no redundant requests
+
+    def test_a_retry_of_a_failed_call_is_not_called_redundant(self):
+        """Nothing is in hand there, so asking again is a legitimate move."""
+        registry = _MultiRegistry(self.db_path, self.tmp.name)
+        self.registry = registry
+        client = _Client([
+            '{"action":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need git status"}',
+            '{"status":"found","operation":"git_status","reason":"reports changes","related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"finished"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+            events = orchestrator.task_store.recent_events(
+                result.session_id, kind="redundant_tool_request"
+            )
+        finally:
+            orchestrator.close()
+        self.assertEqual(events, [])
+
+    def test_a_lookup_that_already_ran_says_so_on_itself(self):
+        """Otherwise it reads as an invitation to make the call it just made.
+
+        Session e33be32780f747de8c6a85f0ba6af00d: find_tool resolved and
+        executed github_issue, the observation said only `resolved_tool`, and
+        the controller followed the documented "find_tool then call_tool" and
+        called it. The guard refused a call that was never needed.
+        """
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need a git inspection capability"}',
+            '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
+            '"related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"Repository inspected.","reason":"the result is already here"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+        finally:
+            orchestrator.close()
+
+        lookups = [o for o in result.observations if o.get("tool") == "find_tool"]
+        self.assertTrue(lookups, result.observations)
+        lookup = lookups[0]
+        self.assertTrue(lookup.get("already_executed"))
+        self.assertIn("already run", lookup.get("next_step", ""))
+        # And it names where the result is, so "read it below" is checkable.
+        executed = [
+            o for o in result.observations
+            if o.get("tool") == "operation" and o.get("operation") == "git_status"
+        ]
+        self.assertEqual(lookup.get("result_in_event"), executed[0]["event_id"])
+
+    def test_the_annotation_reaches_the_controller_prompt(self):
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"tool","tool":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need a git inspection capability"}',
+            '{"status":"found","operation":"git_status","reason":"git_status reports repository changes",'
+            '"related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"the result is already here"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            orchestrator.run("Inspect local repository changes")
+        finally:
+            orchestrator.close()
+
+        # The turn after the lookup is the one that used to call it again.
+        section = client.prompts[2].partition("OBSERVATIONS FROM TOOLS USED IN THIS RUN:")[2]
+        self.assertIn("already_executed", section)
+        self.assertIn("already run", section)
+
+    def test_every_controller_decision_is_journalled_with_its_reason(self):
+        """Reading a session back has to answer "why", not only "what".
+
+        `nexus_controller_turns` keeps a turn's outcome; the model's own
+        stated reason was kept nowhere, so a finished session showed which
+        tools ran and nothing about what the controller thought it was doing.
+        """
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"memory_search","query":"prior work","limit":3,'
+            '"reason":"check what is already known"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"memory was enough"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect prior work")
+            events = orchestrator.task_store.recent_events(
+                result.session_id, kind="controller_decision"
+            )
+        finally:
+            orchestrator.close()
+
+        recorded = sorted(
+            ((e["metadata"] or {}).get("action"), e["content"]) for e in events
+        )
+        self.assertEqual(
+            recorded,
+            [("answer", "memory was enough"), ("memory_search", "check what is already known")],
+        )
+        query = next(
+            (e["metadata"] or {}).get("query")
+            for e in events
+            if (e["metadata"] or {}).get("action") == "memory_search"
+        )
+        self.assertEqual(query, "prior work")
+
+    def test_journalling_a_decision_never_breaks_the_turn(self):
+        """Instrumentation must not be the reason a turn fails."""
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"nothing to do"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        original = orchestrator.task_store.append_event
+
+        def explode_on_decisions(session_id, *, role, kind, content, metadata=None):
+            if kind == "controller_decision":
+                raise RuntimeError("journal is on fire")
+            return original(session_id, role=role, kind=kind, content=content, metadata=metadata)
+
+        orchestrator.task_store.append_event = explode_on_decisions  # type: ignore[method-assign]
+        try:
+            result = orchestrator.run("Answer despite a broken journal")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "done")
+
     def test_low_memory_budget_is_advisory_when_local_succeeds(self):
         client = _Client([
             '{"type":"action","action":"answer","experiment_id":null,'
@@ -348,10 +616,25 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn('"tool":"find_tool"', client.prompts[2])
         self.assertIn('"status":"found"', client.prompts[2])
         self.assertIn('"operation":"git_status"', client.prompts[2])
-        self.assertIn('"main_selected_schema_chars"', client.prompts[2])
-        self.assertIn('"legacy_catalog_schema_chars"', client.prompts[2])
-        self.assertIn('"selection_correctness":"unknown"', client.prompts[2])
-        self.assertIn('"grant_event_id"', client.prompts[3])
+        # The controller is shown what the lookup answered, not what the
+        # resolver measured doing it, and not the grant that authorised the
+        # call (#223). All of it is still recorded - see the journal
+        # assertions below.
+        # Scoped to the observation section: `legacy_catalog_schema_chars`
+        # also describes the find_tool capability itself in the catalog above,
+        # which is a different field with the same name.
+        for prompt in (client.prompts[2], client.prompts[3]):
+            section = prompt.partition("OBSERVATIONS FROM TOOLS USED IN THIS RUN:\n")[2]
+            for internal in (
+                '"main_selected_schema_chars"',
+                '"legacy_catalog_schema_chars"',
+                '"selection_correctness"',
+                '"grant_event_id"',
+                '"operation_schema"',
+            ):
+                self.assertNotIn(internal, section)
+        self.assertIn('"resolved_tool":"git_status"', client.prompts[2])
+        self.assertIn('"status":"succeeded"', client.prompts[3])
 
     def test_guessed_operation_without_find_tool_grant_is_rejected(self):
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
@@ -405,7 +688,21 @@ class TaskOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(second.action, ACTION_ANSWER)
         self.assertEqual(self.registry.calls[0][0], "git_status")
-        self.assertIn('"grant_event_id"', client2.prompts[1])
+        # The grant survived, which is what this test is about: the operation
+        # ran in a second process without a fresh find_tool. It is proven by
+        # the journal, where the grant id is recorded, rather than by the
+        # controller prompt, which no longer carries execution metadata (#223).
+        store = NexusTaskStore(db_path=self.db_path)
+        try:
+            events = store.recent_events(first.session_id, kind="operation")
+        finally:
+            store.close()
+        persisted = [json.loads(event["content"]) for event in events]
+        self.assertTrue(
+            any(entry.get("grant_event_id") for entry in persisted),
+            "the persisted operation event must still carry its grant",
+        )
+        self.assertNotIn('"grant_event_id"', client2.prompts[1])
 
     def test_find_tool_rejects_placeholder_goals_and_distinguishes_not_found(self):
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)

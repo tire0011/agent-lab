@@ -104,6 +104,35 @@ class OperationChainService:
         self._conn = conn
         self._running_threads: dict[str, threading.Thread] = {}
 
+    def wait_for_chain(self, request_id: str, *, timeout: float = 10.0) -> bool:
+        """Block until the chain started for *request_id* has finished.
+
+        Returns True once its pipeline thread is done (or there was never one,
+        as for a rejected chain), False if it was still running at *timeout*.
+
+        A caller that wants the finished result has no other way to know when
+        one exists: ``start_chain`` returns as soon as the row is queued.
+        Without this the only option is to sleep for a guessed duration and
+        hope - which is what the tests did, and they then had to accept
+        ``STATUS_RUNNING`` as a passing outcome to stay green, so they asserted
+        almost nothing.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM operation_chains WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                return True
+            # Read the reference under the lock, join outside it: the pipeline
+            # thread takes this same lock for every write, so joining while
+            # holding it would deadlock.
+            thread = self._running_threads.get(row["id"])
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
     def close(self) -> None:
         """Join any still-running chain-execution threads before closing the
         shared sqlite3 connection. The connection is opened with

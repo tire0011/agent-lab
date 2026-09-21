@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # Must be set before api.py is imported (it reads os.environ["AGENT_API_KEY"] at module level).
-os.environ.setdefault("AGENT_API_KEY", "test-api-key")
+# conftest has already set it by the time this runs, so this is a fallback for
+# importing the module directly - and it has to name the same key the rest of
+# the suite uses, or it reintroduces the mismatch it looks like it is avoiding.
+# The endpoint tests below do not rely on it: they monkeypatch api.API_KEY to
+# _MAINT_API_KEY, deliberately a different value, to prove the override works.
+os.environ.setdefault("AGENT_API_KEY", "test-key")
 
 from modules.maintenance_service import (
     MaintenanceAuthError,
@@ -274,11 +279,13 @@ def test_run_tests_background_task_queued(monkeypatch):
     svc = _make_service()
 
     started = threading.Event()
-    original_run = __import__("subprocess").run
+    # Held until the test has seen "running", instead of sleeping and hoping
+    # the observation lands inside the window.
+    may_finish = threading.Event()
 
     def slow_run(*args, **kwargs):
         started.set()
-        time.sleep(0.05)
+        assert may_finish.wait(timeout=10)
         return MagicMock(returncode=0, stdout="5 passed", stderr="")
 
     with patch("modules.maintenance_service.subprocess.run", side_effect=slow_run):
@@ -286,13 +293,15 @@ def test_run_tests_background_task_queued(monkeypatch):
         task_id = result["task_id"]
         assert result["status"] == "queued"
 
-        # Wait for the background thread to start.
-        started.wait(timeout=2)
+        assert started.wait(timeout=10)
         status = svc.execute("test_task_status", "tok", {"task_id": task_id})
-        assert status["status"] in ("running", "succeeded")
+        # Strictly "running": the fake is blocked until we release it, so it
+        # cannot have finished. "succeeded" was only accepted before because
+        # the fake's sleep might have elapsed first.
+        assert status["status"] == "running"
 
-        # Wait for it to finish.
-        time.sleep(0.15)
+        may_finish.set()
+        assert svc.wait_for_task(task_id)
         final = svc.execute("test_task_result", "tok", {"task_id": task_id})
         assert final["status"] == "succeeded"
         assert "5 passed" in final["output"]
@@ -317,8 +326,7 @@ def test_run_tests_task_times_out(monkeypatch):
         result = svc.execute("run_tests", "tok")
         task_id = result["task_id"]
 
-    # Give background thread time to process the timeout.
-    time.sleep(0.15)
+    assert svc.wait_for_task(task_id)
     final = svc.execute("test_task_result", "tok", {"task_id": task_id})
     assert final["status"] == "timed_out"
     assert "timed out" in final["error"]

@@ -1,5 +1,5 @@
-import sqlite3
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +44,34 @@ def _connect(db_path: str) -> sqlite3.Connection:
     # threads remain responsible for serializing concurrent access.
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
+    _apply_durability(conn)
     return conn
+
+
+# Production keeps SQLite's default durability: every commit is fsynced, so a
+# power cut cannot lose an acknowledged write. That is the right default for a
+# journal whose whole job is to still be there afterwards.
+#
+# It is also the single biggest cost in the test suite. Measured on the VM, 500
+# commits take 5.01s against 0.37s on a dev box - fsync there is 13.5x more
+# expensive, and the suite commits constantly because nearly every test builds
+# its own temporary database. Pure CPU is only 1.6x slower and process spawning
+# 2.8x, so the disk is what makes the VM run take half an hour.
+#
+# A test database lives in a temporary directory and is deleted at the end of
+# the test. There is nothing to recover, so paying for durability buys nothing.
+# WAL + synchronous=NORMAL takes those 500 commits from 0.463s to 0.007s here.
+_DURABILITY_ENV_VAR = "NEXUS_DB_DURABILITY"
+
+
+def _apply_durability(conn: sqlite3.Connection) -> None:
+    mode = (os.environ.get(_DURABILITY_ENV_VAR) or "").strip().lower()
+    if mode != "relaxed":
+        return
+    # journal_mode is persistent in the file; synchronous is per connection,
+    # so both are set on every connect rather than once at creation.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
 
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
