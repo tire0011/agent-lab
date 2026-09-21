@@ -43,6 +43,23 @@ class _IssueSpec:
         }
 
 
+class _MutationSpec:
+    name = "apply_fix"
+    description = "Apply the requested repository fix."
+    arguments = []
+    tags = ["repository", "change"]
+    mutates_state = True
+
+    def to_dict(self):
+        return {
+            "operation": self.name,
+            "description": self.description,
+            "arguments": [],
+            "tags": list(self.tags),
+            "mutates_state": self.mutates_state,
+        }
+
+
 class _IssueRegistry:
     def __init__(self, db_path: str, repo_root: str):
         self.db_path = db_path
@@ -50,7 +67,7 @@ class _IssueRegistry:
         self.calls = []
 
     def catalog(self):
-        return [_IssueSpec()]
+        return [_IssueSpec(), _MutationSpec()]
 
     def execute(self, operation, args, *, caller):
         self.calls.append((operation, args, caller))
@@ -111,6 +128,64 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
         self.assertNotEqual(result.action, ACTION_ANSWER)
         self.assertEqual(len(client.prompts), 5)
+
+
+    def test_read_only_summary_can_finish_after_issue_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _IssueRegistry(str(Path(tmp) / "state.db"), tmp)
+            client = _Client(
+                [
+                    '{"type":"tool","tool":"find_tool","goal":"read github issue 196",'
+                    '"reason":"need the issue details"}',
+                    '{"status":"found","operation":"github_issue",'
+                    '"reason":"github_issue reads an issue","related_tools":[]}',
+                    '{"action":"call_tool","tool":"github_issue",'
+                    '"arguments":{"issue_number":196},"reason":"read the issue"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Issue #196 is open.","reason":"summary complete"}',
+                ]
+            )
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=registry,
+                experiment_service=MagicMock(),
+                llama_client=client,
+            )
+            try:
+                result = orchestrator.run("summarize github issue #196")
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(len(registry.calls), 1)
+
+    def test_implementation_can_finish_after_mutating_operation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _IssueRegistry(str(Path(tmp) / "state.db"), tmp)
+            client = _Client(
+                [
+                    '{"type":"tool","tool":"find_tool","goal":"apply repository fix",'
+                    '"reason":"need to change the repository"}',
+                    '{"status":"found","operation":"apply_fix",'
+                    '"reason":"apply_fix changes the repository","related_tools":[]}',
+                    '{"action":"call_tool","tool":"apply_fix","arguments":{},'
+                    '"reason":"apply the requested change"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Implemented.","reason":"change completed"}',
+                ]
+            )
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=registry,
+                experiment_service=MagicMock(),
+                llama_client=client,
+            )
+            try:
+                result = orchestrator.run("fix the repository behavior")
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(len(registry.calls), 1)
+        self.assertEqual(registry.calls[0][0], "apply_fix")
 
 
 if __name__ == "__main__":
