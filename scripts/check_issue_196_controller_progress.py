@@ -520,11 +520,8 @@ def _replay_prompts(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     host under different memory pressure than at the time will reconstruct
     different prompts. The header says so.
     """
-    from modules.prompt_budget import (
-        compact_observations,
-        controller_observation_view,
-        prompt_json,
-    )
+    from modules.controller_observations import controller_observation_view
+    from modules.prompt_budget import compact_observations, prompt_json
 
     plan = _live_budget()
     replayed: list[dict[str, Any]] = []
