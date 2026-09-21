@@ -1427,8 +1427,6 @@ class NexusTaskOrchestrator:
             if content:
                 seen.add(content)
         deduped_observations = dedupe_nested_results(observations, already_seen=seen)
-        # Narrow to what a decision needs *before* budgeting it. Dropping the
-        # grant id, the already-bound operation schema and the resolver's
         # Prepare semantic content before applying the size budget.
         viewed_observations = controller_observation_view(deduped_observations)
         compacted_observations, omitted_indices = compact_observations(
