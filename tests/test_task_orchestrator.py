@@ -249,6 +249,67 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_every_controller_decision_is_journalled_with_its_reason(self):
+        """Reading a session back has to answer "why", not only "what".
+
+        `nexus_controller_turns` keeps a turn's outcome; the model's own
+        stated reason was kept nowhere, so a finished session showed which
+        tools ran and nothing about what the controller thought it was doing.
+        """
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"memory_search","query":"prior work","limit":3,'
+            '"reason":"check what is already known"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"memory was enough"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect prior work")
+            events = orchestrator.task_store.recent_events(
+                result.session_id, kind="controller_decision"
+            )
+        finally:
+            orchestrator.close()
+
+        recorded = sorted(
+            ((e["metadata"] or {}).get("action"), e["content"]) for e in events
+        )
+        self.assertEqual(
+            recorded,
+            [("answer", "memory was enough"), ("memory_search", "check what is already known")],
+        )
+        query = next(
+            (e["metadata"] or {}).get("query")
+            for e in events
+            if (e["metadata"] or {}).get("action") == "memory_search"
+        )
+        self.assertEqual(query, "prior work")
+
+    def test_journalling_a_decision_never_breaks_the_turn(self):
+        """Instrumentation must not be the reason a turn fails."""
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"nothing to do"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        original = orchestrator.task_store.append_event
+
+        def explode_on_decisions(session_id, *, role, kind, content, metadata=None):
+            if kind == "controller_decision":
+                raise RuntimeError("journal is on fire")
+            return original(session_id, role=role, kind=kind, content=content, metadata=metadata)
+
+        orchestrator.task_store.append_event = explode_on_decisions  # type: ignore[method-assign]
+        try:
+            result = orchestrator.run("Answer despite a broken journal")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "done")
+
     def test_low_memory_budget_is_advisory_when_local_succeeds(self):
         client = _Client([
             '{"type":"action","action":"answer","experiment_id":null,'

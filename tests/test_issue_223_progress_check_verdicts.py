@@ -175,7 +175,7 @@ class RecordedSessionTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.db_path = str(Path(self._tmp.name) / "agent.db")
 
-    def _session(self, observations, *, kind="answer", reason="done"):
+    def _session(self, observations, *, kind="answer", reason="done", decisions=()):
         from modules.nexus_task_store import NexusTaskStore
 
         store = NexusTaskStore(db_path=self.db_path)
@@ -184,6 +184,14 @@ class RecordedSessionTests(unittest.TestCase):
                 source_type="task", source_id="s", title="solve github issue #196"
             )
             store.claim_session(session.id, worker_id="w1")
+            for decision in decisions:
+                store.append_event(
+                    session.id,
+                    role="system",
+                    kind="controller_decision",
+                    content=decision.get("reason", ""),
+                    metadata={k: v for k, v in decision.items() if k != "reason"},
+                )
             for observation in observations:
                 store.append_event(
                     session.id,
@@ -341,6 +349,32 @@ class RecordedSessionTests(unittest.TestCase):
         code, out = self._judge(self._session([SUCCESS]), extra=["--show-prompts"])
         self.assertIn("replayed at a", out)
         self.assertNotIn("prompt None chars", out)
+
+    def test_the_controllers_own_reasons_are_shown(self):
+        """The one thing the canonical run could not answer.
+
+        Tool events show which calls ran; they say nothing about what the
+        model thought it was doing when it asked for a result it already had.
+        The decisions are journalled now, so a session read back carries them.
+        """
+        session = self._session(
+            [SUCCESS],
+            decisions=[
+                {"action": "call_tool", "tool": "github_issue",
+                 "arguments": {"issue_number": 196},
+                 "reason": "the task needs the issue content"},
+            ],
+        )
+        code, out = self._judge(session)
+        self.assertEqual(code, 0, out)
+        self.assertIn("call_tool", out)
+        self.assertIn("the task needs the issue content", out)
+
+    def test_a_session_without_journalled_decisions_still_judges(self):
+        """Sessions recorded before this instrumentation existed."""
+        code, out = self._judge(self._session([SUCCESS]))
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS", out)
 
     def test_the_tool_result_itself_is_printed_not_cut_off(self):
         """The one thing the section exists to show.

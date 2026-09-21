@@ -408,9 +408,18 @@ def judge_recorded_session(args, target: "_Target") -> int:
         store.close()
 
     observations: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
     final_action = session.status or "?"
     final_reason = ""
     for event in events:
+        if event["kind"] == "controller_decision":
+            # What the model chose and why, as it said it. Journalled since
+            # the canonical run, where the tool events showed a controller
+            # asking for a result it already had and nothing about what it
+            # thought it was doing.
+            metadata = event["metadata"] or {}
+            decisions.append({**metadata, "reason": event["content"]})
+            continue
         if event["role"] == "tool":
             try:
                 observation = json.loads(event["content"])
@@ -442,9 +451,9 @@ def judge_recorded_session(args, target: "_Target") -> int:
 
     return report_and_judge(
         observations=observations,
-        # Not recorded: the controller's rejected requests never reach the
-        # journal. The verdict falls back to executions and guard refusals.
-        decisions=[],
+        # Journalled since the canonical run. Older sessions have none, and
+        # the verdict still works from executions and guard refusals alone.
+        decisions=decisions,
         target=target,
         final_action=final_action,
         final_reason=final_reason,

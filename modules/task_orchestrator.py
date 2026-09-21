@@ -122,6 +122,13 @@ _ORCHESTRATOR_TOOLS = {
 
 logger = logging.getLogger(__name__)
 
+# Decision fields worth journalling. Not the whole decision: `message` can
+# be a page of prose and adds nothing to "why did it choose this".
+_DECISION_FIELDS = (
+    "tool", "goal", "query", "operation", "provider", "command",
+    "script", "module", "experiment_id",
+)
+
 _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
     "local_worker": ("local_worker", "azure_openai", "codex_readonly"),
     "azure_openai": ("azure_openai", "local_worker", "codex_readonly"),
@@ -635,6 +642,7 @@ class NexusTaskOrchestrator:
             # action this turn executes, but the turn record has to keep saying
             # which decision the model actually produced (#158).
             controller_action = action
+            self._journal_decision(session.id, decision)
             turn_detail: str | None = None
             terminal_not_found = (
                 self._terminal_not_found_observation(
@@ -2224,6 +2232,40 @@ Decide the next step now. Return JSON only.
                 "reason": str(exc)[:1000],
                 "recovery": "correct the arguments or choose another capability",
             }
+
+    def _journal_decision(self, session_id: str, decision: dict[str, Any]) -> None:
+        """Record what the controller chose and the reason it gave.
+
+        `nexus_controller_turns` keeps the outcome of a turn; the model's own
+        stated reason was not kept anywhere. Reading a finished session back
+        therefore showed which tools ran and nothing about why - so a
+        controller that asked for a result it already had could be observed
+        doing it, and never asked what it thought it was doing.
+
+        Best-effort, like every other piece of instrumentation here: this must
+        never be the reason a turn fails.
+        """
+        try:
+            metadata: dict[str, Any] = {"action": str(decision.get("action", ""))[:64]}
+            for field in _DECISION_FIELDS:
+                value = decision.get(field)
+                if value in (None, "", {}, []):
+                    continue
+                metadata[field] = (
+                    redact_secrets(str(value))[:300] if isinstance(value, str) else value
+                )
+            arguments = decision.get("arguments")
+            if isinstance(arguments, dict) and arguments:
+                metadata["arguments"] = arguments
+            self.task_store.append_event(
+                session_id,
+                role="system",
+                kind="controller_decision",
+                content=redact_secrets(str(decision.get("reason", "")))[:1000],
+                metadata=metadata,
+            )
+        except Exception:  # noqa: BLE001 - instrumentation never breaks a turn
+            logger.debug("could not journal the controller decision", exc_info=True)
 
     def _persist_final(self, session_id: str, task: str, decision: TaskDecision) -> None:
         if decision.action == ACTION_CLARIFICATION:
