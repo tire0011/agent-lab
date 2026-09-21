@@ -249,6 +249,93 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_a_request_for_an_already_held_result_is_named_as_such(self):
+        """The loop guard refuses every repeat; this names the one #223 is about.
+
+        A retry of a call that *failed* is legitimate. Asking for a result
+        already in hand is never progress, and the two were indistinguishable
+        in the journal - both arrived as `duplicate_tool_call`.
+        """
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need git status"}',
+            '{"status":"found","operation":"git_status","reason":"reports changes","related_tools":[]}',
+            '{"action":"call_tool","tool":"git_status","arguments":{},'
+            '"reason":"the result is already there but I will fetch it again"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"finished"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+            events = orchestrator.task_store.recent_events(
+                result.session_id, kind="redundant_tool_request"
+            )
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(len(events), 1, events)
+        metadata = events[0]["metadata"]
+        self.assertEqual(metadata["operation"], "git_status")
+        self.assertIsNotNone(metadata["already_succeeded_in_event"])
+        # The model's own words for it, which is what makes the record useful.
+        self.assertIn("fetch it again", metadata["controller_reason"])
+
+    def test_a_finished_run_states_its_reuse_verdict(self):
+        """Green must be observable, not only red.
+
+        Without a line per run, a correct run is silent and indistinguishable
+        from one nobody looked at - so the only way to know was to read the
+        journal back with a script afterwards.
+        """
+        from unittest.mock import patch
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need git status"}',
+            '{"status":"found","operation":"git_status","reason":"reports changes","related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"the result is already here"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        with patch("modules.task_orchestrator.logger") as log:
+            try:
+                orchestrator.run("Inspect local repository changes")
+            finally:
+                orchestrator.close()
+
+        verdicts = [
+            call for call in log.info.call_args_list
+            if call.args and "controller_result_reuse" in str(call.args[0])
+        ]
+        self.assertEqual(len(verdicts), 1, "exactly one verdict per run")
+        rendered = str(verdicts[0].args)
+        self.assertIn("clean", rendered)
+        self.assertIn("0", rendered)  # no redundant requests
+
+    def test_a_retry_of_a_failed_call_is_not_called_redundant(self):
+        """Nothing is in hand there, so asking again is a legitimate move."""
+        registry = _MultiRegistry(self.db_path, self.tmp.name)
+        self.registry = registry
+        client = _Client([
+            '{"action":"find_tool","goal":"inspect whether the repository has local changes",'
+            '"reason":"need git status"}',
+            '{"status":"found","operation":"git_status","reason":"reports changes","related_tools":[]}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"finished"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Inspect local repository changes")
+            events = orchestrator.task_store.recent_events(
+                result.session_id, kind="redundant_tool_request"
+            )
+        finally:
+            orchestrator.close()
+        self.assertEqual(events, [])
+
     def test_a_lookup_that_already_ran_says_so_on_itself(self):
         """Otherwise it reads as an invitation to make the call it just made.
 

@@ -74,6 +74,7 @@ from modules.prompt_budget import (
     PromptBudgetPlan,
     compact_observations,
     controller_observation_view,
+    _args_signature,
     compute_budget,
     dedupe_nested_results,
     prompt_json,
@@ -539,6 +540,9 @@ class NexusTaskOrchestrator:
             metadata={"source_type": session.source_type, "source_id": session.source_id},
         )
         observations: list[dict[str, Any]] = []
+        # Counted so a finished run says plainly whether the controller used
+        # the results it already had. See `_log_result_reuse`.
+        redundant_requests = 0
 
         for _ in range(self.max_steps):
             state_token = self._state_token(task)
@@ -643,6 +647,10 @@ class NexusTaskOrchestrator:
             # which decision the model actually produced (#158).
             controller_action = action
             self._journal_decision(session.id, decision)
+            satisfied_by = self._already_satisfied(decision, observations)
+            if satisfied_by is not None:
+                redundant_requests += 1
+                self._journal_redundant_request(session.id, decision, satisfied_by)
             turn_detail: str | None = None
             terminal_not_found = (
                 self._terminal_not_found_observation(
@@ -844,6 +852,9 @@ class NexusTaskOrchestrator:
                             recovery=str(observation.get("recovery", "")),
                         )
                     if check.stop:
+                        self._log_result_reuse(
+                            session.id, observations, redundant_requests
+                        )
                         return self._loop_limit_result(
                             session.id,
                             task,
@@ -946,6 +957,7 @@ class NexusTaskOrchestrator:
                     str(decision.get("reason", ""))[:500],
                 )
 
+            self._log_result_reuse(session.id, observations, redundant_requests)
             result = TaskDecision(
                 action=action,
                 reason=str(decision.get("reason", ""))[:1000],
@@ -966,6 +978,7 @@ class NexusTaskOrchestrator:
             self._persist_final(session.id, task, result)
             return result
 
+        self._log_result_reuse(session.id, observations, redundant_requests)
         result = TaskDecision(
             action=ACTION_CLARIFICATION,
             reason="local orchestrator reached its bounded decision-step limit",
@@ -2251,6 +2264,99 @@ Decide the next step now. Return JSON only.
                 "reason": str(exc)[:1000],
                 "recovery": "correct the arguments or choose another capability",
             }
+
+    @staticmethod
+    def _already_satisfied(
+        decision: dict[str, Any], observations: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """The successful observation this decision asks to produce again.
+
+        Distinct from what the loop guard catches. The guard refuses any
+        repeat, including a retry of something that failed - a legitimate
+        move. This names the one case #223 is about: asking for a result that
+        is already in hand, which is never progress and never necessary.
+        """
+        if str(decision.get("action", "")).strip().lower() != ACTION_CALL_TOOL:
+            return None
+        operation = str(decision.get("tool", "")).strip()
+        if not operation:
+            return None
+        arguments = decision.get("arguments")
+        wanted = _args_signature(operation, arguments if isinstance(arguments, dict) else {})
+        for observation in reversed(observations):
+            if observation.get("tool") != "operation" or observation.get("event"):
+                continue
+            result = observation.get("result")
+            if not (isinstance(result, dict) and result.get("success")):
+                continue
+            if _args_signature(str(observation.get("operation", "")), observation.get("args")) == wanted:
+                return observation
+        return None
+
+    def _journal_redundant_request(
+        self,
+        session_id: str,
+        decision: dict[str, Any],
+        satisfied_by: dict[str, Any],
+    ) -> None:
+        """Record that the controller asked for something it already had."""
+        operation = str(decision.get("tool", ""))
+        event_id = satisfied_by.get("event_id")
+        logger.warning(
+            "controller_redundant_request session_id=%s operation=%s "
+            "already_succeeded_in_event=%s reason=%s",
+            session_id,
+            operation[:120],
+            event_id,
+            redact_secrets(str(decision.get("reason", "")))[:300],
+            extra={"session_id": session_id, "event": "controller_redundant_request"},
+        )
+        try:
+            self.task_store.append_event(
+                session_id,
+                role="system",
+                kind="redundant_tool_request",
+                content=(
+                    f"{operation} was requested again although event {event_id} "
+                    "already holds its result"
+                ),
+                metadata={
+                    "operation": operation[:120],
+                    "arguments": decision.get("arguments") or {},
+                    "already_succeeded_in_event": event_id,
+                    "controller_reason": redact_secrets(str(decision.get("reason", "")))[:500],
+                },
+            )
+        except Exception:  # noqa: BLE001 - instrumentation never breaks a turn
+            logger.debug("could not journal the redundant request", exc_info=True)
+
+    @staticmethod
+    def _log_result_reuse(
+        session_id: str, observations: list[dict[str, Any]], redundant_requests: int
+    ) -> None:
+        """One line per run saying whether results were reused.
+
+        Green has to be observable, not only red. Without this a correct run
+        is silent and indistinguishable from one nobody looked at, so the only
+        way to know was to read the journal back with a script afterwards.
+        """
+        successes = sum(
+            1
+            for observation in observations
+            if observation.get("tool") == "operation"
+            and not observation.get("event")
+            and isinstance(observation.get("result"), dict)
+            and observation["result"].get("success")
+        )
+        logger.info(
+            "controller_result_reuse session_id=%s successful_operations=%s "
+            "redundant_requests=%s verdict=%s",
+            session_id,
+            successes,
+            redundant_requests,
+            "clean" if redundant_requests == 0 else "reused_nothing",
+            extra={"session_id": session_id, "event": "controller_result_reuse"},
+        )
 
     def _journal_decision(self, session_id: str, decision: dict[str, Any]) -> None:
         """Record what the controller chose and the reason it gave.
