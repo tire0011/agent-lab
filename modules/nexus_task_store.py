@@ -68,6 +68,7 @@ class NexusTaskSession:
     claimed_at: str | None = None
     last_heartbeat_at: str | None = None
     terminal_reason: str | None = None
+    requires_completion_evidence: bool = False
 
 
 class NexusTaskStore:
@@ -133,9 +134,9 @@ class NexusTaskStore:
                     ON nexus_controller_turns(created_at);
                 """
             )
-            self._migrate_heartbeat_columns()
+            self._migrate_session_columns()
 
-    def _migrate_heartbeat_columns(self) -> None:
+    def _migrate_session_columns(self) -> None:
         """Add the explicit ownership/liveness columns (#162).
 
         ``updated_at`` moves whenever anything touches the row, which is why it
@@ -151,6 +152,11 @@ class NexusTaskStore:
                 self._conn.execute(
                     f"ALTER TABLE nexus_task_sessions ADD COLUMN {column} TEXT NULL"
                 )
+        if "requires_completion_evidence" not in existing:
+            self._conn.execute(
+                "ALTER TABLE nexus_task_sessions "
+                "ADD COLUMN requires_completion_evidence INTEGER NOT NULL DEFAULT 0"
+            )
         self._conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_nexus_task_heartbeat
                    ON nexus_task_sessions(status, last_heartbeat_at)"""
@@ -848,6 +854,17 @@ class NexusTaskStore:
                 break
         return blocked
 
+    def set_requires_completion_evidence(self, session_id: str, required: bool) -> None:
+        """Persist whether this session represents an implementation/state-change task."""
+        with self._lock:
+            self._conn.execute(
+                """UPDATE nexus_task_sessions
+                   SET requires_completion_evidence=?, updated_at=?
+                   WHERE id=?""",
+                (1 if required else 0, _now(), session_id),
+            )
+            self._conn.commit()
+
     def set_status(self, session_id: str, status: str, *, worker_id: str | None = None) -> bool:
         """Move a session's status, optionally only while ``worker_id`` owns it.
 
@@ -890,4 +907,9 @@ class NexusTaskStore:
             claimed_at=row["claimed_at"] if "claimed_at" in keys else None,
             last_heartbeat_at=row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None,
             terminal_reason=row["terminal_reason"] if "terminal_reason" in keys else None,
+            requires_completion_evidence=(
+                bool(row["requires_completion_evidence"])
+                if "requires_completion_evidence" in keys
+                else False
+            ),
         )
