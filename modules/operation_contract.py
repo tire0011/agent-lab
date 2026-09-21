@@ -1,20 +1,9 @@
 """The operation contract: what a capability declares, takes and returns.
 
-Split out of ``operations_registry`` to break an import cycle, not to make a
-new layer. The registry imports ``mailbox_processor`` at module scope, which
-reaches ``modules.mailbox`` -> failure analysis -> ``nexus_tool_router``, and
-that router needs ``OperationValidationError`` and
-``normalize_integer_argument`` back. Importing the registry first was fine;
-importing the router first - which is what collecting
-``tests/test_task_orchestrator.py`` on its own does - found the registry
-half-built, its definitions not yet executed, and failed with
-``cannot import name 'OperationValidationError' from partially initialized
-module``.
-
-These pieces are pure data and validation with no project dependencies, so as
-a leaf they can be imported from either side at any point in the cycle. The
-registry re-exports them, so ``from modules.operations_registry import
-OperationSpec`` keeps working and remains the ordinary way to reach them.
+Split out of ``operations_registry`` to break an import cycle with
+``nexus_tool_router``. It must stay a leaf - pure data and validation, no
+project imports - or the cycle comes back. The registry re-exports these, so
+``from modules.operations_registry import OperationSpec`` keeps working.
 """
 
 from __future__ import annotations
@@ -53,15 +42,9 @@ class OperationArgSpec:
 class OperationSpec:
     """One capability's metadata, including whether calling it can change state.
 
-    ``mutates_state`` is required and keyword-only on purpose. Read-only used
-    to be defined negatively - "everything in the catalog except the names on
-    a denylist" - which made the safe set depend on somebody remembering to
-    extend that list whenever a mutating operation was added. A new operation
-    would have been read-only by default, and the diagnostic role that may
-    only read would have inherited it silently. Declaring access per
-    operation makes the question unskippable: a spec that does not answer it
-    does not construct, and a role that may only read filters on the answer
-    rather than on a list maintained somewhere else.
+    ``mutates_state`` has no default on purpose: a read-only role filters on
+    it, so an operation that forgets to declare it must fail to construct
+    rather than default to safe.
     """
 
     name: str
