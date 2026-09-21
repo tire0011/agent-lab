@@ -333,6 +333,58 @@ def _resolve_nexus_chat_job_service() -> NexusChatJobService:
     return get_nexus_chat_job_service()
 
 
+def _resume_blocked_capabilities_after_startup() -> None:
+    """Resume capability-blocked controller sessions after a deployment refresh."""
+    store = None
+    try:
+        store = NexusTaskStore()
+        if not store.blocked_missing_capabilities(limit=1):
+            return
+    except Exception as exc:  # noqa: BLE001 - startup recovery is best effort
+        _logger.error("could not inspect blocked capability sessions: %s", exc)
+        return
+    finally:
+        if store is not None:
+            store.close()
+
+    def run() -> None:
+        from modules.nexus_controller_service import NexusControllerService
+        from modules.task_orchestrator import NexusTaskOrchestrator
+
+        registry = None
+        orchestrator = None
+        try:
+            experiment_service = _resolve_experiment_service()
+            registry = OperationsRegistry(experiment_service=experiment_service)
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=registry,
+                experiment_service=experiment_service,
+            )
+            resumed = NexusControllerService(
+                orchestrator=orchestrator
+            ).resume_available_capabilities()
+            if resumed:
+                _logger.info(
+                    "resumed %d capability-blocked controller session(s) after startup",
+                    len(resumed),
+                )
+        except Exception as exc:  # noqa: BLE001 - never block API startup
+            _logger.error("capability-blocked session resume failed: %s", exc)
+        finally:
+            if orchestrator is not None:
+                orchestrator.close()
+            if registry is not None:
+                close = getattr(registry, "close", None)
+                if callable(close):
+                    close()
+
+    threading.Thread(
+        target=run,
+        daemon=True,
+        name="nexus-capability-resume",
+    ).start()
+
+
 @lru_cache(maxsize=1)
 def get_operations_executor() -> OperationsExecutor:
     """Singleton OperationsExecutor for the process."""
@@ -364,6 +416,7 @@ async def lifespan(app: FastAPI):
         mts.recover_after_restart()
         _resolve_experiment_adoption_service().recover_after_restart()
         _resolve_operation_chain_service().recover_after_restart()
+        _resume_blocked_capabilities_after_startup()
 
         # Controller sessions only reach a terminal status through the final
         # decision path, so a turn that dies mid-flight leaves its row `active`
