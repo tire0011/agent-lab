@@ -171,6 +171,7 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
             "effect": {"type": "string", "enum": ["read", "change", "verify"]},
             "experiment_id": {"type": ["string", "null"]},
             "message": {"type": "string"},
+            "verified_noop": {"type": "boolean"},
             "reason": {"type": "string"},
             "information_gap": {"type": "string"},
             "gap_kind": {
@@ -1016,11 +1017,18 @@ class NexusTaskOrchestrator:
                         budget_plan=budget_plan,
                         task_logger=task_logger,
                     )
-                    if self._is_completion_evidence(execution_decision, observation):
+                    if self._successful_effect(execution_decision, observation, "change"):
                         observation = dict(observation)
                         observation["completion_evidence"] = {
                             "kind": "state_change",
                             "effect": "change",
+                            "source": str(observation.get("tool", tool)),
+                        }
+                    elif self._successful_effect(execution_decision, observation, "verify"):
+                        observation = dict(observation)
+                        observation["verification_evidence"] = {
+                            "kind": "verified_state",
+                            "effect": "verify",
                             "source": str(observation.get("tool", tool)),
                         }
                     if (
@@ -1668,7 +1676,7 @@ Rules:
 - When an observation reports command_not_found, do not repeat the command and do not repeat memory searches: switch to `python_run`, another capability, or the missing_capability action.
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
-- For implementation/state-change tasks, a successful read-only lookup is context only, not proof that work is complete. For command or python_run, set effect to read, change, or verify. A successful effect=change execution is completion evidence; read/verify are not. If the required change cannot be performed, use missing_capability instead of claiming completion.
+- For implementation/state-change tasks, a successful read-only lookup is context only, not proof that work is complete. For command or python_run, set effect to read, change, or verify. A successful effect=change execution is completion evidence. If verification proves the requested state already exists and no change is required, use effect=verify and only then answer with verified_noop=true. If the required change cannot be performed or verified, use missing_capability instead of claiming completion.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
 - If a capability is genuinely missing, choose missing_capability and describe exactly what is needed. Set capability to a stable identifier for the missing capability and required_inputs to the values it needs. Cite the event IDs of the relevant failed attempt or terminal find_tool not_found result; an untried capability is not missing.
 - Never invent tool names, provider names, operation results or experiment IDs.
@@ -1877,29 +1885,17 @@ Decide the next step now. Return JSON only.
         match = re.search(r"(?m)^exit_code:\s*(-?\d+)\s*$", str(output or ""))
         return int(match.group(1)) if match else None
 
-    def _operation_mutates_state(self, operation: str) -> bool:
-        for spec in self.operations_registry.catalog():
-            if str(getattr(spec, "name", "")).strip() == operation:
-                return bool(getattr(spec, "mutates_state", False))
-        return False
-
-    def _is_completion_evidence(
+    def _successful_effect(
         self,
         decision: dict[str, Any],
         observation: dict[str, Any],
+        effect: str,
     ) -> bool:
-        """Classify evidence from this action's own declared/returned effect."""
+        """Whether a command/python action reported the requested successful effect."""
         tool = str(observation.get("tool", "")).strip()
-        if tool == "operation":
-            result = observation.get("result")
-            return (
-                self._operation_mutates_state(str(observation.get("operation", "")).strip())
-                and isinstance(result, dict)
-                and bool(result.get("success"))
-            )
         if tool not in {ACTION_COMMAND, TOOL_PYTHON_RUN}:
             return False
-        if str(decision.get("effect", "")).strip().lower() != "change":
+        if str(decision.get("effect", "")).strip().lower() != effect:
             return False
         if observation.get("error") or observation.get("event") == "command_not_found":
             return False
@@ -1913,6 +1909,15 @@ Decide the next step now. Return JSON only.
         """Read explicit completion evidence from this run or persisted session history."""
         evidence = self._terminal_evidence(session_id, observations, [])
         return any(bool(item.get("completion_evidence")) for item in evidence)
+
+    def _has_verification_evidence(
+        self,
+        session_id: str,
+        observations: list[dict[str, Any]],
+    ) -> bool:
+        """Read explicit no-op verification evidence from current/persisted history."""
+        evidence = self._terminal_evidence(session_id, observations, [])
+        return any(bool(item.get("verification_evidence")) for item in evidence)
 
     def _validate_evidence_sensitive_terminal(
         self,
@@ -1930,6 +1935,10 @@ Decide the next step now. Return JSON only.
         )
         if action == ACTION_ANSWER and requires_completion:
             if self._has_completion_evidence(session_id, observations):
+                return None
+            if bool(decision.get("verified_noop")) and self._has_verification_evidence(
+                session_id, observations
+            ):
                 return None
             return {
                 "event": "terminal_decision_rejected",
