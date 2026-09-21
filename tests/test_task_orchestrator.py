@@ -282,6 +282,68 @@ class TaskOrchestratorTests(unittest.TestCase):
         # The model's own words for it, which is what makes the record useful.
         self.assertIn("fetch it again", metadata["controller_reason"])
 
+    def test_the_budget_is_logged_once_not_every_turn(self):
+        """A dozen numbers that do not move bury the two that do.
+
+        The budget plan carries host memory, the context window and the
+        section split. None of it changes within a run, and repeating it on
+        every turn pushed prompt_chars and omitted_observations - the values
+        worth watching - into the noise.
+        """
+        from unittest.mock import patch
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"memory_search","query":"one","limit":3,"reason":"look"}',
+            '{"action":"memory_search","query":"two","limit":3,"reason":"look again"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"enough"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        with patch("modules.task_orchestrator.logger") as log:
+            try:
+                orchestrator.run("Search memory twice")
+            finally:
+                orchestrator.close()
+
+        lines = [str(c.args[0]) for c in log.info.call_args_list if c.args]
+        budgets = [l for l in lines if "controller_prompt_budget" in l]
+        prompts = [l for l in lines if l.startswith("controller_prompt session_id")]
+        self.assertEqual(len(budgets), 1, "the unchanged budget goes out once")
+        self.assertEqual(len(prompts), 3, "what changes is still logged per turn")
+
+    def test_a_jittering_memory_reading_does_not_relog_the_budget(self):
+        """MemAvailable moves on every read; the budget it produces does not.
+
+        Comparing the whole plan would log every turn again while looking like
+        it does not.
+        """
+        from unittest.mock import patch
+
+        self.registry = _MultiRegistry(self.db_path, self.tmp.name)
+        client = _Client([
+            '{"action":"memory_search","query":"one","limit":3,"reason":"look"}',
+            '{"action":"memory_search","query":"two","limit":3,"reason":"look again"}',
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done","reason":"enough"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        readings = iter([8_000_000, 7_999_100, 8_000_300, 7_998_800])
+
+        with patch("modules.task_orchestrator.read_mem_available_kb",
+                   side_effect=lambda *a, **k: next(readings, 8_000_000)), \
+             patch("modules.task_orchestrator.logger") as log:
+            try:
+                orchestrator.run("Search memory twice")
+            finally:
+                orchestrator.close()
+
+        budgets = [
+            str(c.args[0]) for c in log.info.call_args_list
+            if c.args and "controller_prompt_budget" in str(c.args[0])
+        ]
+        self.assertEqual(len(budgets), 1, "a moving reading is not a moving budget")
+
     def test_a_finished_run_states_its_reuse_verdict(self):
         """Green must be observable, not only red.
 

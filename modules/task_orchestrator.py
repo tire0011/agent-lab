@@ -543,6 +543,8 @@ class NexusTaskOrchestrator:
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
         redundant_requests = 0
+        # The budget is logged when it changes, not every turn; see below.
+        last_budget_shape: tuple[Any, ...] | None = None
 
         for _ in range(self.max_steps):
             state_token = self._state_token(task)
@@ -567,10 +569,30 @@ class NexusTaskOrchestrator:
                 max_event_id=run_start_event_id,
             )
             prompt, prompt_meta = self._build_prompt(session, task, history, observations, budget_plan)
+            # The plan is a dozen numbers, and repeating them every turn buries
+            # the two that actually change. It goes out once, and again only
+            # when the budget really shifts.
+            #
+            # Compared on what was decided, not on what was measured:
+            # `mem_available_kb` moves every read, so comparing the whole plan
+            # would log on every turn again while looking like it does not.
+            budget_shape = (
+                budget_plan.effective_budget_chars,
+                budget_plan.observation_chars,
+                budget_plan.history_chars,
+                budget_plan.low_memory,
+            )
+            if budget_shape != last_budget_shape:
+                logger.info(
+                    "controller_prompt_budget session_id=%s %s",
+                    session.id,
+                    budget_plan.as_log_fields(),
+                )
+                last_budget_shape = budget_shape
             logger.info(
-                "controller_prompt_budget session_id=%s prompt_chars=%s estimated_tokens=%s "
+                "controller_prompt session_id=%s prompt_chars=%s estimated_tokens=%s "
                 "history_events=%s observation_count=%s omitted_observations=%s "
-                "superseded_observations=%s %s",
+                "superseded_observations=%s",
                 session.id,
                 len(prompt),
                 len(prompt) // CHARS_PER_TOKEN,
@@ -578,7 +600,6 @@ class NexusTaskOrchestrator:
                 len(observations),
                 prompt_meta["omitted_observation_indices"],
                 prompt_meta["superseded_observation_count"],
-                budget_plan.as_log_fields(),
             )
             logger.info(
                 "llm_provider selected provider=local role=controller session_id=%s reason=persistent_controller",
