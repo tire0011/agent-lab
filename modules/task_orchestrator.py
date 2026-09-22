@@ -206,6 +206,35 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
     "nexus_controller_decision", _ORCHESTRATOR_SCHEMA
 )
 
+
+_PREFLIGHT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["need_information", "ready"]},
+        "known": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "missing": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "historical_context_needed": {"type": "boolean"},
+        "request_kind": {"type": "string", "enum": ["none", "memory", "read_only"]},
+        "request": {"type": "string"},
+        "next_goal": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": [
+        "status",
+        "known",
+        "missing",
+        "historical_context_needed",
+        "request_kind",
+        "request",
+        "next_goal",
+        "reason",
+    ],
+    "additionalProperties": False,
+}
+_PREFLIGHT_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
+    "nexus_preflight_plan", _PREFLIGHT_SCHEMA
+)
+
 # The shared tool mechanism owns the resolver schema, the read-only
 # boundary, candidate scoring and the not-found metadata (#172). Re-exported
 # here under their historical names so existing importers keep working.
@@ -689,6 +718,47 @@ class NexusTaskOrchestrator:
                 metadata={"source_type": session.source_type, "source_id": session.source_id},
             )
         observations: list[dict[str, Any]] = []
+        preflight_budget = compute_budget(
+            mem_available_kb=read_mem_available_kb(),
+            swap_free_kb=read_swap_free_kb(),
+            swap_total_kb=read_swap_total_kb(),
+        )
+        preflight_history = self.task_store.history(
+            session.id,
+            limit=12,
+            max_chars=preflight_budget.history_chars,
+            max_event_id=run_start_event_id,
+        )
+        try:
+            observations.extend(
+                await self._run_preflight(
+                    session,
+                    task,
+                    preflight_history,
+                    preflight_budget,
+                    task_logger=task_logger,
+                )
+            )
+        except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
+            logger.warning(
+                "preflight unavailable session_id=%s error=%s; continuing with developer controller",
+                session.id,
+                str(exc)[:1000],
+            )
+            observations.append(
+                {
+                    "tool": "preflight_plan",
+                    "status": "ready",
+                    "known": [],
+                    "missing": [],
+                    "historical_context_needed": False,
+                    "request_kind": "none",
+                    "request": "",
+                    "next_goal": "continue the task and gather any necessary information",
+                    "reason": "preflight unavailable; developer controller retains control",
+                    "error": str(exc)[:1000],
+                }
+            )
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
         redundant_requests = 0
@@ -1603,6 +1673,207 @@ class NexusTaskOrchestrator:
             {"name": ACTION_CLARIFICATION, "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory."},
         ]
 
+    def _preflight_prompt(
+        self,
+        current_input: str,
+        history: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> str:
+        """Render the bounded information-gathering planner prompt."""
+        return f"""You are the Nexus preflight planner. Your only job is to decide whether Nexus has enough information to begin or continue the requested work.
+
+You do not implement, edit files, run commands, run tests, finish the task, or choose implementation tools. The normal Nexus developer controller owns all of that.
+
+You may request at most one information lookup in this turn:
+- request_kind=read_only: one concrete current fact/source that can be obtained through a read-only OperationsRegistry operation. The request must be a concrete information goal such as "fetch GitHub issue #238" or "read service_logs of llama-server".
+- request_kind=memory: prior project history only when historical context could materially change the next decision, earlier work is explicitly relevant, or current information is insufficient.
+- request_kind=none: enough information is already available; status must be ready.
+
+Do not use memory mechanically. Do not request historical context just because it might exist. If the current input and observations already provide enough information to make progress, choose ready.
+
+When ready, next_goal describes what the developer should accomplish next at the reasoning level, without naming command, python_run, find_tool, or another implementation tool.
+
+CURRENT INPUT:
+{current_input}
+
+PERSISTENT HISTORY:
+{prompt_json(history)}
+
+PREFLIGHT OBSERVATIONS:
+{prompt_json(observations)}
+
+Return JSON only."""
+
+    @staticmethod
+    def _parse_preflight(raw: str) -> dict[str, Any]:
+        try:
+            data = extract_json(raw)
+        except LlamaCppClientError as exc:
+            raise TaskOrchestratorError(str(exc)) from exc
+        if not isinstance(data, dict):
+            raise TaskOrchestratorError("preflight response must be a JSON object")
+
+        status = str(data.get("status", "")).strip().lower()
+        request_kind = str(data.get("request_kind", "")).strip().lower()
+        request = str(data.get("request", "")).strip()
+        next_goal = str(data.get("next_goal", "")).strip()
+        historical = bool(data.get("historical_context_needed", False))
+        known = data.get("known")
+        missing = data.get("missing")
+
+        if status not in {"need_information", "ready"}:
+            raise TaskOrchestratorError("preflight status must be need_information or ready")
+        if request_kind not in {"none", "memory", "read_only"}:
+            raise TaskOrchestratorError("preflight request_kind must be none, memory or read_only")
+        if not isinstance(known, list) or not isinstance(missing, list):
+            raise TaskOrchestratorError("preflight known and missing must be arrays")
+        if not next_goal:
+            raise TaskOrchestratorError("preflight requires next_goal")
+        if status == "ready" and request_kind != "none":
+            raise TaskOrchestratorError("ready preflight must not request another lookup")
+        if status == "need_information":
+            if request_kind == "none" or not request:
+                raise TaskOrchestratorError("need_information preflight requires a concrete request")
+            if request_kind == "memory" and not historical:
+                raise TaskOrchestratorError(
+                    "memory preflight request requires historical_context_needed=true"
+                )
+
+        data["status"] = status
+        data["request_kind"] = request_kind
+        data["request"] = request
+        data["next_goal"] = next_goal
+        data["historical_context_needed"] = historical
+        data["known"] = [str(item)[:500] for item in known[:8]]
+        data["missing"] = [str(item)[:500] for item in missing[:8]]
+        return data
+
+    async def _run_preflight(
+        self,
+        session: Any,
+        task: str,
+        history: list[dict[str, Any]],
+        budget_plan: PromptBudgetPlan,
+        *,
+        task_logger: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Gather only information the mini planner says is materially needed."""
+        observations: list[dict[str, Any]] = []
+        seen_requests: set[tuple[str, str]] = set()
+        max_rounds = max(
+            1,
+            min(int(os.environ.get("NEXUS_PREFLIGHT_MAX_ROUNDS", "2")), 4),
+        )
+
+        for round_number in range(1, max_rounds + 1):
+            prompt = self._preflight_prompt(task, history, observations)
+            raw, provider_used = await self._schema_completion(
+                prompt,
+                session_id=session.id,
+                max_tokens=450,
+                response_format=_PREFLIGHT_RESPONSE_FORMAT,
+                budget_plan=budget_plan,
+                waiting_status="waiting_for_preflight",
+                role="preflight_planner",
+                task_logger=task_logger,
+            )
+            plan = self._parse_preflight(raw)
+            self.task_store.append_event(
+                session.id,
+                role="system",
+                kind="preflight_plan",
+                content=json.dumps(plan, separators=(",", ":")),
+                metadata={
+                    "round": round_number,
+                    "provider_used": provider_used,
+                    "status": plan["status"],
+                    "request_kind": plan["request_kind"],
+                },
+            )
+
+            if plan["status"] == "ready":
+                observations.append({"tool": "preflight_plan", **plan})
+                return observations
+
+            signature = (plan["request_kind"], plan["request"].lower())
+            if signature in seen_requests:
+                observations.append(
+                    {
+                        "tool": "preflight_plan",
+                        "status": "ready",
+                        "known": plan["known"],
+                        "missing": plan["missing"],
+                        "historical_context_needed": plan["historical_context_needed"],
+                        "request_kind": "none",
+                        "request": "",
+                        "next_goal": plan["next_goal"],
+                        "reason": "preflight lookup repeated without new information; continue with current context",
+                        "bounded_stop": "duplicate_information_request",
+                    }
+                )
+                return observations
+            seen_requests.add(signature)
+
+            if plan["request_kind"] == "memory":
+                observation = {
+                    "tool": "memory_search",
+                    "query": plan["request"][:500],
+                    "results": self.memory.search(plan["request"], limit=6),
+                    "preflight": True,
+                }
+                event_id = self.task_store.append_event(
+                    session.id,
+                    role="tool",
+                    kind="memory_search",
+                    content=json.dumps(observation, separators=(",", ":")),
+                    metadata={"reason": plan.get("reason", "")[:1000], "preflight": True},
+                )
+                observations.append({**observation, "event_id": event_id})
+                continue
+
+            resolved = await self._resolve_find_tool(
+                plan["request"],
+                session_id=session.id,
+                current_task=task,
+                budget_plan=budget_plan,
+                task_logger=task_logger,
+            )
+            event_id = self.task_store.append_event(
+                session.id,
+                role="tool",
+                kind=TOOL_FIND_TOOL,
+                content=json.dumps(resolved, separators=(",", ":")),
+                metadata={"reason": plan.get("reason", "")[:1000], "preflight": True},
+            )
+            resolved = {**resolved, "event_id": event_id, "preflight": True}
+            observations.append(resolved)
+
+            executed = self._execute_resolved_tool(
+                session_id=session.id,
+                state_token=self._state_token(task),
+                observation=resolved,
+                reason=f"preflight: {plan.get('reason', '')}",
+                task_logger=task_logger,
+            )
+            if executed is not None:
+                observations.append({**executed, "preflight": True})
+
+        observations.append(
+            {
+                "tool": "preflight_plan",
+                "status": "ready",
+                "known": [],
+                "missing": [],
+                "historical_context_needed": False,
+                "request_kind": "none",
+                "request": "",
+                "next_goal": "continue the task using the information gathered so far",
+                "reason": "bounded preflight rounds exhausted; hand control to developer",
+                "bounded_stop": "round_limit",
+            }
+        )
+        return observations
+
     def _build_prompt(
         self,
         session: Any,
@@ -1712,6 +1983,7 @@ Model policy:
 
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
+- If a `preflight_plan` observation is present, use its gathered information and `next_goal` as the starting point for development. Do not repeat its information lookups unless later evidence creates a genuinely new need.
 - Use `memory_search` only when prior project context could materially change the next decision, especially when important information is missing, earlier work may exist, or you are stuck. Do not search memory mechanically.
 - Before using `memory_search`, decide whether previous project context is actually needed to make progress. If the current input and observations already provide enough information to choose the next step, keep working instead of searching memory.
 - Memory is for missing or potentially relevant historical context, not for re-reading information that is already present in the current task or observations. Do not use `memory_search` merely to obtain the contents of a specifically named current GitHub issue or other directly addressable source.
