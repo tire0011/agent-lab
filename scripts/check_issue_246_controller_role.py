@@ -93,9 +93,10 @@ def verdict(scenario: str, decision: dict) -> tuple[bool, str]:
     if scenario == "after-read":
         if action not in {ACTION_COMMAND, TOOL_PYTHON_RUN}:
             return False, (
-                "after github_issue(238) already supplied root cause/fix, Nexus should "
-                "start local repository work itself; expected command/python_run, "
-                f"got action={action!r}"
+                "after github_issue(238) already supplied the root cause, expected "
+                "change and acceptance criteria, Nexus already has enough current "
+                "information to make progress; expected local repository work via "
+                f"command/python_run, got action={action!r}"
             )
         return True, f"local development next step: {action}"
 
