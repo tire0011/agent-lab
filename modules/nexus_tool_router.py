@@ -130,6 +130,11 @@ _PYTHON_GOAL_PATTERN = re.compile(
     rf"\b{_EXECUTION_VERBS}\b[^.]{{0,24}}\bpython\b",
     re.IGNORECASE,
 )
+_LOCAL_REPOSITORY_WORK_PATTERN = re.compile(
+    r"\b(?:inspect|modify|edit|change|update|fix|implement|apply)\b"
+    r"[^.]{0,80}\b(?:repository|repo|worktree|checkout|source|code|files?)\b",
+    re.IGNORECASE,
+)
 
 TOOL_ACCURACY_UNKNOWN = "unknown"
 TOOL_ACCURACY_CORRECT = "correct"
@@ -316,7 +321,7 @@ def controller_native_capabilities(goal: str) -> list[str]:
     native: list[str] = []
     if _PYTHON_GOAL_PATTERN.search(text):
         native.append(TOOL_PYTHON_RUN)
-    if _SHELL_GOAL_PATTERN.search(text):
+    if _SHELL_GOAL_PATTERN.search(text) or _LOCAL_REPOSITORY_WORK_PATTERN.search(text):
         native.append(ACTION_COMMAND)
     return native
 
