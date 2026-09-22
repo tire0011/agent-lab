@@ -171,6 +171,62 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
         self.assertEqual(len(client.prompts), 5)
 
+    def test_missing_capability_is_rejected_when_local_command_can_do_the_work(self):
+        """Regression for #244 / the real #238 autonomy run.
+
+        The read-only OperationsRegistry has no operation for editing the
+        repository. That must not prove the capability is missing because
+        `command` is a controller-native LOCAL development capability.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"type":"action","action":"missing_capability","experiment_id":null,'
+                    '"message":"A capability is needed to inspect and modify the repository.",'
+                    '"reason":"no repository-edit operation is available",'
+                    '"gap_kind":"missing_capability",'
+                    '"information_gap":"use a shell command to inspect and modify the repository '
+                    'to exclude bookkeeping rows from the memory index",'
+                    '"capability":"repository_modification","required_inputs":[]}',
+                    '{"action":"command","command":"printf fixed","effect":"change",'
+                    '"reason":"use the existing LOCAL shell path to apply the fix"}',
+                    '{"type":"action","action":"answer","experiment_id":null,'
+                    '"message":"Implemented.","reason":"repository change completed"}',
+                ],
+            )
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    side_effect=_writes(Path(tmp) / "issue-244-fixed.txt"),
+                ):
+                    result = orchestrator.run("solve github issue #238")
+                system_events = orchestrator.task_store.recent_events(
+                    result.session_id, role="system", limit=20
+                )
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(
+            result.action,
+            ACTION_ANSWER,
+            "missing_capability must not terminate while LOCAL command can satisfy the gap",
+        )
+        rejection = next(
+            (
+                event
+                for event in system_events
+                if event["kind"] == "terminal_decision_rejected"
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            rejection,
+            "the rejected missing_capability decision must be journalled for diagnosis",
+        )
+        self.assertIn("command", rejection["content"])
+        self.assertIn("controller-native", rejection["content"])
+
     def test_read_only_summary_can_finish_after_issue_fetch(self):
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator, registry, _ = _orchestrator(
