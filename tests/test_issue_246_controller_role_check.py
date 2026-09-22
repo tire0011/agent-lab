@@ -56,7 +56,7 @@ def test_after_read_rejects_repeated_issue_read():
         },
     )
     assert not ok
-    assert "expected command/python_run" in reason
+    assert "expected local repository work via command/python_run" in reason
 
 
 def test_after_read_rejects_false_completion():
@@ -68,7 +68,7 @@ def test_after_read_rejects_false_completion():
         },
     )
     assert not ok
-    assert "expected command/python_run" in reason
+    assert "expected local repository work via command/python_run" in reason
 
 
 def test_after_read_rejects_missing_capability():
@@ -80,4 +80,4 @@ def test_after_read_rejects_missing_capability():
         },
     )
     assert not ok
-    assert "expected command/python_run" in reason
+    assert "expected local repository work via command/python_run" in reason
