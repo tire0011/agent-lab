@@ -134,7 +134,7 @@ async def planner_turn(scenario: str) -> tuple[dict, dict]:
             raw, provider = await orchestrator._schema_completion(
                 prompt,
                 session_id=session.id,
-                max_tokens=450,
+                max_tokens=700,
                 response_format=_PREFLIGHT_RESPONSE_FORMAT,
                 budget_plan=budget,
                 waiting_status="waiting_for_preflight",
