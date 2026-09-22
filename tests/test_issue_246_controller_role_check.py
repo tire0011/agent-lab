@@ -81,3 +81,26 @@ def test_after_read_rejects_missing_capability():
     )
     assert not ok
     assert "expected local repository work via command/python_run" in reason
+
+
+def test_after_memory_accepts_local_repository_work():
+    ok, reason = verdict(
+        "after-memory",
+        {
+            "action": "command",
+            "command": "sed -n '1,220p' modules/nexus_memory.py",
+        },
+    )
+    assert ok, reason
+
+
+def test_after_memory_rejects_another_search():
+    ok, reason = verdict(
+        "after-memory",
+        {
+            "action": "memory_search",
+            "query": "exclude orchestrator bookkeeping from the memory index",
+        },
+    )
+    assert not ok
+    assert "duplicate historical issue reads" in reason
