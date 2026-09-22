@@ -1774,7 +1774,7 @@ Return JSON only."""
             raw, provider_used = await self._schema_completion(
                 prompt,
                 session_id=session.id,
-                max_tokens=450,
+                max_tokens=700,
                 response_format=_PREFLIGHT_RESPONSE_FORMAT,
                 budget_plan=budget_plan,
                 waiting_status="waiting_for_preflight",
