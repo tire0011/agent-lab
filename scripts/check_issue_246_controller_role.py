@@ -63,11 +63,14 @@ ISSUE_238_OBSERVATION = {
 
 
 
+# Shaped exactly as production emits it: `results`, not `result`, and no
+# `limit`. `dedupe_nested_results` keys off `results`, so the old spelling
+# made this fixture invisible to it - the `after-memory` scenario then pinned
+# a verdict against a prompt shape a real run never produces.
 MEMORY_SEARCH_OBSERVATION = {
     "tool": "memory_search",
     "query": "exclude orchestrator bookkeeping from the memory index",
-    "limit": 6,
-    "result": [
+    "results": [
         {
             "source": "task_history",
             "session_id": "6eb74de91092477dbcfb1645590eaaeb",

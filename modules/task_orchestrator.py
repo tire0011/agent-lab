@@ -207,6 +207,16 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
 )
 
 
+# The `tool` name every preflight planner observation carries. Named so the
+# evidence helpers can recognise a plan without matching a bare string in
+# four places.
+TOOL_PREFLIGHT_PLAN = "preflight_plan"
+
+# Recorded as the reason on events a preflight lookup produces. The compact
+# schema dropped the planner's own `reason` field, so there is nothing
+# per-request left to quote here.
+_PREFLIGHT_REQUEST_REASON = "preflight information request"
+
 _PREFLIGHT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -736,17 +746,7 @@ class NexusTaskOrchestrator:
                     session.id,
                     str(exc)[:1000],
                 )
-                observations.append(
-                    {
-                        "tool": "preflight_plan",
-                        "need_info": False,
-                        "kind": "none",
-                        "request": "",
-                        "next_goal": "continue the task and gather any necessary information",
-                        "bounded_reason": "preflight unavailable; developer controller retains control",
-                        "error": str(exc)[:1000],
-                    }
-                )
+                observations.append(self._preflight_unavailable_plan(exc))
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
         redundant_requests = 0
@@ -1666,8 +1666,22 @@ class NexusTaskOrchestrator:
         current_input: str,
         history: list[dict[str, Any]],
         observations: list[dict[str, Any]],
+        budget_plan: PromptBudgetPlan,
     ) -> str:
-        """Render the bounded information-gathering planner prompt."""
+        """Render the bounded information-gathering planner prompt.
+
+        Bounded the same way `_build_prompt` bounds the controller's. A round
+        that fetched a large tool result would otherwise carry all of it into
+        the next round's prompt: `prompt_json` does not truncate, so the
+        budget was computed and then ignored, and round 2 could run past
+        `safe_local_budget_chars` on the local model.
+        """
+        truncated_input, _ = truncate_text(current_input, budget_plan.current_input_chars)
+        compacted_observations, _ = compact_observations(
+            observations,
+            budget_chars=budget_plan.observation_chars,
+            keep_recent_full=2,
+        )
         return f"""You are the Nexus preflight planner. Decide only whether Nexus needs one more piece of information before the developer can continue.
 
 Rules:
@@ -1680,13 +1694,13 @@ Rules:
 - next_goal is one short developer goal. Do not name implementation tools.
 
 CURRENT INPUT:
-{current_input}
+{truncated_input}
 
 HISTORY:
 {prompt_json(history)}
 
 OBSERVATIONS:
-{prompt_json(observations)}
+{prompt_json(compacted_observations)}
 
 Return exactly one small JSON object matching the schema. Keep every string short."""
 
@@ -1725,6 +1739,72 @@ Return exactly one small JSON object matching the schema. Keep every string shor
             "next_goal": next_goal[:500],
         }
 
+    @staticmethod
+    def _mark_already_executed(
+        lookup: dict[str, Any], executed: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Say on a ``find_tool`` observation that its operation already ran.
+
+        The controller follows "find_tool then call_tool", and a lookup that
+        reports `resolved_tool` and nothing else reads as an invitation to
+        make that call - so it does, and the guard refuses a call that was
+        never needed. Measured in session
+        e33be32780f747de8c6a85f0ba6af00d: find_tool ran the operation, the
+        controller called it anyway, and only after the refusal did it use the
+        result it already had (#223).
+
+        Shared with the preflight planner, which resolves and executes through
+        the same two calls and therefore hands the controller the same trap.
+        """
+        return {
+            **lookup,
+            "already_executed": True,
+            "result_in_event": executed.get("event_id"),
+            "next_step": (
+                "this operation has already run; read its result below "
+                "and choose a different next step"
+            ),
+        }
+
+    @staticmethod
+    def _preflight_max_rounds() -> int:
+        """Bounded round count, tolerant of an unparseable override.
+
+        A typo in `NEXUS_PREFLIGHT_MAX_ROUNDS` must not fail the turn: the
+        planner is an optimisation, and the developer controller can run
+        without it. `ValueError` here escaped the caller's handler, which
+        only catches orchestrator and budget errors.
+        """
+        raw = os.environ.get("NEXUS_PREFLIGHT_MAX_ROUNDS", "").strip()
+        try:
+            configured = int(raw) if raw else 2
+        except ValueError:
+            logger.warning(
+                "invalid NEXUS_PREFLIGHT_MAX_ROUNDS=%r; falling back to 2", raw[:100]
+            )
+            configured = 2
+        return max(1, min(configured, 4))
+
+    @staticmethod
+    def _preflight_unavailable_plan(exc: BaseException) -> dict[str, Any]:
+        """The stub that hands control back when the planner cannot run.
+
+        The failure reason is deliberately *not* under `error`: that key makes
+        `_is_resolution_evidence` and `_supports_missing_capability` both
+        report a real attempt, and a terminal `missing_capability` could then
+        cite a planner that never tried anything (#244). `TOOL_PREFLIGHT_PLAN`
+        is excluded in those helpers as well; the key name is the second lock.
+        """
+        return {
+            "tool": TOOL_PREFLIGHT_PLAN,
+            "need_info": False,
+            "kind": "none",
+            "request": "",
+            "next_goal": "continue the task and gather any necessary information",
+            "bounded_reason": "preflight unavailable; developer controller retains control",
+            "preflight_error": str(exc)[:1000],
+        }
+
     async def _run_preflight(
         self,
         session: Any,
@@ -1737,104 +1817,133 @@ Return exactly one small JSON object matching the schema. Keep every string shor
         """Gather only information the mini planner says is materially needed."""
         observations: list[dict[str, Any]] = []
         seen_requests: set[tuple[str, str]] = set()
-        max_rounds = max(
-            1,
-            min(int(os.environ.get("NEXUS_PREFLIGHT_MAX_ROUNDS", "2")), 4),
-        )
+        max_rounds = self._preflight_max_rounds()
 
         for round_number in range(1, max_rounds + 1):
-            prompt = self._preflight_prompt(task, history, observations)
-            raw, provider_used = await self._schema_completion(
-                prompt,
-                session_id=session.id,
-                max_tokens=300,
-                response_format=_PREFLIGHT_RESPONSE_FORMAT,
-                budget_plan=budget_plan,
-                waiting_status="waiting_for_preflight",
-                role="preflight_planner",
-                task_logger=task_logger,
-            )
-            plan = self._parse_preflight(raw)
-            self.task_store.append_event(
-                session.id,
-                role="system",
-                kind="preflight_plan",
-                content=json.dumps(plan, separators=(",", ":")),
-                metadata={
-                    "round": round_number,
-                    "provider_used": provider_used,
-                    "need_info": plan["need_info"],
-                    "kind": plan["kind"],
-                },
-            )
-
-            if not plan["need_info"]:
-                observations.append({"tool": "preflight_plan", **plan})
-                return observations
-
-            signature = (plan["kind"], plan["request"].lower())
-            if signature in seen_requests:
-                observations.append(
-                    {
-                        "tool": "preflight_plan",
-                        "need_info": False,
-                        "kind": "none",
-                        "request": "",
-                        "next_goal": plan["next_goal"],
-                        "bounded_reason": "preflight lookup repeated without new information; continue with current context",
-                        "bounded_stop": "duplicate_information_request",
-                    }
+            try:
+                prompt = self._preflight_prompt(task, history, observations, budget_plan)
+                raw, provider_used = await self._schema_completion(
+                    prompt,
+                    session_id=session.id,
+                    max_tokens=300,
+                    response_format=_PREFLIGHT_RESPONSE_FORMAT,
+                    budget_plan=budget_plan,
+                    waiting_status="waiting_for_preflight",
+                    role="preflight_planner",
+                    task_logger=task_logger,
                 )
-                return observations
-            seen_requests.add(signature)
+                plan = self._parse_preflight(raw)
+                self.task_store.append_event(
+                    session.id,
+                    role="system",
+                    kind=TOOL_PREFLIGHT_PLAN,
+                    content=json.dumps(plan, separators=(",", ":")),
+                    metadata={
+                        "round": round_number,
+                        "provider_used": provider_used,
+                        "need_info": plan["need_info"],
+                        "kind": plan["kind"],
+                    },
+                )
 
-            if plan["kind"] == "memory":
-                observation = {
-                    "tool": "memory_search",
-                    "query": plan["request"][:500],
-                    "results": self.memory.search(plan["request"], limit=6),
-                    "preflight": True,
-                }
+                if not plan["need_info"]:
+                    observations.append({"tool": TOOL_PREFLIGHT_PLAN, **plan})
+                    return observations
+
+                signature = (plan["kind"], plan["request"].lower())
+                if signature in seen_requests:
+                    observations.append(
+                        {
+                            "tool": TOOL_PREFLIGHT_PLAN,
+                            "need_info": False,
+                            "kind": "none",
+                            "request": "",
+                            "next_goal": plan["next_goal"],
+                            "bounded_reason": "preflight lookup repeated without new information; continue with current context",
+                            "bounded_stop": "duplicate_information_request",
+                        }
+                    )
+                    return observations
+                seen_requests.add(signature)
+
+                if plan["kind"] == "memory":
+                    observation = {
+                        "tool": "memory_search",
+                        "query": plan["request"][:500],
+                        "results": self.memory.search(plan["request"], limit=6),
+                        "preflight": True,
+                    }
+                    event_id = self.task_store.append_event(
+                        session.id,
+                        role="tool",
+                        kind="memory_search",
+                        content=json.dumps(observation, separators=(",", ":")),
+                        metadata={"reason": _PREFLIGHT_REQUEST_REASON, "preflight": True},
+                    )
+                    observations.append({**observation, "event_id": event_id})
+                    continue
+
+                state_token = self._state_token(task)
+                resolved = await self._resolve_find_tool(
+                    plan["request"],
+                    session_id=session.id,
+                    current_task=task,
+                    budget_plan=budget_plan,
+                    task_logger=task_logger,
+                )
                 event_id = self.task_store.append_event(
                     session.id,
                     role="tool",
-                    kind="memory_search",
-                    content=json.dumps(observation, separators=(",", ":")),
-                    metadata={"reason": "preflight information request", "preflight": True},
+                    kind=TOOL_FIND_TOOL,
+                    content=json.dumps(resolved, separators=(",", ":")),
+                    metadata={"reason": _PREFLIGHT_REQUEST_REASON, "preflight": True},
                 )
-                observations.append({**observation, "event_id": event_id})
-                continue
+                # `state_token` is what lets `terminal_not_found_observation` match
+                # a later repeat of this same goal and answer it with the
+                # alternatives instead of a bare refusal (#164). A preflight lookup
+                # the controller repeats is the same question asked twice, so it
+                # has to carry the same marker the controller's own lookups do.
+                resolved = {
+                    **resolved,
+                    "event_id": event_id,
+                    "preflight": True,
+                    "state_token": state_token,
+                }
+                observations.append(resolved)
 
-            resolved = await self._resolve_find_tool(
-                plan["request"],
-                session_id=session.id,
-                current_task=task,
-                budget_plan=budget_plan,
-                task_logger=task_logger,
-            )
-            event_id = self.task_store.append_event(
-                session.id,
-                role="tool",
-                kind=TOOL_FIND_TOOL,
-                content=json.dumps(resolved, separators=(",", ":")),
-                metadata={"reason": "preflight information request", "preflight": True},
-            )
-            resolved = {**resolved, "event_id": event_id, "preflight": True}
-            observations.append(resolved)
-
-            executed = self._execute_resolved_tool(
-                session_id=session.id,
-                state_token=self._state_token(task),
-                observation=resolved,
-                reason=f"preflight: {"preflight information request"}",
-                task_logger=task_logger,
-            )
-            if executed is not None:
-                observations.append({**executed, "preflight": True})
+                executed = self._execute_resolved_tool(
+                    session_id=session.id,
+                    state_token=state_token,
+                    observation=resolved,
+                    reason=f"preflight: {_PREFLIGHT_REQUEST_REASON}",
+                    task_logger=task_logger,
+                )
+                if executed is not None:
+                    observations[-1] = self._mark_already_executed(observations[-1], executed)
+                    observations.append({**executed, "preflight": True})
+            except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
+                # Everything earlier rounds already fetched is kept. Returning
+                # the observations instead of raising is the whole point: the
+                # loop-guard rows for operations this preflight already ran
+                # survive the failure, so a discarded observation is both
+                # unreachable and un-refetchable - the identical call is now a
+                # refused duplicate with no `already_succeeded_in_event` to
+                # point at. Covers the lookup and its execution too, not just
+                # the planner call: they fail the same way and cost the same.
+                logger.warning(
+                    "preflight round failed session_id=%s round=%s error=%s; "
+                    "keeping %s observation(s) and handing control to the developer controller",
+                    session.id,
+                    round_number,
+                    str(exc)[:1000],
+                    len(observations),
+                )
+                observations.append(self._preflight_unavailable_plan(exc))
+                return observations
 
         observations.append(
             {
-                "tool": "preflight_plan",
+                "tool": TOOL_PREFLIGHT_PLAN,
                 "need_info": False,
                 "kind": "none",
                 "request": "",
@@ -2088,6 +2197,13 @@ Decide the next step now. Return JSON only.
         tool = str(observation.get("tool", "")).strip()
         if not tool:
             return False
+        # A plan is a statement of intent, never an attempt. The preflight
+        # stub written when the planner is unavailable carries the reason it
+        # failed, and any truthy failure key below would otherwise let that
+        # stub stand in for a capability nobody tried - the exact bypass the
+        # #244 guard exists to prevent.
+        if tool == TOOL_PREFLIGHT_PLAN:
+            return False
         if tool == TOOL_FIND_TOOL:
             return str(observation.get("status", "")).lower() in {
                 "not_found", "unavailable", "invalid_goal",
@@ -2105,6 +2221,10 @@ Decide the next step now. Return JSON only.
 
     @staticmethod
     def _supports_missing_capability(observation: dict[str, Any]) -> bool:
+        # See `_is_resolution_evidence`: a preflight plan never evidences an
+        # attempted capability, however it ended.
+        if observation.get("tool") == TOOL_PREFLIGHT_PLAN:
+            return False
         if observation.get("tool") == TOOL_FIND_TOOL:
             return str(observation.get("status", "")).lower() in {
                 "not_found", "unavailable",

@@ -120,7 +120,7 @@ async def planner_turn(scenario: str) -> tuple[dict, dict]:
                 swap_free_kb=read_swap_free_kb(),
                 swap_total_kb=read_swap_total_kb(),
             )
-            prompt = orchestrator._preflight_prompt(task, [], observations)
+            prompt = orchestrator._preflight_prompt(task, [], observations, budget)
             raw, provider = await orchestrator._schema_completion(
                 prompt,
                 session_id=session.id,
