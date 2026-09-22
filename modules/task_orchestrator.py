@@ -2153,11 +2153,33 @@ Decide the next step now. Return JSON only.
                 else any(self._is_resolution_evidence(item) for item in evidence)
             )
             candidates = self.tool_router.candidate_operations(information_gap)
-            native_candidates = controller_native_capabilities(information_gap)
+            native_candidates = (
+                controller_native_capabilities(information_gap)
+                if action == ACTION_MISSING_CAPABILITY
+                else []
+            )
+            terminal_evidence = self._terminal_evidence(
+                session_id, observations, requested_ids
+            )
             native_failure = any(
-                str(item.get("tool", "")).strip() in native_candidates
-                and self._supports_missing_capability(item)
-                for item in evidence
+                (
+                    str(item.get("tool", "")).strip() == ACTION_COMMAND
+                    and ACTION_COMMAND in native_candidates
+                    and (
+                        item.get("event") == "command_not_found"
+                        or (
+                            self._command_exit_code(item.get("result")) is not None
+                            and self._command_exit_code(item.get("result")) != 0
+                        )
+                        or bool(item.get("error"))
+                    )
+                )
+                or (
+                    str(item.get("tool", "")).strip() == TOOL_PYTHON_RUN
+                    and TOOL_PYTHON_RUN in native_candidates
+                    and self._supports_missing_capability(item)
+                )
+                for item in terminal_evidence
             )
             # An empty result from the authoritative read-only catalog only
             # rules a capability out when the controller has no native path
@@ -2195,13 +2217,10 @@ Decide the next step now. Return JSON only.
                     "The terminal claim is unsupported by an actual tool, memory, or capability-search observation."
                 )
 
-        candidate_names = [
-            spec.name for spec in self.tool_router.candidate_operations(information_gap)
-        ][:3]
-        native_candidates = controller_native_capabilities(information_gap)
+        candidate_names = [spec.name for spec in candidates][:3]
         recommended_next_action = (
             native_candidates[0]
-            if native_candidates
+            if action == ACTION_MISSING_CAPABILITY and native_candidates
             else (TOOL_FIND_TOOL if candidate_names else "memory_search")
         )
         return {
