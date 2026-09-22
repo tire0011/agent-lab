@@ -227,6 +227,46 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertIn("command", rejection["content"])
         self.assertIn("controller-native", rejection["content"])
 
+    def test_missing_capability_is_allowed_after_native_command_really_failed(self):
+        """A failed LOCAL attempt must allow a real structured blocker (#244)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, _ = _orchestrator(
+                tmp,
+                [
+                    '{"action":"command","command":"false","effect":"change",'
+                    '"reason":"try the LOCAL repository fix"}',
+                    '{"type":"action","action":"missing_capability","experiment_id":null,'
+                    '"message":"The LOCAL repository change failed; another capability is required.",'
+                    '"reason":"the native command attempt failed",'
+                    '"gap_kind":"missing_capability",'
+                    '"information_gap":"modify the repository to exclude bookkeeping rows from the memory index",'
+                    '"capability":"repository_modification","required_inputs":[]}',
+                ],
+            )
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    return_value=(_command_result(1, "failed"), None),
+                ):
+                    result = orchestrator.run("solve github issue #238")
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+
+    def test_remote_or_read_only_wording_does_not_become_local_command(self):
+        from modules.nexus_tool_router import controller_native_capabilities
+
+        for gap in (
+            "update the GitHub issue body with the offending source snippet",
+            "edit a Confluence page describing the code",
+            "change the deployment configuration files on the remote host",
+            "update the user on the state of the code",
+            "fix the customer's uploaded spreadsheet files",
+        ):
+            with self.subTest(gap=gap):
+                self.assertNotIn("command", controller_native_capabilities(gap))
+
     def test_read_only_summary_can_finish_after_issue_fetch(self):
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator, registry, _ = _orchestrator(
