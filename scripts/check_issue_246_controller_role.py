@@ -24,6 +24,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from modules.operations_registry import OperationsRegistry
 from modules.prompt_budget import compute_budget, read_mem_available_kb, read_swap_free_kb, read_swap_total_kb
 from modules.task_orchestrator import (
