@@ -61,6 +61,7 @@ from modules.nexus_tool_router import (
     NexusToolRouter,
     ToolResolverUnavailableError,
     ToolRouterError,
+    controller_native_capabilities,
     invalid_find_tool_goal,
     operation_already_resolved,
     related_operation_lookup_goal,
@@ -2152,10 +2153,32 @@ Decide the next step now. Return JSON only.
                 else any(self._is_resolution_evidence(item) for item in evidence)
             )
             candidates = self.tool_router.candidate_operations(information_gap)
-            # An empty result from the authoritative read-only catalog is itself
-            # evidence that this capability class is not currently exposed.
-            catalog_rules_out_capability = action == ACTION_MISSING_CAPABILITY and not candidates
-            if supported or catalog_rules_out_capability or (
+            native_candidates = controller_native_capabilities(information_gap)
+            native_failure = any(
+                str(item.get("tool", "")).strip() in native_candidates
+                and self._supports_missing_capability(item)
+                for item in evidence
+            )
+            # An empty result from the authoritative read-only catalog only
+            # rules a capability out when the controller has no native path
+            # for the same gap. command/python_run deliberately do not live in
+            # OperationsRegistry, so treating an empty read-only catalog as
+            # proof of absence is the #244 failure.
+            catalog_rules_out_capability = (
+                action == ACTION_MISSING_CAPABILITY
+                and not candidates
+                and not native_candidates
+            )
+            if (
+                action == ACTION_MISSING_CAPABILITY
+                and native_candidates
+                and not native_failure
+            ):
+                rejection_reason = (
+                    "The terminal claim is unsupported: a controller-native LOCAL "
+                    "capability can address this gap and has not failed yet."
+                )
+            elif supported or catalog_rules_out_capability or (
                 action == ACTION_CLARIFICATION and not candidates and not gap_kind
             ):
                 return None
@@ -2174,6 +2197,12 @@ Decide the next step now. Return JSON only.
         candidate_names = [
             spec.name for spec in self.tool_router.candidate_operations(information_gap)
         ][:3]
+        native_candidates = controller_native_capabilities(information_gap)
+        recommended_next_action = (
+            native_candidates[0]
+            if native_candidates
+            else (TOOL_FIND_TOOL if candidate_names else "memory_search")
+        )
         return {
             "event": "terminal_decision_rejected",
             "terminal_action": action,
@@ -2182,7 +2211,8 @@ Decide the next step now. Return JSON only.
             "reason": rejection_reason[:1000],
             "candidate_operations": candidate_names,
             "retryable": True,
-            "recommended_next_action": TOOL_FIND_TOOL if candidate_names else "memory_search",
+            "recommended_next_action": recommended_next_action,
+            "direct_capabilities": native_candidates,
         }
 
     def _loop_limit_result(
