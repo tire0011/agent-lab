@@ -718,47 +718,51 @@ class NexusTaskOrchestrator:
                 metadata={"source_type": session.source_type, "source_id": session.source_id},
             )
         observations: list[dict[str, Any]] = []
-        preflight_budget = compute_budget(
-            mem_available_kb=read_mem_available_kb(),
-            swap_free_kb=read_swap_free_kb(),
-            swap_total_kb=read_swap_total_kb(),
-        )
-        preflight_history = self.task_store.history(
-            session.id,
-            limit=12,
-            max_chars=preflight_budget.history_chars,
-            max_event_id=run_start_event_id,
-        )
-        try:
-            observations.extend(
-                await self._run_preflight(
-                    session,
-                    task,
-                    preflight_history,
-                    preflight_budget,
-                    task_logger=task_logger,
-                )
+        preflight_enabled = os.environ.get(
+            "NEXUS_PREFLIGHT_PLANNER_ENABLED", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if preflight_enabled:
+            preflight_budget = compute_budget(
+                mem_available_kb=read_mem_available_kb(),
+                swap_free_kb=read_swap_free_kb(),
+                swap_total_kb=read_swap_total_kb(),
             )
-        except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
-            logger.warning(
-                "preflight unavailable session_id=%s error=%s; continuing with developer controller",
+            preflight_history = self.task_store.history(
                 session.id,
-                str(exc)[:1000],
+                limit=12,
+                max_chars=preflight_budget.history_chars,
+                max_event_id=run_start_event_id,
             )
-            observations.append(
-                {
-                    "tool": "preflight_plan",
-                    "status": "ready",
-                    "known": [],
-                    "missing": [],
-                    "historical_context_needed": False,
-                    "request_kind": "none",
-                    "request": "",
-                    "next_goal": "continue the task and gather any necessary information",
-                    "reason": "preflight unavailable; developer controller retains control",
-                    "error": str(exc)[:1000],
-                }
-            )
+            try:
+                observations.extend(
+                    await self._run_preflight(
+                        session,
+                        task,
+                        preflight_history,
+                        preflight_budget,
+                        task_logger=task_logger,
+                    )
+                )
+            except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
+                logger.warning(
+                    "preflight unavailable session_id=%s error=%s; continuing with developer controller",
+                    session.id,
+                    str(exc)[:1000],
+                )
+                observations.append(
+                    {
+                        "tool": "preflight_plan",
+                        "status": "ready",
+                        "known": [],
+                        "missing": [],
+                        "historical_context_needed": False,
+                        "request_kind": "none",
+                        "request": "",
+                        "next_goal": "continue the task and gather any necessary information",
+                        "reason": "preflight unavailable; developer controller retains control",
+                        "error": str(exc)[:1000],
+                    }
+                )
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
         redundant_requests = 0
