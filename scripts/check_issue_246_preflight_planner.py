@@ -46,47 +46,37 @@ HISTORICAL_TASK = (
 
 
 def verdict(scenario: str, plan: dict) -> tuple[bool, str]:
-    status = str(plan.get("status", "")).strip().lower()
-    kind = str(plan.get("request_kind", "")).strip().lower()
+    need_info = bool(plan.get("need_info"))
+    kind = str(plan.get("kind", "")).strip().lower()
     request = str(plan.get("request", "")).strip().lower()
     next_goal = str(plan.get("next_goal", "")).strip().lower()
 
     if scenario == "initial":
-        ok = (
-            status == "need_information"
-            and kind == "read_only"
-            and "238" in request
-            and "issue" in request
-        )
+        ok = need_info and kind == "read_only" and "238" in request and "issue" in request
         return ok, (
-            f"expected concrete issue #238 read request; got status={status!r}, "
-            f"request_kind={kind!r}, request={request!r}"
+            f"expected concrete issue #238 read request; got need_info={need_info!r}, "
+            f"kind={kind!r}, request={request!r}"
         )
 
     if scenario == "after-read":
-        ok = status == "ready" and kind == "none" and bool(next_goal)
+        ok = (not need_info) and kind == "none" and bool(next_goal)
         return ok, (
-            "expected ready after root cause/fix/acceptance criteria were supplied; "
-            f"got status={status!r}, request_kind={kind!r}, next_goal={next_goal!r}"
+            "expected no further information after root cause/fix/acceptance criteria were supplied; "
+            f"got need_info={need_info!r}, kind={kind!r}, next_goal={next_goal!r}"
         )
 
     if scenario == "historical":
-        ok = (
-            status == "need_information"
-            and kind == "memory"
-            and bool(plan.get("historical_context_needed"))
-        )
+        ok = need_info and kind == "memory" and bool(request)
         return ok, (
-            "expected a justified historical memory request; "
-            f"got status={status!r}, request_kind={kind!r}, "
-            f"historical_context_needed={plan.get('historical_context_needed')!r}"
+            "expected a historical memory request; "
+            f"got need_info={need_info!r}, kind={kind!r}, request={request!r}"
         )
 
     if scenario == "after-memory":
-        ok = status == "ready" and kind == "none" and bool(next_goal)
+        ok = (not need_info) and kind == "none" and bool(next_goal)
         return ok, (
-            "expected ready after memory returned duplicate/no-new-information hits; "
-            f"got status={status!r}, request_kind={kind!r}, request={request!r}, "
+            "expected no further information after duplicate/no-new-information memory hits; "
+            f"got need_info={need_info!r}, kind={kind!r}, request={request!r}, "
             f"next_goal={next_goal!r}"
         )
 
@@ -134,7 +124,7 @@ async def planner_turn(scenario: str) -> tuple[dict, dict]:
             raw, provider = await orchestrator._schema_completion(
                 prompt,
                 session_id=session.id,
-                max_tokens=700,
+                max_tokens=300,
                 response_format=_PREFLIGHT_RESPONSE_FORMAT,
                 budget_plan=budget,
                 waiting_status="waiting_for_preflight",
