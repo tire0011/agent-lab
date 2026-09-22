@@ -131,7 +131,7 @@ _PYTHON_GOAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _LOCAL_REPOSITORY_WORK_PATTERN = re.compile(
-    r"\b(?:inspect|modify|edit|change|update|fix|implement|apply)\b"
+    r"\b(?:modify|edit|change|update|fix|implement|apply)\b"
     r"[^.]{0,80}\b(?:repository|repo|worktree|checkout|source|code|files?)\b",
     re.IGNORECASE,
 )
