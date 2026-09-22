@@ -2169,11 +2169,12 @@ Decide the next step now. Return JSON only.
                 and not candidates
                 and not native_candidates
             )
-            if (
+            native_rejection = (
                 action == ACTION_MISSING_CAPABILITY
-                and native_candidates
+                and bool(native_candidates)
                 and not native_failure
-            ):
+            )
+            if native_rejection:
                 rejection_reason = (
                     "The terminal claim is unsupported: a controller-native LOCAL "
                     "capability can address this gap and has not failed yet."
@@ -2182,7 +2183,7 @@ Decide the next step now. Return JSON only.
                 action == ACTION_CLARIFICATION and not candidates and not gap_kind
             ):
                 return None
-            if requested_ids and len(evidence) != len(set(requested_ids)):
+            elif requested_ids and len(evidence) != len(set(requested_ids)):
                 rejection_reason = "The cited evidence_event_ids do not all identify persisted tool observations."
             elif candidates:
                 rejection_reason = (
