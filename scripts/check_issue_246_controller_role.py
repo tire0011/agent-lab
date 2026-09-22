@@ -9,6 +9,9 @@ Scenarios:
 - initial: "solve github issue #238" before issue contents are known.
 - after-read: the same task after a successful github_issue(238) observation
   already supplied the root cause, suggested fix and acceptance criteria.
+- after-memory: the same task after that issue read plus a successful
+  memory_search that returned only older github_issue(238) reads and no new
+  implementation information.
 
 Exit codes:
   0 = controller chose an acceptable next action
@@ -59,6 +62,63 @@ ISSUE_238_OBSERVATION = {
 }
 
 
+
+MEMORY_SEARCH_OBSERVATION = {
+    "tool": "memory_search",
+    "query": "exclude orchestrator bookkeeping from the memory index",
+    "limit": 6,
+    "result": [
+        {
+            "source": "task_history",
+            "session_id": "6eb74de91092477dbcfb1645590eaaeb",
+            "source_type": "task",
+            "role": "tool",
+            "kind": "operation",
+            "content": "github_issue(238) succeeded; issue title: memory_search indexes its own output and feeds the controller recursively nested results",
+        },
+        {
+            "source": "task_history",
+            "session_id": "1297331810fc4f82abb73b61ea7794e6",
+            "source_type": "task",
+            "role": "tool",
+            "kind": "operation",
+            "content": "github_issue(238) succeeded; same issue details, suggested fix and acceptance criteria already seen",
+        },
+        {
+            "source": "task_history",
+            "session_id": "58dd0a50cab9439298046e1d4e657829",
+            "source_type": "task",
+            "role": "tool",
+            "kind": "operation",
+            "content": "github_issue(238) succeeded; duplicate historical read with no additional implementation context",
+        },
+        {
+            "source": "task_history",
+            "session_id": "ce9402208ac74be3acf406fe99f2192f",
+            "source_type": "task",
+            "role": "tool",
+            "kind": "operation",
+            "content": "github_issue(238) succeeded; duplicate historical read with no additional implementation context",
+        },
+        {
+            "source": "task_history",
+            "session_id": "ce9402208ac74be3acf406fe99f2192f",
+            "source_type": "task",
+            "role": "tool",
+            "kind": "operation",
+            "content": "github_issue(238) succeeded; duplicate historical read with no additional implementation context",
+        },
+        {
+            "source": "task_history",
+            "session_id": "634aa82eaf784812b6c55400936157fb",
+            "source_type": "task",
+            "role": "tool",
+            "kind": "operation",
+            "content": "github_issue(238) succeeded; duplicate historical read with no additional implementation context",
+        },
+    ],
+}
+
 def verdict(scenario: str, decision: dict) -> tuple[bool, str]:
     action = str(decision.get("action", "")).strip().lower()
 
@@ -100,6 +160,16 @@ def verdict(scenario: str, decision: dict) -> tuple[bool, str]:
             )
         return True, f"local development next step: {action}"
 
+    if scenario == "after-memory":
+        if action not in {ACTION_COMMAND, TOOL_PYTHON_RUN}:
+            return False, (
+                "after the issue read and a memory_search returned only duplicate "
+                "historical issue reads with no new implementation information, "
+                "Nexus should now continue with local repository work; expected "
+                f"command/python_run, got action={action!r}"
+            )
+        return True, f"progressed to local development after memory search: {action}"
+
     raise ValueError(f"unknown scenario {scenario!r}")
 
 
@@ -122,7 +192,12 @@ async def controller_turn(scenario: str) -> tuple[dict, str]:
                 source_id=f"issue-246-{scenario}",
                 title=TASK,
             )
-            observations = [] if scenario == "initial" else [ISSUE_238_OBSERVATION]
+            if scenario == "initial":
+                observations = []
+            elif scenario == "after-read":
+                observations = [ISSUE_238_OBSERVATION]
+            else:
+                observations = [ISSUE_238_OBSERVATION, MEMORY_SEARCH_OBSERVATION]
             budget = compute_budget(
                 mem_available_kb=read_mem_available_kb(),
                 swap_free_kb=read_swap_free_kb(),
@@ -161,12 +236,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--scenario",
-        choices=("initial", "after-read", "all"),
+        choices=("initial", "after-read", "after-memory", "all"),
         default="all",
     )
     args = parser.parse_args()
 
-    scenarios = ["initial", "after-read"] if args.scenario == "all" else [args.scenario]
+    scenarios = ["initial", "after-read", "after-memory"] if args.scenario == "all" else [args.scenario]
     failed = False
     for scenario in scenarios:
         print(f"\n=== issue #246 controller-only scenario: {scenario} ===")
