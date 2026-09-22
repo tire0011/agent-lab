@@ -186,7 +186,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                     '"message":"A capability is needed to inspect and modify the repository.",'
                     '"reason":"no repository-edit operation is available",'
                     '"gap_kind":"missing_capability",'
-                    '"information_gap":"use a shell command to inspect and modify the repository '
+                    '"information_gap":"inspect and modify the repository '
                     'to exclude bookkeeping rows from the memory index",'
                     '"capability":"repository_modification","required_inputs":[]}',
                     '{"action":"command","command":"printf fixed","effect":"change",'
