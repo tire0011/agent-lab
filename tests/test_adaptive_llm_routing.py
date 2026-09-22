@@ -102,7 +102,10 @@ def test_prompt_keeps_local_model_as_real_development_path():
 
     prompt = orchestrator._prompt(session, "fix a small file", [], [])
 
-    assert "LOCAL is a real development path" in prompt
+    assert "You are not a tool router" in prompt
+    assert "Nexus owns the reasoning and implementation" in prompt
+    assert "Use `command`, `python_run`, and other capabilities only as instruments" in prompt
+    assert "For local repository work" in prompt
     assert "medium programming work" in prompt
     assert "Codex implementation" in prompt
     assert "quota/token limited" in prompt
