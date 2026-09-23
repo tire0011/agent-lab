@@ -217,8 +217,8 @@ _KNOWLEDGE_COLLECTOR_SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {"type": "string", "enum": ["lookup", "briefing"]},
         "source": {"type": "string", "enum": ["none", "memory", "read_only"]},
-        "query": {"type": "string"},
-        "briefing": {"type": "string"},
+        "query": {"type": "string", "maxLength": 120},
+        "briefing": {"type": "string", "maxLength": 5000},
     },
     "required": ["action", "source", "query", "briefing"],
     "additionalProperties": False,
@@ -1680,6 +1680,8 @@ Your job is research and synthesis only:
 For action=lookup:
 - source=read_only for one concrete current source lookup such as "fetch GitHub issue #238".
 - source=memory for relevant prior project discussions, decisions, or attempts.
+- query must be a short information goal, not instructions to the tool. Keep it under 120 characters.
+- Do not invent repository names, URLs, owners, issue metadata, or source details that are not present in TASK or COLLECTED SOURCES.
 - briefing must be empty.
 
 For action=briefing:
@@ -1803,7 +1805,7 @@ Return exactly one JSON object matching the schema."""
                 raw, provider_used = await self._schema_completion(
                     prompt,
                     session_id=session.id,
-                    max_tokens=500,
+                    max_tokens=250,
                     response_format=_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
                     budget_plan=budget_plan,
                     waiting_status="waiting_for_knowledge",
