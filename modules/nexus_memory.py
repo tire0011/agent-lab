@@ -26,6 +26,7 @@ _MEMORY_DOCS = (
     "IDEAS.md",
 )
 _WORD_RE = re.compile(r"[A-Za-z0-9_./:-]{2,}")
+_ISSUE_QUERY_RE = re.compile(r"\bissue\s+#?(\d+)\b", re.IGNORECASE)
 
 
 def _terms(query: str) -> list[str]:
@@ -42,6 +43,24 @@ def _terms(query: str) -> list[str]:
 def _score(text: str, terms: list[str]) -> int:
     low = text.lower()
     return sum(3 if low.startswith(term) else low.count(term) for term in terms)
+
+
+def _explicit_issue_number(query: str) -> int | None:
+    match = _ISSUE_QUERY_RE.search(query)
+    return int(match.group(1)) if match else None
+
+
+def _mentions_issue(text: str, issue_number: int, *, source_id: str | None = None) -> bool:
+    if source_id and source_id.strip() == str(issue_number):
+        return True
+    escaped = re.escape(str(issue_number))
+    patterns = (
+        rf"(?<!\d)#{escaped}(?!\d)",
+        rf"\bissue\s+#?{escaped}\b",
+        rf"/issues/{escaped}(?:\b|/)",
+        rf'["\']number["\']\s*:\s*{escaped}\b',
+    )
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
 def _chunks(text: str, max_chars: int = 800) -> list[str]:
@@ -85,16 +104,21 @@ class NexusMemory:
         terms = _terms(query)
         if not terms:
             return []
+        issue_number = _explicit_issue_number(query)
         limit = max(1, min(limit, 10))
         candidates: list[tuple[int, dict[str, Any]]] = []
-        self._search_knowledge(terms, candidates)
-        self._search_task_events(terms, candidates)
-        self._search_docs(terms, candidates)
+        self._search_knowledge(terms, candidates, issue_number=issue_number)
+        self._search_task_events(terms, candidates, issue_number=issue_number)
+        self._search_docs(terms, candidates, issue_number=issue_number)
         candidates.sort(key=lambda item: item[0], reverse=True)
         return [item for score, item in candidates[:limit] if score > 0]
 
     def _search_knowledge(
-        self, terms: list[str], candidates: list[tuple[int, dict[str, Any]]]
+        self,
+        terms: list[str],
+        candidates: list[tuple[int, dict[str, Any]]],
+        *,
+        issue_number: int | None = None,
     ) -> None:
         try:
             rows = self._conn.execute(
@@ -105,6 +129,8 @@ class NexusMemory:
             return
         for row in rows:
             text = f"{row['category']} {row['key']} {row['value']} {row['source']}"
+            if issue_number is not None and not _mentions_issue(text, issue_number):
+                continue
             score = _score(text, terms)
             if score:
                 candidates.append(
@@ -121,7 +147,11 @@ class NexusMemory:
                 )
 
     def _search_task_events(
-        self, terms: list[str], candidates: list[tuple[int, dict[str, Any]]]
+        self,
+        terms: list[str],
+        candidates: list[tuple[int, dict[str, Any]]],
+        *,
+        issue_number: int | None = None,
     ) -> None:
         try:
             rows = self._conn.execute(
@@ -135,6 +165,12 @@ class NexusMemory:
             return
         for row in rows:
             text = f"{row['title'] or ''} {row['kind']} {row['content']}"
+            if issue_number is not None and not _mentions_issue(
+                text,
+                issue_number,
+                source_id=str(row["source_id"] or ""),
+            ):
+                continue
             score = _score(text, terms)
             if score:
                 candidates.append(
@@ -154,7 +190,11 @@ class NexusMemory:
                 )
 
     def _search_docs(
-        self, terms: list[str], candidates: list[tuple[int, dict[str, Any]]]
+        self,
+        terms: list[str],
+        candidates: list[tuple[int, dict[str, Any]]],
+        *,
+        issue_number: int | None = None,
     ) -> None:
         for filename in _MEMORY_DOCS:
             path = self.repo_root / filename
@@ -165,6 +205,8 @@ class NexusMemory:
             except OSError:
                 continue
             for index, chunk in enumerate(_chunks(text)):
+                if issue_number is not None and not _mentions_issue(chunk, issue_number):
+                    continue
                 score = _score(chunk, terms)
                 if score:
                     candidates.append(
