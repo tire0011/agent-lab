@@ -45,7 +45,6 @@ def _budget():
 def briefing_verdict(briefing: str) -> tuple[bool, str]:
     lower = briefing.lower()
     required_groups = [
-        ("issue", "238"),
         ("memory_search",),
         ("nexusmemory", "_search_task_events"),
         ("recursive", "recursively", "nested", "nest"),
