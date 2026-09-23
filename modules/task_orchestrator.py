@@ -207,29 +207,24 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
 )
 
 
-# The `tool` name every preflight planner observation carries. Named so the
-# evidence helpers can recognise a plan without matching a bare string in
-# four places.
-TOOL_PREFLIGHT_PLAN = "preflight_plan"
+# The developer receives only the collector's final compact knowledge product.
+TOOL_KNOWLEDGE_BRIEFING = "knowledge_briefing"
 
-# Recorded as the reason on events a preflight lookup produces. The compact
-# schema dropped the planner's own `reason` field, so there is nothing
-# per-request left to quote here.
-_PREFLIGHT_REQUEST_REASON = "preflight information request"
+_KNOWLEDGE_LOOKUP_REASON = "knowledge collector lookup"
 
-_PREFLIGHT_SCHEMA: dict[str, Any] = {
+_KNOWLEDGE_COLLECTOR_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "need_info": {"type": "boolean"},
-        "kind": {"type": "string", "enum": ["none", "memory", "read_only"]},
-        "request": {"type": "string"},
-        "next_goal": {"type": "string"},
+        "action": {"type": "string", "enum": ["lookup", "briefing"]},
+        "source": {"type": "string", "enum": ["none", "memory", "read_only"]},
+        "query": {"type": "string"},
+        "briefing": {"type": "string"},
     },
-    "required": ["need_info", "kind", "request", "next_goal"],
+    "required": ["action", "source", "query", "briefing"],
     "additionalProperties": False,
 }
-_PREFLIGHT_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
-    "nexus_preflight_plan", _PREFLIGHT_SCHEMA
+_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
+    "nexus_knowledge_collector", _KNOWLEDGE_COLLECTOR_SCHEMA
 )
 
 # The shared tool mechanism owns the resolver schema, the read-only
@@ -715,38 +710,24 @@ class NexusTaskOrchestrator:
                 metadata={"source_type": session.source_type, "source_id": session.source_id},
             )
         observations: list[dict[str, Any]] = []
-        preflight_enabled = os.environ.get(
-            "NEXUS_PREFLIGHT_PLANNER_ENABLED", ""
+        knowledge_collector_enabled = os.environ.get(
+            "NEXUS_KNOWLEDGE_COLLECTOR_ENABLED",
+            os.environ.get("NEXUS_PREFLIGHT_PLANNER_ENABLED", ""),
         ).strip().lower() in {"1", "true", "yes", "on"}
-        if preflight_enabled:
-            preflight_budget = compute_budget(
+        if knowledge_collector_enabled:
+            knowledge_budget = compute_budget(
                 mem_available_kb=read_mem_available_kb(),
                 swap_free_kb=read_swap_free_kb(),
                 swap_total_kb=read_swap_total_kb(),
             )
-            preflight_history = self.task_store.history(
-                session.id,
-                limit=12,
-                max_chars=preflight_budget.history_chars,
-                max_event_id=run_start_event_id,
+            observations.extend(
+                await self._run_knowledge_collector(
+                    session,
+                    task,
+                    knowledge_budget,
+                    task_logger=task_logger,
+                )
             )
-            try:
-                observations.extend(
-                    await self._run_preflight(
-                        session,
-                        task,
-                        preflight_history,
-                        preflight_budget,
-                        task_logger=task_logger,
-                    )
-                )
-            except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
-                logger.warning(
-                    "preflight unavailable session_id=%s error=%s; continuing with developer controller",
-                    session.id,
-                    str(exc)[:1000],
-                )
-                observations.append(self._preflight_unavailable_plan(exc))
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
         redundant_requests = 0
@@ -1661,82 +1642,96 @@ class NexusTaskOrchestrator:
             {"name": ACTION_CLARIFICATION, "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory."},
         ]
 
-    def _preflight_prompt(
+    def _knowledge_collector_prompt(
         self,
-        current_input: str,
-        history: list[dict[str, Any]],
-        observations: list[dict[str, Any]],
+        task: str,
+        sources: list[dict[str, Any]],
         budget_plan: PromptBudgetPlan,
+        *,
+        force_briefing: bool = False,
     ) -> str:
-        """Render the bounded information-gathering planner prompt.
-
-        Bounded the same way `_build_prompt` bounds the controller's. A round
-        that fetched a large tool result would otherwise carry all of it into
-        the next round's prompt: `prompt_json` does not truncate, so the
-        budget was computed and then ignored, and round 2 could run past
-        `safe_local_budget_chars` on the local model.
-        """
-        truncated_input, _ = truncate_text(current_input, budget_plan.current_input_chars)
-        compacted_observations, _ = compact_observations(
-            observations,
+        """Render the bounded research/synthesis prompt for the knowledge collector."""
+        truncated_task, _ = truncate_text(task, budget_plan.current_input_chars)
+        compacted_sources, _ = compact_observations(
+            sources,
             budget_chars=budget_plan.observation_chars,
-            keep_recent_full=2,
+            keep_recent_full=3,
         )
-        return f"""You are the Nexus preflight planner. Decide only whether Nexus needs one more piece of information before the developer can continue.
+        final_instruction = (
+            "No more lookups are allowed in this turn. Return action=briefing now."
+            if force_briefing
+            else "Either request one useful lookup or return the final briefing."
+        )
+        return f"""You are the Nexus knowledge collector.
 
-Rules:
-- You do not implement, edit files, run commands, run tests, or finish the task.
-- need_info=true only when one specific missing fact materially blocks the next development step.
-- kind=read_only for one concrete current external/source lookup, such as "fetch GitHub issue #238".
-- kind=memory only when prior project history is genuinely needed, for example an earlier design decision explicitly referenced by the task.
-- If current input and observations already contain enough information to continue, use need_info=false and kind=none.
-- Never request memory merely to repeat information already present.
-- next_goal is one short developer goal. Do not name implementation tools.
+Before Nexus starts development, gather and combine the knowledge that materially helps with the task.
 
-CURRENT INPUT:
-{truncated_input}
+Your job is research and synthesis only:
+- Use read-only sources or project memory when they add useful knowledge.
+- Combine overlapping information and remove duplicates.
+- Prefer facts already present in the collected sources over repeating a lookup.
+- Do not plan the implementation.
+- Do not choose development tools.
+- Do not edit files, run development commands or tests, or claim the task is solved.
+- Your final product is one compact factual briefing for the developer.
+- Preserve concrete facts such as root cause, affected component, constraints, prior attempts, and acceptance criteria when present.
+- Do not invent missing facts.
 
-HISTORY:
-{prompt_json(history)}
+For action=lookup:
+- source=read_only for one concrete current source lookup such as "fetch GitHub issue #238".
+- source=memory for relevant prior project discussions, decisions, or attempts.
+- briefing must be empty.
 
-OBSERVATIONS:
-{prompt_json(compacted_observations)}
+For action=briefing:
+- source=none
+- query must be empty
+- briefing contains the compact factual knowledge summary.
 
-Return exactly one small JSON object matching the schema. Keep every string short."""
+TASK:
+{truncated_task}
+
+COLLECTED SOURCES:
+{prompt_json(compacted_sources)}
+
+{final_instruction}
+Return exactly one JSON object matching the schema."""
 
     @staticmethod
-    def _parse_preflight(raw: str) -> dict[str, Any]:
+    def _parse_knowledge_collector(raw: str) -> dict[str, Any]:
         try:
             data = extract_json(raw)
         except LlamaCppClientError as exc:
             raise TaskOrchestratorError(str(exc)) from exc
         if not isinstance(data, dict):
-            raise TaskOrchestratorError("preflight response must be a JSON object")
+            raise TaskOrchestratorError("knowledge collector response must be a JSON object")
 
-        need_info = bool(data.get("need_info", False))
-        kind = str(data.get("kind", "")).strip().lower()
-        request = str(data.get("request", "")).strip()
-        next_goal = str(data.get("next_goal", "")).strip()
+        action = str(data.get("action", "")).strip().lower()
+        source = str(data.get("source", "")).strip().lower()
+        query = str(data.get("query", "")).strip()
+        briefing = str(data.get("briefing", "")).strip()
 
-        if kind not in {"none", "memory", "read_only"}:
-            raise TaskOrchestratorError("preflight kind must be none, memory or read_only")
-        if not next_goal:
-            raise TaskOrchestratorError("preflight requires next_goal")
-        if need_info:
-            if kind == "none" or not request:
-                raise TaskOrchestratorError(
-                    "preflight with need_info=true requires a concrete information request"
-                )
-        elif kind != "none" or request:
+        if action not in {"lookup", "briefing"}:
+            raise TaskOrchestratorError("knowledge collector action must be lookup or briefing")
+        if source not in {"none", "memory", "read_only"}:
             raise TaskOrchestratorError(
-                "preflight with need_info=false must use kind=none and empty request"
+                "knowledge collector source must be none, memory or read_only"
             )
+        if action == "lookup":
+            if source not in {"memory", "read_only"} or not query or briefing:
+                raise TaskOrchestratorError(
+                    "knowledge lookup requires memory/read_only source, query and empty briefing"
+                )
+        else:
+            if source != "none" or query or not briefing:
+                raise TaskOrchestratorError(
+                    "knowledge briefing requires source=none, empty query and briefing text"
+                )
 
         return {
-            "need_info": need_info,
-            "kind": kind,
-            "request": request[:500],
-            "next_goal": next_goal[:500],
+            "action": action,
+            "source": source,
+            "query": query[:500],
+            "briefing": briefing[:6000],
         }
 
     @staticmethod
@@ -1753,7 +1748,7 @@ Return exactly one small JSON object matching the schema. Keep every string shor
         controller called it anyway, and only after the refusal did it use the
         result it already had (#223).
 
-        Shared with the preflight planner, which resolves and executes through
+        Shared with the knowledge collector, which resolves and executes through
         the same two calls and therefore hands the controller the same trap.
         """
         return {
@@ -1767,125 +1762,111 @@ Return exactly one small JSON object matching the schema. Keep every string shor
         }
 
     @staticmethod
-    def _preflight_max_rounds() -> int:
-        """Bounded round count, tolerant of an unparseable override.
-
-        A typo in `NEXUS_PREFLIGHT_MAX_ROUNDS` must not fail the turn: the
-        planner is an optimisation, and the developer controller can run
-        without it. `ValueError` here escaped the caller's handler, which
-        only catches orchestrator and budget errors.
-        """
-        raw = os.environ.get("NEXUS_PREFLIGHT_MAX_ROUNDS", "").strip()
+    def _knowledge_collector_max_rounds() -> int:
+        """Bound research turns; the final synthesis turn is separate."""
+        raw = os.environ.get("NEXUS_KNOWLEDGE_COLLECTOR_MAX_ROUNDS", "").strip()
         try:
-            configured = int(raw) if raw else 2
+            configured = int(raw) if raw else 3
         except ValueError:
             logger.warning(
-                "invalid NEXUS_PREFLIGHT_MAX_ROUNDS=%r; falling back to 2", raw[:100]
+                "invalid NEXUS_KNOWLEDGE_COLLECTOR_MAX_ROUNDS=%r; falling back to 3",
+                raw[:100],
             )
-            configured = 2
-        return max(1, min(configured, 4))
+            configured = 3
+        return max(1, min(configured, 5))
 
     @staticmethod
-    def _preflight_unavailable_plan(exc: BaseException) -> dict[str, Any]:
-        """The stub that hands control back when the planner cannot run.
-
-        The failure reason is deliberately *not* under `error`: that key makes
-        `_is_resolution_evidence` and `_supports_missing_capability` both
-        report a real attempt, and a terminal `missing_capability` could then
-        cite a planner that never tried anything (#244). `TOOL_PREFLIGHT_PLAN`
-        is excluded in those helpers as well; the key name is the second lock.
-        """
+    def _knowledge_collector_unavailable_briefing(exc: BaseException) -> dict[str, Any]:
         return {
-            "tool": TOOL_PREFLIGHT_PLAN,
-            "need_info": False,
-            "kind": "none",
-            "request": "",
-            "next_goal": "continue the task and gather any necessary information",
-            "bounded_reason": "preflight unavailable; developer controller retains control",
-            "preflight_error": str(exc)[:1000],
+            "tool": TOOL_KNOWLEDGE_BRIEFING,
+            "briefing": "",
+            "collector_error": str(exc)[:1000],
+            "bounded_reason": "knowledge collector unavailable; developer controller retains control",
         }
 
-    async def _run_preflight(
+    async def _run_knowledge_collector(
         self,
         session: Any,
         task: str,
-        history: list[dict[str, Any]],
         budget_plan: PromptBudgetPlan,
         *,
         task_logger: Any | None = None,
     ) -> list[dict[str, Any]]:
-        """Gather only information the mini planner says is materially needed."""
-        observations: list[dict[str, Any]] = []
+        """Research useful context, then hand one compact briefing to the developer."""
+        sources: list[dict[str, Any]] = []
         seen_requests: set[tuple[str, str]] = set()
-        max_rounds = self._preflight_max_rounds()
+        max_rounds = self._knowledge_collector_max_rounds()
 
         for round_number in range(1, max_rounds + 1):
             try:
-                prompt = self._preflight_prompt(task, history, observations, budget_plan)
+                prompt = self._knowledge_collector_prompt(task, sources, budget_plan)
                 raw, provider_used = await self._schema_completion(
                     prompt,
                     session_id=session.id,
-                    max_tokens=300,
-                    response_format=_PREFLIGHT_RESPONSE_FORMAT,
+                    max_tokens=500,
+                    response_format=_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
                     budget_plan=budget_plan,
-                    waiting_status="waiting_for_preflight",
-                    role="preflight_planner",
+                    waiting_status="waiting_for_knowledge",
+                    role="knowledge_collector",
                     task_logger=task_logger,
                 )
-                plan = self._parse_preflight(raw)
+                decision = self._parse_knowledge_collector(raw)
                 self.task_store.append_event(
                     session.id,
                     role="system",
-                    kind=TOOL_PREFLIGHT_PLAN,
-                    content=json.dumps(plan, separators=(",", ":")),
+                    kind="knowledge_collection",
+                    content=json.dumps(decision, separators=(",", ":")),
                     metadata={
                         "round": round_number,
                         "provider_used": provider_used,
-                        "need_info": plan["need_info"],
-                        "kind": plan["kind"],
+                        "action": decision["action"],
+                        "source": decision["source"],
                     },
                 )
 
-                if not plan["need_info"]:
-                    observations.append({"tool": TOOL_PREFLIGHT_PLAN, **plan})
-                    return observations
-
-                signature = (plan["kind"], plan["request"].lower())
-                if signature in seen_requests:
-                    observations.append(
+                if decision["action"] == "briefing":
+                    return [
                         {
-                            "tool": TOOL_PREFLIGHT_PLAN,
-                            "need_info": False,
-                            "kind": "none",
-                            "request": "",
-                            "next_goal": plan["next_goal"],
-                            "bounded_reason": "preflight lookup repeated without new information; continue with current context",
-                            "bounded_stop": "duplicate_information_request",
+                            "tool": TOOL_KNOWLEDGE_BRIEFING,
+                            "briefing": decision["briefing"],
+                            "source_count": len(sources),
+                        }
+                    ]
+
+                signature = (decision["source"], decision["query"].lower())
+                if signature in seen_requests:
+                    sources.append(
+                        {
+                            "tool": "knowledge_collector_notice",
+                            "content": (
+                                "This lookup was already performed and added no new source. "
+                                "Use the collected material instead of repeating it."
+                            ),
                         }
                     )
-                    return observations
+                    break
                 seen_requests.add(signature)
 
-                if plan["kind"] == "memory":
+                if decision["source"] == "memory":
                     observation = {
                         "tool": "memory_search",
-                        "query": plan["request"][:500],
-                        "results": self.memory.search(plan["request"], limit=6),
-                        "preflight": True,
+                        "query": decision["query"][:500],
+                        "results": self.memory.search(decision["query"], limit=6),
+                        "knowledge_collector": True,
                     }
                     event_id = self.task_store.append_event(
                         session.id,
                         role="tool",
                         kind="memory_search",
                         content=json.dumps(observation, separators=(",", ":")),
-                        metadata={"reason": _PREFLIGHT_REQUEST_REASON, "preflight": True},
+                        metadata={"reason": _KNOWLEDGE_LOOKUP_REASON, "knowledge_collector": True},
                     )
-                    observations.append({**observation, "event_id": event_id})
+                    sources.append({**observation, "event_id": event_id})
                     continue
 
                 state_token = self._state_token(task)
                 resolved = await self._resolve_find_tool(
-                    plan["request"],
+                    decision["query"],
                     session_id=session.id,
                     current_task=task,
                     budget_plan=budget_plan,
@@ -1896,63 +1877,82 @@ Return exactly one small JSON object matching the schema. Keep every string shor
                     role="tool",
                     kind=TOOL_FIND_TOOL,
                     content=json.dumps(resolved, separators=(",", ":")),
-                    metadata={"reason": _PREFLIGHT_REQUEST_REASON, "preflight": True},
+                    metadata={"reason": _KNOWLEDGE_LOOKUP_REASON, "knowledge_collector": True},
                 )
-                # `state_token` is what lets `terminal_not_found_observation` match
-                # a later repeat of this same goal and answer it with the
-                # alternatives instead of a bare refusal (#164). A preflight lookup
-                # the controller repeats is the same question asked twice, so it
-                # has to carry the same marker the controller's own lookups do.
                 resolved = {
                     **resolved,
                     "event_id": event_id,
-                    "preflight": True,
+                    "knowledge_collector": True,
                     "state_token": state_token,
                 }
-                observations.append(resolved)
+                sources.append(resolved)
 
                 executed = self._execute_resolved_tool(
                     session_id=session.id,
                     state_token=state_token,
                     observation=resolved,
-                    reason=f"preflight: {_PREFLIGHT_REQUEST_REASON}",
+                    reason=_KNOWLEDGE_LOOKUP_REASON,
                     task_logger=task_logger,
                 )
                 if executed is not None:
-                    observations[-1] = self._mark_already_executed(observations[-1], executed)
-                    observations.append({**executed, "preflight": True})
+                    sources[-1] = self._mark_already_executed(sources[-1], executed)
+                    sources.append({**executed, "knowledge_collector": True})
             except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
-                # Everything earlier rounds already fetched is kept. Returning
-                # the observations instead of raising is the whole point: the
-                # loop-guard rows for operations this preflight already ran
-                # survive the failure, so a discarded observation is both
-                # unreachable and un-refetchable - the identical call is now a
-                # refused duplicate with no `already_succeeded_in_event` to
-                # point at. Covers the lookup and its execution too, not just
-                # the planner call: they fail the same way and cost the same.
                 logger.warning(
-                    "preflight round failed session_id=%s round=%s error=%s; "
-                    "keeping %s observation(s) and handing control to the developer controller",
+                    "knowledge collector round failed session_id=%s round=%s error=%s; "
+                    "handing control to developer",
                     session.id,
                     round_number,
                     str(exc)[:1000],
-                    len(observations),
                 )
-                observations.append(self._preflight_unavailable_plan(exc))
-                return observations
+                return [self._knowledge_collector_unavailable_briefing(exc)]
 
-        observations.append(
-            {
-                "tool": TOOL_PREFLIGHT_PLAN,
-                "need_info": False,
-                "kind": "none",
-                "request": "",
-                "next_goal": "continue the task using the information gathered so far",
-                "bounded_reason": "bounded preflight rounds exhausted; hand control to developer",
-                "bounded_stop": "round_limit",
-            }
-        )
-        return observations
+        # Research is bounded. Give the model one synthesis-only turn so the
+        # developer receives a briefing rather than planner/control metadata.
+        try:
+            prompt = self._knowledge_collector_prompt(
+                task,
+                sources,
+                budget_plan,
+                force_briefing=True,
+            )
+            raw, provider_used = await self._schema_completion(
+                prompt,
+                session_id=session.id,
+                max_tokens=650,
+                response_format=_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
+                budget_plan=budget_plan,
+                waiting_status="waiting_for_knowledge",
+                role="knowledge_collector",
+                task_logger=task_logger,
+            )
+            decision = self._parse_knowledge_collector(raw)
+            if decision["action"] != "briefing":
+                raise TaskOrchestratorError(
+                    "knowledge collector requested another lookup after research budget ended"
+                )
+            self.task_store.append_event(
+                session.id,
+                role="system",
+                kind="knowledge_collection",
+                content=json.dumps(decision, separators=(",", ":")),
+                metadata={
+                    "round": max_rounds + 1,
+                    "provider_used": provider_used,
+                    "action": "briefing",
+                    "forced_synthesis": True,
+                },
+            )
+            return [
+                {
+                    "tool": TOOL_KNOWLEDGE_BRIEFING,
+                    "briefing": decision["briefing"],
+                    "source_count": len(sources),
+                    "bounded_stop": "research_round_limit",
+                }
+            ]
+        except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
+            return [self._knowledge_collector_unavailable_briefing(exc)]
 
     def _build_prompt(
         self,
@@ -2063,7 +2063,7 @@ Model policy:
 
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
-- If a `preflight_plan` observation is present, use its gathered information and `next_goal` as the starting point for development. Do not repeat its information lookups unless later evidence creates a genuinely new need.
+- If a `knowledge_briefing` observation is present, treat its `briefing` as compact factual context gathered before development. Do not repeat those information lookups unless later evidence creates a genuinely new need.
 - Use `memory_search` only when prior project context could materially change the next decision, especially when important information is missing, earlier work may exist, or you are stuck. Do not search memory mechanically.
 - Before using `memory_search`, decide whether previous project context is actually needed to make progress. If the current input and observations already provide enough information to choose the next step, keep working instead of searching memory.
 - Memory is for missing or potentially relevant historical context, not for re-reading information that is already present in the current task or observations. Do not use `memory_search` merely to obtain the contents of a specifically named current GitHub issue or other directly addressable source.
@@ -2197,12 +2197,12 @@ Decide the next step now. Return JSON only.
         tool = str(observation.get("tool", "")).strip()
         if not tool:
             return False
-        # A plan is a statement of intent, never an attempt. The preflight
+        # A plan is a statement of intent, never an attempt. The knowledge collector
         # stub written when the planner is unavailable carries the reason it
         # failed, and any truthy failure key below would otherwise let that
         # stub stand in for a capability nobody tried - the exact bypass the
         # #244 guard exists to prevent.
-        if tool == TOOL_PREFLIGHT_PLAN:
+        if tool == TOOL_KNOWLEDGE_BRIEFING:
             return False
         if tool == TOOL_FIND_TOOL:
             return str(observation.get("status", "")).lower() in {
@@ -2221,9 +2221,9 @@ Decide the next step now. Return JSON only.
 
     @staticmethod
     def _supports_missing_capability(observation: dict[str, Any]) -> bool:
-        # See `_is_resolution_evidence`: a preflight plan never evidences an
+        # See `_is_resolution_evidence`: a knowledge collector plan never evidences an
         # attempted capability, however it ended.
-        if observation.get("tool") == TOOL_PREFLIGHT_PLAN:
+        if observation.get("tool") == TOOL_KNOWLEDGE_BRIEFING:
             return False
         if observation.get("tool") == TOOL_FIND_TOOL:
             return str(observation.get("status", "")).lower() in {
