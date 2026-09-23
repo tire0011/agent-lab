@@ -8,6 +8,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -126,7 +127,7 @@ async def live_collection() -> tuple[list[dict], dict]:
     try:
         session = orchestrator.task_store.get_or_create(
             source_type="task",
-            source_id="issue-246-live-knowledge-collector",
+            source_id=f"issue-246-live-knowledge-collector-{uuid.uuid4().hex}",
             title=TASK,
         )
         observations = await orchestrator._run_knowledge_collector(
