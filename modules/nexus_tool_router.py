@@ -135,6 +135,11 @@ _LOCAL_REPOSITORY_WORK_PATTERN = re.compile(
     r"[^.]{0,80}\b(?:repository|repo|worktree|checkout)\b",
     re.IGNORECASE,
 )
+_LOCAL_CODE_CHANGE_PATTERN = re.compile(
+    r"\b(?:modify|edit|change|update|fix|implement|apply|exclude|remove|filter|refactor|rewrite)\b"
+    r"[^.]{0,100}\b(?:code|source|module|file|index|controller|orchestrator)\b",
+    re.IGNORECASE,
+)
 _REMOTE_TARGET_PATTERN = re.compile(
     r"\b(?:github|confluence|remote\s+host|uploaded\s+spreadsheet|user\s+on\s+the\s+state)\b",
     re.IGNORECASE,
@@ -326,7 +331,10 @@ def controller_native_capabilities(goal: str) -> list[str]:
     if _PYTHON_GOAL_PATTERN.search(text):
         native.append(TOOL_PYTHON_RUN)
     if _SHELL_GOAL_PATTERN.search(text) or (
-        _LOCAL_REPOSITORY_WORK_PATTERN.search(text)
+        (
+            _LOCAL_REPOSITORY_WORK_PATTERN.search(text)
+            or _LOCAL_CODE_CHANGE_PATTERN.search(text)
+        )
         and not _REMOTE_TARGET_PATTERN.search(text)
     ):
         native.append(ACTION_COMMAND)
