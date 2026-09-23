@@ -254,6 +254,12 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
 
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
 
+    def test_local_code_change_gap_maps_to_command(self):
+        from modules.nexus_tool_router import controller_native_capabilities
+
+        gap = "exclude the orchestrator's own bookkeeping from the memory index"
+        self.assertIn("command", controller_native_capabilities(gap))
+
     def test_remote_or_read_only_wording_does_not_become_local_command(self):
         from modules.nexus_tool_router import controller_native_capabilities
 
