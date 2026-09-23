@@ -94,3 +94,17 @@ def test_briefing_requires_text():
         orchestrator._parse_knowledge_collector(
             '{"action":"briefing","source":"none","query":"","briefing":""}'
         )
+
+
+def test_knowledge_request_strips_development_intent_from_github_issue_task():
+    orchestrator = _orchestrator()
+    request = orchestrator._knowledge_request("solve github issue #238")
+    assert request.startswith("Gather all relevant factual information about GitHub issue #238")
+    assert "Do not solve or plan the implementation." in request
+
+
+def test_knowledge_request_generic_task_is_research_only():
+    orchestrator = _orchestrator()
+    request = orchestrator._knowledge_request("fix the failing controller test")
+    assert "Gather all relevant factual information needed to understand this task." in request
+    assert "Do not solve or plan the implementation." in request
