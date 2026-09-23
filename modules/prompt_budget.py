@@ -383,6 +383,15 @@ def _shrink(obs: dict[str, Any], max_chars: int) -> tuple[dict[str, Any], bool]:
             shrunk[field], was_truncated = truncate_text(value, remaining)
             truncated = truncated or was_truncated
             remaining -= len(shrunk[field])
+        elif isinstance(value, dict):
+            # The production shape of an operation result: `result` is a dict
+            # whose `output_lines` carry the bulk. Without this branch a dict
+            # matched neither case below and the observation was returned at
+            # full size - the budget was computed, reported, and then not
+            # applied, on the controller prompt as much as the preflight one.
+            shrunk[field], was_truncated = _shrink(value, remaining)
+            truncated = truncated or was_truncated
+            remaining -= len(json.dumps(shrunk[field], separators=(",", ":"), default=str))
         elif isinstance(value, list):
             text = json.dumps(value, separators=(",", ":"))
             if len(text) > remaining:

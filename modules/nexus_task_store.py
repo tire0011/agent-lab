@@ -24,7 +24,19 @@ logger = logging.getLogger(__name__)
 # Statuses in which a live worker is supposed to be driving the session. Only
 # these can go stale: everything else is either finished or deliberately at
 # rest.
-WORKING_STATUSES: tuple[str, ...] = ("active", "queued", "waiting_for_llm")
+#
+# Every status a worker sets while it is blocked on a model call belongs here,
+# not just `waiting_for_llm`. The tool resolver and the knowledge collector each
+# park the session under their own name for the length of an inference, and a
+# worker that dies in that window left a row no reaper would look at and no
+# diagnostic would list - the session simply stopped, unclaimed and invisible.
+WORKING_STATUSES: tuple[str, ...] = (
+    "active",
+    "queued",
+    "waiting_for_llm",
+    "waiting_for_tool_resolver",
+    "waiting_for_knowledge",
+)
 
 # Intentional resting states. A session waiting for a human reply, or blocked
 # on a capability nobody has built yet, has no worker by design - silence there
