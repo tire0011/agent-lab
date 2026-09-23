@@ -1203,6 +1203,34 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("Optimize for cost", client.prompts[1])
         self.assertIn("Improve model routing", client.prompts[1])
 
+    def test_knowledge_collector_runs_only_on_the_turn_that_opens_the_task(self):
+        from unittest.mock import patch
+
+        client = _Client([
+            '{"type":"action","action":"clarification","experiment_id":null,'
+            '"command":null,"message":"Should I optimize for cost or latency?",'
+            '"reason":"the tradeoff materially changes the design"}',
+            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
+            '"message":"I will optimize for cost.","reason":"the user answered the tradeoff"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        collector = AsyncMock(return_value=[])
+        try:
+            with patch.dict("os.environ", {"NEXUS_KNOWLEDGE_COLLECTOR_ENABLED": "1"}), patch.object(
+                orchestrator, "_run_knowledge_collector", collector
+            ):
+                first = orchestrator.run(
+                    "Improve model routing", source_type="issue", source_id="52"
+                )
+                orchestrator.continue_session(first.session_id, "Optimize for cost.")
+
+            # The reply is not a new task: briefing on it would restate the
+            # user's answer to the developer as gathered facts.
+            collector.assert_awaited_once()
+            self.assertEqual(collector.await_args.args[1], "Improve model routing")
+        finally:
+            orchestrator.close()
+
     def test_invalid_json_escape_gets_one_schema_constrained_correction(self):
         client = _Client([
             r'''{"type":"tool","tool":"command","command":"echo Don\'t stop","reason":"implement"}''',

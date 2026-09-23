@@ -314,6 +314,17 @@ class SessionClaimTests(unittest.TestCase):
 
         self.assertEqual(self.store.get(sid).status, STATUS_ABANDONED)
 
+    def test_work_waiting_on_the_knowledge_collector_still_has_to_beat(self):
+        # The collector parks the session under its own status for the length
+        # of its inference; a worker that dies there must still be reaped.
+        sid = self._session(
+            "s16b", status="waiting_for_knowledge", worker="worker-a", last_heartbeat_at=_ago(minutes=30)
+        )
+
+        self.store.reconcile_stale_heartbeats(120)
+
+        self.assertEqual(self.store.get(sid).status, STATUS_ABANDONED)
+
     # -- restart / takeover -------------------------------------------------
 
     def test_a_restarted_worker_can_take_over_its_reconciled_session(self):

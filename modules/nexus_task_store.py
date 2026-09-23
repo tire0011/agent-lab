@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # rest.
 #
 # Every status a worker sets while it is blocked on a model call belongs here,
-# not just `waiting_for_llm`. The tool resolver and the preflight planner each
+# not just `waiting_for_llm`. The tool resolver and the knowledge collector each
 # park the session under their own name for the length of an inference, and a
 # worker that dies in that window left a row no reaper would look at and no
 # diagnostic would list - the session simply stopped, unclaimed and invisible.
@@ -35,7 +35,7 @@ WORKING_STATUSES: tuple[str, ...] = (
     "queued",
     "waiting_for_llm",
     "waiting_for_tool_resolver",
-    "waiting_for_preflight",
+    "waiting_for_knowledge",
 )
 
 # Intentional resting states. A session waiting for a human reply, or blocked

@@ -690,6 +690,12 @@ class NexusTaskOrchestrator:
         blocker_event_id: int | None = None,
     ) -> TaskDecision:
         self._claimed_status(session.id, "active")
+        # Only the turn that opens a task has the task itself as input. A
+        # reply to a question or a capability resume would hand the collector
+        # the reply text instead, and brief the developer on that as facts.
+        opens_task = not resume_capability and not self.task_store.recent_events(
+            session.id, role="user", kind="input", limit=1
+        )
         if resume_capability:
             run_start_event_id = self.task_store.append_event(
                 session.id,
@@ -714,7 +720,7 @@ class NexusTaskOrchestrator:
             "NEXUS_KNOWLEDGE_COLLECTOR_ENABLED",
             os.environ.get("NEXUS_PREFLIGHT_PLANNER_ENABLED", ""),
         ).strip().lower() in {"1", "true", "yes", "on"}
-        if knowledge_collector_enabled:
+        if knowledge_collector_enabled and opens_task:
             knowledge_budget = compute_budget(
                 mem_available_kb=read_mem_available_kb(),
                 swap_free_kb=read_swap_free_kb(),
