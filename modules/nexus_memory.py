@@ -28,6 +28,20 @@ _MEMORY_DOCS = (
 _WORD_RE = re.compile(r"[A-Za-z0-9_./:-]{2,}")
 _ISSUE_QUERY_RE = re.compile(r"\bissue\s+#?(\d+)\b", re.IGNORECASE)
 
+# Orchestrator bookkeeping must never become project knowledge. In particular,
+# indexing memory_search results makes later memory_search calls recursively
+# contain earlier serialized searches (#238).
+_TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY = {
+    "memory_search",
+    "controller_decision",
+    "find_tool",
+    "find_tool_redirected",
+    "redundant_tool_request",
+    "terminal_decision_rejected",
+    "knowledge_collection",
+    "preflight_plan",
+}
+
 
 def _terms(query: str) -> list[str]:
     seen: set[str] = set()
@@ -164,6 +178,8 @@ class NexusMemory:
         except sqlite3.Error:
             return
         for row in rows:
+            if str(row["kind"] or "") in _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY:
+                continue
             text = f"{row['title'] or ''} {row['kind']} {row['content']}"
             if issue_number is not None and not _mentions_issue(
                 text,
