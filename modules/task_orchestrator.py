@@ -1642,16 +1642,35 @@ class NexusTaskOrchestrator:
             {"name": ACTION_CLARIFICATION, "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory."},
         ]
 
+    @staticmethod
+    def _knowledge_request(task: str) -> str:
+        """Translate a development task into a research-only request for the collector."""
+        stripped = task.strip()
+        lowered = stripped.lower()
+        match = re.search(r"github\s+issue\s+#?(\d+)", lowered)
+        if match:
+            return (
+                f"Gather all relevant factual information about GitHub issue #{match.group(1)}. "
+                "Include the issue description, known root cause, prior attempts, related decisions, "
+                "constraints, and acceptance criteria when available. Do not solve or plan the implementation."
+            )
+        return (
+            "Gather all relevant factual information needed to understand this task. "
+            "Summarize prior context, constraints, decisions, and acceptance criteria when available. "
+            "Do not solve or plan the implementation.\n\nTask reference:\n"
+            + stripped
+        )
+
     def _knowledge_collector_prompt(
         self,
-        task: str,
+        knowledge_request: str,
         sources: list[dict[str, Any]],
         budget_plan: PromptBudgetPlan,
         *,
         force_briefing: bool = False,
     ) -> str:
         """Render the bounded research/synthesis prompt for the knowledge collector."""
-        truncated_task, _ = truncate_text(task, budget_plan.current_input_chars)
+        truncated_task, _ = truncate_text(knowledge_request, budget_plan.current_input_chars)
         compacted_sources, _ = compact_observations(
             sources,
             budget_chars=budget_plan.observation_chars,
@@ -1689,7 +1708,7 @@ For action=briefing:
 - query must be empty
 - briefing contains the compact factual knowledge summary.
 
-TASK:
+KNOWLEDGE REQUEST:
 {truncated_task}
 
 COLLECTED SOURCES:
@@ -1798,10 +1817,11 @@ Return exactly one JSON object matching the schema."""
         sources: list[dict[str, Any]] = []
         seen_requests: set[tuple[str, str]] = set()
         max_rounds = self._knowledge_collector_max_rounds()
+        knowledge_request = self._knowledge_request(task)
 
         for round_number in range(1, max_rounds + 1):
             try:
-                prompt = self._knowledge_collector_prompt(task, sources, budget_plan)
+                prompt = self._knowledge_collector_prompt(knowledge_request, sources, budget_plan)
                 raw, provider_used = await self._schema_completion(
                     prompt,
                     session_id=session.id,
@@ -1913,7 +1933,7 @@ Return exactly one JSON object matching the schema."""
         # developer receives a briefing rather than planner/control metadata.
         try:
             prompt = self._knowledge_collector_prompt(
-                task,
+                knowledge_request,
                 sources,
                 budget_plan,
                 force_briefing=True,
