@@ -32,6 +32,7 @@ from scripts.check_issue_246_controller_role import (
 )
 
 TASK = "solve github issue #238"
+KNOWLEDGE_REQUEST = "Gather all relevant factual information about GitHub issue #238."
 
 
 def _budget():
@@ -83,7 +84,7 @@ async def synthesis_only() -> tuple[str, dict]:
             sources = [ISSUE_238_OBSERVATION, MEMORY_SEARCH_OBSERVATION]
             budget = _budget()
             prompt = orchestrator._knowledge_collector_prompt(
-                TASK,
+                KNOWLEDGE_REQUEST,
                 sources,
                 budget,
                 force_briefing=True,
@@ -104,6 +105,7 @@ async def synthesis_only() -> tuple[str, dict]:
                 "provider": provider,
                 "prompt_chars": len(prompt),
                 "source_count": len(sources),
+                "knowledge_request": KNOWLEDGE_REQUEST,
             }
         finally:
             orchestrator.close()
