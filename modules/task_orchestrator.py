@@ -1813,102 +1813,44 @@ Return exactly one JSON object matching the schema."""
         *,
         task_logger: Any | None = None,
     ) -> list[dict[str, Any]]:
-        """Research useful context, then hand one compact briefing to the developer."""
-        sources: list[dict[str, Any]] = []
-        seen_requests: set[tuple[str, str]] = set()
-        max_rounds = self._knowledge_collector_max_rounds()
+        """Collect explicit task references deterministically, then synthesize them."""
         knowledge_request = self._knowledge_request(task)
+        sources: list[dict[str, Any]] = []
 
-        for round_number in range(1, max_rounds + 1):
+        issue_match = re.search(r"github\s+issue\s+#?(\d+)", task, re.IGNORECASE)
+        if issue_match:
+            issue_number = int(issue_match.group(1))
+            goal = f"fetch GitHub issue #{issue_number}"
+            state_token = self._state_token(task)
             try:
-                prompt = self._knowledge_collector_prompt(knowledge_request, sources, budget_plan)
-                raw, provider_used = await self._schema_completion(
-                    prompt,
-                    session_id=session.id,
-                    max_tokens=250,
-                    response_format=_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
-                    budget_plan=budget_plan,
-                    waiting_status="waiting_for_knowledge",
-                    role="knowledge_collector",
-                    task_logger=task_logger,
-                )
-                decision = self._parse_knowledge_collector(raw)
-                self.task_store.append_event(
-                    session.id,
-                    role="system",
-                    kind="knowledge_collection",
-                    content=json.dumps(decision, separators=(",", ":")),
-                    metadata={
-                        "round": round_number,
-                        "provider_used": provider_used,
-                        "action": decision["action"],
-                        "source": decision["source"],
-                    },
-                )
-
-                if decision["action"] == "briefing":
-                    return [
-                        {
-                            "tool": TOOL_KNOWLEDGE_BRIEFING,
-                            "briefing": decision["briefing"],
-                            "source_count": len(sources),
-                        }
-                    ]
-
-                signature = (decision["source"], decision["query"].lower())
-                if signature in seen_requests:
-                    sources.append(
-                        {
-                            "tool": "knowledge_collector_notice",
-                            "content": (
-                                "This lookup was already performed and added no new source. "
-                                "Use the collected material instead of repeating it."
-                            ),
-                        }
-                    )
-                    break
-                seen_requests.add(signature)
-
-                if decision["source"] == "memory":
-                    observation = {
-                        "tool": "memory_search",
-                        "query": decision["query"][:500],
-                        "results": self.memory.search(decision["query"], limit=6),
-                        "knowledge_collector": True,
-                    }
-                    event_id = self.task_store.append_event(
-                        session.id,
-                        role="tool",
-                        kind="memory_search",
-                        content=json.dumps(observation, separators=(",", ":")),
-                        metadata={"reason": _KNOWLEDGE_LOOKUP_REASON, "knowledge_collector": True},
-                    )
-                    sources.append({**observation, "event_id": event_id})
-                    continue
-
-                state_token = self._state_token(task)
                 resolved = await self._resolve_find_tool(
-                    decision["query"],
+                    goal,
                     session_id=session.id,
                     current_task=task,
                     budget_plan=budget_plan,
                     task_logger=task_logger,
+                    expected_operation="github_issue",
+                    expected_status="found",
                 )
                 event_id = self.task_store.append_event(
                     session.id,
                     role="tool",
                     kind=TOOL_FIND_TOOL,
                     content=json.dumps(resolved, separators=(",", ":")),
-                    metadata={"reason": _KNOWLEDGE_LOOKUP_REASON, "knowledge_collector": True},
+                    metadata={
+                        "reason": _KNOWLEDGE_LOOKUP_REASON,
+                        "knowledge_collector": True,
+                        "deterministic_reference": True,
+                    },
                 )
                 resolved = {
                     **resolved,
                     "event_id": event_id,
                     "knowledge_collector": True,
+                    "deterministic_reference": True,
                     "state_token": state_token,
                 }
                 sources.append(resolved)
-
                 executed = self._execute_resolved_tool(
                     session_id=session.id,
                     state_token=state_token,
@@ -1918,19 +1860,60 @@ Return exactly one JSON object matching the schema."""
                 )
                 if executed is not None:
                     sources[-1] = self._mark_already_executed(sources[-1], executed)
-                    sources.append({**executed, "knowledge_collector": True})
+                    sources.append(
+                        {
+                            **executed,
+                            "knowledge_collector": True,
+                            "deterministic_reference": True,
+                        }
+                    )
             except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
-                logger.warning(
-                    "knowledge collector round failed session_id=%s round=%s error=%s; "
-                    "handing control to developer",
-                    session.id,
-                    round_number,
-                    str(exc)[:1000],
+                sources.append(
+                    {
+                        "tool": "knowledge_source_error",
+                        "source": "github_issue",
+                        "issue_number": issue_number,
+                        "error": str(exc)[:1000],
+                    }
                 )
-                return [self._knowledge_collector_unavailable_briefing(exc)]
 
-        # Research is bounded. Give the model one synthesis-only turn so the
-        # developer receives a briefing rather than planner/control metadata.
+            # Project history is a complementary source for an explicitly
+            # referenced issue. It is gathered by Nexus, not selected by the
+            # collector model, so a failed current GitHub read can still be
+            # complemented by prior task knowledge without another planning loop.
+            memory_query = f"GitHub issue #{issue_number}"
+            try:
+                sources.append(
+                    {
+                        "tool": "memory_search",
+                        "query": memory_query,
+                        "results": self.memory.search(memory_query, limit=8),
+                        "knowledge_collector": True,
+                        "deterministic_reference": True,
+                    }
+                )
+            except Exception as exc:
+                sources.append(
+                    {
+                        "tool": "knowledge_source_error",
+                        "source": "memory",
+                        "query": memory_query,
+                        "error": str(exc)[:1000],
+                    }
+                )
+
+        if not sources:
+            # Generic tasks currently have no deterministic extractor. The
+            # collector must summarize only the request itself rather than
+            # inventing external facts.
+            sources.append(
+                {
+                    "tool": "knowledge_request",
+                    "content": knowledge_request,
+                    "note": "No explicit deterministic source reference was recognized.",
+                }
+            )
+
         try:
             prompt = self._knowledge_collector_prompt(
                 knowledge_request,
@@ -1951,7 +1934,7 @@ Return exactly one JSON object matching the schema."""
             decision = self._parse_knowledge_collector(raw)
             if decision["action"] != "briefing":
                 raise TaskOrchestratorError(
-                    "knowledge collector requested another lookup after research budget ended"
+                    "knowledge collector must return a briefing after deterministic retrieval"
                 )
             self.task_store.append_event(
                 session.id,
@@ -1959,10 +1942,10 @@ Return exactly one JSON object matching the schema."""
                 kind="knowledge_collection",
                 content=json.dumps(decision, separators=(",", ":")),
                 metadata={
-                    "round": max_rounds + 1,
                     "provider_used": provider_used,
                     "action": "briefing",
-                    "forced_synthesis": True,
+                    "deterministic_retrieval": True,
+                    "source_count": len(sources),
                 },
             )
             return [
@@ -1970,7 +1953,7 @@ Return exactly one JSON object matching the schema."""
                     "tool": TOOL_KNOWLEDGE_BRIEFING,
                     "briefing": decision["briefing"],
                     "source_count": len(sources),
-                    "bounded_stop": "research_round_limit",
+                    "deterministic_retrieval": True,
                 }
             ]
         except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
