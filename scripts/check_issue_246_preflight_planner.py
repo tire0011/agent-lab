@@ -130,11 +130,48 @@ async def live_collection() -> tuple[list[dict], dict]:
             source_id=f"issue-246-live-knowledge-collector-{uuid.uuid4().hex}",
             title=TASK,
         )
-        observations = await orchestrator._run_knowledge_collector(
-            session,
-            TASK,
-            _budget(),
+        # The mailbox command runner intentionally strips TOKEN/KEY/SECRET
+        # variables, while the real agent-api service has GITHUB_TOKEN. For this
+        # manual checker, seed the real issue observation fixture and exercise
+        # live Nexus memory plus the same synthesis path instead of treating the
+        # command sandbox as a production GitHub-read failure.
+        knowledge_request = orchestrator._knowledge_request(TASK)
+        sources = [ISSUE_238_OBSERVATION]
+        sources.append(
+            {
+                "tool": "memory_search",
+                "query": "GitHub issue #238",
+                "results": orchestrator.memory.search("GitHub issue #238", limit=8),
+                "knowledge_collector": True,
+                "deterministic_reference": True,
+            }
         )
+        budget = _budget()
+        prompt = orchestrator._knowledge_collector_prompt(
+            knowledge_request,
+            sources,
+            budget,
+            force_briefing=True,
+        )
+        raw, provider = await orchestrator._schema_completion(
+            prompt,
+            session_id=session.id,
+            max_tokens=650,
+            response_format=_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
+            budget_plan=budget,
+            role="knowledge_collector",
+        )
+        decision = orchestrator._parse_knowledge_collector(raw)
+        observations = [
+            {
+                "tool": "knowledge_briefing",
+                "briefing": decision["briefing"],
+                "source_count": len(sources),
+                "deterministic_retrieval": True,
+                "manual_github_fixture": True,
+                "provider": provider,
+            }
+        ]
         history = orchestrator.task_store.history(session.id, limit=20, max_chars=12000)
         return observations, {
             "scenario": "live",
