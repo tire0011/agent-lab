@@ -64,7 +64,12 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
     def _compact_capabilities(self) -> list[dict[str, Any]]:
         compact: list[dict[str, Any]] = []
         for item in self._capabilities():
-            entry = {"name": item.get("name"), "description": item.get("description", "")}
+            # Chat has a deliberately small prompt budget. Capability descriptions
+            # are hints here; the full task controller keeps the complete definitions.
+            entry = {
+                "name": item.get("name"),
+                "description": str(item.get("description", ""))[:160],
+            }
             if item.get("name") == "operation":
                 entry["operations"] = [{"name": op.get("operation") or op.get("name"), "description": op.get("description", ""), "arguments": [arg.get("name") for arg in op.get("arguments", []) if isinstance(arg, dict)]} for op in item.get("operations", [])]
             elif "providers" in item:
