@@ -983,24 +983,6 @@ class NexusTaskOrchestrator:
                 detail=turn_detail,
             )
             if action in _ORCHESTRATOR_TOOLS:
-                redundant_memory = self._redundant_memory_search_after_briefing(
-                    decision, observations
-                )
-                if redundant_memory is not None:
-                    event_id = self.task_store.append_event(
-                        session.id,
-                        role="system",
-                        kind="redundant_memory_search",
-                        content=json.dumps(redundant_memory, separators=(",", ":")),
-                        metadata={
-                            "controller_action": controller_action,
-                            "controller_reason": str(decision.get("reason", ""))[:500],
-                        },
-                    )
-                    redundant_memory["event_id"] = event_id
-                    observations.append(redundant_memory)
-                    continue
-
                 execution_decision = self._action_to_tool_decision(decision)
                 if task_logger is not None:
                     task_logger.info(
@@ -1968,9 +1950,24 @@ Return exactly one JSON object matching the schema."""
                     "source_count": len(sources),
                 },
             )
+            used_sources: list[str] = []
+            for source in sources:
+                if source.get("tool") == "knowledge_source_error":
+                    continue
+                name = (
+                    source.get("operation")
+                    if source.get("tool") == "operation"
+                    else source.get("tool")
+                )
+                if name == TOOL_FIND_TOOL:
+                    name = source.get("operation")
+                if name and name not in used_sources:
+                    used_sources.append(str(name))
+
             return {
                 "tool": TOOL_KNOWLEDGE_BRIEFING,
                 "knowledge_briefing": decision["briefing"],
+                "used_sources": used_sources,
                 "source_count": len(sources),
                 "deterministic_retrieval": True,
             }
@@ -2090,7 +2087,6 @@ Model policy:
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - If a `knowledge_collector` observation contains `knowledge_briefing`, treat it as compact factual context gathered at your request. Do not repeat those information lookups unless later evidence creates a genuinely new need.
-- After a useful knowledge briefing for an implementation task, the default next step is execution/inspection of the actual repository, not another memory search. A memory_search after the briefing is justified only for a distinct historical fact that is genuinely absent from the briefing.
 - Use `memory_search` only when prior project context could materially change the next decision, especially when important information is missing, earlier work may exist, or you are stuck. Do not search memory mechanically.
 - Before using `memory_search`, decide whether previous project context is actually needed to make progress. If the current input and observations already provide enough information to choose the next step, keep working instead of searching memory.
 - Memory is for missing or potentially relevant historical context, not for re-reading information that is already present in the current task or observations. Do not use `memory_search` merely to obtain the contents of a specifically named current GitHub issue or other directly addressable source.
@@ -3204,69 +3200,6 @@ Decide the next step now. Return JSON only.
             }
 
     @staticmethod
-    @staticmethod
-    def _redundant_memory_search_after_briefing(
-        decision: dict[str, Any], observations: list[dict[str, Any]]
-    ) -> dict[str, Any] | None:
-        """Reject memory searches that only re-read knowledge already in hand.
-
-        The local controller can otherwise treat the compact collector briefing
-        as a reason to search memory for the same issue again instead of moving
-        on to execution. A genuinely new historical question is still allowed.
-        """
-        if str(decision.get("action", "")).strip().lower() != "memory_search":
-            return None
-        query = " ".join(str(decision.get("query", "")).lower().split())
-        if not query:
-            return None
-
-        briefing = ""
-        for observation in reversed(observations):
-            if observation.get("tool") != ACTION_KNOWLEDGE_COLLECTOR:
-                continue
-            candidate = " ".join(
-                str(observation.get("knowledge_briefing", "")).lower().split()
-            )
-            if candidate:
-                briefing = candidate
-                break
-        if not briefing:
-            return None
-
-        query_words = {
-            word.strip(".,:;!?()[]{}\"'")
-            for word in query.split()
-            if len(word.strip(".,:;!?()[]{}\"'")) >= 2
-        }
-        briefing_words = {
-            word.strip(".,:;!?()[]{}\"'")
-            for word in briefing.split()
-            if len(word.strip(".,:;!?()[]{}\"'")) >= 2
-        }
-        repeats_briefing = (
-            query in briefing
-            or briefing in query
-            or (len(query_words) >= 2 and query_words.issubset(briefing_words))
-        )
-        if not repeats_briefing:
-            return None
-
-        return {
-            "event": "redundant_memory_search",
-            "query": str(decision.get("query", ""))[:1000],
-            "reason": (
-                "The requested memory search only re-reads facts already present "
-                "in the current knowledge_collector briefing."
-            ),
-            "recovery": (
-                "Use the briefing already in the observations and continue the "
-                "original task. For repository work, inspect or modify the local "
-                "repository with command/python_run."
-            ),
-            "recommended_next_action": "continue_original_task",
-            "direct_capabilities": [ACTION_COMMAND, TOOL_PYTHON_RUN],
-        }
-
     def _already_satisfied(
         decision: dict[str, Any], observations: list[dict[str, Any]]
     ) -> dict[str, Any] | None:
