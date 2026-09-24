@@ -30,7 +30,7 @@ def test_knowledge_collector_prompt_describes_research_not_planning():
     lower = prompt.lower()
     assert "knowledge collector" in lower
     assert "compact factual briefing" in lower
-    assert "do not plan the implementation" in lower
+    assert "do not plan the solution" in lower
     assert "remove duplicates" in lower
     assert "lookup" in lower
     assert "briefing" in lower
@@ -100,11 +100,11 @@ def test_knowledge_request_strips_development_intent_from_github_issue_task():
     orchestrator = _orchestrator()
     request = orchestrator._knowledge_request("solve github issue #238")
     assert request.startswith("Gather all relevant factual information about GitHub issue #238")
-    assert "Do not solve or plan the implementation." in request
+    assert "Do not solve or plan the task." in request
 
 
 def test_knowledge_request_generic_task_is_research_only():
     orchestrator = _orchestrator()
     request = orchestrator._knowledge_request("fix the failing controller test")
     assert "Gather all relevant factual information needed to understand this task." in request
-    assert "Do not solve or plan the implementation." in request
+    assert "Do not solve or plan the task." in request
