@@ -1203,15 +1203,11 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("Optimize for cost", client.prompts[1])
         self.assertIn("Improve model routing", client.prompts[1])
 
-    def test_knowledge_collector_runs_only_on_the_turn_that_opens_the_task(self):
+    def test_knowledge_collector_is_not_automatic_preflight(self):
         from unittest.mock import patch
 
         client = _Client([
-            '{"type":"action","action":"clarification","experiment_id":null,'
-            '"command":null,"message":"Should I optimize for cost or latency?",'
-            '"reason":"the tradeoff materially changes the design"}',
-            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
-            '"message":"I will optimize for cost.","reason":"the user answered the tradeoff"}',
+            '{"action":"answer","message":"No research needed.","reason":"task is already clear"}',
         ])
         orchestrator = self._orchestrator(client)
         collector = AsyncMock(return_value=[])
@@ -1219,15 +1215,59 @@ class TaskOrchestratorTests(unittest.TestCase):
             with patch.dict("os.environ", {"NEXUS_KNOWLEDGE_COLLECTOR_ENABLED": "1"}), patch.object(
                 orchestrator, "_run_knowledge_collector", collector
             ):
-                first = orchestrator.run(
-                    "Improve model routing", source_type="issue", source_id="52"
-                )
-                orchestrator.continue_session(first.session_id, "Optimize for cost.")
+                result = orchestrator.run("Explain the current status")
 
-            # The reply is not a new task: briefing on it would restate the
-            # user's answer to the developer as gathered facts.
+            self.assertEqual(result.action, ACTION_ANSWER)
+            collector.assert_not_awaited()
+        finally:
+            orchestrator.close()
+
+    def test_controller_can_explicitly_invoke_knowledge_collector(self):
+        from unittest.mock import patch
+
+        client = _Client([
+            '{"action":"knowledge_collector",'
+            '"request":"Collect relevant facts about GitHub issue #238.",'
+            '"reason":"issue context is needed before deciding what to do"}',
+            '{"action":"answer","message":"I used the gathered facts.",'
+            '"reason":"the briefing now answers the informational request"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        briefing = {
+            "tool": "knowledge_collector",
+            "knowledge_briefing": "Issue #238 concerns recursive memory_search indexing.",
+            "source_count": 2,
+        }
+        collector = AsyncMock(return_value=[briefing])
+        try:
+            with patch.object(orchestrator, "_run_knowledge_collector", collector):
+                result = orchestrator.run("Tell me what is known about GitHub issue #238")
+
+            self.assertEqual(result.action, ACTION_ANSWER)
             collector.assert_awaited_once()
-            self.assertEqual(collector.await_args.args[1], "Improve model routing")
+            self.assertEqual(
+                collector.await_args.args[1],
+                "Collect relevant facts about GitHub issue #238.",
+            )
+            self.assertIn("Issue #238 concerns recursive memory_search indexing", client.prompts[-1])
+            self.assertEqual(result.session_id, collector.await_args.args[0].id)
+        finally:
+            orchestrator.close()
+
+    def test_main_prompt_is_general_agent_and_exposes_direct_local_work(self):
+        client = _Client([
+            '{"action":"answer","message":"done","reason":"no action required"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            orchestrator.run("Summarize this task")
+            prompt = client.prompts[0]
+            self.assertIn("You are Nexus, an autonomous agent.", prompt)
+            self.assertNotIn("autonomous software developer", prompt)
+            self.assertIn("knowledge_collector", prompt)
+            self.assertIn("command", prompt)
+            self.assertIn("python_run", prompt)
+            self.assertIn("must not be discovered through find_tool", prompt)
         finally:
             orchestrator.close()
 
