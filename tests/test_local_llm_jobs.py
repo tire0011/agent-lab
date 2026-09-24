@@ -366,6 +366,40 @@ class CrossProcessSerializationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await consumer.wait(job_id), "reply:queued by the other process")
         self.assertEqual(consumer.get(job_id).worker_id, consumer.worker_id)
 
+    async def test_closing_finishes_a_job_it_claimed_for_another_process(self):
+        # A short-lived process (the tick, a mailbox run) drains the shared
+        # queue, so its worker can be mid-request on a job another process is
+        # waiting for when it closes. Closing used to give up after two
+        # seconds and close the database under the worker: the result could
+        # not be recorded and the job stayed `running` until its lease
+        # lapsed, then failed as interrupted.
+        started = threading.Event()
+        release = threading.Event()
+
+        class _BlockingClient:
+            model = "test-local-model"
+
+            async def complete(self, *, prompt, temperature, max_tokens, response_format=None, system=None):
+                del temperature, max_tokens, response_format, system
+                started.set()
+                release.wait(timeout=10)
+                return "reply:" + prompt
+
+        short_lived = self._service(_BlockingClient())
+        job_id = short_lived.submit("queued by the long-lived process")
+        self.assertTrue(started.wait(timeout=5))
+
+        # Released only after the old two-second close deadline has passed.
+        timer = threading.Timer(2.5, release.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        self.addCleanup(release.set)
+        short_lived.close()
+
+        waiter = self._service(_ConcurrencyProbe())
+        self.assertEqual(await waiter.wait(job_id), "reply:queued by the long-lived process")
+        self.assertEqual(waiter.get(job_id).status, STATUS_SUCCEEDED)
+
     def test_startup_does_not_kill_another_live_worker_claim(self):
         client = _ConcurrencyProbe()
         live = self._service(client)

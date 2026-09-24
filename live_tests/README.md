@@ -7,6 +7,21 @@ this fix hold up on Nexus?", which the unit tests in `tests/` cannot.
 They are run by hand, one at a time. They are **not** part of CI: `pytest.ini`
 only collects `tests/`, so neither CI nor a plain `pytest` sees this folder.
 
+## How close to Nexus
+
+As close as possible, with only the parts isolated that a test must not
+change:
+
+- **Real:** the code under test, the production prompt, the live prompt
+  budget, llama-server and the production local-LLM queue in `AGENT_DB_PATH`.
+  A test's inference waits for the single inference slot exactly like every
+  Nexus process (#167). It never runs concurrently with Nexus and never on a
+  queue of its own; a busy Nexus simply makes the test wait.
+- **Isolated:** task sessions, memory and the loop guard use a scratch
+  database, so a test neither pollutes Nexus's memory index nor claims real
+  sessions. Selected tools are never executed.
+- Tests run one after another; the runner disables xdist.
+
 ## Running on the VM
 
 `scripts/nexus-live-check.sh` puts a branch into a throwaway worktree, prints
@@ -38,7 +53,8 @@ git -C /agent show FETCH_HEAD:scripts/nexus-live-check.sh | bash -s -- <branch> 
 
 - `PASSED` - the behaviour holds on Nexus.
 - `FAILED` - the regression reproduced; the message says why.
-- `ERROR` - the environment could not answer (e.g. llama-server down).
+- `ERROR` - the environment could not answer (e.g. llama-server down, Nexus
+  database not found).
 
 At the end pytest prints one JSON line per test under `live results (json)`
 with commit, model, outcome, duration and whatever the test recorded (for
@@ -53,6 +69,8 @@ Fixtures from `conftest.py`:
 - `orchestrator` - the underlying `NexusTaskOrchestrator`, for anything else.
 - `llama_server` - `{"url", "model"}`; turns the test into an ERROR if the
   server is unreachable.
+- `nexus_llm_queue` - the production local-LLM job queue; ERROR if the Nexus
+  database does not exist.
 - `live_result` - a dict; its fields land in the test's JSON line.
 
 A test is usually a handful of lines: build the observations, call
