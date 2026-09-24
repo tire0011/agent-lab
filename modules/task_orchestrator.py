@@ -1650,12 +1650,12 @@ class NexusTaskOrchestrator:
             return (
                 f"Gather all relevant factual information about GitHub issue #{match.group(1)}. "
                 "Include the issue description, known root cause, prior attempts, related decisions, "
-                "constraints, and acceptance criteria when available. Do not solve or plan the implementation."
+                "constraints, and acceptance criteria when available. Do not solve or plan the task."
             )
         return (
             "Gather all relevant factual information needed to understand this task. "
             "Summarize prior context, constraints, decisions, and acceptance criteria when available. "
-            "Do not solve or plan the implementation.\n\nTask reference:\n"
+            "Do not solve or plan the task.\n\nTask reference:\n"
             + stripped
         )
 
@@ -1840,6 +1840,7 @@ Return exactly one JSON object matching the schema."""
                     metadata={
                         "reason": _KNOWLEDGE_LOOKUP_REASON,
                         "knowledge_collector": True,
+                        "knowledge_collector_internal": True,
                         "deterministic_reference": True,
                     },
                 )
@@ -1944,6 +1945,7 @@ Return exactly one JSON object matching the schema."""
                 metadata={
                     "provider_used": provider_used,
                     "action": "briefing",
+                    "knowledge_collector_internal": True,
                     "deterministic_retrieval": True,
                     "source_count": len(sources),
                 },
@@ -2088,6 +2090,7 @@ Rules:
 - For an existing experiment, inspect state if useful and select resume_experiment with its real id/prefix.
 - Solve small requests with reasoning/operations/commands where practical, then answer instead of creating an experiment.
 - For implementation requests such as solve, fix, implement, resolve, address, apply, update, or work on, reading information is preparation, not completion. Continue until Nexus has actually performed the required repository change and verified it, or has established with evidence that no change is necessary.
+- A terminal_decision_rejected with gap_kind=completion_evidence means your previous completion was premature. It is not a capability failure and its information_gap is not a new task blocker. Continue the original task using available execution capabilities; never turn "implementation completion evidence" itself into missing_capability or a user-only clarification.
 - After a successful issue/task read that already provides the problem and expected change, the default next step for a repository fix is local development work: inspect the relevant code with `command` or `python_run`, then edit, test, and verify. Do not search for another capability merely to restate the requested code change.
 - For command or python_run, set effect to read, change, or verify to say what the call is for. Completion evidence is what the executor observes: a command that succeeds and leaves the checkout actually changed. Declaring effect=change does not by itself complete anything, and a command that changes nothing (for example `true`) never will. If you believe no change is required, say so as a clarification that asks the user to confirm, citing the verification output. If the required change cannot be performed, use missing_capability instead of claiming completion.
 - Ask clarification only when missing information materially changes the result and cannot be obtained from tools or memory; the session persists for the reply. Classify the gap and cite actual tool/memory event IDs when the gap concerns external information. User intent, preference and authorization may be asked immediately, but explain why only the user can decide.
@@ -3137,7 +3140,14 @@ Decide the next step now. Return JSON only.
             role="tool",
             kind=str(result.get("tool", "operation")),
             content=json.dumps(result, separators=(",", ":")),
-            metadata={"reason": f"resolved by find_tool: {reason}"[:1000]},
+            metadata={
+                "reason": f"resolved by find_tool: {reason}"[:1000],
+                **(
+                    {"knowledge_collector_internal": True}
+                    if reason == _KNOWLEDGE_LOOKUP_REASON
+                    else {}
+                ),
+            },
         )
         result = dict(result)
         result["event_id"] = event_id
