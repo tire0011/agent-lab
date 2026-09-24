@@ -1238,7 +1238,7 @@ class TaskOrchestratorTests(unittest.TestCase):
             "knowledge_briefing": "Issue #238 concerns recursive memory_search indexing.",
             "source_count": 2,
         }
-        collector = AsyncMock(return_value=[briefing])
+        collector = AsyncMock(return_value=briefing)
         try:
             with patch.object(orchestrator, "_run_knowledge_collector", collector):
                 result = orchestrator.run("Tell me what is known about GitHub issue #238")
