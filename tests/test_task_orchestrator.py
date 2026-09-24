@@ -1254,48 +1254,52 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
-    def test_memory_search_reusing_knowledge_briefing_is_rejected(self):
-        orchestrator = self._orchestrator(_Client([]))
-        try:
-            observations = [{
-                "tool": "knowledge_collector",
-                "knowledge_briefing": (
-                    "GitHub issue #238: NexusMemory._search_task_events indexes "
-                    "memory_search and other controller bookkeeping."
-                ),
-            }]
-            rejected = orchestrator._redundant_memory_search_after_briefing(
-                {
-                    "action": "memory_search",
-                    "query": "GitHub issue #238",
-                    "reason": "look up the issue again",
-                },
-                observations,
-            )
-            self.assertIsNotNone(rejected)
-            self.assertEqual(rejected["event"], "redundant_memory_search")
-            self.assertEqual(rejected["recommended_next_action"], "continue_original_task")
-        finally:
-            orchestrator.close()
+    def test_knowledge_collector_reports_used_sources_dynamically(self):
+        from unittest.mock import patch
 
-    def test_memory_search_for_genuinely_new_history_remains_allowed(self):
-        orchestrator = self._orchestrator(_Client([]))
-        try:
-            observations = [{
+        client = _Client([
+            '{"action":"knowledge_collector",'
+            '"request":"Collect relevant facts about GitHub issue #238.",'
+            '"reason":"need issue context"}',
+            '{"action":"answer","message":"done","reason":"briefing is enough"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        sources = [
+            {
+                "tool": "operation",
+                "operation": "github_issue",
+                "result": {"success": True, "output_lines": ["issue facts"]},
+            },
+            {
+                "tool": "memory_search",
+                "query": "GitHub issue #238",
+                "results": [{"content": "prior context"}],
+            },
+        ]
+
+        async def fake_collector(session, task, budget_plan, **kwargs):
+            used_sources = []
+            for source in sources:
+                name = (
+                    source.get("operation")
+                    if source.get("tool") == "operation"
+                    else source.get("tool")
+                )
+                if name and name not in used_sources:
+                    used_sources.append(name)
+            return {
                 "tool": "knowledge_collector",
-                "knowledge_briefing": (
-                    "GitHub issue #238 concerns recursive memory_search indexing."
-                ),
-            }]
-            rejected = orchestrator._redundant_memory_search_after_briefing(
-                {
-                    "action": "memory_search",
-                    "query": "earlier architecture decision about event journal versus curated memory",
-                    "reason": "need a distinct historical decision not in the briefing",
-                },
-                observations,
-            )
-            self.assertIsNone(rejected)
+                "knowledge_briefing": "Issue #238 facts.",
+                "used_sources": used_sources,
+                "source_count": len(sources),
+                "deterministic_retrieval": True,
+            }
+
+        try:
+            with patch.object(orchestrator, "_run_knowledge_collector", side_effect=fake_collector):
+                result = orchestrator.run("Tell me about GitHub issue #238")
+            self.assertEqual(result.action, ACTION_ANSWER)
+            self.assertIn('"used_sources":["github_issue","memory_search"]', client.prompts[-1])
         finally:
             orchestrator.close()
 
