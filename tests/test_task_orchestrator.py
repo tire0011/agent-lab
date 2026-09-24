@@ -1254,6 +1254,51 @@ class TaskOrchestratorTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_memory_search_reusing_knowledge_briefing_is_rejected(self):
+        orchestrator = self._orchestrator(_Client([]))
+        try:
+            observations = [{
+                "tool": "knowledge_collector",
+                "knowledge_briefing": (
+                    "GitHub issue #238: NexusMemory._search_task_events indexes "
+                    "memory_search and other controller bookkeeping."
+                ),
+            }]
+            rejected = orchestrator._redundant_memory_search_after_briefing(
+                {
+                    "action": "memory_search",
+                    "query": "GitHub issue #238",
+                    "reason": "look up the issue again",
+                },
+                observations,
+            )
+            self.assertIsNotNone(rejected)
+            self.assertEqual(rejected["event"], "redundant_memory_search")
+            self.assertEqual(rejected["recommended_next_action"], "continue_original_task")
+        finally:
+            orchestrator.close()
+
+    def test_memory_search_for_genuinely_new_history_remains_allowed(self):
+        orchestrator = self._orchestrator(_Client([]))
+        try:
+            observations = [{
+                "tool": "knowledge_collector",
+                "knowledge_briefing": (
+                    "GitHub issue #238 concerns recursive memory_search indexing."
+                ),
+            }]
+            rejected = orchestrator._redundant_memory_search_after_briefing(
+                {
+                    "action": "memory_search",
+                    "query": "earlier architecture decision about event journal versus curated memory",
+                    "reason": "need a distinct historical decision not in the briefing",
+                },
+                observations,
+            )
+            self.assertIsNone(rejected)
+        finally:
+            orchestrator.close()
+
     def test_main_prompt_is_general_agent_and_exposes_direct_local_work(self):
         client = _Client([
             '{"action":"answer","message":"done","reason":"no action required"}',
