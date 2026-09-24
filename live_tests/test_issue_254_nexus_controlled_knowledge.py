@@ -23,6 +23,7 @@ KNOWN_ISSUE = {
         "bookkeeping from searchable memory. Acceptance includes successive searches "
         "not retrieving earlier memory_search output."
     ),
+    "used_sources": ["github_issue", "memory_search"],
     "event_id": 343,
 }
 
