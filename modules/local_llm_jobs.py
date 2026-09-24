@@ -316,6 +316,8 @@ class LocalLlmJobService:
         self._reclaim_dead_leases()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._closed = threading.Event()
+        # The job this service's worker is executing right now, if any.
+        self._current_job: str | None = None
         self._worker = threading.Thread(target=self._worker_loop, name="local-llm-job-worker", daemon=True)
         self._worker.start()
 
@@ -327,6 +329,22 @@ class LocalLlmJobService:
         self._closed.set()
         self._queue.put(None)
         self._worker.join(timeout=2.0)
+        # A worker drains every queued job, including ones another process
+        # submitted and is still waiting for. A short-lived process (the tick,
+        # a mailbox run) that finishes its own job can claim such a job just
+        # before it closes. Exiting then took the claim down with it: the job
+        # sat `running` until its lease lapsed and failed as interrupted,
+        # although its submitter was alive the whole time. So an in-flight
+        # job is finished first. It is bounded by the client watchdog, and
+        # handing it back mid-request instead would put a second request on
+        # llama-server while this one is still running.
+        if self._worker.is_alive() and self._current_job is not None:
+            _LOGGER.info(
+                "local_llm service closing; finishing in-flight job_id=%s first",
+                self._current_job,
+            )
+            while self._worker.is_alive() and self._current_job is not None:
+                self._worker.join(timeout=1.0)
         with self._lock:
             self._conn.close()
 
@@ -697,7 +715,11 @@ class LocalLlmJobService:
                 job_id = self._claim_next_job()
                 if job_id is None:
                     break
-                self._run(job_id)
+                self._current_job = job_id
+                try:
+                    self._run(job_id)
+                finally:
+                    self._current_job = None
             if self._closed.is_set():
                 return
             try:
