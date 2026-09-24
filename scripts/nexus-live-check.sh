@@ -9,8 +9,13 @@
 # a test fails or the run is interrupted. Without pytest args it runs all of
 # live_tests/. The exit code is pytest's.
 #
+# Tests run one after another (xdist is disabled) and queue their inference
+# on the running Nexus's local-LLM queue in AGENT_DB_PATH, so they never race
+# Nexus for llama-server - see live_tests/conftest.py.
+#
 # Environment: AGENT_REPO (default /agent), PYTHON (default
-# $AGENT_REPO/.venv/bin/python).
+# $AGENT_REPO/.venv/bin/python), AGENT_DB_PATH (default /var/lib/nexus/agent.db;
+# set by the mailbox service).
 
 set -u
 
@@ -42,8 +47,9 @@ echo "branch:       $BRANCH"
 echo "commit:       $(git -C "$WT" --no-pager log --oneline -1)"
 echo "llama-server: $(systemctl is-active llama-server 2>/dev/null || echo unknown)"
 awk '/^(MemAvailable|SwapFree):/ {printf "%-13s %d MiB\n", $1, $2 / 1024}' /proc/meminfo
+echo "nexus db:     ${AGENT_DB_PATH:-/var/lib/nexus/agent.db}"
 echo "pytest args:  $*"
 echo
 
 cd "$WT" || exit 2
-"$PYTHON" -m pytest -p no:cacheprovider -v --tb=short -rfE "$@"
+"$PYTHON" -m pytest -p no:cacheprovider -p no:xdist -v --tb=short -rfE "$@"

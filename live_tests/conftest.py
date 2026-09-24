@@ -5,6 +5,16 @@ time, on the Nexus VM - usually through ``scripts/nexus-live-check.sh``. They
 live outside ``tests/`` on purpose: pytest.ini only collects ``tests/``, so CI
 and a plain ``pytest`` never pick them up.
 
+How close to production:
+- Inference goes through the production local-LLM queue (the
+  ``local_llm_jobs`` table in Nexus's database, ``AGENT_DB_PATH``). A test's
+  request waits for the single inference slot like every Nexus process does
+  (#167), so it never talks to llama-server concurrently with Nexus and never
+  runs on a queue of its own.
+- Only what a test must not change is isolated: task sessions, memory and the
+  loop guard live in a scratch database, so a test neither shows up in Nexus's
+  memory index nor claims real sessions. Selected tools are never executed.
+
 Conventions:
 - A FAILED test is a reproduced regression; an ERROR (setup failure, e.g.
   llama-server down) means the environment could not answer the question.
@@ -102,9 +112,41 @@ def live_result(request) -> dict[str, Any]:
     return data
 
 
+@pytest.fixture(scope="session")
+def nexus_llm_queue():
+    """The production local-LLM job queue, shared with the running Nexus.
+
+    Nexus serializes local inference in its database, not in a process: every
+    Nexus process (API, tick, mailbox) queues there and runs a job only after
+    claiming the one inference slot. Joining that same queue is what keeps a
+    live test from racing Nexus for llama-server. A missing database is a
+    setup ERROR - SQLite would otherwise quietly create an empty one, which is
+    exactly the private queue this must never be.
+    """
+    from modules.local_llm_jobs import acquire_local_llm_job_service, release_local_llm_job_service
+    from modules.run_store import DEFAULT_DB_PATH
+
+    db_path = Path(DEFAULT_DB_PATH)
+    if not db_path.is_file():
+        pytest.fail(
+            f"Nexus database {db_path} not found; set AGENT_DB_PATH to the database "
+            "the running Nexus uses",
+            pytrace=False,
+        )
+    service = acquire_local_llm_job_service(db_path=str(db_path))
+    try:
+        yield service
+    finally:
+        release_local_llm_job_service(service)
+
+
 @pytest.fixture
-def orchestrator(llama_server, tmp_path):
-    """A real NexusTaskOrchestrator on a scratch database, one step at most."""
+def orchestrator(llama_server, nexus_llm_queue, tmp_path):
+    """A real NexusTaskOrchestrator, one step at most.
+
+    Inference runs on the production queue; sessions, memory and loop guard
+    on a scratch database.
+    """
     from modules.operations_registry import OperationsRegistry
     from modules.task_orchestrator import NexusTaskOrchestrator
 
@@ -116,6 +158,7 @@ def orchestrator(llama_server, tmp_path):
     orch = NexusTaskOrchestrator(
         operations_registry=registry,
         experiment_service=null_experiment_service(),
+        llm_job_service=nexus_llm_queue,
         max_steps=1,
     )
     try:
@@ -128,9 +171,10 @@ def orchestrator(llama_server, tmp_path):
 def controller_turn(orchestrator, live_result):
     """Run one real controller turn and return the parsed decision.
 
-    Renders the production prompt for ``task`` plus ``observations``, sends it
-    to the real model and stops after parsing the chosen action. The selected
-    tool is never executed.
+    Renders the production prompt for ``task`` plus ``observations``, queues it
+    on the production local-LLM queue and stops after parsing the chosen
+    action. The selected tool is never executed. ``llm_seconds`` includes the
+    time spent waiting for Nexus's own inference to finish.
     """
     from modules.task_orchestrator import _ORCHESTRATOR_RESPONSE_FORMAT
 
@@ -157,6 +201,7 @@ def controller_turn(orchestrator, live_result):
             prompt_chars=len(prompt),
             llm_seconds=round(time.monotonic() - started, 1),
             omitted_observation_indices=meta.get("omitted_observation_indices"),
+            queue_db=orchestrator.llm_jobs.db_path,
             decision=decision,
         )
         return decision
