@@ -99,6 +99,7 @@ from modules.tool_loop_guard import PersistentToolLoopGuard
 ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
+ACTION_KNOWLEDGE_COLLECTOR = "knowledge_collector"
 
 # Delegates the local controller may fall back to after a local inference
 # failure. ``local_worker`` is deliberately excluded because it uses the same
@@ -118,6 +119,7 @@ _ORCHESTRATOR_TOOLS = {
     TOOL_FIND_TOOL,
     ACTION_CALL_TOOL,
     "memory_search",
+    ACTION_KNOWLEDGE_COLLECTOR,
     "delegate",
     ACTION_COMMAND,
     TOOL_PYTHON_RUN,
@@ -128,7 +130,7 @@ logger = logging.getLogger(__name__)
 # Decision fields worth journalling. Not the whole decision: `message` can
 # be a page of prose and adds nothing to "why did it choose this".
 _DECISION_FIELDS = (
-    "tool", "goal", "query", "operation", "provider", "command",
+    "tool", "goal", "query", "request", "operation", "provider", "command",
     "script", "module", "experiment_id", "capability",
 )
 
@@ -147,6 +149,7 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
                     TOOL_FIND_TOOL,
                     ACTION_CALL_TOOL,
                     "memory_search",
+                    ACTION_KNOWLEDGE_COLLECTOR,
                     "delegate",
                     ACTION_COMMAND,
                     TOOL_PYTHON_RUN,
@@ -161,6 +164,7 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
             "tool": {"type": "string"},
             "arguments": {"type": "object", "additionalProperties": True},
             "query": {"type": "string"},
+            "request": {"type": "string"},
             "limit": {"type": "integer"},
             "provider": {"type": "string"},
             "task": {"type": "string"},
@@ -207,8 +211,8 @@ _ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
 )
 
 
-# The developer receives only the collector's final compact knowledge product.
-TOOL_KNOWLEDGE_BRIEFING = "knowledge_briefing"
+# Nexus receives only the collector's final compact factual knowledge product.
+TOOL_KNOWLEDGE_BRIEFING = ACTION_KNOWLEDGE_COLLECTOR
 
 _KNOWLEDGE_LOOKUP_REASON = "knowledge collector lookup"
 
@@ -690,12 +694,6 @@ class NexusTaskOrchestrator:
         blocker_event_id: int | None = None,
     ) -> TaskDecision:
         self._claimed_status(session.id, "active")
-        # Only the turn that opens a task has the task itself as input. A
-        # reply to a question or a capability resume would hand the collector
-        # the reply text instead, and brief the developer on that as facts.
-        opens_task = not resume_capability and not self.task_store.recent_events(
-            session.id, role="user", kind="input", limit=1
-        )
         if resume_capability:
             run_start_event_id = self.task_store.append_event(
                 session.id,
@@ -716,24 +714,6 @@ class NexusTaskOrchestrator:
                 metadata={"source_type": session.source_type, "source_id": session.source_id},
             )
         observations: list[dict[str, Any]] = []
-        knowledge_collector_enabled = os.environ.get(
-            "NEXUS_KNOWLEDGE_COLLECTOR_ENABLED",
-            os.environ.get("NEXUS_PREFLIGHT_PLANNER_ENABLED", ""),
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if knowledge_collector_enabled and opens_task:
-            knowledge_budget = compute_budget(
-                mem_available_kb=read_mem_available_kb(),
-                swap_free_kb=read_swap_free_kb(),
-                swap_total_kb=read_swap_total_kb(),
-            )
-            observations.extend(
-                await self._run_knowledge_collector(
-                    session,
-                    task,
-                    knowledge_budget,
-                    task_logger=task_logger,
-                )
-            )
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
         redundant_requests = 0
@@ -1605,6 +1585,19 @@ class NexusTaskOrchestrator:
                 "arguments": {"query": "string", "limit": "1..10"},
             },
             {
+                "name": ACTION_KNOWLEDGE_COLLECTOR,
+                "description": (
+                    "Gather additional factual context when it would materially help Nexus "
+                    "understand or solve the current task. The collector may use read-only "
+                    "sources and project memory, deduplicates what it finds, and returns one "
+                    "compact factual briefing. It does not plan, implement, or choose Nexus' "
+                    "next action."
+                ),
+                "arguments": {
+                    "request": "focused research request describing what Nexus needs to know",
+                },
+            },
+            {
                 "name": "delegate",
                 "description": (
                     "Ask another bounded LLM worker for analysis/research/review. "
@@ -1621,9 +1614,8 @@ class NexusTaskOrchestrator:
             {
                 "name": ACTION_COMMAND,
                 "description": (
-                    "Local development tool: execute one shell command through the "
-                    "trusted development command primitive, observe its real output, "
-                    "then keep control and decide again."
+                    "Execute one trusted local shell command for repository or machine work, "
+                    "observe its real output, then keep control and decide again."
                 ),
                 "arguments": {"command": "shell command"},
             },
@@ -1650,7 +1642,7 @@ class NexusTaskOrchestrator:
 
     @staticmethod
     def _knowledge_request(task: str) -> str:
-        """Translate a development task into a research-only request for the collector."""
+        """Normalize a Nexus research request for the knowledge collector."""
         stripped = task.strip()
         lowered = stripped.lower()
         match = re.search(r"github\s+issue\s+#?(\d+)", lowered)
@@ -1687,18 +1679,20 @@ class NexusTaskOrchestrator:
             if force_briefing
             else "Either request one useful lookup or return the final briefing."
         )
-        return f"""You are the Nexus knowledge collector.
+        return f"""You are the Nexus Knowledge Collector.
 
-Before Nexus starts development, gather and combine the knowledge that materially helps with the task.
+Nexus has asked you to gather knowledge needed for its current task.
 
 Your job is research and synthesis only:
-- Use read-only sources or project memory when they add useful knowledge.
-- Combine overlapping information and remove duplicates.
+- Gather only information relevant to the research request.
+- Use available read-only sources and project memory when useful.
+- Combine duplicate or overlapping information and remove duplicates.
 - Prefer facts already present in the collected sources over repeating a lookup.
-- Do not plan the implementation.
+- Do not plan the solution.
+- Do not decide what Nexus should do next.
 - Do not choose development tools.
-- Do not edit files, run development commands or tests, or claim the task is solved.
-- Your final product is one compact factual briefing for the developer.
+- Do not modify anything, run development commands or tests, or claim the task is solved.
+- Your final product is one compact factual briefing for Nexus to reason with.
 - Preserve concrete facts such as root cause, affected component, constraints, prior attempts, and acceptance criteria when present.
 - Do not invent missing facts.
 
@@ -1806,9 +1800,9 @@ Return exactly one JSON object matching the schema."""
     def _knowledge_collector_unavailable_briefing(exc: BaseException) -> dict[str, Any]:
         return {
             "tool": TOOL_KNOWLEDGE_BRIEFING,
-            "briefing": "",
+            "knowledge_briefing": "",
             "collector_error": str(exc)[:1000],
-            "bounded_reason": "knowledge collector unavailable; developer controller retains control",
+            "bounded_reason": "knowledge collector unavailable; Nexus retains control",
         }
 
     async def _run_knowledge_collector(
@@ -1818,8 +1812,8 @@ Return exactly one JSON object matching the schema."""
         budget_plan: PromptBudgetPlan,
         *,
         task_logger: Any | None = None,
-    ) -> list[dict[str, Any]]:
-        """Collect explicit task references deterministically, then synthesize them."""
+    ) -> dict[str, Any]:
+        """Collect explicit research references deterministically, then synthesize them."""
         knowledge_request = self._knowledge_request(task)
         sources: list[dict[str, Any]] = []
 
@@ -1954,16 +1948,14 @@ Return exactly one JSON object matching the schema."""
                     "source_count": len(sources),
                 },
             )
-            return [
-                {
-                    "tool": TOOL_KNOWLEDGE_BRIEFING,
-                    "briefing": decision["briefing"],
-                    "source_count": len(sources),
-                    "deterministic_retrieval": True,
-                }
-            ]
+            return {
+                "tool": TOOL_KNOWLEDGE_BRIEFING,
+                "knowledge_briefing": decision["briefing"],
+                "source_count": len(sources),
+                "deterministic_retrieval": True,
+            }
         except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
-            return [self._knowledge_collector_unavailable_briefing(exc)]
+            return self._knowledge_collector_unavailable_briefing(exc)
 
     def _build_prompt(
         self,
@@ -2028,9 +2020,9 @@ Return exactly one JSON object matching the schema."""
         as the final thing it reads is measurably worse at answering in the
         requested shape, and those few tokens are cheap to recompute.
         """
-        return f"""You are Nexus, an autonomous software developer working on this repository. You own the task from understanding through implementation and verification.
-You reason about the problem yourself, decide the approach, implement the solution, run tests, verify the result, and keep control after every observation.
-You are not a tool router. Tools and capabilities are instruments you use to inspect, modify, test, verify, retrieve information, delegate bounded work, or run experiments. They do not solve the task for you.
+        return f"""You are Nexus, an autonomous agent. You receive a task and own it from understanding through execution and verification.
+Reason about the task yourself and decide what information, actions, and verification are needed. Available capabilities are instruments you may use; they do not own or solve the task for you.
+You are not a tool router. Keep control after every observation and decide what to do next.
 Your task state persists across tool calls and user replies. Continue from the current state instead of restarting the task.
 
 SOURCE:
@@ -2050,6 +2042,7 @@ Tool discovery/execution:
 {{"action":"find_tool","goal":"{FIND_TOOL_GOAL_PLACEHOLDER}","reason":"<why this task needs that capability>"}}
 {{"action":"call_tool","tool":"<tool returned by find_tool>","arguments":{{...}},"reason":"..."}}
 Controller-native capabilities:
+{{"action":"knowledge_collector","request":"<focused research request>","reason":"<why more context would materially help>"}}
 {{"action":"memory_search","query":"...","limit":6,"reason":"..."}}
 {{"action":"delegate","provider":"local_worker|codex_readonly|azure_openai","task":"bounded sub-problem","context":"optional","reason":"..."}}
 {{"action":"command","command":"<shell command>","reason":"..."}}
@@ -2059,8 +2052,10 @@ Final action:
 {{"action":"clarification|missing_capability","message":"...","reason":"...","information_gap":"...","gap_kind":"user_intent|user_preference|user_authorization|external_information|missing_capability","evidence_event_ids":[123],"why_human_required":"...","capability":"stable capability identifier","required_inputs":["input_name"]}}
 
 Model policy:
-- Nexus owns the reasoning and implementation. Understand the problem, diagnose root causes, design fixes and tests, and decide what to implement yourself.
-- Use `command`, `python_run`, and other capabilities only as instruments to inspect, modify, test, and verify the repository. Do not treat a tool as the implementer.
+- Nexus owns the task. Understand it, reason about what is needed, execute the work, verify the result, and decide when it is complete.
+- Use `knowledge_collector` when additional context would materially help you understand or solve the task. Give it a focused research request. It returns factual knowledge only; after receiving the briefing, you remain responsible for deciding what to do next.
+- If the task requires local repository or machine work, use `command` or `python_run` directly to inspect, modify, test, and verify the local code or machine. These capabilities are explicitly available and must not be discovered through find_tool.
+- Use capabilities as instruments. Do not treat a tool as the owner or implementer of the task.
 - `find_tool` is only for discovering a specific read-only OperationsRegistry operation that Nexus actually needs. It is not the default way to make progress.
 - Do not use `find_tool` for reasoning or development responsibilities such as "understand the problem", "find the root cause", "decide how to fix this", "design a test", "implement the solution", "exclude bookkeeping from the memory index", or "propose a solution". Those are Nexus' responsibilities.
 - Good `find_tool` goals request concrete external/read-only information, for example "fetch GitHub issue #238" or "read the service_logs of llama-server".
@@ -2074,12 +2069,12 @@ Model policy:
 
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
-- If a `knowledge_briefing` observation is present, treat its `briefing` as compact factual context gathered before development. Do not repeat those information lookups unless later evidence creates a genuinely new need.
+- If a `knowledge_collector` observation contains `knowledge_briefing`, treat it as compact factual context gathered at your request. Do not repeat those information lookups unless later evidence creates a genuinely new need.
 - Use `memory_search` only when prior project context could materially change the next decision, especially when important information is missing, earlier work may exist, or you are stuck. Do not search memory mechanically.
 - Before using `memory_search`, decide whether previous project context is actually needed to make progress. If the current input and observations already provide enough information to choose the next step, keep working instead of searching memory.
 - Memory is for missing or potentially relevant historical context, not for re-reading information that is already present in the current task or observations. Do not use `memory_search` merely to obtain the contents of a specifically named current GitHub issue or other directly addressable source.
 - Use find_tool only when you need a concrete read-only OperationsRegistry capability that has not already been resolved in this session; then invoke only the returned identifier with call_tool. Never guess concrete tool names.
-- Example: for "solve github issue #238", first obtain the issue contents if necessary. Once the issue is known, reason about it yourself. If code must change, inspect the repository and implement the change using local execution capabilities. Do not search for a capability named "solve issue", "find root cause", "propose solution", or a textual description of the desired code change.
+- Example: for "solve github issue #238", if you need issue/history context, ask `knowledge_collector` for the relevant facts. Once enough context is known, reason about it yourself. If code must change, inspect and modify the repository using local execution capabilities. Do not search for a capability named "solve issue", "find root cause", "propose solution", or a textual description of the desired code change.
 - Name the concrete values a capability needs inside the find_tool goal ("the service_logs of llama-server"). When they can be read straight out of the goal, that operation is executed for you and its result is the next observation - do not call it again. A goal that names none, for a capability that takes some, comes back with the reason and is yours to call with explicit arguments.
 - A find_tool observation with status=not_found and retryable=false is terminal for that exact goal while state is unchanged. Never repeat the identical lookup, and never re-word it into the same request.
 - Read that observation's `related_operations` before deciding: each is a full descriptor with `operation`, `description`, `why_relevant` and the `arguments` schema. If one of those descriptions satisfies the reason you gave, resolve it with a new find_tool goal that names that operation, then call it. Otherwise follow `recommended_next_action`/`direct_capabilities`, use command/python_run, or choose missing_capability. related_operations are suggestions only and are not call_tool grants.
@@ -2138,6 +2133,8 @@ Decide the next step now. Return JSON only.
             return tool, {"query": str(decision.get("query", "")).strip(), "limit": limit}
         if tool == TOOL_FIND_TOOL:
             return tool, {"goal": str(decision.get("goal", "")).strip()}
+        if tool == ACTION_KNOWLEDGE_COLLECTOR:
+            return tool, {"request": str(decision.get("request", "")).strip()}
         if tool == "delegate":
             return tool, {
                 "provider": str(decision.get("provider", "")).strip(),
@@ -2499,15 +2496,37 @@ Decide the next step now. Return JSON only.
                 "gap_kind": "completion_evidence",
                 "reason": (
                     "Implementation-intent tasks cannot finish from read-only context alone; "
-                    "no state change was observed by the executor after any command."
+                    "no state change was observed by the executor after any command. Continue "
+                    "working on the original task; this meta-gap is not a missing capability."
                 ),
                 "candidate_operations": [],
                 "retryable": True,
-                "recommended_next_action": ACTION_MISSING_CAPABILITY,
+                "recommended_next_action": "continue_work",
             }
 
         if action not in {ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY}:
             return None
+
+        if (
+            action == ACTION_MISSING_CAPABILITY
+            and requires_completion
+            and str(decision.get("information_gap", "")).strip().lower()
+            == "implementation completion evidence"
+        ):
+            return {
+                "event": "terminal_decision_rejected",
+                "terminal_action": action,
+                "information_gap": "implementation completion evidence",
+                "gap_kind": "completion_evidence",
+                "reason": (
+                    "Missing implementation completion evidence means the task is unfinished; "
+                    "it does not prove a capability is missing. Continue the original task."
+                ),
+                "candidate_operations": [],
+                "retryable": True,
+                "recommended_next_action": "continue_work",
+                "direct_capabilities": [ACTION_COMMAND, TOOL_PYTHON_RUN],
+            }
 
         gap_kind = str(decision.get("gap_kind", "")).strip().lower()
         information_gap = str(
@@ -2789,6 +2808,26 @@ Decide the next step now. Return JSON only.
             except (TypeError, ValueError):
                 limit = 6
             return {"tool": "memory_search", "query": query[:500], "results": self.memory.search(query, limit=limit)}
+        if tool == ACTION_KNOWLEDGE_COLLECTOR:
+            request = str(decision.get("request", "")).strip()
+            if not request:
+                raise TaskOrchestratorError("knowledge_collector requires request")
+            session_id = str(decision.get("session_id", "")).strip()
+            session = self.task_store.get(session_id)
+            if session is None:
+                raise TaskOrchestratorError("knowledge_collector requires a valid task session")
+            if budget_plan is None:
+                budget_plan = compute_budget(
+                    mem_available_kb=read_mem_available_kb(),
+                    swap_free_kb=read_swap_free_kb(),
+                    swap_total_kb=read_swap_total_kb(),
+                )
+            return await self._run_knowledge_collector(
+                session,
+                request,
+                budget_plan,
+                task_logger=task_logger,
+            )
         if tool == "delegate":
             provider = str(decision.get("provider", "")).strip()
             subtask = str(decision.get("task", "")).strip()
