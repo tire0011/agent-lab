@@ -1577,14 +1577,6 @@ class NexusTaskOrchestrator:
                 },
             },
             {
-                "name": "memory_search",
-                "description": (
-                    "Search Nexus memory: structured knowledge, previous task/dialog "
-                    "history and project memory documents."
-                ),
-                "arguments": {"query": "string", "limit": "1..10"},
-            },
-            {
                 "name": ACTION_KNOWLEDGE_COLLECTOR,
                 "description": (
                     "Gather additional factual context when it would materially help Nexus "
