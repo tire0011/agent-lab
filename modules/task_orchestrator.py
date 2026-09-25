@@ -2043,7 +2043,9 @@ Return exactly one JSON object matching the schema."""
             for observation in observations
         )
 
-        tool_results_block = ("\n\n" + tool_results) if tool_results else ""\n\n        return f"""You are Nexus, an autonomous agent.
+        tool_results_block = ("\n\n" + tool_results) if tool_results else ""
+
+        return f"""You are Nexus, an autonomous agent.
 Own the task from understanding through execution and verification.
 
 INPUT:
