@@ -1318,6 +1318,11 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertIn("python_run", prompt)
             self.assertIn("must not be discovered through find_tool", prompt)
             self.assertIn("`used_sources` lists sources already consulted", prompt)
+            self.assertLess(prompt.index("AVAILABLE CAPABILITIES:"), prompt.index("Decide the next step now."))
+            self.assertGreater(prompt.index("AVAILABLE CAPABILITIES:"), prompt.index("OBSERVATIONS FROM TOOLS USED IN THIS RUN:"))
+            self.assertNotIn("Controller-native capabilities:", prompt)
+            self.assertLessEqual(prompt.count("memory_search"), 2)
+            self.assertLess(len(prompt), 10000)
         finally:
             orchestrator.close()
 
