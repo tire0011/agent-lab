@@ -1317,7 +1317,7 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertIn("command", prompt)
             self.assertIn("python_run", prompt)
             self.assertIn("must not be discovered through find_tool", prompt)
-            self.assertIn("used_sources lists sources already consulted", prompt)
+            self.assertIn("`used_sources` lists sources already consulted", prompt)
         finally:
             orchestrator.close()
 
