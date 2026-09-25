@@ -1316,6 +1316,7 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertIn("knowledge_collector", prompt)
             self.assertIn("command", prompt)
             self.assertIn("python_run", prompt)
+            self.assertNotIn('"name":"memory_search"', prompt)
             self.assertIn("find_tool only discovers a concrete read-only OperationsRegistry operation", prompt)
             self.assertIn("used_sources lists sources already consulted", prompt)
             self.assertNotIn("SOURCE:", prompt)
