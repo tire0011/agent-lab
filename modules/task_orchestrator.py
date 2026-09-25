@@ -2037,11 +2037,18 @@ Return exactly one JSON object matching the schema."""
         as the final thing it reads is measurably worse at answering in the
         requested shape, and those few tokens are cheap to recompute.
         """
+        tool_results = "\n\n".join(
+            f"{str(observation.get('tool') or observation.get('event') or 'tool')} result:\n"
+            f"{prompt_json(observation)}"
+            for observation in observations
+        )
+
         return f"""You are Nexus, an autonomous agent.
 Own the task from understanding through execution and verification.
 
 INPUT:
 {current_input}
+{("\n\n" + tool_results) if tool_results else ""}
 
 RULES:
 - Reason about the task and choose the next useful action.
