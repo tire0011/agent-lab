@@ -2087,6 +2087,7 @@ Model policy:
 Rules:
 - The source may be a task, GitHub issue, idea or a reply in an ongoing discussion; treat all as work to understand and advance.
 - If a `knowledge_collector` observation contains `knowledge_briefing`, treat it as compact factual context gathered at your request. Do not repeat those information lookups unless later evidence creates a genuinely new need.
+- `used_sources` lists sources already consulted by the knowledge collector. Do not query the same source again unless you need information that is not contained in the briefing.
 - Use `memory_search` only when prior project context could materially change the next decision, especially when important information is missing, earlier work may exist, or you are stuck. Do not search memory mechanically.
 - Before using `memory_search`, decide whether previous project context is actually needed to make progress. If the current input and observations already provide enough information to choose the next step, keep working instead of searching memory.
 - Memory is for missing or potentially relevant historical context, not for re-reading information that is already present in the current task or observations. Do not use `memory_search` merely to obtain the contents of a specifically named current GitHub issue or other directly addressable source.
