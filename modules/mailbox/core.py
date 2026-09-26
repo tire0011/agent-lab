@@ -38,7 +38,7 @@ STATUS_DONE = "done"
 STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
 STATUS_DEFERRED = "deferred"
 _DEFERRED_PROCESSING = object()
-SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain", "refresh"}
+SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain", "refresh", "diagnose"}
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
     re.compile(r"AZURE_[A-Z_]+\s*=\s*\S"),
