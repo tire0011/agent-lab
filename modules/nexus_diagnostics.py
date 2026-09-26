@@ -74,6 +74,7 @@ logger = logging.getLogger(__name__)
 SUBJECT_TASK = "task"
 SUBJECT_EXPERIMENT = "experiment"
 SUBJECT_SESSION = "session"
+SUBJECT_LLM_JOB = "llm_job"
 
 # Lifecycle vocabulary. Each subsystem keeps its own status values - they mean
 # something precise there and renaming them would be a lie - and this is the
@@ -157,6 +158,14 @@ _ADOPTION_LIFECYCLE: dict[str, str] = {
     "interrupted": LIFECYCLE_ABANDONED,
 }
 
+_LLM_JOB_LIFECYCLE: dict[str, str] = {
+    "queued": LIFECYCLE_QUEUED,
+    "running": LIFECYCLE_RUNNING,
+    "succeeded": LIFECYCLE_SUCCEEDED,
+    "failed": LIFECYCLE_FAILED,
+    "cancelled": LIFECYCLE_ABANDONED,
+}
+
 _SESSION_LIFECYCLE: dict[str, str] = {
     "queued": LIFECYCLE_QUEUED,
     "active": LIFECYCLE_RUNNING,
@@ -203,6 +212,7 @@ _RESOLUTION_TABLES: tuple[tuple[str, str], ...] = (
     (SUBJECT_TASK, "mailbox_task_approvals"),
     (SUBJECT_EXPERIMENT, "experiments"),
     (SUBJECT_SESSION, "nexus_task_sessions"),
+    (SUBJECT_LLM_JOB, "local_llm_jobs"),
 )
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -769,6 +779,8 @@ class NexusDiagnostics:
             return self.experiment_status(subject_id)
         if subject_type == SUBJECT_SESSION:
             return self.session_status(subject_id)
+        if subject_type == SUBJECT_LLM_JOB:
+            return self.llm_job_status(subject_id)
         raise DiagnosticsError(f"unknown subject type: {subject_type!r}")
 
     def task_status(self, task_id: str) -> LifecycleState:
@@ -915,6 +927,80 @@ class NexusDiagnostics:
         }
         state.progress = self._progress(state, row)
         return state
+
+    def llm_job_status(self, job_id: str) -> LifecycleState:
+        row = self._fetchone(
+            "SELECT * FROM local_llm_jobs WHERE id = ?", (job_id,)
+        )
+        if row is None:
+            raise DiagnosticsError(f"no local LLM job {job_id[:64]!r}")
+        status = str(row["status"] or "")
+        created_at = _column(row, "created_at")
+        started_at = _column(row, "started_at")
+        finished_at = _column(row, "finished_at")
+        session_id = _column(row, "session_id")
+        result = _text(_column(row, "result"), 32000)
+        prompt = _column(row, "prompt")
+        correlation = {"job_id": job_id}
+        if session_id:
+            correlation["session_id"] = str(session_id)
+        state = LifecycleState(
+            subject_type=SUBJECT_LLM_JOB,
+            subject_id=job_id,
+            lifecycle=_LLM_JOB_LIFECYCLE.get(status, LIFECYCLE_UNKNOWN),
+            status=status,
+            created_at=created_at,
+            updated_at=finished_at or started_at or created_at,
+            ended_at=finished_at,
+            last_error=_text(_column(row, "error"), _MAX_ERROR_CHARS),
+            correlation_ids=correlation,
+            service=SERVICE_ALIASES["llm"],
+            related={
+                "role": _column(row, "role"),
+                "error_kind": _column(row, "error_kind"),
+                "prompt_chars": len(str(prompt or "")),
+                "result": result,
+            },
+        )
+        if session_id:
+            state.related["session_id"] = str(session_id)
+        state.progress = self._progress(state, None)
+        return state
+
+    def inspect(
+        self,
+        reference: str,
+        *,
+        subject: str | None = None,
+        include: Sequence[str] = (),
+        lines: object = None,
+    ) -> dict[str, Any]:
+        """Generic read-only diagnostic entry point for every supported subject."""
+        requested = {str(item).strip().lower() for item in include if str(item).strip()}
+        if subject and subject not in {
+            SUBJECT_TASK, SUBJECT_EXPERIMENT, SUBJECT_SESSION, SUBJECT_LLM_JOB, "auto"
+        }:
+            raise DiagnosticsError(f"unknown diagnostic subject: {subject!r}")
+
+        if subject and subject != "auto":
+            subject_type, subject_id = subject, reference
+        else:
+            subject_type, subject_id = self.resolve(reference)
+
+        report = self.diagnose_subject(
+            subject_type, subject_id, lines=lines, reference=reference
+        )
+        payload = report.to_dict()
+
+        if subject_type == SUBJECT_LLM_JOB and "prompt" in requested:
+            row = self._fetchone(
+                "SELECT prompt FROM local_llm_jobs WHERE id = ?", (subject_id,)
+            )
+            if row is not None:
+                payload.setdefault("details", {})["prompt"] = _text(
+                    _column(row, "prompt"), 32000
+                )
+        return payload
 
     # ------------------------------------------------------------------
     # Joins onto the subsystems that own the remaining facts
