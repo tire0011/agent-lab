@@ -195,6 +195,40 @@ class DiagnosticsFixture(unittest.TestCase):
         self.conn.commit()
         return session.id
 
+    def add_llm_job(
+        self,
+        *,
+        status: str = "succeeded",
+        result: str = '{"action":"command","command":"git status"}',
+        prompt: str = "controller prompt",
+        role: str = "controller",
+        session_id: str | None = None,
+    ) -> str:
+        job_id = uuid.uuid4().hex
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS local_llm_jobs (
+                   id TEXT PRIMARY KEY, status TEXT NOT NULL, prompt TEXT NOT NULL,
+                   temperature REAL NOT NULL, max_tokens INTEGER NOT NULL,
+                   response_format TEXT, session_id TEXT, created_at TEXT NOT NULL,
+                   started_at TEXT, finished_at TEXT, result TEXT, error TEXT,
+                   role TEXT NOT NULL DEFAULT 'controller', system TEXT,
+                   error_kind TEXT, worker_id TEXT, lease_expires_at TEXT
+               )"""
+        )
+        self.conn.execute(
+            """INSERT INTO local_llm_jobs
+                   (id,status,prompt,temperature,max_tokens,session_id,created_at,
+                    started_at,finished_at,result,role)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                job_id, status, prompt, 0.0, 550, session_id, _iso(3),
+                _iso(2), _iso(1) if status not in {"queued", "running"} else None,
+                result, role,
+            ),
+        )
+        self.conn.commit()
+        return job_id
+
     def write_log(self, name: str, entries: list[dict]) -> None:
         path = self.log_dir / name
         with path.open("w", encoding="utf-8") as handle:
@@ -266,6 +300,28 @@ class ReadOnlyConnectionTests(DiagnosticsFixture):
         state = diagnostics.status("lonely1")
         self.assertEqual(LIFECYCLE_RUNNING, state.lifecycle)
         self.assertIsNone(state.pr_number)
+
+
+class LocalLlmJobDiagnosticsTests(DiagnosticsFixture):
+    def test_llm_job_is_a_first_class_diagnostic_subject(self) -> None:
+        job_id = self.add_llm_job(result='{"action":"find_tool","arguments":{"goal":"inspect repo"}}')
+        payload = self.diagnostics().inspect(job_id, subject="llm_job")
+        self.assertEqual("llm_job", payload["lifecycle"]["subject_type"])
+        self.assertEqual(job_id, payload["lifecycle"]["subject_id"])
+        self.assertEqual("succeeded", payload["lifecycle"]["status"])
+        self.assertEqual(
+            '{"action":"find_tool","arguments":{"goal":"inspect repo"}}',
+            payload["lifecycle"]["related"]["result"],
+        )
+        self.assertNotIn("details", payload)
+
+    def test_llm_job_auto_resolves_and_prompt_is_opt_in(self) -> None:
+        job_id = self.add_llm_job(prompt="SECRET controller prompt")
+        diagnostics = self.diagnostics()
+        without_prompt = diagnostics.inspect(job_id)
+        self.assertNotIn("details", without_prompt)
+        with_prompt = diagnostics.inspect(job_id, include=["prompt"])
+        self.assertEqual("SECRET controller prompt", with_prompt["details"]["prompt"])
 
 
 class ProgressVerdictTests(unittest.TestCase):
