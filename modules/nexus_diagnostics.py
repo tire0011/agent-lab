@@ -1338,6 +1338,32 @@ class NexusDiagnostics:
         result.entries = [_compact(entry) for entry in entries]
         return result
 
+    # ------------------------------------------------------------------
+    # Local LLM jobs (#259)
+    # ------------------------------------------------------------------
+
+    def llm_job(self, job_id: str) -> dict[str, Any]:
+        """One persisted ``local_llm_jobs`` row, looked up by its exact id.
+
+        Exact id only: a job id is what the controller and the journal print,
+        and a prefix match here would add a second resolution rule for no
+        gain. Free text (prompt, system, result, error) is redacted on the way
+        out; the row itself is only read.
+        """
+        candidate = (job_id or "").strip()
+        if not candidate:
+            raise DiagnosticsError("a job id is required")
+        if not _SAFE_ID_RE.fullmatch(candidate):
+            raise DiagnosticsError(f"unusable job id: {candidate[:64]!r}")
+        row = self._fetchone("SELECT * FROM local_llm_jobs WHERE id = ?", (candidate,))
+        if row is None:
+            raise DiagnosticsError(f"no local LLM job with id {candidate[:64]!r}")
+        job = {key: row[key] for key in row.keys()}
+        for key in ("prompt", "system", "result", "error"):
+            if job.get(key) is not None:
+                job[key] = redact(str(job[key]))
+        return job
+
 
 def _column(row: Any, name: str) -> Any:
     """Read a column that may not exist on an older row shape.
@@ -1405,6 +1431,69 @@ def render_report(report: DiagnosticReport) -> list[str]:
     return lines
 
 
+LLM_JOB_VIEWS = ("summary", "result", "prompt")
+# Bounds the full-text views; a local model's answer is far below this.
+_MAX_LLM_JOB_TEXT_CHARS = 50_000
+
+
+def _chars(value: Any) -> int:
+    return len(value) if isinstance(value, str) else 0
+
+
+def _bounded_text_lines(label: str, value: Any) -> list[str]:
+    if not value:
+        return [f"{label}: -"]
+    text = str(value)
+    truncated = len(text) > _MAX_LLM_JOB_TEXT_CHARS
+    lines = [f"{label}:" + (" (truncated)" if truncated else "")]
+    lines.extend(text[:_MAX_LLM_JOB_TEXT_CHARS].splitlines())
+    return lines
+
+
+def render_llm_job(job: dict[str, Any], *, view: str = "summary") -> list[str]:
+    """``nexus debug llm-job <id> [--result|--prompt]`` as key/value lines."""
+    if view not in LLM_JOB_VIEWS:
+        raise DiagnosticsError(f"view must be one of: {', '.join(LLM_JOB_VIEWS)}")
+    if view == "result":
+        return [f"job_id: {job['id']}", *_bounded_text_lines("result", job.get("result"))]
+    if view == "prompt":
+        return [
+            f"job_id: {job['id']}",
+            *_bounded_text_lines("system", job.get("system")),
+            *_bounded_text_lines("prompt", job.get("prompt")),
+        ]
+    started = parse_timestamp(job.get("started_at"))
+    finished = parse_timestamp(job.get("finished_at"))
+    duration = (
+        f"{(finished - started).total_seconds():.1f}s" if started and finished else "-"
+    )
+    result = job.get("result")
+    return [
+        f"job_id: {job['id']}",
+        f"role: {job.get('role') or '-'}",
+        f"session_id: {job.get('session_id') or '-'}",
+        # Every job runs on the local llama.cpp server; the model name is
+        # not persisted per job.
+        "provider: local",
+        f"status: {job.get('status') or '-'}",
+        f"created_at: {job.get('created_at') or '-'}",
+        f"started_at: {job.get('started_at') or '-'}",
+        f"finished_at: {job.get('finished_at') or '-'}",
+        f"duration: {duration}",
+        f"worker: {job.get('worker_id') or '-'}",
+        f"lease_expires_at: {job.get('lease_expires_at') or '-'}",
+        f"temperature: {job.get('temperature') if job.get('temperature') is not None else '-'}",
+        f"max_tokens: {job.get('max_tokens') or '-'}",
+        f"response_format: {'yes' if job.get('response_format') else 'no'}",
+        f"prompt_chars: {_chars(job.get('prompt'))}",
+        f"system_chars: {_chars(job.get('system'))}",
+        f"result_chars: {_chars(result)}",
+        f"error_kind: {job.get('error_kind') or '-'}",
+        f"error: {_text(job.get('error')) or '-'}",
+        f"result_preview: {_text(result) or '-'}",
+    ]
+
+
 def _render_ids(ids: dict[str, str]) -> str:
     return ", ".join(f"{key}={value}" for key, value in sorted(ids.items()))
 
@@ -1427,12 +1516,14 @@ __all__ = [
     "DiagnosticReport",
     "DiagnosticsError",
     "KNOWN_SERVICES",
+    "LLM_JOB_VIEWS",
     "LifecycleState",
     "NexusDiagnostics",
     "ProgressVerdict",
     "SERVICE_ALIASES",
     "ServiceLogs",
     "assess_progress",
+    "render_llm_job",
     "render_report",
     "render_service_logs",
     "resolve_service",

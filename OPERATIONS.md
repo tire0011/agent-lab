@@ -480,13 +480,39 @@ interface reach it without HTTP:
 - `nexus_logs` - `reference`, `limit`
 - `nexus_last_failure` - `limit`
 - `service_logs` - `service`, `limit`, `since_minutes`
+- `nexus_llm_job` - `job_id`, `view` (#259)
 
-All four are catalogued `mutates_state=False`, which is what makes them
+All five are catalogued `mutates_state=False`, which is what makes them
 available to the read-only diagnostic role. A reference that resolves to
 nothing - or a database that cannot be read - comes back as an unsuccessful
 result with a reason, not as an operation fault. The failure-analysis routine reads
 the same backend, so a diagnosis and an operator looking at the same task see
 the same facts.
+
+### Inspecting one local LLM job (#259)
+
+`nexus debug llm-job <job-id> [--result|--prompt]` reads one `local_llm_jobs`
+row by its exact id, read-only (same `mode=ro` connection as above). It is
+available as `GET /diagnostics/llm-jobs/<id>` (plain text, needs `x-api-key`)
+and as the `nexus_llm_job` operation:
+
+| Command | HTTP | Operation args |
+| --- | --- | --- |
+| `nexus debug llm-job <id>` | `?view=summary` (default) | `{"job_id": "<id>"}` |
+| `nexus debug llm-job <id> --result` | `?view=result` | `{"job_id": "<id>", "view": "result"}` |
+| `nexus debug llm-job <id> --prompt` | `?view=prompt` | `{"job_id": "<id>", "view": "prompt"}` |
+
+The default view shows role, session, status, timestamps, duration,
+prompt/result size, error and a result preview; `result` prints the full
+result, `prompt` the system prompt and prompt. Prompt, result and error are
+redacted like every other diagnostic output. The model name is not stored per
+job, so only `provider: local` is shown. An unknown id is a 404 (operation:
+an unsuccessful result) naming the id.
+
+```bash
+curl -sH "x-api-key: $AGENT_API_KEY" \
+  "https://<host>/diagnostics/llm-jobs/<id>?view=result"
+```
 
 ## Maintenance API (temporary remote-maintenance bridge)
 

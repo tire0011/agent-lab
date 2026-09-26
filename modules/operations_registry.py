@@ -213,6 +213,22 @@ class OperationsRegistry:
                 [*diagnostic_tags, "failure", "last failure", "error", "crash"],
                 mutates_state=False,
             ),
+            "nexus_llm_job": OperationSpec(
+                "nexus_llm_job",
+                "Ein gespeicherter lokaler LLM-Job read-only: Rolle, Session, Status, "
+                "Zeitstempel, Dauer, Prompt-Größe, Ergebnis und Fehler; mit view=result "
+                "das volle Ergebnis, mit view=prompt System-Prompt und Prompt. "
+                "Secrets bleiben maskiert (#259).",
+                [
+                    OperationArgSpec("job_id", "string", "Exakte ID des lokalen LLM-Jobs.", required=True),
+                    OperationArgSpec("view", "string", "summary (Standard), result oder prompt.", default="summary"),
+                ],
+                [
+                    *diagnostic_tags, "local model", "llm", "llm job", "job", "controller",
+                    "prompt", "result", "debug",
+                ],
+                mutates_state=False,
+            ),
             "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service], ["service", "status", "systemd", "health"], mutates_state=False),
             "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id], ["adoption", "status", "summary", "inspect"], mutates_state=False),
             "github_status": OperationSpec(
@@ -576,7 +592,12 @@ class OperationsRegistry:
             raise OperationValidationError("reference ist erforderlich.")
         return value.strip()
 
-    def _run_diagnostic(self, operation: str, build: Callable[[Any], Any]) -> OperationResult:
+    def _run_diagnostic(
+        self,
+        operation: str,
+        build: Callable[[Any], Any],
+        render: Callable[[Any], list[str]] | None = None,
+    ) -> OperationResult:
         from modules.nexus_diagnostics import DiagnosticsError, render_report
 
         started = time.perf_counter()
@@ -584,6 +605,7 @@ class OperationsRegistry:
         try:
             diagnostics = self._diagnostics()
             report = build(diagnostics)
+            output_lines = (render or render_report)(report)
         except DiagnosticsError as exc:
             # A reference that resolves to nothing - or a database that cannot
             # be read - is an answer, not a crash: "I looked and found
@@ -603,7 +625,7 @@ class OperationsRegistry:
         return OperationResult(
             operation=operation,
             success=True,
-            output_lines=render_report(report),
+            output_lines=output_lines,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
 
@@ -617,6 +639,21 @@ class OperationsRegistry:
     def _op_nexus_status(self, args: dict[str, Any]) -> OperationResult:
         reference = self._reference(args)
         return self._run_diagnostic("nexus_status", lambda d: d.status_report(reference))
+
+    def _op_nexus_llm_job(self, args: dict[str, Any]) -> OperationResult:
+        from modules.nexus_diagnostics import LLM_JOB_VIEWS, render_llm_job
+
+        job_id = args.get("job_id")
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise OperationValidationError("job_id ist erforderlich.")
+        view = args.get("view") or "summary"
+        if view not in LLM_JOB_VIEWS:
+            raise OperationValidationError("view muss summary, result oder prompt sein.")
+        return self._run_diagnostic(
+            "nexus_llm_job",
+            lambda d: d.llm_job(job_id.strip()),
+            lambda job: render_llm_job(job, view=view),
+        )
 
     def _op_nexus_last_failure(self, args: dict[str, Any]) -> OperationResult:
         limit = self._limit(args, default=50, maximum=500)
