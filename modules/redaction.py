@@ -135,6 +135,24 @@ def redact_secrets(text: str) -> str:
     return _SECRET_PATTERN.sub(_redacted_assignment, text)
 
 
+# Only the userinfo part of a URL, so host and path stay readable.
+_URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^@\s/]*:[^@\s/]*@")
+
+
+def redact_credentials(text: str) -> str:
+    """Scrub credential values only; keep paths, URLs and keyword text.
+
+    For diagnostics whose payload is the text itself - a stored prompt or
+    model answer (#259) - where :func:`redact` would replace every path and
+    URL and make the text useless to analyse.
+    """
+    text = redact_known_secret_values(text)
+    text = _URL_USERINFO_PATTERN.sub(r"\1[REDACTED]@", text)
+    text = _BEARER_PATTERN.sub("Bearer [REDACTED]", text)
+    text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
+    return _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", text)
+
+
 def redact(text: str) -> str:
     """Scrub secret-shaped substrings and absolute filesystem paths."""
     return _PATH_PATTERN.sub("[PATH]", redact_secrets(text))

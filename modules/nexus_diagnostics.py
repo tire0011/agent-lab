@@ -66,7 +66,7 @@ from modules.heartbeat import (
     resolve_interval,
     resolve_stale_timeout,
 )
-from modules.redaction import redact, sanitized_reason
+from modules.redaction import redact, redact_credentials, sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -1347,8 +1347,9 @@ class NexusDiagnostics:
 
         Exact id only: a job id is what the controller and the journal print,
         and a prefix match here would add a second resolution rule for no
-        gain. Free text (prompt, system, result, error) is redacted on the way
-        out; the row itself is only read.
+        gain. Free text (prompt, system, result, error) has credential values
+        masked on the way out - paths, URLs and JSON stay intact, because
+        they are what the analysis needs; the row itself is only read.
         """
         candidate = (job_id or "").strip()
         if not candidate:
@@ -1361,7 +1362,7 @@ class NexusDiagnostics:
         job = {key: row[key] for key in row.keys()}
         for key in ("prompt", "system", "result", "error"):
             if job.get(key) is not None:
-                job[key] = redact(str(job[key]))
+                job[key] = redact_credentials(str(job[key]))
         return job
 
 
@@ -1440,6 +1441,12 @@ def _chars(value: Any) -> int:
     return len(value) if isinstance(value, str) else 0
 
 
+def _preview(value: Any) -> str | None:
+    # Already credential-masked by ``llm_job``; ``_text`` would also strip paths.
+    text = str(value).strip() if value is not None else ""
+    return text[:_MAX_MESSAGE_CHARS] or None
+
+
 def _bounded_text_lines(label: str, value: Any) -> list[str]:
     if not value:
         return [f"{label}: -"]
@@ -1489,8 +1496,8 @@ def render_llm_job(job: dict[str, Any], *, view: str = "summary") -> list[str]:
         f"system_chars: {_chars(job.get('system'))}",
         f"result_chars: {_chars(result)}",
         f"error_kind: {job.get('error_kind') or '-'}",
-        f"error: {_text(job.get('error')) or '-'}",
-        f"result_preview: {_text(result) or '-'}",
+        f"error: {_preview(job.get('error')) or '-'}",
+        f"result_preview: {_preview(result) or '-'}",
     ]
 
 

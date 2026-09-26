@@ -189,3 +189,30 @@ class LlmJobDiagnosticsApiTests(LlmJobFixture):
             404, self.client.get("/diagnostics/llm-jobs/nope", headers=self.headers).status_code
         )
         self.assertEqual(401, self.client.get("/diagnostics/llm-jobs/nope").status_code)
+
+
+class LlmJobMaskingTests(LlmJobFixture):
+    """Only credentials are masked; analysis-relevant text stays intact."""
+
+    def test_paths_urls_and_json_stay_readable(self) -> None:
+        prompt = (
+            'Edit /home/agent/repo/modules/x.py, see https://github.com/o/r/issues/259. '
+            '{"credential": "missing", "token_budget": 800}'
+        )
+        job_id = self.add_job(prompt=prompt, result="wrote /tmp/work/out.json")
+        text = "\n".join(self.run_op(job_id=job_id, view="prompt").output_lines)
+        self.assertIn(prompt, text)
+        result = "\n".join(self.run_op(job_id=job_id, view="result").output_lines)
+        self.assertIn("/tmp/work/out.json", result)
+
+    def test_credentials_are_still_masked(self) -> None:
+        ghp = "ghp_" + "b" * 36
+        prompt = (
+            f"key {_SECRET} gh {ghp} Authorization: Bearer abc.def "
+            "clone https://user:hunter2@github.com/o/r.git"
+        )
+        job_id = self.add_job(prompt=prompt)
+        text = "\n".join(self.run_op(job_id=job_id, view="prompt").output_lines)
+        for secret in (_SECRET, ghp, "abc.def", "hunter2"):
+            self.assertNotIn(secret, text)
+        self.assertIn("github.com/o/r.git", text)
