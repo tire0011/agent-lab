@@ -10,7 +10,7 @@ import re
 from urllib import error, request
 
 MAX_FILE_SIZE = 65536
-SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain"}
+SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain", "diagnose"}
 _SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
     re.compile(r"AZURE_[A-Z_]+\s*=\s*\S"),
