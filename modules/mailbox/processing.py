@@ -11,6 +11,7 @@ from typing import Any
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from .refresh import process_refresh as _process_refresh
+from .diagnose import process_diagnose as _process_diagnose
 
 from .core import (
     MAX_RETRY,
@@ -312,6 +313,7 @@ _PROCESSORS = {
     "context": _process_context,
     # Moving the deployment to a branch, with no shell in the message (#228).
     "refresh": _process_refresh,
+    "diagnose": _process_diagnose,
 }
 
 
