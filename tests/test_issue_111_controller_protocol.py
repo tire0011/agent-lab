@@ -130,6 +130,12 @@ class Issue111ControllerProtocolTests(unittest.TestCase):
         self.assertIn('"status":"succeeded"', client.prompts[3])
         self.assertNotIn('"grant_event_id"', client.prompts[3])
 
+    def test_find_tool_accepts_goal_nested_in_arguments(self):
+        decision = NexusTaskOrchestrator._parse(
+            '{"action":"find_tool","arguments":{"goal":"exclude bookkeeping from memory"}}'
+        )
+        self.assertEqual(decision["goal"], "exclude bookkeeping from memory")
+
     def test_call_tool_requires_arguments(self):
         with self.assertRaisesRegex(TaskOrchestratorError, "call_tool requires arguments"):
             NexusTaskOrchestrator._parse('{"action":"call_tool","tool":"git_status"}')

@@ -2710,6 +2710,12 @@ Decide the next step now. Return JSON only.
         if not action:
             raise TaskOrchestratorError("action response requires action")
         if action == TOOL_FIND_TOOL and not str(data.get("goal", "")).strip():
+            # The capability list shows find_tool's goal under "arguments", and
+            # the local model answers in exactly that shape (#257).
+            nested = data.get("arguments")
+            if isinstance(nested, dict) and str(nested.get("goal", "")).strip():
+                data = {**data, "goal": nested["goal"]}
+        if action == TOOL_FIND_TOOL and not str(data.get("goal", "")).strip():
             raise TaskOrchestratorError("find_tool requires goal")
         if action == ACTION_CALL_TOOL:
             if not str(data.get("tool", "")).strip():
