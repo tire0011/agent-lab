@@ -1,6 +1,7 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('state', 'logs', 'restart', 'mailbox')]
+    [Parameter(Position = 0)]
+    [ValidateSet('state', 'logs', 'restart', 'mailbox', 'debug')]
     [string]$Action = 'state',
 
     [ValidateRange(1, 1000)]
@@ -16,7 +17,12 @@ param(
     [switch]$Details,
 
     [ValidateRange(1, 20)]
-    [int]$ExperimentCount = 5
+    [int]$ExperimentCount = 5,
+
+    # Everything after the action for 'debug', passed through verbatim:
+    # nexus.ps1 debug llm-job <job-id> [--result|--prompt]
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$DebugArguments = @()
 )
 
 Set-StrictMode -Version Latest
@@ -233,9 +239,28 @@ function Restart-Nexus {
     Get-NexusState
 }
 
+function Invoke-NexusDebug {
+    # Read-only diagnostics (#259): the database is opened read-only by
+    # modules.nexus_diagnostics, so nothing here can change Nexus state.
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $Python = if ($env:AGENT_VENV_PYTHON) { $env:AGENT_VENV_PYTHON } else { Join-Path $RepoRoot '.venv/bin/python' }
+    if (-not (Test-Path $Python)) {
+        $Python = 'python3'
+    }
+    Push-Location $RepoRoot
+    try {
+        & $Python -m modules.nexus_diagnostics debug @DebugArguments
+        $script:DebugExitCode = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+}
+
 switch ($Action) {
     'state'   { Get-NexusState }
     'logs'    { Get-NexusLogs }
     'restart' { Restart-Nexus }
     'mailbox' { Invoke-NexusMailbox }
+    'debug'   { Invoke-NexusDebug; exit $script:DebugExitCode }
 }

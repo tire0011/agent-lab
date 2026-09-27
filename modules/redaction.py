@@ -140,7 +140,7 @@ _URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^@\s/]*:[^@\s/
 
 
 def redact_credentials(text: str) -> str:
-    """Scrub credential values only; keep paths, URLs and keyword text.
+    """Scrub credential values only; keep paths and URLs readable.
 
     For diagnostics whose payload is the text itself - a stored prompt or
     model answer (#259) - where :func:`redact` would replace every path and
@@ -150,7 +150,8 @@ def redact_credentials(text: str) -> str:
     text = _URL_USERINFO_PATTERN.sub(r"\1[REDACTED]@", text)
     text = _BEARER_PATTERN.sub("Bearer [REDACTED]", text)
     text = _SK_KEY_PATTERN.sub("[REDACTED]", text)
-    return _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", text)
+    text = _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", text)
+    return _SECRET_PATTERN.sub(_redacted_assignment, text)
 
 
 def redact(text: str) -> str:

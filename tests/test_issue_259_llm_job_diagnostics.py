@@ -192,12 +192,12 @@ class LlmJobDiagnosticsApiTests(LlmJobFixture):
 
 
 class LlmJobMaskingTests(LlmJobFixture):
-    """Only credentials are masked; analysis-relevant text stays intact."""
+    """Credentials are masked; paths, URLs and JSON structure stay intact."""
 
     def test_paths_urls_and_json_stay_readable(self) -> None:
         prompt = (
             'Edit /home/agent/repo/modules/x.py, see https://github.com/o/r/issues/259. '
-            '{"credential": "missing", "token_budget": 800}'
+            '{"action": "edit", "token_budget": 800}'
         )
         job_id = self.add_job(prompt=prompt, result="wrote /tmp/work/out.json")
         text = "\n".join(self.run_op(job_id=job_id, view="prompt").output_lines)
@@ -216,3 +216,62 @@ class LlmJobMaskingTests(LlmJobFixture):
         for secret in (_SECRET, ghp, "abc.def", "hunter2"):
             self.assertNotIn(secret, text)
         self.assertIn("github.com/o/r.git", text)
+
+    def test_generic_credential_assignments_are_masked(self) -> None:
+        prompt = (
+            "password=hunter2 api_key=some-private-value token: abc123def456 "
+            '{"password":"json-secret", "action": "edit"}'
+        )
+        job_id = self.add_job(prompt=prompt, result=prompt)
+        for view in ("prompt", "result"):
+            with self.subTest(view=view):
+                text = "\n".join(self.run_op(job_id=job_id, view=view).output_lines)
+                for secret in ("hunter2", "some-private-value", "abc123def456", "json-secret"):
+                    self.assertNotIn(secret, text)
+                self.assertIn('"action": "edit"', text)
+
+
+class LlmJobCliTests(LlmJobFixture):
+    """``nexus debug llm-job <id> [--result|--prompt]`` (scripts/nexus.ps1 debug)."""
+
+    def test_argument_mapping(self) -> None:
+        from modules.nexus_diagnostics import build_cli_parser
+
+        parser = build_cli_parser()
+        for argv, view in (
+            (["debug", "llm-job", "abc"], "summary"),
+            (["debug", "llm-job", "abc", "--result"], "result"),
+            (["debug", "llm-job", "abc", "--prompt"], "prompt"),
+        ):
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                self.assertEqual(("abc", view), (args.job_id, args.view))
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["debug", "llm-job", "abc", "--result", "--prompt"])
+
+    def run_cli(self, *argv: str) -> tuple[int, str, str]:
+        import contextlib
+        import io
+
+        from modules.nexus_diagnostics import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["debug", "llm-job", *argv, "--db", self.db_path])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cli_prints_each_view(self) -> None:
+        job_id = self.add_job()
+        code, out, _ = self.run_cli(job_id)
+        self.assertEqual(0, code)
+        self.assertIn("role: controller", out)
+        self.assertIn('{"action": "finish"}', self.run_cli(job_id, "--result")[1])
+        prompt = self.run_cli(job_id, "--prompt")[1]
+        self.assertIn("Plan the next step.", prompt)
+        self.assertNotIn(_SECRET, prompt)
+
+    def test_cli_missing_job_exits_nonzero(self) -> None:
+        code, out, err = self.run_cli("does-not-exist")
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertIn("no local LLM job", err)

@@ -492,29 +492,32 @@ the same facts.
 ### Inspecting one local LLM job (#259)
 
 `nexus debug llm-job <job-id> [--result|--prompt]` reads one `local_llm_jobs`
-row by its exact id, read-only (same `mode=ro` connection as above). It is
-available as `GET /diagnostics/llm-jobs/<id>` (plain text, needs `x-api-key`)
-and as the `nexus_llm_job` operation:
+row by its exact id, read-only (same `mode=ro` connection as above). On the VM:
 
-| Command | HTTP | Operation args |
+```bash
+./scripts/nexus.ps1 debug llm-job <job-id>            # summary
+./scripts/nexus.ps1 debug llm-job <job-id> --result   # full result
+./scripts/nexus.ps1 debug llm-job <job-id> --prompt   # system prompt + prompt
+```
+
+`nexus.ps1 debug` runs `python -m modules.nexus_diagnostics debug ...` from the
+repository venv against `AGENT_DB_PATH` (default `/var/lib/nexus/agent.db`;
+override with `--db`). An unknown id prints `error: no local LLM job ...` and
+exits 1. The same answer is available without a shell:
+
+| CLI | HTTP `GET /diagnostics/llm-jobs/<id>` (`x-api-key`) | Operation `nexus_llm_job` |
 | --- | --- | --- |
-| `nexus debug llm-job <id>` | `?view=summary` (default) | `{"job_id": "<id>"}` |
-| `nexus debug llm-job <id> --result` | `?view=result` | `{"job_id": "<id>", "view": "result"}` |
-| `nexus debug llm-job <id> --prompt` | `?view=prompt` | `{"job_id": "<id>", "view": "prompt"}` |
+| *(default)* | `?view=summary` | `{"job_id": "<id>"}` |
+| `--result` | `?view=result` | `{"job_id": "<id>", "view": "result"}` |
+| `--prompt` | `?view=prompt` | `{"job_id": "<id>", "view": "prompt"}` |
 
 The default view shows role, session, status, timestamps, duration,
 prompt/result size, error and a result preview; `result` prints the full
-result, `prompt` the system prompt and prompt. Only credential values are
-masked (configured secrets, `sk-`/`ghp_` keys, `Bearer` tokens, passwords in
-URLs); paths, URLs and JSON are shown unchanged so the text stays analysable.
-The model name is not stored per
-job, so only `provider: local` is shown. An unknown id is a 404 (operation:
-an unsuccessful result) naming the id.
-
-```bash
-curl -sH "x-api-key: $AGENT_API_KEY" \
-  "https://<host>/diagnostics/llm-jobs/<id>?view=result"
-```
+result, `prompt` the system prompt and prompt. Credential values are masked
+(configured secrets, `sk-`/`ghp_` keys, `Bearer` tokens, passwords in URLs,
+and values assigned to `password`/`api_key`/`token`/`secret`/... keys), but
+paths and URLs are shown unchanged, so the text stays analysable. The model
+name is not stored per job, so only `provider: local` is shown.
 
 ## Maintenance API (temporary remote-maintenance bridge)
 

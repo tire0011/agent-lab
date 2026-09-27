@@ -1519,6 +1519,41 @@ def render_service_logs(result: ServiceLogs) -> list[str]:
     return lines
 
 
+def build_cli_parser() -> "argparse.ArgumentParser":
+    """``nexus debug ...``: the terminal form of the read-only diagnostics."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="nexus", description="Read-only Nexus diagnostics.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    debug = commands.add_parser("debug", help="Inspect persisted Nexus state.")
+    targets = debug.add_subparsers(dest="target", required=True)
+    llm_job = targets.add_parser("llm-job", help="One local LLM job by exact id (#259).")
+    llm_job.add_argument("job_id")
+    view = llm_job.add_mutually_exclusive_group()
+    view.add_argument("--result", dest="view", action="store_const", const="result",
+                      help="Print the full result.")
+    view.add_argument("--prompt", dest="view", action="store_const", const="prompt",
+                      help="Print the system prompt and prompt.")
+    llm_job.set_defaults(view="summary")
+    llm_job.add_argument("--db", default=DEFAULT_DB_PATH,
+                         help="Nexus database (default: AGENT_DB_PATH or /var/lib/nexus/agent.db).")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import sys
+
+    args = build_cli_parser().parse_args(argv)
+    try:
+        with NexusDiagnostics(db_path=args.db) as diagnostics:
+            lines = render_llm_job(diagnostics.llm_job(args.job_id), view=args.view)
+    except DiagnosticsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("\n".join(lines))
+    return 0
+
+
 __all__ = [
     "DiagnosticReport",
     "DiagnosticsError",
@@ -1535,3 +1570,7 @@ __all__ = [
     "render_service_logs",
     "resolve_service",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
