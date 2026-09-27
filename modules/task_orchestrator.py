@@ -1578,8 +1578,9 @@ class NexusTaskOrchestrator:
             {
                 "name": ACTION_COMMAND,
                 "description": (
-                    "Execute one trusted local shell command for repository or machine work, "
-                    "observe its real output, then keep control and decide again."
+                    "Execute one trusted local shell command for machine work or for reading "
+                    "the repository, observe its real output, then keep control and decide "
+                    "again. Never use it to change repository code."
                 ),
                 "arguments": {"command": "shell command"},
             },
@@ -1597,7 +1598,7 @@ class NexusTaskOrchestrator:
                     "argv": "list of arguments",
                 },
             },
-            {"name": ACTION_NEW_EXPERIMENT, "description": "Codex development path: start a new isolated implementation experiment for large/complex repository changes."},
+            {"name": ACTION_NEW_EXPERIMENT, "description": "Development path for every repository code change, small ones included: start a new isolated implementation experiment."},
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
@@ -2056,7 +2057,7 @@ INPUT:
 RULES:
 - Reason about the task and choose the next useful action.
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
-- For local repository or machine work, use command or python_run directly.
+- Repository code changes of any size go through new_experiment. Use command or python_run for machine work and for reading.
 - find_tool only discovers a concrete read-only OperationsRegistry operation; then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - Ask clarification only when essential information is really missing.
