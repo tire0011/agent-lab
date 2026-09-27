@@ -1578,8 +1578,9 @@ class NexusTaskOrchestrator:
             {
                 "name": ACTION_COMMAND,
                 "description": (
-                    "Execute one trusted local shell command for repository or machine work, "
-                    "observe its real output, then keep control and decide again."
+                    "Execute one trusted local shell command for machine work or for reading "
+                    "the repository, observe its real output, then keep control and decide "
+                    "again. Never use it to change repository code."
                 ),
                 "arguments": {"command": "shell command"},
             },
@@ -1589,7 +1590,8 @@ class NexusTaskOrchestrator:
                     "Run project Python deterministically: Nexus resolves its own "
                     "interpreter, so never write an interpreter name or path yourself. "
                     "Give either a repository-relative script or an importable module "
-                    "plus arguments."
+                    "plus arguments. Use it for machine work or for reading the "
+                    "repository. Never use it to change repository code."
                 ),
                 "arguments": {
                     "script": "repository-relative .py path",
@@ -1597,7 +1599,7 @@ class NexusTaskOrchestrator:
                     "argv": "list of arguments",
                 },
             },
-            {"name": ACTION_NEW_EXPERIMENT, "description": "Codex development path: start a new isolated implementation experiment for large/complex repository changes."},
+            {"name": ACTION_NEW_EXPERIMENT, "description": "Development path for every repository code change, small ones included: start a new isolated implementation experiment."},
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
@@ -2056,7 +2058,7 @@ INPUT:
 RULES:
 - Reason about the task and choose the next useful action.
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
-- For local repository or machine work, use command or python_run directly.
+- Repository code changes of any size go through new_experiment. Use command or python_run for machine work and for reading.
 - find_tool only discovers a concrete read-only OperationsRegistry operation; then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - Ask clarification only when essential information is really missing.
@@ -2919,12 +2921,38 @@ Decide the next step now. Return JSON only.
         )
         return {**payload, "result": (retried or "")[:10000]}
 
+    @staticmethod
+    def _rejected_python_run(decision: dict[str, Any], error: str) -> dict[str, Any]:
+        """An invalid python_run request, returned to the controller to correct.
+
+        Raising here ended the whole task on one malformed call, and the
+        request itself was never recorded, so the failure could not be
+        diagnosed afterwards.
+        """
+        received = {
+            key: decision.get(key)
+            for key in ("script", "module", "argv", "args", "cwd")
+            if key in decision
+        }
+        logger.warning(
+            "python_run rejected error=%s received=%s",
+            error,
+            redact_secrets(json.dumps(received, default=str))[:2000],
+        )
+        return {
+            "tool": TOOL_PYTHON_RUN,
+            "args": received,
+            "error": "invalid_tool_request",
+            "reason": error[:1000],
+            "recovery": "correct the arguments or choose another capability",
+        }
+
     def _execute_python_run(self, decision: dict[str, Any]) -> dict[str, Any]:
         argv = decision.get("argv")
         if argv is None and isinstance(decision.get("args"), list):
             argv = decision.get("args")
         if argv is not None and not isinstance(argv, list):
-            raise TaskOrchestratorError("python_run argv must be a list")
+            return self._rejected_python_run(decision, "python_run argv must be a list")
         cwd = self._resolve_cwd(decision.get("cwd"))
         try:
             plan = build_python_command(
@@ -2934,7 +2962,7 @@ Decide the next step now. Return JSON only.
                 repo_root=self._repo_root(),
             )
         except RuntimeExecutionError as exc:
-            raise TaskOrchestratorError(str(exc)) from exc
+            return self._rejected_python_run(decision, str(exc))
 
         logger.info(
             "python_run target=%s argument_count=%s cwd=%s reason=%s",

@@ -103,6 +103,12 @@ def test_prompt_keeps_local_model_as_real_development_path():
     prompt = orchestrator._prompt(session, "fix a small file", [], [])
 
     assert "Own the task" in prompt
-    assert "use command or python_run directly" in prompt
+    assert "Repository code changes of any size go through new_experiment" in prompt
+    assert "Use command or python_run for machine work and for reading" in prompt
     assert "find_tool only discovers a concrete read-only OperationsRegistry operation" in prompt
-    assert "Codex development path" in prompt
+    assert "Development path for every repository code change, small ones included" in prompt
+    # Both execution capabilities carry the same boundary; the controller picks
+    # actions from these descriptions, not only from the rules (#263).
+    capabilities = {c["name"]: c["description"] for c in orchestrator._capabilities()}
+    for name in ("command", "python_run"):
+        assert "Never use it to change repository code." in capabilities[name]
