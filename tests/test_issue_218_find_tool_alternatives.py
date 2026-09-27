@@ -829,6 +829,43 @@ class RejectedToolCallTests(unittest.TestCase):
         finally:
             orchestrator.close()
 
+    def test_an_invalid_python_run_becomes_an_observation_with_the_request(self):
+        # Both script and module: the solve-issue-238 run on Nexus ended the
+        # whole task here and left no record of what the controller had sent.
+        registry = _SpyRegistry(str(Path(self.tmp.name) / "pyrun.db"), self.tmp.name)
+        client = _Client([
+            '{"action":"python_run","script":"agent.py","module":"agent",'
+            '"reason":"inspect"}',
+            '{"action":"answer","message":"stopped","reason":"done"}',
+        ])
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=registry,
+            experiment_service=_ExperimentService(),
+            llama_client=client,
+        )
+        try:
+            with self.assertLogs("modules.task_orchestrator", level="WARNING") as logs:
+                result = orchestrator.run(
+                    "Run the agent", source_type="task", source_id="issue-257-python-run"
+                )
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        rejected = [
+            observation for observation in result.observations
+            if observation.get("tool") == "python_run"
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["error"], "invalid_tool_request")
+        self.assertIn("exactly one of script or module", rejected[0]["reason"])
+        self.assertEqual(rejected[0]["args"], {"script": "agent.py", "module": "agent"})
+        self.assertIn("correct the arguments", client.prompts[1])
+        self.assertTrue(
+            any('"module": "agent"' in line and "python_run rejected" in line
+                for line in logs.output)
+        )
+
     def test_the_router_reports_a_rejected_argument_as_a_caller_error(self):
         from modules.nexus_tool_router import (
             InMemoryToolGrantLedger,

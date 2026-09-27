@@ -2919,12 +2919,38 @@ Decide the next step now. Return JSON only.
         )
         return {**payload, "result": (retried or "")[:10000]}
 
+    @staticmethod
+    def _rejected_python_run(decision: dict[str, Any], error: str) -> dict[str, Any]:
+        """An invalid python_run request, returned to the controller to correct.
+
+        Raising here ended the whole task on one malformed call, and the
+        request itself was never recorded, so the failure could not be
+        diagnosed afterwards.
+        """
+        received = {
+            key: decision.get(key)
+            for key in ("script", "module", "argv", "args", "cwd")
+            if key in decision
+        }
+        logger.warning(
+            "python_run rejected error=%s received=%s",
+            error,
+            redact_secrets(json.dumps(received, default=str))[:2000],
+        )
+        return {
+            "tool": TOOL_PYTHON_RUN,
+            "args": received,
+            "error": "invalid_tool_request",
+            "reason": error[:1000],
+            "recovery": "correct the arguments or choose another capability",
+        }
+
     def _execute_python_run(self, decision: dict[str, Any]) -> dict[str, Any]:
         argv = decision.get("argv")
         if argv is None and isinstance(decision.get("args"), list):
             argv = decision.get("args")
         if argv is not None and not isinstance(argv, list):
-            raise TaskOrchestratorError("python_run argv must be a list")
+            return self._rejected_python_run(decision, "python_run argv must be a list")
         cwd = self._resolve_cwd(decision.get("cwd"))
         try:
             plan = build_python_command(
@@ -2934,7 +2960,7 @@ Decide the next step now. Return JSON only.
                 repo_root=self._repo_root(),
             )
         except RuntimeExecutionError as exc:
-            raise TaskOrchestratorError(str(exc)) from exc
+            return self._rejected_python_run(decision, str(exc))
 
         logger.info(
             "python_run target=%s argument_count=%s cwd=%s reason=%s",
