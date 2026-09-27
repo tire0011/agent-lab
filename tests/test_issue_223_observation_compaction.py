@@ -571,7 +571,7 @@ class SuccessRuleTests(unittest.TestCase):
                 )
             finally:
                 orchestrator.close()
-        return prompt.partition("Rules:")[2].partition("OBSERVATIONS FROM")[0]
+        return prompt.partition("RULES:")[2].partition("OBSERVATIONS FROM")[0]
 
     def test_a_succeeded_observation_is_addressed_by_a_rule(self):
         rules = self._rules()

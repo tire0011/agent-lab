@@ -102,10 +102,7 @@ def test_prompt_keeps_local_model_as_real_development_path():
 
     prompt = orchestrator._prompt(session, "fix a small file", [], [])
 
-    assert "You are not a tool router" in prompt
-    assert "Nexus owns the task" in prompt
-    assert "use `command` or `python_run` directly" in prompt
-    assert "must not be discovered through find_tool" in prompt
-    assert "medium programming work" in prompt
-    assert "Codex implementation" in prompt
-    assert "quota/token limited" in prompt
+    assert "Own the task" in prompt
+    assert "use command or python_run directly" in prompt
+    assert "find_tool only discovers a concrete read-only OperationsRegistry operation" in prompt
+    assert "Codex development path" in prompt

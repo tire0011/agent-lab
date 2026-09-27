@@ -584,7 +584,6 @@ class TaskOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertIn('"name":"find_tool"', client.prompts[0])
-        self.assertIn('"action":"find_tool"', client.prompts[0])
         self.assertNotIn('"type":"tool"', client.prompts[0])
         self.assertNotIn('"operations":[', client.prompts[0])
         self.assertNotIn('"operation":"experiment_show"', client.prompts[0])
@@ -917,7 +916,6 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertEqual(memory.queries, [("model delegation decision", 5)])
         self.assertIn("local model first", client.prompts[1])
-        self.assertIn('"type":"idea"', client.prompts[0])
 
     def test_identical_memory_search_executes_only_once(self):
         memory = _Memory([{"content": "original result"}])
@@ -1176,7 +1174,6 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertEqual(delegation.calls[0][0], "codex_readonly")
         self.assertIn("timeout handling", client.prompts[1])
-        self.assertIn('"type":"issue"', client.prompts[0])
 
     def test_clarification_persists_and_same_session_can_continue(self):
         client = _Client([
@@ -1321,8 +1318,6 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertIn("used_sources lists sources already consulted", prompt)
             self.assertNotIn("SOURCE:", prompt)
             self.assertNotIn("PERSISTENT TASK/DISCUSSION HISTORY:", prompt)
-            self.assertNotIn("OBSERVATIONS FROM TOOLS USED IN THIS RUN:", prompt)
-            self.assertNotIn("PERSISTENT TASK/DISCUSSION HISTORY:", prompt)
             self.assertNotIn("Controller-native capabilities:", prompt)
             self.assertGreater(prompt.index("RULES:"), prompt.index("INPUT:"))
             self.assertGreater(prompt.index("AVAILABLE CAPABILITIES:"), prompt.index("RULES:"))
@@ -1449,10 +1444,10 @@ class TaskOrchestratorTests(unittest.TestCase):
 
         final_prompt = client.prompts[-1]
         self.assertIn("Fresh unseen decision content.", final_prompt)
-        # Without dedup this token would appear a third time (again inside the
-        # memory_search observation), duplicating what CURRENT INPUT and the
-        # persisted history section already show verbatim.
-        self.assertEqual(final_prompt.count("Improve model routing"), 2)
+        # Without dedup this token would appear again inside the memory_search
+        # observation, duplicating what INPUT already shows verbatim. The
+        # history leaves out the entry that is the current input itself.
+        self.assertEqual(final_prompt.count("Improve model routing"), 1)
 
     def test_oversized_observation_is_truncated_and_referenced_by_event_id(self):
         client = _Client([

@@ -2035,15 +2035,24 @@ Return exactly one JSON object matching the schema."""
             for observation in observations
         )
 
-        tool_results_block = ("\n\n" + tool_results) if tool_results else ""
+        # Without it a reply to a clarification arrives as the whole task and
+        # the original request is gone. The current input is already shown.
+        earlier = [
+            event for event in history
+            if str(event.get("content", "")).strip() != current_input.strip()
+        ]
+        history_block = (
+            f"\nPERSISTENT TASK/DISCUSSION HISTORY:\n{json.dumps(earlier, separators=(',', ':'))}\n"
+            if earlier
+            else ""
+        )
 
         return f"""You are Nexus, an autonomous agent.
 Own the task from understanding through execution and verification.
 
 INPUT:
 {current_input}
-{tool_results_block}
-
+{history_block}
 RULES:
 - Reason about the task and choose the next useful action.
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
@@ -2051,10 +2060,14 @@ RULES:
 - find_tool only discovers a concrete read-only OperationsRegistry operation; then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - Ask clarification only when essential information is really missing.
+- An observation with `"status":"succeeded"` already carries that call's result. Never call that operation again with the same arguments; use the result and choose a different next step, or `answer` if the request is satisfied.
 - Return exactly one next action.
 
 AVAILABLE CAPABILITIES:
 {prompt_json(self._capabilities())}
+
+OBSERVATIONS FROM TOOLS USED IN THIS RUN:
+{tool_results or "none"}
 
 Decide the next step now. Return JSON only.
 """

@@ -93,8 +93,8 @@ class Issue111ControllerProtocolTests(unittest.TestCase):
         self.assertEqual(schema["required"], ["action"])
         self.assertNotIn("type", schema["properties"])
         self.assertIn("call_tool", schema["properties"]["action"]["enum"])
-        self.assertIn('{"action":"find_tool"', client.prompts[0])
-        self.assertIn('{"action":"call_tool"', client.prompts[0])
+        self.assertIn('"name":"find_tool"', client.prompts[0])
+        self.assertIn('"name":"call_tool"', client.prompts[0])
 
     def test_missing_find_tool_goal_is_corrected_once(self):
         with tempfile.TemporaryDirectory() as tmp:
