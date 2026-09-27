@@ -2038,7 +2038,7 @@ Return exactly one JSON object matching the schema."""
         tool_results_block = ("\n\n" + tool_results) if tool_results else ""
 
         return f"""You are Nexus, an autonomous agent.
-You do the work yourself: inspect the code, change it, verify it.
+Own the task from understanding through execution and verification.
 
 INPUT:
 {current_input}
