@@ -480,13 +480,44 @@ interface reach it without HTTP:
 - `nexus_logs` - `reference`, `limit`
 - `nexus_last_failure` - `limit`
 - `service_logs` - `service`, `limit`, `since_minutes`
+- `nexus_llm_job` - `job_id`, `view` (#259)
 
-All four are catalogued `mutates_state=False`, which is what makes them
+All five are catalogued `mutates_state=False`, which is what makes them
 available to the read-only diagnostic role. A reference that resolves to
 nothing - or a database that cannot be read - comes back as an unsuccessful
 result with a reason, not as an operation fault. The failure-analysis routine reads
 the same backend, so a diagnosis and an operator looking at the same task see
 the same facts.
+
+### Inspecting one local LLM job (#259)
+
+`nexus debug llm-job <job-id> [--result|--prompt]` reads one `local_llm_jobs`
+row by its exact id, read-only (same `mode=ro` connection as above). On the VM:
+
+```bash
+./scripts/nexus.ps1 debug llm-job <job-id>            # summary
+./scripts/nexus.ps1 debug llm-job <job-id> --result   # full result
+./scripts/nexus.ps1 debug llm-job <job-id> --prompt   # system prompt + prompt
+```
+
+`nexus.ps1 debug` runs `python -m modules.nexus_diagnostics debug ...` from the
+repository venv against `AGENT_DB_PATH` (default `/var/lib/nexus/agent.db`;
+override with `--db`). An unknown id prints `error: no local LLM job ...` and
+exits 1. The same answer is available without a shell:
+
+| CLI | HTTP `GET /diagnostics/llm-jobs/<id>` (`x-api-key`) | Operation `nexus_llm_job` |
+| --- | --- | --- |
+| *(default)* | `?view=summary` | `{"job_id": "<id>"}` |
+| `--result` | `?view=result` | `{"job_id": "<id>", "view": "result"}` |
+| `--prompt` | `?view=prompt` | `{"job_id": "<id>", "view": "prompt"}` |
+
+The default view shows role, session, status, timestamps, duration,
+prompt/result size, error and a result preview; `result` prints the full
+result, `prompt` the system prompt and prompt. Credential values are masked
+(configured secrets, `sk-`/`ghp_` keys, `Bearer` tokens, passwords in URLs,
+and values assigned to `password`/`api_key`/`token`/`secret`/... keys), but
+paths and URLs are shown unchanged, so the text stays analysable. The model
+name is not stored per job, so only `provider: local` is shown.
 
 ## Maintenance API (temporary remote-maintenance bridge)
 
