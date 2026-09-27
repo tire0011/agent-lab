@@ -93,8 +93,8 @@ class Issue111ControllerProtocolTests(unittest.TestCase):
         self.assertEqual(schema["required"], ["action"])
         self.assertNotIn("type", schema["properties"])
         self.assertIn("call_tool", schema["properties"]["action"]["enum"])
-        self.assertIn('{"action":"find_tool"', client.prompts[0])
-        self.assertIn('{"action":"call_tool"', client.prompts[0])
+        self.assertIn('"name":"find_tool"', client.prompts[0])
+        self.assertIn('"name":"call_tool"', client.prompts[0])
 
     def test_missing_find_tool_goal_is_corrected_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -129,6 +129,18 @@ class Issue111ControllerProtocolTests(unittest.TestCase):
         # result instead of the grant that authorised it (#223).
         self.assertIn('"status":"succeeded"', client.prompts[3])
         self.assertNotIn('"grant_event_id"', client.prompts[3])
+
+    def test_find_tool_accepts_goal_nested_in_arguments(self):
+        decision = NexusTaskOrchestrator._parse(
+            '{"action":"find_tool","arguments":{"goal":"exclude bookkeeping from memory"}}'
+        )
+        self.assertEqual(decision["goal"], "exclude bookkeeping from memory")
+
+    def test_action_fields_nested_in_arguments_are_lifted(self):
+        decision = NexusTaskOrchestrator._parse(
+            '{"action":"knowledge_collector","arguments":{"request":"GitHub issue #238 details"}}'
+        )
+        self.assertEqual(decision["request"], "GitHub issue #238 details")
 
     def test_call_tool_requires_arguments(self):
         with self.assertRaisesRegex(TaskOrchestratorError, "call_tool requires arguments"):

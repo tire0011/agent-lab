@@ -61,6 +61,30 @@ class NexusTaskStoreEventIdTests(unittest.TestCase):
         self.assertEqual(events[0]["id"], newest_id)
         self.assertEqual(events[0]["metadata"], {"reason": "grant"})
 
+    def test_history_hides_knowledge_collector_internal_events(self):
+        session = self.store.get_or_create(source_type="task", source_id="t-knowledge")
+        self.store.append_event(session.id, role="user", kind="input", content="solve issue")
+        self.store.append_event(
+            session.id,
+            role="tool",
+            kind="find_tool",
+            content='{"internal":"source lookup"}',
+            metadata={"knowledge_collector_internal": True},
+        )
+        self.store.append_event(
+            session.id,
+            role="tool",
+            kind="knowledge_collector",
+            content='{"knowledge_briefing":"compact facts"}',
+        )
+
+        history = self.store.history(session.id)
+        contents = [event["content"] for event in history]
+
+        self.assertIn("solve issue", contents)
+        self.assertIn('{"knowledge_briefing":"compact facts"}', contents)
+        self.assertNotIn('{"internal":"source lookup"}', contents)
+
     def test_history_with_max_event_id_excludes_later_events(self):
         session = self.store.get_or_create(source_type="task", source_id="t-3")
         anchor_id = self.store.append_event(session.id, role="user", kind="input", content="do work")

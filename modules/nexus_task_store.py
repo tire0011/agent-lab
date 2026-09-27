@@ -364,20 +364,25 @@ class NexusTaskStore:
         """
         limit = max(1, min(limit, 100))
         max_chars = max(1000, min(max_chars, 32000))
+        # Collector-internal source lookups stay in the durable journal for
+        # audit/debugging, but are not part of Nexus' prompt-facing history.
+        # Over-fetch so hidden rows do not crowd useful task history out of
+        # the caller's requested visible limit.
+        fetch_limit = min(limit * 3, 300)
         with self._lock:
             if max_event_id is None:
                 rows = self._conn.execute(
                     """SELECT role, kind, content, metadata_json, created_at
                        FROM nexus_task_events WHERE session_id=?
                        ORDER BY id DESC LIMIT ?""",
-                    (session_id, limit),
+                    (session_id, fetch_limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
                     """SELECT role, kind, content, metadata_json, created_at
                        FROM nexus_task_events WHERE session_id=? AND id<=?
                        ORDER BY id DESC LIMIT ?""",
-                    (session_id, max_event_id, limit),
+                    (session_id, max_event_id, fetch_limit),
                 ).fetchall()
         newest_first: list[dict[str, Any]] = []
         used = 0
@@ -386,6 +391,8 @@ class NexusTaskStore:
                 metadata = json.loads(row["metadata_json"] or "{}")
             except json.JSONDecodeError:
                 metadata = {}
+            if metadata.get("knowledge_collector_internal"):
+                continue
             content = str(row["content"] or "")[:1800]
             event_cost = len(content) + 300
             if newest_first and used + event_cost > max_chars:
@@ -400,6 +407,8 @@ class NexusTaskStore:
                 }
             )
             used += event_cost
+            if len(newest_first) >= limit:
+                break
         return list(reversed(newest_first))
 
     def record_controller_turn(

@@ -154,10 +154,8 @@ class TaskOrchestratorCommandToolTests(unittest.TestCase):
                 orchestrator.close()
 
             prompt = client.prompts[0]
-            self.assertIn('{"action":"command"', prompt)
+            self.assertIn('"name":"command"', prompt)
             self.assertNotIn('{"type":"tool"', prompt)
-            final_section = prompt.split("Final action:", 1)[1].split("Rules:", 1)[0]
-            self.assertNotIn("|command|", final_section)
 
 
 if __name__ == "__main__":

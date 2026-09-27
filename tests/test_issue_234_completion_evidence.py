@@ -171,6 +171,51 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
         self.assertEqual(len(client.prompts), 5)
 
+    def test_completion_evidence_meta_gap_cannot_become_missing_capability(self):
+        """Regression for #253: an unfinished task is not a missing capability."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator, _, client = _orchestrator(
+                tmp,
+                [
+                    '{"action":"answer","message":"Issue understood.","reason":"problem identified"}',
+                    '{"action":"missing_capability",'
+                    '"message":"Implementation completion evidence is unavailable.",'
+                    '"reason":"the previous terminal decision was rejected",'
+                    '"information_gap":"implementation completion evidence",'
+                    '"gap_kind":"user_preference",'
+                    '"capability":"memory_index_modification","required_inputs":[]}',
+                    '{"action":"command","command":"printf fixed","effect":"change",'
+                    '"reason":"continue the original repository task"}',
+                    '{"action":"answer","message":"Implemented.","reason":"change is complete"}',
+                ],
+            )
+            try:
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    side_effect=_writes(Path(tmp) / "issue-253-fixed.txt"),
+                ):
+                    result = orchestrator.run("solve github issue #238")
+                system_events = orchestrator.task_store.recent_events(
+                    result.session_id, role="system", limit=20
+                )
+            finally:
+                orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(len(client.prompts), 4)
+        rejections = [
+            event for event in system_events
+            if event["kind"] == "terminal_decision_rejected"
+        ]
+        self.assertGreaterEqual(len(rejections), 2)
+        self.assertTrue(
+            any(
+                "does not prove a capability is missing" in event["content"]
+                for event in rejections
+            ),
+            rejections,
+        )
+
     def test_missing_capability_is_rejected_when_local_command_can_do_the_work(self):
         """Regression for #244 / the real #238 autonomy run.
 

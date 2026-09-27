@@ -702,15 +702,12 @@ class ControllerPromptOrderTests(unittest.TestCase):
         prompt = self._prompt()
         observations_at = prompt.index("OBSERVATIONS FROM TOOLS USED IN THIS RUN:")
         for stable in (
-            "SOURCE:",
-            "CURRENT INPUT:",
+            "INPUT:",
             "PERSISTENT TASK/DISCUSSION HISTORY:",
+            "RULES:",
+            # The last rule; its position decides whether the whole block is cached.
+            "- Return exactly one next action.",
             "AVAILABLE CAPABILITIES:",
-            "Model policy:",
-            "Rules:",
-            # The single rule most likely to be edited, and the one whose
-            # position decides whether the whole block is cached.
-            "- Return JSON only" if "- Return JSON only" in prompt else "Rules:",
         ):
             with self.subTest(section=stable):
                 self.assertLess(prompt.index(stable), observations_at)
