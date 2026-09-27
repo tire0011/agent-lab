@@ -1549,34 +1549,6 @@ class NexusTaskOrchestrator:
         )
         return [
             {
-                "name": TOOL_FIND_TOOL,
-                "description": (
-                    "Resolve one needed read-only Nexus operation by goal. Returns either "
-                    "one full operation schema, invalid_goal for placeholder/generic requests, "
-                    "or a non-retryable not_found carrying described related operations "
-                    "(operation, description, why_relevant, arguments) and the direct "
-                    "controller capabilities that own the goal instead; it never implements "
-                    "missing tools and never resolves shell or Python execution."
-                ),
-                # A description, never a usable goal. The local model copies
-                # whatever concrete goal this prompt shows it - twice over, in
-                # two different runs, with two different examples - and this
-                # was the last place still offering one (#218).
-                "arguments": {"goal": FIND_TOOL_GOAL_PLACEHOLDER},
-                "legacy_catalog_schema_chars": legacy_catalog_chars,
-            },
-            {
-                "name": ACTION_CALL_TOOL,
-                "description": (
-                    "Invoke exactly one concrete read-only Nexus operation only after "
-                    "find_tool returned its schema in this persistent session."
-                ),
-                "arguments": {
-                    "tool": "tool identifier returned by find_tool",
-                    "arguments": "object matching the returned argument schema",
-                },
-            },
-            {
                 "name": ACTION_KNOWLEDGE_COLLECTOR,
                 "description": (
                     "Gather additional factual context when it would materially help Nexus "
@@ -1630,6 +1602,34 @@ class NexusTaskOrchestrator:
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
             {"name": ACTION_CLARIFICATION, "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory."},
+            {
+                "name": TOOL_FIND_TOOL,
+                "description": (
+                    "Resolve one needed read-only Nexus operation by goal. Returns either "
+                    "one full operation schema, invalid_goal for placeholder/generic requests, "
+                    "or a non-retryable not_found carrying described related operations "
+                    "(operation, description, why_relevant, arguments) and the direct "
+                    "controller capabilities that own the goal instead; it never implements "
+                    "missing tools and never resolves shell or Python execution."
+                ),
+                # A description, never a usable goal. The local model copies
+                # whatever concrete goal this prompt shows it - twice over, in
+                # two different runs, with two different examples - and this
+                # was the last place still offering one (#218).
+                "arguments": {"goal": FIND_TOOL_GOAL_PLACEHOLDER},
+                "legacy_catalog_schema_chars": legacy_catalog_chars,
+            },
+            {
+                "name": ACTION_CALL_TOOL,
+                "description": (
+                    "Invoke exactly one concrete read-only Nexus operation only after "
+                    "find_tool returned its schema in this persistent session."
+                ),
+                "arguments": {
+                    "tool": "tool identifier returned by find_tool",
+                    "arguments": "object matching the returned argument schema",
+                },
+            },
         ]
 
     @staticmethod
@@ -2038,7 +2038,7 @@ Return exactly one JSON object matching the schema."""
         tool_results_block = ("\n\n" + tool_results) if tool_results else ""
 
         return f"""You are Nexus, an autonomous agent.
-Own the task from understanding through execution and verification.
+You do the work yourself: inspect the code, change it, verify it.
 
 INPUT:
 {current_input}
