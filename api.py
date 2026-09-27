@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 import chat as chat_module
@@ -1965,6 +1965,26 @@ def get_diagnostic_last_failure(
         return _diagnostic_report_response(diagnostics.last_failure(lines=lines, scan=scan))
     except nexus_diagnostics_module.DiagnosticsError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/diagnostics/llm-jobs/{job_id}", response_class=PlainTextResponse)
+def get_diagnostic_llm_job(
+    job_id: str,
+    x_api_key: str | None = Header(default=None),
+    view: str = Query(default="summary", pattern="^(summary|result|prompt)$"),
+    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
+) -> str:
+    """``nexus debug llm-job <id> [--result|--prompt]`` (#259), read-only.
+
+    Plain ``key: value`` lines, the same the ``nexus_llm_job`` operation
+    returns, so the output reads directly in a terminal.
+    """
+    authorize(x_api_key)
+    try:
+        job = diagnostics.llm_job(job_id)
+    except nexus_diagnostics_module.DiagnosticsError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return "\n".join(nexus_diagnostics_module.render_llm_job(job, view=view)) + "\n"
 
 
 @app.get("/diagnostics/status/{reference:path}", response_model=DiagnosticReportResponse)
