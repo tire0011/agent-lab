@@ -136,6 +136,12 @@ class Issue111ControllerProtocolTests(unittest.TestCase):
         )
         self.assertEqual(decision["goal"], "exclude bookkeeping from memory")
 
+    def test_action_fields_nested_in_arguments_are_lifted(self):
+        decision = NexusTaskOrchestrator._parse(
+            '{"action":"knowledge_collector","arguments":{"request":"GitHub issue #238 details"}}'
+        )
+        self.assertEqual(decision["request"], "GitHub issue #238 details")
+
     def test_call_tool_requires_arguments(self):
         with self.assertRaisesRegex(TaskOrchestratorError, "call_tool requires arguments"):
             NexusTaskOrchestrator._parse('{"action":"call_tool","tool":"git_status"}')
