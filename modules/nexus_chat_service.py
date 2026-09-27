@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
+from modules.experiment_handover import with_handover
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.task_orchestrator import (
@@ -210,6 +211,8 @@ class NexusChatService:
 
             if decision.action == ACTION_NEW_EXPERIMENT:
                 goal = self._implementation_goal(orchestrator, decision, text)
+                # What Nexus already learned travels with the conversation (#263).
+                goal = with_handover(goal, decision.experiment_handover)
                 work_ref = self.github_work_tracking.ensure_for_source(
                     SimpleNamespace(
                         source_type="chat",
