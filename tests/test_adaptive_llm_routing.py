@@ -107,3 +107,8 @@ def test_prompt_keeps_local_model_as_real_development_path():
     assert "Use command or python_run for machine work and for reading" in prompt
     assert "find_tool only discovers a concrete read-only OperationsRegistry operation" in prompt
     assert "Development path for every repository code change, small ones included" in prompt
+    # Both execution capabilities carry the same boundary; the controller picks
+    # actions from these descriptions, not only from the rules (#263).
+    capabilities = {c["name"]: c["description"] for c in orchestrator._capabilities()}
+    for name in ("command", "python_run"):
+        assert "Never use it to change repository code." in capabilities[name]

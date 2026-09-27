@@ -1590,7 +1590,8 @@ class NexusTaskOrchestrator:
                     "Run project Python deterministically: Nexus resolves its own "
                     "interpreter, so never write an interpreter name or path yourself. "
                     "Give either a repository-relative script or an importable module "
-                    "plus arguments."
+                    "plus arguments. Use it for machine work or for reading the "
+                    "repository. Never use it to change repository code."
                 ),
                 "arguments": {
                     "script": "repository-relative .py path",
