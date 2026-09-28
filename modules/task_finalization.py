@@ -5,6 +5,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -791,19 +792,44 @@ class TaskFinalizationCoordinator:
         try:
             _stdout, stderr = proc.communicate(timeout=_RESTART_FAILURE_WINDOW_SECONDS)
         except subprocess.TimeoutExpired:
+            # Return now so a working restart can stop this process, but keep
+            # watching: a slow restart that fails later must still leave its
+            # exit code and stderr in the log (#269 review).
             logger.info("service restart still running: %s", " ".join(command))
+            threading.Thread(
+                target=TaskFinalizationCoordinator._log_restart_outcome,
+                args=(proc, command),
+                name="finalization-restart-watch",
+                daemon=True,
+            ).start()
             return
-        stderr = (stderr or "").strip()[:500]
-        logger.info(
-            "service restart finished: %s exit=%s stderr=%s",
-            " ".join(command),
-            proc.returncode,
-            stderr,
-        )
+        stderr = TaskFinalizationCoordinator._log_restart_result(proc.returncode, stderr, command)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"{' '.join(command)} exited {proc.returncode}: {stderr or 'no output'}"
             )
+
+    @staticmethod
+    def _log_restart_outcome(proc: Any, command: list[str]) -> None:
+        """Wait for a restart that outlived the failure window and log how it ended."""
+        try:
+            _stdout, stderr = proc.communicate()
+        except Exception:  # noqa: BLE001 - a watcher must never raise
+            logger.warning("service restart outcome unknown: %s", " ".join(command), exc_info=True)
+            return
+        TaskFinalizationCoordinator._log_restart_result(proc.returncode, stderr, command)
+
+    @staticmethod
+    def _log_restart_result(returncode: Any, stderr: Any, command: list[str]) -> str:
+        stderr = (stderr or "").strip()[:500]
+        log = logger.info if returncode == 0 else logger.warning
+        log(
+            "service restart finished: %s exit=%s stderr=%s",
+            " ".join(command),
+            returncode,
+            stderr,
+        )
+        return stderr
 
     def _validate_live(self, approval: Any, experiment: Any) -> dict[str, Any]:
         health_url = os.environ.get("NEXUS_LIVE_HEALTH_URL", _DEFAULT_HEALTH_URL)

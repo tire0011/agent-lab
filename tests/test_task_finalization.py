@@ -195,11 +195,36 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
                 TaskFinalizationCoordinator._restart_services(["nexus-mailbox", "agent-api"])
         self.assertTrue(any("exit=1" in line and "Access denied" in line for line in logs.output))
 
-    def test_a_restart_still_running_is_left_alone(self):
-        proc = MagicMock()
-        proc.communicate.side_effect = subprocess.TimeoutExpired("systemctl", 5)
-        with patch("modules.task_finalization.subprocess.Popen", return_value=proc):
+    def test_a_slow_restart_returns_at_once_and_its_later_failure_is_logged(self):
+        # Review on #270: a restart that fails after the 5 s window must
+        # still leave exit code and stderr in the log.
+        proc = MagicMock(returncode=1)
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired("systemctl", 5),
+            ("", "Job for agent-api.service failed\n"),
+        ]
+        watchers = []
+
+        class _Thread:
+            def __init__(self, *, target, args, **_kwargs):
+                watchers.append((target, args))
+
+            def start(self):
+                pass
+
+        with patch("modules.task_finalization.subprocess.Popen", return_value=proc), \
+                patch("modules.task_finalization.threading.Thread", _Thread):
             TaskFinalizationCoordinator._restart_services(["agent-api"])
+
+        # Returned without waiting; the watcher then observes the end.
+        self.assertEqual(len(watchers), 1)
+        target, args = watchers[0]
+        with self.assertLogs("modules.task_finalization", level="WARNING") as logs:
+            target(*args)
+        self.assertTrue(any(
+            "exit=1" in line and "Job for agent-api.service failed" in line
+            for line in logs.output
+        ))
 
     def test_restart_resume_runs_live_validation_and_finishes(self):
         adoption = SimpleNamespace(
