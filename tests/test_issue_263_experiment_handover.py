@@ -7,10 +7,11 @@ experiment would have started from the bare task text.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from modules.experiment_handover import experiment_handover, with_handover
 from modules.task_orchestrator import (
@@ -41,6 +42,18 @@ class HandoverTextTests(unittest.TestCase):
         # A delegate's analysis is a model's opinion, not evidence.
         self.assertIn("Delegate findings (unverified):\nAdd a kind filter.", handover)
         self.assertIn("- command grep -n kind modules/nexus_memory.py", handover)
+
+    def test_a_secret_crossing_a_clip_boundary_is_not_kept_in_part(self):
+        # Review on #265: clipping first left a prefix that no longer matched
+        # the configured secret value, so part of it was persisted.
+        secret = "s3cr3t-value-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        with patch.dict(os.environ, {"AGENT_API_KEY": secret}):
+            handover = experiment_handover(
+                None,
+                [{"tool": "command", "command": "x" * 280 + secret, "result": "ok"}],
+            )
+        self.assertNotIn(secret[:12], handover)
+        self.assertIn("[REDACTED]", handover)
 
     def test_nothing_found_hands_over_nothing(self):
         self.assertEqual(experiment_handover(None, []), "")
