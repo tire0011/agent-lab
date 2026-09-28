@@ -72,6 +72,7 @@ from modules.nexus_tool_router import (
     tokens as tool_search_tokens,
 )
 from modules.controller_observations import _args_signature, controller_observation_view
+from modules.experiment_handover import experiment_handover
 from modules.prompt_budget import (
     CHARS_PER_TOKEN,
     PromptBudgetPlan,
@@ -255,6 +256,9 @@ class TaskDecision:
     session_id: str | None = None
     capability: str | None = None
     required_inputs: list[str] = field(default_factory=list)
+    # What Nexus already learned, handed to a new_experiment with the task so
+    # the coding agent does not begin from the bare task text (#263).
+    experiment_handover: str | None = None
 
 
 class TaskOrchestratorError(RuntimeError):
@@ -1208,6 +1212,11 @@ class NexusTaskOrchestrator:
                 session_id=session.id,
                 capability=capability,
                 required_inputs=required_inputs,
+                experiment_handover=(
+                    experiment_handover(decision.get("goal"), observations) or None
+                    if action == ACTION_NEW_EXPERIMENT
+                    else None
+                ),
             )
             if task_logger is not None:
                 task_logger.info(
@@ -1599,7 +1608,15 @@ class NexusTaskOrchestrator:
                     "argv": "list of arguments",
                 },
             },
-            {"name": ACTION_NEW_EXPERIMENT, "description": "Development path for every repository code change, small ones included: start a new isolated implementation experiment."},
+            {
+                "name": ACTION_NEW_EXPERIMENT,
+                "description": (
+                    "Development path for every repository code change, small ones "
+                    "included: start a new isolated implementation experiment. What you "
+                    "already found in this run is handed over with your goal."
+                ),
+                "arguments": {"goal": "the concrete change to make and why"},
+            },
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
@@ -3339,6 +3356,7 @@ Decide the next step now. Return JSON only.
             event_metadata={
                 "reason": decision.reason,
                 "experiment_id": decision.experiment_id,
+                "experiment_handover": decision.experiment_handover,
                 "has_command": bool(decision.command),
                 "capability": decision.capability,
                 "required_inputs": decision.required_inputs,

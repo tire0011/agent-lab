@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+from modules.experiment_handover import with_handover
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.mailbox.development import process_command
@@ -169,7 +170,9 @@ class NexusControllerService:
                 )
                 raise
 
-            experiment = self.experiment_service.create_experiment(source_content)
+            experiment = self.experiment_service.create_experiment(
+                with_handover(source_content, decision.experiment_handover)
+            )
             work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
             self._record_execution(
                 decision,

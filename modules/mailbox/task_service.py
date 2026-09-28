@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
+from modules.experiment_handover import with_handover
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
@@ -571,7 +572,7 @@ class MailboxTaskService:
         )
 
         if decision.action == ACTION_NEW_EXPERIMENT:
-            self._start_new_experiment(approval)
+            self._start_new_experiment(approval, decision)
         elif decision.action == ACTION_RESUME_EXPERIMENT:
             self._resume_existing_experiment(approval, decision)
         elif decision.action == ACTION_COMMAND:
@@ -600,7 +601,9 @@ class MailboxTaskService:
                 error=decision.reason,
             )
 
-    def _start_new_experiment(self, approval: MailboxTaskApproval) -> None:
+    def _start_new_experiment(
+        self, approval: MailboxTaskApproval, decision: TaskDecision | None = None
+    ) -> None:
         # Re-read task_body so clarification follow-ups accumulated by
         # continue_discussion are included in the implementation goal.
         current_approval = self.get(approval.id)
@@ -642,7 +645,13 @@ class MailboxTaskService:
             ).fetchone()
             if current is None or current["status"] != _STATUS_APPROVED:
                 return
-            experiment = self.experiment_service.create_experiment(current_approval.task_body)
+            # What Nexus already learned travels with the task (#263).
+            experiment = self.experiment_service.create_experiment(
+                with_handover(
+                    current_approval.task_body,
+                    decision.experiment_handover if decision is not None else None,
+                )
+            )
             work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?

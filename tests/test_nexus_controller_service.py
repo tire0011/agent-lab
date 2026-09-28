@@ -76,6 +76,23 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.github.ensure_for_source.assert_called_once()
         self.github.bind_experiment.assert_called_once()
 
+    def test_new_experiment_goal_is_the_task_followed_by_the_handover(self):
+        # #263: what Nexus already found travels with the task.
+        self.orchestrator.run.return_value = TaskDecision(
+            action=ACTION_NEW_EXPERIMENT,
+            session_id="session-1",
+            experiment_handover="What Nexus already found (handover):\n\nNexus goal:\nadd a kind filter",
+        )
+        self.orchestrator.experiment_service.create_experiment.return_value = SimpleNamespace(
+            id="exp-263"
+        )
+
+        self.service.handle_task("Implement the requested feature", source_id="task-1")
+
+        goal = self.orchestrator.experiment_service.create_experiment.call_args[0][0]
+        self.assertTrue(goal.startswith("Implement the requested feature\n\n"))
+        self.assertIn("Nexus goal:\nadd a kind filter", goal)
+
     def test_missing_github_configuration_blocks_before_experiment_creation(self):
         self.orchestrator.run.return_value = TaskDecision(
             action=ACTION_NEW_EXPERIMENT,
