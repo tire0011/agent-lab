@@ -642,6 +642,50 @@ class NexusTaskOrchestrator:
             heartbeat.stop()
             self._claims.pop(session.id, None)
 
+    def resume_after_experiment(
+        self, experiment_id: str, result: dict[str, Any]
+    ) -> list[TaskDecision]:
+        """Continue every session parked on *experiment_id* with its result (#263).
+
+        Called the moment the experiment ends, and by the polling safety net
+        after a restart lost that moment; the claim makes sure only one of
+        them continues a session.
+        """
+        resumed: list[TaskDecision] = []
+        for session in self.task_store.sessions_waiting_for_experiments(experiment_id):
+            worker = heartbeat_worker_id()
+            if not self.task_store.claim_waiting_for_experiment(
+                session.id, experiment_id, worker_id=worker
+            ):
+                continue
+            inputs = self.task_store.recent_events(
+                session.id, role="user", kind="input", limit=1
+            )
+            task = str(inputs[0]["content"]) if inputs else (session.title or "")
+            self._claims[session.id] = worker
+            heartbeat = Heartbeat(
+                lambda sid=session.id: self.task_store.heartbeat(sid, worker_id=worker),
+                name=f"nexus-heartbeat-{session.id[:8]}",
+            )
+            heartbeat.start()
+            try:
+                resumed.append(
+                    asyncio.run(
+                        self._run_claimed(session, task, experiment_result=dict(result))
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
+                self._abort_turn(
+                    session.id,
+                    TERMINAL_REASON_TURN_FAILED,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            finally:
+                heartbeat.stop()
+                self._claims.pop(session.id, None)
+        return resumed
+
     def _restore_missing_capability_block(
         self,
         session_id: str,
@@ -696,9 +740,26 @@ class NexusTaskOrchestrator:
         task_logger: Any | None = None,
         resume_capability: str | None = None,
         blocker_event_id: int | None = None,
+        experiment_result: dict[str, Any] | None = None,
     ) -> TaskDecision:
         self._claimed_status(session.id, "active")
-        if resume_capability:
+        if experiment_result is not None:
+            if experiment_result.get("status") == "succeeded":
+                # The experiment changed the code and passed its verification;
+                # without this the controller's answer is rejected for lack of
+                # completion evidence, turn after turn (#263).
+                experiment_result = dict(experiment_result)
+                experiment_result["completion_evidence"] = self._record_evidence(
+                    session, kind="change", source=ACTION_NEW_EXPERIMENT
+                )
+            run_start_event_id = self.task_store.append_event(
+                session.id,
+                role="tool",
+                kind=ACTION_NEW_EXPERIMENT,
+                content=json.dumps(experiment_result, separators=(",", ":")),
+                metadata={"experiment_id": experiment_result.get("experiment_id")},
+            )
+        elif resume_capability:
             run_start_event_id = self.task_store.append_event(
                 session.id,
                 role="system",
@@ -717,7 +778,9 @@ class NexusTaskOrchestrator:
                 content=task.strip(),
                 metadata={"source_type": session.source_type, "source_id": session.source_id},
             )
-        observations: list[dict[str, Any]] = []
+        observations: list[dict[str, Any]] = (
+            [dict(experiment_result)] if experiment_result is not None else []
+        )
         # Counted so a finished run says plainly whether the controller used
         # the results it already had. See `_log_result_reuse`.
         redundant_requests = 0

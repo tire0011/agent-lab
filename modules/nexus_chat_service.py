@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
 from modules.experiment_handover import with_handover
+from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.task_orchestrator import (
@@ -223,11 +224,24 @@ class NexusChatService:
                 )
                 experiment = self.experiment_service.create_experiment(goal)
                 self.github_work_tracking.bind_experiment(work_ref, experiment.id)
+                # Nexus pauses on the experiment and continues the moment it ends (#263).
+                orchestrator.task_store.wait_for_experiment(decision.session_id, experiment.id)
                 self.background_starter(
                     experiment.id,
-                    lambda: self.experiment_service.run_experiment(
+                    lambda: run_then_resume(
+                        lambda: self.experiment_service.run_experiment(
+                            experiment.id,
+                            github_work_tracking=self.github_work_tracking,
+                        ),
+                        lambda: resume_with_new_orchestrator(
+                            self.orchestrator_factory,
+                            self.experiment_service,
+                            self.github_work_tracking,
+                            experiment.id,
+                            operations_registry=self.operations_registry,
+                            allow_mutation=False,
+                        ),
                         experiment.id,
-                        github_work_tracking=self.github_work_tracking,
                     ),
                 )
                 return NexusChatResult(

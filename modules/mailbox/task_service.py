@@ -22,6 +22,11 @@ from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from modules.experiment_handover import with_handover
+from modules.experiment_wait import (
+    resume_finished_experiments,
+    resume_with_new_orchestrator,
+    run_then_resume,
+)
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
@@ -174,6 +179,9 @@ class MailboxTaskService:
         # Finish queued diagnoses before closing their shared service/SQLite
         # connection. Analysis runs outside the mailbox poll loop.
         self._failure_analysis_executor.shutdown(wait=True)
+        nexus_task_store = getattr(self, "_nexus_task_store", None)
+        if nexus_task_store is not None:
+            nexus_task_store.close()
         if self._owns_operations_registry and self.operations_registry is not None:
             close = getattr(self.operations_registry, "close", None)
             if close:
@@ -670,13 +678,67 @@ class MailboxTaskService:
             "queued", "experiment_created", "experiment created for mailbox task",
             experiment_id=experiment.id,
         )
+        # Nexus pauses on the experiment and continues the moment it ends (#263).
+        if decision is not None and decision.session_id:
+            self._with_task_store(
+                lambda store: store.wait_for_experiment(decision.session_id, experiment.id)
+            )
         self._start_thread(
             experiment.id,
-            lambda: self.experiment_service.run_experiment(
+            lambda: run_then_resume(
+                lambda: self.experiment_service.run_experiment(
+                    experiment.id,
+                    github_work_tracking=self.github_work_tracking,
+                ),
+                lambda: resume_with_new_orchestrator(
+                    self._orchestrator_factory,
+                    self.experiment_service,
+                    self.github_work_tracking,
+                    experiment.id,
+                    operations_registry=self.operations_registry,
+                ),
                 experiment.id,
-                github_work_tracking=self.github_work_tracking,
             ),
         )
+
+    def _with_task_store(self, action: Any) -> Any:
+        """Run *action* against the Nexus task store the orchestrator uses.
+
+        Opened once and kept: the worker checks it every cycle.
+        """
+        if getattr(self, "_nexus_task_store", None) is None:
+            from modules.nexus_task_store import NexusTaskStore
+            from modules.run_store import DEFAULT_DB_PATH
+
+            self._nexus_task_store = NexusTaskStore(
+                db_path=getattr(self.operations_registry, "db_path", DEFAULT_DB_PATH)
+            )
+        return action(self._nexus_task_store)
+
+    def resume_finished_experiments(self) -> None:
+        """Safety net for #263: continue sessions whose experiment ended unnoticed.
+
+        The experiment thread continues its session the moment it ends; a
+        restart in between loses that moment. Checking is one query, so this
+        runs every worker cycle and builds an orchestrator only when a waiting
+        session exists.
+        """
+        if self.experiment_service is None:
+            return
+        if not self._with_task_store(lambda store: store.sessions_waiting_for_experiments()):
+            return
+        orchestrator = self._orchestrator_factory(
+            operations_registry=self.operations_registry,
+            experiment_service=self.experiment_service,
+        )
+        try:
+            resume_finished_experiments(
+                orchestrator, self.experiment_service, self.github_work_tracking
+            )
+        finally:
+            close = getattr(orchestrator, "close", None)
+            if close:
+                close()
 
     def _resume_existing_experiment(
         self,
@@ -1107,4 +1169,8 @@ class MailboxTaskWorker(threading.Thread):
                 self._service.poll_running()
             except Exception:
                 logger.exception("MailboxTaskWorker: poll_running failed")
+            try:
+                self._service.resume_finished_experiments()
+            except Exception:
+                logger.exception("MailboxTaskWorker: resume_finished_experiments failed")
         logger.info("MailboxTaskWorker stopped")
