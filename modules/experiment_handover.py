@@ -18,7 +18,9 @@ _MAX_ATTEMPT_CHARS = 300
 
 
 def _clip(text: Any, limit: int) -> str:
-    value = str(text or "").strip()
+    # Redact before cutting: a secret split at the limit no longer matches
+    # its configured literal value, and its prefix would be kept.
+    value = redact_secrets(str(text or "")).strip()
     return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
@@ -64,7 +66,7 @@ def experiment_handover(nexus_goal: Any, observations: list[dict[str, Any]]) -> 
     if not sections:
         return ""
     handover = "What Nexus already found (handover):\n\n" + "\n\n".join(sections)
-    return _clip(redact_secrets(handover), MAX_HANDOVER_CHARS)
+    return _clip(handover, MAX_HANDOVER_CHARS)
 
 
 def with_handover(goal: str, handover: str | None) -> str:
