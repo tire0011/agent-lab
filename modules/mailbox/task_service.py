@@ -22,11 +22,7 @@ from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from modules.experiment_handover import with_handover
-from modules.experiment_wait import (
-    resume_finished_experiments,
-    resume_with_new_orchestrator,
-    run_then_resume,
-)
+from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
@@ -64,6 +60,10 @@ _TERMINAL_STATUSES = {_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STAT
 _NON_TERMINAL_STATUSES = {_STATUS_PENDING, _STATUS_APPROVED, _STATUS_SUBMITTED, _STATUS_RUNNING}
 _EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
+_EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review"}
+# After a failed experiment Nexus may try again, but a task gets at most this
+# many experiments in total (#263 step 4).
+_MAX_EXPERIMENTS_PER_TASK = 2
 _REJECTION_REASON_RE = re.compile(r"^[\w\s.,!?()\'\"\-]{1,500}$")
 
 
@@ -690,13 +690,7 @@ class MailboxTaskService:
                     experiment.id,
                     github_work_tracking=self.github_work_tracking,
                 ),
-                lambda: resume_with_new_orchestrator(
-                    self._orchestrator_factory,
-                    self.experiment_service,
-                    self.github_work_tracking,
-                    experiment.id,
-                    operations_registry=self.operations_registry,
-                ),
+                lambda: self._after_experiment(experiment.id),
                 experiment.id,
             ),
         )
@@ -725,20 +719,122 @@ class MailboxTaskService:
         """
         if self.experiment_service is None:
             return
-        if not self._with_task_store(lambda store: store.sessions_waiting_for_experiments()):
-            return
-        orchestrator = self._orchestrator_factory(
+        waiting = self._with_task_store(lambda store: store.sessions_waiting_for_experiments())
+        for session in waiting:
+            experiment_id = session.waiting_experiment_id
+            if not experiment_id:
+                continue
+            try:
+                experiment = self.experiment_service.get_experiment(experiment_id)
+                if experiment.status not in _EXP_TERMINAL:
+                    continue
+                self._after_experiment(experiment_id)
+            except Exception:
+                logger.exception(
+                    "mailbox_task: resume after experiment %s failed", experiment_id
+                )
+
+    def _after_experiment(self, experiment_id: str) -> None:
+        """Continue the Nexus session, then carry out what it decided (#263 step 4).
+
+        A succeeded experiment keeps its existing path (``poll_running`` and
+        finalization). After a failed one the task stays open until Nexus has
+        decided: another experiment, within the limit, or an end with Nexus'
+        own words.
+        """
+        decisions = resume_with_new_orchestrator(
+            self._orchestrator_factory,
+            self.experiment_service,
+            self.github_work_tracking,
+            experiment_id,
             operations_registry=self.operations_registry,
-            experiment_service=self.experiment_service,
         )
-        try:
-            resume_finished_experiments(
-                orchestrator, self.experiment_service, self.github_work_tracking
+        if not decisions:
+            # Another path claimed the session and carries on from here.
+            return
+        approval = self._approval_for_experiment(experiment_id)
+        if approval is None or approval.status not in (_STATUS_SUBMITTED, _STATUS_RUNNING):
+            return
+        experiment = self.experiment_service.get_experiment(experiment_id)
+        if experiment.status not in _EXP_FAILED_TERMINAL:
+            return
+        self._continue_after_failed_experiment(approval, experiment, decisions[0])
+
+    def _approval_for_experiment(self, experiment_id: str) -> MailboxTaskApproval | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mailbox_task_approvals WHERE experiment_id=?",
+                (experiment_id,),
+            ).fetchone()
+        return _row_to_approval(row) if row else None
+
+    def _nexus_decides_failure(self, approval: MailboxTaskApproval) -> bool:
+        """Whether Nexus is still deciding what follows a failed experiment.
+
+        ``poll_running`` leaves such a task open; ``_after_experiment`` closes
+        it. A resume that dies leaves the session failed or abandoned, and
+        the ordinary path takes over again.
+        """
+        session = self._with_task_store(
+            lambda store: store.find_by_source("task", approval.id)
+        )
+        return session is not None and session.status in (
+            "waiting_for_experiment",
+            "active",
+        )
+
+    def _continue_after_failed_experiment(
+        self,
+        approval: MailboxTaskApproval,
+        experiment: Any,
+        decision: TaskDecision,
+    ) -> None:
+        from modules.task_orchestrator import (
+            ACTION_ANSWER,
+            ACTION_CLARIFICATION,
+            ACTION_MISSING_CAPABILITY,
+            ACTION_NEW_EXPERIMENT,
+        )
+
+        status = (
+            _STATUS_NEEDS_REVIEW if experiment.status == "needs_review" else _STATUS_FAILED
+        )
+        attempts = len(
+            self._with_task_store(
+                lambda store: store.recent_events(
+                    decision.session_id or "",
+                    role="tool",
+                    kind=ACTION_NEW_EXPERIMENT,
+                    limit=_MAX_EXPERIMENTS_PER_TASK + 1,
+                )
             )
-        finally:
-            close = getattr(orchestrator, "close", None)
-            if close:
-                close()
+        )
+        if decision.action == ACTION_NEW_EXPERIMENT and attempts < _MAX_EXPERIMENTS_PER_TASK:
+            self._task_logger(approval.id).info(
+                "queued", "experiment_retry",
+                f"Nexus starts experiment {attempts + 1} of {_MAX_EXPERIMENTS_PER_TASK} "
+                "after a failed one",
+                previous_experiment_id=experiment.id,
+            )
+            with self._lock:
+                self._conn.execute(
+                    """UPDATE mailbox_task_approvals SET status=?, updated_at=?
+                       WHERE id=? AND status IN (?, ?)""",
+                    (_STATUS_APPROVED, _now_iso(), approval.id,
+                     _STATUS_SUBMITTED, _STATUS_RUNNING),
+                )
+                self._conn.commit()
+            self._start_new_experiment(self.get(approval.id), decision)
+            return
+        note = None
+        if decision.action == ACTION_NEW_EXPERIMENT:
+            note = (
+                f"Nexus wanted another experiment; the limit of "
+                f"{_MAX_EXPERIMENTS_PER_TASK} experiments per task is reached."
+            )
+        elif decision.action in (ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY):
+            note = decision.message or decision.reason or None
+        self._transition_terminal(approval, status, experiment, nexus_note=note)
 
     def _resume_existing_experiment(
         self,
@@ -878,6 +974,8 @@ class MailboxTaskService:
                     self._conn.commit()
             elif exp.status == "succeeded":
                 self._transition_terminal(approval, _STATUS_SUCCEEDED, exp)
+            elif exp.status in _EXP_FAILED_TERMINAL and self._nexus_decides_failure(approval):
+                continue
             elif exp.status in ("failed", "timed_out"):
                 self._transition_terminal(approval, _STATUS_FAILED, exp)
             elif exp.status == "needs_review":
@@ -920,8 +1018,12 @@ class MailboxTaskService:
         approval: MailboxTaskApproval,
         new_status: str,
         exp: Any,
+        *,
+        nexus_note: str | None = None,
     ) -> None:
         summary = self._make_result_summary(exp)
+        if nexus_note:
+            summary = f"{summary}\n\nNexus: {nexus_note}"
         self._write_result_outbox(approval, new_status, summary, exp)
         with self._lock:
             self._conn.execute(

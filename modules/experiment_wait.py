@@ -3,7 +3,8 @@
 A turn that ends in ``new_experiment`` parks its session. The moment the
 experiment ends, the thread that ran it continues the session with one
 observation: status, PR number and - on failure - a short reason. A restart
-loses that moment, so a cheap poll resumes whatever the event missed.
+loses that moment, so the caller's cheap poll resumes whatever the event
+missed.
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ def resume_with_new_orchestrator(
         if close:
             close()
     for decision in decisions:
-        # Recorded in the session; carrying out a follow-up here is #263 step 4.
+        # Recorded in the session; the caller carries it out if it can.
         logger.info(
             "experiment_wait: session=%s continued after experiment=%s action=%s",
             getattr(decision, "session_id", None),
@@ -89,28 +90,6 @@ def resume_with_new_orchestrator(
             getattr(decision, "action", None),
         )
     return decisions
-
-
-def resume_finished_experiments(
-    orchestrator: Any,
-    experiment_service: Any,
-    github_work_tracking: Any | None,
-) -> list[Any]:
-    """Safety net: continue sessions whose experiment ended unnoticed."""
-    resumed: list[Any] = []
-    for session in orchestrator.task_store.sessions_waiting_for_experiments():
-        experiment_id = session.waiting_experiment_id
-        if not experiment_id:
-            continue
-        try:
-            resumed.extend(
-                resume_after_experiment(
-                    orchestrator, experiment_service, github_work_tracking, experiment_id
-                )
-            )
-        except Exception:  # noqa: BLE001 - one session must not stop the others
-            logger.exception("experiment_wait: resume failed for experiment %s", experiment_id)
-    return resumed
 
 
 def run_then_resume(
