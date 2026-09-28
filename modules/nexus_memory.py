@@ -31,7 +31,7 @@ _ISSUE_QUERY_RE = re.compile(r"\bissue\s+#?(\d+)\b", re.IGNORECASE)
 # Orchestrator bookkeeping must never become project knowledge. In particular,
 # indexing memory_search results makes later memory_search calls recursively
 # contain earlier serialized searches (#238).
-_TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY = {
+_TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY = (
     "memory_search",
     "controller_decision",
     "find_tool",
@@ -40,7 +40,7 @@ _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY = {
     "terminal_decision_rejected",
     "knowledge_collection",
     "preflight_plan",
-}
+)
 
 
 def _terms(query: str) -> list[str]:
@@ -167,19 +167,22 @@ class NexusMemory:
         *,
         issue_number: int | None = None,
     ) -> None:
+        excluded_kind_placeholders = ", ".join(
+            "?" for _ in _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY
+        )
         try:
             rows = self._conn.execute(
-                """SELECT e.session_id, e.role, e.kind, e.content, e.created_at,
-                          s.source_type, s.source_id, s.title
-                   FROM nexus_task_events e
-                   JOIN nexus_task_sessions s ON s.id=e.session_id
-                   ORDER BY e.id DESC LIMIT 500"""
+                f"""SELECT e.session_id, e.role, e.kind, e.content, e.created_at,
+                           s.source_type, s.source_id, s.title
+                    FROM nexus_task_events e
+                    JOIN nexus_task_sessions s ON s.id=e.session_id
+                    WHERE e.kind NOT IN ({excluded_kind_placeholders})
+                    ORDER BY e.id DESC LIMIT 500""",
+                _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY,
             ).fetchall()
         except sqlite3.Error:
             return
         for row in rows:
-            if str(row["kind"] or "") in _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY:
-                continue
             text = f"{row['title'] or ''} {row['kind']} {row['content']}"
             if issue_number is not None and not _mentions_issue(
                 text,
