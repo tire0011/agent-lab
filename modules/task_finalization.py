@@ -778,7 +778,9 @@ class TaskFinalizationCoordinator:
     def _restart_services(services: list[str]) -> None:
         if not services:
             return
-        command = ["systemctl", "restart", *services]
+        # The service user may restart the units only through the sudoers rule
+        # from scripts/setup-nexus-permissions.sh; -n fails instead of prompting.
+        command = ["sudo", "-n", "systemctl", "restart", *services]
         proc = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,

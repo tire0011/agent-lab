@@ -189,10 +189,13 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
     def test_a_failing_restart_command_is_logged_and_raised(self):
         proc = MagicMock(returncode=1)
         proc.communicate.return_value = ("", "Failed to restart agent-api.service: Access denied\n")
-        with patch("modules.task_finalization.subprocess.Popen", return_value=proc), \
+        with patch("modules.task_finalization.subprocess.Popen", return_value=proc) as popen, \
                 self.assertLogs("modules.task_finalization", level="INFO") as logs:
             with self.assertRaisesRegex(RuntimeError, "exited 1: .*Access denied"):
                 TaskFinalizationCoordinator._restart_services(["nexus-mailbox", "agent-api"])
+        self.assertEqual(
+            popen.call_args[0][0], ["sudo", "-n", "systemctl", "restart", "nexus-mailbox", "agent-api"]
+        )
         self.assertTrue(any("exit=1" in line and "Access denied" in line for line in logs.output))
 
     def test_a_slow_restart_returns_at_once_and_its_later_failure_is_logged(self):
