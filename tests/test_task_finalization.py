@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from modules.experiment_adoption_service import (
     STATUS_ADOPTED,
@@ -140,6 +141,90 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.status, "running")
         self.assertEqual(result.phase, PHASE_RESTART_REQUESTED)
         self.assertEqual(restart_calls, [["nexus-mailbox", "agent-api"]])
+
+    def test_an_unobserved_restart_ends_in_needs_review_after_the_timeout(self):
+        # #269: on the VM the restart silently never happened and finalization
+        # waited for it for over an hour.
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(
+            _FakeAdoptionService(adoption),
+            process_started_at=time.time() - 60,
+            restart_timeout_seconds=0,
+        )
+        self.addCleanup(coordinator.close)
+
+        first = coordinator.advance(self.approval, self.experiment)
+        time.sleep(0.01)
+        second = coordinator.advance(self.approval, self.experiment)
+
+        self.assertEqual(first.phase, PHASE_RESTART_REQUESTED)
+        self.assertEqual(second.status, "needs_review")
+        self.assertIn("not observed within 0s", second.summary)
+
+    def test_a_restart_within_the_timeout_is_still_awaited(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(
+            _FakeAdoptionService(adoption),
+            process_started_at=time.time() - 60,
+            restart_timeout_seconds=3600,
+        )
+        self.addCleanup(coordinator.close)
+
+        coordinator.advance(self.approval, self.experiment)
+        second = coordinator.advance(self.approval, self.experiment)
+
+        self.assertEqual(second.status, "running")
+        self.assertEqual(second.phase, PHASE_RESTART_REQUESTED)
+
+    def test_a_failing_restart_command_is_logged_and_raised(self):
+        proc = MagicMock(returncode=1)
+        proc.communicate.return_value = ("", "Failed to restart agent-api.service: Access denied\n")
+        with patch("modules.task_finalization.subprocess.Popen", return_value=proc), \
+                self.assertLogs("modules.task_finalization", level="INFO") as logs:
+            with self.assertRaisesRegex(RuntimeError, "exited 1: .*Access denied"):
+                TaskFinalizationCoordinator._restart_services(["nexus-mailbox", "agent-api"])
+        self.assertTrue(any("exit=1" in line and "Access denied" in line for line in logs.output))
+
+    def test_a_slow_restart_returns_at_once_and_its_later_failure_is_logged(self):
+        # Review on #270: a restart that fails after the 5 s window must
+        # still leave exit code and stderr in the log.
+        proc = MagicMock(returncode=1)
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired("systemctl", 5),
+            ("", "Job for agent-api.service failed\n"),
+        ]
+        watchers = []
+
+        class _Thread:
+            def __init__(self, *, target, args, **_kwargs):
+                watchers.append((target, args))
+
+            def start(self):
+                pass
+
+        with patch("modules.task_finalization.subprocess.Popen", return_value=proc), \
+                patch("modules.task_finalization.threading.Thread", _Thread):
+            TaskFinalizationCoordinator._restart_services(["agent-api"])
+
+        # Returned without waiting; the watcher then observes the end.
+        self.assertEqual(len(watchers), 1)
+        target, args = watchers[0]
+        with self.assertLogs("modules.task_finalization", level="WARNING") as logs:
+            target(*args)
+        self.assertTrue(any(
+            "exit=1" in line and "Job for agent-api.service failed" in line
+            for line in logs.output
+        ))
 
     def test_restart_resume_runs_live_validation_and_finishes(self):
         adoption = SimpleNamespace(
