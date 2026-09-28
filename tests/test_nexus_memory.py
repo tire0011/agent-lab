@@ -184,6 +184,49 @@ class NexusMemoryTests(unittest.TestCase):
                 memory.close()
                 store.close()
 
+    def test_bookkeeping_events_do_not_crow_searchable_history_out_of_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / "state.db")
+            store = NexusTaskStore(db_path=db_path)
+
+            session = store.get_or_create(
+                source_type="task",
+                source_id="memory-filter",
+                title="Memory filtering regression",
+            )
+            store.append_event(
+                session.id,
+                role="assistant",
+                kind="answer",
+                content="The durable searchable finding uses the term ultramarine.",
+            )
+            for index in range(501):
+                store.append_event(
+                    session.id,
+                    role="tool",
+                    kind="memory_search",
+                    content=f'{{"tool":"memory_search","result":{index}}}',
+                )
+
+            memory = NexusMemory(
+                db_path=db_path,
+                repo_root=str(root),
+                task_store=store,
+            )
+            try:
+                results = memory.search("ultramarine", limit=10)
+                self.assertTrue(
+                    any(
+                        item.get("kind") == "answer"
+                        and "durable searchable finding" in item.get("content", "")
+                        for item in results
+                    )
+                )
+            finally:
+                memory.close()
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
