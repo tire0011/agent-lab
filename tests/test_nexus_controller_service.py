@@ -91,6 +91,10 @@ class NexusControllerServiceTests(unittest.TestCase):
 
         goal = self.orchestrator.experiment_service.create_experiment.call_args[0][0]
         self.assertTrue(goal.startswith("Implement the requested feature\n\n"))
+        # #263 step 3: the session pauses on the experiment it started.
+        self.orchestrator.task_store.wait_for_experiment.assert_called_once_with(
+            "session-1", "exp-263"
+        )
         self.assertIn("Nexus goal:\nadd a kind filter", goal)
 
     def test_missing_github_configuration_blocks_before_experiment_creation(self):

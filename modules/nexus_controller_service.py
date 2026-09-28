@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from modules.experiment_handover import with_handover
+from modules.experiment_wait import resume_after_experiment, run_then_resume
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.mailbox.development import process_command
@@ -125,6 +126,35 @@ class NexusControllerService:
             completed.append(decision)
         return completed
 
+    def _resume_after_experiment(self, experiment_id: str) -> list[TaskDecision]:
+        return self._continue_after_experiment(
+            resume_after_experiment(
+                self.orchestrator,
+                self.experiment_service,
+                self.github_work_tracking,
+                experiment_id,
+            )
+        )
+
+    def _continue_after_experiment(self, decisions: list[TaskDecision]) -> list[TaskDecision]:
+        """Carry out what Nexus decided after seeing its experiment's result."""
+        completed: list[TaskDecision] = []
+        for decision in decisions:
+            if not decision.session_id:
+                continue
+            try:
+                self._execute(decision, self._execution_goal(decision.session_id, ""))
+            except Exception as exc:
+                self._record_execution(
+                    decision,
+                    "experiment_resume_execution_failed",
+                    f"{type(exc).__name__}: {exc}",
+                )
+                self.orchestrator.task_store.set_status(decision.session_id, "failed")
+                continue
+            completed.append(decision)
+        return completed
+
     def _execution_goal(self, session_id: str, fallback: str) -> str:
         """Reconstruct the user-visible task across clarification replies.
 
@@ -187,11 +217,20 @@ class NexusControllerService:
                 "experiment_started",
                 f"experiment_id={experiment.id}",
             )
+            # Nexus pauses on the experiment and continues the moment it ends (#263).
+            if decision.session_id:
+                self.orchestrator.task_store.wait_for_experiment(
+                    decision.session_id, experiment.id
+                )
             self._start_experiment_thread(
                 experiment.id,
-                lambda: self.experiment_service.run_experiment(
+                lambda: run_then_resume(
+                    lambda: self.experiment_service.run_experiment(
+                        experiment.id,
+                        github_work_tracking=self.github_work_tracking,
+                    ),
+                    lambda: self._resume_after_experiment(experiment.id),
                     experiment.id,
-                    github_work_tracking=self.github_work_tracking,
                 ),
             )
             return

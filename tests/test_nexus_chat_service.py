@@ -15,9 +15,14 @@ from modules.task_orchestrator import (
 class FakeTaskStore:
     def __init__(self, history):
         self._history = history
+        self.waiting = []
 
     def history(self, session_id, limit=18, max_chars=9000):
         return list(self._history)
+
+    def wait_for_experiment(self, session_id, experiment_id):
+        self.waiting.append((session_id, experiment_id))
+        return True
 
 
 class FakeOrchestrator:

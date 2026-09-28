@@ -41,7 +41,13 @@ WORKING_STATUSES: tuple[str, ...] = (
 # Intentional resting states. A session waiting for a human reply, or blocked
 # on a capability nobody has built yet, has no worker by design - silence there
 # is correct, not death (#162).
-RESTING_STATUSES: tuple[str, ...] = ("waiting_for_user", "blocked_missing_capability")
+RESTING_STATUSES: tuple[str, ...] = (
+    "waiting_for_user",
+    "blocked_missing_capability",
+    # Paused while an experiment it started runs; resumed with the result (#263).
+    "waiting_for_experiment",
+)
+STATUS_WAITING_FOR_EXPERIMENT = "waiting_for_experiment"
 
 STATUS_ABANDONED = "abandoned"
 STATUS_FAILED = "failed"
@@ -88,6 +94,7 @@ class NexusTaskSession:
     completion_intent_key: str | None = None
     completion_evidence_key: str | None = None
     verification_evidence_key: str | None = None
+    waiting_experiment_id: str | None = None
 
 
 class NexusTaskStore:
@@ -180,6 +187,7 @@ class NexusTaskStore:
             "completion_intent_key",
             "completion_evidence_key",
             "verification_evidence_key",
+            "waiting_experiment_id",
         ):
             if column not in existing:
                 self._conn.execute(
@@ -891,6 +899,60 @@ class NexusTaskStore:
                 break
         return blocked
 
+    def wait_for_experiment(self, session_id: str, experiment_id: str) -> bool:
+        """Park a session whose turn ended in new_experiment until it finishes.
+
+        Called once the experiment exists. The session holds no claim while it
+        waits, so the local model stays free for other work (#263).
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE nexus_task_sessions
+                   SET status=?, waiting_experiment_id=?, last_heartbeat_at=NULL,
+                       updated_at=?
+                   WHERE id=?""",
+                (STATUS_WAITING_FOR_EXPERIMENT, str(experiment_id), _now(), session_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def sessions_waiting_for_experiments(
+        self, experiment_id: str | None = None
+    ) -> list[NexusTaskSession]:
+        """Sessions parked on an experiment, optionally on one experiment."""
+        query = "SELECT * FROM nexus_task_sessions WHERE status=?"
+        params: list[Any] = [STATUS_WAITING_FOR_EXPERIMENT]
+        if experiment_id is not None:
+            query += " AND waiting_experiment_id=?"
+            params.append(str(experiment_id))
+        with self._lock:
+            rows = self._conn.execute(query + " ORDER BY updated_at", params).fetchall()
+        return [self._row(row) for row in rows]
+
+    def claim_waiting_for_experiment(
+        self, session_id: str, experiment_id: str, *, worker_id: str
+    ) -> bool:
+        """Atomically claim a session parked on *experiment_id* exactly once.
+
+        The event path and the polling safety net can both see the same
+        finished experiment; only one of them resumes the session.
+        """
+        now = _now()
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE nexus_task_sessions
+                   SET worker_id=?, claimed_at=?, last_heartbeat_at=?,
+                       terminal_reason=NULL, status='active',
+                       waiting_experiment_id=NULL, updated_at=?
+                   WHERE id=? AND status=? AND waiting_experiment_id=?""",
+                (
+                    str(worker_id)[:128], now, now, now, session_id,
+                    STATUS_WAITING_FOR_EXPERIMENT, str(experiment_id),
+                ),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
     def set_requires_completion_evidence(
         self,
         session_id: str,
@@ -988,6 +1050,9 @@ class NexusTaskStore:
             ),
             completion_evidence_key=(
                 row["completion_evidence_key"] if "completion_evidence_key" in keys else None
+            ),
+            waiting_experiment_id=(
+                row["waiting_experiment_id"] if "waiting_experiment_id" in keys else None
             ),
             verification_evidence_key=(
                 row["verification_evidence_key"]
