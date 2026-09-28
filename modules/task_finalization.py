@@ -48,6 +48,12 @@ _START_FAILURE_PREFIX = "could not start adoption: "
 
 _DEFAULT_MAX_RETRIES = 2
 _DEFAULT_HEALTH_URL = "http://127.0.0.1:8000/health"
+# How long a requested restart may stay unobserved before finalization stops
+# waiting (#269). On the VM it hung for over an hour with nothing to show.
+_DEFAULT_RESTART_TIMEOUT_SECONDS = 600
+# A restart that cannot happen (e.g. no permission) fails within this window;
+# one that works may stop this very process before it returns.
+_RESTART_FAILURE_WINDOW_SECONDS = 5
 _ACTIVE_APPROVAL_STATUSES = {"pending_approval", "approved", "submitted", "running"}
 
 
@@ -95,8 +101,16 @@ class TaskFinalizationCoordinator:
         live_validator: LiveValidator | None = None,
         process_started_at: float | None = None,
         max_retries: int = _DEFAULT_MAX_RETRIES,
+        restart_timeout_seconds: float | None = None,
     ) -> None:
         self.experiment_service = experiment_service
+        if restart_timeout_seconds is None:
+            restart_timeout_seconds = float(
+                os.environ.get(
+                    "NEXUS_FINALIZE_RESTART_TIMEOUT_SECONDS", _DEFAULT_RESTART_TIMEOUT_SECONDS
+                )
+            )
+        self.restart_timeout_seconds = max(0.0, float(restart_timeout_seconds))
         self.github_work_tracking = github_work_tracking
         self.db_path = db_path
         self.repo_root = Path(repo_root)
@@ -298,6 +312,16 @@ class TaskFinalizationCoordinator:
             )
 
         if self.process_started_at <= state.restart_requested_at:
+            waited = time.time() - state.restart_requested_at
+            if waited > self.restart_timeout_seconds:
+                reason = (
+                    f"service restart of {', '.join(self._restart_service_names())} was "
+                    f"requested {int(waited)}s ago but not observed within "
+                    f"{int(self.restart_timeout_seconds)}s; this process has run since "
+                    f"before the request"
+                )
+                logger.warning("finalization %s: %s", state.approval_id, reason)
+                return self._needs_review(state, reason)
             return FinalizationResult(
                 "running",
                 PHASE_RESTART_REQUESTED,
@@ -753,13 +777,33 @@ class TaskFinalizationCoordinator:
     def _restart_services(services: list[str]) -> None:
         if not services:
             return
-        subprocess.Popen(
-            ["systemctl", "restart", *services],
+        command = ["systemctl", "restart", *services]
+        proc = subprocess.Popen(
+            command,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             start_new_session=True,
         )
+        # Its output used to be discarded, so a restart that could not happen
+        # left finalization waiting for it with no trace of why (#269).
+        try:
+            _stdout, stderr = proc.communicate(timeout=_RESTART_FAILURE_WINDOW_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.info("service restart still running: %s", " ".join(command))
+            return
+        stderr = (stderr or "").strip()[:500]
+        logger.info(
+            "service restart finished: %s exit=%s stderr=%s",
+            " ".join(command),
+            proc.returncode,
+            stderr,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"{' '.join(command)} exited {proc.returncode}: {stderr or 'no output'}"
+            )
 
     def _validate_live(self, approval: Any, experiment: Any) -> dict[str, Any]:
         health_url = os.environ.get("NEXUS_LIVE_HEALTH_URL", _DEFAULT_HEALTH_URL)
