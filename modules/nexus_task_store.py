@@ -916,6 +916,15 @@ class NexusTaskStore:
             self._conn.commit()
         return cursor.rowcount > 0
 
+    def find_by_source(self, source_type: str, source_id: str) -> NexusTaskSession | None:
+        """The session for a source, without creating one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM nexus_task_sessions WHERE source_type=? AND source_id=?",
+                (source_type, str(source_id)),
+            ).fetchone()
+        return self._row(row) if row else None
+
     def sessions_waiting_for_experiments(
         self, experiment_id: str | None = None
     ) -> list[NexusTaskSession]:

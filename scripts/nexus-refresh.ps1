@@ -24,6 +24,12 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Nexus was updated, but MCP write mode could not be enabled.'
 }
 
+# Let the service user restart the units after a finalized task (#269).
+sudo bash (Join-Path $PSScriptRoot 'setup-nexus-permissions.sh')
+if ($LASTEXITCODE -ne 0) {
+    throw 'Nexus was updated, but the restart permission could not be installed.'
+}
+
 & (Join-Path $PSScriptRoot 'nexus-restart.ps1') @RestArgs
 if ($LASTEXITCODE -ne 0) {
     throw 'Nexus was updated, but the restart failed.'

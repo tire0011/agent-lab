@@ -189,11 +189,23 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
     def test_a_failing_restart_command_is_logged_and_raised(self):
         proc = MagicMock(returncode=1)
         proc.communicate.return_value = ("", "Failed to restart agent-api.service: Access denied\n")
-        with patch("modules.task_finalization.subprocess.Popen", return_value=proc), \
+        with patch("modules.task_finalization.subprocess.Popen", return_value=proc) as popen, \
                 self.assertLogs("modules.task_finalization", level="INFO") as logs:
             with self.assertRaisesRegex(RuntimeError, "exited 1: .*Access denied"):
                 TaskFinalizationCoordinator._restart_services(["nexus-mailbox", "agent-api"])
+        self.assertEqual(
+            popen.call_args[0][0], ["sudo", "-n", "systemctl", "restart", "nexus-mailbox", "agent-api"]
+        )
         self.assertTrue(any("exit=1" in line and "Access denied" in line for line in logs.output))
+
+    def test_the_restart_is_exactly_what_the_sudoers_rule_allows(self):
+        # Review on #271: sudo -n only runs the one command the setup script
+        # grants, so the service list is fixed and must match it.
+        with patch.dict("os.environ", {"NEXUS_FINALIZE_RESTART_SERVICES": "agent-api"}):
+            services = TaskFinalizationCoordinator._restart_service_names()
+        self.assertEqual(services, ["nexus-mailbox", "agent-api"])
+        script = (Path(__file__).resolve().parents[1] / "scripts" / "setup-nexus-permissions.sh").read_text()
+        self.assertIn("restart " + " ".join(services) + "\\n", script)
 
     def test_a_slow_restart_returns_at_once_and_its_later_failure_is_logged(self):
         # Review on #270: a restart that fails after the 5 s window must

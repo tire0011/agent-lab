@@ -91,6 +91,8 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
 
             if exp.status == "succeeded":
                 self._advance_verified(approval, exp)
+            elif exp.status in _base._EXP_FAILED_TERMINAL and self._nexus_decides_failure(approval):
+                continue
             elif exp.status in ("failed", "timed_out"):
                 self._transition_terminal(approval, _base._STATUS_FAILED, exp)
             elif exp.status == "needs_review":
