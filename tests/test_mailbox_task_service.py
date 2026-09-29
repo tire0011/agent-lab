@@ -78,6 +78,9 @@ def _make_service(
     operations_registry = MagicMock() if exp_service is not None else None
     if operations_registry is not None:
         operations_registry.catalog.return_value = []
+        # A bare MagicMock attribute as a path creates MagicMock/mock.db_path/*
+        # in the working directory (#279).
+        operations_registry.db_path = db_path
     github = github_work_tracking or MagicMock()
     github.ensure_for_source.return_value = SimpleNamespace(
         issue_number=42, branch_name="nexus/42-mailbox"

@@ -702,15 +702,15 @@ class MailboxTaskService:
     def _with_task_store(self, action: Any) -> Any:
         """Run *action* against the Nexus task store the orchestrator uses.
 
-        Opened once and kept: the worker checks it every cycle.
+        Opened once and kept: the worker checks it every cycle. The store
+        lives in the service's own database; production wires the operations
+        registry to the same path, and a mocked registry must never decide
+        where the file lands (#279: MagicMock/mock.db_path/* on main).
         """
         if getattr(self, "_nexus_task_store", None) is None:
             from modules.nexus_task_store import NexusTaskStore
-            from modules.run_store import DEFAULT_DB_PATH
 
-            self._nexus_task_store = NexusTaskStore(
-                db_path=getattr(self.operations_registry, "db_path", DEFAULT_DB_PATH)
-            )
+            self._nexus_task_store = NexusTaskStore(db_path=self.db_path)
         return action(self._nexus_task_store)
 
     def resume_finished_experiments(self) -> None:

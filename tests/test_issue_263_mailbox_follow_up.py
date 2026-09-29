@@ -29,7 +29,6 @@ class MailboxFollowUpTests(unittest.TestCase):
         exp_service = MagicMock()
         exp_service.get_experiment.side_effect = lambda experiment_id: self.experiments[experiment_id]
         self.svc = _make_service(self.tmp, exp_service=exp_service)
-        self.svc.operations_registry.db_path = str(self.tmp / "test.db")
         self.svc._start_thread = lambda *_args: None
         self.addCleanup(self.svc.close)
         msg_id = _insert_mailbox_msg(self.svc)
@@ -158,6 +157,22 @@ class MailboxFollowUpTests(unittest.TestCase):
         self.store.wait_for_experiment(self.session.id, "exp1")
         self.svc.poll_running()
         self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_SUCCEEDED)
+
+
+class TaskStorePathTests(unittest.TestCase):
+    """#279: the Nexus task store lives in the service's own database."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.svc = _make_service(self.tmp, exp_service=MagicMock())
+        self.addCleanup(self.svc.close)
+
+    def test_task_store_uses_the_service_db_path_not_the_registry(self):
+        # A registry without a real path must not decide where the file lands.
+        self.svc.operations_registry.db_path = MagicMock()
+        store_path = self.svc._with_task_store(lambda store: store.db_path)
+        self.assertEqual(store_path, self.svc.db_path)
+        self.assertFalse((Path.cwd() / "MagicMock").exists())
 
 
 if __name__ == "__main__":
