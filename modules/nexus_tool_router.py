@@ -475,6 +475,14 @@ def related_operation_lookup_goal(prior: dict[str, Any]) -> str:
     can be looked up on its own terms. Built from the descriptor the terminal
     lookup already returned, so the redirected lookup can only ever target an
     operation this session was actually offered.
+
+    When the operation takes arguments, the dead goal's own wording is carried
+    along. The resolver binds argument values only from the goal it is given,
+    so a redirect built from the descriptor alone dropped the concrete values
+    the controller had already named - ``#224`` in "read github issue #224" -
+    and ``github_issue`` resolved without an ``issue_number``, costing another
+    controller round to supply it (#224). An operation that takes no arguments
+    has nothing to bind, so its goal stays the bare descriptor.
     """
     operation = str(prior.get("recommended_operation") or "").strip()
     if not operation:
@@ -489,6 +497,19 @@ def related_operation_lookup_goal(prior: dict[str, Any]) -> str:
     )
     description = str((descriptor or {}).get("description") or "").strip()
     goal = f"{operation}: {description}" if description else operation
+    original_goal = str(prior.get("goal") or "").strip()
+    if (descriptor or {}).get("arguments") and original_goal:
+        if original_goal.startswith(f"{operation}:"):
+            # The dead goal already is a redirect to this operation. Wrapping
+            # it again would produce a new goal every round and let the
+            # redirect chase itself; returning it unchanged lets the caller
+            # see it is the same lookup and leave the repeat to the loop guard.
+            return original_goal[:1000]
+        # The request goes first: the goal is cut at 1000 characters, and the
+        # values the request names are what the binding needs to find.
+        goal = f"{operation}: {original_goal} ({description})" if description else (
+            f"{operation}: {original_goal}"
+        )
     return goal[:1000]
 
 
