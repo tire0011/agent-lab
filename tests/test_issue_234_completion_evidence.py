@@ -179,9 +179,9 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 [
                     '{"action":"answer","message":"Issue understood.","reason":"problem identified"}',
                     '{"action":"missing_capability",'
-                    '"message":"Implementation completion evidence is unavailable.",'
+                    '"message":"There is no proof that the requested fix is finished.",'
                     '"reason":"the previous terminal decision was rejected",'
-                    '"information_gap":"implementation completion evidence",'
+                    '"information_gap":"proof that the requested fix has been completed",'
                     '"gap_kind":"user_preference",'
                     '"capability":"memory_index_modification","required_inputs":[]}',
                     '{"action":"command","command":"printf fixed","effect":"change",'

@@ -2502,6 +2502,39 @@ Decide the next step now. Return JSON only.
         observed = getattr(session, column, None) or ""
         return bool(required) and observed == required
 
+    def _promotes_completion_rejection(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> bool:
+        """Whether the latest unresolved evidence gate is being called a capability gap.
+
+        The controller is free to paraphrase an observation, so matching its next
+        ``information_gap`` string cannot reliably preserve the distinction between
+        unfinished work and a missing capability.  Use the structured rejection that
+        Nexus itself emitted instead.  A failed tool attempt is independent evidence
+        for a real blocker; when one exists, normal missing-capability validation still
+        applies.
+        """
+        latest_completion_rejection = -1
+        for index, observation in enumerate(observations):
+            if (
+                observation.get("event") == "terminal_decision_rejected"
+                and observation.get("gap_kind") == "completion_evidence"
+            ):
+                latest_completion_rejection = index
+
+        if latest_completion_rejection < 0:
+            return False
+        has_failed_attempt = any(
+            self._supports_missing_capability(item)
+            or (
+                item.get("tool") == ACTION_COMMAND
+                and self._command_exit_code(item.get("result")) not in {None, 0}
+            )
+            for item in observations
+        )
+        return not has_failed_attempt
+
     def _validate_evidence_sensitive_terminal(
         self,
         *,
@@ -2563,8 +2596,7 @@ Decide the next step now. Return JSON only.
         if (
             action == ACTION_MISSING_CAPABILITY
             and requires_completion
-            and str(decision.get("information_gap", "")).strip().lower()
-            == "implementation completion evidence"
+            and self._promotes_completion_rejection(observations)
         ):
             return {
                 "event": "terminal_decision_rejected",
