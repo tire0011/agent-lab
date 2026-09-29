@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup-nexus-permissions.sh
 # Lets the service user restart the Nexus units after a finalized task
-# (task finalization runs `sudo -n systemctl restart nexus-mailbox agent-api`).
+# (task finalization runs `sudo -n systemctl --no-block restart nexus-mailbox agent-api`).
 # Idempotent: nexus-refresh.ps1 runs it on every refresh, so a new machine
 # gets the rule with its first refresh.
 #
@@ -30,7 +30,7 @@ fi
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-printf '%s ALL=(root) NOPASSWD: %s restart nexus-mailbox agent-api\n' "$SERVICE_USER" "$SYSTEMCTL" > "$tmp"
+printf '%s ALL=(root) NOPASSWD: %s --no-block restart nexus-mailbox agent-api\n' "$SERVICE_USER" "$SYSTEMCTL" > "$tmp"
 visudo -cq -f "$tmp"
 install --mode=0440 "$tmp" "$SUDOERS_FILE"
 
