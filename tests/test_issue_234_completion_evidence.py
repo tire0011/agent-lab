@@ -159,17 +159,24 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                     '{"type":"action","action":"missing_capability","experiment_id":null,'
                     '"message":"Implementation still requires a state-changing capability.",'
                     '"reason":"no completion evidence exists"}',
+                    '{"action":"command","command":"printf fixed","effect":"change",'
+                    '"reason":"continue the original repository task"}',
+                    '{"action":"answer","message":"Implemented.","reason":"change is complete"}',
                 ],
             )
             try:
-                result = orchestrator.run("solve github issue #196")
+                with patch(
+                    "modules.task_orchestrator.process_command",
+                    side_effect=_writes(Path(tmp) / "issue-196-fixed.txt"),
+                ):
+                    result = orchestrator.run("solve github issue #196")
             finally:
                 orchestrator.close()
 
         self.assertEqual(len(registry.calls), 1)
         self.assertEqual(registry.calls[0][0], "github_issue")
-        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
-        self.assertEqual(len(client.prompts), 5)
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(len(client.prompts), 7)
 
     def test_completion_evidence_meta_gap_cannot_become_missing_capability(self):
         """Regression for #253: an unfinished task is not a missing capability."""
