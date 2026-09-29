@@ -194,7 +194,8 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exited 1: .*Access denied"):
                 TaskFinalizationCoordinator._restart_services(["nexus-mailbox", "agent-api"])
         self.assertEqual(
-            popen.call_args[0][0], ["sudo", "-n", "systemctl", "restart", "nexus-mailbox", "agent-api"]
+            popen.call_args[0][0],
+            ["sudo", "-n", "systemctl", "--no-block", "restart", "nexus-mailbox", "agent-api"],
         )
         self.assertTrue(any("exit=1" in line and "Access denied" in line for line in logs.output))
 
@@ -205,7 +206,7 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
             services = TaskFinalizationCoordinator._restart_service_names()
         self.assertEqual(services, ["nexus-mailbox", "agent-api"])
         script = (Path(__file__).resolve().parents[1] / "scripts" / "setup-nexus-permissions.sh").read_text()
-        self.assertIn("restart " + " ".join(services) + "\\n", script)
+        self.assertIn("--no-block restart " + " ".join(services) + "\\n", script)
 
     def test_a_slow_restart_returns_at_once_and_its_later_failure_is_logged(self):
         # Review on #270: a restart that fails after the 5 s window must

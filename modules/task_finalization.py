@@ -59,7 +59,7 @@ _ACTIVE_APPROVAL_STATUSES = {
     "pending_approval", "approved", "submitted", "running", "nexus_deciding",
 }
 # Restarted after an adopted change, in this order. scripts/setup-nexus-permissions.sh
-# grants the service user exactly `systemctl restart nexus-mailbox agent-api`.
+# grants the service user exactly `systemctl --no-block restart nexus-mailbox agent-api`.
 RESTART_SERVICES: tuple[str, ...] = ("nexus-mailbox", "agent-api")
 
 
@@ -786,7 +786,10 @@ class TaskFinalizationCoordinator:
             return
         # The service user may restart the units only through the sudoers rule
         # from scripts/setup-nexus-permissions.sh; -n fails instead of prompting.
-        command = ["sudo", "-n", "systemctl", "restart", *services]
+        # --no-block: systemd queues the restart and the call returns at once.
+        # A blocking call is itself stopped by the restart it waits for and
+        # exits -15, which read as a failed restart (#273).
+        command = ["sudo", "-n", "systemctl", "--no-block", "restart", *services]
         proc = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
