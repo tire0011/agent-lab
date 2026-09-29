@@ -140,7 +140,7 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(result.status, "running")
         self.assertEqual(result.phase, PHASE_RESTART_REQUESTED)
-        self.assertEqual(restart_calls, [["nexus-mailbox", "agent-api"]])
+        self.assertEqual(restart_calls, [["agent-api"]])
 
     def test_an_unobserved_restart_ends_in_needs_review_after_the_timeout(self):
         # #269: on the VM the restart silently never happened and finalization
@@ -192,10 +192,13 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         with patch("modules.task_finalization.subprocess.Popen", return_value=proc) as popen, \
                 self.assertLogs("modules.task_finalization", level="INFO") as logs:
             with self.assertRaisesRegex(RuntimeError, "exited 1: .*Access denied"):
-                TaskFinalizationCoordinator._restart_services(["nexus-mailbox", "agent-api"])
+                TaskFinalizationCoordinator._restart_services(["agent-api"])
         self.assertEqual(
             popen.call_args[0][0],
-            ["sudo", "-n", "systemctl", "--no-block", "restart", "nexus-mailbox", "agent-api"],
+            [
+                "sudo", "-n", "systemd-run", "--collect", "--on-active=2",
+                "systemctl", "restart", "agent-api",
+            ],
         )
         self.assertTrue(any("exit=1" in line and "Access denied" in line for line in logs.output))
 
@@ -204,9 +207,11 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         # grants, so the service list is fixed and must match it.
         with patch.dict("os.environ", {"NEXUS_FINALIZE_RESTART_SERVICES": "agent-api"}):
             services = TaskFinalizationCoordinator._restart_service_names()
-        self.assertEqual(services, ["nexus-mailbox", "agent-api"])
+        self.assertEqual(services, ["agent-api"])
         script = (Path(__file__).resolve().parents[1] / "scripts" / "setup-nexus-permissions.sh").read_text()
-        self.assertIn("--no-block restart " + " ".join(services) + "\\n", script)
+        allowed_args = "--collect --on-active=2 systemctl restart " + " ".join(services)
+        self.assertIn("SYSTEMD_RUN=\"$(command -v systemd-run)\"", script)
+        self.assertIn(allowed_args + "\\n", script)
 
     def test_a_slow_restart_returns_at_once_and_its_later_failure_is_logged(self):
         # Review on #270: a restart that fails after the 5 s window must

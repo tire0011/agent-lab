@@ -308,7 +308,7 @@ sudo cp deploy/nexus-mailbox.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable nexus-mailbox.timer
 sudo systemctl start nexus-mailbox.timer
-# Let the service user restart the units after a finalized task
+# Let the service user schedule the transient agent-api restart after a finalized task
 # (nexus-refresh.ps1 also runs this on every refresh).
 sudo bash scripts/setup-nexus-permissions.sh
 # Verify
