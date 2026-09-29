@@ -58,9 +58,9 @@ _RESTART_FAILURE_WINDOW_SECONDS = 5
 _ACTIVE_APPROVAL_STATUSES = {
     "pending_approval", "approved", "submitted", "running", "nexus_deciding",
 }
-# Restarted after an adopted change, in this order. scripts/setup-nexus-permissions.sh
-# grants the service user exactly `systemctl --no-block restart nexus-mailbox agent-api`.
-RESTART_SERVICES: tuple[str, ...] = ("nexus-mailbox", "agent-api")
+# Restarted after an adopted change. scripts/setup-nexus-permissions.sh grants
+# the service user exactly the transient-unit command assembled below.
+RESTART_SERVICES: tuple[str, ...] = ("agent-api",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -786,10 +786,20 @@ class TaskFinalizationCoordinator:
             return
         # The service user may restart the units only through the sudoers rule
         # from scripts/setup-nexus-permissions.sh; -n fails instead of prompting.
-        # --no-block: systemd queues the restart and the call returns at once.
-        # A blocking call is itself stopped by the restart it waits for and
-        # exits -15, which read as a failed restart (#273).
-        command = ["sudo", "-n", "systemctl", "--no-block", "restart", *services]
+        # A systemctl process launched directly by agent-api remains in that
+        # service's cgroup and is killed during its own restart, even with
+        # --no-block. Hand the delayed restart to a transient systemd unit so
+        # it survives agent-api's teardown and is collected afterwards (#280).
+        command = [
+            "sudo",
+            "-n",
+            "systemd-run",
+            "--collect",
+            "--on-active=2",
+            "systemctl",
+            "restart",
+            *services,
+        ]
         proc = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
