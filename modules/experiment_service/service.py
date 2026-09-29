@@ -46,6 +46,7 @@ from .models import (
     STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_REJECTED,
+    STATUS_SELECTING,
     STATUS_SUCCEEDED,
     STATUS_TIMED_OUT,
     STATUS_VERIFYING,
@@ -80,6 +81,9 @@ _DEFAULT_PLAN_TIMEOUT_SECONDS = 90
 _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 1200  # 20 minutes
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
+
+# Error recorded on experiments whose thread died with the process (#281).
+_INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
 
 # Progress-aware local verification (#209). The verification subprocess is no
 # longer bounded by a fixed wall-clock timeout, adaptive or not: a wall-clock
@@ -607,6 +611,42 @@ class ExperimentService:
             policy_rule=fields.get("policy_rule"),
             reason=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
         )
+
+    # ------------------------------------------------------------------
+    # mark_interrupted_experiments_failed — startup recovery (#281)
+    # ------------------------------------------------------------------
+
+    def mark_interrupted_experiments_failed(self) -> list[str]:
+        """Mark experiments orphaned by a service restart as ``failed``.
+
+        An experiment runs in a daemon thread of the ``agent-api`` process, so
+        a restart kills it mid-flight and leaves its row in ``implementing`` or
+        ``verifying`` forever (#281). Intended to be called once at process
+        startup, before any new experiment is run: at that moment no thread in
+        this process can still own an active experiment.
+
+        Never resumes the work. Moving the experiment to a terminal status is
+        what lets the waiting Nexus session resume (see
+        ``MailboxTaskService.resume_finished_experiments``) and decide whether
+        the task continues or ends.
+
+        Returns the list of experiment ids that were marked.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, status FROM experiments WHERE status IN (?, ?, ?)",
+                (STATUS_SELECTING, STATUS_IMPLEMENTING, STATUS_VERIFYING),
+            ).fetchall()
+        marked: list[str] = []
+        for row in rows:
+            # Conditional per row: a status that moved on in between is left alone.
+            if self._transition(
+                row["id"], row["status"], STATUS_FAILED,
+                ended_at=_utcnow_iso(),
+                error=_INTERRUPTED_BY_RESTART_ERROR,
+            ):
+                marked.append(row["id"])
+        return marked
 
     # ------------------------------------------------------------------
     # run_experiment — the whole pipeline, single entry point
