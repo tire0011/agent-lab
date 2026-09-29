@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from modules.mailbox.task_service import (
     _STATUS_FAILED,
+    _STATUS_NEXUS_DECIDING,
     _STATUS_RUNNING,
     _STATUS_SUBMITTED,
     _STATUS_SUCCEEDED,
@@ -109,6 +110,38 @@ class MailboxFollowUpTests(unittest.TestCase):
         with patch(_RESUME, return_value=[]):
             self.svc._after_experiment("exp1")
         self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_RUNNING)
+
+    def test_poll_cannot_close_the_task_between_resume_and_follow_up(self):
+        # Review on #271: the resume leaves the session action_selected before
+        # the mailbox carries out the decision; a poll in that window must not
+        # close the task.
+        self._observed_experiments(1)
+        self.svc.experiment_service.create_experiment.return_value = _make_exp("exp2")
+
+        def resume_then_poll(*_args, **_kwargs):
+            self.store.set_status(self.session.id, "action_selected")
+            self.svc.poll_running()
+            self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_NEXUS_DECIDING)
+            return [self._decision(ACTION_NEW_EXPERIMENT)]
+
+        with patch(_RESUME, side_effect=resume_then_poll):
+            self.svc._after_experiment("exp1")
+
+        approval = self.svc.get(self.approval_id)
+        self.assertEqual(approval.status, _STATUS_SUBMITTED)
+        self.assertEqual(approval.experiment_id, "exp2")
+
+    def test_a_failed_resume_hands_the_task_back_to_the_ordinary_path(self):
+        with patch(_RESUME, side_effect=RuntimeError("model down")):
+            with self.assertRaises(RuntimeError):
+                self.svc._after_experiment("exp1")
+        self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_RUNNING)
+
+    def test_a_restart_hands_an_interrupted_decision_back(self):
+        self.svc._claim_decision("exp1")
+        self.store.set_status(self.session.id, "abandoned")
+        self.svc.recover_after_restart()
+        self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_FAILED)
 
     def test_poll_leaves_a_failed_task_open_while_nexus_decides(self):
         self.store.wait_for_experiment(self.session.id, "exp1")

@@ -55,9 +55,13 @@ _STATUS_RUNNING = "running"
 _STATUS_SUCCEEDED = "succeeded"
 _STATUS_FAILED = "failed"
 _STATUS_NEEDS_REVIEW = "needs_review"
+# Nexus decides what follows a failed experiment; poll_running keeps out (#263).
+_STATUS_NEXUS_DECIDING = "nexus_deciding"
 
 _TERMINAL_STATUSES = {_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STATUS_NEEDS_REVIEW}
-_NON_TERMINAL_STATUSES = {_STATUS_PENDING, _STATUS_APPROVED, _STATUS_SUBMITTED, _STATUS_RUNNING}
+_NON_TERMINAL_STATUSES = {
+    _STATUS_PENDING, _STATUS_APPROVED, _STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_NEXUS_DECIDING,
+}
 _EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
 _EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review"}
@@ -740,25 +744,52 @@ class MailboxTaskService:
         A succeeded experiment keeps its existing path (``poll_running`` and
         finalization). After a failed one the task stays open until Nexus has
         decided: another experiment, within the limit, or an end with Nexus'
-        own words.
+        own words. The task is claimed as ``nexus_deciding`` before Nexus
+        resumes, so ``poll_running`` cannot close it in between.
         """
-        decisions = resume_with_new_orchestrator(
-            self._orchestrator_factory,
-            self.experiment_service,
-            self.github_work_tracking,
-            experiment_id,
-            operations_registry=self.operations_registry,
-        )
-        if not decisions:
-            # Another path claimed the session and carries on from here.
-            return
-        approval = self._approval_for_experiment(experiment_id)
-        if approval is None or approval.status not in (_STATUS_SUBMITTED, _STATUS_RUNNING):
-            return
         experiment = self.experiment_service.get_experiment(experiment_id)
-        if experiment.status not in _EXP_FAILED_TERMINAL:
+        claimed = experiment.status in _EXP_FAILED_TERMINAL and self._claim_decision(experiment_id)
+        try:
+            decisions = resume_with_new_orchestrator(
+                self._orchestrator_factory,
+                self.experiment_service,
+                self.github_work_tracking,
+                experiment_id,
+                operations_registry=self.operations_registry,
+            )
+        except BaseException:
+            if claimed:
+                self._release_decision(experiment_id)
+            raise
+        if not claimed:
             return
-        self._continue_after_failed_experiment(approval, experiment, decisions[0])
+        if not decisions:
+            # Nobody resumed the session here; the ordinary path takes over.
+            self._release_decision(experiment_id)
+            return
+        self._continue_after_failed_experiment(
+            self._approval_for_experiment(experiment_id), experiment, decisions[0]
+        )
+
+    def _claim_decision(self, experiment_id: str) -> bool:
+        with self._lock:
+            claimed = self._conn.execute(
+                """UPDATE mailbox_task_approvals SET status=?, updated_at=?
+                   WHERE experiment_id=? AND status IN (?, ?)""",
+                (_STATUS_NEXUS_DECIDING, _now_iso(), experiment_id,
+                 _STATUS_SUBMITTED, _STATUS_RUNNING),
+            ).rowcount
+            self._conn.commit()
+        return claimed > 0
+
+    def _release_decision(self, experiment_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE mailbox_task_approvals SET status=?, updated_at=?
+                   WHERE experiment_id=? AND status=?""",
+                (_STATUS_RUNNING, _now_iso(), experiment_id, _STATUS_NEXUS_DECIDING),
+            )
+            self._conn.commit()
 
     def _approval_for_experiment(self, experiment_id: str) -> MailboxTaskApproval | None:
         with self._lock:
@@ -817,14 +848,14 @@ class MailboxTaskService:
                 previous_experiment_id=experiment.id,
             )
             with self._lock:
-                self._conn.execute(
+                updated = self._conn.execute(
                     """UPDATE mailbox_task_approvals SET status=?, updated_at=?
-                       WHERE id=? AND status IN (?, ?)""",
-                    (_STATUS_APPROVED, _now_iso(), approval.id,
-                     _STATUS_SUBMITTED, _STATUS_RUNNING),
-                )
+                       WHERE id=? AND status=?""",
+                    (_STATUS_APPROVED, _now_iso(), approval.id, _STATUS_NEXUS_DECIDING),
+                ).rowcount
                 self._conn.commit()
-            self._start_new_experiment(self.get(approval.id), decision)
+            if updated:
+                self._start_new_experiment(self.get(approval.id), decision)
             return
         note = None
         if decision.action == ACTION_NEW_EXPERIMENT:
@@ -1000,6 +1031,11 @@ class MailboxTaskService:
                     _now_iso(),
                     _STATUS_RUNNING,
                 ),
+            )
+            # A decision cut off by the restart goes back to the ordinary path.
+            self._conn.execute(
+                "UPDATE mailbox_task_approvals SET status=?, updated_at=? WHERE status=?",
+                (_STATUS_RUNNING, _now_iso(), _STATUS_NEXUS_DECIDING),
             )
             self._conn.commit()
         for approval_id in interrupted_ids:

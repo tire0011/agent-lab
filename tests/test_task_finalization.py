@@ -198,6 +198,15 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         )
         self.assertTrue(any("exit=1" in line and "Access denied" in line for line in logs.output))
 
+    def test_the_restart_is_exactly_what_the_sudoers_rule_allows(self):
+        # Review on #271: sudo -n only runs the one command the setup script
+        # grants, so the service list is fixed and must match it.
+        with patch.dict("os.environ", {"NEXUS_FINALIZE_RESTART_SERVICES": "agent-api"}):
+            services = TaskFinalizationCoordinator._restart_service_names()
+        self.assertEqual(services, ["nexus-mailbox", "agent-api"])
+        script = (Path(__file__).resolve().parents[1] / "scripts" / "setup-nexus-permissions.sh").read_text()
+        self.assertIn("restart " + " ".join(services) + "\\n", script)
+
     def test_a_slow_restart_returns_at_once_and_its_later_failure_is_logged(self):
         # Review on #270: a restart that fails after the 5 s window must
         # still leave exit code and stderr in the log.

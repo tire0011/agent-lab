@@ -129,6 +129,7 @@ _TASK_LIFECYCLE: dict[str, str] = {
     "approved": LIFECYCLE_QUEUED,
     "submitted": LIFECYCLE_QUEUED,
     "running": LIFECYCLE_RUNNING,
+    "nexus_deciding": LIFECYCLE_RUNNING,
     "needs_review": LIFECYCLE_NEEDS_REVIEW,
     "succeeded": LIFECYCLE_SUCCEEDED,
     "failed": LIFECYCLE_FAILED,

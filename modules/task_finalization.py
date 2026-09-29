@@ -55,7 +55,12 @@ _DEFAULT_RESTART_TIMEOUT_SECONDS = 600
 # A restart that cannot happen (e.g. no permission) fails within this window;
 # one that works may stop this very process before it returns.
 _RESTART_FAILURE_WINDOW_SECONDS = 5
-_ACTIVE_APPROVAL_STATUSES = {"pending_approval", "approved", "submitted", "running"}
+_ACTIVE_APPROVAL_STATUSES = {
+    "pending_approval", "approved", "submitted", "running", "nexus_deciding",
+}
+# Restarted after an adopted change, in this order. scripts/setup-nexus-permissions.sh
+# grants the service user exactly `systemctl restart nexus-mailbox agent-api`.
+RESTART_SERVICES: tuple[str, ...] = ("nexus-mailbox", "agent-api")
 
 
 @dataclass(frozen=True, slots=True)
@@ -771,8 +776,9 @@ class TaskFinalizationCoordinator:
 
     @staticmethod
     def _restart_service_names() -> list[str]:
-        raw = os.environ.get("NEXUS_FINALIZE_RESTART_SERVICES", "nexus-mailbox,agent-api")
-        return [item.strip() for item in raw.split(",") if item.strip()]
+        # Fixed on purpose: the sudoers rule from setup-nexus-permissions.sh
+        # allows exactly this command, so a configurable list could only fail.
+        return list(RESTART_SERVICES)
 
     @staticmethod
     def _restart_services(services: list[str]) -> None:
