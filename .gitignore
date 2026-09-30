@@ -16,3 +16,5 @@ state/experiment-logs/test-runs/
 # output of whichever controller turn produced it - including a local
 # scripts/check_issue_218_find_tool.py run - never repository content.
 state/requirements/*.json
+# A MagicMock used as a path turns into a real file named after it (#279).
+MagicMock/

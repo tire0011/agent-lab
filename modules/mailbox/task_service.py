@@ -706,11 +706,10 @@ class MailboxTaskService:
         """
         if getattr(self, "_nexus_task_store", None) is None:
             from modules.nexus_task_store import NexusTaskStore
-            from modules.run_store import DEFAULT_DB_PATH
 
-            self._nexus_task_store = NexusTaskStore(
-                db_path=getattr(self.operations_registry, "db_path", DEFAULT_DB_PATH)
-            )
+            # The service's own database: the same file as the orchestrator's
+            # in production, and never a mock's attribute in tests (#279).
+            self._nexus_task_store = NexusTaskStore(db_path=self.db_path)
         return action(self._nexus_task_store)
 
     def resume_finished_experiments(self) -> None:

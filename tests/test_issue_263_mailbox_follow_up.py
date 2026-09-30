@@ -143,6 +143,14 @@ class MailboxFollowUpTests(unittest.TestCase):
         self.svc.recover_after_restart()
         self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_FAILED)
 
+    def test_the_task_store_uses_the_service_database_not_a_mock_attribute(self):
+        # #279: a MagicMock operations_registry used to name the database file.
+        self.svc.operations_registry.db_path = MagicMock()
+        self.svc._nexus_task_store = None
+        path = self.svc._with_task_store(lambda store: store.db_path)
+        self.addCleanup(self.svc._nexus_task_store.close)
+        self.assertEqual(path, self.svc.db_path)
+
     def test_poll_leaves_a_failed_task_open_while_nexus_decides(self):
         self.store.wait_for_experiment(self.session.id, "exp1")
         self.svc.poll_running()
