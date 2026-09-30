@@ -1,11 +1,11 @@
-"""Unit tests for modules.coding_provider — the random coding-agent choice.
+"""Unit tests for modules.coding_provider — durable provider rotation.
 
-No CLI is ever launched here: availability is faked and the draw is seeded,
-so the tests assert the selection rules rather than a coin toss.
+No CLI is ever launched here: availability is faked so the tests assert the
+selection and persistence rules directly.
 """
 
 import os
-import random
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -104,7 +104,7 @@ class PinTests(unittest.TestCase):
 
     def test_pin_wins_over_a_random_draw(self):
         with _clean_env(**{ENV_PROVIDER_PIN: "codex"}), _installed(PROVIDER_CLAUDE):
-            self.assertEqual(choose_provider(random.Random(1)), PROVIDER_CODEX)
+            self.assertEqual(choose_provider(), PROVIDER_CODEX)
 
     def test_unknown_pin_is_ignored(self):
         with _clean_env(**{ENV_PROVIDER_PIN: "gpt5-cli"}):
@@ -115,39 +115,57 @@ class PinTests(unittest.TestCase):
             self.assertIsNone(pinned_provider())
 
 
-class ChooseProviderTests(unittest.TestCase):
-    def test_draw_alternates_between_the_installed_agents(self):
-        with _clean_env(), _installed(*KNOWN_PROVIDERS):
-            rng = random.Random(20260915)
-            drawn = {choose_provider(rng) for _ in range(40)}
-        self.assertEqual(drawn, set(KNOWN_PROVIDERS))
+class PersistentDatabaseTestCase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "agent.db")
 
-    def test_draw_is_reproducible_for_a_seeded_rng(self):
+    def tearDown(self):
+        self._tmp.cleanup()
+
+
+class ChooseProviderTests(PersistentDatabaseTestCase):
+    def test_consecutive_selections_alternate(self):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
-            first = [choose_provider(random.Random(7)) for _ in range(5)]
-            second = [choose_provider(random.Random(7)) for _ in range(5)]
-        self.assertEqual(first, second)
+            selected = [choose_provider(db_path=self.db_path) for _ in range(4)]
+        self.assertEqual(selected, [PROVIDER_CODEX, PROVIDER_CLAUDE] * 2)
+
+    def test_rotation_persists_across_fresh_callers(self):
+        with _clean_env(), _installed(*KNOWN_PROVIDERS):
+            first = choose_provider(db_path=self.db_path)
+            # choose_provider opens and closes its own connection each time,
+            # which models a process/service restart.
+            after_restart = choose_provider(db_path=self.db_path)
+        self.assertEqual((first, after_restart), (PROVIDER_CODEX, PROVIDER_CLAUDE))
 
     def test_an_uninstalled_agent_is_never_drawn(self):
         with _clean_env(), _installed(PROVIDER_CODEX):
-            drawn = {choose_provider(random.Random(3)) for _ in range(20)}
+            drawn = {choose_provider(db_path=self.db_path) for _ in range(4)}
         self.assertEqual(drawn, {PROVIDER_CODEX})
 
     def test_a_disallowed_agent_is_never_drawn(self):
         with _clean_env(**{ENV_PROVIDER_ALLOW_LIST: "codex"}), _installed(*KNOWN_PROVIDERS):
-            drawn = {choose_provider(random.Random(3)) for _ in range(20)}
+            drawn = {choose_provider(db_path=self.db_path) for _ in range(4)}
         self.assertEqual(drawn, {PROVIDER_CODEX})
 
     def test_falls_back_to_the_first_allowed_agent_when_none_is_installed(self):
         with _clean_env(), _installed():
-            self.assertEqual(choose_provider(random.Random(1)), KNOWN_PROVIDERS[0])
+            self.assertEqual(choose_provider(db_path=self.db_path), KNOWN_PROVIDERS[0])
 
     def test_fallback_respects_the_allow_list(self):
         with _clean_env(**{ENV_PROVIDER_ALLOW_LIST: "claude"}), _installed():
-            self.assertEqual(choose_provider(random.Random(1)), PROVIDER_CLAUDE)
+            self.assertEqual(choose_provider(db_path=self.db_path), PROVIDER_CLAUDE)
+
+    def test_pin_does_not_advance_rotation(self):
+        with _clean_env(), _installed(*KNOWN_PROVIDERS):
+            self.assertEqual(choose_provider(db_path=self.db_path), PROVIDER_CODEX)
+        with _clean_env(**{ENV_PROVIDER_PIN: "codex"}), _installed(*KNOWN_PROVIDERS):
+            self.assertEqual(choose_provider(db_path=self.db_path), PROVIDER_CODEX)
+        with _clean_env(), _installed(*KNOWN_PROVIDERS):
+            self.assertEqual(choose_provider(db_path=self.db_path), PROVIDER_CLAUDE)
 
 
-class BuildWorkerTests(unittest.TestCase):
+class BuildWorkerTests(PersistentDatabaseTestCase):
     def test_builds_the_matching_worker(self):
         self.assertIsInstance(build_worker(PROVIDER_CODEX), CodexWorker)
         self.assertIsInstance(build_worker(PROVIDER_CLAUDE), ClaudeWorker)
@@ -165,30 +183,30 @@ class BuildWorkerTests(unittest.TestCase):
 
     def test_random_worker_reports_its_provider(self):
         with _clean_env(), _installed(PROVIDER_CLAUDE):
-            provider, worker = build_random_worker(rng=random.Random(1))
+            provider, worker = build_random_worker(db_path=self.db_path)
         self.assertEqual(provider, PROVIDER_CLAUDE)
         self.assertEqual(worker.provider, PROVIDER_CLAUDE)
 
 
-class WorkerFactoryTests(unittest.TestCase):
+class WorkerFactoryTests(PersistentDatabaseTestCase):
     def test_one_agent_per_working_directory(self):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
-            factory = random_worker_factory(rng=random.Random(11))
+            factory = random_worker_factory(db_path=self.db_path)
             first = factory("/worktrees/exp-1").provider
             again = factory("/worktrees/exp-1").provider
         self.assertEqual(first, again)
 
     def test_different_working_directories_draw_independently(self):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
-            factory = random_worker_factory(rng=random.Random(20260915))
-            drawn = {factory(f"/worktrees/exp-{i}").provider for i in range(40)}
-        self.assertEqual(drawn, set(KNOWN_PROVIDERS))
+            factory = random_worker_factory(db_path=self.db_path)
+            drawn = [factory(f"/worktrees/exp-{i}").provider for i in range(4)]
+        self.assertEqual(drawn, [PROVIDER_CODEX, PROVIDER_CLAUDE] * 2)
 
     def test_non_sticky_factory_draws_every_call(self):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
-            factory = random_worker_factory(rng=random.Random(20260915), sticky=False)
-            drawn = {factory("/worktrees/exp-1").provider for _ in range(40)}
-        self.assertEqual(drawn, set(KNOWN_PROVIDERS))
+            factory = random_worker_factory(db_path=self.db_path, sticky=False)
+            drawn = [factory("/worktrees/exp-1").provider for _ in range(4)]
+        self.assertEqual(drawn, [PROVIDER_CODEX, PROVIDER_CLAUDE] * 2)
 
 
 class ProviderOfTests(unittest.TestCase):

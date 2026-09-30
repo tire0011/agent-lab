@@ -459,7 +459,7 @@ Decision log for architecture and operating choices.
   means something is using `/agent` as a workspace, which is a problem to fix at
   the source rather than to keep rescuing.
 
-### D-022: Coding work is delegated to one of several interchangeable CLI agents, drawn at random
+### D-022: Coding work rotates between interchangeable CLI agents
 
 - Status: Accepted
 - Why: Every piece of real coding work — mailbox task, `/codex/tasks` call,
@@ -473,23 +473,25 @@ Decision log for architecture and operating choices.
   (`modules/coding_worker.py`): same `run()` signature, same result type, same
   sandbox vocabulary, same audit entry. `CodexWorker` and `ClaudeWorker` are
   implementations of it, and nothing above them may assume which one it got.
-- The provider is drawn at random, uniformly, per unit of work
-  (`modules/coding_provider.py`). Neither agent is the default and there is no
-  "primary" to fall back from: alternating is the point, both because it
+- The provider rotates in stable round-robin order per unit of work
+  (`modules/coding_provider.py`). The last unpinned selection is persisted in
+  SQLite so alternation survives process and host restarts. Neither agent is
+  the default and there is no "primary" to fall back from: alternating is the point, both because it
   removes the single dependency and because comparable runs accumulate on both
   sides in the same store.
-- The draw is narrowed, never widened: `AGENT_CODING_PROVIDER` pins one agent
+- The rotation is narrowed, never widened: `AGENT_CODING_PROVIDER` pins one agent
   (incident, debugging), `AGENT_CODING_PROVIDERS` is the allow list, and an
-  agent whose CLI is not installed is dropped before the draw. A configuration
+  agent whose CLI is not installed is dropped before selection. A configuration
   typo falls back to all known agents rather than leaving the system unable to
   run anything.
-- One experiment runs on one agent. The draw is sticky per worktree, so the
+- One experiment runs on one agent. The selection is sticky per worktree, so the
   implementation call and its repair iterations stay with the same agent; the
-  next experiment draws again. A run that mixed agents mid-flight would be
+  next experiment rotates again. A run that mixed agents mid-flight would be
   neither reproducible nor attributable.
-- Naming an agent beats drawing one, and a named agent is never swapped: the
+- Naming an agent beats rotation, and a named agent is never swapped: the
   `codex_readonly` / `claude_readonly` delegates and the router's `codex`
-  provider pin what they ask for. Random applies only where nobody chose.
+  provider pin what they ask for. Rotation applies only where nobody chose;
+  pinned selections do not advance its cursor.
 - Whichever agent ran is recorded — `WorkerResult.provider`, `codex_tasks.provider`,
   `experiments.implementation_provider`, and the `runs` audit row — so a failure
   can be attributed and the two agents can be compared later. Rows written
@@ -498,7 +500,7 @@ Decision log for architecture and operating choices.
   do: read-only means the write tools do not exist for that run, and nothing
   may wait for a human, because a non-interactive run has nobody to answer.
 - Revisit if: measured quality or cost differs enough between the agents that a
-  uniform draw is demonstrably wasteful. The replacement is a weighted draw
+  uniform rotation is demonstrably wasteful. The replacement may be weighted selection
   based on recorded outcomes — not a return to a single hard-coded agent.
 
 
@@ -606,7 +608,7 @@ Decision log for architecture and operating choices.
 - Status: In evaluation
 - Why: Potential productivity gains; needs practical reliability and cost evidence.
 - Note: no longer the only such sub-agent — see D-022, which makes the CLI
-  coding agent interchangeable and draws it at random per task.
+  coding agent interchangeable and rotates it per task.
 
 ## Deferred
 
@@ -620,4 +622,3 @@ Decision log for architecture and operating choices.
 - Best schema and retention policy for long-term experiment data.
 - Best model/provider mix for quality per dollar.
 - Formal safety/evaluation policy before any autonomous self-modification.
-

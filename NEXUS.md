@@ -4,7 +4,7 @@ Nexus is the persistent identity of this experimental self-improving agent syste
 
 Codex, Claude, Copilot, local models, and other LLMs are interchangeable
 reasoning and execution workers acting on Nexus's behalf. Which coding agent
-executes a given task is drawn at random (see DECISIONS.md D-022) and changes
+executes a given task is selected by durable rotation (see DECISIONS.md D-022) and changes
 nothing about this identity. They are not separate human users and must not
 claim individually to be Nexus.
 

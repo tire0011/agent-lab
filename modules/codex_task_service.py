@@ -204,7 +204,7 @@ class CodexTaskService:
     parallelism: ``run_task`` executes synchronously in the caller's thread.
 
     Which agent runs a task is decided **once, at creation time**, and stored
-    with the task: either the caller names it, or it is drawn at random from
+    with the task: either the caller names it, or it is selected by the durable rotation from
     the installed providers (see ``modules.coding_provider``). Injecting a
     *worker* pins every task of this service to that worker instead, which is
     what tests and single-provider deployments do.
@@ -225,11 +225,11 @@ class CodexTaskService:
         worker:
             Optional fixed worker. When given, every task of this service runs
             on it and is recorded under its provider. When ``None`` (the
-            production default), each task draws its own provider and the
+            production default), each task selects its own provider and the
             matching worker is built when the task runs.
         rng:
-            Optional ``random.Random`` used for the provider draw, so a test
-            or a reproducible run can fix the sequence.
+            Deprecated compatibility argument. Provider selection is now a
+            deterministic, persistent rotation.
         """
         self.worker = worker
         self.rng = rng
@@ -267,7 +267,7 @@ class CodexTaskService:
         """Persist a new task in status ``queued``. Does not execute it.
 
         *provider* names the coding agent to use; omit it to let the service
-        decide (the injected worker's provider, otherwise a random draw).
+        decide (the injected worker's provider, otherwise the provider rotation).
         """
         if not prompt or not prompt.strip():
             raise ValueError("prompt must not be empty")
@@ -315,7 +315,7 @@ class CodexTaskService:
             # anything other than a known provider is recorded as Codex, the
             # only provider that existed when such callers were written.
             return provider_of(self.worker, PROVIDER_CODEX) or PROVIDER_CODEX
-        return choose_provider(self.rng)
+        return choose_provider(self.rng, db_path=self.db_path)
 
     def _worker_for(self, task: CodexTask) -> Any:
         """The worker that runs *task*: the injected one, or the task's own."""
@@ -530,7 +530,7 @@ def _build_cli_parser():
     )
     parser.add_argument(
         "--provider", default=None, choices=list(KNOWN_PROVIDERS),
-        help="Coding agent to use (default: drawn at random from the installed ones)",
+        help="Coding agent to use (default: next in the persistent installed-provider rotation)",
     )
     return parser
 
