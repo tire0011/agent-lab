@@ -219,7 +219,7 @@ which itself reuses the coding-agent workers — `modules.codex_worker.CodexWork
 never `shell=True`. Currently synchronous only, no chat/Web UI integration, no
 background queue, no parallel execution.
 
-Which agent runs a task is drawn at random when the task is created and
+Which agent runs a task is selected by a persistent round-robin when the task is created and
 reported back as `provider` (see ARCHITECTURE.md section 13 and DECISIONS.md
 D-022). The `/codex/tasks` paths are kept for compatibility; they are not
 Codex-only. `modules.codex_task_service`'s own CLI takes `--provider` to name

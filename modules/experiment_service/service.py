@@ -142,9 +142,9 @@ class ExperimentService:
     duplicated here beyond git worktree management and the fixed verification
     commands.
 
-    Which agent runs an experiment is drawn at random per experiment (see
+    Which agent runs an experiment is selected by a persistent rotation (see
     ``modules.coding_provider``) unless the caller injects its own worker or
-    factory. The drawn provider is recorded on the experiment as
+    factory. The selected provider is recorded on the experiment as
     ``implementation_provider``.
     """
 
@@ -172,9 +172,8 @@ class ExperimentService:
         Parameters
         ----------
         rng:
-            Optional ``random.Random`` used to draw the coding agent for the
-            default worker factories, so a test or a reproducible run can fix
-            the sequence. Ignored when the factories are injected.
+            Deprecated compatibility argument. Provider selection is now a
+            deterministic, persistent rotation. Ignored when factories are injected.
         selection_worker:
             ``CodexWorker`` used for the read-only *research* phase (the
             only phase that ever investigates the live repository).
@@ -182,8 +181,8 @@ class ExperimentService:
         worker_factory:
             Callable ``(worktree_path) -> CodexWorker`` used to build the
             implementation-phase worker, scoped (legacy worker root configuration) to that
-            single worktree path only. Defaults to a factory that draws the
-            coding agent at random once per worktree
+            single worktree path only. Defaults to a factory that selects the
+            next coding agent once per worktree
             (``modules.coding_provider.random_worker_factory``).
         plan_worker_factory:
             Callable ``(scratch_dir) -> CodexWorker`` used to build the
@@ -194,7 +193,7 @@ class ExperimentService:
             research summary as input — it cannot perform any further
             repository research even if it tried to run a shell command,
             since its working directory is empty. Defaults to a factory that
-            draws the coding agent at random once per scratch directory.
+            selects the next coding agent once per scratch directory.
         repo_root:
             Root of the main repository (default ``/agent``). Never
             modified by this service.
@@ -241,13 +240,13 @@ class ExperimentService:
         self.selection_worker = (
             selection_worker
             if selection_worker is not None
-            else build_random_worker()[1]
+            else build_random_worker(db_path=db_path)[1]
         )
-        # One draw per worktree/scratch directory, i.e. one agent per
+        # One selection per worktree/scratch directory, i.e. one agent per
         # experiment: the implementation call and any repair iteration run on
-        # the same provider, while the next experiment draws again.
-        self.worker_factory = worker_factory or random_worker_factory(rng=rng)
-        self.plan_worker_factory = plan_worker_factory or random_worker_factory(rng=rng)
+        # the same provider, while the next experiment rotates again.
+        self.worker_factory = worker_factory or random_worker_factory(db_path=db_path, rng=rng)
+        self.plan_worker_factory = plan_worker_factory or random_worker_factory(db_path=db_path, rng=rng)
         self.db_path = db_path
         self.repo_root = repo_root
         self.worktrees_root = worktrees_root or str(Path.home() / "agent-worktrees")
@@ -706,7 +705,7 @@ class ExperimentService:
         Phases (in order):
           1. Goal security check (deterministic, no LLM call).
           2. Isolated git worktree creation.
-          3. One coding-agent call (Codex or Claude, drawn per experiment) —
+          3. One coding-agent call (Codex or Claude, selected per experiment) —
              the worker analyses the repo, plans, and implements the goal
              directly inside the worktree.
           4. Verification — git diff + tests + deterministic quality gate.

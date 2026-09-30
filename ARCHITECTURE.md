@@ -454,7 +454,7 @@
   capability for what was asked is a valid outcome, and the diagnosis states
   the missing evidence instead of assuming either answer.
 
-### 13) Coding agents (one contract, drawn at random)
+### 13) Coding agents (one contract, persistent rotation)
 
 - Modules: `modules/coding_worker.py` (shared contract), `modules/codex_worker.py`
   (`CodexWorker`), `modules/claude_worker.py` (`ClaudeWorker`),
@@ -475,10 +475,10 @@
   its tool set, since a non-interactive run has nobody to answer a permission
   prompt: in read-only mode no write or shell tool exists at all, and anything
   that would prompt is denied instead of waiting.
-- Neither agent is preferred. The provider is drawn uniformly at random per
+- Neither agent is preferred. The provider is selected in persistent round-robin order per
   unit of work, narrowed first by `AGENT_CODING_PROVIDER` (pin),
   `AGENT_CODING_PROVIDERS` (allow list) and by which CLI is actually installed
-  (see D-022). Tasks draw at creation; experiments draw once per worktree, so
+  (see D-022). Tasks select at creation; experiments select once per worktree, so
   an implementation and its repair iterations stay on one agent.
 - A caller that names an agent gets that agent: the `codex_readonly` /
   `claude_readonly` delegates and the router's `codex` provider pin their

@@ -1,11 +1,12 @@
 """Which external coding agent runs the next task.
 
 Nexus has more than one CLI agent available (Codex and Claude Code). Neither
-is preferred: the provider is drawn **at random per task**, so the system
-keeps alternating instead of depending on a single vendor, and both agents
-accumulate comparable runs in the same store.
+is preferred: providers are selected in a durable round-robin, so consecutive
+units of work use different agents and both accumulate comparable runs in the
+same store.  The last selection is stored in SQLite and therefore survives a
+service or host restart.
 
-The choice is narrowed before the draw:
+The rotation is narrowed before selection:
 
   1. ``AGENT_CODING_PROVIDER`` pins one provider (debugging, or standing down
      an agent during an incident). An unknown value is ignored rather than
@@ -13,7 +14,7 @@ The choice is narrowed before the draw:
   2. ``AGENT_CODING_PROVIDERS`` is the allow list (default: all known
      providers).
   3. Providers whose CLI is not installed on this machine are dropped, so a
-     half-provisioned VM never draws an agent it cannot run.
+     half-provisioned VM never selects an agent it cannot run.
 
 If that leaves nothing (no CLI installed at all), the first allowed provider
 is returned anyway: the resulting run then fails with the worker's ordinary
@@ -21,7 +22,7 @@ is returned anyway: the resulting run then fails with the worker's ordinary
 existed — an honest failure beats a silent no-op.
 
 Callers that only need "a worker" use :func:`build_random_worker` or
-:func:`random_worker_factory`; the provider that was actually drawn is
+:func:`random_worker_factory` (legacy names); the provider that was selected is
 reported on every ``WorkerResult.provider``.
 """
 
@@ -29,8 +30,8 @@ from __future__ import annotations
 
 import logging
 import os
-import random
 import shutil
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from modules.claude_worker import ClaudeWorker
@@ -38,6 +39,7 @@ from modules.claude_worker import PROVIDER as PROVIDER_CLAUDE
 from modules.claude_worker import _default_claude_bin
 from modules.codex_worker import _DEFAULT_CODEX_BIN, CodexWorker
 from modules.codex_worker import PROVIDER as PROVIDER_CODEX
+from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger("modules.coding_provider")
 
@@ -45,6 +47,7 @@ KNOWN_PROVIDERS: tuple[str, ...] = (PROVIDER_CODEX, PROVIDER_CLAUDE)
 
 ENV_PROVIDER_PIN = "AGENT_CODING_PROVIDER"
 ENV_PROVIDER_ALLOW_LIST = "AGENT_CODING_PROVIDERS"
+_ROUND_ROBIN_SETTING = "coding_provider.last_selected"
 
 
 class UnknownProviderError(ValueError):
@@ -122,18 +125,22 @@ def pinned_provider() -> str | None:
     provider = _normalize(raw)
     if provider not in KNOWN_PROVIDERS:
         logger.warning(
-            "ignoring unknown provider %r in %s; drawing at random instead",
+            "ignoring unknown provider %r in %s; using provider rotation instead",
             provider, ENV_PROVIDER_PIN,
         )
         return None
     return provider
 
 
-def choose_provider(rng: random.Random | None = None) -> str:
-    """Draw the provider for one task.
+def choose_provider(
+    rng: Any | None = None, *, db_path: str = DEFAULT_DB_PATH
+) -> str:
+    """Select the next provider in a persistent, concurrency-safe rotation.
 
-    Uniform over the installed, allowed providers. Pass *rng* to make the
-    draw deterministic (tests, or a reproducible experiment run).
+    ``rng`` remains as a compatibility argument for existing callers but is
+    intentionally unused: selection is deterministic now. Pins bypass the
+    rotation and do not advance it. The allow list and installed-CLI filter
+    are applied before rotating.
     """
     pinned = pinned_provider()
     if pinned is not None:
@@ -146,10 +153,42 @@ def choose_provider(rng: random.Random | None = None) -> str:
             "no coding-agent CLI found for any allowed provider; using %r anyway",
             fallback,
         )
-        return fallback
+        candidates = [fallback]
 
-    chooser = rng or random
-    return chooser.choice(candidates)
+    # BEGIN IMMEDIATE makes read-next-write one atomic operation across API,
+    # mailbox, and experiment processes sharing the database. Without it two
+    # simultaneous tasks could both observe the same cursor and pick the same
+    # provider.
+    conn = init_db(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM service_settings WHERE key = ?",
+            (_ROUND_ROBIN_SETTING,),
+        ).fetchone()
+        last = row[0] if row is not None else None
+        if last in candidates:
+            selected = candidates[(candidates.index(last) + 1) % len(candidates)]
+        else:
+            # Stable order gives a deterministic first selection and also
+            # handles a previously selected provider being disallowed.
+            selected = candidates[0]
+        conn.execute(
+            """
+            INSERT INTO service_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE
+            SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (_ROUND_ROBIN_SETTING, selected, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return selected
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def provider_of(worker: Any, default: str | None = None) -> str | None:
@@ -182,30 +221,30 @@ def build_worker(provider: str, *, db_path: str | None = None, **kwargs: Any) ->
 
 
 def build_random_worker(
-    *, db_path: str | None = None, rng: random.Random | None = None, **kwargs: Any
+    *, db_path: str | None = None, rng: Any | None = None, **kwargs: Any
 ) -> tuple[str, Any]:
-    """Draw a provider and return ``(provider, worker)``."""
-    provider = choose_provider(rng)
+    """Select a provider and return ``(provider, worker)``."""
+    provider = choose_provider(rng, db_path=db_path or DEFAULT_DB_PATH)
     return provider, build_worker(provider, db_path=db_path, **kwargs)
 
 
 def random_worker_factory(
     *,
     db_path: str | None = None,
-    rng: random.Random | None = None,
+    rng: Any | None = None,
     sticky: bool = True,
     **kwargs: Any,
 ) -> Callable[..., Any]:
-    """A ``(working_dir) -> worker`` factory that draws a provider per call.
+    """A ``(working_dir) -> worker`` factory that selects a provider per call.
 
     Matches the factory signature ``ExperimentService`` expects. The working
     directory is not used to confine the worker — that is the worker's own job
     (sandbox mode plus the subprocess ``cwd``) — but it does identify the
-    piece of work: with *sticky* (the default) the first draw for a given
+    piece of work: with *sticky* (the default) the first selection for a given
     working directory is reused for every later call with the same one, so an
     experiment and its repair attempts run on one agent while different
-    experiments still draw independently. Pass ``sticky=False`` for an
-    independent draw on every call.
+    experiments still select independently. Pass ``sticky=False`` for an
+    independent selection on every call.
     """
     drawn: dict[str, str] = {}
 
@@ -216,7 +255,7 @@ def random_worker_factory(
         key = str(working_dir)
         provider = drawn.get(key)
         if provider is None:
-            provider = choose_provider(rng)
+            provider = choose_provider(rng, db_path=db_path or DEFAULT_DB_PATH)
             drawn[key] = provider
         return build_worker(provider, db_path=db_path, **kwargs)
 
