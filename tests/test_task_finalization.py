@@ -21,6 +21,7 @@ from modules.task_finalization import (
     PHASE_RESTART_REQUESTED,
     PHASE_SUCCEEDED,
     FinalizationResult,
+    LiveHealthUnavailableError,
     TaskFinalizationCoordinator,
 )
 
@@ -278,6 +279,111 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.phase, PHASE_SUCCEEDED)
         self.assertEqual(live_calls, [(self.approval.id, self.experiment.id)])
         self.assertEqual(resumed.get_phase(self.approval.id), PHASE_SUCCEEDED)
+
+    def test_unreachable_health_after_restart_waits_without_spending_a_retry(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(
+            _FakeAdoptionService(adoption),
+            process_started_at=time.time() + 60,
+            restart_timeout_seconds=600,
+            live_validator=MagicMock(
+                side_effect=LiveHealthUnavailableError("connection refused")
+            ),
+        )
+        self.addCleanup(coordinator.close)
+        state = coordinator._get_or_create(self.approval.id, self.experiment.id)
+        state.phase = PHASE_RESTART_REQUESTED
+        state.restart_requested_at = time.time()
+        coordinator._save(state)
+
+        result = coordinator.advance(self.approval, self.experiment)
+        persisted = coordinator._get(self.approval.id)
+
+        self.assertEqual(result.status, "running")
+        self.assertEqual(result.phase, PHASE_RESTART_REQUESTED)
+        self.assertEqual(persisted.retry_count, 0)
+        self.assertEqual(persisted.restart_requested_at, state.restart_requested_at)
+
+    def test_connection_refused_is_classified_as_health_unavailable(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(_FakeAdoptionService(adoption))
+        self.addCleanup(coordinator.close)
+
+        with patch(
+            "modules.task_finalization.urllib.request.urlopen",
+            side_effect=ConnectionRefusedError("connection refused"),
+        ), self.assertRaisesRegex(LiveHealthUnavailableError, "connection refused"):
+            coordinator._validate_live(self.approval, self.experiment)
+
+    def test_health_becoming_ok_after_unreachable_finishes_successfully(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        validator = MagicMock(
+            side_effect=[
+                LiveHealthUnavailableError("connection refused"),
+                {"summary": "live health passed"},
+            ]
+        )
+        coordinator = self._coordinator(
+            _FakeAdoptionService(adoption),
+            process_started_at=time.time() + 60,
+            restart_timeout_seconds=600,
+            live_validator=validator,
+        )
+        self.addCleanup(coordinator.close)
+        state = coordinator._get_or_create(self.approval.id, self.experiment.id)
+        state.phase = PHASE_RESTART_REQUESTED
+        state.restart_requested_at = time.time()
+        coordinator._save(state)
+
+        waiting = coordinator.advance(self.approval, self.experiment)
+        result = coordinator.advance(self.approval, self.experiment)
+
+        self.assertEqual(waiting.phase, PHASE_RESTART_REQUESTED)
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.phase, PHASE_SUCCEEDED)
+        self.assertEqual(coordinator._get(self.approval.id).retry_count, 0)
+
+    def test_unreachable_health_beyond_restart_timeout_needs_review(self):
+        adoption = SimpleNamespace(
+            status=STATUS_ADOPTED,
+            reason=None,
+            integrated_commit_sha="merge-sha",
+            local_sync_pending=False,
+        )
+        coordinator = self._coordinator(
+            _FakeAdoptionService(adoption),
+            process_started_at=time.time() + 60,
+            restart_timeout_seconds=10,
+            live_validator=MagicMock(
+                side_effect=LiveHealthUnavailableError("connection refused")
+            ),
+        )
+        self.addCleanup(coordinator.close)
+        state = coordinator._get_or_create(self.approval.id, self.experiment.id)
+        state.phase = PHASE_RESTART_REQUESTED
+        state.restart_requested_at = time.time() - 11
+        coordinator._save(state)
+
+        result = coordinator.advance(self.approval, self.experiment)
+
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("live health stayed unreachable", result.summary)
+        self.assertEqual(coordinator._get(self.approval.id).retry_count, 0)
 
     def test_new_approval_rebinds_existing_experiment_state_and_resets_attempt_errors(self):
         adoption = SimpleNamespace(

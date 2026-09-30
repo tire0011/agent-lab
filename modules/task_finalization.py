@@ -86,6 +86,10 @@ RestartRunner = Callable[[list[str]], None]
 LiveValidator = Callable[[Any, Any], dict[str, Any]]
 
 
+class LiveHealthUnavailableError(RuntimeError):
+    """The restarted API has not begun accepting health requests yet."""
+
+
 class TaskFinalizationCoordinator:
     """Continue a verified development task until the merged code is live.
 
@@ -338,6 +342,23 @@ class TaskFinalizationCoordinator:
         self._save(state)
         try:
             validation = self._live_validator(approval, experiment)
+        except LiveHealthUnavailableError as exc:
+            waited = time.time() - state.restart_requested_at
+            if waited > self.restart_timeout_seconds:
+                reason = (
+                    f"live health stayed unreachable for {int(waited)}s after restart "
+                    f"was requested (timeout {int(self.restart_timeout_seconds)}s): {exc}"
+                )
+                logger.warning("finalization %s: %s", state.approval_id, reason)
+                return self._needs_review(state, reason)
+            state.phase = PHASE_RESTART_REQUESTED
+            state.last_error = None
+            self._save(state)
+            return FinalizationResult(
+                "running",
+                state.phase,
+                "service restart was observed; waiting for the live health endpoint",
+            )
         except Exception as exc:
             return self._retry_or_review(state, f"live validation failed: {exc}", reset_restart=True)
 
@@ -859,8 +880,12 @@ class TaskFinalizationCoordinator:
                 if response.status != 200:
                     raise RuntimeError(f"health endpoint returned HTTP {response.status}")
                 payload = json.loads(response.read().decode("utf-8"))
-        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"health endpoint unavailable: {exc}") from exc
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"health endpoint returned HTTP {exc.code}") from exc
+        except (OSError, urllib.error.URLError) as exc:
+            raise LiveHealthUnavailableError(f"health endpoint unavailable: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid health response: {exc}") from exc
         if not isinstance(payload, dict) or payload.get("status") != "ok":
             raise RuntimeError(f"unexpected health response: {payload!r}")
 
