@@ -127,6 +127,33 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.service.close()
         self.tmp.cleanup()
 
+    def _checkpoint_repo(self):
+        repo = Path(self.tmp.name) / "repo"
+        remote = Path(self.tmp.name) / "remote.git"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Nexus Test"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "nexus@example.test"], cwd=repo, check=True)
+        (repo / "feature.py").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "add", "feature.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=repo, check=True, capture_output=True)
+        self.fake.refs["main"] = head
+        ref = self.service.bind_experiment(
+            self.service.ensure_for_source(
+                SimpleNamespace(
+                    source_type="task", source_id="checkpoint", title="Checkpoint", content="Checkpoint"
+                )
+            ),
+            "checkpoint-exp",
+        )
+        return repo, remote, ref, head
+
     def test_creates_missing_database_parent_directory(self):
         nested_db = Path(self.tmp.name) / "state" / "nested" / "nexus.db"
         service = GitHubWorkTrackingService(
@@ -175,31 +202,7 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertEqual(self.service.for_experiment("legacy-exp").branch_name, first.branch_name)
 
     def test_checkpoint_pushes_publishable_files_and_preserves_worktree(self):
-        repo = Path(self.tmp.name) / "repo"
-        remote = Path(self.tmp.name) / "remote.git"
-        repo.mkdir()
-        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Nexus Test"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "nexus@example.test"], cwd=repo, check=True)
-        (repo / "feature.py").write_text("before\n", encoding="utf-8")
-        subprocess.run(["git", "add", "feature.py"], cwd=repo, check=True)
-        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
-        ).stdout.strip()
-        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
-        subprocess.run(["git", "push", "origin", "main"], cwd=repo, check=True, capture_output=True)
-        self.fake.refs["main"] = head
-
-        ref = self.service.bind_experiment(
-            self.service.ensure_for_source(
-                SimpleNamespace(
-                    source_type="task", source_id="checkpoint", title="Checkpoint", content="Checkpoint"
-                )
-            ),
-            "checkpoint-exp",
-        )
+        repo, remote, ref, _ = self._checkpoint_repo()
         (repo / "feature.py").write_text("after\n", encoding="utf-8")
         (repo / "communication").mkdir()
         (repo / "communication" / "runtime.md").write_text("runtime\n", encoding="utf-8")
@@ -226,6 +229,45 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         ).stdout
         self.assertIn("feature.py", status)
         self.assertIn("communication/", status)
+
+    def test_checkpoint_uses_worktree_head_when_issue_branch_is_only_behind(self):
+        repo, remote, _, _ = self._checkpoint_repo()
+        (repo / "committed.py").write_text("already committed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "committed.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "experiment progress"], cwd=repo, check=True, capture_output=True)
+        worktree_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True, capture_output=True
+        ).stdout.strip()
+        (repo / "feature.py").write_text("after\n", encoding="utf-8")
+
+        self.service.checkpoint_experiment("checkpoint-exp", str(repo))
+
+        checkpoint_sha = self.service.for_experiment("checkpoint-exp").checkpoint_sha
+        parent = subprocess.run(
+            ["git", f"--git-dir={remote}", "rev-parse", f"{checkpoint_sha}^"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        self.assertEqual(parent, worktree_head)
+
+    def test_checkpoint_rejects_issue_branch_commit_missing_from_worktree(self):
+        repo, _, ref, base_sha = self._checkpoint_repo()
+        (repo / "committed.py").write_text("experiment progress\n", encoding="utf-8")
+        subprocess.run(["git", "add", "committed.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "experiment progress"], cwd=repo, check=True, capture_output=True)
+        (repo / "feature.py").write_text("after\n", encoding="utf-8")
+        branch_sha = subprocess.run(
+            ["git", "commit-tree", f"{base_sha}^{{tree}}", "-p", base_sha, "-m", "branch-only commit"],
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        self.fake.refs[ref.branch_name] = branch_sha
+
+        with self.assertRaisesRegex(GitHubWorkTrackingError, "manual reconciliation required"):
+            self.service.checkpoint_experiment("checkpoint-exp", str(repo))
 
     def test_existing_issue_is_reused_and_two_experiments_keep_same_work_identity(self):
         source = SimpleNamespace(

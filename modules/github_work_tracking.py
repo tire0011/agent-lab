@@ -546,45 +546,56 @@ class GitHubWorkTrackingService:
 
         remote_sha = self._remote_branch_sha(ref.branch_name)
         worktree_head = self._git(["rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
+        checkpoint_base = remote_sha
         if ref.checkpoint_sha != remote_sha:
-            ancestor = self._git(
+            remote_descends_from_worktree = self._git(
                 ["merge-base", "--is-ancestor", worktree_head, remote_sha],
                 cwd=worktree_path,
                 check=False,
             )
-            if ancestor.returncode != 0:
-                raise GitHubWorkTrackingError(
-                    "Issue branch no longer descends from the experiment worktree; manual reconciliation required"
-                )
-            upstream_paths = set(
-                self._git(
-                    ["diff", "--name-only", f"{worktree_head}..{remote_sha}"],
+            if remote_descends_from_worktree.returncode != 0:
+                worktree_descends_from_remote = self._git(
+                    ["merge-base", "--is-ancestor", remote_sha, worktree_head],
                     cwd=worktree_path,
-                ).stdout.splitlines()
-            )
-            overlap = sorted(upstream_paths.intersection(publishable))
-            if overlap:
-                raise GitHubWorkTrackingError(
-                    "Issue branch changed the same files as the worktree: " + ", ".join(overlap[:20])
+                    check=False,
                 )
+                if worktree_descends_from_remote.returncode == 0:
+                    checkpoint_base = worktree_head
+                else:
+                    raise GitHubWorkTrackingError(
+                        "Issue branch no longer descends from the experiment worktree; manual reconciliation required"
+                    )
+
+            if checkpoint_base == remote_sha:
+                upstream_paths = set(
+                    self._git(
+                        ["diff", "--name-only", f"{worktree_head}..{remote_sha}"],
+                        cwd=worktree_path,
+                    ).stdout.splitlines()
+                )
+                overlap = sorted(upstream_paths.intersection(publishable))
+                if overlap:
+                    raise GitHubWorkTrackingError(
+                        "Issue branch changed the same files as the worktree: " + ", ".join(overlap[:20])
+                    )
 
         with tempfile.TemporaryDirectory(prefix="nexus-checkpoint-index-") as temp_dir:
             env = dict(os.environ)
             env["GIT_INDEX_FILE"] = str(Path(temp_dir) / "index")
-            self._git(["read-tree", remote_sha], cwd=worktree_path, env=env)
+            self._git(["read-tree", checkpoint_base], cwd=worktree_path, env=env)
             self._git(["add", "-A", "--", *publishable], cwd=worktree_path, env=env)
             tree_sha = self._git(["write-tree"], cwd=worktree_path, env=env).stdout.strip()
-        remote_tree = self._git(
-            ["rev-parse", f"{remote_sha}^{{tree}}"], cwd=worktree_path
+        base_tree = self._git(
+            ["rev-parse", f"{checkpoint_base}^{{tree}}"], cwd=worktree_path
         ).stdout.strip()
-        checkpoint_sha = remote_sha
-        if tree_sha != remote_tree:
+        checkpoint_sha = checkpoint_base
+        if tree_sha != base_tree:
             checkpoint_sha = self._git(
                 [
                     "commit-tree",
                     tree_sha,
                     "-p",
-                    remote_sha,
+                    checkpoint_base,
                     "-m",
                     f"WIP: Nexus experiment {experiment_id[:8]}",
                 ],
