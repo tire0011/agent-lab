@@ -1979,23 +1979,24 @@ Return exactly one JSON object matching the schema."""
             # complemented by prior task knowledge without another planning loop.
             memory_query = f"GitHub issue #{issue_number}"
             try:
-                # Placed first and marked as history: earlier runs may have
-                # recorded an older version of the issue, and the current
-                # text must win and survive compaction as the newest source (#292).
-                sources.insert(
-                    0,
-                    {
-                        "tool": "memory_search",
-                        "query": memory_query,
-                        "note": (
-                            "Earlier project history. It may describe an older version of "
-                            "this issue; the current GitHub issue wins on any conflict."
-                        ),
-                        "results": self.memory.search(memory_query, limit=8),
-                        "knowledge_collector": True,
-                        "deterministic_reference": True,
-                    },
-                )
+                memory_source = {
+                    "tool": "memory_search",
+                    "query": memory_query,
+                    "results": self.memory.search(memory_query, limit=8),
+                    "knowledge_collector": True,
+                    "deterministic_reference": True,
+                }
+                if self._fetched_issue_heading(sources):
+                    # Placed first and marked as history: earlier runs may have
+                    # recorded an older version of the issue, and the current
+                    # text must win and survive compaction as the newest source (#292).
+                    memory_source["note"] = (
+                        "Earlier project history. It may describe an older version of "
+                        "this issue; the current GitHub issue wins on any conflict."
+                    )
+                    sources.insert(0, memory_source)
+                else:
+                    sources.append(memory_source)
             except Exception as exc:
                 sources.append(
                     {

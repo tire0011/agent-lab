@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from modules.task_orchestrator import NexusTaskOrchestrator
+from modules.task_orchestrator import NexusTaskOrchestrator, TaskOrchestratorError
 
 CURRENT_TITLE = "Code change in ExperimentService: startup recovery reruns an interrupted experiment once"
 OLD_MEMORY = "GitHub issue #288: An experiment interrupted by a restart should be resumed."
@@ -26,7 +26,7 @@ def _issue_observation(title: str = CURRENT_TITLE) -> dict:
     }
 
 
-def _orchestrator(briefing: str) -> tuple[NexusTaskOrchestrator, dict, list]:
+def _orchestrator(briefing: str, *, fetch_fails: bool = False) -> tuple[NexusTaskOrchestrator, dict, list]:
     orchestrator = object.__new__(NexusTaskOrchestrator)
     orchestrator.task_store = MagicMock()
     orchestrator.task_store.append_event.return_value = 1
@@ -42,7 +42,9 @@ def _orchestrator(briefing: str) -> tuple[NexusTaskOrchestrator, dict, list]:
         patch.object(
             orchestrator,
             "_resolve_find_tool",
-            AsyncMock(return_value={"tool": "find_tool", "status": "found", "resolved_tool": "github_issue"}),
+            AsyncMock(side_effect=TaskOrchestratorError("github unavailable"))
+            if fetch_fails
+            else AsyncMock(return_value={"tool": "find_tool", "status": "found", "resolved_tool": "github_issue"}),
         ),
         patch.object(orchestrator, "_execute_resolved_tool", return_value=_issue_observation()),
         patch.object(orchestrator, "_mark_already_executed", side_effect=lambda source, _executed: source),
@@ -54,8 +56,8 @@ def _orchestrator(briefing: str) -> tuple[NexusTaskOrchestrator, dict, list]:
     return orchestrator, seen, patches
 
 
-def _run(briefing: str):
-    orchestrator, seen, patches = _orchestrator(briefing)
+def _run(briefing: str, *, fetch_fails: bool = False):
+    orchestrator, seen, patches = _orchestrator(briefing, fetch_fails=fetch_fails)
     try:
         result = asyncio.run(
             orchestrator._run_knowledge_collector(
@@ -93,3 +95,11 @@ def test_no_heading_without_a_successfully_fetched_issue():
     failed["result"]["success"] = False
     assert NexusTaskOrchestrator._fetched_issue_heading([failed]) is None
     assert NexusTaskOrchestrator._fetched_issue_heading([]) is None
+
+
+def test_a_failed_fetch_keeps_the_previous_source_order_and_briefing():
+    # Review on #293: without a current issue nothing is reordered or marked.
+    result, prompt = _run("summary from memory", fetch_fails=True)
+    assert prompt.index("knowledge_source_error") < prompt.index(OLD_MEMORY)
+    assert "older version of this issue" not in prompt
+    assert result["knowledge_briefing"] == "summary from memory"
