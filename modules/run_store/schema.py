@@ -302,6 +302,9 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("quality_evaluation_json", "TEXT"),
     # Which coding agent ran the implementation phase (codex | claude).
     ("implementation_provider", "TEXT"),
+    # The experiment a restart interrupted, when this one is its automatic
+    # rerun (#288). Also what keeps that rerun to a single one.
+    ("rerun_of", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

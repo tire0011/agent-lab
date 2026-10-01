@@ -624,8 +624,10 @@ class ExperimentService:
         startup, before any new experiment is run: at that moment no thread in
         this process can still own an active experiment.
 
-        Never resumes the work. Moving the experiment to a terminal status is
-        what lets the waiting Nexus session resume (see
+        Never resumes the work itself. The mailbox recovery then queues one
+        rerun per interrupted experiment (``rerun_interrupted_experiment``,
+        #288); where none is due, the terminal status is what lets the waiting
+        Nexus session resume (see
         ``MailboxTaskService.resume_finished_experiments``) and decide whether
         the task continues or ends.
 
@@ -646,6 +648,71 @@ class ExperimentService:
             ):
                 marked.append(row["id"])
         return marked
+
+    def rerun_interrupted_experiment(self, experiment_id: str) -> Experiment | None:
+        """Queue the one automatic rerun of an experiment a restart cut off (#288).
+
+        A restart says nothing about the work itself, so it should not end the
+        task. Returns the new ``queued`` experiment (same goal, ``rerun_of``
+        pointing at *experiment_id*), or ``None`` when no rerun is due:
+
+        - the experiment did not fail with ``interrupted by service restart``;
+        - it already has its rerun (a second restart must not add another);
+        - it is itself a rerun, so a restart that keeps recurring does not
+          loop forever and the failure goes to Nexus instead.
+
+        Only creates the row; running it is the caller's job.
+        """
+        new_id = uuid.uuid4().hex
+        created_at = _utcnow_iso()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT goal, status, error, rerun_of FROM experiments WHERE id = ?",
+                (experiment_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != STATUS_FAILED
+                or row["error"] != _INTERRUPTED_BY_RESTART_ERROR
+                or row["rerun_of"]
+            ):
+                return None
+            existing = self._conn.execute(
+                "SELECT 1 FROM experiments WHERE rerun_of = ? LIMIT 1", (experiment_id,)
+            ).fetchone()
+            if existing is not None:
+                return None
+            self._conn.execute(
+                """
+                INSERT INTO experiments (id, goal, status, created_at, rerun_of)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (new_id, row["goal"], STATUS_QUEUED, created_at, experiment_id),
+            )
+            insert_activity(
+                self._conn,
+                timestamp=created_at,
+                entity_type="experiment",
+                entity_id=new_id,
+                event="created",
+                to_status=STATUS_QUEUED,
+                message=f"rerun of {experiment_id} after service restart",
+            )
+        logger.info(
+            "experiment %s created as rerun of interrupted experiment %s",
+            new_id, experiment_id,
+        )
+        self.get_experiment_logger(experiment_id).info(
+            STATUS_FAILED, "experiment_rerun_queued",
+            "Interrupted by service restart; queued one automatic rerun",
+            rerun_experiment_id=new_id,
+        )
+        self.get_experiment_logger(new_id).info(
+            STATUS_QUEUED, "experiment_created",
+            f"Experiment created as rerun of {experiment_id}",
+            rerun_of=experiment_id,
+        )
+        return self.get_experiment(new_id)
 
     # ------------------------------------------------------------------
     # run_experiment — the whole pipeline, single entry point

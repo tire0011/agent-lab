@@ -687,15 +687,18 @@ class MailboxTaskService:
             self._with_task_store(
                 lambda store: store.wait_for_experiment(decision.session_id, experiment.id)
             )
+        self._run_experiment_then_resume(experiment.id)
+
+    def _run_experiment_then_resume(self, experiment_id: str) -> None:
         self._start_thread(
-            experiment.id,
+            experiment_id,
             lambda: run_then_resume(
                 lambda: self.experiment_service.run_experiment(
-                    experiment.id,
+                    experiment_id,
                     github_work_tracking=self.github_work_tracking,
                 ),
-                lambda: self._after_experiment(experiment.id),
-                experiment.id,
+                lambda: self._after_experiment(experiment_id),
+                experiment_id,
             ),
         )
 
@@ -1042,7 +1045,96 @@ class MailboxTaskService:
                 "mailbox", "task_interrupted_by_restart",
                 "non-experiment task interrupted by restart; marked needs_review",
             )
+        self._rerun_interrupted_experiments()
         self.poll_running()
+
+    def _rerun_interrupted_experiments(self) -> None:
+        """Give each task whose experiment a restart cut off one new run (#288).
+
+        Runs at startup, after ``ExperimentService.mark_interrupted_experiments_failed``.
+        The task and its waiting Nexus session move to the rerun, so the task
+        can still succeed. No ``new_experiment`` event is recorded, so the
+        rerun does not count against ``_MAX_EXPERIMENTS_PER_TASK``. When no
+        rerun is due (other failures, a rerun already made, a rerun that was
+        itself interrupted) the ordinary path hands the failure to Nexus.
+        """
+        if self.experiment_service is None:
+            return
+        from modules.experiment_service.service import _INTERRUPTED_BY_RESTART_ERROR
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM mailbox_task_approvals
+                   WHERE status IN (?, ?) AND experiment_id IS NOT NULL""",
+                (_STATUS_SUBMITTED, _STATUS_RUNNING),
+            ).fetchall()
+        for row in rows:
+            approval = _row_to_approval(row)
+            old_id = approval.experiment_id
+            try:
+                experiment = self.experiment_service.get_experiment(old_id)
+                if (
+                    experiment.status != "failed"
+                    or experiment.error != _INTERRUPTED_BY_RESTART_ERROR
+                ):
+                    continue
+                session = self._with_task_store(
+                    lambda store: store.find_by_source("task", approval.id)
+                )
+                if session is not None and (
+                    session.status == "active"
+                    or (
+                        session.status == "waiting_for_experiment"
+                        and session.waiting_experiment_id != old_id
+                    )
+                ):
+                    # Nexus has already moved on from this experiment.
+                    continue
+                rerun = self.experiment_service.rerun_interrupted_experiment(old_id)
+                if rerun is None:
+                    continue
+                self._move_task_to_rerun(approval, session, old_id, rerun.id)
+            except Exception:
+                logger.exception(
+                    "mailbox_task: rerun of interrupted experiment %s failed", old_id
+                )
+
+    def _move_task_to_rerun(
+        self, approval: MailboxTaskApproval, session: Any, old_id: str, new_id: str
+    ) -> None:
+        task_log = self._task_logger(approval.id)
+        try:
+            ref = self.github_work_tracking.for_experiment(old_id)
+            if ref is not None:
+                self.github_work_tracking.bind_experiment(ref, new_id)
+        except Exception as exc:  # noqa: BLE001 - the run reports a missing link itself
+            task_log.warning(
+                "queued", "github_work_tracking_failed",
+                "could not carry the GitHub link over to the rerun", exc=exc,
+                experiment_id=new_id,
+            )
+        with self._lock:
+            updated = self._conn.execute(
+                """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
+                   WHERE id=? AND experiment_id=? AND status IN (?, ?)""",
+                (_STATUS_SUBMITTED, new_id, _now_iso(), approval.id, old_id,
+                 _STATUS_SUBMITTED, _STATUS_RUNNING),
+            ).rowcount
+            self._conn.commit()
+        if not updated:
+            logger.warning(
+                "mailbox_task: lost race after creating rerun %s of %s", new_id, old_id
+            )
+            return
+        if session is not None and session.status == "waiting_for_experiment":
+            self._with_task_store(lambda store: store.wait_for_experiment(session.id, new_id))
+        task_log.warning(
+            "queued", "experiment_rerun_after_restart",
+            "experiment interrupted by service restart; started its one automatic rerun",
+            experiment_id=new_id,
+            previous_experiment_id=old_id,
+        )
+        self._run_experiment_then_resume(new_id)
 
     # ------------------------------------------------------------------
     # Terminal results / outbox

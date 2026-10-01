@@ -425,8 +425,9 @@ async def lifespan(app: FastAPI):
         # Never restarts execution and never starts a Codex process.
         _resolve_codex_service().mark_interrupted_tasks_failed()
         # Experiment threads die with this process too (#281). Failing them
-        # before the mailbox recovery below lets the waiting Nexus session
-        # resume and decide whether the task continues or ends.
+        # before the mailbox recovery below lets that recovery give each one
+        # its single automatic rerun (#288); anything else lets the waiting
+        # Nexus session resume and decide whether the task continues or ends.
         try:
             _interrupted = _resolve_experiment_service().mark_interrupted_experiments_failed()
             if isinstance(_interrupted, list) and _interrupted:
