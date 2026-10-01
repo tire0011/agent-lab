@@ -1768,6 +1768,7 @@ Your job is research and synthesis only:
 - Do not modify anything, run development commands or tests, or claim the task is solved.
 - Your final product is one compact factual briefing for Nexus to reason with.
 - Preserve concrete facts such as root cause, affected component, constraints, prior attempts, and acceptance criteria when present.
+- Sources fetched now, such as a GitHub issue, are current. Memory is earlier history and may describe an older version; when they disagree, the current source wins.
 - Do not invent missing facts.
 
 For action=lookup:
@@ -1879,6 +1880,26 @@ Return exactly one JSON object matching the schema."""
             "bounded_reason": "knowledge collector unavailable; Nexus retains control",
         }
 
+    @staticmethod
+    def _fetched_issue_heading(sources: list[dict[str, Any]]) -> str | None:
+        """``GitHub issue #N: <title>`` from a fetched issue, verbatim (#292)."""
+        for source in sources:
+            if source.get("tool") != "operation" or source.get("operation") != "github_issue":
+                continue
+            result = source.get("result") or {}
+            if not result.get("success"):
+                continue
+            for line in result.get("output_lines") or []:
+                if not str(line).startswith("issue: "):
+                    continue
+                try:
+                    meta = json.loads(str(line)[len("issue: "):])
+                except (TypeError, ValueError):
+                    return None
+                if meta.get("number") and meta.get("title"):
+                    return f"GitHub issue #{meta['number']}: {meta['title']}"
+        return None
+
     async def _run_knowledge_collector(
         self,
         session: Any,
@@ -1958,15 +1979,24 @@ Return exactly one JSON object matching the schema."""
             # complemented by prior task knowledge without another planning loop.
             memory_query = f"GitHub issue #{issue_number}"
             try:
-                sources.append(
-                    {
-                        "tool": "memory_search",
-                        "query": memory_query,
-                        "results": self.memory.search(memory_query, limit=8),
-                        "knowledge_collector": True,
-                        "deterministic_reference": True,
-                    }
-                )
+                memory_source = {
+                    "tool": "memory_search",
+                    "query": memory_query,
+                    "results": self.memory.search(memory_query, limit=8),
+                    "knowledge_collector": True,
+                    "deterministic_reference": True,
+                }
+                if self._fetched_issue_heading(sources):
+                    # Placed first and marked as history: earlier runs may have
+                    # recorded an older version of the issue, and the current
+                    # text must win and survive compaction as the newest source (#292).
+                    memory_source["note"] = (
+                        "Earlier project history. It may describe an older version of "
+                        "this issue; the current GitHub issue wins on any conflict."
+                    )
+                    sources.insert(0, memory_source)
+                else:
+                    sources.append(memory_source)
             except Exception as exc:
                 sources.append(
                     {
@@ -2038,9 +2068,13 @@ Return exactly one JSON object matching the schema."""
                 if name and name not in used_sources:
                     used_sources.append(str(name))
 
+            briefing = decision["briefing"]
+            title = self._fetched_issue_heading(sources)
+            if title and not briefing.startswith(title):
+                briefing = f"{title}\n{briefing}"
             return {
                 "tool": TOOL_KNOWLEDGE_BRIEFING,
-                "knowledge_briefing": decision["briefing"],
+                "knowledge_briefing": briefing,
                 "used_sources": used_sources,
                 "source_count": len(sources),
                 "deterministic_retrieval": True,
