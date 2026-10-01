@@ -1892,12 +1892,15 @@ Return exactly one JSON object matching the schema."""
             for line in result.get("output_lines") or []:
                 if not str(line).startswith("issue: "):
                     continue
-                try:
-                    meta = json.loads(str(line)[len("issue: "):])
-                except (TypeError, ValueError):
-                    return None
-                if meta.get("number") and meta.get("title"):
-                    return f"GitHub issue #{meta['number']}: {meta['title']}"
+                # Read the fields one by one: redaction replaces the URL and
+                # everything after it on the line, so the line is no longer
+                # valid JSON (#292, seen on the VM).
+                number = re.search(r'"number":\s*(\d+)', str(line))
+                title = re.search(r'"title":\s*"((?:[^"\\]|\\.)*)"', str(line))
+                if number and title:
+                    title_text = json.loads(f'"{title.group(1)}"')
+                    return f"GitHub issue #{number.group(1)}: {title_text}"
+                return None
         return None
 
     async def _run_knowledge_collector(

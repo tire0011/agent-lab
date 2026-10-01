@@ -103,3 +103,24 @@ def test_a_failed_fetch_keeps_the_previous_source_order_and_briefing():
     assert prompt.index("knowledge_source_error") < prompt.index(OLD_MEMORY)
     assert "older version of this issue" not in prompt
     assert result["knowledge_briefing"] == "summary from memory"
+
+
+def test_the_heading_survives_a_redacted_issue_line():
+    # On the VM redaction replaces the URL and the rest of the line, so the
+    # "issue:" line is no longer valid JSON.
+    observation = _issue_observation()
+    observation["result"]["output_lines"][0] = (
+        'issue: {"author": "tire0011", "number": 288, "state": "open", '
+        f'"title": "{CURRENT_TITLE}", "updated_at": "2026", "url": "[REMOTE]'
+    )
+    assert NexusTaskOrchestrator._fetched_issue_heading([observation]) == (
+        f"GitHub issue #288: {CURRENT_TITLE}"
+    )
+
+
+def test_an_escaped_quote_in_the_title_is_kept():
+    observation = _issue_observation()
+    observation["result"]["output_lines"][0] = (
+        'issue: {"number": 7, "title": "Say \\"hi\\" first", "url": "[REMOTE]'
+    )
+    assert NexusTaskOrchestrator._fetched_issue_heading([observation]) == 'GitHub issue #7: Say "hi" first'
