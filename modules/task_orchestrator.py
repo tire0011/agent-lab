@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +29,7 @@ from modules.local_llm_jobs import (
     acquire_local_llm_job_service,
     release_local_llm_job_service,
 )
+from modules.escalation_probes import ProbeResult, logprob_decision, same_requirement_logprob_prompt
 from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
@@ -106,6 +107,11 @@ ACTION_KNOWLEDGE_COLLECTOR = "knowledge_collector"
 # failure. ``local_worker`` is deliberately excluded because it uses the same
 # local llama-server and cannot recover from that failure.
 _EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
+# External fallback prompts are cut to this length, so callers that cannot
+# lose their tail size the prompt below it first (#297).
+_EXTERNAL_PROMPT_CHARS = 16000
+# Room for the role preamble that _external_fallback_completion puts in front.
+_EXTERNAL_PREAMBLE_CHARS = 300
 
 
 _FINAL_ACTIONS = {
@@ -1363,18 +1369,24 @@ class NexusTaskOrchestrator:
                 + (f": {local_failure}" if local_failure else "")
                 + "; no external provider is configured"
             )
-        if role == "tool_resolver":
+        if role == "knowledge_collector":
+            task_text = (
+                "Continue as the Nexus knowledge collector for this turn only. "
+                "Return exactly one JSON object matching the schema/instructions below; "
+                "no Markdown, no prose.\n\n" + prompt
+            )[:_EXTERNAL_PROMPT_CHARS]
+        elif role == "tool_resolver":
             task_text = (
                 "Continue as the Nexus tool resolver for this turn only. "
                 "Return exactly one JSON object matching the resolver "
                 "schema/instructions below; no Markdown, no prose.\n\n" + prompt
-            )[:16000]
+            )[:_EXTERNAL_PROMPT_CHARS]
         else:
             task_text = (
                 "Continue as the Nexus persistent controller for this turn only. "
                 "Return exactly one JSON object matching the schema/instructions below; "
                 "no Markdown, no prose.\n\n" + prompt
-            )[:16000]
+            )[:_EXTERNAL_PROMPT_CHARS]
         attempts: list[str] = []
         for provider in candidates:
             result = await self.delegation.delegate(provider, task_text, context="")
@@ -1903,6 +1915,109 @@ Return exactly one JSON object matching the schema."""
                 return None
         return None
 
+    def _external_collector_prompt(
+        self,
+        knowledge_request: str,
+        sources: list[dict[str, Any]],
+        budget_plan: PromptBudgetPlan,
+        prompt: str,
+    ) -> str:
+        """The collector prompt sized for the external fallback (#297 review).
+
+        The external path cuts prompts from the end, which would drop the
+        current issue and the output instruction. Memory is shortened first:
+        it is the source that disagreed. If the prompt is still too long,
+        compaction shrinks the remaining sources, the current issue last.
+        """
+        limit = _EXTERNAL_PROMPT_CHARS - _EXTERNAL_PREAMBLE_CHARS
+        overflow = len(prompt) - limit
+        if overflow <= 0:
+            return prompt
+        memory_chars = sum(
+            len(str(item.get("content", "")))
+            for source in sources
+            if source.get("tool") == "memory_search"
+            for item in source.get("results") or []
+            if isinstance(item, dict)
+        )
+        if memory_chars:
+            keep = max(0.0, (memory_chars - overflow - 200) / memory_chars)
+            sources = [
+                {
+                    **source,
+                    "results": [
+                        {
+                            **item,
+                            "content": truncate_text(
+                                str(item.get("content", "")),
+                                int(len(str(item.get("content", ""))) * keep),
+                            )[0],
+                        }
+                        if isinstance(item, dict)
+                        else item
+                        for item in source.get("results") or []
+                    ],
+                }
+                if source.get("tool") == "memory_search"
+                else source
+                for source in sources
+            ]
+            prompt = self._knowledge_collector_prompt(
+                knowledge_request, sources, budget_plan, force_briefing=True
+            )
+        plan = budget_plan
+        for _ in range(4):
+            if len(prompt) <= limit:
+                break
+            plan = replace(
+                plan,
+                observation_chars=max(1000, plan.observation_chars - (len(prompt) - limit) - 200),
+            )
+            prompt = self._knowledge_collector_prompt(
+                knowledge_request, sources, plan, force_briefing=True
+            )
+        return prompt
+
+    async def _memory_matches_issue(
+        self, session_id: str, sources: list[dict[str, Any]]
+    ) -> ProbeResult | None:
+        """Ask the local model whether memory describes the fetched issue (#297).
+
+        The answer's token probability is the signal: the model's plain
+        answer is "yes" even for outdated memory, but its p_yes drops. None
+        when there is nothing to compare or the probe itself failed; the
+        briefing then runs locally as before.
+        """
+        issue_text = ""
+        memory_texts: list[str] = []
+        for source in sources:
+            if source.get("tool") == "operation" and source.get("operation") == "github_issue":
+                result = source.get("result") or {}
+                if result.get("success"):
+                    issue_text = "\n".join(str(line) for line in result.get("output_lines") or [])
+            elif source.get("tool") == "memory_search":
+                memory_texts = [
+                    str(item.get("content", ""))
+                    for item in source.get("results") or []
+                    if isinstance(item, dict) and item.get("content")
+                ]
+        if not issue_text or not memory_texts:
+            return None
+        prompt = same_requirement_logprob_prompt(issue_text, "\n\n".join(memory_texts))
+        try:
+            job_id = self.llm_jobs.submit(
+                prompt,
+                temperature=0.0,
+                max_tokens=2,
+                session_id=session_id,
+                role="knowledge_collector",
+                top_logprobs=5,
+            )
+            return logprob_decision(json.loads(await self.llm_jobs.wait(job_id)))
+        except (LocalLlmJobError, ValueError, TypeError) as exc:
+            logger.warning("knowledge_memory_check_failed session_id=%s error=%s", session_id, exc)
+            return None
+
     async def _run_knowledge_collector(
         self,
         session: Any,
@@ -2029,16 +2144,55 @@ Return exactly one JSON object matching the schema."""
                 budget_plan,
                 force_briefing=True,
             )
-            raw, provider_used = await self._schema_completion(
-                prompt,
-                session_id=session.id,
-                max_tokens=650,
-                response_format=_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
-                budget_plan=budget_plan,
-                waiting_status="waiting_for_knowledge",
-                role="knowledge_collector",
-                task_logger=task_logger,
-            )
+            memory_check = await self._memory_matches_issue(session.id, sources)
+            escalation: dict[str, Any] = {}
+            raw = ""
+            provider_used = ""
+            if memory_check is not None:
+                escalation = {
+                    "p_yes": memory_check.details.get("p_yes"),
+                    "p_no": memory_check.details.get("p_no"),
+                    "threshold": memory_check.details.get("threshold"),
+                    "escalated": memory_check.escalate,
+                    "reason": memory_check.reason,
+                }
+            if memory_check is not None and memory_check.escalate:
+                # Memory and the current issue disagree: a stronger model
+                # writes the briefing, through the same external chain the
+                # controller uses when local inference fails (#297).
+                try:
+                    raw, provider_used = await self._external_fallback_completion(
+                        self._external_collector_prompt(
+                            knowledge_request, sources, budget_plan, prompt
+                        ),
+                        session_id=session.id,
+                        budget_plan=budget_plan,
+                        task_logger=task_logger,
+                        role="knowledge_collector",
+                        local_failure=f"memory differs from the current issue ({memory_check.reason})",
+                    )
+                    self._parse_knowledge_collector(raw)
+                except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
+                    escalation["escalation_failed"] = str(exc)[:500]
+                    raw = ""
+                logger.info(
+                    "knowledge_escalation session_id=%s %s provider=%s failed=%s",
+                    session.id,
+                    memory_check.reason,
+                    provider_used or "-",
+                    bool(escalation.get("escalation_failed")),
+                )
+            if not raw:
+                raw, provider_used = await self._schema_completion(
+                    prompt,
+                    session_id=session.id,
+                    max_tokens=650,
+                    response_format=_KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
+                    budget_plan=budget_plan,
+                    waiting_status="waiting_for_knowledge",
+                    role="knowledge_collector",
+                    task_logger=task_logger,
+                )
             decision = self._parse_knowledge_collector(raw)
             if decision["action"] != "briefing":
                 raise TaskOrchestratorError(
@@ -2055,6 +2209,7 @@ Return exactly one JSON object matching the schema."""
                     "knowledge_collector_internal": True,
                     "deterministic_retrieval": True,
                     "source_count": len(sources),
+                    **({"memory_check": escalation} if escalation else {}),
                 },
             )
             used_sources: list[str] = []

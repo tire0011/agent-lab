@@ -50,6 +50,8 @@ def _orchestrator(briefing: str, *, fetch_fails: bool = False) -> tuple[NexusTas
         patch.object(orchestrator, "_mark_already_executed", side_effect=lambda source, _executed: source),
         patch.object(orchestrator, "_state_token", return_value="token"),
         patch.object(orchestrator, "_schema_completion", side_effect=completion),
+        # The #297 memory check is covered in its own tests.
+        patch.object(orchestrator, "_memory_matches_issue", AsyncMock(return_value=None)),
     ]
     for item in patches:
         item.start()
