@@ -304,6 +304,8 @@ class LocalLlmJobService:
             self._conn.execute("ALTER TABLE local_llm_jobs ADD COLUMN worker_id TEXT")
         if "lease_expires_at" not in columns:
             self._conn.execute("ALTER TABLE local_llm_jobs ADD COLUMN lease_expires_at TEXT")
+        if "top_logprobs" not in columns:
+            self._conn.execute("ALTER TABLE local_llm_jobs ADD COLUMN top_logprobs INTEGER")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_local_llm_jobs_status_created "
             "ON local_llm_jobs (status, created_at)"
@@ -358,6 +360,7 @@ class LocalLlmJobService:
         response_format: dict[str, Any] | None = None,
         role: str = ROLE_CONTROLLER,
         system: str | None = None,
+        top_logprobs: int = 0,
     ) -> str:
         """Queue one local-model call and return its job id.
 
@@ -365,6 +368,10 @@ class LocalLlmJobService:
         ``ROLE_*`` constants). It never changes how a job is executed - every
         role shares this one queue and one worker - it only keeps the jobs
         separable in the database and in the logs.
+
+        With *top_logprobs* > 0 the job asks for token log-probabilities and
+        its result is the JSON of the first choice (``message`` and
+        ``logprobs``) instead of the plain text (#297).
         """
         self._sweep_stuck_jobs()
         job_id = uuid.uuid4().hex
@@ -378,8 +385,8 @@ class LocalLlmJobService:
                 """
                 INSERT INTO local_llm_jobs
                     (id, status, prompt, temperature, max_tokens, response_format,
-                     session_id, created_at, role, system)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     session_id, created_at, role, system, top_logprobs)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -392,6 +399,7 @@ class LocalLlmJobService:
                     _now(),
                     str(role or ROLE_CONTROLLER),
                     system or None,
+                    int(top_logprobs) or None,
                 ),
             )
             self._conn.commit()
@@ -729,6 +737,21 @@ class LocalLlmJobService:
             if signal is None:
                 return
 
+    async def _logprob_completion(self, row: sqlite3.Row, max_tokens: int) -> str:
+        """One completion with token log-probabilities, returned as JSON (#297)."""
+        data = await self.llama.chat_completion(
+            [{"role": "user", "content": str(row["prompt"])}],
+            temperature=float(row["temperature"]),
+            max_tokens=max_tokens,
+            logprobs=True,
+            top_logprobs=int(row["top_logprobs"]),
+        )
+        choice = (data.get("choices") or [{}])[0]
+        return json.dumps(
+            {"choices": [{"message": choice.get("message"), "logprobs": choice.get("logprobs")}]},
+            separators=(",", ":"),
+        )
+
     def _run(self, job_id: str) -> None:
         """Execute a job this worker has already claimed.
 
@@ -739,7 +762,7 @@ class LocalLlmJobService:
         with self._lock:
             row = self._conn.execute(
                 "SELECT prompt,temperature,max_tokens,response_format,session_id,status,role,system,"
-                "worker_id FROM local_llm_jobs WHERE id = ?",
+                "worker_id,top_logprobs FROM local_llm_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
         if row is None or row["status"] != STATUS_RUNNING or row["worker_id"] != self.worker_id:
@@ -774,14 +797,17 @@ class LocalLlmJobService:
             # client that never needed one keeps its existing call signature.
             if row["system"]:
                 completion_options["system"] = str(row["system"])
-            result = asyncio.run(
-                self.llama.complete(
-                    prompt=str(row["prompt"]),
-                    temperature=float(row["temperature"]),
-                    max_tokens=max_tokens,
-                    **completion_options,
+            if row["top_logprobs"]:
+                result = asyncio.run(self._logprob_completion(row, max_tokens))
+            else:
+                result = asyncio.run(
+                    self.llama.complete(
+                        prompt=str(row["prompt"]),
+                        temperature=float(row["temperature"]),
+                        max_tokens=max_tokens,
+                        **completion_options,
+                    )
                 )
-            )
         except Exception as exc:  # noqa: BLE001
             lease.stop()
             duration = time.perf_counter() - started

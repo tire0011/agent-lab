@@ -1,10 +1,12 @@
-"""Experimental probes: should a step go from the local model to a stronger one? (#297)
+"""Probes: should a step go from the local model to a stronger one? (#297)
 
 The local 7B model does not notice when it is wrong: in the #288 runs it
 copied its own outdated summary from memory and was confident about it. These
-probes test three concrete ways to detect such a step. They only *decide* and
-*log*; nothing here calls an external model. They are used by live tests, not
-by any production path.
+probes test three concrete ways to detect such a step. They only *decide*;
+nothing here calls an external model.
+
+Only approach 3 worked in the live tests and is used in production by the
+knowledge collector; 1 and 2 stay for the live measurements.
 
 1. ``escalate`` action: the knowledge collector may answer ``escalate`` when
    fixed triggers hold (current source and memory disagree, ...).
@@ -25,8 +27,9 @@ import httpx
 
 from modules.llama_cpp_client import json_schema_response_format
 
-# Below this probability for the chosen answer token the model counts as unsure.
-LOGPROB_CONFIDENCE_THRESHOLD = 0.8
+# Below this probability for "yes" the model counts as unsure. Measured on 10
+# live cases (#297): accurate memory gave p_yes >= 0.968, outdated <= 0.905.
+LOGPROB_CONFIDENCE_THRESHOLD = 0.95
 
 
 @dataclass
@@ -121,6 +124,11 @@ def same_requirement_prompt(current: str, memory: str) -> str:
     )
 
 
+def same_requirement_logprob_prompt(current: str, memory: str) -> str:
+    """The yes/no question for approach 3: the answer must be the first token."""
+    return same_requirement_prompt(current, memory) + "\nAnswer with exactly one word: yes or no."
+
+
 def parse_same_requirement(raw: str) -> ProbeResult:
     try:
         answer = str(json.loads(raw).get("answer", "")).lower()
@@ -187,12 +195,12 @@ async def ask_with_logprobs(
 ) -> dict[str, Any]:
     """One short completion straight to llama-server with token log-probabilities.
 
-    The job queue does not carry logprobs yet, so this experiment talks to
-    llama-server directly. Run it while Nexus is idle.
+    Live-test helper: it bypasses the job queue, so run it while Nexus is
+    idle. Production goes through the queue's ``top_logprobs`` option.
     """
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt + "\nAnswer with exactly one word: yes or no."}],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
         "max_tokens": 2,
         "logprobs": True,

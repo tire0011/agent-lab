@@ -63,8 +63,8 @@ def test_logprobs_unsure_yes_escalates():
 
 
 def test_case_variants_are_added_up():
-    result = logprob_decision(_response("Yes", 0.5, {"Yes": 0.5, " yes": 0.4, "No": 0.05}))
-    assert not result.escalate and result.details["p_yes"] == 0.9
+    result = logprob_decision(_response("Yes", 0.6, {"Yes": 0.6, " yes": 0.37, "No": 0.02}))
+    assert not result.escalate and result.details["p_yes"] == 0.97
 
 
 def test_missing_logprobs_is_reported_not_escalated():

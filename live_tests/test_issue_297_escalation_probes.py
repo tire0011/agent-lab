@@ -29,6 +29,7 @@ from modules.escalation_probes import (
     logprob_decision,
     parse_escalate_collector,
     parse_same_requirement,
+    same_requirement_logprob_prompt,
     same_requirement_prompt,
 )
 
@@ -283,7 +284,7 @@ def probe_yes_no(orchestrator, scenario: dict):
 
 
 def probe_logprobs(llama_server: dict, scenario: dict):
-    prompt = same_requirement_prompt(_current_text(scenario), scenario["memory"])
+    prompt = same_requirement_logprob_prompt(_current_text(scenario), scenario["memory"])
     started = time.monotonic()
     response = asyncio.run(ask_with_logprobs(llama_server["url"], llama_server["model"], prompt))
     result = logprob_decision(response)
