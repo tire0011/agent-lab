@@ -88,6 +88,113 @@ ISSUE_289_MEMORY = (
     "the worktree HEAD; keep rejecting branches with their own commits. Tests cover both cases."
 )
 
+# More pairs for approach 3 (#297 follow-up): real closed issues, each with an
+# outdated memory (same item, earlier/other solution) and an accurate one.
+MORE_ISSUES = {
+    280: {
+        "title": "Finalization restart still exits -15: hand it to a transient systemd unit",
+        "body": (
+            "## Observed\n\nAfter #275 (`systemctl --no-block restart`), the #224 run still ended `needs_review`: "
+            "service restart failed: sudo -n systemctl --no-block restart nexus-mailbox agent-api exited -15.\n\n"
+            "systemd starts stopping `agent-api` before the `sudo`/`systemctl` client has returned. The client is a "
+            "child in `agent-api`'s control group, so it is killed with SIGTERM.\n\n"
+            "## Fix: reuse the approach from `modules/nexus_refresh.py`\n\n"
+            "Apply `systemd-run --collect --on-active=2 systemctl restart <service>` in "
+            "`TaskFinalizationCoordinator._restart_services`:\n"
+            "- Restart only `agent-api`; `nexus-mailbox` is a oneshot started by a timer.\n"
+            "- Command: `sudo -n systemd-run --collect --on-active=2 systemctl restart agent-api`. Exit 0 means the "
+            "restart is scheduled; any other exit code is still a failure.\n"
+            "- `RESTART_SERVICES` and `scripts/setup-nexus-permissions.sh` grant exactly that command.\n\n"
+            "## Acceptance criteria\n\n- Finalization reaches `restart_requested`, then live validation and "
+            "`succeeded`.\n- A failing restart command is still reported as a failure.\n"
+            "- Tests assert the command and that it matches the sudoers rule."
+        ),
+        "outdated": (
+            "GitHub issue #280: Finalization restart exits -15. Fix: treat exit code -15 of "
+            "`systemctl --no-block restart nexus-mailbox agent-api` as success, because SIGTERM only means the "
+            "service is already stopping. Keep restarting both services. Tests cover the -15 case."
+        ),
+        "accurate": (
+            "GitHub issue #280: Finalization restart still exits -15. Fix: hand the restart to a transient unit, "
+            "`sudo -n systemd-run --collect --on-active=2 systemctl restart agent-api`, restart only agent-api, "
+            "any non-zero exit is a failure, sudoers rule in setup-nexus-permissions.sh matches. Tests assert the command."
+        ),
+    },
+    286: {
+        "title": "Live validation after a restart runs before agent-api listens (connection refused)",
+        "body": (
+            "## Observed\n\nWith #280 the finalization restart works. The runs still ended `needs_review`: "
+            "live validation failed: health endpoint unavailable: Connection refused.\n\n## Cause\n\n"
+            "`api.py` calls `MailboxTaskService.recover_after_restart()` during startup, before uvicorn binds its "
+            "port. It resumes the finalization in phase `restart_requested` and asks `/health` of the process itself, "
+            "not yet listening.\n\n## Fix\n\nIn `TaskFinalizationCoordinator`: a health endpoint that is not "
+            "reachable yet (connection refused / URL error) is not a failure. Finalization stays in "
+            "`restart_requested` and returns `running`, so the next worker cycle tries again. The existing "
+            "`restart_timeout_seconds` (600 s) still bounds the wait. A reachable endpoint with a wrong answer is "
+            "still a failure.\n\n## Acceptance criteria\n\n- Connection refused keeps the finalization `running` "
+            "without counting a retry.\n- Once the endpoint answers `ok`, it ends `succeeded`.\n"
+            "- Unreachable beyond the restart timeout ends `needs_review`.\n- Tests cover all three cases."
+        ),
+        "outdated": (
+            "GitHub issue #286: Live validation fails with connection refused after a restart. Fix: move "
+            "`recover_after_restart()` out of startup into a background thread that sleeps 30 seconds before it "
+            "runs, so uvicorn is listening by then. Tests check the delay."
+        ),
+        "accurate": (
+            "GitHub issue #286: Live validation after a restart runs before agent-api listens. Fix: connection "
+            "refused during live validation is not a failure; finalization stays in restart_requested and retries "
+            "on the next worker cycle, bounded by restart_timeout_seconds. Wrong answers still fail. Tests cover all three cases."
+        ),
+    },
+    279: {
+        "title": "Tests create MagicMock/mock.db_path/* database files, and one landed on main",
+        "body": (
+            "## Problem\n\nPR #278 committed six SQLite files `MagicMock/mock.db_path/<id>` to main. "
+            "`MailboxTaskService._with_task_store` opens the task store at "
+            "`getattr(self.operations_registry, \"db_path\", DEFAULT_DB_PATH)`; tests pass a `MagicMock()` as "
+            "`operations_registry`, so a real database file is created under `MagicMock/`.\n\n## Fix\n\n"
+            "1. `_with_task_store` uses the service's own `self.db_path`.\n2. Add `MagicMock/` to `.gitignore`.\n"
+            "3. Delete the six files.\n\n## Acceptance criteria\n\n- The full test suite leaves no `MagicMock/` "
+            "directory.\n- A test asserts `_with_task_store` opens the store at the service's own `db_path`.\n"
+            "- `MagicMock/` is in `.gitignore` and the files are gone."
+        ),
+        "outdated": (
+            "GitHub issue #279: Stray MagicMock database files in the repository. Fix: add a pytest session "
+            "fixture in conftest.py that deletes the MagicMock/ directory after the test run, and make the coding "
+            "agent run `git clean` before committing. No change to the mailbox service."
+        ),
+        "accurate": (
+            "GitHub issue #279: Tests create MagicMock/mock.db_path/* files. Fix: _with_task_store uses the "
+            "service's own self.db_path instead of operations_registry.db_path, add MagicMock/ to .gitignore, "
+            "delete the six files. A test asserts the db_path."
+        ),
+    },
+    277: {
+        "title": "Alternate between Codex and Claude instead of drawing at random",
+        "body": (
+            "## Problem\n\n`modules/coding_provider.py` draws the coding agent for each experiment at random "
+            "(`choose_provider`). The last three experiments all ran on Codex.\n\n## Desired behavior\n\n"
+            "Alternate strictly between the available providers: the next experiment uses the provider that did "
+            "not run the previous one.\n- The last used provider is persisted, so the alternation survives "
+            "restarts.\n- `AGENT_CODING_PROVIDER` (pin) and `AGENT_CODING_PROVIDERS` (allow list) keep working; "
+            "with one available provider, that one is used.\n- One agent per experiment stays.\n"
+            "- Update the docstring and `OPERATIONS.md`.\n\n## Acceptance criteria\n\n- Two consecutive "
+            "experiments use different providers when both are available.\n- Alternation continues after a "
+            "restart.\n- Pin and allow list take precedence.\n- Tests cover alternation, restart, pin and a single provider."
+        ),
+        "outdated": (
+            "GitHub issue #277: Choose the coding provider better. Desired: pick the provider with the lowest "
+            "failure rate over the last ten experiments, falling back to a random draw on a tie. Store the "
+            "failure statistics in a new table."
+        ),
+        "accurate": (
+            "GitHub issue #277: Alternate between Codex and Claude instead of drawing at random. The next "
+            "experiment uses the provider that did not run the previous one; last provider persisted across "
+            "restarts; pin and allow list still win. Tests cover alternation, restart, pin, single provider."
+        ),
+    },
+}
+
 SCENARIOS = {
     "conflict": {
         "number": 288, "title": ISSUE_288_TITLE, "body": ISSUE_288_BODY,
@@ -98,6 +205,12 @@ SCENARIOS = {
         "memory": ISSUE_289_MEMORY, "expect_escalate": False,
     },
 }
+for _number, _issue in MORE_ISSUES.items():
+    for _kind, _expect in (("outdated", True), ("accurate", False)):
+        SCENARIOS[f"{_number}-{_kind}"] = {
+            "number": _number, "title": _issue["title"], "body": _issue["body"],
+            "memory": _issue[_kind], "expect_escalate": _expect,
+        }
 
 
 def _current_text(scenario: dict) -> str:
@@ -194,7 +307,7 @@ def test_yes_no(orchestrator, live_result, scenario_name):
     assert result.escalate == scenario["expect_escalate"], result.as_dict()
 
 
-@pytest.mark.parametrize("scenario_name", ["conflict", "control"])
+@pytest.mark.parametrize("scenario_name", list(SCENARIOS))
 def test_logprobs(llama_server, live_result, scenario_name):
     scenario = SCENARIOS[scenario_name]
     result = probe_logprobs(llama_server, scenario)
