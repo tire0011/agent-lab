@@ -62,6 +62,11 @@ def test_logprobs_unsure_yes_escalates():
     assert result.details["alternatives"] == {"yes": 0.55, "no": 0.4}
 
 
+def test_case_variants_are_added_up():
+    result = logprob_decision(_response("Yes", 0.5, {"Yes": 0.5, " yes": 0.4, "No": 0.05}))
+    assert not result.escalate and result.details["p_yes"] == 0.9
+
+
 def test_missing_logprobs_is_reported_not_escalated():
     result = logprob_decision({"choices": [{"message": {"content": "yes"}}]})
     assert not result.escalate and result.details == {"available": False}

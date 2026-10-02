@@ -141,8 +141,9 @@ def parse_same_requirement(raw: str) -> ProbeResult:
 def logprob_decision(response: dict[str, Any], *, threshold: float = LOGPROB_CONFIDENCE_THRESHOLD) -> ProbeResult:
     """Decide from a chat completion requested with ``logprobs``/``top_logprobs``.
 
-    The first generated token carries the answer. Its probability and the
-    best alternatives come from ``choices[0].logprobs.content[0]``.
+    The first generated token carries the answer. Its top alternatives come
+    from ``choices[0].logprobs.content[0]``; case and spacing variants of
+    yes/no are added up before deciding.
     """
     try:
         first = response["choices"][0]["logprobs"]["content"][0]
@@ -150,25 +151,31 @@ def logprob_decision(response: dict[str, Any], *, threshold: float = LOGPROB_CON
         return ProbeResult("logprobs", False, "no logprobs in the response", {"available": False})
     token = str(first.get("token", "")).strip().lower()
     probability = math.exp(float(first.get("logprob", -math.inf)))
-    alternatives = {
-        str(item.get("token", "")).strip().lower(): round(math.exp(float(item.get("logprob", -math.inf))), 4)
+    # "Yes", " yes" and "yes" are different tokens; add them up per answer.
+    raw_top = [
+        (str(item.get("token", "")), round(math.exp(float(item.get("logprob", -math.inf))), 4))
         for item in first.get("top_logprobs") or []
-    }
+    ]
+    alternatives: dict[str, float] = {}
+    for raw_token, p in raw_top:
+        key = raw_token.strip().lower()
+        alternatives[key] = round(alternatives.get(key, 0.0) + p, 4)
     details = {
         "available": True,
         "token": token,
         "probability": round(probability, 4),
+        "p_yes": alternatives.get("yes", 0.0),
+        "p_no": alternatives.get("no", 0.0),
         "alternatives": alternatives,
+        "top_tokens": [repr(t) for t, _ in raw_top],
         "threshold": threshold,
     }
-    if token.startswith("no"):
-        return ProbeResult("logprobs", True, "answered no", details)
-    if probability < threshold:
-        return ProbeResult("logprobs", True, f"unsure: p={probability:.2f} < {threshold}", details)
-    if not token.startswith("yes"):
-        return ProbeResult("logprobs", True, f"unexpected token {token!r}", details)
-    return ProbeResult("logprobs", False, f"answered yes with p={probability:.2f}", details)
-
+    p_yes, p_no = details["p_yes"], details["p_no"]
+    if p_no >= p_yes:
+        return ProbeResult("logprobs", True, f"leans no: p_yes={p_yes:.2f} p_no={p_no:.2f}", details)
+    if p_yes < threshold:
+        return ProbeResult("logprobs", True, f"unsure: p_yes={p_yes:.2f} < {threshold}", details)
+    return ProbeResult("logprobs", False, f"yes with p_yes={p_yes:.2f}", details)
 
 async def ask_with_logprobs(
     base_url: str,
