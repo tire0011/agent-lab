@@ -168,3 +168,28 @@ def test_the_job_queue_returns_logprobs_only_when_asked():
     assert json.loads(probed)["choices"][0]["logprobs"]["content"][0]["token"] == "Yes"
     assert len(client.chat_calls) == 1
     assert client.chat_calls[0]["logprobs"] is True and client.chat_calls[0]["top_logprobs"] == 5
+
+
+def test_a_large_escalated_prompt_keeps_the_current_issue_and_the_instruction():
+    # Review on #298: the external path cuts prompts from the end, which would
+    # drop the current issue and the output instruction. Memory shrinks instead.
+    from modules.prompt_budget import compute_budget
+    from modules.task_orchestrator import _EXTERNAL_PREAMBLE_CHARS, _EXTERNAL_PROMPT_CHARS
+
+    orchestrator = object.__new__(NexusTaskOrchestrator)
+    budget = compute_budget(model_context_tokens=32000)
+    observation = _issue_observation()
+    observation["result"]["output_lines"].append("body[2]: CURRENT-ISSUE-TAIL")
+    sources = [
+        {"tool": "memory_search", "query": "GitHub issue #288", "results": [{"content": OLD_MEMORY * 400}]},
+        observation,
+    ]
+    request = "Gather all relevant factual information about GitHub issue #288."
+    prompt = orchestrator._knowledge_collector_prompt(request, sources, budget, force_briefing=True)
+    assert len(prompt) > _EXTERNAL_PROMPT_CHARS
+
+    sized = orchestrator._external_collector_prompt(request, sources, budget, prompt)
+
+    assert len(sized) <= _EXTERNAL_PROMPT_CHARS - _EXTERNAL_PREAMBLE_CHARS
+    assert "CURRENT-ISSUE-TAIL" in sized
+    assert sized.endswith("Return exactly one JSON object matching the schema.")
