@@ -5,7 +5,8 @@ into one text and answered p_yes 0.961, just above the 0.95 threshold. The
 hits are earlier collector briefings, two of them already headed with the
 current title (#292). This file measures, on those real hits, the joined
 check as production ran it against a per-entry check (duplicates removed,
-plain task inputs skipped, lowest p_yes wins).
+plain task inputs skipped, lowest p_yes wins), on the raw texts and on the
+cleaned texts (issue title + body, briefing prose only).
 """
 
 from __future__ import annotations
@@ -27,7 +28,9 @@ from live_tests.test_issue_297_escalation_probes import (
 from modules.escalation_probes import (
     LOGPROB_CONFIDENCE_THRESHOLD,
     ask_with_logprobs,
+    issue_text,
     logprob_decision,
+    memory_entry_text,
     same_requirement_logprob_prompt,
 )
 
@@ -66,10 +69,13 @@ CASES = {
 }
 
 
-def _issue_text(case: dict) -> str:
+def _issue_lines(case: dict) -> list[str]:
     # The fetched issue as the production probe sees it: the operation's output lines.
-    issue = _collector_sources({**case, "memory": ""})[1]
-    return "\n".join(issue["result"]["output_lines"])
+    return _collector_sources({**case, "memory": ""})[1]["result"]["output_lines"]
+
+
+def _issue_text(case: dict) -> str:
+    return "\n".join(_issue_lines(case))
 
 
 def _distinct_entries(hits: list[dict]) -> list[str]:
@@ -104,7 +110,13 @@ def test_joined_vs_per_entry(llama_server, live_result, case_name):
     entries = _distinct_entries(case["hits"])
     per_entry = [_probe(llama_server, issue, entry) for entry in entries]
     lowest = min(item["p_yes"] for item in per_entry)
+    # Proposed production input: title + body, and only the briefing prose.
+    clean_issue = issue_text(_issue_lines(case))
+    per_entry_clean = [_probe(llama_server, clean_issue, memory_entry_text(entry)) for entry in entries]
+    lowest_clean = min(item["p_yes"] for item in per_entry_clean)
     live_result.update(
+        per_entry_clean=per_entry_clean,
+        lowest_clean_p_yes=lowest_clean,
         case=case_name,
         threshold=LOGPROB_CONFIDENCE_THRESHOLD,
         joined=joined,
@@ -112,4 +124,4 @@ def test_joined_vs_per_entry(llama_server, live_result, case_name):
         distinct_entries=len(entries),
         lowest_p_yes=lowest,
     )
-    assert (lowest < LOGPROB_CONFIDENCE_THRESHOLD) == case["expect"], live_result
+    assert (lowest_clean < LOGPROB_CONFIDENCE_THRESHOLD) == case["expect"], live_result

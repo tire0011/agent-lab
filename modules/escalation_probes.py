@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -122,6 +123,39 @@ def same_requirement_prompt(current: str, memory: str) -> str:
         "(same goal, same component, same acceptance criteria)? "
         "Answer yes or no."
     )
+
+
+def issue_text(output_lines: list[str]) -> str:
+    """``GitHub issue #N: <title>`` and the body, from github_issue output lines.
+
+    The raw lines carry a JSON metadata line and ``body[i]:`` chunk prefixes;
+    in the live #288 run that framing raised p_yes for outdated memory.
+    """
+    heading = ""
+    body: list[str] = []
+    for line in output_lines:
+        line = str(line)
+        if line.startswith("issue: "):
+            number = re.search(r'"number":\s*(\d+)', line)
+            title = re.search(r'"title":\s*"((?:[^"\\]|\\.)*)"', line)
+            if number and title:
+                title_text = json.loads('"' + title.group(1) + '"')
+                heading = f"GitHub issue #{number.group(1)}: {title_text}"
+        else:
+            chunk = re.match(r"body\[\d+\]: ?(.*)", line, re.DOTALL)
+            body.append(chunk.group(1) if chunk else line)
+    return (heading + "\n\n" + "".join(body)).strip()
+
+
+def memory_entry_text(content: str) -> str:
+    """The prose of one memory hit: a stored collector result keeps its briefing."""
+    try:
+        data = json.loads(content)
+    except (TypeError, ValueError):
+        return str(content).strip()
+    if isinstance(data, dict) and data.get("knowledge_briefing"):
+        return str(data["knowledge_briefing"]).strip()
+    return str(content).strip()
 
 
 def same_requirement_logprob_prompt(current: str, memory: str) -> str:
