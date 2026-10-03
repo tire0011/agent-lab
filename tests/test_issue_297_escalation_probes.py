@@ -7,6 +7,8 @@ import math
 
 from modules.escalation_probes import (
     ProbeResult,
+    issue_text,
+    memory_entry_text,
     combine,
     escalate_collector_prompt,
     logprob_decision,
@@ -77,3 +79,19 @@ def test_combined_escalates_when_any_probe_does():
     loud = ProbeResult("b", True, "x")
     assert combine([quiet, loud]).escalate and combine([quiet, loud]).reason == "escalate: b"
     assert not combine([quiet]).escalate
+
+
+def test_issue_text_drops_the_metadata_line_and_chunk_prefixes():
+    lines = [
+        'issue: {"number": 7, "title": "Say \\"hi\\" first", "url": "[REMOTE]',
+        "body[1]: first part ",
+        "body[2]: second part",
+    ]
+    assert issue_text(lines) == 'GitHub issue #7: Say "hi" first\n\nfirst part second part'
+
+
+def test_memory_entry_text_keeps_the_briefing_of_a_stored_collector_result():
+    stored = json.dumps({"tool": "knowledge_collector", "knowledge_briefing": "facts", "used_sources": ["x"]})
+    assert memory_entry_text(stored) == "facts"
+    assert memory_entry_text("plain note") == "plain note"
+    assert memory_entry_text('{"other": 1}') == '{"other": 1}'

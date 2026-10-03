@@ -29,7 +29,13 @@ from modules.local_llm_jobs import (
     acquire_local_llm_job_service,
     release_local_llm_job_service,
 )
-from modules.escalation_probes import ProbeResult, logprob_decision, same_requirement_logprob_prompt
+from modules.escalation_probes import (
+    ProbeResult,
+    issue_text,
+    logprob_decision,
+    memory_entry_text,
+    same_requirement_logprob_prompt,
+)
 from modules.mailbox.development import process_command
 from modules.nexus_delegation import NexusDelegationService
 from modules.nexus_memory import NexusMemory
@@ -112,6 +118,9 @@ _EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
 _EXTERNAL_PROMPT_CHARS = 16000
 # Room for the role preamble that _external_fallback_completion puts in front.
 _EXTERNAL_PREAMBLE_CHARS = 300
+# Distinct memory entries checked one by one against a fetched issue (#297).
+# Each check is one short local call (about 10-25 s on the VM).
+_MEMORY_CHECK_MAX_ENTRIES = 4
 
 
 _FINAL_ACTIONS = {
@@ -1984,39 +1993,49 @@ Return exactly one JSON object matching the schema."""
         """Ask the local model whether memory describes the fetched issue (#297).
 
         The answer's token probability is the signal: the model's plain
-        answer is "yes" even for outdated memory, but its p_yes drops. None
-        when there is nothing to compare or the probe itself failed; the
-        briefing then runs locally as before.
+        answer is "yes" even for outdated memory, but its p_yes drops. Each
+        distinct memory entry is asked about on its own, against the issue
+        title and body, and the lowest p_yes decides: joined entries and the
+        raw output lines hid an outdated entry in the live #288 run. None
+        when there is nothing to compare or a probe failed; the briefing
+        then runs locally as before.
         """
-        issue_text = ""
-        memory_texts: list[str] = []
+        issue = ""
+        entries: list[str] = []
         for source in sources:
             if source.get("tool") == "operation" and source.get("operation") == "github_issue":
                 result = source.get("result") or {}
                 if result.get("success"):
-                    issue_text = "\n".join(str(line) for line in result.get("output_lines") or [])
+                    issue = issue_text(result.get("output_lines") or [])
             elif source.get("tool") == "memory_search":
-                memory_texts = [
-                    str(item.get("content", ""))
-                    for item in source.get("results") or []
-                    if isinstance(item, dict) and item.get("content")
-                ]
-        if not issue_text or not memory_texts:
+                for item in source.get("results") or []:
+                    # A stored task input ("solve github issue #N") names the
+                    # item but describes nothing to compare.
+                    if not isinstance(item, dict) or item.get("kind") == "input":
+                        continue
+                    text = memory_entry_text(str(item.get("content", "")))
+                    if text and text not in entries:
+                        entries.append(text)
+        if not issue or not entries:
             return None
-        prompt = same_requirement_logprob_prompt(issue_text, "\n\n".join(memory_texts))
+        results: list[ProbeResult] = []
         try:
-            job_id = self.llm_jobs.submit(
-                prompt,
-                temperature=0.0,
-                max_tokens=2,
-                session_id=session_id,
-                role="knowledge_collector",
-                top_logprobs=5,
-            )
-            return logprob_decision(json.loads(await self.llm_jobs.wait(job_id)))
+            for entry in entries[:_MEMORY_CHECK_MAX_ENTRIES]:
+                job_id = self.llm_jobs.submit(
+                    same_requirement_logprob_prompt(issue, entry),
+                    temperature=0.0,
+                    max_tokens=2,
+                    session_id=session_id,
+                    role="knowledge_collector",
+                    top_logprobs=5,
+                )
+                results.append(logprob_decision(json.loads(await self.llm_jobs.wait(job_id))))
         except (LocalLlmJobError, ValueError, TypeError) as exc:
             logger.warning("knowledge_memory_check_failed session_id=%s error=%s", session_id, exc)
             return None
+        lowest = min(results, key=lambda result: float(result.details.get("p_yes", 0.0)))
+        lowest.details["entries_p_yes"] = [result.details.get("p_yes") for result in results]
+        return lowest
 
     async def _run_knowledge_collector(
         self,
@@ -2153,6 +2172,7 @@ Return exactly one JSON object matching the schema."""
                     "p_yes": memory_check.details.get("p_yes"),
                     "p_no": memory_check.details.get("p_no"),
                     "threshold": memory_check.details.get("threshold"),
+                    "entries_p_yes": memory_check.details.get("entries_p_yes"),
                     "escalated": memory_check.escalate,
                     "reason": memory_check.reason,
                 }
