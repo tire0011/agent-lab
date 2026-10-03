@@ -129,6 +129,15 @@ def test_each_distinct_entry_is_checked_and_the_lowest_p_yes_decides():
     local.assert_not_awaited()
 
 
+def test_every_distinct_entry_is_checked_even_beyond_four():
+    # Review on #299: an outdated entry ranked fifth must still be checked.
+    memory = [{"kind": "knowledge_collector", "content": f"note {i}"} for i in range(5)]
+    _result, metadata, jobs, _local, _external = _run(p_yes=[0.98, 0.97, 0.98, 0.97, 0.90], memory=memory)
+    assert jobs.submit.call_count == 5
+    assert "note 4" in jobs.submit.call_args_list[4].args[0]
+    assert metadata["memory_check"]["escalated"] is True
+
+
 def test_the_issue_is_compared_as_title_and_body():
     _result, _metadata, jobs, _local, _external = _run(p_yes=0.97)
     prompt = jobs.submit.call_args.args[0]

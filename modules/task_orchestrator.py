@@ -118,9 +118,6 @@ _EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
 _EXTERNAL_PROMPT_CHARS = 16000
 # Room for the role preamble that _external_fallback_completion puts in front.
 _EXTERNAL_PREAMBLE_CHARS = 300
-# Distinct memory entries checked one by one against a fetched issue (#297).
-# Each check is one short local call (about 10-25 s on the VM).
-_MEMORY_CHECK_MAX_ENTRIES = 4
 
 
 _FINAL_ACTIONS = {
@@ -2020,7 +2017,10 @@ Return exactly one JSON object matching the schema."""
             return None
         results: list[ProbeResult] = []
         try:
-            for entry in entries[:_MEMORY_CHECK_MAX_ENTRIES]:
+            # Every distinct entry the briefing will see is checked: one left
+            # out could carry the outdated text unnoticed (review on #299).
+            # memory.search returns at most 8 hits, each check is a short call.
+            for entry in entries:
                 job_id = self.llm_jobs.submit(
                     same_requirement_logprob_prompt(issue, entry),
                     temperature=0.0,
