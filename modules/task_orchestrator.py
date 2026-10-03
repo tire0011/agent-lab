@@ -2191,7 +2191,13 @@ Return exactly one JSON object matching the schema."""
                         role="knowledge_collector",
                         local_failure=f"memory differs from the current issue ({memory_check.reason})",
                     )
-                    self._parse_knowledge_collector(raw)
+                    # A valid answer must still be a briefing; anything else
+                    # (e.g. a lookup) falls back to the local briefing (#297).
+                    external_action = self._parse_knowledge_collector(raw)["action"]
+                    if external_action != "briefing":
+                        raise TaskOrchestratorError(
+                            f"{provider_used} returned action={external_action}, not a briefing"
+                        )
                 except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
                     escalation["escalation_failed"] = str(exc)[:500]
                     raw = ""

@@ -175,6 +175,18 @@ def test_escalation_without_an_external_provider_falls_back_to_local():
     local.assert_awaited_once()
 
 
+def test_an_external_answer_that_is_not_a_briefing_falls_back_to_local():
+    # Live #288 run after #299: codex_readonly answered, but not with a
+    # briefing, and the collector ended without one.
+    lookup = json.dumps({"action": "lookup", "source": "memory", "query": "issue 288", "briefing": ""})
+    external = AsyncMock(return_value=(lookup, "codex_readonly"))
+    result, metadata, _jobs, local, _external = _run(p_yes=0.5, external=external)
+    assert "local summary" in result["knowledge_briefing"]
+    assert metadata["provider_used"] == "local"
+    assert "action=lookup" in metadata["memory_check"]["escalation_failed"]
+    local.assert_awaited_once()
+
+
 def test_a_failed_probe_never_blocks_the_briefing():
     result, metadata, _jobs, local, external = _run(p_yes=None)
     assert "local summary" in result["knowledge_briefing"]
