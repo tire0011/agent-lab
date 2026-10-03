@@ -43,7 +43,7 @@ def _issue_observation() -> dict:
     }
 
 
-def _run(*, p_yes: float | None, memory: list | None = None, external=None, issue_ok: bool = True):
+def _run(*, p_yes: float | list | None, memory: list | None = None, external=None, issue_ok: bool = True):
     orchestrator = object.__new__(NexusTaskOrchestrator)
     orchestrator.task_store = MagicMock()
     orchestrator.task_store.append_event.return_value = 1
@@ -51,7 +51,10 @@ def _run(*, p_yes: float | None, memory: list | None = None, external=None, issu
     orchestrator.memory.search.return_value = [{"content": OLD_MEMORY}] if memory is None else memory
     orchestrator.llm_jobs = MagicMock()
     orchestrator.llm_jobs.submit.return_value = "probe-job"
-    orchestrator.llm_jobs.wait = AsyncMock(return_value=_logprobs(p_yes) if p_yes is not None else "")
+    if isinstance(p_yes, list):
+        orchestrator.llm_jobs.wait = AsyncMock(side_effect=[_logprobs(p) for p in p_yes])
+    else:
+        orchestrator.llm_jobs.wait = AsyncMock(return_value=_logprobs(p_yes) if p_yes is not None else "")
     local = AsyncMock(return_value=(_briefing("local summary"), "local"))
     external = external or AsyncMock(return_value=(_briefing("external summary"), "azure_openai"))
     observation = _issue_observation()
@@ -104,6 +107,50 @@ def test_matching_memory_stays_local():
     assert metadata["memory_check"]["escalated"] is False
     external.assert_not_awaited()
     local.assert_awaited_once()
+
+
+def test_each_distinct_entry_is_checked_and_the_lowest_p_yes_decides():
+    stored = json.dumps({"tool": "knowledge_collector", "knowledge_briefing": "old briefing"})
+    memory = [
+        {"kind": "knowledge_collector", "content": stored},
+        {"kind": "knowledge_collector", "content": stored},
+        {"kind": "knowledge_collector", "content": "another note"},
+        {"kind": "input", "content": "solve github issue #288"},
+    ]
+    result, metadata, jobs, local, _external = _run(p_yes=[0.97, 0.91], memory=memory)
+    prompts = [call.args[0] for call in jobs.submit.call_args_list]
+    assert len(prompts) == 2
+    assert "MEMORY (written earlier):\nold briefing" in prompts[0]
+    assert "another note" in prompts[1]
+    assert not any("solve github issue" in prompt for prompt in prompts)
+    assert metadata["memory_check"]["entries_p_yes"] == [0.97, 0.91]
+    assert metadata["memory_check"]["p_yes"] == 0.91 and metadata["memory_check"]["escalated"] is True
+    assert "external summary" in result["knowledge_briefing"]
+    local.assert_not_awaited()
+
+
+def test_every_distinct_entry_is_checked_even_beyond_four():
+    # Review on #299: an outdated entry ranked fifth must still be checked.
+    memory = [{"kind": "knowledge_collector", "content": f"note {i}"} for i in range(5)]
+    _result, metadata, jobs, _local, _external = _run(p_yes=[0.98, 0.97, 0.98, 0.97, 0.90], memory=memory)
+    assert jobs.submit.call_count == 5
+    assert "note 4" in jobs.submit.call_args_list[4].args[0]
+    assert metadata["memory_check"]["escalated"] is True
+
+
+def test_the_issue_is_compared_as_title_and_body():
+    _result, _metadata, jobs, _local, _external = _run(p_yes=0.97)
+    prompt = jobs.submit.call_args.args[0]
+    assert f"GitHub issue #288: {TITLE}\n\ncurrent text" in prompt
+    assert "issue: {" not in prompt and "body[1]" not in prompt
+
+
+def test_only_task_inputs_in_memory_means_no_probe():
+    _result, metadata, jobs, _local, _external = _run(
+        p_yes=0.1, memory=[{"kind": "input", "content": "solve github issue #288"}]
+    )
+    jobs.submit.assert_not_called()
+    assert "memory_check" not in metadata
 
 
 def test_no_memory_results_means_no_probe():
