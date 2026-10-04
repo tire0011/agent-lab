@@ -15,7 +15,9 @@
 # Results: $OUT_DIR/<timestamp>/<model>.log and summary.txt.
 #
 # Candidates: CANDIDATES (newline separated "name|hf_repo|file") overrides the
-# list below.
+# list below. Downloaded candidates are deleted after their run (the disk has
+# room for one or two, not all); KEEP_MODELS=1 keeps them. The model the
+# llama-server unit serves is never deleted.
 
 set -u
 
@@ -27,6 +29,8 @@ CTX=${LOCAL_MODEL_CONTEXT:-8192}
 SERVICE_USER=${LOCAL_MODEL_SERVICE_USER:-agent}
 OUT_DIR=${OUT_DIR:-/var/tmp/model-benchmark}
 TEST=live_tests/test_model_benchmark_controller.py
+KEEP_MODELS=${KEEP_MODELS:-0}
+UNIT_MODEL=$(systemctl cat llama-server 2>/dev/null | sed -n 's/.*--model \([^ ]*\).*/\1/p' | head -1)
 
 DEFAULT_CANDIDATES="baseline-qwen2.5-coder-7b|Qwen/Qwen2.5-Coder-7B-Instruct-GGUF|qwen2.5-coder-7b-instruct-q4_k_m.gguf
 gemma-3-4b|ggml-org/gemma-3-4b-it-GGUF|gemma-3-4b-it-Q4_K_M.gguf
@@ -116,6 +120,9 @@ for line in sys.stdin:
 ' | tee -a "$SUMMARY"
 
     kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+    if [ "$KEEP_MODELS" != 1 ] && [ "$MODEL_DIR/$file" != "$UNIT_MODEL" ]; then
+        rm -f "$MODEL_DIR/$file"
+    fi
 done <<< "$CANDIDATES"
 
 chmod 644 "$RUN_DIR"/*
