@@ -49,6 +49,7 @@ gemma-4-e4b|ggml-org/gemma-4-E4B-it-GGUF|gemma-4-E4B-it-Q4_0.gguf
 gemma-3-12b-iq3|bartowski/google_gemma-3-12b-it-GGUF|google_gemma-3-12b-it-IQ3_XXS.gguf
 gemma-4-12b-iq3|unsloth/gemma-4-12b-it-GGUF|gemma-4-12b-it-UD-IQ3_XXS.gguf
 qwen3-14b-iq2|unsloth/Qwen3-14B-GGUF|Qwen3-14B-UD-IQ2_M.gguf
+lfm-8b|LiquidAI/LFM2.5-8B-A1B-GGUF|LFM2.5-8B-A1B-Q4_K_M.gguf
 ternary-bonsai-8b|prism-ml/Ternary-Bonsai-8B-gguf|Ternary-Bonsai-8B-Q2_0.gguf
 bonsai-27b-q1|prism-ml/Bonsai-27B-gguf|Bonsai-27B-Q1_0.gguf
 ternary-bonsai-2-27b|prism-ml/Ternary-Bonsai-2-27B-gguf|Ternary-Bonsai-2-27B-PTQ1_0.gguf"
