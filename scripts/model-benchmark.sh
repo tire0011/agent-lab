@@ -42,8 +42,16 @@ qwen3-4b-2507|unsloth/Qwen3-4B-Instruct-2507-GGUF|Qwen3-4B-Instruct-2507-Q4_K_M.
 llama-3.1-8b|bartowski/Meta-Llama-3.1-8B-Instruct-GGUF|Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 phi-4-mini|bartowski/microsoft_Phi-4-mini-instruct-GGUF|microsoft_Phi-4-mini-instruct-Q4_K_M.gguf
 qwen3-8b|Qwen/Qwen3-8B-GGUF|Qwen3-8B-Q4_K_M.gguf
-granite-3.3-8b|ibm-granite/granite-3.3-8b-instruct-GGUF|granite-3.3-8b-instruct-Q4_K_M.gguf
-ministral-8b|bartowski/Ministral-8B-Instruct-2410-GGUF|Ministral-8B-Instruct-2410-Q4_K_M.gguf"
+ministral-8b|bartowski/Ministral-8B-Instruct-2410-GGUF|Ministral-8B-Instruct-2410-Q4_K_M.gguf
+granite-4.2-8b|ibm-granite/granite-4.2-8b-GGUF|granite-4.2-8b-Q4_K_M.gguf
+qwen3.5-9b|unsloth/Qwen3.5-9B-GGUF|Qwen3.5-9B-IQ4_XS.gguf
+gemma-4-e4b|ggml-org/gemma-4-E4B-it-GGUF|gemma-4-E4B-it-Q4_0.gguf
+gemma-3-12b-iq3|bartowski/google_gemma-3-12b-it-GGUF|google_gemma-3-12b-it-IQ3_XXS.gguf
+gemma-4-12b-iq3|unsloth/gemma-4-12b-it-GGUF|gemma-4-12b-it-UD-IQ3_XXS.gguf
+qwen3-14b-iq2|unsloth/Qwen3-14B-GGUF|Qwen3-14B-UD-IQ2_M.gguf
+ternary-bonsai-8b|prism-ml/Ternary-Bonsai-8B-gguf|Ternary-Bonsai-8B-Q2_0.gguf
+bonsai-27b-q1|prism-ml/Bonsai-27B-gguf|Bonsai-27B-Q1_0.gguf
+ternary-bonsai-2-27b|prism-ml/Ternary-Bonsai-2-27B-gguf|Ternary-Bonsai-2-27B-PTQ1_0.gguf"
 CANDIDATES=${CANDIDATES:-$DEFAULT_CANDIDATES}
 
 url_of() { echo "https://huggingface.co/$1/resolve/main/$2"; }
