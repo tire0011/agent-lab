@@ -89,12 +89,29 @@ mkdir -p "$RUN_DIR" "$CANDIDATE_DIR"
 chmod 755 "$OUT_DIR" "$RUN_DIR" "$CANDIDATE_DIR"
 SUMMARY="$RUN_DIR/summary.txt"
 SERVER_PID=""
+SERVER_MODEL=""
+
+port_free() { ! curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null; }
+
+wait_port_free() {
+    for _ in $(seq 1 30); do port_free && return 0; sleep 1; done
+    return 1
+}
+
+# Stop the candidate server. $! may be a wrapper (runuser), so the server
+# itself is matched by its command line too; a server left running would
+# answer the next candidate's test (seen on 2026-10-04).
+stop_server() {
+    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+    [ -n "$SERVER_MODEL" ] && pkill -f -- "llama-server --model $SERVER_MODEL " 2>/dev/null
+    [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null
+    SERVER_PID=""
+    SERVER_MODEL=""
+    wait_port_free
+}
 
 restore() {
-    if [ -n "$SERVER_PID" ]; then
-        kill "$SERVER_PID" 2>/dev/null
-        wait "$SERVER_PID" 2>/dev/null
-    fi
+    stop_server || echo "WARNING: port $PORT still busy after stopping the candidate" | tee -a "$SUMMARY"
     unit start
     echo "llama-server unit: $(systemctl is-active llama-server)" | tee -a "$SUMMARY"
 }
@@ -103,6 +120,11 @@ echo "llama-server: $(llama-server --version 2>&1 | head -1)" | tee "$SUMMARY"
 echo "branch: $BRANCH" | tee -a "$SUMMARY"
 if ! unit stop; then
     echo "ERROR: cannot stop llama-server (missing sudo rule? run setup-nexus-permissions.sh)" | tee -a "$SUMMARY" >&2
+    exit 2
+fi
+if ! wait_port_free; then
+    echo "ERROR: port $PORT is still served after stopping the unit; another llama-server is running" | tee -a "$SUMMARY" >&2
+    unit start
     exit 2
 fi
 trap restore EXIT
@@ -127,16 +149,32 @@ while IFS='|' read -r name repo file; do
         fi
     fi
 
-    as_service_user llama-server --model "$model" \
-        --host 127.0.0.1 --port "$PORT" --threads "$THREADS" --ctx-size "$CTX" --parallel 1 \
-        >>"$log" 2>&1 &
+    if ! port_free; then
+        echo "  port $PORT is busy before start; aborting the run" | tee -a "$SUMMARY"
+        exit 2
+    fi
+    if [ "$(id -u)" -eq 0 ]; then
+        runuser -u "$SERVICE_USER" -- llama-server --model "$model" \
+            --host 127.0.0.1 --port "$PORT" --threads "$THREADS" --ctx-size "$CTX" --parallel 1 \
+            >>"$log" 2>&1 &
+    else
+        llama-server --model "$model" \
+            --host 127.0.0.1 --port "$PORT" --threads "$THREADS" --ctx-size "$CTX" --parallel 1 \
+            >>"$log" 2>&1 &
+    fi
     SERVER_PID=$!
+    SERVER_MODEL=$model
     ready=""
     for _ in $(seq 1 90); do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
         if curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null; then ready=1; break; fi
         sleep 2
     done
+    # The answer must come from this candidate, not from any other server.
+    if [ -n "$ready" ] && ! curl -sf "http://127.0.0.1:$PORT/v1/models" | grep -qF "$file"; then
+        echo "  port $PORT answers with another model; aborting the run" | tee -a "$SUMMARY"
+        exit 2
+    fi
     if [ -z "$ready" ]; then
         echo "  model did not load (see $log)" | tee -a "$SUMMARY"
     else
@@ -152,7 +190,10 @@ for line in sys.stdin:
 ' | tee -a "$SUMMARY"
     fi
 
-    kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+    if ! stop_server; then
+        echo "  port $PORT still busy after stopping $name; aborting the run" | tee -a "$SUMMARY"
+        exit 2
+    fi
     if [ -n "$downloaded" ] && [ "$KEEP_MODELS" != 1 ]; then
         rm -f "$model"
     fi
