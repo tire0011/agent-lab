@@ -35,6 +35,9 @@ OUT_DIR=${OUT_DIR:-/var/tmp/model-benchmark}
 CANDIDATE_DIR=${CANDIDATE_DIR:-$OUT_DIR/models}
 TEST=live_tests/test_model_benchmark_controller.py
 KEEP_MODELS=${KEEP_MODELS:-0}
+# Stay below the caller's timeout (the mailbox kills the whole command, and
+# then the unit is never started again; seen on 2026-10-04 with a 14B model).
+TEST_TIMEOUT=${TEST_TIMEOUT:-2700}
 
 DEFAULT_CANDIDATES="baseline-qwen2.5-coder-7b|Qwen/Qwen2.5-Coder-7B-Instruct-GGUF|qwen2.5-coder-7b-instruct-q4_k_m.gguf
 gemma-3-4b|ggml-org/gemma-3-4b-it-GGUF|gemma-3-4b-it-Q4_K_M.gguf
@@ -105,10 +108,14 @@ wait_port_free() {
 stop_server() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     [ -n "$SERVER_MODEL" ] && pkill -f -- "llama-server --model $SERVER_MODEL " 2>/dev/null
+    if ! wait_port_free; then
+        [ -n "$SERVER_MODEL" ] && pkill -9 -f -- "llama-server --model $SERVER_MODEL " 2>/dev/null
+        wait_port_free || return 1
+    fi
     [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null
     SERVER_PID=""
     SERVER_MODEL=""
-    wait_port_free
+    return 0
 }
 
 restore() {
@@ -179,8 +186,10 @@ while IFS='|' read -r name repo file; do
     if [ -z "$ready" ]; then
         echo "  model did not load (see $log)" | tee -a "$SUMMARY"
     else
-        as_service_user env AGENT_DB_PATH="${AGENT_DB_PATH:-/var/lib/nexus/agent.db}" \
+        as_service_user timeout --kill-after=30 "$TEST_TIMEOUT" \
+            env AGENT_DB_PATH="${AGENT_DB_PATH:-/var/lib/nexus/agent.db}" \
             "$REPO/scripts/nexus-live-check.sh" "$BRANCH" "$TEST" >>"$log" 2>&1
+        [ $? -eq 124 ] && echo "  test run stopped after ${TEST_TIMEOUT}s" | tee -a "$SUMMARY"
         # One JSON line per scenario: scenario, action, verdict, seconds.
         sed -n '/live results (json)/,$p' "$log" | grep '^{' | python3 -c '
 import json, sys
