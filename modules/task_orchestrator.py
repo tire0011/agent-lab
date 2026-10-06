@@ -2357,6 +2357,7 @@ RULES:
 - Reason about the task and choose the next useful action.
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
 - Repository code changes of any size go through new_experiment. Use command or python_run for machine work and for reading.
+- When a briefing shows that the task asks for a code change, the next action is new_experiment.
 - find_tool only discovers a concrete read-only OperationsRegistry operation; then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - Ask clarification only when essential information is really missing.
