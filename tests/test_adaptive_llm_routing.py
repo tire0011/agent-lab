@@ -105,7 +105,6 @@ def test_prompt_keeps_local_model_as_real_development_path():
     assert "Own the task" in prompt
     assert "Repository code changes of any size go through new_experiment" in prompt
     assert "Use command or python_run for machine work and for reading" in prompt
-    assert "To solve a GitHub issue, use new_experiment once its briefing is there" in prompt
     assert "find_tool only discovers a concrete read-only OperationsRegistry operation" in prompt
     assert "Development path for every repository code change, small ones included" in prompt
     # Both execution capabilities carry the same boundary; the controller picks

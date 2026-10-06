@@ -31,6 +31,7 @@ def test_knowledge_collector_prompt_describes_research_not_planning():
     assert "knowledge collector" in lower
     assert "compact factual briefing" in lower
     assert "do not plan the solution" in lower
+    assert "keep what the current source asks to change" in lower
     assert "remove duplicates" in lower
     assert "lookup" in lower
     assert "briefing" in lower

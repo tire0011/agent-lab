@@ -1786,6 +1786,7 @@ Your job is research and synthesis only:
 - Do not modify anything, run development commands or tests, or claim the task is solved.
 - Your final product is one compact factual briefing for Nexus to reason with.
 - Preserve concrete facts such as root cause, affected component, constraints, prior attempts, and acceptance criteria when present.
+- Keep what the current source asks to change, in its own words.
 - Sources fetched now, such as a GitHub issue, are current. Memory is earlier history and may describe an older version; when they disagree, the current source wins.
 - Do not invent missing facts.
 
@@ -2357,7 +2358,6 @@ RULES:
 - Reason about the task and choose the next useful action.
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
 - Repository code changes of any size go through new_experiment. Use command or python_run for machine work and for reading.
-- To solve a GitHub issue, use new_experiment once its briefing is there.
 - find_tool only discovers a concrete read-only OperationsRegistry operation; then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - Ask clarification only when essential information is really missing.
