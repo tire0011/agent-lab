@@ -1786,6 +1786,7 @@ Your job is research and synthesis only:
 - Do not modify anything, run development commands or tests, or claim the task is solved.
 - Your final product is one compact factual briefing for Nexus to reason with.
 - Preserve concrete facts such as root cause, affected component, constraints, prior attempts, and acceptance criteria when present.
+- Keep what the current source asks to change, in its own words.
 - Sources fetched now, such as a GitHub issue, are current. Memory is earlier history and may describe an older version; when they disagree, the current source wins.
 - Do not invent missing facts.
 
