@@ -1378,8 +1378,9 @@ class NexusTaskOrchestrator:
         if role == "knowledge_collector":
             task_text = (
                 "Continue as the Nexus knowledge collector for this turn only. "
-                "Return exactly one JSON object matching the schema/instructions below; "
-                "no Markdown, no prose.\n\n" + prompt
+                "Lookups are not possible here; write the final briefing now as exactly one "
+                'JSON object: {"action":"briefing","source":"none","query":"","briefing":"..."}. '
+                "No Markdown, no prose.\n\n" + prompt
             )[:_EXTERNAL_PROMPT_CHARS]
         elif role == "tool_resolver":
             task_text = (
