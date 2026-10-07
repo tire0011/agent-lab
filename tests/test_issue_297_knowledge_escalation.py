@@ -252,3 +252,27 @@ def test_a_large_escalated_prompt_keeps_the_current_issue_and_the_instruction():
     assert len(sized) <= _EXTERNAL_PROMPT_CHARS - _EXTERNAL_PREAMBLE_CHARS
     assert "CURRENT-ISSUE-TAIL" in sized
     assert sized.endswith("Return exactly one JSON object matching the schema.")
+
+
+def test_an_escalated_collector_call_asks_the_external_provider_for_a_briefing_only():
+    # #306: codex_readonly answered action=lookup twice in the live #301 runs.
+    from modules.prompt_budget import compute_budget
+
+    orchestrator = object.__new__(NexusTaskOrchestrator)
+    answer = SimpleNamespace(to_dict=lambda: {"success": True, "content": _briefing("external")})
+    orchestrator.delegation = MagicMock()
+    orchestrator.delegation.catalog.return_value = [{"provider": "codex_readonly"}]
+    orchestrator.delegation.delegate = AsyncMock(return_value=answer)
+    asyncio.run(
+        orchestrator._external_fallback_completion(
+            "COLLECTOR PROMPT",
+            session_id="s1",
+            budget_plan=compute_budget(model_context_tokens=32000),
+            task_logger=None,
+            role="knowledge_collector",
+        )
+    )
+    task_text = orchestrator.delegation.delegate.await_args.args[1]
+    assert "Lookups are not possible here" in task_text
+    assert '{"action":"briefing","source":"none","query":"","briefing":"..."}' in task_text
+    assert task_text.endswith("COLLECTOR PROMPT")
