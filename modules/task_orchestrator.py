@@ -1399,11 +1399,34 @@ class NexusTaskOrchestrator:
             result = await self.delegation.delegate(provider, task_text, context="")
             payload = result.to_dict()
             attempts.append(provider)
+            error = "" if payload.get("success") else redact_secrets(
+                str((payload.get("metadata") or {}).get("error") or "provider returned unsuccessful result")
+            )[:1000]
+            answer = redact_secrets(str(payload.get("content", "")))[:4000]
+            # Every attempt and its answer or error is kept as a task event so
+            # an escalation can be diagnosed afterwards (#301). Internal: the
+            # controller's prompt history must not replay these.
+            self.task_store.append_event(
+                session_id,
+                role="system",
+                kind="external_fallback",
+                content=answer if payload.get("success") else error,
+                metadata={
+                    "role": role,
+                    "provider": provider,
+                    "success": bool(payload.get("success")),
+                    "attempt": len(attempts),
+                    **({"error": error} if error else {}),
+                    **({"reason": local_failure[:500]} if local_failure else {}),
+                    "knowledge_collector_internal": True,
+                },
+            )
             if task_logger is not None:
                 task_logger.info(
                     "orchestration",
                     f"{role}_external_fallback",
-                    f"provider={provider} success={payload.get('success')}",
+                    f"provider={provider} success={payload.get('success')}"
+                    + (f" error={error[:300]}" if error else ""),
                     session_id=session_id,
                     provider=provider,
                 )
@@ -1996,8 +2019,9 @@ Return exactly one JSON object matching the schema."""
         distinct memory entry is asked about on its own, against the issue
         title and body, and the lowest p_yes decides: joined entries and the
         raw output lines hid an outdated entry in the live #288 run. None
-        when there is nothing to compare or a probe failed; the briefing
-        then runs locally as before.
+        when there is nothing to compare. A failed probe never escalates: the
+        briefing then runs locally as before, and the result names the
+        error so the knowledge collection event shows it (#301).
         """
         issue = ""
         entries: list[str] = []
@@ -2034,9 +2058,29 @@ Return exactly one JSON object matching the schema."""
                 results.append(logprob_decision(json.loads(await self.llm_jobs.wait(job_id))))
         except (LocalLlmJobError, ValueError, TypeError) as exc:
             logger.warning("knowledge_memory_check_failed session_id=%s error=%s", session_id, exc)
-            return None
+            return ProbeResult(
+                "logprobs",
+                False,
+                f"memory check failed: {str(exc)[:300]}",
+                {
+                    "failed": True,
+                    "entries_p_yes": [result.details.get("p_yes") for result in results],
+                },
+            )
+        probes = [
+            {
+                "memory": entry[:200],
+                "escalate": result.escalate,
+                "reason": result.reason,
+                "token": result.details.get("token"),
+                "p_yes": result.details.get("p_yes"),
+                "p_no": result.details.get("p_no"),
+            }
+            for entry, result in zip(entries, results)
+        ]
         lowest = min(results, key=lambda result: float(result.details.get("p_yes", 0.0)))
         lowest.details["entries_p_yes"] = [result.details.get("p_yes") for result in results]
+        lowest.details["probes"] = probes
         return lowest
 
     async def _run_knowledge_collector(
@@ -2175,8 +2219,10 @@ Return exactly one JSON object matching the schema."""
                     "p_no": memory_check.details.get("p_no"),
                     "threshold": memory_check.details.get("threshold"),
                     "entries_p_yes": memory_check.details.get("entries_p_yes"),
+                    "probes": memory_check.details.get("probes") or [],
                     "escalated": memory_check.escalate,
                     "reason": memory_check.reason,
+                    **({"check_failed": True} if memory_check.details.get("failed") else {}),
                 }
             if memory_check is not None and memory_check.escalate:
                 # Memory and the current issue disagree: a stronger model
@@ -2203,6 +2249,8 @@ Return exactly one JSON object matching the schema."""
                 except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
                     escalation["escalation_failed"] = str(exc)[:500]
                     raw = ""
+                if provider_used:
+                    escalation["external_provider"] = provider_used
                 logger.info(
                     "knowledge_escalation session_id=%s %s provider=%s failed=%s",
                     session.id,

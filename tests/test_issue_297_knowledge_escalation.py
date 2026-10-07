@@ -190,7 +190,9 @@ def test_an_external_answer_that_is_not_a_briefing_falls_back_to_local():
 def test_a_failed_probe_never_blocks_the_briefing():
     result, metadata, _jobs, local, external = _run(p_yes=None)
     assert "local summary" in result["knowledge_briefing"]
-    assert "memory_check" not in metadata
+    # #301: the failure is visible, but it does not escalate.
+    assert metadata["memory_check"]["escalated"] is False
+    assert metadata["memory_check"]["check_failed"] is True
     external.assert_not_awaited()
 
 
@@ -259,6 +261,7 @@ def test_an_escalated_collector_call_asks_the_external_provider_for_a_briefing_o
     from modules.prompt_budget import compute_budget
 
     orchestrator = object.__new__(NexusTaskOrchestrator)
+    orchestrator.task_store = MagicMock()
     answer = SimpleNamespace(to_dict=lambda: {"success": True, "content": _briefing("external")})
     orchestrator.delegation = MagicMock()
     orchestrator.delegation.catalog.return_value = [{"provider": "codex_readonly"}]
