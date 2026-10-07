@@ -32,6 +32,12 @@ os.environ.setdefault("AGENT_LOG_DIR", _LOG_DIR)
 # happens to override it is not passing.
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
+# The services default to AGENT_DB_PATH or /var/lib/nexus/agent.db. The coding
+# agent runs this suite inside an experiment worktree on the VM, where a
+# lifespan test then marked the running experiment "interrupted by service
+# restart" (#309). Assigned, not setdefault: the production value is set there.
+os.environ["AGENT_DB_PATH"] = str(Path(_LOG_DIR) / "agent.db")
+
 # Test databases live in temporary directories and are deleted with them, so
 # there is nothing for an fsync to protect and the suite pays for it on every
 # commit. On the VM that is the dominant cost of a run: 500 commits take 5.01s
