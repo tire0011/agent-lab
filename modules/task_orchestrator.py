@@ -257,6 +257,45 @@ _TOOL_ACCURACY_INCORRECT = TOOL_ACCURACY_INCORRECT
 _TOOL_SEARCH_STOP_WORDS = TOOL_SEARCH_STOP_WORDS
 
 
+_SOLVE_ISSUE_RE = re.compile(r"^\s*solve github issue #\d+\s*$", re.IGNORECASE)
+
+
+def _issue_briefing_decision(task: str, observations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """An issue to solve goes to an experiment once its briefing is there (#311).
+
+    Issue -> experiment -> PR is the fixed workflow. The local controller got
+    this step right in one live #301 run and wrong in the next (find_tool,
+    delegate, clarification), so it no longer decides it.
+    """
+    if not _SOLVE_ISSUE_RE.match(task) or not observations:
+        return None
+    last = observations[-1]
+    if last.get("tool") != ACTION_KNOWLEDGE_COLLECTOR or not last.get("knowledge_briefing"):
+        return None
+    return {
+        "action": ACTION_NEW_EXPERIMENT,
+        "goal": task.strip(),
+        "reason": "issue briefing collected; solving an issue starts an experiment",
+    }
+
+
+def _guidance_core(text: str) -> str:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return " ".join(word for word in words if word not in {"please", "could", "you"})
+
+
+def _repeats_tool_guidance(question: str, observations: list[dict[str, Any]]) -> bool:
+    """Whether a clarification only passes on a tool's guidance to Nexus (#312)."""
+    asked = _guidance_core(question)
+    if not asked:
+        return False
+    for observation in observations:
+        guidance = _guidance_core(str(observation.get("guidance") or ""))
+        if guidance and guidance in asked:
+            return True
+    return False
+
+
 @dataclass(slots=True)
 class TaskDecision:
     action: str
@@ -858,19 +897,23 @@ class NexusTaskOrchestrator:
                 "llm_provider selected provider=local role=controller session_id=%s reason=persistent_controller",
                 session.id,
             )
+            issue_decision = _issue_briefing_decision(task, observations)
             try:
-                raw, provider_used = await self._controller_completion(
-                    prompt,
-                    session_id=session.id,
-                    max_tokens=550,
-                    budget_plan=budget_plan,
-                    task_logger=task_logger,
-                )
+                if issue_decision is not None:
+                    raw, provider_used = json.dumps(issue_decision), "issue_rule"
+                else:
+                    raw, provider_used = await self._controller_completion(
+                        prompt,
+                        session_id=session.id,
+                        max_tokens=550,
+                        budget_plan=budget_plan,
+                        task_logger=task_logger,
+                    )
             except ControllerBudgetExceededError as exc:
                 return self._budget_exceeded_result(
                     session.id, task, observations, str(exc), task_logger
                 )
-            if provider_used != "local":
+            if provider_used not in {"local", "issue_rule"}:
                 logger.warning(
                     "controller_external_fallback session_id=%s provider_used=%s prompt_chars=%s "
                     "safe_local_budget_chars=%s",
@@ -2812,6 +2855,23 @@ Decide the next step now. Return JSON only.
 
         if action not in {ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY}:
             return None
+
+        if action == ACTION_CLARIFICATION and _repeats_tool_guidance(
+            str(decision.get("message", "")), observations
+        ):
+            return {
+                "event": "terminal_decision_rejected",
+                "terminal_action": action,
+                "information_gap": str(decision.get("message", ""))[:1000],
+                "gap_kind": "tool_guidance",
+                "reason": (
+                    "The question repeats guidance a tool gave to Nexus; the user cannot "
+                    "answer it. Continue the original task."
+                ),
+                "candidate_operations": [],
+                "retryable": True,
+                "recommended_next_action": "continue_work",
+            }
 
         if (
             action == ACTION_MISSING_CAPABILITY
