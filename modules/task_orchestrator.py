@@ -1404,11 +1404,14 @@ class NexusTaskOrchestrator:
         task_logger: Any | None,
         role: str = "controller",
         local_failure: str = "",
+        attempt_log: list[dict[str, Any]] | None = None,
     ) -> tuple[str, str]:
         """Delegate externally after local inference has actually failed.
 
         Never falls back to ``local_worker``: that delegate also calls the
         same local llama-server and cannot recover from the local failure.
+        ``attempt_log`` receives one entry per provider tried, with its
+        answer or error, also when every provider fails (#301).
         """
         available = {item["provider"] for item in self.delegation.catalog()}
         candidates = [p for p in _EXTERNAL_FALLBACK_ORDER if p in available]
@@ -1438,17 +1441,37 @@ class NexusTaskOrchestrator:
                 "no Markdown, no prose.\n\n" + prompt
             )[:_EXTERNAL_PROMPT_CHARS]
         attempts: list[str] = []
+        tried: list[dict[str, Any]] = []
         for provider in candidates:
             result = await self.delegation.delegate(provider, task_text, context="")
             payload = result.to_dict()
             attempts.append(provider)
+            attempt = self._fallback_attempt(provider, payload)
+            tried.append(attempt)
+            if attempt_log is not None:
+                attempt_log.append(attempt)
+            # The answer or the provider error is what explains an escalation
+            # afterwards; success=False alone did not (#301).
+            outcome = (
+                f"answer={attempt.get('answer', '')[:500]!r}"
+                if attempt["success"]
+                else f"error={attempt.get('error', '-')} detail={attempt.get('error_detail', '')[:300]!r}"
+            )
+            logger.info(
+                "%s_external_fallback session_id=%s provider=%s success=%s %s",
+                role,
+                session_id,
+                provider,
+                attempt["success"],
+                outcome,
+            )
             if task_logger is not None:
                 task_logger.info(
                     "orchestration",
                     f"{role}_external_fallback",
-                    f"provider={provider} success={payload.get('success')}",
+                    f"provider={provider} success={payload.get('success')} {outcome}",
                     session_id=session_id,
-                    provider=provider,
+                    **{key: value for key, value in attempt.items() if key != "success"},
                 )
             if payload.get("success"):
                 logger.info(
@@ -1466,7 +1489,29 @@ class NexusTaskOrchestrator:
             "local inference failed"
             + (f": {local_failure}" if local_failure else "")
             + f"; all external providers failed: {attempts}"
+            + "".join(
+                f"; {item['provider']}: {item.get('error', '-')}"
+                for item in tried
+            )
         )
+
+    @staticmethod
+    def _fallback_attempt(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """One provider's answer or error, bounded and redacted for logs (#301)."""
+        metadata = payload.get("metadata") or {}
+        attempt: dict[str, Any] = {"provider": provider, "success": bool(payload.get("success"))}
+        if attempt["success"]:
+            attempt["answer"] = redact_secrets(str(payload.get("content", "")))[:2000]
+        else:
+            attempt["error"] = redact_secrets(
+                str(metadata.get("error") or payload.get("content") or "unsuccessful result")
+            )[:500]
+            if metadata.get("error_detail"):
+                attempt["error_detail"] = redact_secrets(str(metadata["error_detail"]))[:1000]
+        for key in ("http_status", "deployment", "job_id", "task_id", "status", "error_kind"):
+            if metadata.get(key) not in (None, ""):
+                attempt[key] = metadata[key]
+        return attempt
 
     async def _schema_completion(
         self,
@@ -2079,7 +2124,22 @@ Return exactly one JSON object matching the schema."""
             logger.warning("knowledge_memory_check_failed session_id=%s error=%s", session_id, exc)
             return None
         lowest = min(results, key=lambda result: float(result.details.get("p_yes", 0.0)))
+        # Each entry's answer token and alternatives, not only the lowest
+        # p_yes, so a check can be retraced from the event (#301).
+        probes = [
+            {
+                "entry": entry[:300],
+                "escalate": result.escalate,
+                "reason": result.reason,
+                **{
+                    key: result.details.get(key)
+                    for key in ("token", "probability", "p_yes", "p_no", "alternatives", "top_tokens")
+                },
+            }
+            for entry, result in zip(entries, results)
+        ]
         lowest.details["entries_p_yes"] = [result.details.get("p_yes") for result in results]
+        lowest.details["entries"] = probes
         return lowest
 
     async def _run_knowledge_collector(
@@ -2218,13 +2278,31 @@ Return exactly one JSON object matching the schema."""
                     "p_no": memory_check.details.get("p_no"),
                     "threshold": memory_check.details.get("threshold"),
                     "entries_p_yes": memory_check.details.get("entries_p_yes"),
+                    "entries": memory_check.details.get("entries"),
                     "escalated": memory_check.escalate,
                     "reason": memory_check.reason,
                 }
+                logger.info(
+                    "knowledge_memory_check session_id=%s escalate=%s %s entries=%s",
+                    session.id,
+                    memory_check.escalate,
+                    memory_check.reason,
+                    json.dumps(escalation["entries"], default=str)[:2000],
+                )
+                if task_logger is not None:
+                    task_logger.info(
+                        "orchestration",
+                        "knowledge_memory_check",
+                        f"escalate={memory_check.escalate} {memory_check.reason}",
+                        session_id=session.id,
+                        memory_check=escalation,
+                    )
             if memory_check is not None and memory_check.escalate:
                 # Memory and the current issue disagree: a stronger model
                 # writes the briefing, through the same external chain the
                 # controller uses when local inference fails (#297).
+                external_attempts: list[dict[str, Any]] = []
+                escalation["external_attempts"] = external_attempts
                 try:
                     raw, provider_used = await self._external_fallback_completion(
                         self._external_collector_prompt(
@@ -2235,6 +2313,7 @@ Return exactly one JSON object matching the schema."""
                         task_logger=task_logger,
                         role="knowledge_collector",
                         local_failure=f"memory differs from the current issue ({memory_check.reason})",
+                        attempt_log=external_attempts,
                     )
                     # A valid answer must still be a briefing; anything else
                     # (e.g. a lookup) falls back to the local briefing (#297).
@@ -2245,13 +2324,18 @@ Return exactly one JSON object matching the schema."""
                         )
                 except (TaskOrchestratorError, ControllerBudgetExceededError) as exc:
                     escalation["escalation_failed"] = str(exc)[:500]
+                    if raw:
+                        # The rejected external answer stays visible (#301).
+                        escalation["rejected_answer"] = redact_secrets(raw)[:2000]
+                        escalation["rejected_provider"] = provider_used
                     raw = ""
                 logger.info(
-                    "knowledge_escalation session_id=%s %s provider=%s failed=%s",
+                    "knowledge_escalation session_id=%s %s provider=%s failed=%s attempts=%s",
                     session.id,
                     memory_check.reason,
                     provider_used or "-",
-                    bool(escalation.get("escalation_failed")),
+                    escalation.get("escalation_failed", False),
+                    json.dumps(external_attempts, default=str)[:3000],
                 )
             if not raw:
                 raw, provider_used = await self._schema_completion(
