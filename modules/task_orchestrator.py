@@ -2488,7 +2488,7 @@ RULES:
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
 - Repository code changes of any size go through new_experiment. Use command or python_run for machine work and for reading.
 - Nexus services: agent-api, nexus-mailbox, llama-server.
-- find_tool only discovers a concrete read-only OperationsRegistry operation; then use call_tool.
+- find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart); then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - Ask clarification only when essential information is really missing.
 - An observation with `"status":"succeeded"` already carries that call's result. Never call that operation again with the same arguments; use the result and choose a different next step, or `answer` if the request is satisfied.

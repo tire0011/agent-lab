@@ -6,6 +6,8 @@ only knew read-only operations, and the run ended asking for a service name.
 
 from __future__ import annotations
 
+import asyncio
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +15,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from modules.nexus_tool_router import NexusToolRouter
-from modules.operations_registry import OperationsRegistry, OperationValidationError
+from modules.operations_registry import _RESTARTABLE_SERVICES, OperationsRegistry, OperationValidationError
+from modules.service_operations import _systemctl
+
+SUDOERS_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "setup-nexus-permissions.sh"
 
 
 def _router(tmp: str, *, controller: bool) -> NexusToolRouter:
@@ -66,6 +71,25 @@ class ServiceRestartTests(unittest.TestCase):
                 with self.assertRaises(OperationValidationError):
                     router.operations_registry.execute("service_restart", {"service": name})
             mocked.assert_not_awaited()
+
+
+class RestartPrivilegeTests(unittest.TestCase):
+    """Review on #316: the sudo rules must cover exactly the restarts it runs."""
+
+    def test_restart_runs_through_sudo(self):
+        process = AsyncMock()
+        process.communicate.return_value = (b"", b"")
+        process.returncode = 0
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=process)) as spawn:
+            asyncio.run(_systemctl(["restart", "llama-server"]))
+            asyncio.run(_systemctl(["is-active", "llama-server"]))
+        self.assertEqual(spawn.await_args_list[0].args, ("sudo", "-n", "systemctl", "restart", "llama-server"))
+        self.assertEqual(spawn.await_args_list[1].args, ("systemctl", "is-active", "llama-server"))
+
+    def test_sudoers_grants_exactly_the_allowed_restarts(self):
+        script = SUDOERS_SCRIPT.read_text(encoding="utf-8")
+        granted = set(re.findall(r"%s restart ([\w-]+)", script))
+        self.assertEqual(granted, set(_RESTARTABLE_SERVICES))
 
 
 if __name__ == "__main__":
