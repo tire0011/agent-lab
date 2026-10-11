@@ -446,6 +446,7 @@ class NexusTaskOrchestrator:
             schema_completion=self._router_schema_completion,
             grant_ledger=_TaskStoreGrantLedger(self.task_store),
             caller="local task orchestrator",
+            controller=True,
         )
         # session_id -> the worker id this process currently holds the claim
         # under. Every status write during a claimed turn is scoped to it, so a
@@ -1598,7 +1599,7 @@ class NexusTaskOrchestrator:
         return tool_search_tokens(text)
 
     def _read_only_operation_specs(self) -> list[Any]:
-        return self.tool_router.read_only_operation_specs()
+        return self.tool_router.operation_specs()
 
     def _candidate_operations(self, goal: str) -> list[Any]:
         return self.tool_router.candidate_operations(goal)
@@ -2486,7 +2487,8 @@ RULES:
 - Reason about the task and choose the next useful action.
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
 - Repository code changes of any size go through new_experiment. Use command or python_run for machine work and for reading.
-- find_tool only discovers a concrete read-only OperationsRegistry operation; then use call_tool.
+- Nexus services: agent-api, nexus-mailbox, llama-server.
+- find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart); then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - Ask clarification only when essential information is really missing.
 - An observation with `"status":"succeeded"` already carries that call's result. Never call that operation again with the same arguments; use the result and choose a different next step, or `answer` if the request is satisfied.

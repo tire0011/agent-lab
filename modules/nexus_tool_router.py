@@ -670,12 +670,14 @@ class NexusToolRouter:
         experiment_service: Any | None = None,
         grant_ledger: ToolGrantLedger | None = None,
         caller: str = "nexus tool router",
+        controller: bool = False,
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
         self._schema_completion = schema_completion
         self.grant_ledger: ToolGrantLedger = grant_ledger or InMemoryToolGrantLedger()
         self.caller = caller
+        self.controller = controller
 
     # ------------------------------------------------------------------
     # Catalog / candidate selection
@@ -694,10 +696,18 @@ class NexusToolRouter:
             if is_read_only(spec)
         ]
 
+    def operation_specs(self) -> list[Any]:
+        """What this caller may find and call: the read-only operations, plus
+        the few marked ``controller_allowed`` when the caller is the controller."""
+        return [
+            spec for spec in self.operations_registry.catalog()
+            if is_read_only(spec) or (self.controller and getattr(spec, "controller_allowed", False) is True)
+        ]
+
     def candidate_operations(self, goal: str) -> list[Any]:
         goal_tokens = tokens(goal)
         scored: list[tuple[int, str, Any]] = []
-        for spec in self.read_only_operation_specs():
+        for spec in self.operation_specs():
             spec_tags = " ".join(str(tag) for tag in getattr(spec, "tags", []) or [])
             haystack = f"{spec.name} {spec.description} {spec_tags}"
             haystack_tokens = tokens(haystack)
@@ -764,7 +774,7 @@ class NexusToolRouter:
         name with no spec behind it is dropped rather than described from
         guesswork.
         """
-        specs = {spec.name: spec for spec in self.read_only_operation_specs()}
+        specs = {spec.name: spec for spec in self.operation_specs()}
         descriptors: list[dict[str, Any]] = []
         for name in list(related_operations)[:MAX_RELATED_OPERATIONS]:
             spec = specs.get(str(name))
@@ -1132,7 +1142,7 @@ class NexusToolRouter:
         args = decision.get("args") or {}
         if not isinstance(args, dict):
             raise ToolRouterError("operation args must be an object")
-        available = {spec.name for spec in self.read_only_operation_specs()}
+        available = {spec.name for spec in self.operation_specs()}
         if operation not in available:
             raise ToolRouterError(f"operation {operation!r} is not available")
         grant = self.grant_ledger.latest_grant(

@@ -20,8 +20,10 @@ _GRACEFUL_STOP_TIMEOUT = 5  # seconds before SIGKILL
 
 
 async def _systemctl(args: list[str], timeout: int = 15) -> tuple[int, str]:
+    # The API runs as an unprivileged user; a restart needs root (#315).
+    prefix = ["sudo", "-n"] if args[:1] == ["restart"] else []
     proc = await asyncio.create_subprocess_exec(
-        "systemctl", *args,
+        *prefix, "systemctl", *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
