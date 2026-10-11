@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +27,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_REPO_ROOT = "/agent"
 _DEFAULT_MAILBOX_LOCK_PATH = "/var/lib/nexus/mailbox.lock"
 _DEFAULT_SERVICE_NAME = "agent-api"
+# The services the controller may restart (#315); never the API itself.
+_RESTARTABLE_SERVICES = ("nexus-mailbox", "llama-server")
 
 
 def _default_github_work_tracking_factory(*, db_path: str, repo_root: str) -> Any:
@@ -228,6 +232,14 @@ class OperationsRegistry:
                     "prompt", "result", "debug",
                 ],
                 mutates_state=False,
+            ),
+            "service_restart": OperationSpec(
+                "service_restart",
+                "Einen Nexus-Service neu starten: mailbox (nexus-mailbox) oder llm (llama-server).",
+                [OperationArgSpec("service", "string", "mailbox oder llm.", required=True)],
+                ["service", "restart", "systemd", "mailbox", "llm", "llama"],
+                mutates_state=True,
+                controller_allowed=True,
             ),
             "service_status": OperationSpec("service_status", "systemctl-Status eines systemd-Service (Standard: API-Service).", [service], ["service", "status", "systemd", "health"], mutates_state=False),
             "adoption_show": OperationSpec("adoption_show", "Sichere Kurzübersicht zu einer Adoption.", [adoption_id], ["adoption", "status", "summary", "inspect"], mutates_state=False),
@@ -504,6 +516,28 @@ class OperationsRegistry:
         result = self._run_command(["systemctl", "status", service, "--no-pager", "-n", "0"], timeout=15)
         result.operation = "service_status"
         return result
+
+    def _op_service_restart(self, args: dict[str, Any]) -> OperationResult:
+        from modules.service_operations import ServiceOperations
+
+        if args.get("service") is None:
+            raise OperationValidationError("service ist erforderlich (mailbox oder llm).")
+        service = self._resolve_service(args)
+        if service not in _RESTARTABLE_SERVICES:
+            raise OperationValidationError(f"service_restart erlaubt nur mailbox oder llm, nicht {service}.")
+        started = time.perf_counter()
+        # Reuses the API restart; run in its own thread so a running event loop
+        # of the caller does not matter.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            outcome = pool.submit(asyncio.run, ServiceOperations().restart(service)).result()
+        status = outcome["results"][service]
+        return OperationResult(
+            "service_restart",
+            status == "restarted",
+            [f"{service}: {status}"],
+            int((time.perf_counter() - started) * 1000),
+            error_summary=None if status == "restarted" else status,
+        )
 
     def _op_mailbox_status(self, args: dict[str, Any]) -> OperationResult:
         if args:

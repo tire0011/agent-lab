@@ -45,6 +45,9 @@ class OperationSpec:
     ``mutates_state`` has no default on purpose: a read-only role filters on
     it, so an operation that forgets to declare it must fail to construct
     rather than default to safe.
+
+    ``controller_allowed`` lets the task controller find and call one mutating
+    operation; every other read-only role still sees only ``mutates_state=False``.
     """
 
     name: str
@@ -52,6 +55,7 @@ class OperationSpec:
     arguments: list[OperationArgSpec] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     mutates_state: bool = field(kw_only=True)
+    controller_allowed: bool = field(default=False, kw_only=True)
 
     @property
     def read_only(self) -> bool:

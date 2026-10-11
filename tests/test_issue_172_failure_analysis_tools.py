@@ -536,8 +536,8 @@ class ReadOnlyBoundaryDurabilityTests(unittest.TestCase):
                 self.assertIsInstance(spec.mutates_state, bool)
                 self.assertEqual(spec.read_only, not spec.mutates_state)
         self.assertEqual(
-            [spec.name for spec in registry.catalog() if spec.mutates_state],
-            ["inbox_refresh"],
+            sorted(spec.name for spec in registry.catalog() if spec.mutates_state),
+            ["inbox_refresh", "service_restart"],
         )
 
 
