@@ -29,6 +29,8 @@ _DEFAULT_MAILBOX_LOCK_PATH = "/var/lib/nexus/mailbox.lock"
 _DEFAULT_SERVICE_NAME = "agent-api"
 # The services the controller may restart (#315); never the API itself.
 _RESTARTABLE_SERVICES = ("nexus-mailbox", "llama-server")
+_LOCAL_MODEL_RESTART_TIMEOUT_SECONDS = 120.0
+_LOCAL_MODEL_RESTART_POLL_SECONDS = 2.0
 
 
 def _default_github_work_tracking_factory(*, db_path: str, repo_root: str) -> Any:
@@ -235,7 +237,8 @@ class OperationsRegistry:
             ),
             "service_restart": OperationSpec(
                 "service_restart",
-                "Einen Nexus-Service neu starten: mailbox (nexus-mailbox) oder llm (llama-server).",
+                "Einen Nexus-Service neu starten: mailbox (nexus-mailbox) oder llm (llama-server); "
+                "bei llm bis zur erneuten Bereitschaft warten.",
                 [OperationArgSpec("service", "string", "mailbox oder llm.", required=True)],
                 ["service", "restart", "systemd", "mailbox", "llm", "llama"],
                 mutates_state=True,
@@ -531,10 +534,23 @@ class OperationsRegistry:
         with ThreadPoolExecutor(max_workers=1) as pool:
             outcome = pool.submit(asyncio.run, ServiceOperations().restart(service)).result()
         status = outcome["results"][service]
+        output_lines = [f"{service}: {status}"]
+        if status == "restarted" and service == "llama-server":
+            deadline = time.monotonic() + _LOCAL_MODEL_RESTART_TIMEOUT_SECONDS
+            while True:
+                readiness = self._op_local_model_status({})
+                if readiness.success:
+                    output_lines.append("local model: ready")
+                    break
+                if time.monotonic() >= deadline:
+                    status = "local model did not come back before the readiness timeout"
+                    output_lines.append(f"local model: {status}")
+                    break
+                time.sleep(_LOCAL_MODEL_RESTART_POLL_SECONDS)
         return OperationResult(
             "service_restart",
             status == "restarted",
-            [f"{service}: {status}"],
+            output_lines,
             int((time.perf_counter() - started) * 1000),
             error_summary=None if status == "restarted" else status,
         )

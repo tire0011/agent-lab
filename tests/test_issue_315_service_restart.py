@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from modules.nexus_tool_router import NexusToolRouter
 from modules.operations_registry import _RESTARTABLE_SERVICES, OperationsRegistry, OperationValidationError
@@ -58,7 +58,10 @@ class ServiceRestartTests(unittest.TestCase):
 
     def test_mailbox_and_llm_are_restarted_through_service_operations(self):
         router = _router(self.tmp, controller=True)
-        with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked:
+        ready = Mock(success=True)
+        with patch("modules.service_operations._systemctl", new=AsyncMock(return_value=(0, ""))) as mocked, patch.object(
+            router.operations_registry, "_op_local_model_status", return_value=ready
+        ):
             for name, unit in (("mailbox", "nexus-mailbox"), ("llm", "llama-server")):
                 result = router.operations_registry.execute("service_restart", {"service": name})
                 self.assertTrue(result.success, result)
