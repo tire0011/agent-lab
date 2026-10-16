@@ -15,6 +15,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from modules.nexus_delegation import NexusDelegationService
+from scripts.list_azure_openai_models import _load_agent_env
 
 
 def _credential_hint() -> str:
@@ -25,6 +26,8 @@ def _credential_hint() -> str:
 
 
 async def _main() -> int:
+    # Same configuration as the service: /etc/agent-lab/agent.env (root-only).
+    _load_agent_env()
     endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/") or "<not configured>"
     deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
