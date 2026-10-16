@@ -31,6 +31,12 @@ _DEFAULT_SERVICE_NAME = "agent-api"
 _RESTARTABLE_SERVICES = ("nexus-mailbox", "llama-server")
 _LOCAL_MODEL_RESTART_TIMEOUT_SECONDS = 120.0
 _LOCAL_MODEL_RESTART_POLL_SECONDS = 2.0
+# machine_reboot (#319): handed to a transient systemd unit so the reply can
+# still be written before the machine goes down. The sudoers rule from
+# scripts/setup-nexus-permissions.sh allows exactly this command.
+MACHINE_REBOOT_COMMAND = ("sudo", "-n", "systemd-run", "--collect", "--on-active=60", "systemctl", "reboot")
+# Experiment statuses that a reboot would interrupt.
+_ACTIVE_EXPERIMENT_STATUSES = ("queued", "selecting", "implementing", "verifying")
 
 
 def _default_github_work_tracking_factory(*, db_path: str, repo_root: str) -> Any:
@@ -241,6 +247,14 @@ class OperationsRegistry:
                 "bei llm bis zur erneuten Bereitschaft warten.",
                 [OperationArgSpec("service", "string", "mailbox oder llm.", required=True)],
                 ["service", "restart", "systemd", "mailbox", "llm", "llama"],
+                mutates_state=True,
+                controller_allowed=True,
+            ),
+            "machine_reboot": OperationSpec(
+                "machine_reboot",
+                "Die VM in 60 Sekunden neu starten, z. B. nach einem Ubuntu-Update. "
+                "Wird verweigert, solange ein Experiment aktiv ist.",
+                tags=["machine", "vm", "host", "reboot", "restart", "update", "ubuntu", "system"],
                 mutates_state=True,
                 controller_allowed=True,
             ),
@@ -554,6 +568,30 @@ class OperationsRegistry:
             int((time.perf_counter() - started) * 1000),
             error_summary=None if status == "restarted" else status,
         )
+
+    def _active_experiment_ids(self) -> list[str]:
+        placeholders = ", ".join("?" for _ in _ACTIVE_EXPERIMENT_STATUSES)
+        rows = self._conn.execute(
+            f"SELECT id FROM experiments WHERE status IN ({placeholders}) ORDER BY created_at",
+            _ACTIVE_EXPERIMENT_STATUSES,
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+    def _op_machine_reboot(self, args: dict[str, Any]) -> OperationResult:
+        if args:
+            raise OperationValidationError("machine_reboot akzeptiert keine Argumente.")
+        active = self._active_experiment_ids()
+        if active:
+            # A reboot would kill the experiment mid-run; it would never
+            # write a failed status (#188).
+            raise OperationValidationError(
+                "machine_reboot verweigert: Experiment aktiv (" + ", ".join(i[:8] for i in active[:5]) + ")."
+            )
+        result = self._run_command(list(MACHINE_REBOOT_COMMAND), timeout=15)
+        result.operation = "machine_reboot"
+        if result.success:
+            result.output_lines = ["reboot scheduled in 60 seconds", *result.output_lines]
+        return result
 
     def _op_mailbox_status(self, args: dict[str, Any]) -> OperationResult:
         if args:

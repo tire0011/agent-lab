@@ -5,7 +5,9 @@
 # `sudo -n systemd-run --collect --on-active=2 systemctl restart agent-api`),
 # and stop/start the llama-server unit for scripts/model-benchmark.sh (#302).
 # and restart nexus-mailbox and llama-server for the controller's service_restart
-# (#315; modules/service_operations.py runs `sudo -n systemctl restart <unit>`).
+# (#315; modules/service_operations.py runs `sudo -n systemctl restart <unit>`),
+# and schedule a VM reboot for the controller's machine_reboot (#319; runs
+# `sudo -n systemd-run --collect --on-active=60 systemctl reboot`).
 # Idempotent: nexus-refresh.ps1 runs it on every refresh, so a new machine
 # gets the rule with its first refresh.
 #
@@ -38,7 +40,8 @@ trap 'rm -f "$tmp"' EXIT
 printf '%s ALL=(root) NOPASSWD: %s --collect --on-active=2 systemctl restart agent-api\n' "$SERVICE_USER" "$SYSTEMD_RUN" > "$tmp"
 printf '%s ALL=(root) NOPASSWD: %s stop llama-server, %s start llama-server\n' "$SERVICE_USER" "$SYSTEMCTL" "$SYSTEMCTL" >> "$tmp"
 printf '%s ALL=(root) NOPASSWD: %s restart nexus-mailbox, %s restart llama-server\n' "$SERVICE_USER" "$SYSTEMCTL" "$SYSTEMCTL" >> "$tmp"
+printf '%s ALL=(root) NOPASSWD: %s --collect --on-active=60 systemctl reboot\n' "$SERVICE_USER" "$SYSTEMD_RUN" >> "$tmp"
 visudo -cq -f "$tmp"
 install --mode=0440 "$tmp" "$SUDOERS_FILE"
 
-echo "$LOG_PREFIX $SERVICE_USER may schedule an agent-api restart, stop/start llama-server and restart nexus-mailbox/llama-server ($SUDOERS_FILE)."
+echo "$LOG_PREFIX $SERVICE_USER may schedule an agent-api restart, stop/start llama-server restart nexus-mailbox/llama-server and schedule a reboot ($SUDOERS_FILE)."
