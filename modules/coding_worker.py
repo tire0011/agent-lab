@@ -24,9 +24,11 @@ A worker implementation is expected to:
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -171,6 +173,13 @@ MIN_AGENT_MAX_SECONDS = 30 * 60
 STOP_STALLED = "stalled"
 STOP_MAX_RUNTIME = "max_runtime"
 
+# Output kept while the agent runs (review on #328): the start (Codex names its
+# thread there) and the end (result and usage events), never all of it.
+CAPTURE_HEAD_BYTES = 64 * 1024
+CAPTURE_TAIL_BYTES = 1024 * 1024
+# Time the agent's process group gets to exit after SIGTERM before SIGKILL.
+TERMINATE_GRACE_SECONDS = 10.0
+
 
 def _env_seconds(env: Mapping[str, str], key: str, *, default: float, floor: float) -> float:
     try:
@@ -196,6 +205,53 @@ class WatchedRun:
     stop_reason: str | None  # None, STOP_STALLED or STOP_MAX_RUNTIME
 
 
+class _BoundedCapture:
+    """Keeps the first and the last lines of a stream, within a byte budget."""
+
+    def __init__(self, head_bytes: int = CAPTURE_HEAD_BYTES, tail_bytes: int = CAPTURE_TAIL_BYTES) -> None:
+        self._head: list[str] = []
+        self._head_left = head_bytes
+        self._tail: deque[str] = deque()
+        self._tail_size = 0
+        self._tail_bytes = tail_bytes
+        self.dropped = False
+
+    def add(self, line: str) -> None:
+        size = len(line.encode("utf-8", errors="replace"))
+        if size <= self._head_left and not self._tail:
+            self._head.append(line)
+            self._head_left -= size
+            return
+        self._tail.append(line)
+        self._tail_size += size
+        # The newest line always stays, even if it alone exceeds the budget.
+        while self._tail_size > self._tail_bytes and len(self._tail) > 1:
+            dropped = self._tail.popleft()
+            self._tail_size -= len(dropped.encode("utf-8", errors="replace"))
+            self.dropped = True
+
+    def text(self) -> str:
+        middle = "[... output truncated]\n" if self.dropped else ""
+        return "".join(self._head) + middle + "".join(self._tail)
+
+
+def _terminate_group(proc: subprocess.Popen, grace_seconds: float) -> None:
+    """Stop the agent and everything it started (its own process group):
+    SIGTERM, up to *grace_seconds* for the agent to exit, then SIGKILL."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def run_watched(
     cmd: list[str],
     *,
@@ -205,11 +261,14 @@ def run_watched(
     max_seconds: float,
     input_text: str | None = None,
     poll_seconds: float = 1.0,
+    grace_seconds: float = TERMINATE_GRACE_SECONDS,
 ) -> WatchedRun:
     """Run *cmd* and stop it only when it stalls or reaches the absolute cap.
 
-    Any line on stdout or stderr is progress. Raises ``OSError`` (including
-    ``FileNotFoundError``) when the process cannot be started.
+    Any line on stdout or stderr is progress. The agent runs in its own
+    process group, so stopping it also stops the commands it started; after
+    a normal exit, leftovers of that group are stopped too. Raises ``OSError``
+    (including ``FileNotFoundError``) when the process cannot be started.
     """
     proc = subprocess.Popen(
         cmd,
@@ -219,20 +278,21 @@ def run_watched(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
     last_output = [time.monotonic()]
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
+    stdout_capture = _BoundedCapture()
+    stderr_capture = _BoundedCapture()
 
-    def pump(stream: Any, sink: list[str]) -> None:
+    def pump(stream: Any, sink: _BoundedCapture) -> None:
         for line in iter(stream.readline, ""):
-            sink.append(line)
+            sink.add(line)
             last_output[0] = time.monotonic()
         stream.close()
 
     readers = [
-        threading.Thread(target=pump, args=(proc.stdout, stdout_lines), daemon=True),
-        threading.Thread(target=pump, args=(proc.stderr, stderr_lines), daemon=True),
+        threading.Thread(target=pump, args=(proc.stdout, stdout_capture), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, stderr_capture), daemon=True),
     ]
     for reader in readers:
         reader.start()
@@ -252,16 +312,16 @@ def run_watched(
         elif now - started > max_seconds:
             stop_reason = STOP_MAX_RUNTIME
         if stop_reason:
-            proc.kill()
             break
         time.sleep(poll_seconds)
+    _terminate_group(proc, grace_seconds if stop_reason else 0)
     exit_code = proc.wait()
     for reader in readers:
         reader.join(timeout=5)
     return WatchedRun(
         exit_code=None if stop_reason else exit_code,
-        stdout="".join(stdout_lines),
-        stderr="".join(stderr_lines),
+        stdout=stdout_capture.text(),
+        stderr=stderr_capture.text(),
         stop_reason=stop_reason,
     )
 

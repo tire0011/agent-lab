@@ -29,6 +29,14 @@ SILENT = "import time\ntime.sleep(30)\n"
 FOREVER = "import time\nwhile True:\n    print('.', flush=True)\n    time.sleep(0.2)\n"
 
 
+def _alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().split()[2] != "Z"
+    except FileNotFoundError:
+        return False
+
+
 def _run(script: str, *, stall: float, cap: float):
     return run_watched(
         [sys.executable, "-c", script], cwd=tempfile.gettempdir(), env={},
@@ -52,6 +60,45 @@ class RunWatchedTests(unittest.TestCase):
     def test_the_absolute_cap_still_holds(self):
         run = _run(FOREVER, stall=5.0, cap=1.5)
         self.assertEqual(run.stop_reason, STOP_MAX_RUNTIME)
+
+    def test_a_stopped_agent_takes_its_child_processes_with_it(self):
+        # Review on #328: a tool command the agent started must not keep
+        # changing the worktree after the experiment has timed out.
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "child.pid"
+            script = (
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+                "time.sleep(60)\n"
+            )
+            run = run_watched(
+                [sys.executable, "-c", script], cwd=tmp, env={},
+                stall_seconds=1.0, max_seconds=20, poll_seconds=0.1, grace_seconds=1.0,
+            )
+            self.assertEqual(run.stop_reason, STOP_STALLED)
+            child_pid = int(pid_file.read_text())
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and _alive(child_pid):
+                time.sleep(0.1)
+            self.assertFalse(_alive(child_pid), "the agent's child process is still running")
+
+    def test_captured_output_stays_bounded_and_keeps_start_and_end(self):
+        # Review on #328: memory must not grow with the run; the parsers need
+        # the first and the last events.
+        script = (
+            "print('FIRST', flush=True)\n"
+            "line = 'x' * 99\n"
+            "for _ in range(40000):\n"
+            "    print(line)\n"
+            "print('LAST', flush=True)\n"
+        )
+        run = _run(script, stall=5.0, cap=60)
+        self.assertIsNone(run.stop_reason)
+        self.assertLess(len(run.stdout), 2 * 1024 * 1024)
+        self.assertTrue(run.stdout.startswith("FIRST"))
+        self.assertTrue(run.stdout.rstrip().endswith("LAST"))
+        self.assertIn("[... output truncated]", run.stdout)
 
     def test_limits_come_from_the_environment_with_floors(self):
         self.assertEqual(agent_watchdog_limits({}), (600, 3 * 60 * 60))
