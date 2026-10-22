@@ -38,8 +38,10 @@ from modules.coding_worker import (
     WorkerConfigError,
     WorkerResult,
     filtered_env,
+    run_watched,
     truncate_output,
     validate_worker_config,
+    watchdog_error,
 )
 
 #: This worker's provider name as recorded on every :class:`WorkerResult`.
@@ -146,6 +148,7 @@ class CodexWorker:
         skip_git_repo_check: bool = False,
         experiment_logger: Any | None = None,
         phase: str = "codex",
+        stall_seconds: float | None = None,
     ) -> CodexResult:
         """Execute *task* non-interactively via ``codex exec``.
 
@@ -188,6 +191,10 @@ class CodexWorker:
         phase:
             Label used in log entries when *experiment_logger* is given
             (e.g. ``"research"``, ``"selection"``, ``"implementation"``).
+        stall_seconds:
+            When set, the run is progress-watched (#327): it is stopped only
+            after this long without any output, and *timeout_seconds* becomes
+            the absolute cap instead of the normal limit.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -235,7 +242,7 @@ class CodexWorker:
                     timeout_seconds=timeout_seconds,
                 )
 
-            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox)
+            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds)
         finally:
             if schema_path is not None:
                 try:
@@ -346,6 +353,7 @@ class CodexWorker:
         timeout_seconds: int,
         task: str,
         sandbox: str,
+        stall_seconds: float | None = None,
     ) -> CodexResult:
         timed_out = False
         proc_error: str | None = None
@@ -355,19 +363,30 @@ class CodexWorker:
         started = time.perf_counter()
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                cwd=working_dir,
-                # Intentionally inherit only a minimal env; never pass full
-                # os.environ to avoid leaking secrets.
-                env=self._safe_env(),
-            )
-            exit_code = proc.returncode
-            stdout_raw = proc.stdout
-            stderr_raw = proc.stderr
+            if stall_seconds is not None:
+                watched = run_watched(
+                    cmd, cwd=working_dir, env=self._safe_env(),
+                    stall_seconds=stall_seconds, max_seconds=timeout_seconds,
+                )
+                stdout_raw, stderr_raw = watched.stdout, watched.stderr
+                if watched.stop_reason:
+                    timed_out = True
+                    proc_error = watchdog_error("Codex", watched, stall_seconds, timeout_seconds)
+                exit_code = watched.exit_code
+            else:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    cwd=working_dir,
+                    # Intentionally inherit only a minimal env; never pass full
+                    # os.environ to avoid leaking secrets.
+                    env=self._safe_env(),
+                )
+                exit_code = proc.returncode
+                stdout_raw = proc.stdout
+                stderr_raw = proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             stdout_raw = (exc.stdout or b"").decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
