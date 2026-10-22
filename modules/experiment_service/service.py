@@ -19,6 +19,7 @@ from modules.coding_provider import (
     random_worker_factory,
 )
 from modules.codex_worker import CodexResult, CodexWorker
+from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
 from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
@@ -79,7 +80,9 @@ _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES = 64 * 1024
 _DEFAULT_RESEARCH_TIMEOUT_SECONDS = 120
 _DEFAULT_PLAN_TIMEOUT_SECONDS = 90
 _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
-_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 1200  # 20 minutes
+# Absolute cap only (#327): the coding agent is progress-watched and stopped
+# when it stalls; see modules.coding_worker.agent_watchdog_limits.
+_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
 
 # Error recorded on experiments whose thread died with the process (#281).
@@ -806,15 +809,14 @@ class ExperimentService:
             provider=implementation_provider or "",
         )
 
-        implementation_timeout = getattr(
-            self, "_implementation_timeout_seconds", _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
-        )
+        stall_seconds, max_seconds = agent_watchdog_limits()
 
         implementation_result: CodexResult = worker.run(
             task=implementation_prompt,
             working_dir=worktree_path,
             sandbox="workspace-write",
-            timeout_seconds=implementation_timeout,
+            timeout_seconds=max_seconds,
+            stall_seconds=stall_seconds,
             experiment_logger=elog,
             phase="implementation",
         )
@@ -831,7 +833,9 @@ class ExperimentService:
                 implementation_runtime_ms=implementation_result.runtime_ms,
                 implementation_usage_json=json.dumps(implementation_result.usage)
                 if implementation_result.usage else None,
-                error="implementation phase timed out" + checkpoint_error,
+                error="implementation phase timed out"
+                + (f" ({implementation_result.error})" if implementation_result.error else "")
+                + checkpoint_error,
             )
             return self.get_experiment(experiment_id)
 
@@ -949,10 +953,8 @@ class ExperimentService:
                 task=_build_repair_implementation_prompt(result.goal, feedback),
                 working_dir=worktree_path,
                 sandbox="workspace-write",
-                timeout_seconds=getattr(
-                    self, "_implementation_timeout_seconds",
-                    _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
-                ),
+                timeout_seconds=agent_watchdog_limits()[1],
+                stall_seconds=agent_watchdog_limits()[0],
                 experiment_logger=elog,
                 phase="implementation_repair",
             )

@@ -58,8 +58,10 @@ from modules.coding_worker import (
     WorkerConfigError,
     WorkerResult,
     filtered_env,
+    run_watched,
     truncate_output,
     validate_worker_config,
+    watchdog_error,
 )
 
 #: This worker's provider name as recorded on every :class:`WorkerResult`.
@@ -214,6 +216,7 @@ class ClaudeWorker:
         skip_git_repo_check: bool = False,
         experiment_logger: Any | None = None,
         phase: str = "claude",
+        stall_seconds: float | None = None,
     ) -> WorkerResult:
         """Execute *task* non-interactively via the ``claude`` CLI.
 
@@ -269,7 +272,8 @@ class ClaudeWorker:
                 error=str(exc),
             )
 
-        cmd = self._build_command(sandbox, output_schema)
+        # A progress-watched run (#327) streams events so every step shows up.
+        cmd = self._build_command(sandbox, output_schema, stream=stall_seconds is not None)
 
         if experiment_logger is not None:
             experiment_logger.debug(
@@ -279,7 +283,7 @@ class ClaudeWorker:
                 timeout_seconds=timeout_seconds,
             )
 
-        result = self._execute(cmd, task, working_dir, timeout_seconds, sandbox)
+        result = self._execute(cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds)
 
         if experiment_logger is not None:
             self._log_result(experiment_logger, phase, cmd, working_dir, result)
@@ -361,11 +365,13 @@ class ClaudeWorker:
         self,
         sandbox: str,
         output_schema: dict | None = None,
+        stream: bool = False,
     ) -> list[str]:
         cmd = [
             self.claude_bin,
             "--print",
-            "--output-format", "json",
+            # stream-json needs --verbose in --print mode.
+            *(["--output-format", "stream-json", "--verbose"] if stream else ["--output-format", "json"]),
             "--no-session-persistence",
             # Nothing may block on a human: whatever is not pre-approved below
             # is denied instead of turning into an interactive prompt.
@@ -404,6 +410,7 @@ class ClaudeWorker:
         working_dir: str,
         timeout_seconds: int,
         sandbox: str,
+        stall_seconds: float | None = None,
     ) -> WorkerResult:
         timed_out = False
         proc_error: str | None = None
@@ -413,20 +420,31 @@ class ClaudeWorker:
         started = time.perf_counter()
 
         try:
-            proc = subprocess.run(
-                cmd,
-                input=task,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                cwd=working_dir,
-                # Intentionally inherit only a minimal env; never pass full
-                # os.environ to avoid leaking secrets.
-                env=self._safe_env(),
-            )
-            exit_code = proc.returncode
-            stdout_raw = proc.stdout
-            stderr_raw = proc.stderr
+            if stall_seconds is not None:
+                watched = run_watched(
+                    cmd, cwd=working_dir, env=self._safe_env(), input_text=task,
+                    stall_seconds=stall_seconds, max_seconds=timeout_seconds,
+                )
+                stdout_raw, stderr_raw = watched.stdout, watched.stderr
+                if watched.stop_reason:
+                    timed_out = True
+                    proc_error = watchdog_error("Claude", watched, stall_seconds, timeout_seconds)
+                exit_code = watched.exit_code
+            else:
+                proc = subprocess.run(
+                    cmd,
+                    input=task,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    cwd=working_dir,
+                    # Intentionally inherit only a minimal env; never pass full
+                    # os.environ to avoid leaking secrets.
+                    env=self._safe_env(),
+                )
+                exit_code = proc.returncode
+                stdout_raw = proc.stdout
+                stderr_raw = proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             stdout_raw = _decoded(exc.stdout)
