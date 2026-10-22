@@ -62,7 +62,7 @@ class MachineRebootTests(unittest.TestCase):
         )
 
     def test_reboot_is_refused_while_an_experiment_is_active(self):
-        for status in ("queued", "selecting", "implementing", "verifying"):
+        for status in ("selecting", "implementing", "verifying"):
             with self.subTest(status=status):
                 experiment_id = f"{status:0<32}"[:32]
                 self._add_experiment(experiment_id, status)
@@ -71,6 +71,14 @@ class MachineRebootTests(unittest.TestCase):
                 self.assertIn(experiment_id[:8], str(ctx.exception))
                 self.registry._conn.execute("DELETE FROM experiments")
         self.runner.assert_not_called()
+
+    def test_queued_experiment_does_not_block_reboot(self):
+        self._add_experiment("q" * 32, "queued")
+
+        result = self.registry.execute("machine_reboot", {})
+
+        self.assertTrue(result.success, result)
+        self.runner.assert_called_once()
 
     def test_arguments_are_rejected(self):
         with self.assertRaises(OperationValidationError):

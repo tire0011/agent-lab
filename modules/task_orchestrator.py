@@ -1267,6 +1267,27 @@ class NexusTaskOrchestrator:
                         ),
                     }
                     observations.append(executed)
+                reboot = executed or observation
+                if self._successful_machine_reboot(reboot):
+                    # Scheduling the reboot is itself the requested state
+                    # change. Do not queue another controller inference: the
+                    # host may go down during it and recovery would otherwise
+                    # repeat the reboot forever (#326).
+                    reboot = dict(reboot)
+                    reboot["completion_evidence"] = self._record_evidence(
+                        session, kind="change", source="machine_reboot"
+                    )
+                    observations[-1] = reboot
+                    result = TaskDecision(
+                        action=ACTION_ANSWER,
+                        reason="machine reboot was scheduled successfully",
+                        message="The machine reboot has been scheduled.",
+                        observations=observations,
+                        session_id=session.id,
+                    )
+                    self._log_result_reuse(session.id, observations, redundant_requests)
+                    self._persist_final(session.id, task, result)
+                    return result
                 continue
 
             if action not in _FINAL_ACTIONS:
@@ -2752,6 +2773,17 @@ Decide the next step now. Return JSON only.
         if observation.get("error") or observation.get("event") == "command_not_found":
             return False
         return self._command_exit_code(observation.get("result")) == 0
+
+    @staticmethod
+    def _successful_machine_reboot(observation: dict[str, Any]) -> bool:
+        """Whether an operation observation confirms a scheduled reboot."""
+        result = observation.get("result")
+        return (
+            observation.get("tool") == "operation"
+            and observation.get("operation") == "machine_reboot"
+            and isinstance(result, dict)
+            and result.get("success") is True
+        )
 
     def _worktree_snapshot(self, cwd: Path | None = None) -> str | None:
         """Executor-side view of the code checkout, scoped to *cwd*.

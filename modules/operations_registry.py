@@ -35,8 +35,9 @@ _LOCAL_MODEL_RESTART_POLL_SECONDS = 2.0
 # still be written before the machine goes down. The sudoers rule from
 # scripts/setup-nexus-permissions.sh allows exactly this command.
 MACHINE_REBOOT_COMMAND = ("sudo", "-n", "systemd-run", "--collect", "--on-active=60", "systemctl", "reboot")
-# Experiment statuses that a reboot would interrupt.
-_ACTIVE_EXPERIMENT_STATUSES = ("queued", "selecting", "implementing", "verifying")
+# Experiment statuses that a reboot would interrupt. Queued work has not
+# started and remains durable across a reboot, so it must not prevent one.
+_ACTIVE_EXPERIMENT_STATUSES = ("selecting", "implementing", "verifying")
 
 
 def _default_github_work_tracking_factory(*, db_path: str, repo_root: str) -> Any:
