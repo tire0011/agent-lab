@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from modules.nexus_delegation import DelegationResult
 from modules.nexus_task_store import NexusTaskStore
@@ -515,6 +516,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertEqual(result.message, "done")
 
+    @patch.dict(os.environ, {"NEXUS_CONTROLLER_PROVIDER": "local"})  # local-first controller (#337)
     def test_low_memory_budget_is_advisory_when_local_succeeds(self):
         client = _Client([
             '{"type":"action","action":"answer","experiment_id":null,'
@@ -547,6 +549,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(client.prompts), 1)
         delegation.delegate.assert_not_called()
 
+    @patch.dict(os.environ, {"NEXUS_CONTROLLER_PROVIDER": "local"})  # local-first controller (#337)
     def test_local_inference_failure_uses_external_fallback(self):
         client = _FailingClient([])
         delegation = MagicMock()
