@@ -61,7 +61,9 @@ async def test_azure_failure_falls_back_to_local_before_codex():
 
 
 @pytest.mark.asyncio
-async def test_local_failure_escalates_to_azure_then_codex():
+async def test_local_failure_escalates_to_azure_then_codex(monkeypatch):
+    # The local-first chain; by default local_worker now goes to Azure first (#337).
+    monkeypatch.setenv("NEXUS_CONTROLLER_PROVIDER", "local")
     orchestrator = _orchestrator(
         {"local_worker": False, "azure_openai": False, "codex_readonly": True}
     )

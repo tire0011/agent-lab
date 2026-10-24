@@ -113,6 +113,24 @@ ACTION_KNOWLEDGE_COLLECTOR = "knowledge_collector"
 # failure. ``local_worker`` is deliberately excluded because it uses the same
 # local llama-server and cannot recover from that failure.
 _EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
+
+# Who drives the controller (#337). A small local model does not notice when a
+# turn is beyond it, so when Azure is configured it takes the controller's turns
+# and the local model only covers an Azure failure. "local" restores the old
+# behaviour.
+_CONTROLLER_PROVIDER_ENV = "NEXUS_CONTROLLER_PROVIDER"
+# Room for a routed reasoning model to think before it writes the JSON answer.
+_AZURE_CONTROLLER_MAX_TOKENS = 2000
+
+# Commands that write to GitHub (#337). They are reviewed through
+# new_experiment and a PR instead of running straight from the controller.
+_GITHUB_WRITE_COMMAND = re.compile(
+    r"\bgh\s+(?:issue|pr|label|release|repo)\s+"
+    r"(?:close|comment|create|delete|edit|lock|merge|reopen|review|transfer|unlock)\b"
+    r"|\bgh\s+api\b.*(?:\s(?:-X|--method)\s*(?:POST|PATCH|PUT|DELETE)\b"
+    r"|\s(?:-f|-F|--field|--raw-field|--input)\b)",
+    re.IGNORECASE,
+)
 # External fallback prompts are cut to this length, so callers that cannot
 # lose their tail size the prompt below it first (#297).
 _EXTERNAL_PROMPT_CHARS = 16000
@@ -895,7 +913,8 @@ class NexusTaskOrchestrator:
                 prompt_meta["superseded_observation_count"],
             )
             logger.info(
-                "llm_provider selected provider=local role=controller session_id=%s reason=persistent_controller",
+                "llm_provider selected provider=%s role=controller session_id=%s reason=persistent_controller",
+                "azure_openai" if self._azure_drives_controller() else "local",
                 session.id,
             )
             issue_decision = _issue_briefing_decision(task, observations)
@@ -914,7 +933,9 @@ class NexusTaskOrchestrator:
                 return self._budget_exceeded_result(
                     session.id, task, observations, str(exc), task_logger
                 )
-            if provider_used not in {"local", "issue_rule"}:
+            if provider_used not in {"local", "issue_rule"} and not (
+                provider_used == "azure_openai" and self._azure_drives_controller()
+            ):
                 logger.warning(
                     "controller_external_fallback session_id=%s provider_used=%s prompt_chars=%s "
                     "safe_local_budget_chars=%s",
@@ -1434,6 +1455,23 @@ class NexusTaskOrchestrator:
         llama-server. External providers are used only after a real local
         inference failure.
         """
+        if self._azure_drives_controller():
+            self._claimed_status(session_id, "waiting_for_llm")
+            try:
+                result = await self.delegation.azure_chat(
+                    prompt, max_tokens=_AZURE_CONTROLLER_MAX_TOKENS
+                )
+            finally:
+                self._claimed_status(session_id, "active")
+            payload = result.to_dict()
+            content = str(payload.get("content") or "")
+            if payload.get("success") and content.strip():
+                return content, "azure_openai"
+            logger.warning(
+                "controller_azure_failed session_id=%s error=%s; using the local model",
+                session_id,
+                str((payload.get("metadata") or {}).get("error") or "empty answer")[:300],
+            )
         return await self._schema_completion(
             prompt,
             session_id=session_id,
@@ -1444,6 +1482,19 @@ class NexusTaskOrchestrator:
             role="controller",
             task_logger=task_logger,
         )
+
+    def _azure_configured(self) -> bool:
+        return any(item.get("provider") == "azure_openai" for item in self.delegation.catalog())
+
+    @staticmethod
+    def _controller_forced_local() -> bool:
+        return os.environ.get(_CONTROLLER_PROVIDER_ENV, "").strip().lower() == "local"
+
+    def _azure_drives_controller(self) -> bool:
+        """Azure takes the controller's turns when configured (#337)."""
+        if self._controller_forced_local():
+            return False
+        return callable(getattr(self.delegation, "azure_chat", None)) and self._azure_configured()
 
     async def _external_fallback_completion(
         self,
@@ -3366,6 +3417,17 @@ Decide the next step now. Return JSON only.
             command = str(decision.get("command", "")).strip()
             if not command:
                 raise TaskOrchestratorError("command tool requires command")
+            if _GITHUB_WRITE_COMMAND.search(command):
+                return {
+                    "tool": ACTION_COMMAND,
+                    "command": command,
+                    "error": "github_write_refused",
+                    "reason": (
+                        "Commands that write to GitHub (close, comment, create, edit, merge, "
+                        "or gh api writes) are not run from the controller. Use new_experiment "
+                        "so the change is made in a reviewable PR."
+                    ),
+                }
             logger.info(
                 "llm_provider selected provider=local role=developer reason=%s command_chars=%s",
                 str(decision.get("reason", ""))[:500],
@@ -3592,7 +3654,12 @@ Decide the next step now. Return JSON only.
         if provider not in available:
             raise TaskOrchestratorError(f"delegation provider {provider!r} is not available")
 
-        order = [p for p in _PROVIDER_FALLBACKS.get(provider, (provider,)) if p in available]
+        # Judgement goes to a strong model (#337): the local worker is the same
+        # small model as the controller and answers confidently when it is wrong.
+        routed = provider
+        if provider == "local_worker" and "azure_openai" in available and not self._controller_forced_local():
+            routed = "azure_openai"
+        order = [p for p in _PROVIDER_FALLBACKS.get(routed, (routed,)) if p in available]
         attempts: list[dict[str, Any]] = []
         previous_error = ""
 

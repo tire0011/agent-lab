@@ -218,24 +218,35 @@ class NexusDelegationService:
             return DelegationResult(delegate, False, "", {"error": type(exc).__name__})
 
     async def _azure(self, task: str, context: str) -> DelegationResult:
-        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-        api_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
-        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-        if not endpoint or not api_key:
-            return DelegationResult("azure_openai", False, "", {"error": "not_configured"})
-        url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-05-01-preview"
         prompt = (
             "You are a specialist consulted by a local Nexus controller. Analyse the "
             "sub-problem and return concise findings and a recommended next action. "
             "You do not control execution and must not claim to have used unavailable tools.\n\n"
             f"SUB-PROBLEM:\n{task[:6000]}\n\nCONTEXT:\n{context[:6000]}"
         )
+        return await self._azure_chat(prompt, max_tokens=900, timeout=60.0)
+
+    async def azure_chat(self, prompt: str, *, max_tokens: int) -> DelegationResult:
+        """Send *prompt* to Azure as is: no wrapper and no truncation.
+
+        Used when Azure drives the controller itself (#337). Unlike a delegated
+        sub-problem, a controller prompt must arrive whole.
+        """
+        return await self._azure_chat(prompt, max_tokens=max_tokens, timeout=120.0)
+
+    async def _azure_chat(self, prompt: str, *, max_tokens: int, timeout: float) -> DelegationResult:
+        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+        api_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
+        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        if not endpoint or not api_key:
+            return DelegationResult("azure_openai", False, "", {"error": "not_configured"})
+        url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-05-01-preview"
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
                     url,
                     headers={"api-key": api_key, "Content-Type": "application/json"},
-                    json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 900},
+                    json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": max_tokens},
                 )
             if response.status_code != 200:
                 metadata: dict[str, Any] = {
