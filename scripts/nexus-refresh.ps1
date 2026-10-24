@@ -7,7 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Services = @('agent-api.service', 'nexus-mailbox.service')
+$Services = @('agent-api.service', 'nexus-mailbox.service', 'nexus-reboot-check.timer')
 
 Write-Host "=== Refreshing Nexus ===" -ForegroundColor Cyan
 
@@ -28,6 +28,12 @@ if ($LASTEXITCODE -ne 0) {
 sudo bash (Join-Path $PSScriptRoot 'setup-nexus-permissions.sh')
 if ($LASTEXITCODE -ne 0) {
     throw 'Nexus was updated, but the restart permission could not be installed.'
+}
+
+# Check every 2 hours whether the VM needs a reboot (#332).
+sudo bash (Join-Path $PSScriptRoot 'setup-reboot-check.sh')
+if ($LASTEXITCODE -ne 0) {
+    throw 'Nexus was updated, but the reboot check timer could not be installed.'
 }
 
 & (Join-Path $PSScriptRoot 'nexus-restart.ps1') @RestArgs

@@ -1,0 +1,17 @@
+[Unit]
+Description=Nexus reboot check (schedule a reboot when Ubuntu requires one and nothing is running)
+After=network.target agent-api.service
+
+[Service]
+Type=oneshot
+User=agent
+WorkingDirectory=/agent
+StateDirectory=nexus
+EnvironmentFile=/etc/agent-lab/agent.env
+Environment=AGENT_DB_PATH=/var/lib/nexus/agent.db
+ExecStart=/agent/.venv/bin/python /agent/nexus_reboot_check.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
