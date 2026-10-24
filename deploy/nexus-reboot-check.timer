@@ -1,0 +1,12 @@
+[Unit]
+Description=Check every 2 hours whether the VM needs a reboot
+
+[Timer]
+# Not on boot: a freshly booted machine has just cleared the marker. The
+# service is a no-op without /var/run/reboot-required or while work is running.
+OnBootSec=2h
+OnUnitActiveSec=2h
+Unit=nexus-reboot-check.service
+
+[Install]
+WantedBy=timers.target

@@ -364,6 +364,27 @@ sudo systemctl start nexus-mailbox.timer
 For a clean rollback, remove duplicate keys from `/etc/agent-lab/agent.env` and
 keep only the intended values.
 
+## Automatic reboot check (#332)
+
+`deploy/nexus-reboot-check.timer` runs `deploy/nexus-reboot-check.service`
+every 2 hours. The service runs `nexus_reboot_check.py`: when
+`/var/run/reboot-required` exists, it calls the `machine_reboot` operation
+(`MACHINE_REBOOT_COMMAND` in `modules/operations_registry.py`, reboot in 60
+seconds). That operation refuses while an experiment is `selecting`,
+`implementing` or `verifying`; the check then does nothing and tries again on
+the next run. No controller and no model call is involved. Every attempt is
+written to `operations_audit`.
+
+`scripts/nexus-refresh.ps1` installs and enables the timer on every refresh
+via `scripts/setup-reboot-check.sh`. To check it manually:
+
+```bash
+systemctl list-timers nexus-reboot-check.timer --no-pager
+journalctl -u nexus-reboot-check.service -n 20 --no-pager
+```
+
+To disable it: `sudo systemctl disable --now nexus-reboot-check.timer`.
+
 ## Incident triage (minimal)
 
 If agent/API behavior regresses:
