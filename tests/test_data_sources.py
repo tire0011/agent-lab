@@ -10,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
@@ -155,6 +156,16 @@ class AddIdeaIntegrationTests(unittest.TestCase):
         self.assertEqual(
             sum(1 for i in ideas if i.text in submitted), len(submitted)
         )
+
+
+class RepositoryIdeasTests(unittest.TestCase):
+    def test_repository_ideas_remain_parseable_and_complete(self):
+        ideas_path = Path(__file__).resolve().parents[1] / "IDEAS.md"
+        with patch.object(data_sources, "IDEAS_PATH", ideas_path):
+            ideas = data_sources.list_ideas()
+
+        self.assertEqual(len(ideas), 69)
+        self.assertTrue(all(idea.state in data_sources._KNOWN_STATES for idea in ideas))
 
 
 if __name__ == "__main__":
