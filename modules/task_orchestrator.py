@@ -997,7 +997,11 @@ class NexusTaskOrchestrator:
                 # refuses that as a duplicate - the same loop, one step later.
                 # The refusal below says what was resolved instead.
                 related_goal = ""
-            if terminal_not_found is not None and resume_experiment_id:
+            if (
+                terminal_not_found is not None
+                and resume_experiment_id
+                and self._may_resume_experiment(session.id, task, resume_experiment_id)
+            ):
                 # The lookup is terminal and the resolver already established -
                 # against the experiment service, not against a regex - which
                 # experiment this task is about. Go there directly instead of
@@ -1319,6 +1323,30 @@ class NexusTaskOrchestrator:
                     experiment_id = self.experiment_service.resolve_experiment(str(experiment_id)).id
                 except Exception as exc:
                     raise TaskOrchestratorError(f"unknown experiment {experiment_id!r}") from exc
+                if not self._may_resume_experiment(session.id, task, experiment_id):
+                    # An experiment named in a refusal is someone else's work.
+                    # Resuming it is what turned a refused machine_reboot into
+                    # an unrelated merged change (#330).
+                    rejection = self._foreign_resume_rejection(experiment_id)
+                    event_id = self.task_store.append_event(
+                        session.id,
+                        role="system",
+                        kind="terminal_decision_rejected",
+                        content=json.dumps(rejection, separators=(",", ":")),
+                        metadata={
+                            "controller_action": action,
+                            "experiment_id": experiment_id,
+                        },
+                    )
+                    logger.warning(
+                        "resume_experiment rejected session_id=%s experiment_id=%s "
+                        "reason=not_started_by_session",
+                        session.id,
+                        experiment_id,
+                    )
+                    rejection["event_id"] = event_id
+                    observations.append(rejection)
+                    continue
             else:
                 experiment_id = None
 
@@ -1809,7 +1837,7 @@ class NexusTaskOrchestrator:
                 ),
                 "arguments": {"goal": "the concrete change to make and why"},
             },
-            {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment."},
+            {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment. Only for an experiment this task started or the user explicitly asked to resume."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
             {"name": ACTION_MISSING_CAPABILITY, "description": "State that no available capability can complete the request and record a structured requirement."},
             {"name": ACTION_CLARIFICATION, "description": "Pause the persistent task and ask one concise question when a material ambiguity/information gap cannot be resolved with tools or memory."},
@@ -2511,6 +2539,7 @@ RULES:
 - Nexus services: agent-api, nexus-mailbox, llama-server.
 - find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart and machine_reboot); then use call_tool.
 - Implementation tasks are complete only after change + verification.
+- If a tool is refused because of another experiment, tell the user which experiment blocks it. Never resume that experiment: resume_experiment is only for an experiment this task started or the user asked to resume.
 - Ask clarification only when essential information is really missing.
 - An observation with `"status":"succeeded"` already carries that call's result. Never call that operation again with the same arguments; use the result and choose a different next step, or `answer` if the request is satisfied.
 - Return exactly one next action.
@@ -2915,6 +2944,63 @@ Decide the next step now. Return JSON only.
             for item in observations
         )
         return not has_failed_attempt
+
+    def _session_experiment_ids(self, session_id: str) -> set[str]:
+        """Experiments this session started (#330).
+
+        A session parks on the experiment its new_experiment created and,
+        once that ends, journals the result under the same id; between them
+        they cover the experiment's whole life.
+        """
+        started: set[str] = set()
+        session = self.task_store.get(session_id)
+        waiting = getattr(session, "waiting_experiment_id", None) if session else None
+        if waiting:
+            started.add(str(waiting))
+        for event in self.task_store.recent_events(
+            session_id, role="tool", kind=ACTION_NEW_EXPERIMENT, limit=100
+        ):
+            experiment_id = (event.get("metadata") or {}).get("experiment_id")
+            if experiment_id:
+                started.add(str(experiment_id))
+        return started
+
+    def _may_resume_experiment(self, session_id: str, task: str, experiment_id: str) -> bool:
+        """Whether resume_experiment may continue *experiment_id* here (#330).
+
+        Only the session's own experiments qualify, plus the one the user's
+        own request explicitly asks to resume. An id that merely turned up in
+        an observation - a refusal naming whatever blocks it, say - does not.
+        """
+        experiment_id = str(experiment_id)
+        if experiment_id in self._session_experiment_ids(session_id):
+            return True
+        text = task or ""
+        if not _RESUME_INTENT_PATTERN.search(text):
+            return False
+        return any(
+            experiment_id.lower().startswith(token.lower())
+            for token in _EXPERIMENT_ID_PATTERN.findall(text)
+        )
+
+    @staticmethod
+    def _foreign_resume_rejection(experiment_id: str) -> dict[str, Any]:
+        return {
+            "event": "terminal_decision_rejected",
+            "terminal_action": ACTION_RESUME_EXPERIMENT,
+            "experiment_id": experiment_id,
+            "information_gap": "whether the user wants this other experiment touched",
+            "gap_kind": "user_intent",
+            "reason": (
+                f"Experiment {experiment_id} was not started by this task and the "
+                "user did not ask to resume it. Do not resume it. If a tool was "
+                "refused because of this experiment, tell the user which experiment "
+                "blocks the request and let them decide."
+            ),
+            "candidate_operations": [],
+            "retryable": False,
+            "recommended_next_action": ACTION_CLARIFICATION,
+        }
 
     def _validate_evidence_sensitive_terminal(
         self,
