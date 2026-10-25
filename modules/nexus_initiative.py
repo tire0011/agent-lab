@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from modules.nexus_planner import PROPOSAL_LABEL
 from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
 _DEFAULT_DAILY_BUDGET = 5
+# Open proposals beyond this many are not added to (#354): they wait for review.
+_MAX_OPEN_PROPOSALS = 3
 
 
 def _utcnow() -> datetime:
@@ -112,6 +115,10 @@ class NexusInitiativeService:
         idea_lister: Callable[[], list[Any]] | None = None,
         daily_budget: int | None = None,
         stale_after_seconds: int | None = None,
+        planner: Any | None = None,
+        issue_commenter: Callable[[int, str], None] | None = None,
+        proposal_creator: Callable[[str, str], None] | None = None,
+        proposal_counter: Callable[[], int] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -119,6 +126,12 @@ class NexusInitiativeService:
         self.controller = controller
         self._issue_lister = issue_lister
         self._idea_lister = idea_lister
+        # Planning step (#354): which open issue is the most useful next one.
+        self._planner = planner
+        self._issue_commenter = issue_commenter
+        self._proposal_creator = proposal_creator
+        self._proposal_counter = proposal_counter
+        self._open_proposals = 0
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
             try:
@@ -299,8 +312,17 @@ class NexusInitiativeService:
             return []
         linked = self._linked_issue_numbers()
         candidates: list[Candidate] = []
+        self._open_proposals = 0
         for issue in issues:
             number = issue.get("number")
+            labels = {
+                str(label.get("name") if isinstance(label, dict) else label).lower()
+                for label in issue.get("labels") or []
+            }
+            if PROPOSAL_LABEL in labels:
+                # Waits for a human to review it and remove the label (#354).
+                self._open_proposals += 1
+                continue
             if number is None or int(number) in linked:
                 continue
             candidates.append(
@@ -435,9 +457,48 @@ class NexusInitiativeService:
         """
         found = list(self._integration_candidates()) if self.adoption_service is not None else []
         if self.controller is not None:
-            found.extend(self._issue_candidates())
+            issues = self._issue_candidates()
+            # Integration work is dispatched first; asking the planner then
+            # would be a paid call whose answer is thrown away.
+            if self._planner is not None and not found:
+                issues = self._planned_issue(issues)
+            found.extend(issues)
             found.extend(self._idea_candidates())
         return found
+
+    def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:
+        """The one issue the planner picks as next, or none (#354).
+
+        No plan means no issue work this tick: taking issues in list order
+        is what the planning step replaces.
+        """
+        if not issues:
+            return []
+        choice = self._planner.choose(
+            [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues]
+        )
+        if choice is None:
+            return []
+        chosen = next(c for c in issues if int(c.ref) == choice.issue)
+        chosen.reason = choice.reason
+        chosen.payload["planned"] = True
+        if choice.proposal_title and self._proposal_slot_free():
+            chosen.payload["proposal"] = {"title": choice.proposal_title, "body": choice.proposal_body}
+        return [chosen]
+
+    def _proposal_slot_free(self) -> bool:
+        """Fewer than three proposals are open; unknown counts as full.
+
+        The issue list is capped, so it can miss older proposals: the count
+        comes from its own exhaustive query when one is configured.
+        """
+        if self._proposal_counter is None:
+            return self._open_proposals < _MAX_OPEN_PROPOSALS
+        try:
+            return self._proposal_counter() < _MAX_OPEN_PROPOSALS
+        except Exception as exc:  # noqa: BLE001 - no proposal is the safe side
+            logger.warning("initiative: proposal count failed: %s", exc)
+            return False
 
     # ---- the tick --------------------------------------------------------
 
@@ -487,6 +548,7 @@ class NexusInitiativeService:
         if self.controller is None:
             raise RuntimeError("no controller configured")
         if candidate.kind == KIND_ISSUE:
+            self._announce_plan(candidate)
             self.controller.handle_issue(
                 int(candidate.ref),
                 title=candidate.title,
@@ -497,6 +559,28 @@ class NexusInitiativeService:
             self.controller.handle_idea(candidate.ref)
             return
         raise RuntimeError(f"unknown candidate kind {candidate.kind!r}")
+
+    def _announce_plan(self, candidate: Candidate) -> None:
+        """Say on GitHub why this issue is next, and open a suggested one (#354).
+
+        Best effort: a failed comment must not stop the work itself.
+        """
+        if not candidate.payload.get("planned"):
+            return
+        if self._issue_commenter is not None:
+            try:
+                self._issue_commenter(
+                    int(candidate.ref),
+                    f"Nexus picked this issue as the next one to work on: {candidate.reason}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("initiative: plan comment failed for #%s: %s", candidate.ref, exc)
+        proposal = candidate.payload.get("proposal")
+        if proposal and self._proposal_creator is not None:
+            try:
+                self._proposal_creator(proposal["title"], proposal["body"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("initiative: proposal issue failed: %s", exc)
 
     def _record(self, decision: InitiativeDecision, *, update: bool = False) -> InitiativeDecision:
         considered = json.dumps(
