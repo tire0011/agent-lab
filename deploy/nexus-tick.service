@@ -9,9 +9,10 @@ WorkingDirectory=/agent
 StateDirectory=nexus
 EnvironmentFile=/etc/agent-lab/agent.env
 Environment=AGENT_DB_PATH=/var/lib/nexus/agent.db
-# Start conservatively: drain verified-but-unintegrated work only. Drop the
-# flag once a full self-started cycle has been observed end to end.
-ExecStart=/agent/.venv/bin/python /agent/nexus_tick.py --integration-only
+# The service's one-at-a-time gate and five-start rolling daily budget bound
+# autonomous work. The full controller is required to plan and implement open
+# issues after the integration backlog has drained.
+ExecStart=/agent/.venv/bin/python /agent/nexus_tick.py --daily-budget 5
 StandardOutput=journal
 StandardError=journal
 

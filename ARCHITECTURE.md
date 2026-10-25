@@ -241,12 +241,13 @@
   crash mid-dispatch leaves a record of intent, not a silent gap.
 - Priority: `integration_backlog` (succeeded experiments whose adoption is
   `not_started`/`needs_review`/`interrupted`, dispatched to
-  `ExperimentAdoptionService.start_adoption`) → `open_issue` (open GitHub
-  issues labelled `nexus`, via `NexusControllerService.handle_issue`) →
-  `new_idea` (IDEAS.md entries in state `new`, via `handle_idea`).
-- Bounds: one item per tick; `NEXUS_INITIATIVE_DAILY_BUDGET` (default 8) per
-  24h; issues require the `nexus` label. `--integration-only` builds no LLM
-  controller at all and drains only already-verified work.
+  `ExperimentAdoptionService.start_adoption`) → `open_issue` (ordinary open
+  GitHub issues not already linked to work, via
+  `NexusControllerService.handle_issue`) → `new_idea` (IDEAS.md entries in
+  state `new`, via `handle_idea`).
+- Bounds: one item per tick; `NEXUS_INITIATIVE_DAILY_BUDGET` (default 5) per
+  rolling 24h. `--integration-only` remains available for manual recovery and
+  builds no LLM controller at all.
 - Staleness: a row in a running state counts as busy only while it is newer
   than `NEXUS_INITIATIVE_STALE_AFTER_SECONDS` (default 2h). Older rows are
   reported through `abandoned_work()` and otherwise ignored — see D-017.

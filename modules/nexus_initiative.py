@@ -55,7 +55,7 @@ KIND_INTEGRATION = "integration_backlog"
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
-_DEFAULT_DAILY_BUDGET = 8
+_DEFAULT_DAILY_BUDGET = 5
 
 
 def _utcnow() -> datetime:

@@ -27,24 +27,24 @@ from modules.run_store import DEFAULT_DB_PATH
 configure_logging()
 logger = logging.getLogger("nexus_tick")
 
-_ISSUE_LABEL = "nexus"
-_ISSUE_LIMIT = 20
+_ISSUE_LIMIT = 100
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
-    """Open GitHub issues Nexus is allowed to pick up on its own.
+    """Return the open GitHub issue backlog available to Nexus.
 
-    Deliberately label-gated: an issue only becomes self-startable work once a
-    human has marked it, so opening an issue is not the same as dispatching an
-    agent at it. Uses the ``gh`` CLI already installed and authenticated on the
-    VM rather than adding another GitHub client.
+    The initiative budget and one-at-a-time gate are the safety boundary.  A
+    label gate made the supposedly self-directed tick depend on a human first
+    labelling every issue, and in production that left it with no work to
+    plan. Pull a bounded view of the ordinary issue backlog instead. Pull
+    requests are excluded by ``gh issue list`` and linked issues are filtered
+    by :class:`NexusInitiativeService` before dispatch.
     """
     try:
         proc = subprocess.run(
             [
                 "gh", "issue", "list",
                 "--state", "open",
-                "--label", _ISSUE_LABEL,
                 "--limit", str(_ISSUE_LIMIT),
                 "--json", "number,title,body",
             ],
