@@ -43,13 +43,14 @@ class PlanningStepTests(unittest.TestCase):
         self.comments: list[tuple[int, str]] = []
         self.proposals: list[tuple[str, str]] = []
 
-    def _service(self, raw, issues=ISSUES):
+    def _service(self, raw, issues=ISSUES, **extra):
         planner = _Planner(raw)
         svc = self.fx.service(
             issue_lister=lambda: [dict(issue) for issue in issues],
             planner=planner,
             issue_commenter=lambda number, text: self.comments.append((number, text)),
             proposal_creator=lambda title, body: self.proposals.append((title, body)),
+            **extra,
         )
         self.addCleanup(svc.close)
         return svc, planner
@@ -92,6 +93,33 @@ class PlanningStepTests(unittest.TestCase):
         svc.tick()
         self.assertEqual(self.fx.controller.issues, [351])
         self.assertEqual(self.proposals, [])
+
+    def test_proposals_beyond_the_listed_issues_still_count(self):
+        # Review on #355: the issue list stops at 100, older proposals must count.
+        svc, _ = self._service(
+            _answer(351, proposal={"title": "Add X", "body": "Change Y"}), proposal_counter=lambda: 3
+        )
+        svc.tick()
+        self.assertEqual(self.fx.controller.issues, [351])
+        self.assertEqual(self.proposals, [])
+
+    def test_an_unknown_proposal_count_opens_no_proposal(self):
+        def fail():
+            raise RuntimeError("gh down")
+
+        svc, _ = self._service(_answer(351, proposal={"title": "Add X", "body": "Change Y"}), proposal_counter=fail)
+        svc.tick()
+        self.assertEqual(self.fx.controller.issues, [351])
+        self.assertEqual(self.proposals, [])
+
+    def test_the_planner_is_not_asked_while_integration_work_waits(self):
+        # Review on #355: the integration candidate goes first, so a planner
+        # call would be a paid request whose answer is thrown away.
+        self.fx.add_experiment("stuck", "succeeded", adoption="needs_review")
+        svc, planner = self._service(_answer(351))
+        svc.candidates()
+        self.assertEqual(planner.prompts, [])
+        self.assertEqual(self.fx.controller.issues, [])
 
     def test_a_failed_comment_does_not_stop_the_work(self):
         planner = _Planner(_answer(351))

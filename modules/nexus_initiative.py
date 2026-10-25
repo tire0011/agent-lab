@@ -118,6 +118,7 @@ class NexusInitiativeService:
         planner: Any | None = None,
         issue_commenter: Callable[[int, str], None] | None = None,
         proposal_creator: Callable[[str, str], None] | None = None,
+        proposal_counter: Callable[[], int] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -129,6 +130,7 @@ class NexusInitiativeService:
         self._planner = planner
         self._issue_commenter = issue_commenter
         self._proposal_creator = proposal_creator
+        self._proposal_counter = proposal_counter
         self._open_proposals = 0
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
@@ -456,7 +458,9 @@ class NexusInitiativeService:
         found = list(self._integration_candidates()) if self.adoption_service is not None else []
         if self.controller is not None:
             issues = self._issue_candidates()
-            if self._planner is not None:
+            # Integration work is dispatched first; asking the planner then
+            # would be a paid call whose answer is thrown away.
+            if self._planner is not None and not found:
                 issues = self._planned_issue(issues)
             found.extend(issues)
             found.extend(self._idea_candidates())
@@ -478,9 +482,23 @@ class NexusInitiativeService:
         chosen = next(c for c in issues if int(c.ref) == choice.issue)
         chosen.reason = choice.reason
         chosen.payload["planned"] = True
-        if choice.proposal_title and self._open_proposals < _MAX_OPEN_PROPOSALS:
+        if choice.proposal_title and self._proposal_slot_free():
             chosen.payload["proposal"] = {"title": choice.proposal_title, "body": choice.proposal_body}
         return [chosen]
+
+    def _proposal_slot_free(self) -> bool:
+        """Fewer than three proposals are open; unknown counts as full.
+
+        The issue list is capped, so it can miss older proposals: the count
+        comes from its own exhaustive query when one is configured.
+        """
+        if self._proposal_counter is None:
+            return self._open_proposals < _MAX_OPEN_PROPOSALS
+        try:
+            return self._proposal_counter() < _MAX_OPEN_PROPOSALS
+        except Exception as exc:  # noqa: BLE001 - no proposal is the safe side
+            logger.warning("initiative: proposal count failed: %s", exc)
+            return False
 
     # ---- the tick --------------------------------------------------------
 

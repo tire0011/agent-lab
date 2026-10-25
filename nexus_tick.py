@@ -91,6 +91,20 @@ def _open_proposal(repo_root: str, title: str, body: str) -> None:
     _gh(repo_root, ["issue", "create", "--title", title, "--body", body + footer, "--label", PROPOSAL_LABEL])
 
 
+def _count_open_proposals(repo_root: str) -> int:
+    """All open proposals; the issue list itself stops at ``_ISSUE_LIMIT``."""
+    from modules.nexus_planner import PROPOSAL_LABEL
+
+    proc = subprocess.run(
+        ["gh", "issue", "list", "--state", "open", "--label", PROPOSAL_LABEL,
+         "--limit", "1000", "--json", "number"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+    return len(json.loads(proc.stdout or "[]"))
+
+
 def _planner():
     """The planning step runs on Azure, like the controller (#337, #354)."""
     import asyncio
@@ -138,6 +152,7 @@ def _build_service(args) -> NexusInitiativeService:
         planner=_planner() if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
+        proposal_counter=lambda: _count_open_proposals(args.repo_root),
         daily_budget=args.daily_budget,
     )
 
