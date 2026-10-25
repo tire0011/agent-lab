@@ -275,6 +275,32 @@ class NexusInitiativeTests(unittest.TestCase):
         self.assertEqual(second.decision, "budget_exhausted")
         self.assertEqual(self.fx.adoption.started, ["stuck"])
 
+    def test_default_daily_budget_is_five(self):
+        svc = self.fx.service(
+            issue_lister=lambda: [
+                {"number": number, "title": f"Issue {number}", "body": ""}
+                for number in range(1, 7)
+            ]
+        )
+        self.addCleanup(svc.close)
+
+        # A completed dispatch no longer appears busy, so repeated timer ticks
+        # can consume the daily allowance. The sixth must remain untouched.
+        for _ in range(5):
+            decision = svc.tick()
+            self.assertTrue(decision.acted)
+            with sqlite3.connect(self.fx.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO github_experiment_links "
+                    "(experiment_id, issue_number) VALUES (?, ?)",
+                    (f"e{decision.candidate.ref}", int(decision.candidate.ref)),
+                )
+
+        decision = svc.tick()
+
+        self.assertEqual(decision.decision, "budget_exhausted")
+        self.assertEqual(self.fx.controller.issues, [1, 2, 3, 4, 5])
+
     def test_failed_dispatch_is_recorded_not_raised(self):
         self.fx.add_experiment("stuck", "succeeded", adoption="needs_review")
 

@@ -236,8 +236,8 @@ Decision log for architecture and operating choices.
 - Rule: `modules/nexus_initiative.py` picks exactly one item per tick,
   persists the decision *before* dispatching, and hands it to the pipeline
   that already exists. It adds no lifecycle stage of its own.
-- Priority order is deliberate: unintegrated verified work first, then
-  labelled open issues, then `new` ideas. Finishing started work is cheaper
+- Priority order is deliberate: unintegrated verified work first, then open
+  issues not already linked to work, then `new` ideas. Finishing started work is cheaper
   and more valuable than starting new work, and the live database held
   **seven** succeeded experiments that were never integrated - the dominant
   failure mode, not an edge case.
@@ -248,9 +248,10 @@ Decision log for architecture and operating choices.
   is treated as abandoned and reported rather than obeyed. Cleanup is left to
   the services that own that state.
 - Bounds: one item per tick, a no-op while anything is genuinely running, and
-  `NEXUS_INITIATIVE_DAILY_BUDGET` (default 8) self-started items per 24h.
-  Issues must carry the `nexus` label, so opening an issue is not the same as
-  dispatching an agent at it.
+  `NEXUS_INITIATIVE_DAILY_BUDGET` (default 5) self-started items per rolling
+  24h. Open issues do not require a human-applied label: the daily budget,
+  active-work gate, and persisted issue links bound autonomous dispatch while
+  allowing Nexus to plan its own backlog.
 - Only dispatchable work is listed. Under `--integration-only` no controller
   exists, so ideas and issues are omitted from the backlog entirely rather
   than reported as work that cannot be started.
