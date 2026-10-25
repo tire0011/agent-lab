@@ -46,7 +46,7 @@ def _list_open_issues(repo_root: str) -> list[dict]:
                 "gh", "issue", "list",
                 "--state", "open",
                 "--limit", str(_ISSUE_LIMIT),
-                "--json", "number,title,body",
+                "--json", "number,title,body,labels",
             ],
             cwd=repo_root,
             capture_output=True,
@@ -65,6 +65,50 @@ def _list_open_issues(repo_root: str) -> list[dict]:
     except json.JSONDecodeError:
         logger.warning("issue lookup returned unparsable JSON")
         return []
+
+
+def _gh(repo_root: str, argv: list[str]) -> None:
+    """Run one ``gh`` write for the planning step; raise on failure."""
+    proc = subprocess.run(
+        ["gh", *argv], cwd=repo_root, capture_output=True, text=True, timeout=60, check=False
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+
+
+def _comment_on_issue(repo_root: str, number: int, text: str) -> None:
+    _gh(repo_root, ["issue", "comment", str(number), "--body", text])
+
+
+def _open_proposal(repo_root: str, title: str, body: str) -> None:
+    from modules.nexus_planner import PROPOSAL_LABEL
+
+    _gh(repo_root, [
+        "label", "create", PROPOSAL_LABEL, "--force", "--color", "FBCA04",
+        "--description", "Suggested by Nexus; not worked on until a human removes this label",
+    ])
+    footer = "\n\n---\nSuggested by the Nexus planning step. Remove the `proposal` label to let Nexus work on it."
+    _gh(repo_root, ["issue", "create", "--title", title, "--body", body + footer, "--label", PROPOSAL_LABEL])
+
+
+def _planner():
+    """The planning step runs on Azure, like the controller (#337, #354)."""
+    import asyncio
+
+    from modules.nexus_delegation import NexusDelegationService
+    from modules.nexus_planner import IssuePlanner
+
+    def complete(prompt: str) -> str:
+        service = NexusDelegationService()
+        try:
+            result = asyncio.run(service.azure_chat(prompt, max_tokens=2000)).to_dict()
+        finally:
+            service.close()
+        if not result.get("success"):
+            raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
+        return str(result.get("content") or "")
+
+    return IssuePlanner(complete)
 
 
 def _build_service(args) -> NexusInitiativeService:
@@ -91,6 +135,9 @@ def _build_service(args) -> NexusInitiativeService:
         adoption_service=adoption_service,
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
+        planner=_planner() if controller else None,
+        issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
+        proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         daily_budget=args.daily_budget,
     )
 
