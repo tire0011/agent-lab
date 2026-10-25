@@ -101,7 +101,7 @@ class RunWatchedTests(unittest.TestCase):
         self.assertIn("[... output truncated]", run.stdout)
 
     def test_limits_come_from_the_environment_with_floors(self):
-        self.assertEqual(agent_watchdog_limits({}), (600, 3 * 60 * 60))
+        self.assertEqual(agent_watchdog_limits({}), (1800, 3 * 60 * 60))
         self.assertEqual(
             agent_watchdog_limits({"NEXUS_AGENT_STALL_SECONDS": "900", "NEXUS_AGENT_MAX_SECONDS": "7200"}),
             (900, 7200),
@@ -182,7 +182,7 @@ class ExperimentUsesTheWatchdogTests(unittest.TestCase):
         self.addCleanup(service.close)
         service.run_experiment(service.create_experiment(goal="Add a small helper.").id)
         implementation = [c for c in worker.calls if c.get("phase") == "implementation"]
-        self.assertEqual(implementation[0]["stall_seconds"], 600)
+        self.assertEqual(implementation[0]["stall_seconds"], 1800)
         self.assertEqual(implementation[0]["timeout_seconds"], 3 * 60 * 60)
 
 

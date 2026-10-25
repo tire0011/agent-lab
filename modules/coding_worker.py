@@ -164,7 +164,10 @@ def filtered_env(extra_keys: frozenset[str] | set[str] | tuple[str, ...] = ()) -
 # guard, when the absolute cap is reached.
 AGENT_STALL_ENV_VAR = "NEXUS_AGENT_STALL_SECONDS"
 AGENT_MAX_ENV_VAR = "NEXUS_AGENT_MAX_SECONDS"
-DEFAULT_AGENT_STALL_SECONDS = 600  # 10 minutes
+# 30 minutes: a coding agent says nothing while its own test run is going, and
+# the full suite on the VM can take longer than 10 minutes (#340 was stopped
+# after 26 minutes of good work, during a silent stretch of 10).
+DEFAULT_AGENT_STALL_SECONDS = 1800
 DEFAULT_AGENT_MAX_SECONDS = 3 * 60 * 60
 # Floors for values from the environment, like NEXUS_TEST_STALL_SECONDS (#209).
 MIN_AGENT_STALL_SECONDS = 120
