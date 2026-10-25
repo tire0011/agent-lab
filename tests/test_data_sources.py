@@ -159,13 +159,13 @@ class AddIdeaIntegrationTests(unittest.TestCase):
 
 
 class RepositoryIdeasTests(unittest.TestCase):
-    def test_repository_ideas_remain_parseable_and_complete(self):
+    def test_repository_has_no_ideas_left_after_moving_them_to_issues(self):
+        # #340: the ideas moved to docs/ideas-to-issues.md and GitHub issues.
         ideas_path = Path(__file__).resolve().parents[1] / "IDEAS.md"
         with patch.object(data_sources, "IDEAS_PATH", ideas_path):
             ideas = data_sources.list_ideas()
 
-        self.assertEqual(len(ideas), 69)
-        self.assertTrue(all(idea.state in data_sources._KNOWN_STATES for idea in ideas))
+        self.assertEqual(ideas, [])
 
 
 if __name__ == "__main__":
