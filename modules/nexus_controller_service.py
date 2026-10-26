@@ -21,6 +21,10 @@ from modules.task_orchestrator import (
     TaskDecision,
 )
 
+# Experiments run in threads of this process; a short-lived caller such as
+# the initiative tick must wait for them before it exits (#358).
+EXPERIMENT_THREAD_PREFIX = "nexus-controller-exp-"
+
 
 class NexusControllerService:
     """Feed heterogeneous work into one persistent local-LLM controller.
@@ -300,5 +304,5 @@ class NexusControllerService:
         threading.Thread(
             target=run,
             daemon=True,
-            name=f"nexus-controller-exp-{experiment_id[:8]}",
+            name=f"{EXPERIMENT_THREAD_PREFIX}{experiment_id[:8]}",
         ).start()

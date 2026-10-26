@@ -18,6 +18,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
@@ -185,6 +186,20 @@ def _reconcile_stale_claims(db_path: str) -> None:
                 pass
 
 
+def _wait_for_experiments() -> None:
+    """Keep the process alive until the experiments it started have ended (#358).
+
+    The controller runs an experiment in a daemon thread of this process; the
+    oneshot unit would otherwise exit and kill it while it is still queued.
+    """
+    from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
+
+    for thread in threading.enumerate():
+        if thread.name.startswith(EXPERIMENT_THREAD_PREFIX):
+            logger.info("waiting for %s to finish", thread.name)
+            thread.join()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
@@ -254,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("no work started (%s): %s", decision.decision, decision.detail)
         return 0 if decision.decision != "error" else 1
     finally:
+        _wait_for_experiments()
         service.close()
 
 
