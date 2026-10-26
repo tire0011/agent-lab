@@ -429,6 +429,42 @@ class ExperimentServiceTestCase(unittest.TestCase):
         )
         self.assertEqual(status.stdout.strip(), "")
 
+    def test_github_experiment_creates_worktree_from_issue_branch(self):
+        issue_branch = "nexus/322-continue-existing-work"
+        (self.repo_root / "continued.py").write_text("first experiment\n")
+        subprocess.run(["git", "-C", str(self.repo_root), "add", "continued.py"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo_root), "commit", "-q", "-m", "first experiment"],
+            check=True,
+        )
+        issue_sha = subprocess.run(
+            ["git", "-C", str(self.repo_root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(self.repo_root), "reset", "--hard", "HEAD^"], check=True)
+
+        github = MagicMock()
+        github.experiment_base_sha.return_value = issue_sha
+        github.checkpoint_experiment.return_value = SimpleNamespace(
+            branch_name=issue_branch,
+            checkpoint_sha="checkpoint-sha",
+        )
+        github.wait_for_ci.return_value = SimpleNamespace(
+            status="unavailable", commit_sha="checkpoint-sha", conclusion=None,
+            run_id=None, url=None, reason="no matching workflow run",
+        )
+        experiment = self.service.create_experiment(goal="Continue the existing change.")
+
+        result = self.service.run_experiment(
+            experiment.id, github_work_tracking=github
+        )
+
+        self.assertTrue((Path(result.worktree_path) / "continued.py").is_file())
+        github.experiment_base_sha.assert_called_once_with(experiment.id)
+        github.checkpoint_experiment.assert_called_once_with(
+            experiment.id, result.worktree_path
+        )
+
     def test_implementation_uses_workspace_write_only_in_worktree(self):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
@@ -2287,6 +2323,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
     def test_successful_github_ci_skips_local_test_suite(self):
         github = MagicMock()
+        github.experiment_base_sha.return_value = "HEAD"
         github.checkpoint_experiment.return_value = SimpleNamespace(
             branch_name="nexus/103-ci",
             checkpoint_sha="exact-checkpoint-sha",
@@ -2321,6 +2358,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
     def test_failed_github_ci_skips_local_test_suite_and_fails(self):
         github = MagicMock()
+        github.experiment_base_sha.return_value = "HEAD"
         github.checkpoint_experiment.return_value = SimpleNamespace(
             branch_name="nexus/103-ci",
             checkpoint_sha="failed-checkpoint-sha",
@@ -2346,6 +2384,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
     def test_unavailable_github_ci_runs_local_fallback(self):
         github = MagicMock()
+        github.experiment_base_sha.return_value = "HEAD"
         github.checkpoint_experiment.return_value = SimpleNamespace(
             branch_name="nexus/103-ci",
             checkpoint_sha="fallback-checkpoint-sha",

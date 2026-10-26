@@ -741,15 +741,18 @@ class ExperimentService:
         # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
+        base_ref = "HEAD"
+        if github_work_tracking is not None:
+            base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
         elog.debug(
             "implementation", "worktree_check",
-            f"Creating isolated git worktree at branch {branch_name}",
+            f"Creating isolated git worktree at branch {branch_name} from {base_ref}",
         )
         try:
             Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
             create_proc = _run_git(
-                ["worktree", "add", "-b", branch_name, worktree_path, "HEAD"],
+                ["worktree", "add", "-b", branch_name, worktree_path, base_ref],
                 cwd=self.repo_root,
                 timeout=60,
                 elog=elog,

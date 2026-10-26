@@ -620,6 +620,26 @@ class GitHubWorkTrackingService:
         )
         return ref
 
+    def experiment_base_sha(self, experiment_id: str) -> str:
+        """Fetch and return the issue branch commit an experiment must continue.
+
+        A later experiment for the same issue must inherit work already
+        checkpointed by an earlier experiment.  Fetching by branch also makes
+        the returned GitHub SHA available in a fresh deployment checkout's
+        object database without creating or moving a local tracking branch.
+        """
+        ref = self.ensure_for_experiment(experiment_id)
+        remote_sha = self._remote_branch_sha(ref.branch_name)
+        self._git(
+            ["fetch", "--no-tags", "origin", f"refs/heads/{ref.branch_name}"],
+            cwd=self.repo_root,
+        )
+        self._git(
+            ["cat-file", "-e", f"{remote_sha}^{{commit}}"],
+            cwd=self.repo_root,
+        )
+        return remote_sha
+
     def record_verification(
         self,
         experiment_id: str,
