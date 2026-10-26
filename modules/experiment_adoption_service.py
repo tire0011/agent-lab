@@ -44,6 +44,10 @@ STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
 
+# Adoptions run in threads of this process; a short-lived caller such as the
+# initiative tick must wait for them before it exits (#358).
+ADOPTION_THREAD_PREFIX = "adopt-"
+
 _TERMINAL_STATUSES = {STATUS_ADOPTED, STATUS_NEEDS_REVIEW, STATUS_FAILED, STATUS_INTERRUPTED}
 _ACTIVE_STATUSES = {STATUS_QUEUED, STATUS_ADOPTING}
 
@@ -449,7 +453,7 @@ class ExperimentAdoptionService:
             args=(adoption_id, experiment_id),
             kwargs={"resume": True},
             daemon=True,
-            name=f"adopt-resume-{experiment_id[:8]}",
+            name=f"{ADOPTION_THREAD_PREFIX}resume-{experiment_id[:8]}",
         )
         self._threads[experiment_id] = thread
         thread.start()
@@ -1112,7 +1116,7 @@ class ExperimentAdoptionService:
             target=self._run_thread,
             args=(adoption_id, experiment_id),
             daemon=True,
-            name=f"adopt-{experiment_id[:8]}",
+            name=f"{ADOPTION_THREAD_PREFIX}{experiment_id[:8]}",
         )
         self._threads[experiment_id] = thread
         thread.start()

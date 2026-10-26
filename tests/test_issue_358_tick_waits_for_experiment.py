@@ -13,13 +13,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import nexus_tick
+from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
 from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
 
 
 class _Service:
     controller = None
 
-    def __init__(self):
+    def __init__(self, prefix=EXPERIMENT_THREAD_PREFIX):
+        self.prefix = prefix
         self.finished = threading.Event()
         self.closed = False
 
@@ -31,7 +33,7 @@ class _Service:
             time.sleep(0.3)
             self.finished.set()
 
-        threading.Thread(target=run, daemon=True, name=f"{EXPERIMENT_THREAD_PREFIX}abc").start()
+        threading.Thread(target=run, daemon=True, name=f"{self.prefix}abc").start()
         return SimpleNamespace(acted=False, candidate=None, decision="dispatched", detail="")
 
     def close(self):
@@ -46,6 +48,15 @@ class TickWaitsTests(unittest.TestCase):
             self.assertEqual(nexus_tick.main(["--db-path", ":memory:"]), 0)
         self.assertTrue(service.finished.is_set())
         self.assertTrue(service.closed)
+
+    def test_the_tick_returns_only_after_its_adoption_ended(self):
+        # After #359 the next tick started an integration, exited, and left
+        # the adoption in ``adopting``.
+        service = _Service(prefix=ADOPTION_THREAD_PREFIX)
+        with patch.object(nexus_tick, "_build_service", return_value=service), \
+                patch.object(nexus_tick, "_reconcile_stale_claims"):
+            self.assertEqual(nexus_tick.main(["--db-path", ":memory:"]), 0)
+        self.assertTrue(service.finished.is_set())
 
 
 if __name__ == "__main__":
