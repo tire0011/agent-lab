@@ -7,7 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Services = @('agent-api.service', 'nexus-mailbox.service', 'nexus-reboot-check.timer')
+$Services = @('agent-api.service', 'nexus-mailbox.service', 'nexus-reboot-check.timer', 'nexus-tick.timer')
 
 Write-Host "=== Refreshing Nexus ===" -ForegroundColor Cyan
 
@@ -34,6 +34,12 @@ if ($LASTEXITCODE -ne 0) {
 sudo bash (Join-Path $PSScriptRoot 'setup-reboot-check.sh')
 if ($LASTEXITCODE -ne 0) {
     throw 'Nexus was updated, but the reboot check timer could not be installed.'
+}
+
+# Let Nexus pick and start its own work every 15 minutes (#356).
+sudo bash (Join-Path $PSScriptRoot 'setup-nexus-tick.sh')
+if ($LASTEXITCODE -ne 0) {
+    throw 'Nexus was updated, but the initiative tick timer could not be installed.'
 }
 
 & (Join-Path $PSScriptRoot 'nexus-restart.ps1') @RestArgs
