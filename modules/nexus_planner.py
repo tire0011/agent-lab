@@ -46,12 +46,14 @@ def planning_prompt(issues: list[dict[str, Any]]) -> str:
         "Pick the ONE issue that is the most useful to work on next. Prefer issues "
         "that are concrete and small enough for one change with tests, and that "
         "unblock or simplify later work. Skip issues that need a human decision, a "
-        "purchase, or setup outside the repository.\n\n"
-        "Optionally suggest ONE new issue, but only for a clearly missing, concrete "
-        "improvement that no listed issue covers.\n\n"
+        "purchase, or setup outside the repository. The web UI is not a priority: "
+        "do not pick web UI work.\n\n"
+        "Also suggest exactly ONE new issue of your own: a concrete, testable "
+        "improvement that no listed issue covers and that makes Nexus work more "
+        "reliably or more autonomously. No web UI work.\n\n"
         "Answer with exactly one JSON object and nothing else:\n"
         '{"issue": <number>, "reason": "<one sentence why this is next>", '
-        '"proposal": null or {"title": "...", "body": "what to change, where, how to test"}}\n\n'
+        '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
         "OPEN ISSUES:\n\n" + "\n\n".join(lines)
     )
 

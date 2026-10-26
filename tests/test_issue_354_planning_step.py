@@ -9,7 +9,7 @@ import json
 import unittest
 
 from modules.nexus_initiative import KIND_ISSUE
-from modules.nexus_planner import IssuePlanner, parse_choice
+from modules.nexus_planner import IssuePlanner, parse_choice, planning_prompt
 from tests.test_nexus_initiative import InitiativeFixture
 
 ISSUES = [
@@ -131,6 +131,15 @@ class PlanningStepTests(unittest.TestCase):
         self.addCleanup(svc.close)
         self.assertEqual(svc.tick().decision, "dispatched")
         self.assertEqual(self.fx.controller.issues, [351])
+
+
+class PromptTests(unittest.TestCase):
+    def test_the_planner_is_asked_for_its_own_idea_and_to_skip_web_ui_work(self):
+        # #363: the owner wants Nexus's own ideas; the web UI is no longer a priority.
+        prompt = planning_prompt(ISSUES[:2])
+        self.assertIn("suggest exactly ONE new issue", prompt)
+        self.assertNotIn("null or", prompt)
+        self.assertIn("do not pick web UI work", prompt)
 
 
 class ParseChoiceTests(unittest.TestCase):
