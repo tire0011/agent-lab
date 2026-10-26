@@ -251,6 +251,39 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(parent, worktree_head)
 
+    def test_existing_issue_branch_is_fetched_as_next_experiment_base_and_checkpoints(self):
+        repo, _, ref, _ = self._checkpoint_repo()
+        self.service.repo_root = str(repo)
+        (repo / "continued.py").write_text("first experiment\n", encoding="utf-8")
+        subprocess.run(["git", "add", "continued.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "first experiment"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        issue_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            text=True, capture_output=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "push", "origin", f"HEAD:refs/heads/{ref.branch_name}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        self.fake.refs[ref.branch_name] = issue_sha
+
+        base_sha = self.service.experiment_base_sha("checkpoint-exp")
+        self.assertEqual(base_sha, issue_sha)
+
+        (repo / "second.py").write_text("second experiment\n", encoding="utf-8")
+        published = self.service.checkpoint_experiment("checkpoint-exp", str(repo))
+
+        self.assertIsNotNone(published.checkpoint_sha)
+        remote_text = subprocess.run(
+            ["git", f"--git-dir={Path(self.tmp.name) / 'remote.git'}", "show",
+             f"{ref.branch_name}:continued.py"],
+            check=True, text=True, capture_output=True,
+        ).stdout
+        self.assertEqual(remote_text, "first experiment\n")
+
     def test_checkpoint_rejects_issue_branch_commit_missing_from_worktree(self):
         repo, _, ref, base_sha = self._checkpoint_repo()
         (repo / "committed.py").write_text("experiment progress\n", encoding="utf-8")
