@@ -16,9 +16,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import sqlite3
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone
 
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
@@ -29,6 +32,9 @@ configure_logging()
 logger = logging.getLogger("nexus_tick")
 
 _ISSUE_LIMIT = 100
+
+# Things worth telling Claude about, collected during one tick (#365).
+_events: list[str] = []
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
@@ -90,6 +96,7 @@ def _open_proposal(repo_root: str, title: str, body: str) -> None:
     ])
     footer = "\n\n---\nSuggested by the Nexus planning step. Remove the `proposal` label to let Nexus work on it."
     _gh(repo_root, ["issue", "create", "--title", title, "--body", body + footer, "--label", PROPOSAL_LABEL])
+    _events.append(f"New proposal issue: {title}")
 
 
 def _count_open_proposals(repo_root: str) -> int:
@@ -202,6 +209,52 @@ def _wait_for_experiments() -> None:
             thread.join()
 
 
+def _finished_badly(db_path: str, since: str) -> list[str]:
+    """Experiments and adoptions that ended without success since *since*."""
+    found: list[str] = []
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return found
+    try:
+        for exp_id, status, goal, error in db.execute(
+            "SELECT id, status, goal, error FROM experiments "
+            "WHERE ended_at >= ? AND status != 'succeeded'",
+            (since,),
+        ):
+            lines = str(goal or "").strip().splitlines()
+            title = lines[0][:100] if lines else ""
+            found.append(f"Experiment {exp_id[:8]} ({title}) ended {status}: {str(error or '')[:300]}")
+        for exp_id, status, reason in db.execute(
+            "SELECT experiment_id, status, reason FROM experiment_adoptions "
+            "WHERE updated_at >= ? AND status IN ('failed', 'needs_review')",
+            (since,),
+        ):
+            found.append(f"Adoption of experiment {exp_id[:8]} ended {status}: {str(reason or '')[:300]}")
+    except sqlite3.Error as exc:
+        logger.warning("notify: could not read outcomes: %s", exc)
+    finally:
+        db.close()
+    return found
+
+
+def _notify(repo_root: str, messages: list[str]) -> None:
+    """Comment on the watched notification PR so Claude wakes up (#365).
+
+    ``NEXUS_NOTIFY_PR`` is ``owner/repo#number``; unset means no notifications.
+    Best effort: a failed comment must not fail the tick.
+    """
+    target = os.environ.get("NEXUS_NOTIFY_PR", "").strip()
+    if not target or not messages or "#" not in target:
+        return
+    repo, number = target.rsplit("#", 1)
+    body = "Nexus:\n\n" + "\n".join(f"- {m}" for m in messages)
+    try:
+        _gh(repo_root, ["pr", "comment", number, "--repo", repo, "--body", body])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("notify: comment failed: %s", exc)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
@@ -219,6 +272,9 @@ def main(argv: list[str] | None = None) -> int:
              "(no LLM controller is constructed)",
     )
     args = parser.parse_args(argv)
+    started_at = datetime.now(timezone.utc).isoformat()
+    _events.clear()
+    decision = None
 
     # --dry-run reports what would happen and changes nothing, reaping
     # included.
@@ -273,6 +329,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         _wait_for_experiments()
         service.close()
+        if not args.dry_run:
+            if decision is not None and decision.decision == "error":
+                _events.append(f"Tick error: {str(decision.detail or '')[:300]}")
+            _notify(args.repo_root, _events + _finished_badly(args.db_path, started_at))
 
 
 if __name__ == "__main__":
