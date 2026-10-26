@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from modules.tool_resolver_evaluation import (
     EVALUATION_CASES,
@@ -100,7 +102,11 @@ class ToolResolverEvaluationTests(unittest.TestCase):
         )
 
     def test_all_mode_separates_local_llm_from_deterministic_candidate_check(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # A unit test must not reach a real llama-server: on the VM one is
+        # running, and this test hung a whole experiment's verification
+        # (#235). Point the local model at a closed port, as in CI.
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"LOCAL_MODEL_URL": "http://127.0.0.1:9/v1"}):
             result = asyncio.run(
                 evaluate_all(
                     repo_root=Path(__file__).resolve().parents[1],
