@@ -214,6 +214,7 @@ def run_verification_test_monitored(
     on_heartbeat: Callable[[dict[str, Any]], None] | None = None,
     test_log_dir: str | Path | None = None,
     prune_logs: bool = True,
+    on_process: Callable[[subprocess.Popen | None], None] | None = None,
 ) -> VerificationRunResult:
     """Run the verification tests under a progress-aware watchdog.
 
@@ -255,6 +256,8 @@ def run_verification_test_monitored(
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        if on_process is not None:
+            on_process(process)
     except (OSError, subprocess.SubprocessError) as exc:
         test_log.log_run_event("test_run_spawn_failed", f"failed to run test command: {exc}")
         return VerificationRunResult(
@@ -331,6 +334,8 @@ def run_verification_test_monitored(
     tracker.set_total_tests(total_tests)
 
     exit_code = process.returncode
+    if on_process is not None:
+        on_process(None)
     # A negative return code means a signal, not a verdict: the suite never
     # got to decide anything. Reporting it as an exit status would let an
     # OOM-killed or externally terminated run be filed as "tests failed".

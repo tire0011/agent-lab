@@ -167,6 +167,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             implementation_started_at TEXT NULL,
             implementation_ended_at TEXT NULL,
             ended_at TEXT NULL,
+            cancelled_at TEXT NULL,
+            cancelled_by TEXT NULL,
             plan_json TEXT NULL,
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
@@ -302,6 +304,8 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("quality_evaluation_json", "TEXT"),
     # Which coding agent ran the implementation phase (codex | claude).
     ("implementation_provider", "TEXT"),
+    ("cancelled_at", "TEXT"),
+    ("cancelled_by", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
@@ -758,4 +762,3 @@ def _migrate_operation_log(conn: sqlite3.Connection) -> None:
             ON operation_log(operation);
         """
     )
-
