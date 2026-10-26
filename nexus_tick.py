@@ -187,15 +187,17 @@ def _reconcile_stale_claims(db_path: str) -> None:
 
 
 def _wait_for_experiments() -> None:
-    """Keep the process alive until the experiments it started have ended (#358).
+    """Keep the process alive until the work it started has ended (#358).
 
-    The controller runs an experiment in a daemon thread of this process; the
-    oneshot unit would otherwise exit and kill it while it is still queued.
+    The controller runs an experiment, and the adoption service an
+    integration, in a daemon thread of this process; the oneshot unit would
+    otherwise exit and kill it while it is still queued or adopting.
     """
+    from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
     from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
 
     for thread in threading.enumerate():
-        if thread.name.startswith(EXPERIMENT_THREAD_PREFIX):
+        if thread.name.startswith((EXPERIMENT_THREAD_PREFIX, ADOPTION_THREAD_PREFIX)):
             logger.info("waiting for %s to finish", thread.name)
             thread.join()
 
