@@ -346,6 +346,20 @@ class WebClientTests(ApiTestsBase):
         mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
         self.assertIn(".logs-status { align-items: flex-start; flex-direction: column;", mobile_rules)
 
+    def test_idea_input_is_multiline_textarea(self):
+        """Issue #351: the idea field is a ~3-row textarea capped at 500
+        characters, full width on mobile, and still read by overview.js."""
+        html = self.client.get("/").text
+        self.assertRegex(html, r'<textarea id="idea-input"[^>]*\smaxlength="500"')
+        self.assertRegex(html, r'<textarea id="idea-input"[^>]*\srows="3"')
+        self.assertNotIn('<input id="idea-input"', html)
+        stylesheet = self.client.get("/static/styles.css").text
+        mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
+        self.assertIn(".idea-form textarea, .idea-form button { flex-basis: 100%; }", mobile_rules)
+        javascript = self.client.get("/static/overview.js").text
+        self.assertIn('ideaInput: document.querySelector("#idea-input")', javascript)
+        self.assertIn("elements.ideaInput.value.trim()", javascript)
+
 
 class MailboxTaskDetailEndpointTests(ApiTestsBase):
     def test_mailbox_task_detail_exposes_full_experiment_id(self):

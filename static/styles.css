@@ -261,8 +261,7 @@ button.secondary { border: 1px solid var(--border); background: var(--surface); 
 .message.error { align-self: flex-start; color: var(--bad); background: var(--bad-bg); }
 .chat-form { display: flex; align-items: stretch; gap: 10px; }
 .idea-form { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin-top: 12px; }
-.idea-form input[type="text"] { flex: 1 1 160px; }
-.idea-form input { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); font: inherit; }
+.idea-form textarea { flex: 1 1 240px; width: auto; }
 #idea-state { flex-basis: 100%; }
 textarea { width: 100%; min-height: 48px; resize: vertical; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); font: inherit; }
 textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible {
@@ -359,6 +358,7 @@ textarea:focus-visible, button:focus-visible, input:focus-visible, select:focus-
   .card { padding: 16px; border-radius: 13px; }
   .chat-form { flex-direction: column; }
   .chat-form button { width: 100%; }
+  .idea-form textarea, .idea-form button { flex-basis: 100%; }
   .message { max-width: 92%; }
   .card-actions { flex-direction: column; }
   .card-actions button { width: 100%; }
