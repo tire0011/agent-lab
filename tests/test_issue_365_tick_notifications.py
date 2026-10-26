@@ -97,6 +97,9 @@ class TickNotificationTests(unittest.TestCase):
 
         self._run(_Service(self.db_path, on_tick=propose))
         self.assertIn("New proposal issue: Add X", self.calls[-1][-1])
+        # The VM's gh has no `label` command; the proposal is one issue create.
+        self.assertEqual(self.calls[0][:2], ["issue", "create"])
+        self.assertNotIn("label", [argv[0] for argv in self.calls])
 
     def test_nothing_to_report_sends_nothing(self):
         self._run(_Service(self.db_path, on_tick=_ended("succeeded")))

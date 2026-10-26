@@ -90,10 +90,7 @@ def _comment_on_issue(repo_root: str, number: int, text: str) -> None:
 def _open_proposal(repo_root: str, title: str, body: str) -> None:
     from modules.nexus_planner import PROPOSAL_LABEL
 
-    _gh(repo_root, [
-        "label", "create", PROPOSAL_LABEL, "--force", "--color", "FBCA04",
-        "--description", "Suggested by Nexus; not worked on until a human removes this label",
-    ])
+    # The label exists in the repository; the VM's gh has no `label` command.
     footer = "\n\n---\nSuggested by the Nexus planning step. Remove the `proposal` label to let Nexus work on it."
     _gh(repo_root, ["issue", "create", "--title", title, "--body", body + footer, "--label", PROPOSAL_LABEL])
     _events.append(f"New proposal issue: {title}")
