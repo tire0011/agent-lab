@@ -109,6 +109,16 @@ class TestMailboxDevelopment(unittest.TestCase):
         self.assertIn("hello", body)
         self.assertIsNone(idea_id)
 
+    def test_internal_command_without_front_matter_uses_default_timeout(self):
+        msg = SimpleNamespace(body="printf hello")
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = process_command(msg, Path(tmp), None, 0)
+        self.assertIn("**Exit code:** 0", body)
+        self.assertIn(
+            f"**Deadline:** {mailbox_development.DEFAULT_COMMAND_TIMEOUT_SECONDS}s",
+            body,
+        )
+
     def test_command_executes_and_can_change_workspace(self):
         msg = SimpleNamespace(
             body="printf hello && printf changed > created.txt",

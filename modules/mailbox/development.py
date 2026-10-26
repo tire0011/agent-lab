@@ -140,8 +140,11 @@ def process_command(
     if not command:
         raise ValueError("command body must not be empty")
 
-    timeout = _command_timeout(msg.meta)
-    unknown_meta = _unknown_command_meta(msg.meta)
+    # Internal orchestrator commands predate mailbox front matter and provide
+    # only a body. Treat absent metadata exactly like an empty header.
+    meta = getattr(msg, "meta", None)
+    timeout = _command_timeout(meta)
+    unknown_meta = _unknown_command_meta(meta)
     if unknown_meta:
         logger.warning("Unknown command front-matter keys: %s", ", ".join(unknown_meta))
 
@@ -316,7 +319,7 @@ def process_command(
             started_path.write_text(str(time.time()))
             timeout_path.write_text(str(timeout))
             write_recovery_state(
-                state_dir, repo_path, parse_expected_services(msg.meta)
+                state_dir, repo_path, parse_expected_services(meta)
             )
             wrapper = (
                 "set +e\n(" + command + "\n)\n"
