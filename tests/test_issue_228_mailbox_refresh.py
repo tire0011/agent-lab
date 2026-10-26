@@ -325,6 +325,81 @@ class SelfRestartTests(unittest.TestCase):
         result, _ = self._run(("agent-api",), "agent-api")
         self.assertNotEqual(result["agent-api"], "restarted")
 
+    def test_failed_transient_restart_uses_no_block_fallback(self):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        attempts = [
+            SimpleNamespace(returncode=1, stderr="systemd-run unavailable", stdout=""),
+            SimpleNamespace(returncode=0, stderr="", stdout=""),
+        ]
+        with patch.object(refresh_module.subprocess, "run", side_effect=attempts) as run:
+            result = refresh_module.systemd_restarter(
+                ("agent-api",), current_unit="agent-api"
+            )()
+
+        self.assertIn("systemd-run", run.call_args_list[0].args[0])
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["sudo", "systemctl", "restart", "--no-block", "agent-api"],
+        )
+        self.assertIn("scheduled via fallback", result["agent-api"])
+        self.assertIn("outcome unknown", result["agent-api"])
+
+    def test_missing_systemd_run_still_uses_fallback(self):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        completed = SimpleNamespace(returncode=0, stderr="", stdout="")
+        with patch.object(
+            refresh_module.subprocess, "run", side_effect=[FileNotFoundError("missing"), completed]
+        ) as run:
+            result = refresh_module.systemd_restarter(
+                ("agent-api",), use_sudo=False, current_unit="agent-api"
+            )()
+
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["systemctl", "restart", "--no-block", "agent-api"],
+        )
+        self.assertIn("outcome unknown", result["agent-api"])
+
+    def test_fallback_sigterm_means_replaced_mid_call(self):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        attempts = [
+            SimpleNamespace(returncode=1, stderr="denied", stdout=""),
+            SimpleNamespace(returncode=-15, stderr="", stdout=""),
+        ]
+        with patch.object(refresh_module.subprocess, "run", side_effect=attempts):
+            result = refresh_module.systemd_restarter(
+                ("agent-api",), current_unit="agent-api"
+            )()
+
+        self.assertEqual(
+            result["agent-api"],
+            "restart attempted via fallback; replaced mid-call, outcome unknown",
+        )
+        self.assertNotIn("error", result["agent-api"])
+
+    def test_both_restart_methods_failing_says_not_restarted(self):
+        from unittest.mock import patch
+        import modules.nexus_refresh as refresh_module
+
+        attempts = [
+            SimpleNamespace(returncode=1, stderr="transient denied", stdout=""),
+            SimpleNamespace(returncode=5, stderr="unit failed", stdout=""),
+        ]
+        with patch.object(refresh_module.subprocess, "run", side_effect=attempts):
+            result = refresh_module.systemd_restarter(
+                ("agent-api",), current_unit="agent-api"
+            )()
+
+        self.assertIn("not restarted", result["agent-api"])
+        self.assertIn("transient denied", result["agent-api"])
+        self.assertIn("unit failed", result["agent-api"])
+
 
 class OwnUnitTests(unittest.TestCase):
     def _own_unit(self, text):

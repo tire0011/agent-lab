@@ -145,8 +145,9 @@ def systemd_restarter(
 ) -> Callable[[], dict[str, str]]:
     """Restarter that asks systemd to restart *services*, one report per unit.
 
-    Restarting our own unit is handed to a transient unit, so the outcome is
-    unknown to us and is reported as scheduled rather than as done.
+    Restarting our own unit is handed to a transient unit.  If that cannot be
+    scheduled, make a best-effort ``systemctl --no-block`` attempt from this
+    process and report its inherently uncertain outcome honestly.
     """
     unit = get_current_systemd_unit() if current_unit is _UNSET else current_unit
 
@@ -179,24 +180,67 @@ def systemd_restarter(
                     timeout=_SERVICE_TIMEOUT,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                results[service] = f"error: {redact_secrets(str(exc))[:200]}"
-                continue
-            if completed.returncode == 0:
+                completed = None
+                primary_error = redact_secrets(
+                    str(exc) or exc.__class__.__name__
+                ).strip()[:200]
+            else:
+                primary_error = ""
+            if completed is not None and completed.returncode == 0:
                 results[service] = (
                     "restart scheduled (this process is being replaced)"
                     if replacing_self
                     else "restarted"
                 )
+                continue
+
+            if replacing_self:
+                # A missing/denied/broken systemd-run must not turn a deploy
+                # into a no-op.  --no-block is racy when restarting our own
+                # cgroup, but it usually performs the restart; success and a
+                # SIGTERM exit therefore both mean "attempted, now verify".
+                fallback = prefix + ["systemctl", "restart", "--no-block", service]
+                try:
+                    attempted = subprocess.run(
+                        fallback,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=_SERVICE_TIMEOUT,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    fallback_error = redact_secrets(
+                        str(exc) or exc.__class__.__name__
+                    ).strip()[:200]
+                else:
+                    if attempted.returncode == 0:
+                        results[service] = "restart scheduled via fallback; outcome unknown"
+                        continue
+                    if attempted.returncode == -15:
+                        results[service] = "restart attempted via fallback; replaced mid-call, outcome unknown"
+                        continue
+                    fallback_error = _restart_failure_detail(attempted)
+
+                first = primary_error or _restart_failure_detail(completed)
+                results[service] = (
+                    "error: not restarted; transient restart failed: "
+                    f"{first}; fallback failed: {fallback_error}"
+                )
             else:
                 # systemctl can fail with both streams empty, so the exit
                 # code is the only thing always worth reporting.
-                detail = redact_secrets(completed.stderr or completed.stdout).strip()[:200]
-                if not detail:
-                    detail = "no output; run it by hand to see why"
-                results[service] = f"error: exit {completed.returncode}: {detail}"
+                results[service] = f"error: {primary_error or _restart_failure_detail(completed)}"
         return results
 
     return restart
+
+
+def _restart_failure_detail(completed: subprocess.CompletedProcess[str]) -> str:
+    """Return an actionable, bounded description of a failed restart call."""
+    detail = redact_secrets(completed.stderr or completed.stdout).strip()[:200]
+    if not detail:
+        detail = "no output; run it by hand to see why"
+    return f"exit {completed.returncode}: {detail}"
 
 
 class NexusRefresh:
