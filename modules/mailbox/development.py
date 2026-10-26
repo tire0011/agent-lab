@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import shlex
 import subprocess
 import tempfile
@@ -27,6 +28,16 @@ from .command_recovery import (
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 32_000
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 3_600
+MAX_COMMAND_TIMEOUT_SECONDS = 21_600
+COMMAND_TIMEOUT_EXIT_CODE = 124
+_COMMAND_META_KEYS = {
+    "type",
+    "created_by",
+    "request_id",
+    "timeout",
+    "recovery_services",
+}
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _ACTIVE_COMMANDS: dict[int, subprocess.Popen] = {}
 _SENSITIVE_ENV_MARKERS = (
@@ -58,6 +69,67 @@ def _bounded_redacted(text: str | None) -> str:
     return clean[:MAX_OUTPUT_CHARS] + f"\n...[truncated {omitted} chars]"
 
 
+def _command_timeout(meta: dict[str, str] | None) -> int:
+    raw = (meta or {}).get("timeout", "").strip()
+    if not raw:
+        return DEFAULT_COMMAND_TIMEOUT_SECONDS
+    try:
+        timeout = int(raw)
+    except ValueError as exc:
+        raise ValueError("command timeout must be a whole number of seconds") from exc
+    if timeout < 1:
+        raise ValueError("command timeout must be at least 1 second")
+    if timeout > MAX_COMMAND_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"command timeout must not exceed {MAX_COMMAND_TIMEOUT_SECONDS} seconds"
+        )
+    return timeout
+
+
+def _unknown_command_meta(meta: dict[str, str] | None) -> list[str]:
+    return sorted(set(meta or {}) - _COMMAND_META_KEYS)
+
+
+def _record_progress(conn: Any, db_msg_id: int, elapsed: float, timeout: int) -> None:
+    message = f"command running: {elapsed:.1f}s elapsed; deadline {timeout}s"
+    logger.info("Mailbox %s %s", db_msg_id, message)
+    if conn is not None:
+        conn.execute(
+            "UPDATE mailbox_messages SET last_error=? WHERE id=?",
+            (message, db_msg_id),
+        )
+        conn.commit()
+
+
+def _terminate_process_group(pid: int) -> None:
+    """Terminate the detached command and its children, escalating if needed."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _reap_active_command(db_msg_id: int) -> None:
+    active = _ACTIVE_COMMANDS.pop(db_msg_id, None)
+    if active is None:
+        return
+    try:
+        active.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def process_command(
     msg: Any,
     repo_path: Path,
@@ -68,24 +140,58 @@ def process_command(
     if not command:
         raise ValueError("command body must not be empty")
 
+    # Internal orchestrator commands predate mailbox front matter and provide
+    # only a body. Treat absent metadata exactly like an empty header.
+    meta = getattr(msg, "meta", None)
+    timeout = _command_timeout(meta)
+    unknown_meta = _unknown_command_meta(meta)
+    if unknown_meta:
+        logger.warning("Unknown command front-matter keys: %s", ", ".join(unknown_meta))
+
     if conn is None and db_msg_id == 0:
         started = time.time()
-        completed = subprocess.run(
-            ["/bin/bash", "-lc", command],
-            cwd=str(repo_path),
-            env=_command_environment(),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                ["/bin/bash", "-lc", command],
+                cwd=str(repo_path),
+                env=_command_environment(),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            returncode = completed.returncode
+            raw_stdout = completed.stdout
+            raw_stderr = completed.stderr
+            timed_out = False
+        except subprocess.TimeoutExpired as exc:
+            returncode = COMMAND_TIMEOUT_EXIT_CODE
+            raw_stdout = (
+                exc.stdout.decode(errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else exc.stdout
+            )
+            raw_stderr = (
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else exc.stderr
+            )
+            timed_out = True
         duration = max(0.0, time.time() - started)
-        stdout = _bounded_redacted(completed.stdout)
-        stderr = _bounded_redacted(completed.stderr)
+        stdout = _bounded_redacted(raw_stdout)
+        stderr = _bounded_redacted(raw_stderr)
         return (
             "\n".join(
                 [
-                    f"**Exit code:** {completed.returncode}",
+                    f"**Exit code:** {returncode}",
                     f"**Duration:** {duration:.3f}s",
+                    f"**Deadline:** {timeout}s",
+                    *(["**Timed out:** yes"] if timed_out else []),
+                    *(
+                        [f"**Warning:** Unknown front-matter keys: {', '.join(unknown_meta)}"]
+                        if unknown_meta
+                        else []
+                    ),
                     "",
                     "### stdout",
                     "",
@@ -115,14 +221,11 @@ def process_command(
     exit_path = state_dir / "exit_code"
     pid_path = state_dir / "pid"
     started_path = state_dir / "started"
+    timeout_path = state_dir / "timeout"
+    timed_out_path = state_dir / "timed_out"
 
     if exit_path.exists():
-        active = _ACTIVE_COMMANDS.pop(db_msg_id, None)
-        if active is not None:
-            try:
-                active.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                pass
+        _reap_active_command(db_msg_id)
         try:
             returncode = int(exit_path.read_text().strip())
         except (OSError, ValueError):
@@ -132,6 +235,11 @@ def process_command(
         except (OSError, ValueError):
             started = time.time()
         duration = max(0.0, time.time() - started)
+        try:
+            persisted_timeout = int(timeout_path.read_text().strip())
+        except (OSError, ValueError):
+            persisted_timeout = timeout
+        timed_out = timed_out_path.exists()
         stdout = _bounded_redacted(stdout_path.read_text(errors="replace") if stdout_path.exists() else "")
         stderr = _bounded_redacted(stderr_path.read_text(errors="replace") if stderr_path.exists() else "")
     else:
@@ -139,8 +247,40 @@ def process_command(
             try:
                 pid = int(pid_path.read_text().strip())
                 os.kill(pid, 0)
-                return _DEFERRED_PROCESSING
+                try:
+                    started = float(started_path.read_text().strip())
+                except (OSError, ValueError):
+                    started = time.time()
+                try:
+                    persisted_timeout = int(timeout_path.read_text().strip())
+                except (OSError, ValueError):
+                    persisted_timeout = timeout
+                duration = max(0.0, time.time() - started)
+                if duration < persisted_timeout:
+                    _record_progress(conn, db_msg_id, duration, persisted_timeout)
+                    return _DEFERRED_PROCESSING
+                _terminate_process_group(pid)
+                _reap_active_command(db_msg_id)
+                returncode = COMMAND_TIMEOUT_EXIT_CODE
+                timed_out = True
+                timed_out_path.write_text(
+                    f"deadline {persisted_timeout}s exceeded after {duration:.3f}s\n"
+                )
+                exit_path.write_text(str(returncode))
+                raw_stderr = stderr_path.read_text(errors="replace") if stderr_path.exists() else ""
+                timeout_line = (
+                    f"[timeout] deadline {persisted_timeout}s exceeded; "
+                    f"terminated after {duration:.3f}s"
+                )
+                stderr_path.write_text(
+                    (raw_stderr.rstrip("\n") + "\n" if raw_stderr else "") + timeout_line + "\n"
+                )
+                stdout = _bounded_redacted(
+                    stdout_path.read_text(errors="replace") if stdout_path.exists() else ""
+                )
+                stderr = _bounded_redacted(stderr_path.read_text(errors="replace"))
             except (OSError, ValueError):
+                _reap_active_command(db_msg_id)
                 try:
                     started = float(started_path.read_text().strip())
                 except (OSError, ValueError):
@@ -172,11 +312,14 @@ def process_command(
 
                 stdout = _bounded_redacted(partial_stdout)
                 stderr = _bounded_redacted(raw_stderr)
+                persisted_timeout = timeout
+                timed_out = False
         else:
             state_dir.mkdir(parents=True, exist_ok=True)
             started_path.write_text(str(time.time()))
+            timeout_path.write_text(str(timeout))
             write_recovery_state(
-                state_dir, repo_path, parse_expected_services(msg.meta)
+                state_dir, repo_path, parse_expected_services(meta)
             )
             wrapper = (
                 "set +e\n(" + command + "\n)\n"
@@ -200,6 +343,13 @@ def process_command(
             [
                 f"**Exit code:** {returncode}",
                 f"**Duration:** {duration:.3f}s",
+                f"**Deadline:** {persisted_timeout}s",
+                *(["**Timed out:** yes"] if timed_out else []),
+                *(
+                    [f"**Warning:** Unknown front-matter keys: {', '.join(unknown_meta)}"]
+                    if unknown_meta
+                    else []
+                ),
                 "",
                 "### stdout",
                 "",

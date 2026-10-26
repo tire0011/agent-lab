@@ -198,6 +198,7 @@ MAILBOX_MESSAGE_COLUMNS = (
     "received_at",
     "processed_at",
     "outbox_file",
+    "last_error",
 )
 
 
