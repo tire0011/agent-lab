@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from modules import mailbox
+from modules.mailbox import development as mailbox_development
 from modules.mailbox.development import development_mode_enabled, install, process_command
 from modules.run_store import init_db
 
@@ -126,17 +127,81 @@ class TestMailboxDevelopment(unittest.TestCase):
         self.assertIn("**Exit code:** 0", body)
         self.assertIn("hello", body)
 
-    def test_command_timeout_metadata_is_ignored(self):
-        msg = SimpleNamespace(body="sleep 0.05; printf done", meta={"timeout": "1"})
+    def test_command_timeout_metadata_changes_persisted_deadline(self):
+        msg = SimpleNamespace(body="sleep 30", meta={"timeout": "1"})
         env = {"PATH": os.environ.get("PATH", "")}
         with tempfile.TemporaryDirectory() as tmp:
             env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
             with patch.dict(os.environ, env, clear=True):
                 first = process_command(msg, Path(tmp), None, 1)
                 self.assertIs(first, mailbox._DEFERRED_PROCESSING)
+                self.assertEqual((Path(tmp) / "jobs" / "1" / "timeout").read_text(), "1")
                 body, _ = self._run_command(msg, Path(tmp))
-        self.assertIn("**Exit code:** 0", body)
-        self.assertIn("done", body)
+        self.assertIn("**Exit code:** 124", body)
+        self.assertIn("**Deadline:** 1s", body)
+        self.assertIn("**Timed out:** yes", body)
+        self.assertIn("[timeout] deadline 1s exceeded", body)
+
+    def test_command_rejects_invalid_or_unbounded_timeout(self):
+        for value in ("0", "not-a-number", "21601"):
+            with self.subTest(timeout=value), self.assertRaises(ValueError):
+                process_command(
+                    SimpleNamespace(body="true", meta={"timeout": value}),
+                    Path("."),
+                    None,
+                    0,
+                )
+
+    def test_nonzero_command_always_returns_a_terminal_report(self):
+        msg = SimpleNamespace(body="printf failed >&2; exit 7", meta={"timeout": "5"})
+        env = {"PATH": os.environ.get("PATH", "")}
+        with tempfile.TemporaryDirectory() as tmp:
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            with patch.dict(os.environ, env, clear=True):
+                body, _ = self._run_command(msg, Path(tmp))
+        self.assertIn("**Exit code:** 7", body)
+        self.assertIn("failed", body)
+
+    def test_running_command_publishes_progress_in_mailbox_state(self):
+        msg = SimpleNamespace(body="sleep 30", meta={"timeout": "5"})
+        env = {"PATH": os.environ.get("PATH", "")}
+        with tempfile.TemporaryDirectory() as tmp:
+            env["NEXUS_MAILBOX_COMMAND_STATE_DIR"] = str(Path(tmp) / "jobs")
+            conn = init_db(str(Path(tmp) / "state.db"))
+            mailbox.init_mailbox_db(conn)
+            cur = conn.execute(
+                """
+                INSERT INTO mailbox_messages
+                    (file_path, source_commit_sha, msg_type, created_by, status, received_at)
+                VALUES ('inbox/running.md', 'sha', 'command', 'nexus', 'processing', 'now')
+                """
+            )
+            db_msg_id = cur.lastrowid
+            conn.commit()
+            with patch.dict(os.environ, env, clear=True):
+                self.assertIs(
+                    process_command(msg, Path(tmp), conn, db_msg_id),
+                    mailbox._DEFERRED_PROCESSING,
+                )
+                self.assertIs(
+                    process_command(msg, Path(tmp), conn, db_msg_id),
+                    mailbox._DEFERRED_PROCESSING,
+                )
+                progress = conn.execute(
+                    "SELECT last_error FROM mailbox_messages WHERE id=?", (db_msg_id,)
+                ).fetchone()[0]
+                pid = int((Path(tmp) / "jobs" / str(db_msg_id) / "pid").read_text())
+                os.killpg(pid, 15)
+                mailbox_development._ACTIVE_COMMANDS.pop(db_msg_id).wait(timeout=2)
+            conn.close()
+        self.assertIn("command running:", progress)
+        self.assertIn("deadline 5s", progress)
+
+    def test_unknown_front_matter_key_is_reported(self):
+        msg = SimpleNamespace(body="true", meta={"mystery_guard": "enabled"})
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = process_command(msg, Path(tmp), None, 0)
+        self.assertIn("Unknown front-matter keys: mystery_guard", body)
 
     def test_command_allows_read_only_service_status(self):
         msg = SimpleNamespace(body="printf 'agent-api status check'", meta={})
