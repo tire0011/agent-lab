@@ -9,6 +9,8 @@ WorkingDirectory=/agent
 StateDirectory=nexus
 EnvironmentFile=/etc/agent-lab/agent.env
 Environment=AGENT_DB_PATH=/var/lib/nexus/agent.db
+# Claude watches this PR and is woken by each comment (#365).
+Environment=NEXUS_NOTIFY_PR=tire0011/agent-lab-mailbox#6
 # The service's one-at-a-time gate and five-start rolling daily budget bound
 # autonomous work. The full controller is required to plan and implement open
 # issues after the integration backlog has drained.
