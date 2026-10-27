@@ -31,7 +31,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 # Sandbox vocabulary shared by every worker. Each implementation maps these
 # to whatever its own CLI offers; the *meaning* is fixed here:
@@ -265,6 +265,7 @@ def run_watched(
     input_text: str | None = None,
     poll_seconds: float = 1.0,
     grace_seconds: float = TERMINATE_GRACE_SECONDS,
+    on_process: Callable[[subprocess.Popen | None], None] | None = None,
 ) -> WatchedRun:
     """Run *cmd* and stop it only when it stalls or reaches the absolute cap.
 
@@ -283,6 +284,8 @@ def run_watched(
         text=True,
         start_new_session=True,
     )
+    if on_process is not None:
+        on_process(proc)
     last_output = [time.monotonic()]
     stdout_capture = _BoundedCapture()
     stderr_capture = _BoundedCapture()
@@ -317,8 +320,12 @@ def run_watched(
         if stop_reason:
             break
         time.sleep(poll_seconds)
-    _terminate_group(proc, grace_seconds if stop_reason else 0)
-    exit_code = proc.wait()
+    try:
+        _terminate_group(proc, grace_seconds if stop_reason else 0)
+        exit_code = proc.wait()
+    finally:
+        if on_process is not None:
+            on_process(None)
     for reader in readers:
         reader.join(timeout=5)
     return WatchedRun(

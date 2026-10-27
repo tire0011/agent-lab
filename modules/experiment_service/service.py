@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -42,6 +43,8 @@ from .models import (
     Experiment,
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
+    ExperimentNotCancellableError,
+    STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
     STATUS_NEEDS_REVIEW,
@@ -64,7 +67,7 @@ logger = logging.getLogger("modules.experiment_service")
 # as a small fixed set here so lifecycle logging in ``_transition``/
 # ``_force_status`` stays centralized and consistent.
 _WARNING_STATUSES = frozenset(
-    {"rejected", "failed", "timed_out", "needs_review"}
+    {"rejected", "failed", "timed_out", "needs_review", "cancelled"}
 )
 
 # Subset of the above that represents an actual failure (as opposed to a
@@ -275,9 +278,65 @@ class ExperimentService:
         conn.row_factory = sqlite3.Row
         self._conn = conn
         self._lock = threading.Lock()
+        self._active_processes: dict[str, subprocess.Popen] = {}
+        self._process_lock = threading.Lock()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _track_process(self, experiment_id: str, process: subprocess.Popen | None) -> None:
+        with self._process_lock:
+            if process is None:
+                self._active_processes.pop(experiment_id, None)
+            else:
+                self._active_processes[experiment_id] = process
+        # Close the narrow race where cancellation commits after the caller
+        # starts a phase but before that phase publishes its Popen handle.
+        if process is not None and self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            self._terminate_process(process)
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            process.wait(timeout=2)
+
+    def cancel_experiment(self, experiment_id: str, cancelled_by: str) -> Experiment:
+        """Cancel an active implementation or verification and retain its worktree."""
+        experiment = self.resolve_experiment(experiment_id)
+        actor = (cancelled_by or "api").strip()[:200] or "api"
+        now = _utcnow_iso()
+        moved = False
+        for status in (STATUS_IMPLEMENTING, STATUS_VERIFYING):
+            if self._transition(
+                experiment.id, status, STATUS_CANCELLED,
+                ended_at=now, cancelled_at=now, cancelled_by=actor,
+                error=f"cancelled by {actor}",
+            ):
+                moved = True
+                break
+        if not moved:
+            current = self.get_experiment(experiment.id)
+            raise ExperimentNotCancellableError(
+                f"experiment {experiment.id!r} cannot be cancelled from status {current.status!r}"
+            )
+
+        with self._process_lock:
+            process = self._active_processes.get(experiment.id)
+        if process is not None:
+            self._terminate_process(process)
+        return self.get_experiment(experiment.id)
 
     # ------------------------------------------------------------------
     # verification test watchdog (#209)
@@ -579,6 +638,11 @@ class ExperimentService:
         values.append(experiment_id)
 
         with self._lock, self._conn:
+            current = self._conn.execute(
+                "SELECT status FROM experiments WHERE id = ?", (experiment_id,)
+            ).fetchone()
+            if current is not None and current[0] == STATUS_CANCELLED and status != STATUS_CANCELLED:
+                return
             self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} WHERE id = ?",
                 values,
@@ -822,7 +886,11 @@ class ExperimentService:
             stall_seconds=stall_seconds,
             experiment_logger=elog,
             phase="implementation",
+            on_process=lambda process: self._track_process(experiment_id, process),
         )
+
+        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            return self.get_experiment(experiment_id)
 
         if implementation_result.timed_out:
             checkpoint_error = self._checkpoint_interrupted_work(
@@ -866,6 +934,9 @@ class ExperimentService:
             implementation_usage_json=json.dumps(implementation_result.usage)
             if implementation_result.usage else None,
         )
+
+        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            return self.get_experiment(experiment_id)
 
         # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
@@ -960,7 +1031,10 @@ class ExperimentService:
                 stall_seconds=agent_watchdog_limits()[0],
                 experiment_logger=elog,
                 phase="implementation_repair",
+                on_process=lambda process: self._track_process(experiment_id, process),
             )
+            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+                return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:
                 self._force_status(
                     experiment_id,
@@ -1201,7 +1275,10 @@ class ExperimentService:
                 # suite runs; the per-test entries stay in the dedicated test
                 # log rather than flooding this one.
                 on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
+                on_process=lambda process: self._track_process(experiment_id, process),
             )
+            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+                return self.get_experiment(experiment_id)
             test_exit_code = test_run.exit_code
             test_output = test_run.output
             test_timed_out = test_run.timed_out

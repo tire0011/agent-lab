@@ -275,6 +275,8 @@ class ExperimentSummary(BaseModel):
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
     branch_name: str | None = None
     test_exit_code: int | None = None
     error: str | None = None
@@ -293,6 +295,8 @@ class ExperimentDetail(BaseModel):
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
     plan: dict[str, Any] | None = None
     worktree_path: str | None = None
     branch_name: str | None = None

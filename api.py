@@ -38,7 +38,11 @@ from modules.heartbeat import resolve_stale_timeout
 from modules.nexus_task_store import NexusTaskStore
 from modules.task_orchestrator import TaskOrchestratorError
 from modules.experiment_adoption_service import ExperimentAdoptionError, ExperimentAdoptionService
-from modules.experiment_service import ExperimentNotFoundError, ExperimentService
+from modules.experiment_service import (
+    ExperimentNotCancellableError,
+    ExperimentNotFoundError,
+    ExperimentService,
+)
 from modules.failure_analysis_service import FailureAnalysisService
 from modules.operations_registry import OperationValidationError, OperationsRegistry
 from modules.operation_chain_service import OperationChainService
@@ -1034,6 +1038,23 @@ def get_experiment(
     return ExperimentDetail(**payload)
 
 
+@app.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)
+def cancel_experiment(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    x_cancelled_by: str | None = Header(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ExperimentDetail:
+    authorize(x_api_key)
+    try:
+        experiment = service.cancel_experiment(experiment_id, x_cancelled_by or "api")
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    except ExperimentNotCancellableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return ExperimentDetail(**experiment.to_dict())
+
+
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 
 # Coarse groupings of a structured JSONL entry's ``phase`` into the
@@ -1421,6 +1442,7 @@ _PUBLIC_PHASES = {
     "queued": "queued", "selecting": "selecting", "implementing": "implementing",
     "verifying": "verifying", "succeeded": "succeeded", "failed": "failed",
     "needs_review": "needs_review", "timed_out": "failed", "rejected": "needs_review",
+    "cancelled": "failed",
 }
 
 
@@ -1439,6 +1461,8 @@ def _failure_reason(experiment) -> str | None:
         return "Experiment timed out."
     if experiment.status == "rejected":
         return "Experiment was rejected by the safety policy."
+    if experiment.status == "cancelled":
+        return "Experiment was cancelled."
     if experiment.status == "needs_review":
         return "Experiment requires human review."
     if experiment.status == "failed":

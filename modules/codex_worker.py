@@ -149,6 +149,7 @@ class CodexWorker:
         experiment_logger: Any | None = None,
         phase: str = "codex",
         stall_seconds: float | None = None,
+        on_process: Any | None = None,
     ) -> CodexResult:
         """Execute *task* non-interactively via ``codex exec``.
 
@@ -242,7 +243,7 @@ class CodexWorker:
                     timeout_seconds=timeout_seconds,
                 )
 
-            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds)
+            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process)
         finally:
             if schema_path is not None:
                 try:
@@ -354,6 +355,7 @@ class CodexWorker:
         task: str,
         sandbox: str,
         stall_seconds: float | None = None,
+        on_process: Any | None = None,
     ) -> CodexResult:
         timed_out = False
         proc_error: str | None = None
@@ -367,6 +369,7 @@ class CodexWorker:
                 watched = run_watched(
                     cmd, cwd=working_dir, env=self._safe_env(),
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
+                    on_process=on_process,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:

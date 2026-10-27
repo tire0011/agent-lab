@@ -18,6 +18,7 @@ STATUS_SUCCEEDED = "succeeded"
 STATUS_FAILED = "failed"
 STATUS_TIMED_OUT = "timed_out"
 STATUS_NEEDS_REVIEW = "needs_review"
+STATUS_CANCELLED = "cancelled"
 
 EXPERIMENT_STATUSES = (
     STATUS_QUEUED,
@@ -29,6 +30,7 @@ EXPERIMENT_STATUSES = (
     STATUS_FAILED,
     STATUS_TIMED_OUT,
     STATUS_NEEDS_REVIEW,
+    STATUS_CANCELLED,
 )
 
 _TERMINAL_STATUSES = (
@@ -37,6 +39,7 @@ _TERMINAL_STATUSES = (
     STATUS_FAILED,
     STATUS_TIMED_OUT,
     STATUS_NEEDS_REVIEW,
+    STATUS_CANCELLED,
 )
 
 # Valid forward state transitions. ``run_experiment`` walks this graph and
@@ -47,8 +50,8 @@ _TERMINAL_STATUSES = (
 _STATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
     STATUS_QUEUED: (STATUS_IMPLEMENTING, STATUS_REJECTED, STATUS_FAILED, STATUS_SELECTING),
     STATUS_SELECTING: (STATUS_REJECTED, STATUS_IMPLEMENTING, STATUS_FAILED, STATUS_TIMED_OUT),
-    STATUS_IMPLEMENTING: (STATUS_VERIFYING, STATUS_REJECTED, STATUS_FAILED, STATUS_TIMED_OUT),
-    STATUS_VERIFYING: (STATUS_SUCCEEDED, STATUS_FAILED, STATUS_NEEDS_REVIEW, STATUS_TIMED_OUT),
+    STATUS_IMPLEMENTING: (STATUS_VERIFYING, STATUS_REJECTED, STATUS_FAILED, STATUS_TIMED_OUT, STATUS_CANCELLED),
+    STATUS_VERIFYING: (STATUS_SUCCEEDED, STATUS_FAILED, STATUS_NEEDS_REVIEW, STATUS_TIMED_OUT, STATUS_CANCELLED),
 }
 
 class ExperimentNotFoundError(LookupError):
@@ -57,6 +60,10 @@ class ExperimentNotFoundError(LookupError):
 
 class ExperimentNotRunnableError(RuntimeError):
     """Raised when ``run_experiment`` is called on an experiment already started."""
+
+
+class ExperimentNotCancellableError(RuntimeError):
+    """Raised when cancellation is requested outside an active phase."""
 
 
 @dataclass
@@ -114,6 +121,8 @@ class Experiment:
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
     plan: dict[str, Any] | None = None
     worktree_path: str | None = None
     branch_name: str | None = None
@@ -164,6 +173,8 @@ class Experiment:
             "implementation_started_at": self.implementation_started_at,
             "implementation_ended_at": self.implementation_ended_at,
             "ended_at": self.ended_at,
+            "cancelled_at": self.cancelled_at,
+            "cancelled_by": self.cancelled_by,
             "plan": self.plan,
             "worktree_path": self.worktree_path,
             "branch_name": self.branch_name,
@@ -223,6 +234,8 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         implementation_started_at=row["implementation_started_at"],
         implementation_ended_at=row["implementation_ended_at"],
         ended_at=row["ended_at"],
+        cancelled_at=row["cancelled_at"] if "cancelled_at" in row.keys() else None,
+        cancelled_by=row["cancelled_by"] if "cancelled_by" in row.keys() else None,
         plan=_json_or_none(row["plan_json"]),
         worktree_path=row["worktree_path"],
         branch_name=row["branch_name"],

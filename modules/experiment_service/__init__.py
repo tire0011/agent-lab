@@ -48,6 +48,7 @@ from .git_utils import _run_git
 from .models import (
     EXPERIMENT_STATUSES,
     STATUS_FAILED,
+    STATUS_CANCELLED,
     STATUS_IMPLEMENTING,
     STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
@@ -58,6 +59,7 @@ from .models import (
     STATUS_VERIFYING,
     Experiment,
     ExperimentNotFoundError,
+    ExperimentNotCancellableError,
     ExperimentNotRunnableError,
     ExperimentPlan,
     _STATE_TRANSITIONS,
