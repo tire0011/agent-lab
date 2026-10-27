@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,6 +57,7 @@ from .models import (
     STATUS_SUCCEEDED,
     STATUS_TIMED_OUT,
     STATUS_VERIFYING,
+    _TERMINAL_STATUSES,
     _row_to_experiment,
 )
 from .policy import _check_goal_policy, _policy_rule_for_reason
@@ -91,6 +94,50 @@ _DEFAULT_MAX_REPAIR_ITERATIONS = 2
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
+
+# Worktree retention (#376). Every experiment keeps its worktree after it ends
+# so it can be inspected, retried or adopted - but a full checkout per run on a
+# 1 GB VM silently exhausts the disk. Terminal experiments whose ``ended_at``
+# is older than this many hours have their worktree directory removed; the
+# experiment row, its log and its branch are kept. ``0`` disables cleanup, and
+# so does anything unparsable or negative: a typo must not start deleting.
+WORKTREE_RETENTION_ENV_VAR = "NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS"
+DEFAULT_WORKTREE_RETENTION_HOURS = 7 * 24
+
+# Adoption statuses that still need the experiment's worktree, whatever its age.
+_ADOPTION_TERMINAL_STATUSES = ("adopted", "needs_review", "failed", "interrupted")
+
+
+def worktree_retention_hours(raw: str | None = None) -> float:
+    """Configured worktree retention in hours; ``0`` disables cleanup."""
+    value = raw if raw is not None else os.environ.get(WORKTREE_RETENTION_ENV_VAR)
+    if value is None or not str(value).strip():
+        return float(DEFAULT_WORKTREE_RETENTION_HOURS)
+    try:
+        hours = float(str(value).strip())
+    except ValueError:
+        logger.warning("ignoring invalid %s value; worktree cleanup disabled", WORKTREE_RETENTION_ENV_VAR)
+        return 0.0
+    return hours if hours > 0 and hours != float("inf") else 0.0
+
+
+def _parse_utc(timestamp: str | None) -> datetime | None:
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(timestamp))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@dataclass
+class WorktreeCleanupResult:
+    """What one worktree retention pass did, for logging and tests."""
+
+    retention_hours: float
+    removed: list[str] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
 
 # Progress-aware local verification (#209). The verification subprocess is no
 # longer bounded by a fixed wall-clock timeout, adaptive or not: a wall-clock
@@ -1493,7 +1540,7 @@ class ExperimentService:
         return self.get_experiment(experiment_id)
 
     # ------------------------------------------------------------------
-    # Cleanup — explicit only, never automatic
+    # Cleanup — explicit removal of worktree and branch
     # ------------------------------------------------------------------
 
     def cleanup_worktree(self, experiment_id: str) -> None:
@@ -1516,3 +1563,120 @@ class ExperimentService:
         if experiment.branch_name:
             _run_git(["branch", "-D", experiment.branch_name], cwd=self.repo_root, elog=elog, phase="cleanup")
         elog.info("cleanup", "worktree_cleanup_done", "Experiment worktree and branch cleanup finished")
+
+    # ------------------------------------------------------------------
+    # Worktree retention (#376) — startup and periodic, terminal runs only
+    # ------------------------------------------------------------------
+
+    def cleanup_expired_worktrees(
+        self, retention_hours: float | None = None, *, now: datetime | None = None
+    ) -> WorktreeCleanupResult:
+        """Remove worktrees of terminal experiments that ended over ``retention_hours`` ago.
+
+        ``retention_hours`` defaults to ``NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS``
+        (see ``worktree_retention_hours``); ``0`` disables the pass. Only the
+        worktree directory goes: the experiment row (including its
+        ``worktree_path``), its JSONL log and its branch are kept, so the
+        record stays complete and committed work stays recoverable.
+
+        A worktree is never removed while its experiment is non-terminal, has
+        no ``ended_at``, ended within the retention window, or has an adoption
+        that has not finished, nor when its path lies outside
+        ``worktrees_root``. Already-missing directories are skipped silently,
+        so repeated passes are no-ops. A failure on one worktree is recorded
+        (activity log, experiment log) and does not stop the others.
+        """
+        hours = worktree_retention_hours() if retention_hours is None else max(0.0, float(retention_hours))
+        result = WorktreeCleanupResult(retention_hours=hours)
+        if hours <= 0:
+            return result
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=hours)
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ended_at, worktree_path FROM experiments "
+                f"WHERE status IN ({', '.join('?' * len(_TERMINAL_STATUSES))}) "
+                "AND worktree_path IS NOT NULL AND worktree_path != ''",
+                _TERMINAL_STATUSES,
+            ).fetchall()
+        for row in rows:
+            ended_at = _parse_utc(row["ended_at"])
+            if ended_at is None or ended_at > cutoff:
+                continue
+            path = Path(row["worktree_path"])
+            if not path.exists() and not path.is_symlink():
+                continue
+            try:
+                if self._remove_expired_worktree(row["id"], path, hours):
+                    result.removed.append(row["id"])
+            except Exception as exc:  # noqa: BLE001 - one bad worktree must not stop the pass
+                reason = sanitized_reason(f"{type(exc).__name__}: {exc}")
+                result.errors[row["id"]] = reason
+                self._record_worktree_cleanup_error(row["id"], str(path), reason)
+        return result
+
+    def _remove_expired_worktree(self, experiment_id: str, path: Path, hours: float) -> bool:
+        """Remove one expired worktree; ``False`` if it turned out to be still needed."""
+        terminal = ", ".join("?" * len(_TERMINAL_STATUSES))
+        finished = ", ".join("?" * len(_ADOPTION_TERMINAL_STATUSES))
+        with self._lock:
+            # Re-checked right before deleting: an adoption may have been
+            # queued since the candidates were listed.
+            still_expired = self._conn.execute(
+                f"SELECT 1 FROM experiments e WHERE e.id = ? AND e.status IN ({terminal}) "
+                "AND NOT EXISTS (SELECT 1 FROM experiment_adoptions a "
+                f"WHERE a.experiment_id = e.id AND a.status NOT IN ({finished}))",
+                (experiment_id, *_TERMINAL_STATUSES, *_ADOPTION_TERMINAL_STATUSES),
+            ).fetchone()
+        if still_expired is None:
+            return False
+
+        root = Path(self.worktrees_root).resolve()
+        if path.is_symlink() or root not in path.resolve().parents:
+            raise ValueError(f"refusing to remove {path}: not a directory inside {root}")
+
+        elog = self.get_experiment_logger(experiment_id)
+        try:
+            # Unregisters the worktree from the main repository; the rmtree
+            # below is what actually guarantees the directory is gone.
+            _run_git(
+                ["worktree", "remove", "--force", str(path)],
+                cwd=self.repo_root, elog=elog, phase="cleanup",
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("git worktree remove failed for %s: %s", path, exc)
+        if path.exists():
+            shutil.rmtree(path)
+
+        message = f"Removed worktree {path} after the {hours:g} h retention window"
+        with self._lock, self._conn:
+            insert_activity(
+                self._conn,
+                timestamp=_utcnow_iso(),
+                entity_type="experiment",
+                entity_id=experiment_id,
+                event="worktree_removed",
+                message=message,
+            )
+        logger.info("experiment %s: %s", experiment_id, message)
+        elog.info("cleanup", "worktree_retention_removed", message, worktree_path=str(path))
+        return True
+
+    def _record_worktree_cleanup_error(self, experiment_id: str, path: str, reason: str) -> None:
+        logger.warning("experiment %s: could not remove expired worktree %s: %s", experiment_id, path, reason)
+        try:
+            with self._lock, self._conn:
+                insert_activity(
+                    self._conn,
+                    timestamp=_utcnow_iso(),
+                    entity_type="experiment",
+                    entity_id=experiment_id,
+                    event="worktree_cleanup_failed",
+                    message=reason,
+                )
+            self.get_experiment_logger(experiment_id).error(
+                "cleanup", "worktree_retention_failed",
+                "Could not remove expired worktree", worktree_path=path, reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - recording is best effort
+            logger.warning("could not record worktree cleanup failure for %s: %s", experiment_id, exc)

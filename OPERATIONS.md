@@ -59,6 +59,21 @@ Optional, for controller work liveness (see ARCHITECTURE.md section 10):
   fallback, which now only applies to sessions that never reported a
   heartbeat at all.
 
+Optional, for experiment worktree retention (issue #376). Every experiment
+keeps its worktree under `~/agent-worktrees/<experiment-id>` after it ends; the
+API at startup and every `nexus_tick` run remove those that are no longer needed.
+
+- `NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS` (default 168, i.e. 7 days) - how
+  long after its `ended_at` a terminal experiment (`succeeded`, `failed`,
+  `interrupted`, `timed_out`, `needs_review`, `cancelled`, `rejected`) keeps its
+  worktree. Only the directory is removed: the experiment row, its log and its
+  branch are kept. Worktrees of non-terminal experiments, of experiments with
+  an unfinished adoption, of experiments with no `ended_at`, and paths outside
+  the worktrees root are never touched. `0` disables cleanup, and so does an
+  unparsable or negative value. Each removal is recorded as a
+  `worktree_removed` activity event, and each failure as
+  `worktree_cleanup_failed`. A failure never blocks startup or a tick.
+
 Optional, for the local verification test watchdog (issue #209). Local
 verification is bounded by *progress*, not by a fixed wall-clock timeout: the
 run continues for as long as tests keep starting and finishing.
