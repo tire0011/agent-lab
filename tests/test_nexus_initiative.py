@@ -45,7 +45,7 @@ class InitiativeFixture:
             """
             CREATE TABLE experiments (
                 id TEXT PRIMARY KEY, goal TEXT, status TEXT,
-                ended_at TEXT, created_at TEXT
+                ended_at TEXT, created_at TEXT, error TEXT
             );
             CREATE TABLE experiment_adoptions (
                 experiment_id TEXT PRIMARY KEY, status TEXT

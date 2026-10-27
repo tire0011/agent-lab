@@ -277,6 +277,9 @@ _LLM_TOKEN_METRIC_REGEXES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\btokens?\s+budget\b", re.IGNORECASE),
     re.compile(r"\btokens?\s+per\s+second\b", re.IGNORECASE),
     re.compile(r"\btokens?\s+rate\b", re.IGNORECASE),
+    # A quantity of tokens is a measure, not a credential (#348: "used more
+    # than a million tokens").
+    re.compile(r"\b(?:\d[\d,.]*\s*[km]?|hundred|thousand|million|billion)\s+tokens\b", re.IGNORECASE),
 )
 _CREDENTIAL_QUALIFIED_TOKEN_REGEX = re.compile(
     r"\b(?:access|auth|authentication|api|bearer|credential|secret|session|oauth)\s+tokens?\b",

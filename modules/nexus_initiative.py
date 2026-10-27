@@ -489,6 +489,26 @@ class NexusInitiativeService:
             found.extend(self._idea_candidates())
         return found
 
+    def _recent_experiments(self, limit: int = 10) -> list[dict[str, str]]:
+        """What Nexus tried lately and how it ended, for its own ideas."""
+        try:
+            rows = self._conn.execute(
+                "SELECT goal, status, error FROM experiments "
+                "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        recent = []
+        for row in rows:
+            lines = str(row["goal"] or "").strip().splitlines()
+            recent.append({
+                "title": lines[0][:120] if lines else "",
+                "status": str(row["status"] or ""),
+                "error": " ".join(str(row["error"] or "").split())[:200],
+            })
+        return recent
+
     def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:
         """The one issue the planner picks as next, or none (#354).
 
@@ -498,7 +518,8 @@ class NexusInitiativeService:
         if not issues:
             return []
         choice = self._planner.choose(
-            [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues]
+            [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues],
+            recent=self._recent_experiments(),
         )
         if choice is None:
             return []
