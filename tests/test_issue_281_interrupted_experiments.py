@@ -1,9 +1,10 @@
-"""#281: experiments cut off by a service restart must not stay active forever.
+"""#281/#371: interrupted experiments must not stay active forever.
 
 The experiment thread dies with the ``agent-api`` process. At startup every
 experiment still in ``selecting``/``implementing``/``verifying`` is therefore
-orphaned; it is marked ``failed`` with ``interrupted by service restart`` so
-the Nexus session waiting on it resumes and the task continues or ends.
+orphaned. Legacy ``selecting`` rows are marked ``failed``; ``implementing`` and
+``verifying`` rows become ``interrupted``. Every reconciled row records the
+restart explanation so the Nexus session waiting on it can resume safely.
 """
 
 from __future__ import annotations
