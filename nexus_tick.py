@@ -233,6 +233,25 @@ def _reconcile_stale_claims(db_path: str) -> None:
                 pass
 
 
+def _cleanup_expired_worktrees(service) -> None:
+    """Remove worktrees of terminal experiments past their retention (#376).
+
+    The API only cleans up at startup; the tick is what keeps a long-running
+    deployment from filling its disk. Never fails the tick.
+    """
+    experiment_service = getattr(service, "experiment_service", None)
+    if experiment_service is None:
+        return
+    try:
+        result = experiment_service.cleanup_expired_worktrees()
+        if result.removed:
+            logger.info("removed %d expired experiment worktree(s)", len(result.removed))
+        for experiment_id, reason in result.errors.items():
+            logger.warning("could not remove worktree of experiment %s: %s", experiment_id, reason)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not break a tick
+        logger.warning("could not clean up expired experiment worktrees: %s", exc)
+
+
 def _wait_for_experiments() -> None:
     """Keep the process alive until the work it started has ended (#358).
 
@@ -368,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if decision.decision != "error" else 1
     finally:
         _wait_for_experiments()
+        if not args.dry_run:
+            _cleanup_expired_worktrees(service)
         service.close()
         if not args.dry_run:
             if decision is not None and decision.decision == "error":

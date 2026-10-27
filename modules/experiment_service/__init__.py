@@ -139,8 +139,12 @@ from .service import (
     _TEST_COMMANDS,
     _TEST_TOTAL_SETTING_KEY,
     _WARNING_STATUSES,
+    DEFAULT_WORKTREE_RETENTION_HOURS,
+    WORKTREE_RETENTION_ENV_VAR,
     ExperimentService,
+    WorktreeCleanupResult,
     logger,
+    worktree_retention_hours,
 )
 from .text_utils import (
     _DIAGNOSTIC_EVENT_TYPES,

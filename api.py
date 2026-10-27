@@ -441,6 +441,18 @@ async def lifespan(app: FastAPI):
                 )
         except Exception as _exc:  # noqa: BLE001 - recovery must not block startup
             _logger.error("could not mark interrupted experiments: %s", _exc)
+        # Terminal experiments keep their worktree for inspection; past the
+        # retention window it is removed so finished runs cannot fill the
+        # disk (#376). Runs after the reconciliation above, which stamps
+        # just-interrupted runs with a fresh ended_at, so they are kept.
+        try:
+            _gc = _resolve_experiment_service().cleanup_expired_worktrees()
+            if getattr(_gc, "removed", None):
+                _logger.info("removed %d expired experiment worktree(s)", len(_gc.removed))
+            if getattr(_gc, "errors", None):
+                _logger.error("could not remove %d expired experiment worktree(s)", len(_gc.errors))
+        except Exception as _exc:  # noqa: BLE001 - cleanup must not block startup
+            _logger.error("could not clean up expired experiment worktrees: %s", _exc)
         mts = _resolve_mailbox_task_service()
         readiness = getattr(mts.github_work_tracking, "readiness_error", lambda: None)()
         if isinstance(readiness, str) and readiness:
