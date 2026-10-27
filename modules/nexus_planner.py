@@ -35,25 +35,32 @@ class PlanChoice:
     proposal_body: str = ""
 
 
-def planning_prompt(issues: list[dict[str, Any]]) -> str:
+def planning_prompt(issues: list[dict[str, Any]], recent: list[dict[str, str]] | None = None) -> str:
     lines = []
     for issue in issues:
         body = " ".join(str(issue.get("body") or "").split())[:_BODY_CHARS]
         lines.append(f"#{issue['number']} {issue['title']}\n{body}")
+    history = [
+        f"- {r.get('status', '')}: {r.get('title', '')}" + (f" ({r['error']})" if r.get("error") else "")
+        for r in recent or []
+    ]
     return (
-        "You plan the next piece of work for Nexus, a self-developing agent whose "
-        "code lives in this repository. Below are its open GitHub issues.\n\n"
-        "Pick the ONE issue that is the most useful to work on next. Prefer issues "
-        "that are concrete and small enough for one change with tests, and that "
-        "unblock or simplify later work. Skip issues that need a human decision, a "
-        "purchase, or setup outside the repository. The web UI is not a priority: "
-        "do not pick web UI work.\n\n"
+        "You are Nexus, an independent agent that develops itself. Your own code "
+        "lives in this repository, and you pick and do your own work. Below are "
+        "your open GitHub issues and how your most recent experiments ended.\n\n"
+        "Pick the ONE issue that is the most useful for you to work on next. Prefer "
+        "issues that are concrete and small enough for one change with tests, and "
+        "that unblock or simplify later work. Skip issues that need a human "
+        "decision, a purchase, or setup outside the repository. The web UI is not "
+        "a priority: do not pick web UI work.\n\n"
         "Also suggest exactly ONE new issue of your own: a concrete, testable "
-        "improvement that no listed issue covers and that makes Nexus work more "
-        "reliably or more autonomously. No web UI work.\n\n"
+        "improvement that no listed issue covers and that makes you work more "
+        "reliably or more autonomously. Base it on your own experience: what went "
+        "wrong or slowed you down in your recent experiments. No web UI work.\n\n"
         "Answer with exactly one JSON object and nothing else:\n"
         '{"issue": <number>, "reason": "<one sentence why this is next>", '
         '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
+        "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
         "OPEN ISSUES:\n\n" + "\n\n".join(lines)
     )
 
@@ -101,11 +108,13 @@ class IssuePlanner:
     def __init__(self, complete: Callable[[str], str]) -> None:
         self._complete = complete
 
-    def choose(self, issues: list[dict[str, Any]]) -> PlanChoice | None:
+    def choose(
+        self, issues: list[dict[str, Any]], recent: list[dict[str, str]] | None = None
+    ) -> PlanChoice | None:
         if not issues:
             return None
         try:
-            raw = self._complete(planning_prompt(issues))
+            raw = self._complete(planning_prompt(issues, recent))
         except Exception as exc:  # noqa: BLE001 - no plan is a valid outcome
             logger.warning("planner: model call failed: %s", exc)
             return None

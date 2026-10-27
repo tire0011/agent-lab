@@ -42,6 +42,7 @@ Two entry points are used by ``ExperimentService``:
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -381,6 +382,19 @@ class EvaluationResult:
         }
 
 
+def _git_ignored(path: str, worktree_path: str | None) -> bool:
+    """True if git ignores *path* in *worktree_path*; never raises."""
+    if not worktree_path or not path:
+        return False
+    try:
+        return subprocess.run(
+            ["git", "-C", worktree_path, "check-ignore", "-q", "--", _normalize_path(path)],
+            capture_output=True, timeout=10, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _artifact_exists(artifact: str, worktree_path: str | None) -> bool:
     """True if *artifact* exists as a real file inside *worktree_path*.
 
@@ -470,6 +484,9 @@ def evaluate_implementation(
             required_artifacts = extract_explicit_goal_artifacts(goal)
         expected_files = required_artifacts
 
+        # A git-ignored path (runtime state such as state/mailbox.lock) can
+        # never be committed, so it cannot be a required artifact (#185).
+        required_artifacts = [a for a in required_artifacts if not _git_ignored(a, worktree_path)]
         missing_artifacts = [a for a in required_artifacts if not _artifact_exists(a, worktree_path)]
         if missing_artifacts:
             checks.append(EvaluationCheck(
