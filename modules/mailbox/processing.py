@@ -11,6 +11,7 @@ from typing import Any
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from .refresh import process_refresh as _process_refresh
+from .task_ingest import insert_task_approval, resolve_idempotency_key
 
 from .core import (
     MAX_RETRY,
@@ -101,6 +102,10 @@ def _process_task(
     db_msg_id: int,
 ) -> tuple[str, None]:
     """Record task request and create pending approval."""
+    explicit_key = msg.meta.get("idempotency_key") or None
+    # A malformed key fails the message visibly instead of being swallowed
+    # by the best-effort approval insert below.
+    resolve_idempotency_key(db_msg_id, explicit_key)
     try:
         conn.execute(
             "UPDATE mailbox_messages SET task_body = ? WHERE id = ?",
@@ -111,24 +116,30 @@ def _process_task(
         logger.warning("_process_task: failed to store task_body for msg %s", db_msg_id)
 
     try:
+        # A retry of this same inbox row keeps the task it already created,
+        # even if the sender edited the file's key in between.
         existing = conn.execute(
             "SELECT id FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
             (db_msg_id,),
         ).fetchone()
         if not existing:
-            import uuid as _uuid
-            now = _now_iso()
-            approval_id = _uuid.uuid4().hex
-            conn.execute(
-                """
-                INSERT INTO mailbox_task_approvals
-                    (id, mailbox_msg_id, task_body, sender, file_path,
-                     received_at, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
-                """,
-                (approval_id, db_msg_id, msg.body, msg.created_by, str(msg.file_path), now, now, now),
+            # An optional front-matter ``idempotency_key`` lets a sender
+            # redeliver the same task as a new file without a second task
+            # (#378); otherwise the key is derived from this inbox row.
+            approval_id, created = insert_task_approval(
+                conn,
+                mailbox_msg_id=db_msg_id,
+                task_body=msg.body,
+                sender=msg.created_by,
+                file_path=str(msg.file_path),
+                received_at=_now_iso(),
+                idempotency_key=explicit_key,
             )
-            conn.commit()
+            if not created:
+                logger.info(
+                    "_process_task: msg %s is a duplicate delivery of task %s",
+                    db_msg_id, approval_id,
+                )
     except Exception:
         logger.warning("_process_task: failed to create approval for msg %s", db_msg_id, exc_info=True)
 
