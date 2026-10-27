@@ -120,8 +120,20 @@ class OperationsRegistry:
             )
         return normalized
 
-    def execute(self, operation: str, args: dict[str, Any] | None = None, *, caller: str = "authenticated caller") -> OperationResult:
+    def execute(
+        self,
+        operation: str,
+        args: dict[str, Any] | None = None,
+        *,
+        caller: str = "authenticated caller",
+        invocation_id: str | None = None,
+    ) -> OperationResult:
         params = self._normalize_args(operation, dict(args or {}))
+        invocation_id = self._normalize_invocation_id(invocation_id)
+        if invocation_id is not None:
+            recorded = self._recorded_result(invocation_id, operation, params)
+            if recorded is not None:
+                return recorded
         started = time.perf_counter()
         try:
             # Executability is defined by an implemented handler, not by the
@@ -142,8 +154,56 @@ class OperationsRegistry:
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 error_summary=sanitized_reason(str(exc)),
             )
-        self._audit(operation, params, result, caller=caller)
+        self._audit(
+            operation,
+            params,
+            result,
+            caller=caller,
+            invocation_id=invocation_id,
+        )
         return result
+
+    @staticmethod
+    def _normalize_invocation_id(invocation_id: str | None) -> str | None:
+        if invocation_id is None:
+            return None
+        if not isinstance(invocation_id, str):
+            raise OperationValidationError("invocation_id muss eine Zeichenfolge sein.")
+        value = invocation_id.strip()
+        if not value or len(value) > 200:
+            raise OperationValidationError("invocation_id muss 1 bis 200 Zeichen lang sein.")
+        return value
+
+    @staticmethod
+    def _logged_params(args: dict[str, Any]) -> dict[str, str]:
+        return {k: redact(str(v)) for k, v in args.items()}
+
+    def _recorded_result(
+        self,
+        invocation_id: str,
+        operation: str,
+        args: dict[str, Any],
+    ) -> OperationResult | None:
+        row = self._conn.execute(
+            "SELECT operation, parameters, result FROM operation_log WHERE invocation_id = ?",
+            (invocation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        expected_params = json.dumps(self._logged_params(args), sort_keys=True)
+        if row["operation"] != operation or row["parameters"] != expected_params:
+            raise OperationValidationError(
+                "invocation_id wurde bereits für eine andere Operation oder andere Argumente verwendet."
+            )
+        payload = json.loads(row["result"])
+        return OperationResult(
+            operation=payload["operation"],
+            success=bool(payload["success"]),
+            output_lines=list(payload.get("output_lines") or []),
+            duration_ms=int(payload.get("duration_ms") or 0),
+            exit_code=payload.get("exit_code"),
+            error_summary=payload.get("error_summary"),
+        )
 
     def _build_specs(self) -> dict[str, OperationSpec]:
         limit10 = OperationArgSpec("limit", "integer", "Maximale Anzahl Zeilen/Einträge.", default=10, minimum=1, maximum=100)
@@ -287,8 +347,18 @@ class OperationsRegistry:
             "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox.", tags=["mailbox", "outbox", "status", "messages"], mutates_state=False),
         }
 
-    def _audit(self, operation: str, args: dict[str, Any], result: OperationResult, *, caller: str) -> None:
+    def _audit(
+        self,
+        operation: str,
+        args: dict[str, Any],
+        result: OperationResult,
+        *,
+        caller: str,
+        invocation_id: str | None,
+    ) -> None:
         del caller  # never persist credentials or identifiers from the API key
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        logged_params = json.dumps(self._logged_params(args), sort_keys=True)
         self._conn.execute(
             """
             INSERT INTO operations_audit (id, timestamp, operation, args_json, success, duration_ms, error_summary)
@@ -296,12 +366,32 @@ class OperationsRegistry:
             """,
             (
                 uuid.uuid4().hex,
-                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                timestamp,
                 operation,
-                json.dumps({k: redact(str(v)) for k, v in args.items()}, sort_keys=True),
+                logged_params,
                 1 if result.success else 0,
                 result.duration_ms,
                 sanitized_reason(result.error_summary),
+            ),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO operation_log
+                (id, timestamp, operation, parameters, success, result, error,
+                 duration_ms, executor, invocation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                timestamp,
+                operation,
+                logged_params,
+                1 if result.success else 0,
+                json.dumps(result.to_dict(), sort_keys=True),
+                sanitized_reason(result.error_summary),
+                result.duration_ms,
+                "operations_registry",
+                invocation_id,
             ),
         )
         self._conn.commit()
