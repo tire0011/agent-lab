@@ -47,6 +47,7 @@ from .models import (
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
+    STATUS_INTERRUPTED,
     STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_REJECTED,
@@ -67,7 +68,7 @@ logger = logging.getLogger("modules.experiment_service")
 # as a small fixed set here so lifecycle logging in ``_transition``/
 # ``_force_status`` stays centralized and consistent.
 _WARNING_STATUSES = frozenset(
-    {"rejected", "failed", "timed_out", "needs_review", "cancelled"}
+    {"rejected", "failed", "timed_out", "needs_review", "cancelled", "interrupted"}
 )
 
 # Subset of the above that represents an actual failure (as opposed to a
@@ -679,11 +680,11 @@ class ExperimentService:
         )
 
     # ------------------------------------------------------------------
-    # mark_interrupted_experiments_failed — startup recovery (#281)
+    # mark_interrupted_experiments_failed — startup recovery (#281, #371)
     # ------------------------------------------------------------------
 
     def mark_interrupted_experiments_failed(self) -> list[str]:
-        """Mark experiments orphaned by a service restart as ``failed``.
+        """Reconcile experiments orphaned by a service restart.
 
         An experiment runs in a daemon thread of the ``agent-api`` process, so
         a restart kills it mid-flight and leaves its row in ``implementing`` or
@@ -696,7 +697,13 @@ class ExperimentService:
         ``MailboxTaskService.resume_finished_experiments``) and decide whether
         the task continues or ends.
 
-        Returns the list of experiment ids that were marked.
+        Implementation and verification runs become the distinct terminal
+        ``interrupted`` state. The legacy ``selecting`` phase still becomes
+        ``failed`` so old persisted rows retain their previous recovery
+        behaviour. Worktrees and their database references are deliberately
+        retained for inspection or retry.
+
+        Returns the list of experiment ids that were reconciled.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -706,11 +713,19 @@ class ExperimentService:
         marked: list[str] = []
         for row in rows:
             # Conditional per row: a status that moved on in between is left alone.
+            terminal_status = (
+                STATUS_FAILED if row["status"] == STATUS_SELECTING else STATUS_INTERRUPTED
+            )
             if self._transition(
-                row["id"], row["status"], STATUS_FAILED,
+                row["id"], row["status"], terminal_status,
                 ended_at=_utcnow_iso(),
                 error=_INTERRUPTED_BY_RESTART_ERROR,
             ):
+                # A newly constructed service has no live handles, but clearing
+                # the registry here also makes explicit/in-process startup
+                # reconciliation safe and prevents stale cancellation targets.
+                with self._process_lock:
+                    self._active_processes.pop(row["id"], None)
                 marked.append(row["id"])
         return marked
 
