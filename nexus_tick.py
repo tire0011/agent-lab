@@ -33,6 +33,10 @@ logger = logging.getLogger("nexus_tick")
 
 _ISSUE_LIMIT = 100
 
+# The exploring planner (#384) reads code and calls tools; bound it.
+_PLANNER_TIMEOUT_SECONDS = 900
+_PLANNER_STALL_SECONDS = 300
+
 # Things worth telling Claude about, collected during one tick (#365).
 _events: list[str] = []
 
@@ -110,8 +114,47 @@ def _count_open_proposals(repo_root: str) -> int:
     return len(json.loads(proc.stdout or "[]"))
 
 
-def _planner():
-    """The planning step runs on Azure, like the controller (#337, #354)."""
+def _explore_with_claude(repo_root: str, prompt: str) -> str:
+    """Plan as a read-only Claude agent with the Nexus MCP read tools (#384)."""
+    import tempfile
+
+    from modules.claude_worker import ClaudeWorker
+    from modules.nexus_mcp_tools import READ_ONLY_TOOLS, WRITE_TOOLS
+
+    key = os.environ.get("AGENT_API_KEY", "")
+    if not key:
+        raise RuntimeError("AGENT_API_KEY is not set")
+    config = {"mcpServers": {"nexus": {
+        "type": "http",
+        "url": os.environ.get("NEXUS_MCP_URL", "http://127.0.0.1:8000/mcp/"),
+        "headers": {"x-api-key": key},
+    }}}
+    allowed = ",".join(f"mcp__nexus__{name}" for name in READ_ONLY_TOOLS)
+    # Not pre-approved is already denied; naming the write tools makes it explicit.
+    denied = ",".join(f"mcp__nexus__{name}" for name in WRITE_TOOLS)
+    with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+        json.dump(config, handle)
+        handle.flush()
+        result = ClaudeWorker().run(
+            task=prompt,
+            working_dir=repo_root,
+            sandbox="read-only",
+            timeout_seconds=_PLANNER_TIMEOUT_SECONDS,
+            stall_seconds=_PLANNER_STALL_SECONDS,
+            phase="planning",
+            extra_args=[
+                "--mcp-config", handle.name,
+                "--allowedTools", allowed,
+                "--disallowedTools", denied,
+            ],
+        )
+    if not result.success:
+        raise RuntimeError(result.error or "claude planning failed")
+    return result.final_message or ""
+
+
+def _planner(repo_root: str):
+    """Plan as an exploring agent; a single Azure call is the fallback (#337, #354, #384)."""
     import asyncio
 
     from modules.nexus_delegation import NexusDelegationService
@@ -127,7 +170,7 @@ def _planner():
             raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
         return str(result.get("content") or "")
 
-    return IssuePlanner(complete)
+    return IssuePlanner(complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt))
 
 
 def _build_service(args) -> NexusInitiativeService:
@@ -154,7 +197,7 @@ def _build_service(args) -> NexusInitiativeService:
         adoption_service=adoption_service,
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
-        planner=_planner() if controller else None,
+        planner=_planner(args.repo_root) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),

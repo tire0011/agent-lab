@@ -218,6 +218,7 @@ class ClaudeWorker:
         phase: str = "claude",
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        extra_args: list[str] | None = None,
     ) -> WorkerResult:
         """Execute *task* non-interactively via the ``claude`` CLI.
 
@@ -275,6 +276,8 @@ class ClaudeWorker:
 
         # A progress-watched run (#327) streams events so every step shows up.
         cmd = self._build_command(sandbox, output_schema, stream=stall_seconds is not None)
+        # E.g. an MCP server and its pre-approved read tools for the planner (#384).
+        cmd += list(extra_args or [])
 
         if experiment_logger is not None:
             experiment_logger.debug(
