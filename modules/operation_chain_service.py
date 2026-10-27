@@ -341,7 +341,10 @@ class OperationChainService:
                     )
                     continue
 
-                step_result = self._execute_step(step)
+                step_result = self._execute_step(
+                    step,
+                    invocation_id=f"operation-chain:{request.request_id}:{step.id}",
+                )
                 step_results.append(step_result)
                 if step_result.status == "success":
                     steps_successful += 1
@@ -393,7 +396,12 @@ class OperationChainService:
         finally:
             self._running_threads.pop(chain_id, None)
 
-    def _execute_step(self, step: OperationChainStep) -> OperationChainStepResult:
+    def _execute_step(
+        self,
+        step: OperationChainStep,
+        *,
+        invocation_id: str | None = None,
+    ) -> OperationChainStepResult:
         """Execute one step and return result."""
         started_at = _now_iso()
         start_time = time.time()
@@ -409,7 +417,11 @@ class OperationChainService:
                     error="operations_registry not initialized",
                 )
 
-            result = self.operations_registry.execute(step.action, step.arguments)
+            result = self.operations_registry.execute(
+                step.action,
+                step.arguments,
+                invocation_id=invocation_id,
+            )
             output_lines = result.output_lines[:100]  # Limit to 100 lines
             output_lines = [line[:500] if len(line) > 500 else line for line in output_lines]
 

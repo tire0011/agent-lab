@@ -1165,6 +1165,7 @@ class NexusToolRouter:
                 operation,
                 args,
                 caller=self.caller,
+                invocation_id=decision.get("invocation_id"),
             )
         except ValueError as exc:
             # The registry answers a failing operation with a failed result and

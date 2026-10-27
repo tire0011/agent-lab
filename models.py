@@ -226,6 +226,15 @@ class OperationsExecuteArgs(BaseModel):
 class OperationsExecuteRequest(BaseModel):
     operation: str = Field(min_length=1, max_length=80)
     args: OperationsExecuteArgs = Field(default_factory=OperationsExecuteArgs)
+    invocation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Stable key for an operation attempt. Callers that retry after a timeout "
+            "or restart must reuse the same value to receive the recorded result."
+        ),
+    )
 
 
 class OperationArgumentDefinition(BaseModel):

@@ -753,7 +753,8 @@ def _migrate_operation_log(conn: sqlite3.Connection) -> None:
             result TEXT,
             error TEXT,
             duration_ms INTEGER,
-            executor TEXT
+            executor TEXT,
+            invocation_id TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_operation_log_timestamp
@@ -761,4 +762,11 @@ def _migrate_operation_log(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_operation_log_operation
             ON operation_log(operation);
         """
+    )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(operation_log)")}
+    if "invocation_id" not in existing:
+        conn.execute("ALTER TABLE operation_log ADD COLUMN invocation_id TEXT NULL")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_log_invocation_id "
+        "ON operation_log(invocation_id) WHERE invocation_id IS NOT NULL"
     )

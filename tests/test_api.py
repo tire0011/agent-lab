@@ -705,7 +705,9 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         self.assertEqual(catalog.json()["count"], 1)
         execute = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git_log", "args": {"limit": 5}})
         self.assertEqual(execute.status_code, 200)
-        self.operations_service.execute.assert_called_with("git_log", {"limit": 5})
+        self.operations_service.execute.assert_called_with(
+            "git_log", {"limit": 5}, invocation_id=None
+        )
         self.assertEqual(execute.json()["output_lines"], ["abc init"])
 
     def test_operations_execute_maps_validation_errors_to_400(self):

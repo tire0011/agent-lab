@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from modules.operations_registry import (
+    OperationResult,
     OperationValidationError,
     OperationsRegistry,
 )
@@ -489,6 +490,89 @@ class OperationsRegistryTests(unittest.TestCase):
         self.assertEqual(json.loads(row[1]), {"limit": "1"})
         self.assertEqual(row[2], 1)
         self.assertIsNone(row[3])
+
+    def test_same_invocation_id_replays_terminal_result_without_side_effect(self):
+        calls = []
+
+        def side_effect(args):
+            calls.append(dict(args))
+            return OperationResult("side_effect", True, [f"call {len(calls)}"], 7)
+
+        self.registry._op_side_effect = side_effect
+        first = self.registry.execute(
+            "side_effect", {"value": "one"}, invocation_id="retry-1"
+        )
+        # Reopen the registry to prove the key/result survives a process-style
+        # restart rather than relying on in-memory state.
+        replay_registry = OperationsRegistry(
+            experiment_service=self.exp_service,
+            db_path=self.registry.db_path,
+            repo_root=str(self.repo),
+            mailbox_lock_path=str(Path(self.tmp.name) / "mailbox.lock"),
+            mailbox_processor_factory=FakeProcessor,
+            meminfo_path=str(self.meminfo),
+        )
+        self.addCleanup(replay_registry.close)
+        replay_registry._op_side_effect = side_effect
+        second = replay_registry.execute(
+            "side_effect", {"value": "one"}, invocation_id="retry-1"
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second.to_dict(), first.to_dict())
+        row = self.registry._conn.execute(
+            "SELECT invocation_id, success, result FROM operation_log WHERE invocation_id = ?",
+            ("retry-1",),
+        ).fetchone()
+        self.assertEqual(row["invocation_id"], "retry-1")
+        self.assertEqual(row["success"], 1)
+        self.assertEqual(json.loads(row["result"]), first.to_dict())
+
+    def test_different_invocation_ids_execute_independently(self):
+        calls = []
+
+        def side_effect(args):
+            calls.append(dict(args))
+            return OperationResult("side_effect", True, [str(len(calls))], 1)
+
+        self.registry._op_side_effect = side_effect
+        first = self.registry.execute("side_effect", {}, invocation_id="call-a")
+        second = self.registry.execute("side_effect", {}, invocation_id="call-b")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(first.output_lines, ["1"])
+        self.assertEqual(second.output_lines, ["2"])
+
+    def test_failed_invocation_is_durable_and_replayed(self):
+        calls = []
+
+        def failing(_args):
+            calls.append("called")
+            raise RuntimeError("stable failure")
+
+        self.registry._op_side_effect = failing
+        first = self.registry.execute("side_effect", {}, invocation_id="failed-1")
+        second = self.registry.execute("side_effect", {}, invocation_id="failed-1")
+
+        self.assertEqual(calls, ["called"])
+        self.assertFalse(first.success)
+        self.assertEqual(second.to_dict(), first.to_dict())
+        row = self.registry._conn.execute(
+            "SELECT success, error FROM operation_log WHERE invocation_id = ?",
+            ("failed-1",),
+        ).fetchone()
+        self.assertEqual(row["success"], 0)
+        self.assertEqual(row["error"], "stable failure")
+
+    def test_invocation_id_cannot_be_reused_for_different_arguments(self):
+        self.registry._op_side_effect = lambda args: OperationResult(
+            "side_effect", True, [], 0
+        )
+        self.registry.execute("side_effect", {"value": "one"}, invocation_id="conflict")
+        with self.assertRaises(OperationValidationError):
+            self.registry.execute(
+                "side_effect", {"value": "two"}, invocation_id="conflict"
+            )
 
 
 if __name__ == "__main__":

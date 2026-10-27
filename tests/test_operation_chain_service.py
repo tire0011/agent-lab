@@ -135,7 +135,11 @@ class TestOperationChainService:
         current = service.get_chain(result.request_id)
         assert current is not None
         assert current.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS)
-        mock_registry.execute.assert_called_with("local_model_status", {})
+        mock_registry.execute.assert_called_with(
+            "local_model_status",
+            {},
+            invocation_id=f"operation-chain:{result.request_id}:step1",
+        )
 
     def test_max_ten_steps_limit_rejected(self):
         """A chain with >10 steps cannot even be constructed."""
@@ -251,7 +255,7 @@ class TestOperationChainService:
         """Test stop_on_error stops execution."""
         # Mock registry to fail on second step
         call_count = [0]
-        def side_effect(action, args):
+        def side_effect(action, args, **_kwargs):
             call_count[0] += 1
             if call_count[0] == 2:
                 result = Mock()

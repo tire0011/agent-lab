@@ -1432,6 +1432,7 @@ def execute_operation(
         result = operations_service.execute(
             request.operation,
             request.args.model_dump(exclude_none=True),
+            invocation_id=request.invocation_id,
         )
     except OperationValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
