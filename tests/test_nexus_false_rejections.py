@@ -48,6 +48,21 @@ class GitIgnoredArtifactTests(unittest.TestCase):
         self.assertEqual(result.missing_artifacts, ["modules/mailbox/missing.py"])
 
 
+class HandoverPathTests(unittest.TestCase):
+    def test_paths_in_the_handover_are_not_required(self):
+        from modules.experiment_evaluation import extract_explicit_goal_artifacts
+        from modules.experiment_handover import with_handover
+
+        goal = with_handover(
+            "GitHub Issue #349: add modules/experiment_reflection_service.py",
+            "What Nexus already found (handover):\n\n- command ls .git/hooks: "
+            "git/hooks/applypatch-msg.sample git/hooks/commit-msg.sample",
+        )
+        self.assertEqual(
+            extract_explicit_goal_artifacts(goal), ["modules/experiment_reflection_service.py"]
+        )
+
+
 class TokenQuantityTests(unittest.TestCase):
     def test_a_quantity_of_llm_tokens_is_not_a_credential_action(self):
         self.assertIsNone(_check_goal_policy(
