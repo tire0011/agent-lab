@@ -1161,11 +1161,14 @@ class NexusToolRouter:
                 ),
             }
         try:
+            execute_kwargs: dict[str, Any] = {"caller": self.caller}
+            invocation_id = decision.get("invocation_id")
+            if invocation_id is not None:
+                execute_kwargs["invocation_id"] = invocation_id
             result = self.operations_registry.execute(
                 operation,
                 args,
-                caller=self.caller,
-                invocation_id=decision.get("invocation_id"),
+                **execute_kwargs,
             )
         except ValueError as exc:
             # The registry answers a failing operation with a failed result and
