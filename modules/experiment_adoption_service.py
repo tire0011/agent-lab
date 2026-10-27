@@ -396,6 +396,17 @@ class ExperimentAdoptionService:
             )
             return False
 
+        merge_blocker = self._merge_forbidden_reason(experiment_id)
+        if merge_blocker is not None:
+            self._set_status(
+                experiment_id,
+                STATUS_NEEDS_REVIEW,
+                ended_at=_utcnow_iso(),
+                reason=sanitized_reason(merge_blocker),
+                updated_at=_utcnow_iso(),
+            )
+            return False
+
         blocker = self._recovery_blocker(experiment_id)
         if blocker is not None:
             self._set_status(
@@ -468,6 +479,19 @@ class ExperimentAdoptionService:
         if not worktree_path or not os.path.isdir(worktree_path):
             return "the experiment worktree is no longer available"
         return None
+
+    def _merge_forbidden_reason(self, experiment_id: str) -> str | None:
+        """Read the originating task's durable merge prohibition."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT merge_constraint_reason FROM mailbox_task_approvals
+                   WHERE experiment_id=? AND merge_forbidden=1 LIMIT 1""",
+                (experiment_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        detail = str(row["merge_constraint_reason"] or "explicit do not merge instruction")
+        return f"merge refused: {detail}; pull request is ready for review and was not merged"
 
     def _merged_sha_for(self, experiment_id: str) -> str | None:
         try:
@@ -1968,6 +1992,24 @@ class ExperimentAdoptionService:
                     draft=False,
                 )
                 self.github_work_tracking.mark_pull_request_ready(work_ref)
+                merge_blocker = self._merge_forbidden_reason(experiment_id)
+                if merge_blocker is not None:
+                    elog.warning(
+                        "adoption", "merge_refused", merge_blocker,
+                        pull_request_number=work_ref.pr_number,
+                    )
+                    return self._finish_review(
+                        experiment_id,
+                        reason=merge_blocker,
+                        actual_files=actual_files,
+                        expected_files=expected_files,
+                        test_exit_code=test_exit_code,
+                        test_output=bounded_test_output,
+                        experiment_commit_sha=experiment_commit_sha,
+                        integrated_commit_sha=integrated_commit_sha,
+                        diagnostic_worktree_path=str(integration_path),
+                        elog=elog,
+                    )
                 published_sha = self.github_work_tracking.merge_and_complete(
                     work_ref,
                     expected_head_sha=published_sha,

@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1061,6 +1062,22 @@ class GitHubWorkTrackingService:
         if ref.pr_number is None:
             raise GitHubWorkTrackingError("cannot merge work without a pull request")
 
+        refusal = self._merge_refusal(ref)
+        if refusal is not None:
+            with self._conn:
+                self._conn.execute(
+                    """INSERT INTO operations_audit
+                       (id, timestamp, operation, args_json, success, duration_ms, error_summary)
+                       VALUES (?, ?, 'merge_pull_request', ?, 0, 0, ?)""",
+                    (
+                        uuid.uuid4().hex,
+                        _utcnow_iso(),
+                        json.dumps({"pr_number": ref.pr_number, "experiment_id": ref.experiment_id}),
+                        refusal,
+                    ),
+                )
+            raise GitHubWorkTrackingError(refusal)
+
         # A pull request that GitHub already reports as merged must never be
         # merged a second time: after a restart mid-adoption the merge may
         # already have happened, and re-issuing it would either fail the
@@ -1082,6 +1099,27 @@ class GitHubWorkTrackingService:
             raise GitHubWorkTrackingError(str(result.get("message") or "GitHub did not merge the pull request"))
         self._close_completed_issue(ref)
         return str(result.get("sha") or expected_head_sha or "")
+
+    def _merge_refusal(self, ref: GitHubWorkRef) -> str | None:
+        try:
+            row = self._conn.execute(
+                """SELECT merge_constraint_reason FROM mailbox_task_approvals
+                   WHERE merge_forbidden=1 AND (
+                       (id=? AND ?='task') OR experiment_id=?
+                   ) LIMIT 1""",
+                (ref.source_id, ref.source_type, ref.experiment_id),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            # This service is also usable standalone in tools/tests whose DB
+            # has never hosted mailbox tasks. Only that absent-table case is
+            # equivalent to there being no task constraint.
+            if "no such table: mailbox_task_approvals" not in str(exc):
+                raise
+            return None
+        if row is None:
+            return None
+        detail = str(row["merge_constraint_reason"] or "explicit do not merge instruction")
+        return f"merge refused: {detail}; pull request remains open for review"
 
     def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
         self._request(
