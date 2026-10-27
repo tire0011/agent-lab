@@ -62,9 +62,9 @@ _TERMINAL_STATUSES = {_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STAT
 _NON_TERMINAL_STATUSES = {
     _STATUS_PENDING, _STATUS_APPROVED, _STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_NEXUS_DECIDING,
 }
-_EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected"}
+_EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected", "interrupted"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
-_EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review"}
+_EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review", "interrupted"}
 # After a failed experiment Nexus may try again, but a task gets at most this
 # many experiments in total (#263 step 4).
 _MAX_EXPERIMENTS_PER_TASK = 2
@@ -1006,7 +1006,7 @@ class MailboxTaskService:
                 self._transition_terminal(approval, _STATUS_SUCCEEDED, exp)
             elif exp.status in _EXP_FAILED_TERMINAL and self._nexus_decides_failure(approval):
                 continue
-            elif exp.status in ("failed", "timed_out"):
+            elif exp.status in ("failed", "timed_out", "interrupted"):
                 self._transition_terminal(approval, _STATUS_FAILED, exp)
             elif exp.status == "needs_review":
                 self._transition_terminal(approval, _STATUS_NEEDS_REVIEW, exp)

@@ -428,14 +428,14 @@ async def lifespan(app: FastAPI):
         # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
         # Never restarts execution and never starts a Codex process.
         _resolve_codex_service().mark_interrupted_tasks_failed()
-        # Experiment threads die with this process too (#281). Failing them
+        # Experiment threads die with this process too (#281, #371). Reconciling them
         # before the mailbox recovery below lets the waiting Nexus session
         # resume and decide whether the task continues or ends.
         try:
             _interrupted = _resolve_experiment_service().mark_interrupted_experiments_failed()
             if isinstance(_interrupted, list) and _interrupted:
                 _logger.warning(
-                    "marked %d experiment(s) interrupted by service restart as failed: %s",
+                    "reconciled %d experiment(s) interrupted by service restart: %s",
                     len(_interrupted),
                     ", ".join(_interrupted[:10]),
                 )
@@ -1443,6 +1443,7 @@ _PUBLIC_PHASES = {
     "verifying": "verifying", "succeeded": "succeeded", "failed": "failed",
     "needs_review": "needs_review", "timed_out": "failed", "rejected": "needs_review",
     "cancelled": "failed",
+    "interrupted": "failed",
 }
 
 
@@ -1463,6 +1464,8 @@ def _failure_reason(experiment) -> str | None:
         return "Experiment was rejected by the safety policy."
     if experiment.status == "cancelled":
         return "Experiment was cancelled."
+    if experiment.status == "interrupted":
+        return "Experiment was interrupted by a service restart."
     if experiment.status == "needs_review":
         return "Experiment requires human review."
     if experiment.status == "failed":
