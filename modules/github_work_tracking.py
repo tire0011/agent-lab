@@ -1187,6 +1187,19 @@ class GitHubWorkTrackingService:
         ]
         return matches[0] if len(matches) == 1 else None
 
+    def list_open_issue_titles(self) -> list[str]:
+        """Return open issue titles for advisory-reflection deduplication."""
+        result = self._request(
+            "GET", f"/repos/{self.repository}/issues?state=open&per_page=100"
+        )
+        if not isinstance(result, list):
+            return []
+        return [
+            str(item.get("title") or "")
+            for item in result
+            if isinstance(item, dict) and "pull_request" not in item and item.get("title")
+        ]
+
     def _create_issue(self, title: str, content: str) -> dict[str, Any]:
         body = (
             "Created automatically by Nexus before implementation so the work is durably traceable in GitHub.\n\n"

@@ -178,11 +178,27 @@ class MailboxTaskService:
             db_path=db_path,
             repo_root=str(self.repo_path),
         )
+        self._owns_reflection_service = False
+        if self.experiment_service is not None and getattr(
+            self.experiment_service, "reflection_service", None
+        ) is None:
+            from modules.experiment_reflection_service import ExperimentReflectionService
+
+            self.experiment_service.reflection_service = ExperimentReflectionService(
+                db_path=db_path,
+                open_issue_titles=self.github_work_tracking.list_open_issue_titles,
+            )
+            self._owns_reflection_service = True
 
     def close(self) -> None:
         # Finish queued diagnoses before closing their shared service/SQLite
         # connection. Analysis runs outside the mailbox poll loop.
         self._failure_analysis_executor.shutdown(wait=True)
+        if self._owns_reflection_service:
+            try:
+                self.experiment_service.reflection_service.close()
+            except Exception:
+                logger.exception("mailbox_task: failed closing experiment reflection service")
         nexus_task_store = getattr(self, "_nexus_task_store", None)
         if nexus_task_store is not None:
             nexus_task_store.close()
