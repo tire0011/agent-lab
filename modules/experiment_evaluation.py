@@ -197,8 +197,14 @@ _GOAL_PATH_RE = re.compile(r"\b[\w][\w-]*(?:/[\w.-]+)+\.[A-Za-z0-9]{1,8}\b")
 
 
 def extract_explicit_goal_artifacts(goal: str) -> list[str]:
+    # Only the task itself names files to create. The handover appended to it
+    # (#263) quotes whatever Nexus looked at - file listings, command output -
+    # and made ".git/hooks/*.sample" a required artifact for #349.
+    from modules.experiment_handover import HANDOVER_HEADING
+
+    task = (goal or "").split(HANDOVER_HEADING, 1)[0]
     found: list[str] = []
-    for match in _GOAL_PATH_RE.finditer(goal or ""):
+    for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
         if is_test_path(path) or is_ignored_support_path(path):
             continue
