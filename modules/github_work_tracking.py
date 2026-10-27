@@ -1214,11 +1214,17 @@ class GitHubWorkTrackingService:
         sha = str(((base.get("object") or {}).get("sha") or "")).strip()
         if not sha:
             raise GitHubWorkTrackingError("could not resolve target branch SHA")
-        self._request(
-            "POST",
-            f"/repos/{self.repository}/git/refs",
-            {"ref": f"refs/heads/{branch_name}", "sha": sha},
-        )
+        try:
+            self._request(
+                "POST",
+                f"/repos/{self.repository}/git/refs",
+                {"ref": f"refs/heads/{branch_name}", "sha": sha},
+            )
+        except GitHubWorkTrackingError as exc:
+            # The branch exists (a retry, #374, or a lookup that missed it):
+            # that is the state this method ensures, not a failure.
+            if "HTTP 422" not in str(exc) or "Reference already exists" not in str(exc):
+                raise
 
     def _find_by_source(self, source_type: str, source_id: str) -> GitHubWorkRef | None:
         row = self._conn.execute(
