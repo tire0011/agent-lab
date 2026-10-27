@@ -2520,7 +2520,9 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         entries = self._read_log(experiment.id)
         progress = [e for e in entries if e["event"] == "test_progress"]
         self.assertTrue(progress, "expected test heartbeat entries in the experiment log")
-        self.assertIn("current_test", progress[-1])
+        # A tick that lands after the test finished reports "<between tests>"
+        # without current_test, so only some entry must name the running test.
+        self.assertTrue(any("current_test" in e for e in progress), progress)
         self.assertIn("last_progress_age_seconds", progress[-1])
 
         # Per-test detail must NOT be duplicated into the global log.
