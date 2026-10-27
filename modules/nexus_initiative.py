@@ -60,6 +60,10 @@ _DEFAULT_DAILY_BUDGET = 5
 # Open proposals beyond this many are not added to (#354): they wait for review.
 _MAX_OPEN_PROPOSALS = 3
 
+# A failed issue experiment may be retried; the second failure ends it (#374).
+_RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted")
+_MAX_ISSUE_ATTEMPTS = 2
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -337,18 +341,37 @@ class NexusInitiativeService:
         return candidates
 
     def _linked_issue_numbers(self) -> set[int]:
-        numbers: set[int] = set()
+        """Issues not to start again (#374).
+
+        An issue is free again after a failed experiment, up to
+        ``_MAX_ISSUE_ATTEMPTS`` failed attempts. A running, succeeded or
+        under-review experiment, or a link without a known experiment, keeps
+        it blocked.
+        """
+        failed: dict[int, set[str]] = {}
+        blocked: set[int] = set()
         for table in ("github_experiment_links", "github_work_links"):
             try:
-                rows = self._conn.execute(f"SELECT issue_number FROM {table}").fetchall()
+                rows = self._conn.execute(
+                    f"""
+                    SELECT l.issue_number AS issue_number,
+                           l.experiment_id AS experiment_id, e.status AS status
+                    FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
+                    """
+                ).fetchall()
             except sqlite3.OperationalError:
                 continue
             for row in rows:
                 try:
-                    numbers.add(int(row["issue_number"]))
+                    number = int(row["issue_number"])
                 except (TypeError, ValueError):
                     continue
-        return numbers
+                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
+                    failed.setdefault(number, set()).add(str(row["experiment_id"]))
+                else:
+                    blocked.add(number)
+        blocked.update(n for n, ids in failed.items() if len(ids) >= _MAX_ISSUE_ATTEMPTS)
+        return blocked
 
     def _idea_candidates(self) -> list[Candidate]:
         lister = self._idea_lister
