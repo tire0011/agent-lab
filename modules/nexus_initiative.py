@@ -61,7 +61,9 @@ _DEFAULT_DAILY_BUDGET = 5
 _MAX_OPEN_PROPOSALS = 3
 
 # A failed issue experiment may be retried; the second failure ends it (#374).
-_RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted")
+# needs_review counts too: no human reviews it in autonomous runs, and the
+# gate that stopped it may have been fixed since (#185, #349, #378).
+_RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
 
 
@@ -344,9 +346,8 @@ class NexusInitiativeService:
         """Issues not to start again (#374).
 
         An issue is free again after a failed experiment, up to
-        ``_MAX_ISSUE_ATTEMPTS`` failed attempts. A running, succeeded or
-        under-review experiment, or a link without a known experiment, keeps
-        it blocked.
+        ``_MAX_ISSUE_ATTEMPTS`` failed attempts. A running or succeeded
+        experiment, or a link without a known experiment, keeps it blocked.
         """
         failed: dict[int, set[str]] = {}
         blocked: set[int] = set()
