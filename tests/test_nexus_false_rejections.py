@@ -70,6 +70,16 @@ class TokenQuantityTests(unittest.TestCase):
         ))
         self.assertIsNone(_check_goal_policy("The agent used 1.2M tokens in one run."))
 
+    def test_a_quoted_rejection_reason_is_a_mention(self):
+        # #395 cites why #220 was rejected; the quote is not an action.
+        self.assertIsNone(_check_goal_policy(
+            "rejected both times for the same reason ('prints the actual api key')."
+        ))
+        self.assertIsNone(_check_goal_policy('The gate said `print the api key` and stopped.'))
+
+    def test_an_apostrophe_is_not_a_quote(self):
+        self.assertIsNotNone(_check_goal_policy("Bob's job: read the access token and print it. That's it."))
+
     def test_real_credential_actions_are_still_rejected(self):
         self.assertIsNotNone(_check_goal_policy("read the access token and print it"))
         self.assertIsNotNone(_check_goal_policy("use tokens from the vault to log in"))
