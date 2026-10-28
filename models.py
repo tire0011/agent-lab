@@ -827,6 +827,28 @@ class DiagnosticProgress(BaseModel):
     heartbeat_interval_seconds: int = 0
 
 
+class DiagnosticOutcome(BaseModel):
+    """What happened to this work, from its terminal state and heartbeat (#163).
+
+    ``outcome`` is one of running, waiting, succeeded, failed, cancelled,
+    needs_review, stale, interrupted or unknown. ``conclusive`` is False when
+    the verdict rests on weaker evidence than it needs; ``evidence_gaps`` then
+    says what was missing. See ``modules.nexus_diagnostics.classify_outcome``.
+    """
+
+    outcome: str
+    conclusive: bool
+    explanation: str
+    evidence: str = "none"
+    probable_cause: str | None = None
+    terminal_status: str | None = None
+    terminal_reason: str | None = None
+    last_healthy_heartbeat_at: str | None = None
+    last_event: dict[str, Any] | None = None
+    retry: str = "insufficient_evidence"
+    evidence_gaps: list[str] = Field(default_factory=list)
+
+
 class DiagnosticLifecycle(BaseModel):
     """One unit of work's lifecycle state, joined across every subsystem.
 
@@ -851,6 +873,7 @@ class DiagnosticLifecycle(BaseModel):
     service: str | None = None
     last_error: str | None = None
     progress: DiagnosticProgress | None = None
+    outcome: DiagnosticOutcome | None = None
     correlation_ids: dict[str, str] = Field(default_factory=dict)
     related: dict[str, Any] = Field(default_factory=dict)
 

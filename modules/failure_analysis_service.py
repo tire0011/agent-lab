@@ -511,6 +511,25 @@ def _with_lifecycle_context(
         context["nexus_progress_detail"] = progress.reason
         context["nexus_last_progress_at"] = progress.last_progress_at
         context["nexus_last_progress_source"] = progress.source
+    outcome = getattr(state, "outcome", None)
+    if outcome is not None:
+        # The classified outcome (#163) is what keeps the analysis from
+        # guessing: "stale, last heartbeat 40 min ago" and "failed with an
+        # explicit error" call for different explanations.
+        context["nexus_outcome"] = outcome.outcome
+        context["nexus_outcome_conclusive"] = outcome.conclusive
+        context["nexus_outcome_detail"] = outcome.explanation
+        context["nexus_probable_cause"] = outcome.probable_cause
+        context["nexus_last_healthy_heartbeat_at"] = outcome.last_healthy_heartbeat_at
+        last_event = outcome.last_event or {}
+        if last_event:
+            context["nexus_last_event"] = (
+                f"{last_event.get('at')} {last_event.get('kind') or '-'}: "
+                f"{last_event.get('message') or ''}"
+            ).strip()[:500]
+        context["nexus_retry_hint"] = outcome.retry
+        if outcome.evidence_gaps:
+            context["nexus_evidence_gaps"] = "; ".join(outcome.evidence_gaps)
     context = {key: value for key, value in context.items() if value is not None}
     if isinstance(failure, dict):
         return {**context, **failure}
