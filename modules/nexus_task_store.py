@@ -351,6 +351,33 @@ class NexusTaskStore:
             )
         return events
 
+    def user_inputs(self, session_id: str) -> list[str]:
+        """Return complete user input events in their original order.
+
+        This is a durable-state read, not a prompt view: it deliberately has
+        no history limit or character budget. Knowledge-collector bookkeeping
+        remains auditable in the journal but is not user-authored task text.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT content, metadata_json
+                   FROM nexus_task_events
+                   WHERE session_id=? AND role='user' AND kind='input'
+                   ORDER BY id ASC""",
+                (session_id,),
+            ).fetchall()
+
+        inputs: list[str] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            if metadata.get("knowledge_collector_internal"):
+                continue
+            inputs.append(str(row["content"] or ""))
+        return inputs
+
     def history(
         self,
         session_id: str,
