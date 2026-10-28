@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.nexus_reviewer import default_reviewer
 from modules.experiment_adoption_service import (
     _NullExperimentLogger,
     STATUS_ADOPTED,
@@ -131,6 +132,7 @@ class TaskFinalizationCoordinator:
             db_path=db_path,
             repo_root=str(self.repo_root),
             github_work_tracking=github_work_tracking,
+            reviewer=default_reviewer(db_path),
         )
         self._owns_adoption_service = adoption_service is None
         self._restart_runner = restart_runner or self._restart_services

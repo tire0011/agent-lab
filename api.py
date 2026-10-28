@@ -214,7 +214,11 @@ def get_mailbox_task_service() -> MailboxTaskService:
 @lru_cache(maxsize=1)
 def get_experiment_adoption_service() -> ExperimentAdoptionService:
     """Singleton adoption service for the process."""
-    return ExperimentAdoptionService(experiment_service=_resolve_experiment_service())
+    from modules.nexus_reviewer import default_reviewer
+
+    return ExperimentAdoptionService(
+        experiment_service=_resolve_experiment_service(), reviewer=default_reviewer(),
+    )
 
 
 @lru_cache(maxsize=1)

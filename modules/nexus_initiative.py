@@ -356,8 +356,10 @@ class NexusInitiativeService:
                 rows = self._conn.execute(
                     f"""
                     SELECT l.issue_number AS issue_number,
-                           l.experiment_id AS experiment_id, e.status AS status
+                           l.experiment_id AS experiment_id, e.status AS status,
+                           a.status AS adoption_status
                     FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
+                    LEFT JOIN experiment_adoptions a ON a.experiment_id = l.experiment_id
                     """
                 ).fetchall()
             except sqlite3.OperationalError:
@@ -367,7 +369,9 @@ class NexusInitiativeService:
                     number = int(row["issue_number"])
                 except (TypeError, ValueError):
                     continue
-                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
+                # A review that blocked the merge (#396) fails the adoption of
+                # a succeeded experiment: that is a failed attempt too.
+                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or row["adoption_status"] == "failed":
                     failed.setdefault(number, set()).add(str(row["experiment_id"]))
                 else:
                     blocked.add(number)
