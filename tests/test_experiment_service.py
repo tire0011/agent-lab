@@ -270,6 +270,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(reloaded.status, STATUS_QUEUED)
 
     def test_successful_experiment_has_no_crash_metadata(self):
+        self.service.test_python_executable = sys.executable
         experiment = self.service.create_experiment(goal="g")
 
         result = self.service.run_experiment(experiment.id)
