@@ -196,6 +196,28 @@ def parse_git_status_short(git_status_text: str | None) -> ChangedFiles:
 _GOAL_PATH_RE = re.compile(r"\b[\w][\w-]*(?:/[\w.-]+)+\.[A-Za-z0-9]{1,8}\b")
 
 
+# A section heading at the start of a line: "Change:", "**Change**", "## Change".
+_SECTION_HEADING_RE = re.compile(
+    r"^[ \t]*(?:#+[ \t]*|\*\*)?(problem|change|changes|test|tests|why|context|background|notes?)\b"
+    r"(?:\*\*|[ \t]*:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _change_section(task: str) -> str:
+    """The Change section of an issue that has sections, else the whole text.
+
+    Problem and Test sections name files that already exist or test fixtures
+    (#416: example paths made #403 and #416 fail their own gate).
+    """
+    headings = list(_SECTION_HEADING_RE.finditer(task))
+    for index, heading in enumerate(headings):
+        if heading.group(1).lower() in ("change", "changes"):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(task)
+            return task[heading.start():end]
+    return task
+
+
 def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     # Only the task itself names files to create. The handover appended to it
     # (#263) quotes whatever Nexus looked at - file listings, command output -
@@ -203,6 +225,7 @@ def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
 
     task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+    task = _change_section(task)
     found: list[str] = []
     for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
