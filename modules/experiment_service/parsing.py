@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
+from modules.experiment_evaluation import drop_git_internal
+
 from .models import ExperimentPlan
+
+# The checkout this code runs from; experiment worktrees share its layout.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
 
 
 # JSON Schema for the structured plan, passed to Codex via
@@ -212,6 +218,8 @@ def parse_plan(raw_text: str | None) -> ExperimentPlan | None:
         affected_files = [p.strip() for p in re.split(r"[,\n]", affected_files_raw) if p.strip()]
     else:
         affected_files = []
+    # Paths inside git's own directory can never be committed (#403).
+    affected_files, _ = drop_git_internal(affected_files, _REPO_ROOT)
 
     required = {
         "title": _get_str("title"),
@@ -242,7 +250,7 @@ def parse_plan(raw_text: str | None) -> ExperimentPlan | None:
             return [p.strip() for p in re.split(r"[,\n]", value) if p.strip()]
         return []
 
-    required_artifacts = _get_list("required_artifacts")
+    required_artifacts, _ = drop_git_internal(_get_list("required_artifacts"), _REPO_ROOT)
     acceptance_criteria = _get_list("acceptance_criteria")
 
     return ExperimentPlan(

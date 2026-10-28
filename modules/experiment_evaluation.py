@@ -401,6 +401,34 @@ def _git_ignored(path: str, worktree_path: str | None) -> bool:
         return False
 
 
+def _is_git_internal(path: str, worktree_path: str | None) -> bool:
+    """True if *path* points into git's own directory, which nobody can
+    commit (#403). Planners name ``.git/hooks/*.sample`` or
+    ``git/outbox_publisher.lock`` - the second with the leading dot lost.
+    A ``git/`` path only counts as internal when the worktree has no real
+    ``git/`` directory; without a worktree it is treated as internal."""
+    normalized = _normalize_path(path)
+    if normalized == ".git" or normalized.startswith(".git/"):
+        return True
+    if normalized == "git" or normalized.startswith("git/"):
+        if not worktree_path:
+            return True
+        try:
+            return not (Path(worktree_path) / "git").is_dir()
+        except OSError:
+            return True
+    return False
+
+
+def drop_git_internal(paths: Iterable[str], worktree_path: str | None) -> tuple[list[str], list[str]]:
+    """Splits *paths* into ``(kept, dropped)`` by ``_is_git_internal``."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for path in paths:
+        (dropped if _is_git_internal(path, worktree_path) else kept).append(path)
+    return kept, dropped
+
+
 def _artifact_exists(artifact: str, worktree_path: str | None) -> bool:
     """True if *artifact* exists as a real file inside *worktree_path*.
 
@@ -470,7 +498,7 @@ def evaluate_implementation(
         # "implementation" or "documentation" (and, defensively, any other
         # value — validate_plan() already rejects truly unknown kinds
         # before implementation is ever attempted).
-        non_test_affected = p.expected_non_test_files()
+        non_test_affected, dropped_affected = drop_git_internal(p.expected_non_test_files(), worktree_path)
 
         if not non_test_changed:
             checks.append(EvaluationCheck(
@@ -483,7 +511,7 @@ def evaluate_implementation(
                 "non_test_evidence", True, f"non-test file(s) changed: {non_test_changed}",
             ))
 
-        required_artifacts = list(p.required_artifacts)
+        required_artifacts, dropped_artifacts = drop_git_internal(p.required_artifacts, worktree_path)
         if not required_artifacts:
             required_artifacts = list(non_test_affected)
         if not required_artifacts:
@@ -492,18 +520,23 @@ def evaluate_implementation(
 
         # A git-ignored path (runtime state such as state/mailbox.lock) can
         # never be committed, so it cannot be a required artifact (#185).
+        # Neither can a path inside git's own directory (#403).
         required_artifacts = [a for a in required_artifacts if not _git_ignored(a, worktree_path)]
+        required_artifacts, dropped_late = drop_git_internal(required_artifacts, worktree_path)
+        dropped = list(dict.fromkeys([*dropped_artifacts, *dropped_affected, *dropped_late]))
+        dropped_lines = "".join(f"\nignored git-internal path: {d}" for d in dropped)
         missing_artifacts = [a for a in required_artifacts if not _artifact_exists(a, worktree_path)]
         if missing_artifacts:
             checks.append(EvaluationCheck(
-                "required_artifacts_present", False, f"missing on disk: {missing_artifacts}",
+                "required_artifacts_present", False, f"missing on disk: {missing_artifacts}{dropped_lines}",
             ))
             for artifact in missing_artifacts:
                 reasons.append(f"erforderliches Artefakt {artifact} fehlt")
         else:
             checks.append(EvaluationCheck(
                 "required_artifacts_present", True,
-                "all required artifacts present" if required_artifacts else "no required artifacts declared",
+                ("all required artifacts present" if required_artifacts else "no required artifacts declared")
+                + dropped_lines,
             ))
 
         if non_test_affected:

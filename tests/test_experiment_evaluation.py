@@ -394,6 +394,78 @@ class EvaluateImplementationTestCase(unittest.TestCase):
         self.assertEqual(result.outcome, "needs_review")
 
 
+class GitInternalArtifactTestCase(unittest.TestCase):
+    """#403: paths inside git's own directory are never required artifacts."""
+
+    GIT_PATHS = ["git/hooks/commit-msg.sample", ".git/outbox_publisher.lock"]
+
+    def _evaluate(self, worktree: str, artifacts: list[str]):
+        plan = {
+            "title": "Implement x",
+            "affected_files": ["modules/x.py"],
+            "change_kind": "implementation",
+            "required_artifacts": artifacts,
+        }
+        changed = ChangedFiles(tracked_modified=["modules/x.py"], untracked_new=[])
+        return evaluate_implementation(plan, "Implement x.", changed, worktree_path=worktree)
+
+    def _artifact_check(self, result):
+        return next(c for c in result.checks if c.name == "required_artifacts_present")
+
+    def test_git_internal_paths_are_not_missing(self):
+        with tempfile.TemporaryDirectory() as worktree:
+            (Path(worktree) / "modules").mkdir()
+            (Path(worktree) / "modules" / "x.py").write_text("x = 1\n")
+            result = self._evaluate(worktree, [*self.GIT_PATHS, "modules/x.py"])
+        self.assertEqual(result.outcome, "pass", result.reason)
+        self.assertEqual(result.missing_artifacts, [])
+        detail = self._artifact_check(result).detail
+        for path in self.GIT_PATHS:
+            self.assertEqual(detail.count(f"ignored git-internal path: {path}"), 1)
+
+    def test_normalized_variants_are_dropped(self):
+        with tempfile.TemporaryDirectory() as worktree:
+            (Path(worktree) / "modules").mkdir()
+            (Path(worktree) / "modules" / "x.py").write_text("x = 1\n")
+            result = self._evaluate(
+                worktree, ["./git/hooks/applypatch-msg.sample", ".git\\index", "modules/x.py"],
+            )
+        self.assertEqual(result.outcome, "pass", result.reason)
+
+    def test_real_git_directory_is_a_normal_artifact_path(self):
+        with tempfile.TemporaryDirectory() as worktree:
+            (Path(worktree) / "modules").mkdir()
+            (Path(worktree) / "modules" / "x.py").write_text("x = 1\n")
+            (Path(worktree) / "git").mkdir()
+            (Path(worktree) / "git" / "present.txt").write_text("ok\n")
+            present = self._evaluate(worktree, ["git/present.txt", "modules/x.py"])
+            missing = self._evaluate(worktree, ["git/absent.txt", "modules/x.py"])
+        self.assertEqual(present.outcome, "pass", present.reason)
+        self.assertEqual(missing.missing_artifacts, ["git/absent.txt"])
+
+    def test_genuinely_missing_artifact_is_still_reported(self):
+        with tempfile.TemporaryDirectory() as worktree:
+            (Path(worktree) / "modules").mkdir()
+            (Path(worktree) / "modules" / "x.py").write_text("x = 1\n")
+            result = self._evaluate(worktree, [*self.GIT_PATHS, "modules/x.py", "modules/y.py"])
+        self.assertEqual(result.outcome, "needs_review")
+        self.assertEqual(result.missing_artifacts, ["modules/y.py"])
+        self.assertIn("ignored git-internal path: .git/outbox_publisher.lock", self._artifact_check(result).detail)
+
+    def test_parse_plan_drops_git_internal_paths(self):
+        from modules.experiment_service import parse_plan
+
+        plan = parse_plan(json.dumps({
+            "title": "t", "motivation": "m", "expected_changes": "e",
+            "success_criteria": "s", "planned_tests": "p", "risks": "r",
+            "estimated_scope": "small",
+            "affected_files": ["modules/x.py", ".git/hooks/pre-commit.sample"],
+            "required_artifacts": ["git/outbox_publisher.lock", "modules/x.py"],
+        }))
+        self.assertEqual(plan.affected_files, ["modules/x.py"])
+        self.assertEqual(plan.required_artifacts, ["modules/x.py"])
+
+
 class PlanLikeCompatibilityTestCase(unittest.TestCase):
     def test_experiment_plan_dataclass_round_trips(self):
         plan = ExperimentPlan(
