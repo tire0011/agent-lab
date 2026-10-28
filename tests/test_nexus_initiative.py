@@ -45,7 +45,8 @@ class InitiativeFixture:
             """
             CREATE TABLE experiments (
                 id TEXT PRIMARY KEY, goal TEXT, status TEXT,
-                ended_at TEXT, created_at TEXT, error TEXT
+                ended_at TEXT, created_at TEXT, error TEXT,
+                failure_phase TEXT, failure_type TEXT
             );
             CREATE TABLE experiment_adoptions (
                 experiment_id TEXT PRIMARY KEY, status TEXT, reason TEXT
@@ -63,14 +64,20 @@ class InitiativeFixture:
         self.adoption = RecordingAdoption()
         self.controller = RecordingController()
 
-    def add_experiment(self, exp_id: str, status: str, *, adoption: str | None = None, ended=None):
+    def add_experiment(
+        self, exp_id: str, status: str, *, adoption: str | None = None,
+        ended=None, error: str | None = None, failure_phase: str | None = None,
+        failure_type: str | None = None,
+    ):
         from datetime import datetime, timezone
 
         ended = ended or datetime.now(timezone.utc).isoformat()
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT INTO experiments (id, goal, status, ended_at) VALUES (?, ?, ?, ?)",
-            (exp_id, f"Goal for {exp_id}", status, ended),
+            """INSERT INTO experiments
+               (id, goal, status, ended_at, error, failure_phase, failure_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (exp_id, f"Goal for {exp_id}", status, ended, error, failure_phase, failure_type),
         )
         if adoption is not None:
             conn.execute(

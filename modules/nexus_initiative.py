@@ -600,6 +600,7 @@ class NexusInitiativeService:
             rows = self._conn.execute(
                 """
                 SELECT e.id AS id, e.status AS status, e.error AS error,
+                       e.failure_phase AS failure_phase, e.failure_type AS failure_type,
                        a.status AS adoption_status, a.reason AS adoption_reason
                 FROM github_experiment_links l
                 JOIN experiments e ON e.id = l.experiment_id
@@ -616,7 +617,13 @@ class NexusInitiativeService:
             if row["adoption_status"] == "failed":
                 outcome = f"merge stopped: {row['adoption_reason'] or ''}"
             elif row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
-                outcome = f"{row['status']}: {row['error'] or ''}"
+                crash = ""
+                if row["failure_phase"] or row["failure_type"]:
+                    crash = (
+                        f" [pipeline crash: phase={row['failure_phase'] or 'unknown'}, "
+                        f"type={row['failure_type'] or 'unknown'}]"
+                    )
+                outcome = f"{row['status']}{crash}: {row['error'] or ''}"
             else:
                 continue
             lines.append(f"- experiment {str(row['id'])[:8]}, {' '.join(outcome.split())[:1500]}")

@@ -108,6 +108,22 @@ class RetryAfterBlockedReviewTests(unittest.TestCase):
 
 
 class EarlierAttemptsTests(unittest.TestCase):
+    def test_the_retry_names_the_phase_and_type_of_an_earlier_crash(self):
+        fx = InitiativeFixture()
+        fx.add_experiment(
+            "e1", "failed", error="unhandled GitHubWorkTrackingError in phase github_branch: HTTP 422",
+            failure_phase="github_branch", failure_type="GitHubWorkTrackingError",
+        )
+        with sqlite3.connect(fx.db_path) as conn:
+            conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e1', 9)")
+        svc = fx.service()
+        self.addCleanup(svc.close)
+
+        history = svc._earlier_attempts(9)
+
+        self.assertIn("phase=github_branch", history)
+        self.assertIn("type=GitHubWorkTrackingError", history)
+
     def test_the_retry_gets_the_review_that_blocked_the_first_attempt(self):
         fx = InitiativeFixture()
         fx.add_experiment("e1", "succeeded", adoption="failed")

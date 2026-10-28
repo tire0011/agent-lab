@@ -812,23 +812,38 @@ class ExperimentService:
                 f"{current.status!r} (only {STATUS_QUEUED!r} experiments can run)"
             )
 
+        phase = {"name": "pipeline"}
         try:
-            return self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
+            return self._run_pipeline(
+                experiment_id,
+                github_work_tracking=github_work_tracking,
+                phase=phase,
+            )
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
+            failure_phase = phase["name"]
+            failure_type = type(exc).__name__
             elog.error(
-                "pipeline", "unhandled_exception",
+                failure_phase, "unhandled_exception",
                 "Unhandled exception in experiment pipeline; forcing status=failed",
-                exc=exc,
+                exc=exc, failure_phase=failure_phase, failure_type=failure_type,
             )
             self._force_status(
                 experiment_id,
                 STATUS_FAILED,
                 ended_at=_utcnow_iso(),
-                error=f"unhandled exception in experiment pipeline: {exc}",
+                failure_phase=failure_phase,
+                failure_type=failure_type,
+                error=f"unhandled {failure_type} in phase {failure_phase}: {exc}",
             )
             return self.get_experiment(experiment_id)
 
-    def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
+    def _run_pipeline(
+        self,
+        experiment_id: str,
+        *,
+        github_work_tracking: Any | None = None,
+        phase: dict[str, str] | None = None,
+    ) -> Experiment:
         """Single-call implementation pipeline.
 
         Phases (in order):
@@ -847,8 +862,10 @@ class ExperimentService:
         """
         experiment = self.get_experiment(experiment_id)
         elog = self.get_experiment_logger(experiment_id)
+        phase = phase if phase is not None else {"name": "pipeline"}
 
         # ---- Security check: apply safety denylist to the raw goal --------
+        phase["name"] = "goal_policy"
         rejection_reason = _check_goal_policy(experiment.goal)
         if rejection_reason is not None:
             elog.warning(
@@ -875,8 +892,10 @@ class ExperimentService:
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
         base_ref = "HEAD"
         if github_work_tracking is not None:
+            phase["name"] = "github_branch"
             base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
+        phase["name"] = "worktree"
         elog.debug(
             "implementation", "worktree_check",
             f"Creating isolated git worktree at branch {branch_name} from {base_ref}",
@@ -924,6 +943,7 @@ class ExperimentService:
         )
 
         # ---- Single Codex implementation call -----------------------------
+        phase["name"] = "implementation"
         elog.info(
             "implementation", "implementation_started",
             "Starting implementation (single coding-agent call: analyse, plan, implement)",
@@ -1007,6 +1027,7 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         # ---- Verification -------------------------------------------------
+        phase["name"] = "quality_gate"
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
         result = self._verify(
             experiment_id,
