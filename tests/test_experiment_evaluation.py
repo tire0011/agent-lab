@@ -30,6 +30,7 @@ from modules.experiment_evaluation import (
     extract_explicit_goal_artifacts,
     goal_is_explicit_tests_only,
     parse_git_status_short,
+    split_explicit_goal_artifacts,
     validate_plan,
 )
 from modules.experiment_service import (
@@ -631,6 +632,86 @@ class PipelineIntegrationTestCase(unittest.TestCase):
             result = service.run_experiment(experiment.id)
 
         self.assertNotEqual(result.status, STATUS_SUCCEEDED)
+
+
+# ---------------------------------------------------------------------------
+# #416: with sections, only paths in the Change section are required.
+# ---------------------------------------------------------------------------
+
+# Goal text of #403 as experiment 664ee34c saw it: Problem names paths inside
+# the git directory, Test names made-up fixture paths.
+ISSUE_403_GOAL = (
+    "GitHub Issue #403: Quality gate: drop paths inside the git directory from required artifacts\n\n"
+    "**Problem**\n"
+    "#349 and #378 ended needs_review for missing git/hooks/pre-commit.sample and "
+    "git/outbox_publisher.lock. `modules/experiment_evaluation.py` only drops git-ignored paths.\n\n"
+    "**Change**\n"
+    "- In `modules/experiment_evaluation.py`, add a `_is_git_internal(path, worktree_path)` filter.\n"
+    "- Each dropped path gets one line in the `required_artifacts_present` detail.\n\n"
+    "**Test** (`tests/test_experiment_evaluation.py`)\n"
+    "- A plan naming modules/x.py and modules/y.py plus the two git paths reports only real misses.\n\n"
+    "---\n"
+    "Suggested by the Nexus planning step."
+)
+
+
+class ChangeSectionArtifactsTestCase(unittest.TestCase):
+    def _worktree(self) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (Path(tmp.name) / "modules").mkdir()
+        (Path(tmp.name) / "modules" / "experiment_evaluation.py").write_text('"""doc"""\n')
+        return tmp.name
+
+    def _detail(self, result) -> str:
+        return next(c.detail for c in result.checks if c.name == "required_artifacts_present")
+
+    def test_issue_403_goal_passes_without_plan(self):
+        changed = ChangedFiles(
+            tracked_modified=["modules/experiment_evaluation.py", "tests/test_experiment_evaluation.py"],
+        )
+        result = evaluate_implementation(None, ISSUE_403_GOAL, changed, worktree_path=self._worktree())
+        self.assertEqual(result.outcome, "pass", result.reason)
+        self.assertEqual(result.missing_artifacts, [])
+        self.assertEqual(result.expected_files, ["modules/experiment_evaluation.py"])
+
+    def test_detail_lists_skipped_problem_and_test_paths(self):
+        changed = ChangedFiles(tracked_modified=["modules/experiment_evaluation.py"])
+        result = evaluate_implementation(None, ISSUE_403_GOAL, changed, worktree_path=self._worktree())
+        detail = self._detail(result)
+        for path in ("git/hooks/pre-commit.sample", "git/outbox_publisher.lock", "modules/x.py", "modules/y.py"):
+            self.assertIn(f"skipped (outside Change section): {path}", detail)
+        self.assertEqual(detail.count("skipped (outside Change section)"), 4)
+        self.assertIn("git/outbox_publisher.lock", result.to_dict()["checks"][1]["detail"])
+
+    def test_missing_change_path_still_fails(self):
+        goal = (
+            "**Problem**\nSee modules/experiment_evaluation.py.\n\n"
+            "**Change**\nAdd modules/new_thing.py.\n\n"
+            "**Test**\nCover modules/x.py.\n"
+        )
+        changed = ChangedFiles(tracked_modified=["modules/experiment_evaluation.py"])
+        result = evaluate_implementation(None, goal, changed, worktree_path=self._worktree())
+        self.assertEqual(result.outcome, "needs_review")
+        self.assertEqual(result.missing_artifacts, ["modules/new_thing.py"])
+        self.assertIn("skipped (outside Change section): modules/x.py", self._detail(result))
+
+    def test_heading_styles(self):
+        for goal in (
+            "Problem: see modules/a.py.\n\nChange: add modules/b.py.\nAlso modules/c.py.\n\nTest: modules/d.py",
+            "## Problem\nmodules/a.py\n\n## Change\nmodules/b.py and modules/c.py\n\n## Test\nmodules/d.py",
+            "**Problem:** modules/a.py\n\n**Change:** modules/b.py\nmodules/c.py\n\n**Test**\nmodules/d.py",
+        ):
+            with self.subTest(goal=goal.splitlines()[0]):
+                self.assertEqual(
+                    split_explicit_goal_artifacts(goal),
+                    (["modules/b.py", "modules/c.py"], ["modules/a.py", "modules/d.py"]),
+                )
+
+    def test_goal_without_sections_keeps_whole_text(self):
+        goal = "Problem in static/app.js; extract it into static/logs.js."
+        self.assertEqual(split_explicit_goal_artifacts(goal), (["static/app.js", "static/logs.js"], []))
+        self.assertEqual(extract_explicit_goal_artifacts(EB57900_GOAL), ["static/app.js", "static/logs.js"])
 
 
 if __name__ == "__main__":

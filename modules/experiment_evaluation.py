@@ -65,6 +65,8 @@ DEFAULT_CHANGE_KIND = "implementation"
 # pathological diff (thousands of files) can never blow up storage.
 MAX_EVAL_LIST_ITEMS = 50
 MAX_EVAL_ITEM_CHARS = 300
+# A check detail may list one line per filtered path (#416).
+MAX_EVAL_DETAIL_CHARS = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -196,21 +198,85 @@ def parse_git_status_short(git_status_text: str | None) -> ChangedFiles:
 _GOAL_PATH_RE = re.compile(r"\b[\w][\w-]*(?:/[\w.-]+)+\.[A-Za-z0-9]{1,8}\b")
 
 
-def extract_explicit_goal_artifacts(goal: str) -> list[str]:
+# Section headings as the issue writer formats them: "**Change**", "## Change"
+# or "Change: ..." at the start of a line. Bold and Markdown headings of any
+# name start a new section; the "Name:" form only counts for known section
+# names, so an ordinary "Note: ..." line inside Change does not end it.
+_SECTION_HEADING_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^\s*\*\*(?P<name>[A-Za-z][\w ]{0,40}?)\s*"
+        r"(?::\s*\*\*(?P<rest>.*)|\*\*\s*:(?P<rest2>.*)|\*\*(?P<rest3>\s*(?:\(.*)?))$"
+    ),
+    re.compile(r"^\s*#{1,6}\s+(?P<name>[A-Za-z][\w ]{0,40}?)\s*:?\s*$(?P<rest>)"),
+    re.compile(
+        r"^(?P<name>Problem|Change|Changes|Test|Tests|Testing|Background|Context|Notes?|"
+        r"Acceptance criteria|Goal|Motivation|Scope|Out of scope|Why)\s*:(?P<rest>.*)$",
+        re.IGNORECASE,
+    ),
+)
+_SECTION_RULE_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+_CHANGE_SECTION_NAMES = {"change", "changes"}
+
+
+def _change_section(task: str) -> str | None:
+    """Text of the task's Change section(s), or None if it has no Change heading."""
+    current: str | None = None
+    has_change = False
+    kept: list[str] = []
+    for line in task.splitlines():
+        if _SECTION_RULE_RE.match(line):
+            current = None
+            continue
+        heading = None
+        for pattern in _SECTION_HEADING_RES:
+            heading = pattern.match(line)
+            if heading:
+                break
+        if heading:
+            current = heading.group("name").strip().lower()
+            if current in _CHANGE_SECTION_NAMES:
+                has_change = True
+                kept.extend(v for k, v in heading.groupdict().items() if k.startswith("rest") and v)
+            continue
+        if current in _CHANGE_SECTION_NAMES:
+            kept.append(line)
+    return "\n".join(kept) if has_change else None
+
+
+def _goal_paths(text: str) -> list[str]:
+    found: list[str] = []
+    for match in _GOAL_PATH_RE.finditer(text):
+        path = match.group(0)
+        if is_test_path(path) or is_ignored_support_path(path):
+            continue
+        if path not in found:
+            found.append(path)
+    return found
+
+
+def split_explicit_goal_artifacts(goal: str) -> tuple[list[str], list[str]]:
+    """(required, skipped) explicit paths from the task text.
+
+    When the task has a Change section (#416), only paths named there are
+    required; paths named only in Problem/Test/other sections are returned as
+    skipped. Without a Change heading the whole task text counts.
+    """
     # Only the task itself names files to create. The handover appended to it
     # (#263) quotes whatever Nexus looked at - file listings, command output -
     # and made ".git/hooks/*.sample" a required artifact for #349.
     from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
 
     task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
-    found: list[str] = []
-    for match in _GOAL_PATH_RE.finditer(task):
-        path = match.group(0)
-        if is_test_path(path) or is_ignored_support_path(path):
-            continue
-        if path not in found:
-            found.append(path)
-    return found[:10]
+    change = _change_section(task)
+    if change is None:
+        return _goal_paths(task)[:10], []
+    required = _goal_paths(change)
+    skipped = [p for p in _goal_paths(task) if p not in required]
+    return required[:10], skipped[:MAX_EVAL_LIST_ITEMS]
+
+
+def extract_explicit_goal_artifacts(goal: str) -> list[str]:
+    return split_explicit_goal_artifacts(goal)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +430,7 @@ class EvaluationCheck:
         return {
             "name": self.name[:MAX_EVAL_ITEM_CHARS],
             "passed": bool(self.passed),
-            "detail": self.detail[:MAX_EVAL_ITEM_CHARS],
+            "detail": self.detail[:MAX_EVAL_DETAIL_CHARS],
         }
 
 
@@ -484,11 +550,15 @@ def evaluate_implementation(
             ))
 
         required_artifacts = list(p.required_artifacts)
+        skipped_goal_paths: list[str] = []
         if not required_artifacts:
             required_artifacts = list(non_test_affected)
         if not required_artifacts:
-            required_artifacts = extract_explicit_goal_artifacts(goal)
+            required_artifacts, skipped_goal_paths = split_explicit_goal_artifacts(goal)
         expected_files = required_artifacts
+        skipped_detail = "".join(
+            f"\nskipped (outside Change section): {path}" for path in skipped_goal_paths
+        )
 
         # A git-ignored path (runtime state such as state/mailbox.lock) can
         # never be committed, so it cannot be a required artifact (#185).
@@ -496,14 +566,16 @@ def evaluate_implementation(
         missing_artifacts = [a for a in required_artifacts if not _artifact_exists(a, worktree_path)]
         if missing_artifacts:
             checks.append(EvaluationCheck(
-                "required_artifacts_present", False, f"missing on disk: {missing_artifacts}",
+                "required_artifacts_present", False,
+                f"missing on disk: {missing_artifacts}{skipped_detail}",
             ))
             for artifact in missing_artifacts:
                 reasons.append(f"erforderliches Artefakt {artifact} fehlt")
         else:
             checks.append(EvaluationCheck(
                 "required_artifacts_present", True,
-                "all required artifacts present" if required_artifacts else "no required artifacts declared",
+                ("all required artifacts present" if required_artifacts else "no required artifacts declared")
+                + skipped_detail,
             ))
 
         if non_test_affected:
