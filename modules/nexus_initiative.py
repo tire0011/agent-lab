@@ -588,6 +588,42 @@ class NexusInitiativeService:
             self._record(decision, update=True)
         return decision
 
+    def _earlier_attempts(self, issue_number: int) -> str:
+        """How earlier experiments for this issue ended, for the retry (#374).
+
+        A review that blocked the merge (#396) explains exactly what was
+        wrong; without it the next attempt would make the same mistake.
+        """
+        from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING
+
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT e.id AS id, e.status AS status, e.error AS error,
+                       a.status AS adoption_status, a.reason AS adoption_reason
+                FROM github_experiment_links l
+                JOIN experiments e ON e.id = l.experiment_id
+                LEFT JOIN experiment_adoptions a ON a.experiment_id = e.id
+                WHERE l.issue_number = ?
+                ORDER BY e.created_at
+                """,
+                (issue_number,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return ""
+        lines = []
+        for row in rows:
+            if row["adoption_status"] == "failed":
+                outcome = f"merge stopped: {row['adoption_reason'] or ''}"
+            elif row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
+                outcome = f"{row['status']}: {row['error'] or ''}"
+            else:
+                continue
+            lines.append(f"- experiment {str(row['id'])[:8]}, {' '.join(outcome.split())[:1500]}")
+        if not lines:
+            return ""
+        return f"\n\n{EARLIER_ATTEMPTS_HEADING}\n" + "\n".join(lines)
+
     def _dispatch(self, candidate: Candidate) -> None:
         if candidate.kind == KIND_INTEGRATION:
             if self.adoption_service is None:
@@ -601,7 +637,7 @@ class NexusInitiativeService:
             self.controller.handle_issue(
                 int(candidate.ref),
                 title=candidate.title,
-                body=str(candidate.payload.get("body") or ""),
+                body=str(candidate.payload.get("body") or "") + self._earlier_attempts(int(candidate.ref)),
             )
             return
         if candidate.kind == KIND_IDEA:

@@ -14,6 +14,8 @@ from modules.redaction import redact_secrets
 
 MAX_HANDOVER_CHARS = 12000
 HANDOVER_HEADING = "What Nexus already found (handover):"
+# Appended to an issue that is tried again (#374): how earlier attempts ended.
+EARLIER_ATTEMPTS_HEADING = "Earlier attempts at this issue (do not repeat their mistakes):"
 _MAX_SECTION_ITEM_CHARS = 1500
 _MAX_ATTEMPT_CHARS = 300
 
