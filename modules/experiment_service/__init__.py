@@ -139,11 +139,14 @@ from .service import (
     _TEST_COMMANDS,
     _TEST_TOTAL_SETTING_KEY,
     _WARNING_STATUSES,
+    DEFAULT_STALL_GRACE_SECONDS,
     DEFAULT_WORKTREE_RETENTION_HOURS,
+    STALL_GRACE_ENV_VAR,
     WORKTREE_RETENTION_ENV_VAR,
     ExperimentService,
     WorktreeCleanupResult,
     logger,
+    stall_grace_seconds,
     worktree_retention_hours,
 )
 from .text_utils import (

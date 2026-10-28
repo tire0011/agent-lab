@@ -62,7 +62,8 @@ _MAX_OPEN_PROPOSALS = 3
 
 # A failed issue experiment may be retried; the second failure ends it (#374).
 # needs_review counts too: no human reviews it in autonomous runs, and the
-# gate that stopped it may have been fixed since (#185, #349, #378).
+# gate that stopped it may have been fixed since (#185, #349, #378). A stalled
+# experiment is failed by the stall sweep (#400) and counts through "failed".
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
 
