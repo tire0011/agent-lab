@@ -14,6 +14,7 @@ started work is worth more than starting new work.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -21,9 +22,12 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
+from modules.experiment_service import policy as goal_policy
 from modules.nexus_planner import PROPOSAL_LABEL
+from modules.nexus_sources import issue_source
 from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -66,6 +70,31 @@ _MAX_OPEN_PROPOSALS = 3
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
 
+# An issue the goal policy rejects is not sent (#408): the experiment would be
+# rejected before any work, at the cost of a tick and a budget slot.
+DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
+# Reasons only _check_goal_policy produces. A rejection with one of them is
+# known in advance from the goal text, so retrying the same text is pointless.
+_GOAL_POLICY_REASON_PREFIXES = tuple(
+    prefix for prefix, _ in goal_policy._POLICY_RULE_PREFIXES if prefix.startswith("goal ")
+)
+
+
+def _is_goal_policy_rejection(status: Any, error: Any) -> bool:
+    return status == "rejected" and str(error or "").startswith(_GOAL_POLICY_REASON_PREFIXES)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _policy_hash() -> str:
+    """Hash of the policy module: a changed policy may judge an issue anew."""
+    try:
+        return _sha256(Path(goal_policy.__file__).read_bytes())
+    except OSError:
+        return ""
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -96,7 +125,7 @@ class Candidate:
 class InitiativeDecision:
     """What the tick decided, and why. Persisted before anything is dispatched."""
 
-    decision: str  # "dispatched" | "idle" | "busy" | "budget_exhausted" | "error"
+    decision: str  # "dispatched" | "idle" | "busy" | "budget_exhausted" | "error" | "skipped_goal_policy"
     candidate: Candidate | None = None
     considered: list[Candidate] = field(default_factory=list)
     detail: str = ""
@@ -308,7 +337,7 @@ class NexusInitiativeService:
             )
         return candidates
 
-    def _issue_candidates(self) -> list[Candidate]:
+    def _issue_candidates(self, *, record_skips: bool = True) -> list[Candidate]:
         if self._issue_lister is None:
             return []
         try:
@@ -317,6 +346,8 @@ class NexusInitiativeService:
             logger.warning("initiative: issue lookup failed: %s", exc)
             return []
         linked = self._linked_issue_numbers()
+        skipped = self._goal_policy_skips()
+        policy_hash = _policy_hash()
         candidates: list[Candidate] = []
         self._open_proposals = 0
         for issue in issues:
@@ -331,16 +362,72 @@ class NexusInitiativeService:
                 continue
             if number is None or int(number) in linked:
                 continue
-            candidates.append(
-                Candidate(
-                    kind=KIND_ISSUE,
-                    ref=str(number),
-                    title=str(issue.get("title") or f"Issue #{number}")[:200],
-                    reason="open issue with no experiment working on it",
-                    payload={"body": str(issue.get("body") or "")[:16000]},
+            candidate = Candidate(
+                kind=KIND_ISSUE,
+                ref=str(number),
+                title=str(issue.get("title") or f"Issue #{number}")[:200],
+                reason="open issue with no experiment working on it",
+                payload={"body": str(issue.get("body") or "")[:16000]},
+            )
+            if self._fails_goal_policy(candidate, skipped, policy_hash, record=record_skips):
+                continue
+            candidates.append(candidate)
+        return candidates
+
+    def _goal_policy_skips(self) -> set[tuple[str, str, str]]:
+        """``(issue, issue hash, policy hash)`` of earlier goal-policy skips."""
+        rows = self._conn.execute(
+            "SELECT source_ref, detail FROM nexus_initiative_log WHERE decision = ?",
+            (DECISION_SKIPPED_GOAL_POLICY,),
+        ).fetchall()
+        found: set[tuple[str, str, str]] = set()
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except ValueError:
+                continue
+            found.add((
+                str(row["source_ref"]),
+                str(detail.get("issue_hash") or ""),
+                str(detail.get("policy_hash") or ""),
+            ))
+        return found
+
+    def _fails_goal_policy(
+        self,
+        candidate: Candidate,
+        skipped: set[tuple[str, str, str]],
+        policy_hash: str,
+        *,
+        record: bool,
+    ) -> bool:
+        """Run the experiment's goal policy on this issue before it is sent (#408).
+
+        The checked text is the issue source the controller builds from the
+        same title and body. A skip is recorded once per issue text and policy
+        version; while neither changes, the issue is not judged again.
+        """
+        goal = issue_source(
+            int(candidate.ref), title=candidate.title, body=str(candidate.payload.get("body") or "")
+        ).content
+        issue_hash = _sha256(goal.encode("utf-8"))
+        if (candidate.ref, issue_hash, policy_hash) in skipped:
+            return True
+        reason = goal_policy._check_goal_policy(goal)
+        if reason is None:
+            return False
+        logger.info("initiative: issue #%s skipped by goal policy: %s", candidate.ref, reason)
+        if record:
+            self._record(
+                InitiativeDecision(
+                    DECISION_SKIPPED_GOAL_POLICY,
+                    candidate=Candidate(KIND_ISSUE, candidate.ref, candidate.title, reason),
+                    detail=json.dumps({"issue_hash": issue_hash, "policy_hash": policy_hash}),
+                    tick_id=uuid.uuid4().hex,
                 )
             )
-        return candidates
+            skipped.add((candidate.ref, issue_hash, policy_hash))
+        return True
 
     def _linked_issue_numbers(self) -> set[int]:
         """Issues not to start again (#374).
@@ -357,7 +444,7 @@ class NexusInitiativeService:
                     f"""
                     SELECT l.issue_number AS issue_number,
                            l.experiment_id AS experiment_id, e.status AS status,
-                           a.status AS adoption_status
+                           e.error AS error, a.status AS adoption_status
                     FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
                     LEFT JOIN experiment_adoptions a ON a.experiment_id = l.experiment_id
                     """
@@ -368,6 +455,10 @@ class NexusInitiativeService:
                 try:
                     number = int(row["issue_number"])
                 except (TypeError, ValueError):
+                    continue
+                # A goal-policy rejection is neither an attempt nor a block
+                # (#408): the preflight in _issue_candidates judges the text.
+                if _is_goal_policy_rejection(row["status"], row["error"]):
                     continue
                 # A review that blocked the merge (#396) fails the adoption of
                 # a succeeded experiment: that is a failed attempt too.
@@ -476,16 +567,17 @@ class NexusInitiativeService:
             self._record(decision, update=True)
         return decision
 
-    def candidates(self) -> list[Candidate]:
+    def candidates(self, *, record_skips: bool = True) -> list[Candidate]:
         """All *dispatchable* work, best first.
 
         Work whose dispatcher is not configured is left out rather than listed:
         a candidate that cannot be started is not a candidate, and reporting it
         would misrepresent both the backlog size and what the next tick will do.
+        ``record_skips=False`` judges issues without writing skips to history.
         """
         found = list(self._integration_candidates()) if self.adoption_service is not None else []
         if self.controller is not None:
-            issues = self._issue_candidates()
+            issues = self._issue_candidates(record_skips=record_skips)
             # Integration work is dispatched first; asking the planner then
             # would be a paid call whose answer is thrown away.
             if self._planner is not None and not found:
@@ -613,6 +705,9 @@ class NexusInitiativeService:
             return ""
         lines = []
         for row in rows:
+            # Its reason quotes the rejected text, which would reject the retry.
+            if _is_goal_policy_rejection(row["status"], row["error"]):
+                continue
             if row["adoption_status"] == "failed":
                 outcome = f"merge stopped: {row['adoption_reason'] or ''}"
             elif row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
