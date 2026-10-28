@@ -378,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
             if busy:
                 logger.info("would do nothing: %s", busy)
                 return 0
-            candidates = service.candidates()
+            candidates = service.candidates(record_skips=False)
             if not candidates:
                 logger.info("would do nothing: no actionable work")
                 return 0
