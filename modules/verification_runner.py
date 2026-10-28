@@ -46,6 +46,7 @@ from typing import Any, Callable, Mapping, Sequence
 from modules.test_progress import (
     EVENT_END,
     EVENT_START,
+    FAILING_RESULTS,
     ProgressTracker,
     UnittestStreamParser,
     format_stall_diagnostics,
@@ -198,6 +199,8 @@ class VerificationRunResult:
     test_log_path: str | None = None
     #: Total tests reported by the suite itself, when it got that far.
     tests_total: int | None = None
+    #: Canonical unittest IDs which failed, errored, or were running at a stall.
+    failed_test_ids: list[str] | None = None
 
     @property
     def output(self) -> str:
@@ -233,6 +236,7 @@ def run_verification_test_monitored(
 
     parser = UnittestStreamParser()
     tracker = ProgressTracker(expected_total=expected_total)
+    failed_test_ids: set[str] = set()
     stdout_chunks: list[str] = []
 
     env = build_verification_test_env()
@@ -275,6 +279,8 @@ def run_verification_test_monitored(
             tracker.note_activity()
             for event in events:
                 tracker.record(event)
+                if event.kind == EVENT_END and event.result in FAILING_RESULTS:
+                    failed_test_ids.add(event.test_id)
                 _log_test_event(test_log, event)
 
     def _drain_stdout() -> None:
@@ -360,6 +366,9 @@ def run_verification_test_monitored(
         diagnostics = format_stall_diagnostics(stall_snapshot or final_snapshot, title=title)
         stderr_text += f"\n[{diagnostics}]\n"
         test_log.log_run_event(abort_reason, diagnostics, **(stall_snapshot or final_snapshot))
+        current_test = (stall_snapshot or final_snapshot).get("current_test")
+        if current_test:
+            failed_test_ids.add(str(current_test))
     else:
         test_log.log_run_event(
             "test_run_finished",
@@ -381,6 +390,7 @@ def run_verification_test_monitored(
         progress=final_snapshot,
         test_log_path=str(test_log.path),
         tests_total=total_tests,
+        failed_test_ids=sorted(failed_test_ids),
     )
 
 
