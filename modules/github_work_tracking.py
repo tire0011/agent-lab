@@ -1083,6 +1083,10 @@ class GitHubWorkTrackingService:
         self._close_completed_issue(ref)
         return str(result.get("sha") or expected_head_sha or "")
 
+    def comment(self, number: int, body: str) -> None:
+        """Comment on an issue or pull request (#396: review results)."""
+        self._request("POST", f"/repos/{self.repository}/issues/{number}/comments", {"body": body[:60000]})
+
     def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
         self._request(
             "PATCH",

@@ -181,7 +181,11 @@ def _build_service(args) -> NexusInitiativeService:
     from modules.task_orchestrator import NexusTaskOrchestrator
 
     experiment_service = ExperimentService(db_path=args.db_path)
-    adoption_service = ExperimentAdoptionService(experiment_service=experiment_service)
+    from modules.nexus_reviewer import default_reviewer
+
+    adoption_service = ExperimentAdoptionService(
+        experiment_service=experiment_service, reviewer=default_reviewer(args.db_path),
+    )
     controller = None
     if not args.integration_only:
         registry = OperationsRegistry(experiment_service=experiment_service)
