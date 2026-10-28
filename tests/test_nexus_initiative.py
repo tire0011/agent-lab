@@ -48,7 +48,7 @@ class InitiativeFixture:
                 ended_at TEXT, created_at TEXT, error TEXT
             );
             CREATE TABLE experiment_adoptions (
-                experiment_id TEXT PRIMARY KEY, status TEXT
+                experiment_id TEXT PRIMARY KEY, status TEXT, reason TEXT
             );
             CREATE TABLE mailbox_task_approvals (
                 id TEXT PRIMARY KEY, status TEXT, updated_at TEXT

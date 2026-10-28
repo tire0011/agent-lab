@@ -200,9 +200,9 @@ def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     # Only the task itself names files to create. The handover appended to it
     # (#263) quotes whatever Nexus looked at - file listings, command output -
     # and made ".git/hooks/*.sample" a required artifact for #349.
-    from modules.experiment_handover import HANDOVER_HEADING
+    from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
 
-    task = (goal or "").split(HANDOVER_HEADING, 1)[0]
+    task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
     found: list[str] = []
     for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
