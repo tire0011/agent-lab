@@ -266,8 +266,17 @@ def _wait_for_experiments() -> None:
     from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
     from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
 
-    for thread in threading.enumerate():
-        if thread.name.startswith((EXPERIMENT_THREAD_PREFIX, ADOPTION_THREAD_PREFIX)):
+    # A thread can start the next one - a controller session that resumes
+    # after a rejected experiment starts a new one (#388) - so look again
+    # until none is left.
+    while True:
+        pending = [
+            thread for thread in threading.enumerate()
+            if thread.is_alive() and thread.name.startswith((EXPERIMENT_THREAD_PREFIX, ADOPTION_THREAD_PREFIX))
+        ]
+        if not pending:
+            return
+        for thread in pending:
             logger.info("waiting for %s to finish", thread.name)
             thread.join()
 
