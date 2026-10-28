@@ -60,7 +60,7 @@ from .models import (
     _TERMINAL_STATUSES,
     _row_to_experiment,
 )
-from .policy import _check_goal_policy, _policy_rule_for_reason
+from .policy import _check_goal_policy, _goal_secret_warning, _policy_rule_for_reason
 from .prompts import _build_direct_implementation_prompt, _build_repair_implementation_prompt
 from .text_utils import _truncate_text, _utcnow_iso
 
@@ -863,6 +863,12 @@ class ExperimentService:
                 policy_rule=_policy_rule_for_reason(rejection_reason),
             )
             return self.get_experiment(experiment_id)
+        secret_warning = _goal_secret_warning(experiment.goal)
+        if secret_warning is not None:
+            elog.warning(
+                "implementing", "goal_policy_warning",
+                f"Goal may describe a secret action; continuing, the reviewer checks the change: {secret_warning}",
+            )
 
         # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"

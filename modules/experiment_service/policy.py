@@ -447,6 +447,18 @@ def _check_goal_policy(goal: str) -> str | None:
     for keyword in _REJECT_KEYWORDS:
         if keyword in haystack:
             return f"goal mentions disallowed keyword: {keyword!r}"
+    return None
+
+
+def _goal_secret_warning(goal: str) -> str | None:
+    """Flag a goal that reads like a secret/credential action.
+
+    Only a warning, not a rejection: issues come from the own repository and
+    usually *describe* such actions (a leak to fix, a quoted rejection), which
+    the regexes cannot tell apart. The reviewer checks the actual change
+    before it is merged.
+    """
+    haystack = (goal or "").lower()
     for regex in _SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
