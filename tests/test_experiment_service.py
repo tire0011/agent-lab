@@ -509,7 +509,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertRegex(output, r"(?m)^Ran \d+ tests? in ")
         self.assertNotRegex(output, r"(?m)^[.]+$")
 
-    def test_failed_verification_gets_bounded_repair_in_same_worktree(self):
+    def test_pre_existing_failure_does_not_trigger_repair(self):
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
             "import unittest\n\n"
             "class T(unittest.TestCase):\n"
@@ -542,18 +542,14 @@ class ExperimentServiceTestCase(unittest.TestCase):
         experiment = self.service.create_experiment(goal="Fix the failing test.")
         result = self.service.run_experiment(experiment.id)
 
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-        self.assertEqual(calls, 2)
-        runs = self.service.list_verification_runs(experiment.id)
-        self.assertEqual([run["status"] for run in runs], [STATUS_FAILED, STATUS_SUCCEEDED])
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertEqual(calls, 1)
         self.assertEqual(
-            self.implementation_worker.run.call_args_list[1].kwargs["phase"],
-            "implementation_repair",
+            result.baseline_test_classifications,
+            {"test_placeholder.T.test_fail": "pre_existing"},
         )
-        self.assertIn(
-            "tests failed",
-            self.implementation_worker.run.call_args_list[1].kwargs["task"],
-        )
+        runs = self.service.list_verification_runs(experiment.id)
+        self.assertEqual([run["status"] for run in runs], [STATUS_NEEDS_REVIEW])
 
     def test_default_test_command_uses_verbose_unittest_discover(self):
         """Verbose, because the progress watchdog (#209) reads the per-test
@@ -972,7 +968,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
 
-    def test_failing_tests_yield_failed_status(self):
+    def test_pre_existing_failing_tests_yield_needs_review(self):
         self.service.test_python_executable = sys.executable
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
             "import unittest\n\n"
@@ -987,8 +983,12 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
         self.assertNotEqual(result.test_exit_code, 0)
+        self.assertEqual(
+            result.baseline_test_classifications,
+            {"test_placeholder.T.test_fail": "pre_existing"},
+        )
         output = result.test_output or ""
         self.assertIn("Traceback (most recent call last)", output)
         self.assertRegex(output, r"(?m)^Ran \d+ tests? in ")
@@ -2415,7 +2415,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
             [entry["event"] for entry in entries],
         )
 
-    def test_test_failure_is_logged_as_error_with_context(self):
+    def test_pre_existing_test_failure_is_classified_and_logged(self):
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
             "import unittest\n\n"
             "class T(unittest.TestCase):\n"
@@ -2427,16 +2427,18 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
 
         entries = self._read_log(experiment.id)
-        failed = [e for e in entries if e["event"] == "tests_failed"]
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["level"], "ERROR")
-        self.assertEqual(failed[0]["phase"], "verifying")
-        self.assertIn("exit_code", failed[0])
-        status_change = [e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_FAILED]
-        self.assertTrue(status_change, "expected a status_forced -> failed entry")
+        classified = [e for e in entries if e["event"] == "baseline_recheck_classified"]
+        self.assertEqual(len(classified), 1)
+        self.assertIn("test_placeholder.T.test_fail", classified[0]["classifications"])
+        self.assertIn("pre_existing", classified[0]["classifications"])
+        status_change = [
+            e for e in entries
+            if e["event"] == "status_forced" and e.get("to_status") == STATUS_NEEDS_REVIEW
+        ]
+        self.assertTrue(status_change, "expected a status_forced -> needs_review entry")
 
     def test_stalled_test_run_is_not_classified_as_a_test_failure(self):
         """A verification run the watchdog aborts must be reported as its own
@@ -2450,13 +2452,15 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         service = self._make_watchdog_service(str(Path(self.tmp.name) / "stall.db"))
         experiment = service.create_experiment(goal="g")
-        result = service.run_experiment(experiment.id)
+        with patch.dict(os.environ, {"NEXUS_BASELINE_RECHECK_SECONDS": "0.2"}):
+            result = service.run_experiment(experiment.id)
 
-        self.assertEqual(result.status, STATUS_TIMED_OUT)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
         self.assertIsNone(result.test_exit_code)
-        self.assertIn("stalled", result.error)
-        # The diagnostics must name the test progress stopped on.
-        self.assertIn("test_hangs", result.error)
+        self.assertEqual(
+            result.baseline_test_classifications,
+            {"test_placeholder.T.test_hangs": "pre_existing"},
+        )
 
         entries = self._read_log(experiment.id)
         stalls = [e for e in entries if e["event"] == "test_stalled"]
@@ -2469,9 +2473,10 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         # Never classified as a plain test failure.
         self.assertEqual([e for e in entries if e["event"] == "tests_failed"], [])
         status_change = [
-            e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_TIMED_OUT
+            e for e in entries
+            if e["event"] == "status_forced" and e.get("to_status") == STATUS_NEEDS_REVIEW
         ]
-        self.assertTrue(status_change, "expected a status_forced -> timed_out entry")
+        self.assertTrue(status_change, "expected a status_forced -> needs_review entry")
 
     def test_progressing_suite_is_not_aborted_by_a_long_total_runtime(self):
         """The whole point of #209: a suite that keeps finishing tests must be
