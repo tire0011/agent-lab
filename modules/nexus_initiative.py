@@ -480,12 +480,23 @@ class NexusInitiativeService:
                     continue
                 # A review that blocked the merge (#396) fails the adoption of
                 # a succeeded experiment: that is a failed attempt too.
-                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or row["adoption_status"] == "failed":
+                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or self._merge_stopped(row):
                     failed.setdefault(number, set()).add(str(row["experiment_id"]))
                 else:
                     blocked.add(number)
         blocked.update(n for n, ids in failed.items() if len(ids) >= _MAX_ISSUE_ATTEMPTS)
         return blocked
+
+    def _merge_stopped(self, row: sqlite3.Row) -> bool:
+        """The experiment succeeded but its merge stopped for good.
+
+        A ``needs_review`` that cannot resume is such a stop too: the issue
+        gets another attempt with the reason, instead of waiting for a human.
+        """
+        status = row["adoption_status"]
+        if status == "failed":
+            return True
+        return status == "needs_review" and not self._review_may_resume(str(row["experiment_id"]))
 
     def _idea_candidates(self) -> list[Candidate]:
         lister = self._idea_lister
@@ -709,7 +720,7 @@ class NexusInitiativeService:
         try:
             rows = self._conn.execute(
                 """
-                SELECT e.id AS id, e.status AS status, e.error AS error,
+                SELECT e.id AS id, e.id AS experiment_id, e.status AS status, e.error AS error,
                        a.status AS adoption_status, a.reason AS adoption_reason
                 FROM github_experiment_links l
                 JOIN experiments e ON e.id = l.experiment_id
@@ -726,7 +737,7 @@ class NexusInitiativeService:
             # Its reason quotes the rejected text, which would reject the retry.
             if _is_goal_policy_rejection(row["status"], row["error"]):
                 continue
-            if row["adoption_status"] == "failed":
+            if self._merge_stopped(row):
                 outcome = f"merge stopped: {row['adoption_reason'] or ''}"
             elif row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
                 outcome = f"{row['status']}: {row['error'] or ''}"
