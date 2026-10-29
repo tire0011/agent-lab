@@ -61,6 +61,17 @@ class ExperimentNotFoundError(LookupError):
     """Raised when an experiment id does not exist in the store."""
 
 
+class ExperimentAlreadyActiveError(RuntimeError):
+    """Raised when an issue already has a non-terminal experiment."""
+
+    def __init__(self, experiment_id: str, status: str) -> None:
+        self.experiment_id = experiment_id
+        self.status = status
+        super().__init__(
+            f"experiment {experiment_id!r} is already active (status={status!r})"
+        )
+
+
 class ExperimentNotRunnableError(RuntimeError):
     """Raised when ``run_experiment`` is called on an experiment already started."""
 

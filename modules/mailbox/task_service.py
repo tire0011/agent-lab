@@ -22,6 +22,7 @@ from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from modules.experiment_handover import with_handover
+from modules.experiment_service import ExperimentAlreadyActiveError
 from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
@@ -615,7 +616,7 @@ class MailboxTaskService:
 
     def _start_new_experiment(
         self, approval: MailboxTaskApproval, decision: TaskDecision | None = None
-    ) -> None:
+    ) -> dict[str, str] | None:
         # Re-read task_body so clarification follow-ups accumulated by
         # continue_discussion are included in the implementation goal.
         current_approval = self.get(approval.id)
@@ -658,12 +659,34 @@ class MailboxTaskService:
             if current is None or current["status"] != _STATUS_APPROVED:
                 return
             # What Nexus already learned travels with the task (#263).
-            experiment = self.experiment_service.create_experiment(
-                with_handover(
-                    current_approval.task_body,
-                    decision.experiment_handover if decision is not None else None,
+            try:
+                experiment = self.experiment_service.create_experiment(
+                    with_handover(
+                        current_approval.task_body,
+                        decision.experiment_handover if decision is not None else None,
+                    )
                 )
-            )
+            except ExperimentAlreadyActiveError as exc:
+                task_log.info(
+                    "queued", "already_active",
+                    "mailbox task matched an active experiment",
+                    experiment_id=exc.experiment_id,
+                    experiment_status=exc.status,
+                )
+                self._complete_without_experiment(
+                    approval,
+                    _STATUS_NEEDS_REVIEW,
+                    (
+                        "already_active: an experiment for this GitHub issue is "
+                        f"already active (experiment_id={exc.experiment_id}, "
+                        f"status={exc.status})"
+                    ),
+                )
+                return {
+                    "status": "already_active",
+                    "experiment_id": exc.experiment_id,
+                    "experiment_status": exc.status,
+                }
             work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
