@@ -265,6 +265,65 @@ _SECRET_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+# Environment-variable names of secrets ("AZURE_OPENAI_API_KEY",
+# "GITHUB_TOKEN"): "\bapi_key\b" does not match after an underscore. Goal
+# text only (#398) - plans legitimately name the env vars the code reads,
+# and the plan check is a hard rejection.
+_SECRET_ENV_VAR_NOUN = r"\w+_(?:api_key|secret|token|password|private_key)"
+_GOAL_SECRET_ACTION_REGEXES: tuple[re.Pattern[str], ...] = _SECRET_ACTION_REGEXES + (
+    re.compile(
+        rf"\b(?:{_SECRET_VERB_ALT})\b(?:\s+\S+){{0,{_SECRET_ACTION_MAX_FILLER_WORDS}}}\s+"
+        rf"\b{_SECRET_ENV_VAR_NOUN}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{_SECRET_ENV_VAR_NOUN}\b(?:\s+\S+){{0,{_SECRET_ACTION_MAX_FILLER_WORDS}}}\s+"
+        rf"\b(?:{_SECRET_VERB_ALT})\b",
+        re.IGNORECASE,
+    ),
+)
+
+# A match after one of these words in the same sentence describes what must
+# not happen ("redact ... before printing the api key", "e.g. log the token")
+# rather than asking for it (#398).
+_DESCRIPTIVE_CUE_REGEX = re.compile(
+    r"\b(?:redact\w*|mask\w*|never|must\s+not|instead\s+of)\b|\be\.g\.",
+    re.IGNORECASE,
+)
+# The same cues after the match, before the sentence ends ("If the command
+# prints the actual API key, the outbox must contain `****` and never the
+# real value").
+_DESCRIPTIVE_TRAILING_CUE_REGEX = re.compile(r"\b(?:never|must\s+not)\b", re.IGNORECASE)
+_SO_THAT_REGEX = re.compile(r"\bso\s+that\b", re.IGNORECASE)
+_NEGATION_REGEX = re.compile(r"\b(?:not|never)\b|n't\b", re.IGNORECASE)
+# Sentence end: punctuation (not the dots of "e.g."/"i.e."), or a Markdown
+# heading or list item starting a new line.
+_SENTENCE_END_REGEX = re.compile(
+    r"(?<!\be\.g)(?<!\bi\.e)[.!?](?:\s|$)|\n\s*(?:#|[-*+]\s)", re.IGNORECASE
+)
+
+
+def _sentence_before(preceding_text: str) -> str:
+    start = 0
+    for boundary in _SENTENCE_END_REGEX.finditer(preceding_text):
+        start = boundary.end()
+    return preceding_text[start:]
+
+
+def _sentence_after(following_text: str) -> str:
+    end = _SENTENCE_END_REGEX.search(following_text)
+    return following_text[:end.start()] if end else following_text
+
+
+def _is_descriptive_mention(preceding_text: str, following_text: str) -> bool:
+    before = _sentence_before(preceding_text)
+    after = _sentence_after(following_text)
+    if _DESCRIPTIVE_CUE_REGEX.search(before):
+        return True
+    if _DESCRIPTIVE_TRAILING_CUE_REGEX.search(after):
+        return True
+    return bool(_SO_THAT_REGEX.search(before) and _NEGATION_REGEX.search(after))
+
 # Generic "token" is overloaded: it can mean a credential or an LLM
 # accounting/tokenization unit.  Keep credential-qualified tokens strict,
 # and exempt only explicit metric/tokenization phrases in the immediate
@@ -317,8 +376,13 @@ def _secret_action_match_is_false_positive(
     preceding_text: str = "",
     following_text: str = "",
 ) -> bool:
-    """Return True only for negated or clearly LLM-token metric matches."""
+    """Return True only for negated, descriptive or clearly LLM-token metric matches."""
     if _infra_action_match_is_false_positive(matched_text, preceding_text):
+        return True
+    if _is_descriptive_mention(preceding_text, following_text):
+        return True
+    # "non-secret command output is unchanged" (#220) names the opposite.
+    if preceding_text.lower().endswith("non-"):
         return True
 
     # Metric exemptions apply only to matches whose secret noun is the
@@ -458,8 +522,19 @@ def _goal_secret_warning(goal: str) -> str | None:
     the regexes cannot tell apart. The reviewer checks the actual change
     before it is merged.
     """
+    match = _goal_secret_match(goal)
+    if match is None:
+        return None
+    return f"goal describes an actual secret/credential action: {match.group(0)!r}"
+
+
+def _goal_secret_match(goal: str) -> re.Match[str] | None:
+    """The first secret-action match in *goal* that is not a mention.
+
+    The match is taken on the lowercased goal.
+    """
     haystack = (goal or "").lower()
-    for regex in _SECRET_ACTION_REGEXES:
+    for regex in _GOAL_SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
             following = haystack[match.end():min(len(haystack), match.end() + 120)]
@@ -469,10 +544,7 @@ def _goal_secret_warning(goal: str) -> str | None:
             # is in quotes.
             if _is_quoted(preceding, following):
                 continue
-            return (
-                "goal describes an actual secret/credential action: "
-                f"{match.group(0)!r}"
-            )
+            return match
     return None
 
 
