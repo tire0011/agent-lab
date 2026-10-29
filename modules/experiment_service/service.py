@@ -121,6 +121,43 @@ def worktree_retention_hours(raw: str | None = None) -> float:
     return hours if hours > 0 and hours != float("inf") else 0.0
 
 
+def _report_issue_progress(
+    github_work_tracking: Any | None, experiment_id: str, state: str, detail: str | None = None,
+) -> None:
+    """Best-effort Issue progress comment (#43); never affects the pipeline."""
+    post = getattr(github_work_tracking, "post_progress", None)
+    if post is None:
+        return
+    try:
+        post(experiment_id, state, detail=detail)
+    except Exception as exc:  # noqa: BLE001 - progress comments are informational
+        logger.warning("could not report %s progress for experiment %s: %s", state, experiment_id, exc)
+
+
+def _test_summary(output: str | None) -> str | None:
+    """A short pytest/unittest result line such as ``18 passed``."""
+    text = output or ""
+    match = re.search(r"\b\d+ (?:passed|failed)\b[^\n=]*", text)
+    if match:
+        return match.group(0).strip()
+    match = re.search(r"Ran (\d+) tests?", text)
+    return f"{match.group(1)} tests ran" if match else None
+
+
+def _final_issue_progress(experiment: Experiment) -> tuple[str, str | None] | None:
+    """The Issue progress state and detail for a finished pipeline, if any."""
+    if experiment.status == STATUS_SUCCEEDED:
+        summary = _test_summary(experiment.test_output)
+        return "verification_passed", f"Tests: {summary}." if summary else None
+    reason = sanitized_reason(experiment.error)
+    detail = f"Reason: {reason}" if reason else None
+    if experiment.status == STATUS_NEEDS_REVIEW:
+        return "needs_review", detail
+    if experiment.status in {STATUS_FAILED, STATUS_TIMED_OUT, STATUS_REJECTED}:
+        return "failed", detail
+    return None
+
+
 def _parse_utc(timestamp: str | None) -> datetime | None:
     if not timestamp:
         return None
@@ -812,8 +849,9 @@ class ExperimentService:
                 f"{current.status!r} (only {STATUS_QUEUED!r} experiments can run)"
             )
 
+        _report_issue_progress(github_work_tracking, experiment_id, "started")
         try:
-            return self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
+            result = self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
             elog.error(
                 "pipeline", "unhandled_exception",
@@ -826,7 +864,11 @@ class ExperimentService:
                 ended_at=_utcnow_iso(),
                 error=f"unhandled exception in experiment pipeline: {exc}",
             )
-            return self.get_experiment(experiment_id)
+            result = self.get_experiment(experiment_id)
+        final = _final_issue_progress(result)
+        if final is not None:
+            _report_issue_progress(github_work_tracking, experiment_id, final[0], final[1])
+        return result
 
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
         """Single-call implementation pipeline.
@@ -922,6 +964,7 @@ class ExperimentService:
             worktree_path=worktree_path,
             branch_name=branch_name,
         )
+        _report_issue_progress(github_work_tracking, experiment_id, "implementing")
 
         # ---- Single Codex implementation call -----------------------------
         elog.info(
@@ -1008,6 +1051,7 @@ class ExperimentService:
 
         # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
+        _report_issue_progress(github_work_tracking, experiment_id, "verifying")
         result = self._verify(
             experiment_id,
             worktree_path,

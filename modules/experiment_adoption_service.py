@@ -2028,6 +2028,11 @@ class ExperimentAdoptionService:
                 diagnostic_worktree_path=None,
                 updated_at=_utcnow_iso(),
             )
+            self._report_issue_progress(
+                experiment_id, "completed",
+                f"Merged into {_DEFAULT_TARGET_BRANCH}"
+                + (f" as {published_sha[:12]}." if published_sha else "."),
+            )
             return self.get(experiment_id)
         except ExperimentAdoptionError as exc:
             return self._finish_failure(experiment_id, reason=str(exc), elog=elog)
@@ -2132,7 +2137,18 @@ class ExperimentAdoptionService:
             diagnostic_worktree_path=diagnostic_worktree_path,
             updated_at=_utcnow_iso(),
         )
+        self._report_issue_progress(experiment_id, "failed", f"Reason: {sanitized_reason(reason)}")
         return self.get(experiment_id)
+
+    def _report_issue_progress(self, experiment_id: str, state: str, detail: str | None = None) -> None:
+        """Best-effort adoption outcome comment on the tracking Issue (#43)."""
+        post = getattr(self.github_work_tracking, "post_progress", None)
+        if post is None:
+            return
+        try:
+            post(experiment_id, state, detail=detail)
+        except Exception as exc:  # noqa: BLE001 - the comment is informational
+            logger.warning("could not report %s progress for %s: %s", state, experiment_id, exc)
 
     def _finish_review(
         self,
@@ -2180,6 +2196,7 @@ class ExperimentAdoptionService:
             diagnostic_worktree_path=diagnostic_worktree_path,
             updated_at=_utcnow_iso(),
         )
+        self._report_issue_progress(experiment_id, "needs_review", f"Reason: {sanitized_reason(reason)}")
         return self.get(experiment_id)
 
     def _git_stdout(self, args: list[str], cwd: str, elog) -> str:
