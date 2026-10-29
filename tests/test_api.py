@@ -237,7 +237,7 @@ class WebClientTests(ApiTestsBase):
     def test_public_experiment_detail_fetch_path_is_preserved(self):
         javascript = self.client.get("/static/tasks.js").text
         fetch_block = javascript.split("async function fetchExperimentSummary(experimentId)", 1)[1].split(
-            "async function renderTaskApprovals(tasks)", 1
+            "// States left by the removed approval step (#264)", 1
         )[0]
         self.assertIn(
             "const path = state.apiKey ? `/experiments/${experimentId}` : `/experiments/${experimentId}/public`;",

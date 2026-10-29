@@ -303,11 +303,10 @@ class MailboxTaskIssueReuseTests(unittest.TestCase):
 
     def _run_task(self, body: str) -> str:
         message_id = _insert_mailbox_msg(self.service)
-        approval = self.service.create_approval(
+        approval = self.service.create_task(
             message_id, body, "alice", "/agent/inbox/task.md", "2026-01-01T00:00:00Z"
         )
-        self.service.approve(approval.id)
-        self.service.submit_approved()
+        self.service.submit_queued()
         time.sleep(0.1)
         return approval.id
 

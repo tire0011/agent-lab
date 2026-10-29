@@ -148,9 +148,9 @@ error.
 
 - Public health endpoint: `GET /health`
 - Protected endpoint example: `GET /secure-health` requires `x-api-key` header
-- Task approval endpoints: `GET /mailbox/tasks`, `POST /mailbox/tasks/{id}/approve|reject` — require `x-api-key`
+- Mailbox task endpoints (read-only): `GET /mailbox/tasks`, `GET /mailbox/tasks/{id}` — require `x-api-key`
 - GitHub mailbox webhook: `POST /mailbox/webhook/github` — authenticated via `X-Hub-Signature-256`
-- `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for approved tasks to submit
+- `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for queued tasks to hand to Nexus
 
 ## Operational checks
 
@@ -158,7 +158,7 @@ error.
 2. Verify protected endpoint rejects missing/invalid key.
 3. Validate agent run writes new artifact in `state/runs/`.
 4. Review run logs for token/runtime anomalies.
-5. Check `GET /mailbox/tasks` for pending approvals requiring human review.
+5. Check `GET /mailbox/tasks` for tasks in `needs_review`.
 
 ## Security operations
 

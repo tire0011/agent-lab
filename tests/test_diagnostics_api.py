@@ -40,7 +40,7 @@ class DiagnosticsPublicApiTests(unittest.TestCase):
         mailbox.list_recent.return_value = [
             SimpleNamespace(
                 id="m1",
-                status="approved",
+                status="queued",
                 received_at="2026-08-13T11:00:00+00:00",
                 experiment_id=self.failed.id,
             )

@@ -403,8 +403,15 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE mailbox_task_approvals ADD COLUMN {column_name} {column_type}"
             )
 
-    # Backfill: create pending_approval records for any task messages that
-    # don't already have one.
+    # The approval step is gone (#264). An approved task was only waiting for
+    # the worker, which now takes queued ones. Old pending_approval and
+    # rejected rows stay as they are: readable, never run.
+    conn.execute(
+        "UPDATE mailbox_task_approvals SET status='queued' WHERE status='approved'"
+    )
+
+    # Backfill: create task records for any task messages that don't already
+    # have one. A task whose body was not stored is not handed to Nexus.
     import uuid
     from datetime import datetime, timezone
 
@@ -423,6 +430,7 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
 
     for row in orphan_tasks:
         msg_id, created_by, file_path, received_at, task_body, outbox_file = row
+        status, error = "queued", None
         if not task_body:
             fallback = (
                 "[Task body was not stored at processing time."
@@ -430,16 +438,17 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
                 + "]"
             )
             task_body = fallback
+            status, error = "needs_review", "task body was not stored; not handed to Nexus"
         approval_id = uuid.uuid4().hex
         conn.execute(
             """
             INSERT INTO mailbox_task_approvals
                 (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-                 status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+                 status, error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (approval_id, msg_id, task_body, created_by or "", file_path or "",
-             received_at or now, now, now),
+             received_at or now, status, error, now, now),
         )
 
 

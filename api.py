@@ -28,7 +28,6 @@ from modules.mailbox.github_webhook import has_inbox_changes, is_ping_event, ver
 from modules.mailbox.poll_runner import run_mailbox_poll_once
 from modules.mailbox.task_service import (
     ApprovalNotFoundError,
-    ApprovalStateError,
     MailboxTaskService,
     MailboxTaskWorker,
 )
@@ -90,7 +89,6 @@ from models import (
     OperationsExecuteResponse,
     MailboxTaskApproval,
     MailboxTaskApprovalsResponse,
-    MailboxTaskRejectRequest,
     OperationChainRequest,
     OperationChainResult,
     PublicDiagnosticExperiment,
@@ -189,7 +187,7 @@ def get_codex_service() -> CodexTaskService:
 def get_experiment_service() -> ExperimentService:
     """Singleton ExperimentService for the process.
 
-    Shared with ``MailboxTaskService`` so both the mailbox approval bridge
+    Shared with ``MailboxTaskService`` so both the mailbox task bridge
     and the read-only ``/experiments`` and ``/activity`` endpoints observe
     the same in-process state (single SQLite connection/lock), rather than
     each opening its own separate connection to the same database file.
@@ -794,7 +792,7 @@ def run_codex_task(
 
 
 # ---------------------------------------------------------------------------
-# Mailbox task approval endpoints (authenticated)
+# Mailbox task endpoints (authenticated, read-only)
 # ---------------------------------------------------------------------------
 
 
@@ -827,41 +825,6 @@ def get_mailbox_task(
         approval = service.get(approval_id)
     except ApprovalNotFoundError:
         raise HTTPException(status_code=404, detail="approval not found")
-    return _approval_to_response(approval)
-
-
-@app.post("/mailbox/tasks/{approval_id}/approve", response_model=MailboxTaskApproval)
-def approve_mailbox_task(
-    approval_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: MailboxTaskService = Depends(get_mailbox_task_service),
-) -> MailboxTaskApproval:
-    authorize(x_api_key)
-    try:
-        approval = service.approve(approval_id)
-    except ApprovalNotFoundError:
-        raise HTTPException(status_code=404, detail="approval not found")
-    except ApprovalStateError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    return _approval_to_response(approval)
-
-
-@app.post("/mailbox/tasks/{approval_id}/reject", response_model=MailboxTaskApproval)
-def reject_mailbox_task(
-    approval_id: str,
-    request: MailboxTaskRejectRequest,
-    x_api_key: str | None = Header(default=None),
-    service: MailboxTaskService = Depends(get_mailbox_task_service),
-) -> MailboxTaskApproval:
-    authorize(x_api_key)
-    try:
-        approval = service.reject(approval_id, request.reason)
-    except ApprovalNotFoundError:
-        raise HTTPException(status_code=404, detail="approval not found")
-    except ApprovalStateError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
     return _approval_to_response(approval)
 
 
@@ -925,7 +888,7 @@ _MAILBOX_TYPE_LABELS_DE = {
     "task": "Auftrag",
     "question": "Frage",
     "context": "Kontext",
-    "task_approval_result": "Freigabe-Ergebnis",
+    "task_approval_result": "Auftragsergebnis",
     "failure_analysis": "Fehleranalyse",
 }
 

@@ -167,10 +167,6 @@ class MailboxTaskApprovalsResponse(BaseModel):
     tasks: list[MailboxTaskApproval]
 
 
-class MailboxTaskRejectRequest(BaseModel):
-    reason: str = Field(min_length=1, max_length=500)
-
-
 # ---------------------------------------------------------------------------
 # Experiment activity log models
 # ---------------------------------------------------------------------------
