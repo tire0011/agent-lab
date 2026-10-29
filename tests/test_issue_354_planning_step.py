@@ -156,7 +156,7 @@ class OwnExperienceTests(unittest.TestCase):
         svc.tick()
         prompt = planner.prompts[0]
         self.assertIn("You are Nexus, an independent agent", prompt)
-        self.assertIn("- timed_out: GitHub Issue #235: Self-restart fallback", prompt)
+        self.assertIn("- timed_out / merge: none: GitHub Issue #235: Self-restart fallback", prompt)
 
 
 class ParseChoiceTests(unittest.TestCase):

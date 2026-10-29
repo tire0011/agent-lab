@@ -651,23 +651,46 @@ class NexusInitiativeService:
         return found
 
     def _recent_experiments(self, limit: int = 10) -> list[dict[str, str]]:
-        """What Nexus tried lately and how it ended, for its own ideas."""
+        """What Nexus tried lately and how it ended, for its own ideas.
+
+        Each entry carries the newest adoption outcome too (#439): a
+        ``succeeded`` experiment whose merge a review blocked is not done.
+        Without an ``experiment_adoptions`` table only the old fields come back.
+        """
+        with_adoption = True
         try:
             rows = self._conn.execute(
-                "SELECT goal, status, error FROM experiments "
-                "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                "SELECT e.goal, e.status, e.error, "
+                "a.status AS adoption_status, a.reason AS adoption_reason "
+                "FROM experiments e "
+                "LEFT JOIN experiment_adoptions a ON a.rowid = ("
+                "  SELECT a2.rowid FROM experiment_adoptions a2 "
+                "  WHERE a2.experiment_id = e.id ORDER BY a2.rowid DESC LIMIT 1) "
+                "WHERE e.ended_at IS NOT NULL ORDER BY e.ended_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError:
-            return []
+            with_adoption = False
+            try:
+                rows = self._conn.execute(
+                    "SELECT goal, status, error FROM experiments "
+                    "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
         recent = []
         for row in rows:
             lines = str(row["goal"] or "").strip().splitlines()
-            recent.append({
+            entry = {
                 "title": lines[0][:120] if lines else "",
                 "status": str(row["status"] or ""),
                 "error": " ".join(str(row["error"] or "").split())[:200],
-            })
+            }
+            if with_adoption:
+                entry["adoption_status"] = str(row["adoption_status"] or "")
+                entry["adoption_reason"] = " ".join(str(row["adoption_reason"] or "").split())[:200]
+            recent.append(entry)
         return recent
 
     def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:

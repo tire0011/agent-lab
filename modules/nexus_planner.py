@@ -47,6 +47,29 @@ _EXPLORE = (
 )
 
 
+def _merge_label(status: str, reason: str) -> str:
+    """How the adoption ended, in the planner's words (#439)."""
+    if not status:
+        return "none"
+    if status in ("adopted", "succeeded"):
+        return "merged"
+    if status == "failed" and reason.startswith("Review by"):
+        return "blocked by review"
+    return status
+
+
+def _history_line(r: dict[str, str]) -> str:
+    """One recent experiment; with its merge outcome when that is known."""
+    if "adoption_status" not in r:
+        detail = r.get("error") or ""
+        head = f"- {r.get('status', '')}"
+    else:
+        reason = r.get("adoption_reason") or ""
+        detail = reason or r.get("error") or ""
+        head = f"- {r.get('status', '')} / merge: {_merge_label(r['adoption_status'], reason)}"
+    return f"{head}: {r.get('title', '')}" + (f" ({detail})" if detail else "")
+
+
 def planning_prompt(
     issues: list[dict[str, Any]],
     recent: list[dict[str, str]] | None = None,
@@ -57,10 +80,7 @@ def planning_prompt(
     for issue in issues:
         body = " ".join(str(issue.get("body") or "").split())[:_BODY_CHARS]
         lines.append(f"#{issue['number']} {issue['title']}\n{body}")
-    history = [
-        f"- {r.get('status', '')}: {r.get('title', '')}" + (f" ({r['error']})" if r.get("error") else "")
-        for r in recent or []
-    ]
+    history = [_history_line(r) for r in recent or []]
     return (
         "You are Nexus, an independent agent that develops itself. Your own code "
         "lives in this repository, and you pick and do your own work. Below are "
