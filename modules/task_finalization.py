@@ -57,7 +57,7 @@ _DEFAULT_RESTART_TIMEOUT_SECONDS = 600
 # one that works may stop this very process before it returns.
 _RESTART_FAILURE_WINDOW_SECONDS = 5
 _ACTIVE_APPROVAL_STATUSES = {
-    "pending_approval", "approved", "submitted", "running", "nexus_deciding",
+    "queued", "pending_approval", "approved", "submitted", "running", "nexus_deciding",
 }
 # Restarted after an adopted change. scripts/setup-nexus-permissions.sh grants
 # the service user exactly the transient-unit command assembled below.

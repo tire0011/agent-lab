@@ -166,7 +166,7 @@ Available MCP tools mirror the current **read-only** Nexus API surface:
 
 Intentionally **not** exposed over MCP in this task:
 
-- all write endpoints (`POST /ideas`, task approval/rejection, experiment
+- all write endpoints (`POST /ideas`, experiment
   adoption, operation-chain creation, etc.)
 - shell-backed `/operations/*` execution endpoints
 - webhook endpoints
@@ -259,24 +259,28 @@ Orphaned `running` tasks (left behind by a crash/restart) are marked `failed`
 exactly once at API startup via `mark_interrupted_tasks_failed()`; startup
 never restarts execution or starts a Codex process.
 
-## Mailbox task approval API
+## Mailbox task API
 
-Task messages from the mailbox create `pending_approval` records that must be
-reviewed and approved by a human operator before any code runs.
+Task messages from the mailbox go straight to Nexus: each creates a `queued`
+record in `mailbox_task_approvals`, and the task worker hands it to the local
+controller. There is no approval step (#264).
 
 All endpoints require the `x-api-key` header.
 
-- `GET /mailbox/tasks?limit=20` — list recent approvals (all statuses, newest first).
-- `GET /mailbox/tasks/{id}` — fetch one approval.
-- `POST /mailbox/tasks/{id}/approve` — approve; triggers `ExperimentService` in background.
-- `POST /mailbox/tasks/{id}/reject` — reject (`{"reason": "..."}`).
+- `GET /mailbox/tasks?limit=20` — list recent tasks (all statuses, newest first).
+- `GET /mailbox/tasks/{id}` — fetch one task.
 - `POST /mailbox/webhook/github` — GitHub webhook trigger (`X-Hub-Signature-256`, HMAC-SHA256).
 
-State machine: `pending_approval → approved → submitted → running → succeeded / failed / needs_review`.
+State machine: `queued → submitted → running → succeeded / failed / needs_review`.
 A background `MailboxTaskWorker` daemon (10 s poll interval) calls
-`submit_approved()` + `poll_running()` on each tick. Experiments run
-serially (one VM, one budget). The Web UI Task Approvals card shows all records
-and provides Approve/Reject buttons when an API key is entered.
+`submit_queued()` + `poll_running()` on each tick. Experiments run
+serially (one VM, one budget). Results reach the outbox as
+`task-approval-result-<id>.md` (file name kept for compatibility). The Web UI
+"Mailbox-Aufträge" card lists the records.
+
+Records from before #264 stay readable: `approved` rows became `queued` on
+migration; `pending_approval` and `rejected` rows keep their status and are
+never run.
 
 ## Nexus logs API
 
