@@ -322,6 +322,8 @@ class NexusInitiativeService:
             return []
         candidates: list[Candidate] = []
         for row in rows:
+            if row["adoption_status"] == "needs_review" and not self._review_may_resume(str(row["experiment_id"])):
+                continue
             goal = str(row["goal"] or "").strip().splitlines()
             candidates.append(
                 Candidate(
@@ -336,6 +338,22 @@ class NexusInitiativeService:
                 )
             )
         return candidates
+
+    def _review_may_resume(self, experiment_id: str) -> bool:
+        """Whether a ``needs_review`` adoption could get further now.
+
+        Most of these stop for a reason that does not go away (a denied path,
+        unexpected files). Restarting them every tick changed nothing and used
+        up the daily budget (d5e7de1f, 2026-10-29).
+        """
+        assess = getattr(self.adoption_service, "assess_failure", None)
+        if assess is None:
+            return True
+        try:
+            return bool(assess(experiment_id).retryable)
+        except Exception as exc:  # noqa: BLE001 - an unknown answer is not a reason to retry
+            logger.warning("initiative: cannot assess adoption %s: %s", experiment_id, exc)
+            return False
 
     def _issue_candidates(self, *, record_skips: bool = True) -> list[Candidate]:
         if self._issue_lister is None:
