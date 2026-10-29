@@ -629,8 +629,11 @@ def status() -> StatusResponse:
 
 
 @app.get("/problems", response_model=ProblemsResponse)
-def problems() -> ProblemsResponse:
-    found: list[Problem] = list_problems()
+def problems(
+    limit: int = Query(default=20, ge=1, le=200),
+    since: datetime | None = Query(default=None),
+) -> ProblemsResponse:
+    found: list[Problem] = list_problems(limit=limit, since=since)
     return ProblemsResponse(count=len(found), problems=found)
 
 

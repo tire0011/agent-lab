@@ -209,6 +209,7 @@ class OperationsRegistry:
         limit10 = OperationArgSpec("limit", "integer", "Maximale Anzahl Zeilen/Einträge.", default=10, minimum=1, maximum=100)
         limit50 = OperationArgSpec("limit", "integer", "Maximale Anzahl Zeilen/Einträge.", default=50, minimum=1, maximum=500)
         limit20 = OperationArgSpec("limit", "integer", "Maximale Anzahl Prozesse.", default=20, minimum=1, maximum=200)
+        since_timestamp = OperationArgSpec("since", "string", "Nur Probleme seit diesem ISO-Zeitstempel.")
         experiment_id = OperationArgSpec("experiment_id", "string", "Experiment-ID oder eindeutiges Präfix.", required=True)
         adoption_id = OperationArgSpec("adoption_id", "string", "Adoption-ID.", required=True)
         service = OperationArgSpec("service", "string", "systemd-Unit-Name oder Kurzname (api, mailbox, llm; Standard: agent-api).", default=_DEFAULT_SERVICE_NAME)
@@ -342,7 +343,7 @@ class OperationsRegistry:
                 ],
                 mutates_state=False,
             ),
-            "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", tags=["problems", "errors", "failures", "issues"], mutates_state=False),
+            "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", [limit20, since_timestamp], tags=["problems", "errors", "failures", "issues"], mutates_state=False),
             "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox.", tags=["mailbox", "inbox", "status", "messages"], mutates_state=False),
             "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox.", tags=["mailbox", "outbox", "status", "messages"], mutates_state=False),
         }
@@ -899,10 +900,14 @@ class OperationsRegistry:
         return OperationResult("memory", True, lines, 0)
 
     def _op_problems_list(self, args: dict[str, Any]) -> OperationResult:
-        del args
         from data_sources import list_problems
-        problems = list_problems()
-        lines = [f"{p.id}: {p.summary}" for p in problems[:20]]
+        limit = args.get("limit", 20)
+        problems = list_problems(
+            limit=limit,
+            since=args.get("since"),
+            experiment_db_path=self.db_path,
+        )
+        lines = [f"{p.id}: {p.summary}" for p in problems]
         return OperationResult("problems_list", True, lines, 0)
 
     def _op_adoption_show(self, args: dict[str, Any]) -> OperationResult:
