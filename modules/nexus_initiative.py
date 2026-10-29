@@ -57,6 +57,9 @@ _DEFAULT_STALE_AFTER_SECONDS = 6 * 60 * 60
 
 KIND_CAPABILITY_RESUME = "capability_resume"
 KIND_INTEGRATION = "integration_backlog"
+# An issue whose last attempt the reviewer blocked: retried at once and free of
+# the daily budget, so review findings go straight back to the coder.
+REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findings"
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
@@ -290,8 +293,9 @@ class NexusInitiativeService:
             """
             SELECT COUNT(*) AS n FROM nexus_initiative_log
             WHERE decision = 'dispatched' AND created_at >= ?
+              AND COALESCE(reason, '') != ?
             """,
-            (since,),
+            (since, REVIEW_RETRY_REASON),
         ).fetchone()
         return int(row["n"]) if row else 0
 
@@ -364,6 +368,7 @@ class NexusInitiativeService:
             logger.warning("initiative: issue lookup failed: %s", exc)
             return []
         linked = self._linked_issue_numbers()
+        review_blocked = self._review_blocked_issues()
         skipped = self._goal_policy_skips()
         policy_hash = _policy_hash()
         candidates: list[Candidate] = []
@@ -384,13 +389,39 @@ class NexusInitiativeService:
                 kind=KIND_ISSUE,
                 ref=str(number),
                 title=str(issue.get("title") or f"Issue #{number}")[:200],
-                reason="open issue with no experiment working on it",
+                reason=(
+                    REVIEW_RETRY_REASON if int(number) in review_blocked
+                    else "open issue with no experiment working on it"
+                ),
                 payload={"body": str(issue.get("body") or "")[:16000]},
             )
             if self._fails_goal_policy(candidate, skipped, policy_hash, record=record_skips):
                 continue
             candidates.append(candidate)
         return candidates
+
+    def _review_blocked_issues(self) -> set[int]:
+        """Issues whose latest attempt was stopped by the reviewer (#396)."""
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT l.issue_number AS issue_number, a.status AS status, a.reason AS reason
+                FROM github_experiment_links l
+                JOIN experiments e ON e.id = l.experiment_id
+                LEFT JOIN experiment_adoptions a ON a.experiment_id = e.id
+                ORDER BY e.created_at
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        latest: dict[int, bool] = {}
+        for row in rows:
+            try:
+                number = int(row["issue_number"])
+            except (TypeError, ValueError):
+                continue
+            latest[number] = row["status"] == "failed" and str(row["reason"] or "").startswith("Review by ")
+        return {number for number, blocked in latest.items() if blocked}
 
     def _goal_policy_skips(self) -> set[tuple[str, str, str]]:
         """``(issue, issue hash, policy hash)`` of earlier goal-policy skips."""
@@ -607,9 +638,13 @@ class NexusInitiativeService:
         found = list(self._integration_candidates()) if self.adoption_service is not None else []
         if self.controller is not None:
             issues = self._issue_candidates(record_skips=record_skips)
+            retries = [c for c in issues if c.reason == REVIEW_RETRY_REASON]
+            if retries:
+                # Review findings go straight back to the coder, before new work.
+                issues = retries
             # Integration work is dispatched first; asking the planner then
             # would be a paid call whose answer is thrown away.
-            if self._planner is not None and not found:
+            elif self._planner is not None and not found:
                 issues = self._planned_issue(issues)
             found.extend(issues)
             found.extend(self._idea_candidates())
@@ -679,15 +714,17 @@ class NexusInitiativeService:
             return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
 
         if self.daily_budget and self._spent_today() >= self.daily_budget:
-            return self._record(
-                InitiativeDecision(
-                    "budget_exhausted",
-                    detail=f"{self.daily_budget} self-started items in the last 24h",
-                    tick_id=tick_id,
+            found = [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON] if self.controller else []
+            if not found:
+                return self._record(
+                    InitiativeDecision(
+                        "budget_exhausted",
+                        detail=f"{self.daily_budget} self-started items in the last 24h",
+                        tick_id=tick_id,
+                    )
                 )
-            )
-
-        found = self.candidates()
+        else:
+            found = self.candidates()
         if not found:
             return self._record(
                 InitiativeDecision("idle", detail="no actionable work found", tick_id=tick_id)
