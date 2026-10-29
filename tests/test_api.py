@@ -81,13 +81,16 @@ class ApiTestsBase(unittest.TestCase):
 
         self._orig_runs_dir = data_sources.RUNS_DIR
         self._orig_ideas_path = data_sources.IDEAS_PATH
+        self._orig_experiment_db_path = data_sources.EXPERIMENT_DB_PATH
         data_sources.RUNS_DIR = self.runs_dir
         data_sources.IDEAS_PATH = self.ideas_path
+        data_sources.EXPERIMENT_DB_PATH = Path(self.temp_dir.name) / "agent.db"
         self.addCleanup(self._restore_paths)
 
     def _restore_paths(self) -> None:
         data_sources.RUNS_DIR = self._orig_runs_dir
         data_sources.IDEAS_PATH = self._orig_ideas_path
+        data_sources.EXPERIMENT_DB_PATH = self._orig_experiment_db_path
 
     def _write_run(self, name: str, response: str, timestamp: str = "2026-08-10T00:00:00+00:00") -> None:
         (self.runs_dir / name).write_text(
@@ -415,6 +418,18 @@ class StatusEndpointTests(ApiTestsBase):
 
 
 class ProblemsEndpointTests(ApiTestsBase):
+    def test_problems_passes_limit_and_since(self):
+        with patch.object(api, "list_problems", return_value=[]) as mocked:
+            response = self.client.get(
+                "/problems?limit=1&since=2026-10-01T00:00:00Z"
+            )
+        self.assertEqual(response.status_code, 200)
+        mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.kwargs["limit"], 1)
+        self.assertEqual(
+            mocked.call_args.kwargs["since"].isoformat(), "2026-10-01T00:00:00+00:00"
+        )
+
     def test_problems_empty_when_no_runs(self):
         response = self.client.get("/problems")
         self.assertEqual(response.status_code, 200)

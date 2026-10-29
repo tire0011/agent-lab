@@ -24,9 +24,12 @@ class StatusResponse(BaseModel):
 class Problem(BaseModel):
     id: str
     source: str
+    issue_number: int | None = None
     summary: str
     detail: str
     timestamp: str
+    failure_phase: str | None = None
+    failure_type: str | None = None
 
 
 class ProblemsResponse(BaseModel):
