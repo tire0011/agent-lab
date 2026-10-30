@@ -18,6 +18,9 @@ from typing import Any, Callable
 
 from modules.coding_provider import (
     build_random_worker,
+    build_worker,
+    is_provider_overload,
+    other_provider,
     provider_of,
     random_worker_factory,
 )
@@ -968,6 +971,38 @@ class ExperimentService:
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
         )
+
+        fallback = other_provider(implementation_provider) if implementation_provider else None
+        if (
+            implementation_result.error
+            and not implementation_result.timed_out
+            and is_provider_overload(implementation_result.error)
+            and fallback is not None
+            and self.get_experiment(experiment_id).status != STATUS_CANCELLED
+        ):
+            # The provider was overloaded, not the work wrong: let the other
+            # coding agent do it instead of failing the experiment.
+            elog.warning(
+                "implementation", "implementation_provider_fallback",
+                f"{implementation_provider} is overloaded; implementation runs on {fallback}",
+                provider=fallback,
+            )
+            worker = build_worker(fallback, db_path=self.db_path)
+            implementation_provider = fallback
+            self._force_status(
+                experiment_id, STATUS_IMPLEMENTING,
+                implementation_provider=implementation_provider,
+            )
+            implementation_result = worker.run(
+                task=implementation_prompt,
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=max_seconds,
+                stall_seconds=stall_seconds,
+                experiment_logger=elog,
+                phase="implementation",
+                on_process=lambda process: self._track_process(experiment_id, process),
+            )
 
         if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
             return self.get_experiment(experiment_id)

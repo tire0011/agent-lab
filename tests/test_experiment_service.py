@@ -950,6 +950,39 @@ class ExperimentServiceTestCase(unittest.TestCase):
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_TIMED_OUT)
 
+    def test_overloaded_provider_falls_back_to_the_other_agent(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write",
+            error="API Error: 529 Overloaded. This is a server-side issue",
+        )
+        fallback = MagicMock()
+        fallback.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="real failure",
+        )
+        with patch("modules.experiment_service.service.other_provider", return_value="codex"), patch(
+            "modules.experiment_service.service.build_worker", return_value=fallback
+        ) as build:
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+        build.assert_called_once()
+        self.assertEqual(build.call_args.args[0], "codex")
+        fallback.run.assert_called_once()
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("real failure", result.error)
+
+    def test_other_errors_do_not_fall_back(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="kaboom",
+        )
+        with patch("modules.experiment_service.service.build_worker") as build:
+            experiment = self.service.create_experiment(goal="g")
+            self.service.run_experiment(experiment.id)
+        build.assert_not_called()
+
     # ------------------------------------------------------------------
     # needs_review when a safe test command cannot be determined
     # ------------------------------------------------------------------
