@@ -64,6 +64,10 @@ KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
 _DEFAULT_DAILY_BUDGET = 5
+# A restart hand-off can fail without replacing the API process.  Retrying on
+# every minute tick adds noise and can contend with recovery work, so failed
+# hand-offs get a fixed backoff before another attempt.
+_SERVICE_RESTART_COOLDOWN = timedelta(minutes=30)
 # Open proposals beyond this many are not added to (#354): they wait for review.
 _MAX_OPEN_PROPOSALS = 3
 
@@ -165,6 +169,7 @@ class NexusInitiativeService:
         proposal_creator: Callable[[str, str], None] | None = None,
         proposal_counter: Callable[[], int] | None = None,
         diagnostics_client: Callable[[], dict[str, Any]] | None = None,
+        checkout_revision: Callable[[], str] | None = None,
         restart_hook: Callable[[], None] | None = None,
     ) -> None:
         self.db_path = str(db_path)
@@ -179,6 +184,7 @@ class NexusInitiativeService:
         self._proposal_creator = proposal_creator
         self._proposal_counter = proposal_counter
         self._diagnostics_client = diagnostics_client
+        self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
         self._open_proposals = 0
         if daily_budget is None:
@@ -758,6 +764,10 @@ class NexusInitiativeService:
 
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
+        busy = self.busy_reason()
+        if busy is not None:
+            return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
+
         stale = self._stale_service_revisions()
         if stale is not None:
             startup, checkout = stale
@@ -766,7 +776,7 @@ class NexusInitiativeService:
                 detail=f"git_revision={startup} checkout_revision={checkout}",
                 tick_id=tick_id,
             ))
-            if self._restart_hook is not None:
+            if self._restart_hook is not None and not self._restart_cooldown_active():
                 try:
                     self._restart_hook()
                 except Exception as exc:  # noqa: BLE001 - the activity must survive a failed hand-off
@@ -774,10 +784,6 @@ class NexusInitiativeService:
                     decision.detail += f"; restart failed: {type(exc).__name__}: {exc}"[:500]
                     self._record(decision, update=True)
             return decision
-
-        busy = self.busy_reason()
-        if busy is not None:
-            return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
 
         if self.daily_budget and self._spent_today() >= self.daily_budget:
             found = [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON] if self.controller else []
@@ -814,18 +820,43 @@ class NexusInitiativeService:
 
     def _stale_service_revisions(self) -> tuple[str, str] | None:
         """Return the two revisions when live diagnostics prove the API is stale."""
-        if self._diagnostics_client is None:
+        if self._diagnostics_client is None or self._checkout_revision is None:
             return None
         try:
             payload = self._diagnostics_client()
             service = payload.get("service", payload)
             startup = service.get("git_revision")
-            checkout = service.get("checkout_revision")
-            if service.get("stale") is True and startup and checkout and startup != checkout:
-                return str(startup), str(checkout)
         except Exception as exc:  # noqa: BLE001 - diagnostics must not disable initiative
             logger.warning("initiative: service diagnostics failed: %s", exc)
+            return None
+        if not startup:
+            logger.warning("initiative: service diagnostics did not report git_revision")
+            return None
+        try:
+            checkout = self._checkout_revision()
+        except Exception as exc:  # noqa: BLE001 - revision lookup must not disable initiative
+            logger.warning("initiative: checkout revision lookup failed: %s", exc)
+            return None
+        if not checkout:
+            logger.warning("initiative: checkout revision lookup returned no revision")
+            return None
+        startup_text = str(startup).strip()
+        checkout_text = str(checkout).strip()
+        if not (startup_text.startswith(checkout_text) or checkout_text.startswith(startup_text)):
+            return startup_text, checkout_text
         return None
+
+    def _restart_cooldown_active(self) -> bool:
+        """Whether a recent failed restart hand-off is still cooling down."""
+        row = self._conn.execute(
+            """
+            SELECT created_at FROM nexus_initiative_log
+            WHERE decision = 'service_stale' AND detail LIKE '%; restart failed:%'
+            ORDER BY created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        failed_at = _parse_timestamp(row["created_at"]) if row is not None else None
+        return failed_at is not None and failed_at > _utcnow() - _SERVICE_RESTART_COOLDOWN
 
     def _earlier_attempts(self, issue_number: int) -> str:
         """How earlier experiments for this issue ended, for the retry (#374).

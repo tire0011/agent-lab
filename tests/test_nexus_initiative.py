@@ -123,10 +123,10 @@ class NexusInitiativeTests(unittest.TestCase):
         issue_lister = MagicMock(return_value=[{"number": 441, "title": "work", "body": ""}])
         svc = self.fx.service(
             diagnostics_client=lambda: {"service": {
+                "status": "ok",
                 "git_revision": "aaaa111",
-                "checkout_revision": "bbbb222",
-                "stale": True,
             }},
+            checkout_revision=lambda: "bbbb222",
             restart_hook=restart,
             issue_lister=issue_lister,
         )
@@ -149,9 +149,8 @@ class NexusInitiativeTests(unittest.TestCase):
         svc = self.fx.service(
             diagnostics_client=lambda: {"service": {
                 "git_revision": "aaaa111",
-                "checkout_revision": "aaaa111",
-                "stale": False,
             }},
+            checkout_revision=lambda: "aaaa111ddddddddddddddddddddddddddddddddd",
             restart_hook=restart,
             issue_lister=lambda: [{"number": 441, "title": "work", "body": ""}],
         )
@@ -162,6 +161,65 @@ class NexusInitiativeTests(unittest.TestCase):
         self.assertEqual(decision.decision, "dispatched")
         self.assertEqual(self.fx.controller.issues, [441])
         restart.assert_not_called()
+
+    def test_missing_service_revision_allows_tick_to_proceed(self):
+        restart = MagicMock()
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {"status": "ok"}},
+            checkout_revision=lambda: "bbbb222",
+            restart_hook=restart,
+            issue_lister=lambda: [{"number": 448, "title": "work", "body": ""}],
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "dispatched")
+        self.assertEqual(self.fx.controller.issues, [448])
+        restart.assert_not_called()
+
+    def test_failed_checkout_revision_lookup_allows_tick_to_proceed(self):
+        def fail_lookup():
+            raise RuntimeError("git unavailable")
+
+        restart = MagicMock()
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {"git_revision": "aaaa111"}},
+            checkout_revision=fail_lookup,
+            restart_hook=restart,
+            issue_lister=lambda: [{"number": 448, "title": "work", "body": ""}],
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "dispatched")
+        self.assertEqual(self.fx.controller.issues, [448])
+        restart.assert_not_called()
+
+    def test_busy_service_is_not_restarted_when_revisions_differ(self):
+        self.fx.add_experiment("e1", "implementing")
+        restart = MagicMock()
+        diagnostics = MagicMock(return_value={"service": {"git_revision": "aaaa111"}})
+        svc = self.fx.service(
+            diagnostics_client=diagnostics,
+            checkout_revision=lambda: "bbbb222",
+            restart_hook=restart,
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "busy")
+        restart.assert_not_called()
+        diagnostics.assert_not_called()
+
+    def test_failed_restart_hand_off_is_not_retried_inside_cooldown(self):
+        restart = MagicMock(side_effect=RuntimeError("systemctl failed"))
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {"git_revision": "aaaa111"}},
+            checkout_revision=lambda: "bbbb222",
+            restart_hook=restart,
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "service_stale")
+        self.assertEqual(svc.tick().decision, "service_stale")
+        restart.assert_called_once_with()
 
     def test_does_nothing_while_a_mailbox_task_runs(self):
         self.fx.add_approval("running")
