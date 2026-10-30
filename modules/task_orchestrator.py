@@ -3650,7 +3650,12 @@ Decide the next step now. Return JSON only.
         context: str = "",
         reason: str = "",
     ) -> dict[str, Any]:
-        available = {item["provider"] for item in self.delegation.catalog()}
+        catalog = [item["provider"] for item in self.delegation.catalog()]
+        available = set(catalog)
+        if not provider and catalog:
+            # The controller sometimes leaves the provider out: take the local
+            # worker (it routes judgement to a stronger model) or the first one.
+            provider = "local_worker" if "local_worker" in available else catalog[0]
         if provider not in available:
             raise TaskOrchestratorError(f"delegation provider {provider!r} is not available")
 

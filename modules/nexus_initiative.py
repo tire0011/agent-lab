@@ -14,6 +14,7 @@ started work is worth more than starting new work.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -21,9 +22,13 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
+from modules.experiment_service import policy as goal_policy
 from modules.nexus_planner import PROPOSAL_LABEL
+from modules.nexus_sources import issue_source
+from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -32,7 +37,7 @@ logger = logging.getLogger(__name__)
 # other part of the pipeline still owns the machine.
 _BUSY_EXPERIMENT_STATUSES = ("queued", "selecting", "implementing", "verifying")
 _BUSY_ADOPTION_STATUSES = ("queued", "adopting")
-_BUSY_APPROVAL_STATUSES = ("approved", "submitted", "running", "nexus_deciding")
+_BUSY_APPROVAL_STATUSES = ("queued", "approved", "submitted", "running", "nexus_deciding")
 
 # An adoption in one of these states is not going to move on its own, but the
 # experiment behind it succeeded - that is the integration backlog.
@@ -53,10 +58,17 @@ _DEFAULT_STALE_AFTER_SECONDS = 6 * 60 * 60
 
 KIND_CAPABILITY_RESUME = "capability_resume"
 KIND_INTEGRATION = "integration_backlog"
+# An issue whose last attempt the reviewer blocked: retried at once and free of
+# the daily budget, so review findings go straight back to the coder.
+REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findings"
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
 _DEFAULT_DAILY_BUDGET = 5
+# A restart hand-off can fail without replacing the API process.  Retrying on
+# every minute tick adds noise and can contend with recovery work, so failed
+# hand-offs get a fixed backoff before another attempt.
+_SERVICE_RESTART_COOLDOWN = timedelta(minutes=30)
 # Open proposals beyond this many are not added to (#354): they wait for review.
 _MAX_OPEN_PROPOSALS = 3
 
@@ -65,6 +77,41 @@ _MAX_OPEN_PROPOSALS = 3
 # gate that stopped it may have been fixed since (#185, #349, #378).
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
+# An open issue that used up its attempts is reported, not dropped silently
+# (#457). It stays unselectable until a human acts.
+DECISION_SKIPPED_ATTEMPTS_EXHAUSTED = "skipped_attempts_exhausted"
+
+# An issue the goal policy rejects is not sent (#408): the experiment would be
+# rejected before any work, at the cost of a tick and a budget slot.
+DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
+# Reasons only _check_goal_policy produces. A rejection with one of them is
+# known in advance from the goal text, so retrying the same text is pointless.
+_GOAL_POLICY_REASON_PREFIXES = tuple(
+    prefix for prefix, _ in goal_policy._POLICY_RULE_PREFIXES if prefix.startswith("goal ")
+)
+
+
+def _is_provider_overload(status: Any, error: Any) -> bool:
+    """A run that failed because the coding agent's API was overloaded."""
+    from modules.coding_provider import is_provider_overload
+
+    return status == "failed" and is_provider_overload(error)
+
+
+def _is_goal_policy_rejection(status: Any, error: Any) -> bool:
+    return status == "rejected" and str(error or "").startswith(_GOAL_POLICY_REASON_PREFIXES)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _policy_hash() -> str:
+    """Hash of the policy module: a changed policy may judge an issue anew."""
+    try:
+        return _sha256(Path(goal_policy.__file__).read_bytes())
+    except OSError:
+        return ""
 
 
 def _utcnow() -> datetime:
@@ -96,7 +143,9 @@ class Candidate:
 class InitiativeDecision:
     """What the tick decided, and why. Persisted before anything is dispatched."""
 
-    decision: str  # "dispatched" | "idle" | "busy" | "budget_exhausted" | "error"
+    # "dispatched" | "idle" | "busy" | "budget_exhausted" | "error"
+    # | "skipped_goal_policy" | "skipped_attempts_exhausted"
+    decision: str
     candidate: Candidate | None = None
     considered: list[Candidate] = field(default_factory=list)
     detail: str = ""
@@ -125,6 +174,9 @@ class NexusInitiativeService:
         issue_commenter: Callable[[int, str], None] | None = None,
         proposal_creator: Callable[[str, str], None] | None = None,
         proposal_counter: Callable[[], int] | None = None,
+        diagnostics_client: Callable[[], dict[str, Any]] | None = None,
+        checkout_revision: Callable[[], str] | None = None,
+        restart_hook: Callable[[], None] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -137,7 +189,11 @@ class NexusInitiativeService:
         self._issue_commenter = issue_commenter
         self._proposal_creator = proposal_creator
         self._proposal_counter = proposal_counter
+        self._diagnostics_client = diagnostics_client
+        self._checkout_revision = checkout_revision
+        self._restart_hook = restart_hook
         self._open_proposals = 0
+        self._exhausted_issues: list[dict[str, Any]] = []
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
             try:
@@ -261,10 +317,23 @@ class NexusInitiativeService:
             """
             SELECT COUNT(*) AS n FROM nexus_initiative_log
             WHERE decision = 'dispatched' AND created_at >= ?
+              AND COALESCE(reason, '') != ?
             """,
-            (since,),
+            (since, REVIEW_RETRY_REASON),
         ).fetchone()
-        return int(row["n"]) if row else 0
+        spent = int(row["n"]) if row else 0
+        return max(0, spent - self._overloaded_since(since))
+
+    def _overloaded_since(self, since: str) -> int:
+        """Experiments since *since* that failed only because the provider was overloaded."""
+        try:
+            rows = self._conn.execute(
+                "SELECT status, error FROM experiments WHERE created_at >= ? AND status = 'failed'",
+                (since,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0
+        return sum(1 for r in rows if _is_provider_overload(r["status"], r["error"]))
 
     # ---- candidate discovery --------------------------------------------
 
@@ -293,6 +362,8 @@ class NexusInitiativeService:
             return []
         candidates: list[Candidate] = []
         for row in rows:
+            if row["adoption_status"] == "needs_review" and not self._review_may_resume(str(row["experiment_id"])):
+                continue
             goal = str(row["goal"] or "").strip().splitlines()
             candidates.append(
                 Candidate(
@@ -308,7 +379,23 @@ class NexusInitiativeService:
             )
         return candidates
 
-    def _issue_candidates(self) -> list[Candidate]:
+    def _review_may_resume(self, experiment_id: str) -> bool:
+        """Whether a ``needs_review`` adoption could get further now.
+
+        Most of these stop for a reason that does not go away (a denied path,
+        unexpected files). Restarting them every tick changed nothing and used
+        up the daily budget (d5e7de1f, 2026-10-29).
+        """
+        assess = getattr(self.adoption_service, "assess_failure", None)
+        if assess is None:
+            return True
+        try:
+            return bool(assess(experiment_id).retryable)
+        except Exception as exc:  # noqa: BLE001 - an unknown answer is not a reason to retry
+            logger.warning("initiative: cannot assess adoption %s: %s", experiment_id, exc)
+            return False
+
+    def _issue_candidates(self, *, record_skips: bool = True) -> list[Candidate]:
         if self._issue_lister is None:
             return []
         try:
@@ -316,9 +403,14 @@ class NexusInitiativeService:
         except Exception as exc:  # noqa: BLE001 - a source outage must not stop the tick
             logger.warning("initiative: issue lookup failed: %s", exc)
             return []
-        linked = self._linked_issue_numbers()
+        linked, exhausted = self._issue_attempts()
+        reported = self._exhausted_reports()
+        review_blocked = self._review_blocked_issues()
+        skipped = self._goal_policy_skips()
+        policy_hash = _policy_hash()
         candidates: list[Candidate] = []
         self._open_proposals = 0
+        self._exhausted_issues = []
         for issue in issues:
             number = issue.get("number")
             labels = {
@@ -330,26 +422,186 @@ class NexusInitiativeService:
                 self._open_proposals += 1
                 continue
             if number is None or int(number) in linked:
+                if number is not None and int(number) in exhausted:
+                    self._note_exhausted(issue, exhausted[int(number)], reported, record=record_skips)
                 continue
-            candidates.append(
-                Candidate(
-                    kind=KIND_ISSUE,
-                    ref=str(number),
-                    title=str(issue.get("title") or f"Issue #{number}")[:200],
-                    reason="open issue with no experiment working on it",
-                    payload={"body": str(issue.get("body") or "")[:16000]},
-                )
+            candidate = Candidate(
+                kind=KIND_ISSUE,
+                ref=str(number),
+                title=str(issue.get("title") or f"Issue #{number}")[:200],
+                reason=(
+                    REVIEW_RETRY_REASON if int(number) in review_blocked
+                    else "open issue with no experiment working on it"
+                ),
+                payload={"body": str(issue.get("body") or "")[:16000]},
             )
+            if self._fails_goal_policy(candidate, skipped, policy_hash, record=record_skips):
+                continue
+            candidates.append(candidate)
         return candidates
 
-    def _linked_issue_numbers(self) -> set[int]:
-        """Issues not to start again (#374).
+    def _review_blocked_issues(self) -> set[int]:
+        """Issues whose latest attempt was stopped by the reviewer (#396)."""
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT l.issue_number AS issue_number, a.status AS status, a.reason AS reason
+                FROM github_experiment_links l
+                JOIN experiments e ON e.id = l.experiment_id
+                LEFT JOIN experiment_adoptions a ON a.experiment_id = e.id
+                ORDER BY e.created_at
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        latest: dict[int, bool] = {}
+        for row in rows:
+            try:
+                number = int(row["issue_number"])
+            except (TypeError, ValueError):
+                continue
+            latest[number] = row["status"] == "failed" and str(row["reason"] or "").startswith("Review by ")
+        return {number for number, blocked in latest.items() if blocked}
+
+    def _goal_policy_skips(self) -> set[tuple[str, str, str]]:
+        """``(issue, issue hash, policy hash)`` of earlier goal-policy skips."""
+        rows = self._conn.execute(
+            "SELECT source_ref, detail FROM nexus_initiative_log WHERE decision = ?",
+            (DECISION_SKIPPED_GOAL_POLICY,),
+        ).fetchall()
+        found: set[tuple[str, str, str]] = set()
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except ValueError:
+                continue
+            found.add((
+                str(row["source_ref"]),
+                str(detail.get("issue_hash") or ""),
+                str(detail.get("policy_hash") or ""),
+            ))
+        return found
+
+    def _fails_goal_policy(
+        self,
+        candidate: Candidate,
+        skipped: set[tuple[str, str, str]],
+        policy_hash: str,
+        *,
+        record: bool,
+    ) -> bool:
+        """Run the experiment's goal policy on this issue before it is sent (#408).
+
+        The checked text is the issue source the controller builds from the
+        same title and body. A skip is recorded once per issue text and policy
+        version; while neither changes, the issue is not judged again.
+        """
+        goal = issue_source(
+            int(candidate.ref), title=candidate.title, body=str(candidate.payload.get("body") or "")
+        ).content
+        issue_hash = _sha256(goal.encode("utf-8"))
+        if (candidate.ref, issue_hash, policy_hash) in skipped:
+            return True
+        reason = goal_policy._check_goal_policy(goal)
+        if reason is None:
+            return False
+        logger.info("initiative: issue #%s skipped by goal policy: %s", candidate.ref, reason)
+        if record:
+            self._record(
+                InitiativeDecision(
+                    DECISION_SKIPPED_GOAL_POLICY,
+                    candidate=Candidate(KIND_ISSUE, candidate.ref, candidate.title, reason),
+                    detail=json.dumps({"issue_hash": issue_hash, "policy_hash": policy_hash}),
+                    tick_id=uuid.uuid4().hex,
+                )
+            )
+            skipped.add((candidate.ref, issue_hash, policy_hash))
+        return True
+
+    def _exhausted_reports(self) -> dict[tuple[str, tuple[str, ...]], tuple[str, dict[str, Any]]]:
+        """``(issue, experiment IDs) -> (tick id, detail)`` of earlier reports."""
+        rows = self._conn.execute(
+            "SELECT tick_id, source_ref, detail FROM nexus_initiative_log WHERE decision = ?",
+            (DECISION_SKIPPED_ATTEMPTS_EXHAUSTED,),
+        ).fetchall()
+        found: dict[tuple[str, tuple[str, ...]], tuple[str, dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except ValueError:
+                continue
+            key = (str(row["source_ref"]), tuple(detail.get("experiment_ids") or ()))
+            found[key] = (str(row["tick_id"]), detail)
+        return found
+
+    def _note_exhausted(
+        self,
+        issue: dict[str, Any],
+        attempts: dict[str, Any],
+        reported: dict[tuple[str, tuple[str, ...]], tuple[str, dict[str, Any]]],
+        *,
+        record: bool,
+    ) -> None:
+        """Show this issue to the planner, and report the stop once (#457).
+
+        One log entry per issue and set of experiment IDs. The comment is
+        tracked in that entry: GitHub may be down when the entry is written,
+        and without this a failed comment would never be posted.
+        """
+        ref = str(issue["number"])
+        title = str(issue.get("title") or f"Issue #{ref}")[:200]
+        self._exhausted_issues.append(
+            {"number": int(ref), "title": title, "last_reason": attempts["last_reason"]}
+        )
+        if not record:
+            return
+        key = (ref, tuple(attempts["experiment_ids"]))
+        if key in reported:
+            tick_id, detail = reported[key]
+        else:
+            logger.info("initiative: issue #%s is out of attempts: %s", ref, attempts["last_reason"])
+            tick_id, detail = uuid.uuid4().hex, {**attempts, "commented": False}
+            self._record(
+                InitiativeDecision(
+                    DECISION_SKIPPED_ATTEMPTS_EXHAUSTED,
+                    candidate=Candidate(KIND_ISSUE, ref, title, attempts["last_reason"]),
+                    detail=json.dumps(detail),
+                    tick_id=tick_id,
+                )
+            )
+            reported[key] = (tick_id, detail)
+        if detail.get("commented") or self._issue_commenter is None:
+            return
+        try:
+            self._issue_commenter(
+                int(ref),
+                f"Nexus stopped working on this issue: it used up its {_MAX_ISSUE_ATTEMPTS} attempts.\n\n"
+                f"Experiments: {', '.join(detail['experiment_ids'])}\n"
+                f"Last failure: {detail['last_reason']}\n\n"
+                "Nexus does not start it again on its own; a human has to decide how it goes on.",
+            )
+        except Exception as exc:  # noqa: BLE001 - tried again on the next tick
+            logger.warning("initiative: out-of-attempts comment failed for #%s: %s", ref, exc)
+            return
+        detail["commented"] = True
+        self._record(
+            InitiativeDecision(
+                DECISION_SKIPPED_ATTEMPTS_EXHAUSTED, detail=json.dumps(detail), tick_id=tick_id
+            ),
+            update=True,
+        )
+
+    def _issue_attempts(self) -> tuple[set[int], dict[int, dict[str, Any]]]:
+        """Issues not to start again (#374), and those among them out of attempts.
 
         An issue is free again after a failed experiment, up to
         ``_MAX_ISSUE_ATTEMPTS`` failed attempts. A running or succeeded
-        experiment, or a link without a known experiment, keeps it blocked.
+        experiment, or a link without a known experiment, keeps it blocked,
+        and such an issue is not reported as out of attempts (#457): its work
+        has not stopped.
         """
-        failed: dict[int, set[str]] = {}
+        # issue -> experiment -> (when, why it failed)
+        failed: dict[int, dict[str, tuple[str, str]]] = {}
         blocked: set[int] = set()
         for table in ("github_experiment_links", "github_work_links"):
             try:
@@ -357,7 +609,8 @@ class NexusInitiativeService:
                     f"""
                     SELECT l.issue_number AS issue_number,
                            l.experiment_id AS experiment_id, e.status AS status,
-                           a.status AS adoption_status
+                           e.error AS error, e.created_at AS created_at, e.ended_at AS ended_at,
+                           a.status AS adoption_status, a.reason AS adoption_reason
                     FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
                     LEFT JOIN experiment_adoptions a ON a.experiment_id = l.experiment_id
                     """
@@ -369,14 +622,52 @@ class NexusInitiativeService:
                     number = int(row["issue_number"])
                 except (TypeError, ValueError):
                     continue
+                # ensure_for_source records the source before any experiment
+                # exists (#464): a link without an experiment is no work.
+                if row["experiment_id"] is None:
+                    continue
+                # A goal-policy rejection is neither an attempt nor a block
+                # (#408): the preflight in _issue_candidates judges the text.
+                if _is_goal_policy_rejection(row["status"], row["error"]):
+                    continue
+                # An overloaded provider says nothing about the issue: not an attempt.
+                if _is_provider_overload(row["status"], row["error"]):
+                    continue
                 # A review that blocked the merge (#396) fails the adoption of
                 # a succeeded experiment: that is a failed attempt too.
-                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or row["adoption_status"] == "failed":
-                    failed.setdefault(number, set()).add(str(row["experiment_id"]))
+                merge_stopped = self._merge_stopped(row)
+                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or merge_stopped:
+                    first, second = row["adoption_reason"], row["error"]
+                    if not merge_stopped:
+                        first, second = second, first
+                    failed.setdefault(number, {})[str(row["experiment_id"])] = (
+                        str(row["created_at"] or row["ended_at"] or ""),
+                        str(first or second or ""),
+                    )
                 else:
                     blocked.add(number)
-        blocked.update(n for n, ids in failed.items() if len(ids) >= _MAX_ISSUE_ATTEMPTS)
-        return blocked
+        exhausted = {
+            number: {
+                "experiment_ids": sorted(attempts),
+                "last_reason": sanitized_reason(" ".join(max(attempts.values())[1].split()))
+                or "no reason recorded",
+            }
+            for number, attempts in failed.items()
+            if len(attempts) >= _MAX_ISSUE_ATTEMPTS and number not in blocked
+        }
+        blocked.update(n for n, attempts in failed.items() if len(attempts) >= _MAX_ISSUE_ATTEMPTS)
+        return blocked, exhausted
+
+    def _merge_stopped(self, row: sqlite3.Row) -> bool:
+        """The experiment succeeded but its merge stopped for good.
+
+        A ``needs_review`` that cannot resume is such a stop too: the issue
+        gets another attempt with the reason, instead of waiting for a human.
+        """
+        status = row["adoption_status"]
+        if status == "failed":
+            return True
+        return status == "needs_review" and not self._review_may_resume(str(row["experiment_id"]))
 
     def _idea_candidates(self) -> list[Candidate]:
         lister = self._idea_lister
@@ -476,42 +767,70 @@ class NexusInitiativeService:
             self._record(decision, update=True)
         return decision
 
-    def candidates(self) -> list[Candidate]:
+    def candidates(self, *, record_skips: bool = True) -> list[Candidate]:
         """All *dispatchable* work, best first.
 
         Work whose dispatcher is not configured is left out rather than listed:
         a candidate that cannot be started is not a candidate, and reporting it
         would misrepresent both the backlog size and what the next tick will do.
+        ``record_skips=False`` judges issues without writing skips to history.
         """
         found = list(self._integration_candidates()) if self.adoption_service is not None else []
         if self.controller is not None:
-            issues = self._issue_candidates()
+            issues = self._issue_candidates(record_skips=record_skips)
+            retries = [c for c in issues if c.reason == REVIEW_RETRY_REASON]
+            if retries:
+                # Review findings go straight back to the coder, before new work.
+                issues = retries
             # Integration work is dispatched first; asking the planner then
             # would be a paid call whose answer is thrown away.
-            if self._planner is not None and not found:
+            elif self._planner is not None and not found:
                 issues = self._planned_issue(issues)
             found.extend(issues)
             found.extend(self._idea_candidates())
         return found
 
     def _recent_experiments(self, limit: int = 10) -> list[dict[str, str]]:
-        """What Nexus tried lately and how it ended, for its own ideas."""
+        """What Nexus tried lately and how it ended, for its own ideas.
+
+        Each entry carries the newest adoption outcome too (#439): a
+        ``succeeded`` experiment whose merge a review blocked is not done.
+        Without an ``experiment_adoptions`` table only the old fields come back.
+        """
+        with_adoption = True
         try:
             rows = self._conn.execute(
-                "SELECT goal, status, error FROM experiments "
-                "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                "SELECT e.goal, e.status, e.error, "
+                "a.status AS adoption_status, a.reason AS adoption_reason "
+                "FROM experiments e "
+                "LEFT JOIN experiment_adoptions a ON a.rowid = ("
+                "  SELECT a2.rowid FROM experiment_adoptions a2 "
+                "  WHERE a2.experiment_id = e.id ORDER BY a2.rowid DESC LIMIT 1) "
+                "WHERE e.ended_at IS NOT NULL ORDER BY e.ended_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError:
-            return []
+            with_adoption = False
+            try:
+                rows = self._conn.execute(
+                    "SELECT goal, status, error FROM experiments "
+                    "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
         recent = []
         for row in rows:
             lines = str(row["goal"] or "").strip().splitlines()
-            recent.append({
+            entry = {
                 "title": lines[0][:120] if lines else "",
                 "status": str(row["status"] or ""),
                 "error": " ".join(str(row["error"] or "").split())[:200],
-            })
+            }
+            if with_adoption:
+                entry["adoption_status"] = str(row["adoption_status"] or "")
+                entry["adoption_reason"] = " ".join(str(row["adoption_reason"] or "").split())[:200]
+            recent.append(entry)
         return recent
 
     def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:
@@ -525,6 +844,7 @@ class NexusInitiativeService:
         choice = self._planner.choose(
             [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues],
             recent=self._recent_experiments(),
+            exhausted=self._exhausted_issues,
         )
         if choice is None:
             return []
@@ -557,16 +877,35 @@ class NexusInitiativeService:
         if busy is not None:
             return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
 
-        if self.daily_budget and self._spent_today() >= self.daily_budget:
-            return self._record(
-                InitiativeDecision(
-                    "budget_exhausted",
-                    detail=f"{self.daily_budget} self-started items in the last 24h",
-                    tick_id=tick_id,
-                )
-            )
+        stale = self._stale_service_revisions()
+        if stale is not None:
+            startup, checkout = stale
+            decision = self._record(InitiativeDecision(
+                "service_stale",
+                detail=f"git_revision={startup} checkout_revision={checkout}",
+                tick_id=tick_id,
+            ))
+            if self._restart_hook is not None and not self._restart_cooldown_active():
+                try:
+                    self._restart_hook()
+                except Exception as exc:  # noqa: BLE001 - the activity must survive a failed hand-off
+                    logger.exception("initiative: stale service restart hand-off failed")
+                    decision.detail += f"; restart failed: {type(exc).__name__}: {exc}"[:500]
+                    self._record(decision, update=True)
+            return decision
 
-        found = self.candidates()
+        if self.daily_budget and self._spent_today() >= self.daily_budget:
+            found = [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON] if self.controller else []
+            if not found:
+                return self._record(
+                    InitiativeDecision(
+                        "budget_exhausted",
+                        detail=f"{self.daily_budget} self-started items in the last 24h",
+                        tick_id=tick_id,
+                    )
+                )
+        else:
+            found = self.candidates()
         if not found:
             return self._record(
                 InitiativeDecision("idle", detail="no actionable work found", tick_id=tick_id)
@@ -588,6 +927,46 @@ class NexusInitiativeService:
             self._record(decision, update=True)
         return decision
 
+    def _stale_service_revisions(self) -> tuple[str, str] | None:
+        """Return the two revisions when live diagnostics prove the API is stale."""
+        if self._diagnostics_client is None or self._checkout_revision is None:
+            return None
+        try:
+            payload = self._diagnostics_client()
+            service = payload.get("service", payload)
+            startup = service.get("git_revision")
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not disable initiative
+            logger.warning("initiative: service diagnostics failed: %s", exc)
+            return None
+        if not startup:
+            logger.warning("initiative: service diagnostics did not report git_revision")
+            return None
+        try:
+            checkout = self._checkout_revision()
+        except Exception as exc:  # noqa: BLE001 - revision lookup must not disable initiative
+            logger.warning("initiative: checkout revision lookup failed: %s", exc)
+            return None
+        if not checkout:
+            logger.warning("initiative: checkout revision lookup returned no revision")
+            return None
+        startup_text = str(startup).strip()
+        checkout_text = str(checkout).strip()
+        if not (startup_text.startswith(checkout_text) or checkout_text.startswith(startup_text)):
+            return startup_text, checkout_text
+        return None
+
+    def _restart_cooldown_active(self) -> bool:
+        """Whether a recent failed restart hand-off is still cooling down."""
+        row = self._conn.execute(
+            """
+            SELECT created_at FROM nexus_initiative_log
+            WHERE decision = 'service_stale' AND detail LIKE '%; restart failed:%'
+            ORDER BY created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        failed_at = _parse_timestamp(row["created_at"]) if row is not None else None
+        return failed_at is not None and failed_at > _utcnow() - _SERVICE_RESTART_COOLDOWN
+
     def _earlier_attempts(self, issue_number: int) -> str:
         """How earlier experiments for this issue ended, for the retry (#374).
 
@@ -599,8 +978,7 @@ class NexusInitiativeService:
         try:
             rows = self._conn.execute(
                 """
-                SELECT e.id AS id, e.status AS status, e.error AS error,
-                       e.failure_phase AS failure_phase, e.failure_type AS failure_type,
+                SELECT e.id AS id, e.id AS experiment_id, e.status AS status, e.error AS error,
                        a.status AS adoption_status, a.reason AS adoption_reason
                 FROM github_experiment_links l
                 JOIN experiments e ON e.id = l.experiment_id
@@ -614,16 +992,13 @@ class NexusInitiativeService:
             return ""
         lines = []
         for row in rows:
-            if row["adoption_status"] == "failed":
+            # Its reason quotes the rejected text, which would reject the retry.
+            if _is_goal_policy_rejection(row["status"], row["error"]):
+                continue
+            if self._merge_stopped(row):
                 outcome = f"merge stopped: {row['adoption_reason'] or ''}"
             elif row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
-                crash = ""
-                if row["failure_phase"] or row["failure_type"]:
-                    crash = (
-                        f" [pipeline crash: phase={row['failure_phase'] or 'unknown'}, "
-                        f"type={row['failure_type'] or 'unknown'}]"
-                    )
-                outcome = f"{row['status']}{crash}: {row['error'] or ''}"
+                outcome = f"{row['status']}: {row['error'] or ''}"
             else:
                 continue
             lines.append(f"- experiment {str(row['id'])[:8]}, {' '.join(outcome.split())[:1500]}")

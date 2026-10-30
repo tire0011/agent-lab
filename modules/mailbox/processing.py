@@ -100,7 +100,7 @@ def _process_task(
     conn: sqlite3.Connection,
     db_msg_id: int,
 ) -> tuple[str, None]:
-    """Record task request and create pending approval."""
+    """Record the task request; the task worker hands it straight to Nexus (#264)."""
     try:
         conn.execute(
             "UPDATE mailbox_messages SET task_body = ? WHERE id = ?",
@@ -124,18 +124,17 @@ def _process_task(
                 INSERT INTO mailbox_task_approvals
                     (id, mailbox_msg_id, task_body, sender, file_path,
                      received_at, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (approval_id, db_msg_id, msg.body, msg.created_by, str(msg.file_path), now, now, now),
             )
             conn.commit()
     except Exception:
-        logger.warning("_process_task: failed to create approval for msg %s", db_msg_id, exc_info=True)
+        logger.warning("_process_task: failed to create task record for msg %s", db_msg_id, exc_info=True)
 
     result_body = (
-        "Your task request has been recorded and is queued for human review.\n\n"
-        "Tasks submitted via the mailbox require human approval before execution. "
-        "A Nexus operator will evaluate the request and decide whether to run it."
+        "Your task request has been recorded and handed to Nexus. "
+        "The result will appear in the outbox."
     )
     return result_body, None
 

@@ -18,7 +18,7 @@ function setApiKeyStatus(label, kind) {
 function onApiKeyChanged() {
   // Re-load anything that behaves differently with/without a key.
   refreshIdeas();
-  if (!document.querySelector("#tab-tasks").hidden) loadTaskApprovals();
+  if (!document.querySelector("#tab-tasks").hidden) loadMailboxTasks();
   if (!document.querySelector("#tab-operations").hidden) loadOperationsCatalog();
   if (!document.querySelector("#tab-logs").hidden) loadLogs();
 }

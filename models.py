@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class HealthResponse(BaseModel):
     status: str
     version: str
+    git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
 
 
 class StatusResponse(BaseModel):
@@ -24,9 +27,12 @@ class StatusResponse(BaseModel):
 class Problem(BaseModel):
     id: str
     source: str
+    issue_number: int | None = None
     summary: str
     detail: str
     timestamp: str
+    failure_phase: str | None = None
+    failure_type: str | None = None
 
 
 class ProblemsResponse(BaseModel):
@@ -167,10 +173,6 @@ class MailboxTaskApprovalsResponse(BaseModel):
     tasks: list[MailboxTaskApproval]
 
 
-class MailboxTaskRejectRequest(BaseModel):
-    reason: str = Field(min_length=1, max_length=500)
-
-
 # ---------------------------------------------------------------------------
 # Experiment activity log models
 # ---------------------------------------------------------------------------
@@ -289,8 +291,6 @@ class ExperimentSummary(BaseModel):
     branch_name: str | None = None
     test_exit_code: int | None = None
     error: str | None = None
-    failure_phase: str | None = None
-    failure_type: str | None = None
 
 
 class ExperimentDetail(BaseModel):
@@ -344,8 +344,6 @@ class ExperimentDetail(BaseModel):
     diff_stat: str | None = None
     diff_text: str | None = None
     error: str | None = None
-    failure_phase: str | None = None
-    failure_type: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
     adoption: ExperimentAdoptionStatus | None = None
@@ -473,6 +471,8 @@ class PublicDiagnosticExperiment(BaseModel):
 class PublicDiagnosticServiceStatus(BaseModel):
     status: str
     git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
     deployment_time: str | None = None
 
 

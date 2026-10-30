@@ -108,22 +108,6 @@ class RetryAfterBlockedReviewTests(unittest.TestCase):
 
 
 class EarlierAttemptsTests(unittest.TestCase):
-    def test_the_retry_names_the_phase_and_type_of_an_earlier_crash(self):
-        fx = InitiativeFixture()
-        fx.add_experiment(
-            "e1", "failed", error="unhandled GitHubWorkTrackingError in phase github_branch: HTTP 422",
-            failure_phase="github_branch", failure_type="GitHubWorkTrackingError",
-        )
-        with sqlite3.connect(fx.db_path) as conn:
-            conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e1', 9)")
-        svc = fx.service()
-        self.addCleanup(svc.close)
-
-        history = svc._earlier_attempts(9)
-
-        self.assertIn("phase=github_branch", history)
-        self.assertIn("type=GitHubWorkTrackingError", history)
-
     def test_the_retry_gets_the_review_that_blocked_the_first_attempt(self):
         fx = InitiativeFixture()
         fx.add_experiment("e1", "succeeded", adoption="failed")
@@ -144,8 +128,8 @@ class EarlierAttemptsTests(unittest.TestCase):
         from modules.experiment_evaluation import extract_explicit_goal_artifacts
         from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING
 
-        goal = f"Add modules/x.py\n\n{EARLIER_ATTEMPTS_HEADING}\n- erforderliches Artefakt git/hooks/a.sample fehlt"
-        self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/x.py"])
+        goal = f"Add modules/web_research.py\n\n{EARLIER_ATTEMPTS_HEADING}\n- erforderliches Artefakt git/hooks/a.sample fehlt"
+        self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/web_research.py"])
 
 
 if __name__ == "__main__":

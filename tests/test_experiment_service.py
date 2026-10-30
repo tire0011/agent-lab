@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -59,8 +58,6 @@ from modules.experiment_service import (
     parse_plan,
     plan_violates_policy,
 )
-from modules.github_work_tracking import GitHubWorkTrackingError
-from modules.run_store import init_db
 
 
 # Sanitized, real Codex raw response captured while reproducing the
@@ -268,41 +265,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
         reloaded = self.service.get_experiment(experiment.id)
         self.assertEqual(reloaded.status, STATUS_QUEUED)
-
-    def test_successful_experiment_has_no_crash_metadata(self):
-        self.service.test_python_executable = sys.executable
-        experiment = self.service.create_experiment(goal="g")
-
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-        self.assertIsNone(result.failure_phase)
-        self.assertIsNone(result.failure_type)
-
-    def test_github_branch_crash_records_phase_and_exception_type(self):
-        experiment = self.service.create_experiment(goal="g")
-        tracking = MagicMock()
-        tracking.experiment_base_sha.side_effect = GitHubWorkTrackingError(
-            "HTTP 422: Reference already exists"
-        )
-
-        result = self.service.run_experiment(experiment.id, github_work_tracking=tracking)
-
-        self.assertEqual(result.status, STATUS_FAILED)
-        self.assertEqual(result.failure_phase, "github_branch")
-        self.assertEqual(result.failure_type, "GitHubWorkTrackingError")
-        self.assertIn("unhandled GitHubWorkTrackingError in phase github_branch", result.error)
-
-    @patch("modules.experiment_service.service._run_git", side_effect=RuntimeError("worktree exploded"))
-    def test_worktree_crash_records_the_earlier_phase(self, _mock_run_git):
-        experiment = self.service.create_experiment(goal="g")
-
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_FAILED)
-        self.assertEqual(result.failure_phase, "worktree")
-        self.assertEqual(result.failure_type, "RuntimeError")
-        self.assertIn("unhandled RuntimeError in phase worktree", result.error)
 
     def test_create_experiment_rejects_empty_goal(self):
         with self.assertRaises(ValueError):
@@ -1024,6 +986,39 @@ class ExperimentServiceTestCase(unittest.TestCase):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_TIMED_OUT)
+
+    def test_overloaded_provider_falls_back_to_the_other_agent(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write",
+            error="API Error: 529 Overloaded. This is a server-side issue",
+        )
+        fallback = MagicMock()
+        fallback.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="real failure",
+        )
+        with patch("modules.experiment_service.service.other_provider", return_value="codex"), patch(
+            "modules.experiment_service.service.build_worker", return_value=fallback
+        ) as build:
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+        build.assert_called_once()
+        self.assertEqual(build.call_args.args[0], "codex")
+        fallback.run.assert_called_once()
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("real failure", result.error)
+
+    def test_other_errors_do_not_fall_back(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="kaboom",
+        )
+        with patch("modules.experiment_service.service.build_worker") as build:
+            experiment = self.service.create_experiment(goal="g")
+            self.service.run_experiment(experiment.id)
+        build.assert_not_called()
 
     # ------------------------------------------------------------------
     # needs_review when a safe test command cannot be determined
@@ -3168,33 +3163,3 @@ class AutonomousVmMaintenancePolicyRegressionTest(unittest.TestCase):
         self.assertIsNotNone(_goal_secret_warning("Read the API key from the environment."))
         self.assertIsNotNone(_check_goal_policy("Run rm -rf on generated files."))
         self.assertIsNotNone(_check_goal_policy("Drop table users from the database."))
-
-
-class ExperimentFailureMetadataMigrationTests(unittest.TestCase):
-    def test_legacy_database_gains_failure_columns_without_data_loss(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        path = str(Path(tmp.name) / "legacy.db")
-        conn = sqlite3.connect(path)
-        with conn:
-            conn.execute(
-                """CREATE TABLE experiments (
-                       id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
-                       created_at TEXT NOT NULL, error TEXT NULL)"""
-            )
-            conn.execute(
-                "INSERT INTO experiments VALUES (?, ?, ?, ?, ?)",
-                ("legacy", "keep this goal", "failed", "before", "keep this error"),
-            )
-        conn.close()
-
-        migrated = init_db(path)
-        self.addCleanup(migrated.close)
-
-        columns = {row[1] for row in migrated.execute("PRAGMA table_info(experiments)")}
-        self.assertIn("failure_phase", columns)
-        self.assertIn("failure_type", columns)
-        row = migrated.execute(
-            "SELECT goal, error, failure_phase, failure_type FROM experiments WHERE id = 'legacy'"
-        ).fetchone()
-        self.assertEqual(row, ("keep this goal", "keep this error", None, None))

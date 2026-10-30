@@ -18,6 +18,9 @@ from typing import Any, Callable
 
 from modules.coding_provider import (
     build_random_worker,
+    build_worker,
+    is_provider_overload,
+    other_provider,
     provider_of,
     random_worker_factory,
 )
@@ -221,6 +224,8 @@ class ExperimentService:
         test_safety_cap_seconds: float | None = None,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
         rng: Any | None = None,
+        base_ref: str = "HEAD",
+        test_command: list[str] | None = None,
     ) -> None:
         """
         Parameters
@@ -290,6 +295,14 @@ class ExperimentService:
             All three are passed through as written when set explicitly, and
             clamped to safe floors when they come from the environment - see
             ``WatchdogConfig.resolve``.
+        base_ref:
+            Commit an experiment's worktree starts from, unless the GitHub
+            lifecycle supplies one. The benchmark (#343) pins this; everything
+            else keeps ``HEAD``.
+        test_command:
+            Verification argv template replacing the built-in suite run;
+            ``{python}`` becomes ``test_python_executable``. For trusted callers
+            only: it must never be built from plan or model output.
         """
         self.selection_worker = (
             selection_worker
@@ -313,6 +326,8 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
+        self.base_ref = base_ref
+        self.test_command = test_command
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
         # cleanliness is asserted directly, so the log directory must never
@@ -812,38 +827,23 @@ class ExperimentService:
                 f"{current.status!r} (only {STATUS_QUEUED!r} experiments can run)"
             )
 
-        phase = {"name": "pipeline"}
         try:
-            return self._run_pipeline(
-                experiment_id,
-                github_work_tracking=github_work_tracking,
-                phase=phase,
-            )
+            return self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
-            failure_phase = phase["name"]
-            failure_type = type(exc).__name__
             elog.error(
-                failure_phase, "unhandled_exception",
+                "pipeline", "unhandled_exception",
                 "Unhandled exception in experiment pipeline; forcing status=failed",
-                exc=exc, failure_phase=failure_phase, failure_type=failure_type,
+                exc=exc,
             )
             self._force_status(
                 experiment_id,
                 STATUS_FAILED,
                 ended_at=_utcnow_iso(),
-                failure_phase=failure_phase,
-                failure_type=failure_type,
-                error=f"unhandled {failure_type} in phase {failure_phase}: {exc}",
+                error=f"unhandled exception in experiment pipeline: {exc}",
             )
             return self.get_experiment(experiment_id)
 
-    def _run_pipeline(
-        self,
-        experiment_id: str,
-        *,
-        github_work_tracking: Any | None = None,
-        phase: dict[str, str] | None = None,
-    ) -> Experiment:
+    def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
         """Single-call implementation pipeline.
 
         Phases (in order):
@@ -862,10 +862,8 @@ class ExperimentService:
         """
         experiment = self.get_experiment(experiment_id)
         elog = self.get_experiment_logger(experiment_id)
-        phase = phase if phase is not None else {"name": "pipeline"}
 
         # ---- Security check: apply safety denylist to the raw goal --------
-        phase["name"] = "goal_policy"
         rejection_reason = _check_goal_policy(experiment.goal)
         if rejection_reason is not None:
             elog.warning(
@@ -890,12 +888,10 @@ class ExperimentService:
         # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
-        base_ref = "HEAD"
+        base_ref = self.base_ref
         if github_work_tracking is not None:
-            phase["name"] = "github_branch"
             base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
-        phase["name"] = "worktree"
         elog.debug(
             "implementation", "worktree_check",
             f"Creating isolated git worktree at branch {branch_name} from {base_ref}",
@@ -943,7 +939,6 @@ class ExperimentService:
         )
 
         # ---- Single Codex implementation call -----------------------------
-        phase["name"] = "implementation"
         elog.info(
             "implementation", "implementation_started",
             "Starting implementation (single coding-agent call: analyse, plan, implement)",
@@ -976,6 +971,38 @@ class ExperimentService:
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
         )
+
+        fallback = other_provider(implementation_provider) if implementation_provider else None
+        if (
+            implementation_result.error
+            and not implementation_result.timed_out
+            and is_provider_overload(implementation_result.error)
+            and fallback is not None
+            and self.get_experiment(experiment_id).status != STATUS_CANCELLED
+        ):
+            # The provider was overloaded, not the work wrong: let the other
+            # coding agent do it instead of failing the experiment.
+            elog.warning(
+                "implementation", "implementation_provider_fallback",
+                f"{implementation_provider} is overloaded; implementation runs on {fallback}",
+                provider=fallback,
+            )
+            worker = build_worker(fallback, db_path=self.db_path)
+            implementation_provider = fallback
+            self._force_status(
+                experiment_id, STATUS_IMPLEMENTING,
+                implementation_provider=implementation_provider,
+            )
+            implementation_result = worker.run(
+                task=implementation_prompt,
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=max_seconds,
+                stall_seconds=stall_seconds,
+                experiment_logger=elog,
+                phase="implementation",
+                on_process=lambda process: self._track_process(experiment_id, process),
+            )
 
         if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
             return self.get_experiment(experiment_id)
@@ -1027,7 +1054,6 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         # ---- Verification -------------------------------------------------
-        phase["name"] = "quality_gate"
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
         result = self._verify(
             experiment_id,
@@ -1309,7 +1335,7 @@ class ExperimentService:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
-        test_command_template = _TEST_COMMANDS.get(test_command_key)
+        test_command_template = self.test_command or _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
             if test_command_template is not None

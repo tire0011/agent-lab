@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from modules.nexus_initiative import (
+    DECISION_SKIPPED_ATTEMPTS_EXHAUSTED,
     KIND_IDEA,
     KIND_INTEGRATION,
     KIND_ISSUE,
     NexusInitiativeService,
 )
+from modules.nexus_planner import IssuePlanner
 
 
 class RecordingAdoption:
@@ -45,8 +49,7 @@ class InitiativeFixture:
             """
             CREATE TABLE experiments (
                 id TEXT PRIMARY KEY, goal TEXT, status TEXT,
-                ended_at TEXT, created_at TEXT, error TEXT,
-                failure_phase TEXT, failure_type TEXT
+                ended_at TEXT, created_at TEXT, error TEXT
             );
             CREATE TABLE experiment_adoptions (
                 experiment_id TEXT PRIMARY KEY, status TEXT, reason TEXT
@@ -64,20 +67,14 @@ class InitiativeFixture:
         self.adoption = RecordingAdoption()
         self.controller = RecordingController()
 
-    def add_experiment(
-        self, exp_id: str, status: str, *, adoption: str | None = None,
-        ended=None, error: str | None = None, failure_phase: str | None = None,
-        failure_type: str | None = None,
-    ):
+    def add_experiment(self, exp_id: str, status: str, *, adoption: str | None = None, ended=None):
         from datetime import datetime, timezone
 
         ended = ended or datetime.now(timezone.utc).isoformat()
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            """INSERT INTO experiments
-               (id, goal, status, ended_at, error, failure_phase, failure_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (exp_id, f"Goal for {exp_id}", status, ended, error, failure_phase, failure_type),
+            "INSERT INTO experiments (id, goal, status, ended_at) VALUES (?, ?, ?, ?)",
+            (exp_id, f"Goal for {exp_id}", status, ended),
         )
         if adoption is not None:
             conn.execute(
@@ -123,6 +120,109 @@ class NexusInitiativeTests(unittest.TestCase):
         self.assertEqual(decision.decision, "busy")
         self.assertFalse(decision.acted)
         self.assertEqual(self.fx.adoption.started, [])
+
+    def test_stale_service_is_recorded_restarted_and_no_work_is_submitted(self):
+        restart = MagicMock()
+        issue_lister = MagicMock(return_value=[{"number": 441, "title": "work", "body": ""}])
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {
+                "status": "ok",
+                "git_revision": "aaaa111",
+            }},
+            checkout_revision=lambda: "bbbb222",
+            restart_hook=restart,
+            issue_lister=issue_lister,
+        )
+        self.addCleanup(svc.close)
+
+        decision = svc.tick()
+
+        self.assertEqual(decision.decision, "service_stale")
+        restart.assert_called_once_with()
+        issue_lister.assert_not_called()
+        self.assertEqual(self.fx.controller.issues, [])
+        entries = svc.history()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["decision"], "service_stale")
+        self.assertIn("aaaa111", entries[0]["detail"])
+        self.assertIn("bbbb222", entries[0]["detail"])
+
+    def test_fresh_service_allows_tick_to_proceed(self):
+        restart = MagicMock()
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {
+                "git_revision": "aaaa111",
+            }},
+            checkout_revision=lambda: "aaaa111ddddddddddddddddddddddddddddddddd",
+            restart_hook=restart,
+            issue_lister=lambda: [{"number": 441, "title": "work", "body": ""}],
+        )
+        self.addCleanup(svc.close)
+
+        decision = svc.tick()
+
+        self.assertEqual(decision.decision, "dispatched")
+        self.assertEqual(self.fx.controller.issues, [441])
+        restart.assert_not_called()
+
+    def test_missing_service_revision_allows_tick_to_proceed(self):
+        restart = MagicMock()
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {"status": "ok"}},
+            checkout_revision=lambda: "bbbb222",
+            restart_hook=restart,
+            issue_lister=lambda: [{"number": 448, "title": "work", "body": ""}],
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "dispatched")
+        self.assertEqual(self.fx.controller.issues, [448])
+        restart.assert_not_called()
+
+    def test_failed_checkout_revision_lookup_allows_tick_to_proceed(self):
+        def fail_lookup():
+            raise RuntimeError("git unavailable")
+
+        restart = MagicMock()
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {"git_revision": "aaaa111"}},
+            checkout_revision=fail_lookup,
+            restart_hook=restart,
+            issue_lister=lambda: [{"number": 448, "title": "work", "body": ""}],
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "dispatched")
+        self.assertEqual(self.fx.controller.issues, [448])
+        restart.assert_not_called()
+
+    def test_busy_service_is_not_restarted_when_revisions_differ(self):
+        self.fx.add_experiment("e1", "implementing")
+        restart = MagicMock()
+        diagnostics = MagicMock(return_value={"service": {"git_revision": "aaaa111"}})
+        svc = self.fx.service(
+            diagnostics_client=diagnostics,
+            checkout_revision=lambda: "bbbb222",
+            restart_hook=restart,
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "busy")
+        restart.assert_not_called()
+        diagnostics.assert_not_called()
+
+    def test_failed_restart_hand_off_is_not_retried_inside_cooldown(self):
+        restart = MagicMock(side_effect=RuntimeError("systemctl failed"))
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {"git_revision": "aaaa111"}},
+            checkout_revision=lambda: "bbbb222",
+            restart_hook=restart,
+        )
+        self.addCleanup(svc.close)
+
+        self.assertEqual(svc.tick().decision, "service_stale")
+        self.assertEqual(svc.tick().decision, "service_stale")
+        restart.assert_called_once_with()
 
     def test_does_nothing_while_a_mailbox_task_runs(self):
         self.fx.add_approval("running")
@@ -340,6 +440,178 @@ class NexusInitiativeTests(unittest.TestCase):
         self.assertEqual(entry["source_ref"], "stuck")
         self.assertIn("idea-1", entry["considered_json"])
         self.assertIn("not integrated", entry["reason"])
+
+
+class IssuesOutOfAttemptsTests(unittest.TestCase):
+    """#457: an issue that used up its attempts is reported, not dropped silently."""
+
+    ISSUES = [
+        {"number": 232, "title": "Stuck issue", "body": ""},
+        {"number": 7, "title": "Free issue", "body": ""},
+    ]
+
+    def setUp(self) -> None:
+        self.fx = InitiativeFixture()
+        self.comments: list[tuple[int, str]] = []
+        self.prompts: list[str] = []
+        self.answer = json.dumps({"issue": 7, "reason": "free"})
+
+    def _fail(self, exp_id, *, issue=232, status="failed", error=None, adoption=None, reason=None, ended=None):
+        self.fx.add_experiment(exp_id, status, adoption=adoption, ended=ended)
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute("UPDATE experiments SET error = ? WHERE id = ?", (error, exp_id))
+            conn.execute("UPDATE experiment_adoptions SET reason = ? WHERE experiment_id = ?", (reason, exp_id))
+            conn.execute(
+                "INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES (?, ?)",
+                (exp_id, issue),
+            )
+
+    def _complete(self, prompt):
+        self.prompts.append(prompt)
+        return self.answer
+
+    def _service(self, *, issues=None, commenter=None, **extra):
+        svc = self.fx.service(
+            issue_lister=lambda: [dict(i) for i in (issues or self.ISSUES)],
+            issue_commenter=commenter or (lambda number, text: self.comments.append((number, text))),
+            **extra,
+        )
+        self.addCleanup(svc.close)
+        return svc
+
+    def _planned(self, **extra):
+        return self._service(planner=IssuePlanner(self._complete), **extra)
+
+    @staticmethod
+    def _entries(svc):
+        return [e for e in svc.history(limit=200) if e["decision"] == DECISION_SKIPPED_ATTEMPTS_EXHAUSTED]
+
+    def test_reported_once_over_two_ticks_and_shown_to_the_planner(self):
+        self._fail("e1", error="first", ended="2026-10-01T00:00:00+00:00")
+        self._fail("e2", error="second", ended="2026-10-02T00:00:00+00:00")
+        svc = self._planned()
+
+        first = svc.tick()
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e7', 7)")
+        second = svc.tick()
+
+        self.assertEqual(first.candidate.ref, "7")
+        self.assertEqual(second.decision, "idle")
+        self.assertEqual(self.fx.controller.issues, [7])
+        entries = self._entries(svc)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["source_ref"], "232")
+        self.assertEqual(entries[0]["reason"], "second")
+        detail = json.loads(entries[0]["detail"])
+        self.assertEqual(detail["experiment_ids"], ["e1", "e2"])
+        self.assertEqual(detail["last_reason"], "second")
+        stops = [c for c in self.comments if c[0] == 232]
+        self.assertEqual(len(stops), 1)
+        self.assertIn("e1, e2", stops[0][1])
+        self.assertIn("Last failure: second", stops[0][1])
+        section = self.prompts[0].split("ISSUES OUT OF ATTEMPTS:", 1)[1]
+        self.assertIn("#232 Stuck issue: second", section)
+        self.assertNotIn("#232", self.prompts[0].split("OPEN ISSUES:", 1)[1].split("ISSUES OUT OF", 1)[0])
+
+    def test_the_planner_cannot_pick_it(self):
+        self._fail("e1")
+        self._fail("e2")
+        self.answer = json.dumps({"issue": 232, "reason": "try again"})
+        svc = self._planned()
+
+        self.assertEqual(svc.tick().decision, "idle")
+        self.assertEqual(self.fx.controller.issues, [])
+
+    def test_a_new_failed_experiment_is_reported_again(self):
+        self._fail("e1", error="first")
+        self._fail("e2", error="second")
+        svc = self._service(issues=self.ISSUES[:1])
+        svc.tick()
+        self._fail("e3", error="third")
+
+        svc.tick()
+
+        entries = self._entries(svc)
+        self.assertEqual(len(entries), 2)
+        details = [json.loads(e["detail"]) for e in entries]
+        self.assertCountEqual(
+            [d["experiment_ids"] for d in details], [["e1", "e2"], ["e1", "e2", "e3"]]
+        )
+        self.assertEqual(len(self.comments), 2)
+
+    def test_the_reason_of_a_stopped_merge_comes_from_the_adoption(self):
+        self._fail("e1", ended="2026-10-01T00:00:00+00:00", error="old")
+        self._fail(
+            "e2", status="succeeded", adoption="failed", reason="merge\nconflict",
+            ended="2026-10-02T00:00:00+00:00",
+        )
+        svc = self._service(issues=self.ISSUES[:1])
+
+        svc.tick()
+
+        self.assertEqual(json.loads(self._entries(svc)[0]["detail"])["last_reason"], "merge conflict")
+
+    def test_a_secret_in_the_reason_does_not_reach_github(self):
+        self._fail("e1")
+        self._fail("e2", error="git push failed: Authorization: Bearer abcdef123456789", ended="2999-01-01T00:00:00+00:00")
+        svc = self._service(issues=self.ISSUES[:1])
+
+        svc.tick()
+
+        self.assertNotIn("abcdef123456789", self.comments[0][1])
+        self.assertNotIn("abcdef123456789", self._entries(svc)[0]["detail"])
+
+    def test_a_failed_comment_is_tried_again_without_a_second_entry(self):
+        self._fail("e1")
+        self._fail("e2")
+        calls = []
+
+        def flaky(number, text):
+            calls.append(number)
+            if len(calls) == 1:
+                raise RuntimeError("gh down")
+
+        svc = self._service(issues=self.ISSUES[:1], commenter=flaky)
+
+        self.assertEqual(svc.tick().decision, "idle")
+        svc.tick()
+        svc.tick()
+
+        self.assertEqual(calls, [232, 232])
+        entries = self._entries(svc)
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(json.loads(entries[0]["detail"])["commented"])
+
+    def test_a_dry_run_writes_and_comments_nothing(self):
+        self._fail("e1")
+        self._fail("e2")
+        svc = self._planned()
+
+        svc.candidates(record_skips=False)
+
+        self.assertEqual(self._entries(svc), [])
+        self.assertEqual(self.comments, [])
+        self.assertIn("#232 Stuck issue", self.prompts[0])
+
+    def test_an_issue_with_merged_work_is_not_reported_as_out_of_attempts(self):
+        self._fail("e1")
+        self._fail("e2")
+        self._fail("e3", status="succeeded", adoption="adopted")
+        svc = self._service(issues=self.ISSUES[:1])
+
+        self.assertEqual(svc.tick().decision, "idle")
+
+        self.assertEqual(self._entries(svc), [])
+        self.assertEqual(self.comments, [])
+
+    def test_one_failed_attempt_is_not_reported(self):
+        self._fail("e1")
+        svc = self._service(issues=self.ISSUES[:1])
+
+        self.assertEqual(svc.tick().candidate.ref, "232")
+
+        self.assertEqual(self._entries(svc), [])
 
 
 if __name__ == "__main__":

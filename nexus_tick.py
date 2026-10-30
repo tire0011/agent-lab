@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.request
 from datetime import datetime, timezone
 
 from modules.logging_config import configure_logging
@@ -39,6 +40,35 @@ _PLANNER_STALL_SECONDS = 300
 
 # Things worth telling Claude about, collected during one tick (#365).
 _events: list[str] = []
+
+
+def _service_diagnostics() -> dict:
+    url = os.environ.get(
+        "NEXUS_DIAGNOSTICS_URL", "http://127.0.0.1:8000/diagnostics/public"
+    )
+    with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - fixed/operator URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _restart_stale_service() -> None:
+    from modules.task_finalization import TaskFinalizationCoordinator
+
+    TaskFinalizationCoordinator._restart_services(
+        TaskFinalizationCoordinator._restart_service_names()
+    )
+
+
+def _checkout_revision(repo_root: str) -> str:
+    """Read the revision of the checkout executing this initiative tick."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
@@ -205,6 +235,9 @@ def _build_service(args) -> NexusInitiativeService:
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
+        diagnostics_client=_service_diagnostics,
+        checkout_revision=lambda: _checkout_revision(args.repo_root),
+        restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
 
@@ -378,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             if busy:
                 logger.info("would do nothing: %s", busy)
                 return 0
-            candidates = service.candidates()
+            candidates = service.candidates(record_skips=False)
             if not candidates:
                 logger.info("would do nothing: no actionable work")
                 return 0

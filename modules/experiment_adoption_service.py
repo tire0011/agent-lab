@@ -1424,7 +1424,9 @@ class ExperimentAdoptionService:
             return "Änderungen unter communication/outbox/ werden nicht automatisch übernommen."
         if lower == ".env" or lower.endswith("/.env") or lower.endswith(".pem"):
             return "Sensible Konfigurationsdateien werden nicht automatisch übernommen."
-        if "secret" in lower or "credential" in lower:
+        # Test files may be named after what they test (fixtures such as
+        # "print_vault_secrets.md"); the reviewer reads their content.
+        if ("secret" in lower or "credential" in lower) and not lower.startswith("tests/"):
             return "Potentiell sensible Dateien werden nicht automatisch übernommen."
         return None
 
