@@ -622,6 +622,10 @@ class NexusInitiativeService:
                     number = int(row["issue_number"])
                 except (TypeError, ValueError):
                     continue
+                # ensure_for_source records the source before any experiment
+                # exists (#464): a link without an experiment is no work.
+                if row["experiment_id"] is None:
+                    continue
                 # A goal-policy rejection is neither an attempt nor a block
                 # (#408): the preflight in _issue_candidates judges the text.
                 if _is_goal_policy_rejection(row["status"], row["error"]):
