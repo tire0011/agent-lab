@@ -363,6 +363,30 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertEqual(stored.pr_number, 100)
         self.assertEqual(stored.branch_name, "nexus/42-github-lifecycle")
 
+    def test_issue_closed_by_the_merge_itself_is_not_an_error(self):
+        source = SimpleNamespace(
+            source_type="issue",
+            source_id="42",
+            title="GitHub lifecycle",
+            content="GitHub Issue #42: GitHub lifecycle",
+        )
+        ref = self.service.bind_experiment(self.service.ensure_for_source(source), "exp-raced")
+        ref = self.service.ensure_pull_request(ref, title="Implement", body="Fixes #42")
+        fake = self.fake
+        original = fake.__call__
+
+        def racing(method, path, payload=None):
+            # "Fixes #42" closed the issue first; GitHub refuses the second close.
+            if method == "PATCH" and path.endswith("/issues/42") and (payload or {}).get("state") == "closed":
+                fake.issues[42]["state"] = "closed"
+                raise GitHubWorkTrackingError(
+                    'GitHub HTTP 422: {"message":"This issue was closed by another request."}'
+                )
+            return original(method, path, payload)
+
+        self.service._request = racing
+        self.assertEqual(self.service.merge_and_complete(ref, expected_head_sha="head-sha"), "merged-sha")
+
     def test_failed_verification_is_written_to_existing_draft_pr(self):
         source = SimpleNamespace(
             source_type="issue",
