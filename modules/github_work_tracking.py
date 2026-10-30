@@ -1126,11 +1126,14 @@ class GitHubWorkTrackingService:
         self._request("POST", f"/repos/{self.repository}/issues/{number}/comments", {"body": body[:60000]})
 
     def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
-        self._request(
-            "PATCH",
-            f"/repos/{self.repository}/issues/{ref.issue_number}",
-            {"state": "closed", "state_reason": "completed"},
-        )
+        path = f"/repos/{self.repository}/issues/{ref.issue_number}"
+        try:
+            self._request("PATCH", path, {"state": "closed", "state_reason": "completed"})
+        except GitHubWorkTrackingError:
+            # The merge's "Fixes #N" can close the issue first; GitHub then
+            # answers 422 "closed by another request". Closed is closed.
+            if str((self._request("GET", path) or {}).get("state")) != "closed":
+                raise
 
     def _remote_branch_sha(self, branch_name: str) -> str:
         quoted = urllib.parse.quote(branch_name, safe="")
