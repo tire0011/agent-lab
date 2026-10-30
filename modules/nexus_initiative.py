@@ -83,6 +83,13 @@ _GOAL_POLICY_REASON_PREFIXES = tuple(
 )
 
 
+def _is_provider_overload(status: Any, error: Any) -> bool:
+    """A run that failed because the coding agent's API was overloaded."""
+    from modules.coding_provider import is_provider_overload
+
+    return status == "failed" and is_provider_overload(error)
+
+
 def _is_goal_policy_rejection(status: Any, error: Any) -> bool:
     return status == "rejected" and str(error or "").startswith(_GOAL_POLICY_REASON_PREFIXES)
 
@@ -301,7 +308,19 @@ class NexusInitiativeService:
             """,
             (since, REVIEW_RETRY_REASON),
         ).fetchone()
-        return int(row["n"]) if row else 0
+        spent = int(row["n"]) if row else 0
+        return max(0, spent - self._overloaded_since(since))
+
+    def _overloaded_since(self, since: str) -> int:
+        """Experiments since *since* that failed only because the provider was overloaded."""
+        try:
+            rows = self._conn.execute(
+                "SELECT status, error FROM experiments WHERE created_at >= ? AND status = 'failed'",
+                (since,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0
+        return sum(1 for r in rows if _is_provider_overload(r["status"], r["error"]))
 
     # ---- candidate discovery --------------------------------------------
 
@@ -512,6 +531,9 @@ class NexusInitiativeService:
                 # A goal-policy rejection is neither an attempt nor a block
                 # (#408): the preflight in _issue_candidates judges the text.
                 if _is_goal_policy_rejection(row["status"], row["error"]):
+                    continue
+                # An overloaded provider says nothing about the issue: not an attempt.
+                if _is_provider_overload(row["status"], row["error"]):
                     continue
                 # A review that blocked the merge (#396) fails the adoption of
                 # a succeeded experiment: that is a failed attempt too.
