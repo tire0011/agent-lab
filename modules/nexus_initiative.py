@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
 from modules.nexus_planner import PROPOSAL_LABEL
 from modules.nexus_sources import issue_source
@@ -717,7 +718,7 @@ class NexusInitiativeService:
             entry = {
                 "title": lines[0][:120] if lines else "",
                 "status": str(row["status"] or ""),
-                "error": " ".join(str(row["error"] or "").split())[:200],
+                "error": summarize_error(row["error"]),
             }
             if with_adoption:
                 entry["adoption_status"] = str(row["adoption_status"] or "")
