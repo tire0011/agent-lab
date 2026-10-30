@@ -10,12 +10,12 @@ class ChangeSectionArtifactsTest(unittest.TestCase):
         goal = (
             "GitHub Issue #416: gate\n\n**Problem**\nFlagged git/hooks/commit-msg.sample "
             "and modules/x.py as missing.\n\n**Change**\n- Edit `modules/experiment_evaluation.py` "
-            "and add modules/new_thing.py.\n\n**Test** (`tests/test_experiment_evaluation.py`)\n"
+            "and add modules/web_research.py.\n\n**Test** (`tests/test_experiment_evaluation.py`)\n"
             "- Fixture modules/y.py is missing.\n"
         )
         self.assertEqual(
             extract_explicit_goal_artifacts(goal),
-            ["modules/experiment_evaluation.py", "modules/new_thing.py"],
+            ["modules/experiment_evaluation.py", "modules/web_research.py"],
         )
 
     def test_colon_headings(self):
@@ -27,8 +27,8 @@ class ChangeSectionArtifactsTest(unittest.TestCase):
         self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/experiment_evaluation.py"])
 
     def test_without_sections_keeps_every_path(self):
-        goal = "Fix modules/a.py and update modules/b.py."
-        self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/a.py", "modules/b.py"])
+        goal = "Fix modules/alpha.py and update modules/beta.py."
+        self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/alpha.py", "modules/beta.py"])
 
 
 if __name__ == "__main__":
