@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -290,8 +291,13 @@ def compact_observations(
             result[index] = obs
             remaining = max(0, remaining - len(serialized))
             continue
+        summary = _semantic_summary(obs)
+        serialized_summary = json.dumps(summary, separators=(",", ":"))
+        if summary.get("semantic_summary") and len(serialized_summary) <= fair_share:
+            result[index] = summary
+            remaining = max(0, remaining - len(serialized_summary))
+            continue
         if is_recent and remaining > 500:
-            # Not counted as omitted: this still carries real content.
             compacted, truncated = _shrink(obs, remaining)
             if truncated:
                 compacted["truncated"] = True
@@ -306,6 +312,58 @@ def compact_observations(
         remaining = max(0, remaining - len(serialized_stub))
 
     return [item for item in result if item is not None], sorted(omitted)
+
+
+_DECISION_FIELDS = (
+    "goal", "title", "state", "status", "acceptance_criteria", "summary",
+    "retryable", "recommended_next_action", "recommended_operation",
+)
+
+
+def _semantic_summary(obs: dict[str, Any]) -> dict[str, Any]:
+    """Keep decision-relevant meaning while dropping bulky raw payloads."""
+    summary = _stub(obs)
+    summary.pop("note", None)
+    meaningful = False
+    for field in _DECISION_FIELDS:
+        if field in obs and obs[field] not in (None, "", [], {}):
+            summary[field] = obs[field]
+            meaningful = True
+
+    if obs.get("operation") == "github_issue":
+        lines = obs.get("output_lines")
+        if isinstance(lines, list):
+            body = ""
+            for line in lines:
+                if not isinstance(line, str):
+                    continue
+                if line.startswith("issue: "):
+                    try:
+                        metadata = json.loads(line[7:])
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                    for field in ("title", "state", "url", "number"):
+                        if metadata.get(field) not in (None, ""):
+                            summary[field] = metadata[field]
+                            meaningful = True
+                elif line.startswith("body: "):
+                    body = line[6:]
+            if body:
+                intro = re.split(r"(?m)^\s*#{1,6}\s+", body, maxsplit=1)[0].strip()
+                summary["goal"] = truncate_text(intro or body.strip(), 800, note="goal truncated")[0]
+                meaningful = True
+                match = re.search(
+                    r"(?ims)^\s*#{1,6}\s+acceptance criteria\s*$\n(.*?)(?=^\s*#{1,6}\s+|\Z)",
+                    body,
+                )
+                if match:
+                    summary["acceptance_criteria"] = truncate_text(
+                        match.group(1).strip(), 1600, note="criteria truncated"
+                    )[0]
+                    meaningful = True
+    if meaningful:
+        summary["semantic_summary"] = True
+    return summary
 
 
 # What a next decision depends on, kept even when the body is dropped. These

@@ -188,7 +188,12 @@ class PersistentToolLoopGuard:
                 "signature": signature,
                 "previous_call_id": previous_id,
                 "result_ref": result_ref,
-                "recovery": "choose_different_tool_or_controlled_final_action",
+                "recovery": (
+                    "use_a_different_section_or_offset_to_continue_paging"
+                    if tool.strip().lower() == "operation"
+                    and arguments.get("operation") == "read_tool_result"
+                    else "choose_different_tool_or_controlled_final_action"
+                ),
             }
             self._conn.execute(
                 """INSERT INTO nexus_tool_calls

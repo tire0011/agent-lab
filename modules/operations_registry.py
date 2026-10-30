@@ -227,6 +227,7 @@ class OperationsRegistry:
             required=True,
             minimum=1,
         )
+        event_id = OperationArgSpec("event_id", "integer", "Durable tool-result event ID.", required=True, minimum=1)
         diagnostic_tags = [
             "diagnose", "diagnostics", "logs", "log", "status", "lifecycle", "state",
             "task", "experiment", "session", "issue", "pull request", "branch",
@@ -340,6 +341,16 @@ class OperationsRegistry:
                     "github", "issue", "read", "fetch", "get", "details",
                     "specification", "acceptance criteria", "task",
                 ],
+                mutates_state=False,
+            ),
+            "read_tool_result": OperationSpec(
+                "read_tool_result",
+                "Read a deterministic character slice or top-level JSON section of a persisted tool result.",
+                [event_id,
+                 OperationArgSpec("section", "string", "Optional top-level JSON field to read."),
+                 OperationArgSpec("offset", "integer", "Zero-based character offset.", default=0, minimum=0),
+                 OperationArgSpec("limit", "integer", "Maximum characters returned.", default=4000, minimum=1, maximum=12000)],
+                ["tool result", "event", "page", "slice", "read", "stored result"],
                 mutates_state=False,
             ),
             "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", tags=["problems", "errors", "failures", "issues"], mutates_state=False),
@@ -1056,3 +1067,47 @@ class OperationsRegistry:
                     close()
                 except Exception:  # noqa: BLE001
                     logger.warning("github_issue: could not close tracking service", exc_info=True)
+
+    def _op_read_tool_result(self, args: dict[str, Any]) -> OperationResult:
+        unexpected = sorted(set(args) - {"event_id", "section", "offset", "limit"})
+        if unexpected:
+            raise OperationValidationError(
+                f"read_tool_result kennt diese Argumente nicht: {', '.join(unexpected)}"
+            )
+        event_id = args.get("event_id")
+        offset = args.get("offset", 0)
+        limit = args.get("limit", 4000)
+        section = args.get("section")
+        if not isinstance(event_id, int) or isinstance(event_id, bool) or event_id < 1:
+            raise OperationValidationError("event_id muss eine positive ganze Zahl sein.")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise OperationValidationError("offset muss eine nichtnegative ganze Zahl sein.")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 12000:
+            raise OperationValidationError("limit muss zwischen 1 und 12000 liegen.")
+        if section is not None and (not isinstance(section, str) or not section.strip()):
+            raise OperationValidationError("section muss eine nichtleere Zeichenfolge sein.")
+
+        row = self._conn.execute(
+            "SELECT role, content FROM nexus_task_events WHERE id=?", (event_id,)
+        ).fetchone()
+        if row is None or row["role"] != "tool":
+            return OperationResult("read_tool_result", False, [], 0, error_summary="tool result event not found")
+        content = str(row["content"])
+        if section is not None:
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                return OperationResult("read_tool_result", False, [], 0, error_summary="stored tool result is not JSON")
+            if not isinstance(payload, dict) or section not in payload:
+                return OperationResult("read_tool_result", False, [], 0, error_summary="section not found")
+            selected = payload[section]
+            content = selected if isinstance(selected, str) else json.dumps(
+                selected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        chunk = content[offset:offset + limit]
+        envelope = json.dumps(
+            {"event_id": event_id, "section": section, "offset": offset, "limit": limit,
+             "total_chars": len(content), "next_offset": offset + len(chunk), "content": chunk},
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        return OperationResult("read_tool_result", True, [envelope], 0)
