@@ -254,7 +254,9 @@
   reported through `abandoned_work()` and otherwise ignored — see D-017.
 - Audit: `nexus_initiative_log` records every tick (decision, chosen source,
   reason, what else was considered, failure detail), readable via
-  `NexusInitiativeService.history()`.
+  `NexusInitiativeService.history()`. An open issue out of attempts is logged
+  as `skipped_attempts_exhausted` once per set of experiments, gets one GitHub
+  comment and is listed in the planning prompt, but stays unselectable.
 
 ### 10) Work heartbeats (explicit liveness)
 
