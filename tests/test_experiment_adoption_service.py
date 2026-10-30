@@ -272,9 +272,22 @@ class AdoptionRepoFixture:
         mutate: dict[str, str] | None = None,
         extra_untracked: dict[str, str] | None = None,
         link_github: bool = True,
+        earlier_attempt: dict[str, str | None] | None = None,
     ) -> str:
         worktree = self.worktrees / f"exp-{experiment_id[:8]}"
         git(self.repo, "worktree", "add", "-b", f"exp-{experiment_id[:8]}", str(worktree), "HEAD")
+        if earlier_attempt is not None:
+            # A retry's worktree starts from the issue branch, on top of the
+            # earlier attempt's commit. ``None`` deletes the file.
+            for rel_path, content in earlier_attempt.items():
+                target = worktree / rel_path
+                if content is None:
+                    target.unlink()
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+            git(worktree, "add", "-A")
+            git(worktree, "commit", "-m", "earlier attempt")
         for rel_path, content in (mutate or {"app.py": f"VALUE = '{experiment_id[:8]}'\n"}).items():
             target = worktree / rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -497,7 +510,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
             self.fx.adoption_service.start_adoption(experiment_id)
         self.assertEqual(self.fx.adoption_service.get(experiment_id).status, STATUS_NEEDS_REVIEW)
 
-    def test_cherry_pick_conflict_keeps_diagnostic_worktree_and_skips_push(self):
+    def test_integration_conflict_keeps_diagnostic_worktree_and_skips_push(self):
         experiment_id = "b1" * 16
         self.fx.create_experiment(
             experiment_id=experiment_id,
@@ -511,8 +524,225 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         self.fx.adoption_service.start_adoption(experiment_id)
         adoption = self.fx.wait_terminal(experiment_id)
         self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
-        self.assertIn("Cherry-Pick", adoption.reason)
+        self.assertEqual(adoption.reason, "Integrationskonflikt: app.py")
         self.assertTrue(Path(adoption.diagnostic_worktree_path).exists())
+
+    # ------------------------------------------------------------------
+    # Retries (Issue #455)
+    #
+    # A retry's worktree continues the issue branch, so its own commit is
+    # only a delta on the earlier attempt, which is not on main.
+    # ------------------------------------------------------------------
+
+    _EARLIER_TEST = (
+        "import unittest\n\n"
+        "class XTests(unittest.TestCase):\n"
+        "    def test_x(self):\n"
+        "        self.assertTrue({})\n"
+    )
+
+    def _create_retry(self, experiment_id: str, **kwargs) -> str:
+        return self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["tests/test_x.py", "module.py"],
+            earlier_attempt={"tests/test_x.py": self._EARLIER_TEST.format("True")},
+            mutate={
+                "tests/test_x.py": self._EARLIER_TEST.format("1 == 1"),
+                "module.py": "RETRY = True\n",
+            },
+            **kwargs,
+        )
+
+    def _commit_on_main(self, files: dict[str, str | None]) -> None:
+        for rel_path, content in files.items():
+            target = self.fx.repo / rel_path
+            if content is None:
+                target.unlink()
+            else:
+                target.write_text(content, encoding="utf-8")
+        git(self.fx.repo, "add", "-A")
+        git(self.fx.repo, "commit", "-m", "main change")
+        git(self.fx.repo, "push", "origin", "main")
+
+    def test_retry_adopts_the_earlier_attempt_too(self):
+        experiment_id = "a2" * 16
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["module.py"],
+            earlier_attempt={"tests/test_x.py": self._EARLIER_TEST.format("True")},
+            mutate={"module.py": "RETRY = True\n"},
+        )
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertEqual(sorted(adoption.actual_files), ["module.py", "tests/test_x.py"])
+        self.assertEqual(sorted(adoption.expected_files), ["module.py", "tests/test_x.py"])
+        self.assertIn("assertTrue(True)", git(self.fx.repo, "show", "origin/main:tests/test_x.py").stdout)
+        self.assertIn("RETRY", git(self.fx.repo, "show", "origin/main:module.py").stdout)
+
+    def test_retry_adopts_edits_of_the_earlier_attempts_files(self):
+        experiment_id = "a3" * 16
+        self._create_retry(experiment_id)
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertIn("assertTrue(1 == 1)", git(self.fx.repo, "show", "origin/main:tests/test_x.py").stdout)
+        self.assertIn("RETRY", git(self.fx.repo, "show", "origin/main:module.py").stdout)
+
+    def test_retry_survives_main_moving_in_unrelated_files(self):
+        experiment_id = "a4" * 16
+        self._create_retry(experiment_id)
+        self._commit_on_main({"unrelated.py": "OTHER = True\n"})
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertEqual(sorted(adoption.actual_files), ["module.py", "tests/test_x.py"])
+        self.assertIn("OTHER", git(self.fx.repo, "show", "origin/main:unrelated.py").stdout)
+        self.assertIn("assertTrue(1 == 1)", git(self.fx.repo, "show", "origin/main:tests/test_x.py").stdout)
+
+    def test_retry_keeps_a_file_the_earlier_attempt_deleted_deleted(self):
+        # Staging the cumulative file list would fail on the deleted path.
+        experiment_id = "a5" * 16
+        self._commit_on_main({"obsolete.py": "OLD = True\n"})
+        self.fx.github_api.refs["main"] = git(self.fx.repo, "rev-parse", "HEAD").stdout.strip()
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["module.py"],
+            earlier_attempt={"obsolete.py": None},
+            mutate={"module.py": "RETRY = True\n"},
+        )
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertNotEqual(
+            git(self.fx.repo, "cat-file", "-e", "origin/main:obsolete.py", check=False).returncode, 0
+        )
+
+    def test_retry_conflict_names_the_paths_and_runs_no_abort(self):
+        experiment_id = "a6" * 16
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["module.py"],
+            earlier_attempt={
+                "app.py": "VALUE = 'earlier'\n",
+                "tests/test_app.py": self._EARLIER_TEST.format("True"),
+            },
+            mutate={"module.py": "RETRY = True\n"},
+        )
+        self._commit_on_main({"app.py": "VALUE = 'main-change'\n", "tests/test_app.py": None})
+        before = git(self.fx.repo, "rev-parse", "origin/main").stdout.strip()
+
+        recorded: list[list[str]] = []
+        failures: list[list[str]] = []
+        original_run_git = __import__("modules.experiment_adoption_service", fromlist=["_run_git"])._run_git
+
+        def spy(args, **kwargs):
+            recorded.append(list(args))
+            proc = original_run_git(args, **kwargs)
+            if proc.returncode != 0 and args[0] != "merge":
+                failures.append(list(args))
+            return proc
+
+        with patch("modules.experiment_adoption_service._run_git", side_effect=spy):
+            self.fx.adoption_service.start_adoption(experiment_id)
+            adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
+        self.assertTrue(adoption.reason.startswith("Integrationskonflikt: "), adoption.reason)
+        self.assertIn("app.py", adoption.reason)
+        self.assertIn("tests/test_app.py", adoption.reason)
+        self.assertEqual(before, git(self.fx.repo, "rev-parse", "origin/main").stdout.strip())
+        self.assertFalse([args for args in recorded if "--abort" in args])
+        self.assertEqual(failures, [])
+
+        # The conflict stays inspectable, and the worktree stays removable.
+        diagnostic = Path(adoption.diagnostic_worktree_path)
+        self.assertIn("<<<<<<<", (diagnostic / "app.py").read_text(encoding="utf-8"))
+        self.assertIn("UU app.py", git(diagnostic, "status", "--short").stdout)
+        git(self.fx.repo, "worktree", "remove", "--force", str(diagnostic))
+
+    def test_first_attempt_gives_the_same_tree_as_a_cherry_pick(self):
+        experiment_id = "a7" * 16
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["app.py", "feature.py"],
+            extra_untracked={"feature.py": "FEATURE = True\n"},
+        )
+        self._commit_on_main({"unrelated.py": "OTHER = True\n"})
+        base = git(self.fx.repo, "rev-parse", "origin/main").stdout.strip()
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertEqual(adoption.actual_files, ["app.py", "feature.py"])
+
+        compare = self.fx.worktrees / "cherry-pick-compare"
+        git(self.fx.repo, "worktree", "add", "--detach", str(compare), base)
+        git(compare, "cherry-pick", "--no-commit", adoption.experiment_commit_sha)
+        self.assertEqual(
+            git(compare, "write-tree").stdout.strip(),
+            git(self.fx.repo, "rev-parse", "origin/main^{tree}").stdout.strip(),
+        )
+
+    def test_review_diff_of_a_retry_covers_the_earlier_attempt(self):
+        experiment_id = "a8" * 16
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["module.py"],
+            earlier_attempt={"tests/test_x.py": self._EARLIER_TEST.format("True")},
+            mutate={"module.py": "RETRY = True\n"},
+        )
+        seen: list[str] = []
+
+        def review(*, experiment_id, goal, worktree_path, base_sha):
+            seen.extend(
+                git(Path(worktree_path), "diff", "--name-only", f"{base_sha}...HEAD").stdout.split()
+            )
+            return SimpleNamespace(blocks=False, reviewer="test", verdict="pass", summary="ok")
+
+        self.fx.adoption_service.reviewer = SimpleNamespace(review=review)
+        with patch("modules.nexus_reviewer.review_comment", return_value="ok"), patch.object(
+            self.fx.github_work_tracking, "comment"
+        ):
+            self.fx.adoption_service.start_adoption(experiment_id)
+            adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertEqual(sorted(seen), ["module.py", "tests/test_x.py"])
+
+    def test_clean_retry_worktree_accepts_the_earlier_attempts_files(self):
+        # An earlier adoption run committed the delta: the worktree is clean
+        # and HEAD holds the verified tree, earlier attempt included.
+        experiment_id = "a9" * 16
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["module.py"],
+            earlier_attempt={"tests/test_x.py": self._EARLIER_TEST.format("True")},
+            mutate={"module.py": "RETRY = True\n"},
+        )
+        worktree = Path(self.fx.experiment_service.get_experiment(experiment_id).worktree_path)
+        git(worktree, "add", "-A")
+        git(worktree, "commit", "-m", "retry delta")
+        head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                "UPDATE experiments SET test_command_json = ? WHERE id = ?",
+                (json.dumps(["GitHub Actions", "tests.yml", head]), experiment_id),
+            )
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertIn("assertTrue(True)", git(self.fx.repo, "show", "origin/main:tests/test_x.py").stdout)
 
     def test_integration_test_failure_prevents_push(self):
         experiment_id = "c1" * 16

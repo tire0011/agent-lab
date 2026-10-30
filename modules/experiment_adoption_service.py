@@ -499,7 +499,7 @@ class ExperimentAdoptionService:
             return _NullExperimentLogger()
 
     def _integration_base_sha(self) -> str:
-        """The target-branch commit adoption would cherry-pick onto.
+        """The target-branch commit adoption would integrate onto.
 
         Read from the local ``origin/<target>`` ref rather than from
         GitHub, because this has to work in a process with no
@@ -548,7 +548,7 @@ class ExperimentAdoptionService:
 
         The base is part of the question, not a detail: ``wait_for_ci``
         refuses to call CI authoritative once the target branch has moved
-        past the checkpoint's parent, because cherry-picking the same
+        past the checkpoint's parent, because merging the same
         checkpoint onto a different base produces a tree CI never saw
         (#134). Reading a stored verdict has to honour that too, so the
         base this adoption will actually integrate onto is resolved from
@@ -1247,6 +1247,16 @@ class ExperimentAdoptionService:
         head_tree = self._tree_sha_of(worktree_path, head_sha, elog, phase="adoption")
         if not verified_tree or not head_tree or verified_tree != head_tree:
             return None, []
+        changed_files = self._files_changed_since_target(worktree_path, elog)
+        if not changed_files:
+            return None, []
+        return head_sha, changed_files
+
+    def _files_changed_since_target(self, worktree_path: str, elog) -> list[str]:
+        """Paths ``HEAD`` changed since it diverged from the target branch.
+
+        Raises when the comparison could not be made.
+        """
         # "Nothing to adopt" may only be concluded against a target branch
         # that actually resolved. Without that check an unreachable ref would
         # report an empty change set - reintroducing the very symptom this
@@ -1276,12 +1286,9 @@ class ExperimentAdoptionService:
             raise ExperimentAdoptionError(
                 "Der Experiment-Commit konnte nicht mit dem Ziel-Branch verglichen werden."
             )
-        changed_files = _safe_list(
+        return _safe_list(
             [line.strip() for line in changed.stdout.splitlines() if line.strip()]
         )
-        if not changed_files:
-            return None, []
-        return head_sha, changed_files
 
     def _verified_checkpoint_sha(self, experiment_id: str, experiment: Any) -> str:
         """Return the commit whose content verification actually accepted.
@@ -1358,7 +1365,8 @@ class ExperimentAdoptionService:
                     "Die Änderungen im Experiment-Worktree haben sich seit der erfolgreichen Prüfung verändert."
                 )
 
-        actual_files = _safe_list(snapshot["changed"].all_paths())
+        uncommitted_files = _safe_list(snapshot["changed"].all_paths())
+        actual_files = uncommitted_files
         # An empty uncommitted diff is not the same thing as an empty change:
         # the verified content may already be committed in the worktree. Decide
         # that here rather than in the pipeline, so a retry that cannot possibly
@@ -1379,7 +1387,20 @@ class ExperimentAdoptionService:
                 experiment_commit_sha=committed_commit_sha,
                 changed_files=actual_files,
             )
-        expected_files = _safe_list((quality.get("changed_files") or quality.get("expected_files") or actual_files))
+            # HEAD carries exactly the verified tree, so everything it changed
+            # is verified content, including what an earlier attempt added.
+            inherited_files = actual_files
+        else:
+            # A retry starts from the issue branch: integration applies the
+            # earlier attempts' commits too, but quality only saw this
+            # attempt's delta (#455). HEAD is the attempt's starting point, so
+            # the delta itself still has to pass the check against `expected`.
+            inherited_files = self._files_changed_since_target(worktree_path, elog)
+            actual_files = _safe_list(actual_files + inherited_files)
+        expected_files = _safe_list(
+            (quality.get("changed_files") or quality.get("expected_files") or actual_files)
+            + inherited_files
+        )
         review_reason = self._review_reason(actual_files, expected_files)
         if review_reason is not None:
             if persist_review:
@@ -1395,6 +1416,7 @@ class ExperimentAdoptionService:
             "experiment": experiment,
             "actual_files": actual_files,
             "expected_files": expected_files,
+            "uncommitted_files": uncommitted_files,
             "snapshot": snapshot,
             "committed_commit_sha": committed_commit_sha,
         }
@@ -1584,6 +1606,7 @@ class ExperimentAdoptionService:
                 record = self.get(experiment_id)
                 actual_files = _safe_list(record.actual_files or [])
                 expected_files = _safe_list(record.expected_files or [])
+                uncommitted_files = []
                 experiment_commit_sha = resumed_commit_sha
                 commit_message = self._commit_message(
                     experiment_id, experiment.goal, experiment.plan
@@ -1601,6 +1624,7 @@ class ExperimentAdoptionService:
                 snapshot = validation["snapshot"]
                 actual_files = validation["actual_files"]
                 expected_files = validation["expected_files"]
+                uncommitted_files = validation["uncommitted_files"]
                 elog.debug(
                     "adoption",
                     "adoption_diff_captured",
@@ -1618,7 +1642,9 @@ class ExperimentAdoptionService:
 
             if experiment_commit_sha is None:
                 _run_git(["reset", "HEAD", "--"], cwd=worktree_path, timeout=60, elog=elog, phase="adoption")
-                for rel_path in actual_files:
+                # Only this attempt's delta: `actual_files` also names what
+                # earlier attempts committed, deleted paths included.
+                for rel_path in uncommitted_files:
                     add_proc = _run_git(
                         ["add", "--", rel_path],
                         cwd=worktree_path,
@@ -1683,25 +1709,34 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            cherry_pick = _run_git(
-                ["cherry-pick", "--no-commit", experiment_commit_sha or "HEAD"],
+            # A squash merge, not a cherry-pick: a retry's commit is only a
+            # delta on the earlier attempts, which are not on main (#455).
+            squash_merge = _run_git(
+                ["merge", "--squash", experiment_commit_sha or "HEAD"],
                 cwd=str(integration_path),
                 timeout=120,
                 elog=elog,
                 phase="adoption",
             )
-            if cherry_pick.returncode != 0:
+            if squash_merge.returncode != 0:
                 keep_integration = True
-                _run_git(
-                    ["cherry-pick", "--abort"],
-                    cwd=str(integration_path),
-                    timeout=60,
-                    elog=elog,
-                    phase="adoption",
+                # No cleanup: nothing can abort a squash merge (it leaves no
+                # MERGE_HEAD), and the conflict markers are what this
+                # diagnostic worktree is kept for.
+                conflicted_files = _safe_list(
+                    self._git_stdout(
+                        ["diff", "--name-only", "--diff-filter=U"],
+                        str(integration_path),
+                        elog,
+                    ).splitlines()
                 )
                 return self._finish_review(
                     experiment_id,
-                    reason="Integrationskonflikt beim Cherry-Pick.",
+                    reason=(
+                        f"Integrationskonflikt: {', '.join(conflicted_files)}"
+                        if conflicted_files
+                        else "Integrationskonflikt beim Squash-Merge."
+                    ),
                     actual_files=actual_files,
                     expected_files=expected_files,
                     diagnostic_worktree_path=str(integration_path),
