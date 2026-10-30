@@ -33,8 +33,8 @@ class _Planner:
         self.prompts.append(prompt)
         return self._raw
 
-    def choose(self, issues, recent=None):
-        return self._planner.choose(issues, recent)
+    def choose(self, issues, recent=None, exhausted=None):
+        return self._planner.choose(issues, recent, exhausted)
 
 
 class PlanningStepTests(unittest.TestCase):
