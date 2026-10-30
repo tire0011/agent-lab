@@ -452,37 +452,50 @@ class ExperimentService:
         experiment_id = uuid.uuid4().hex
         created_at = _utcnow_iso()
 
-        with self._lock, self._conn:
-            if issue_match is not None:
-                issue_prefix = f"GitHub Issue #{issue_match.group(1)}:%"
-                placeholders = ", ".join("?" for _ in _TERMINAL_STATUSES)
-                active = self._conn.execute(
-                    f"""
-                    SELECT id, status FROM experiments
-                    WHERE goal LIKE ? AND status NOT IN ({placeholders})
-                    ORDER BY created_at ASC
-                    LIMIT 1
+        with self._lock:
+            # A connection context starts SQLite's default deferred transaction
+            # only when the INSERT runs.  That is too late for this guard: two
+            # service instances can both complete the SELECT before either one
+            # owns the write lock.  BEGIN IMMEDIATE reserves the writer before
+            # the lookup, making the check-and-insert atomic across connections
+            # and processes as well as within this service instance.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if issue_match is not None:
+                    issue_prefix = f"GitHub Issue #{issue_match.group(1)}:%"
+                    placeholders = ", ".join("?" for _ in _TERMINAL_STATUSES)
+                    active = self._conn.execute(
+                        f"""
+                        SELECT id, status FROM experiments
+                        WHERE goal LIKE ? AND status NOT IN ({placeholders})
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        """,
+                        (issue_prefix, *_TERMINAL_STATUSES),
+                    ).fetchone()
+                    if active is not None:
+                        raise ExperimentAlreadyActiveError(active["id"], active["status"])
+                self._conn.execute(
+                    """
+                    INSERT INTO experiments (id, goal, status, created_at)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (issue_prefix, *_TERMINAL_STATUSES),
-                ).fetchone()
-                if active is not None:
-                    raise ExperimentAlreadyActiveError(active["id"], active["status"])
-            self._conn.execute(
-                """
-                INSERT INTO experiments (id, goal, status, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (experiment_id, normalized_goal, STATUS_QUEUED, created_at),
-            )
-            insert_activity(
-                self._conn,
-                timestamp=created_at,
-                entity_type="experiment",
-                entity_id=experiment_id,
-                event="created",
-                to_status=STATUS_QUEUED,
-                message=normalized_goal,
-            )
+                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at),
+                )
+                insert_activity(
+                    self._conn,
+                    timestamp=created_at,
+                    entity_type="experiment",
+                    entity_id=experiment_id,
+                    event="created",
+                    to_status=STATUS_QUEUED,
+                    message=normalized_goal,
+                )
+            except BaseException:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
 
         self._implementation_timeout_seconds = timeout_seconds
         logger.info("experiment %s created (status=%s)", experiment_id, STATUS_QUEUED)
