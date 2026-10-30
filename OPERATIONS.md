@@ -228,6 +228,13 @@ ls -R /var/lib/nexus/runtime-archive/
 Experiments should still run on their own branches; this is a safety net, not
 the normal workflow.
 
+## Experiment benchmark (#343)
+
+`scripts/run_benchmark.py` runs the frozen task set through `ExperimentService`
+and compares a run to a stored baseline; see `benchmarks/README.md`. A run makes
+billed coding-agent calls. Results stay in `benchmark.db`, not in the production
+database.
+
 ## Known limitations
 
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.

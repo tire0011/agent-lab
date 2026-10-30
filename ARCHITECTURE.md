@@ -502,7 +502,7 @@
 2. **Persistent storage**
    - Keep SQLite-backed structured run store and evolve reporting/migrations as needed.
 3. **Benchmark harness**
-   - Reproducible V0 vs V1 comparison pipeline.
+   - Reproducible V0 vs V1 comparison pipeline. For `new_experiment` this exists: see `benchmarks/README.md`.
 4. **Provider abstraction layer**
    - Decouple agent runtime from single provider/model.
 5. **Evaluation gate**
@@ -518,6 +518,6 @@
 ## Known gaps
 
 - No persistent relational metrics store yet.
-- No formal benchmark suite checked into repo yet.
+- The experiment benchmark (`benchmarks/`, #343) has no stored baseline yet.
 - No finalized policy/eval framework for autonomous self-modification yet.
 - External ChatGPT-to-endpoint integration is not yet dependable.

@@ -221,6 +221,8 @@ class ExperimentService:
         test_safety_cap_seconds: float | None = None,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
         rng: Any | None = None,
+        base_ref: str = "HEAD",
+        test_command: list[str] | None = None,
     ) -> None:
         """
         Parameters
@@ -290,6 +292,14 @@ class ExperimentService:
             All three are passed through as written when set explicitly, and
             clamped to safe floors when they come from the environment - see
             ``WatchdogConfig.resolve``.
+        base_ref:
+            Commit an experiment's worktree starts from, unless the GitHub
+            lifecycle supplies one. The benchmark (#343) pins this; everything
+            else keeps ``HEAD``.
+        test_command:
+            Verification argv template replacing the built-in suite run;
+            ``{python}`` becomes ``test_python_executable``. For trusted callers
+            only: it must never be built from plan or model output.
         """
         self.selection_worker = (
             selection_worker
@@ -313,6 +323,8 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
+        self.base_ref = base_ref
+        self.test_command = test_command
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
         # cleanliness is asserted directly, so the log directory must never
@@ -873,7 +885,7 @@ class ExperimentService:
         # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
-        base_ref = "HEAD"
+        base_ref = self.base_ref
         if github_work_tracking is not None:
             base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
@@ -1280,7 +1292,7 @@ class ExperimentService:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
-        test_command_template = _TEST_COMMANDS.get(test_command_key)
+        test_command_template = self.test_command or _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
             if test_command_template is not None

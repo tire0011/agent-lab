@@ -46,5 +46,5 @@ Total estimated cost is the sum of both values.
 
 | Date (UTC) | Experiment | Model/Provider | Tokens (in/out/total) | Runtime (s) | Est. Cost | Notes |
 |---|---|---|---:|---:|---:|---|
-| TBD | TBD | TBD | TBD | TBD | TBD | Initialize once benchmark harness exists |
+| TBD | TBD | TBD | TBD | TBD | TBD | Per-task numbers live in `benchmark_runs`; see `benchmarks/README.md` |
 

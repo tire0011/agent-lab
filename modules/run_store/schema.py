@@ -279,6 +279,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_operation_log(conn)
     _migrate_failure_analyses(conn)
     _migrate_router_tables(conn)
+    _migrate_benchmark_runs(conn)
     conn.commit()
     return conn
 
@@ -778,4 +779,42 @@ def _migrate_operation_log(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_log_invocation_id "
         "ON operation_log(invocation_id) WHERE invocation_id IS NOT NULL"
+    )
+
+
+def _migrate_benchmark_runs(conn: sqlite3.Connection) -> None:
+    """Create benchmark_runs table (#343), one row per task of a benchmark run."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS benchmark_runs (
+            run_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            task_sha256 TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            provider TEXT NULL,
+            model TEXT NULL,
+            prompt_name TEXT NOT NULL,
+            prompt_sha256 TEXT NOT NULL,
+            experiment_id TEXT NULL,
+            status TEXT NOT NULL,
+            score REAL NOT NULL,
+            tests_green INTEGER NOT NULL CHECK (tests_green IN (0, 1)),
+            expected_files_touched INTEGER NOT NULL,
+            expected_files_total INTEGER NOT NULL,
+            evaluation_outcome TEXT NULL,
+            input_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            runtime_ms INTEGER NOT NULL,
+            estimated_cost REAL NULL,
+            currency TEXT NULL,
+            peak_memory_bytes INTEGER NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            error TEXT NULL,
+            PRIMARY KEY (run_id, task_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_benchmark_runs_started_at
+            ON benchmark_runs(started_at);
+        """
     )
