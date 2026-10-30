@@ -293,10 +293,15 @@ def compact_observations(
             continue
         summary = _semantic_summary(obs)
         serialized_summary = json.dumps(summary, separators=(",", ":"))
-        if summary.get("semantic_summary") and len(serialized_summary) <= fair_share:
-            result[index] = summary
-            remaining = max(0, remaining - len(serialized_summary))
-            continue
+        if summary.get("semantic_summary"):
+            if len(serialized_summary) <= fair_share:
+                result[index] = summary
+                remaining = max(0, remaining - len(serialized_summary))
+                continue
+            # A meaningful summary is the middle rung. If it does not fit,
+            # use the identity stub rather than structurally truncating the
+            # raw payload and losing its semantics.
+            is_recent = False
         if is_recent and remaining > 500:
             compacted, truncated = _shrink(obs, remaining)
             if truncated:
@@ -333,6 +338,10 @@ def _semantic_summary(obs: dict[str, Any]) -> dict[str, Any]:
     if obs.get("operation") == "github_issue":
         lines = obs.get("output_lines")
         if isinstance(lines, list):
+            # Usually controller_observation_view has reassembled these
+            # chunks. Keep direct callers correct too: compaction must not
+            # depend on an incidental caller ordering.
+            chunks: dict[int, str] = {}
             body = ""
             for line in lines:
                 if not isinstance(line, str):
@@ -348,6 +357,12 @@ def _semantic_summary(obs: dict[str, Any]) -> dict[str, Any]:
                             meaningful = True
                 elif line.startswith("body: "):
                     body = line[6:]
+                else:
+                    chunk = re.match(r"^body\[(\d+)\]:\s?(.*)$", line, re.DOTALL)
+                    if chunk:
+                        chunks[int(chunk.group(1))] = chunk.group(2)
+            if chunks and not body:
+                body = "".join(chunks[index] for index in sorted(chunks))
             if body:
                 intro = re.split(r"(?m)^\s*#{1,6}\s+", body, maxsplit=1)[0].strip()
                 summary["goal"] = truncate_text(intro or body.strip(), 800, note="goal truncated")[0]

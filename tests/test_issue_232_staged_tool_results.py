@@ -25,12 +25,16 @@ class StagedToolResultTests(unittest.TestCase):
             "args": {"issue_number": 232}, "status": "succeeded", "event_id": 41,
             "output_lines": [
                 'issue: {"number":232,"state":"open","title":"Staged controller view"}',
-                "body: " + body,
+                *[
+                    f"body[{index // 450 + 1}]: {body[index:index + 450]}"
+                    for index in range(0, len(body), 450)
+                ],
             ],
         }
 
     def test_large_result_uses_semantic_rung_and_keeps_decision_fields(self):
-        [result], omitted = compact_observations([self._issue()], budget_chars=1800)
+        [view] = controller_observation_view([self._issue()])
+        [result], omitted = compact_observations([view], budget_chars=1800)
         self.assertEqual(omitted, [])
         self.assertTrue(result["semantic_summary"])
         self.assertEqual(result["title"], "Staged controller view")
@@ -40,7 +44,8 @@ class StagedToolResultTests(unittest.TestCase):
         self.assertNotIn("large diagnostic detail", json.dumps(result))
 
     def test_summary_that_cannot_fit_falls_back_to_identity_stub(self):
-        [result], omitted = compact_observations([self._issue()], budget_chars=150)
+        [view] = controller_observation_view([self._issue()])
+        [result], omitted = compact_observations([view], budget_chars=150)
         self.assertEqual(omitted, [0])
         self.assertEqual(result["operation"], "github_issue")
         self.assertEqual(result["args"], {"issue_number": 232})
@@ -67,6 +72,7 @@ class ReadToolResultTests(unittest.TestCase):
         self.addCleanup(self.registry.close)
 
     def test_deterministic_slice_is_retrieved_by_event_id(self):
+        before = self.registry._conn.total_changes
         args = {"event_id": self.event_id, "section": "result", "offset": 5, "limit": 7}
         first = self.registry.execute("read_tool_result", args)
         second = self.registry.execute("read_tool_result", args)
@@ -75,6 +81,11 @@ class ReadToolResultTests(unittest.TestCase):
         payload = json.loads(first.output_lines[0])
         self.assertEqual(payload["content"], "fghijkl")
         self.assertEqual(payload["next_offset"], 12)
+        self.assertEqual(self.registry._conn.total_changes, before)
+        audit_count = self.registry._conn.execute(
+            "SELECT COUNT(*) FROM operations_audit WHERE operation='read_tool_result'"
+        ).fetchone()[0]
+        self.assertEqual(audit_count, 0)
 
     def test_successive_ranges_are_progress_and_repeat_guidance_is_paging_specific(self):
         guard = PersistentToolLoopGuard(self.db_path)

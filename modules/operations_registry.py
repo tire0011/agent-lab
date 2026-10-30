@@ -154,13 +154,17 @@ class OperationsRegistry:
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 error_summary=sanitized_reason(str(exc)),
             )
-        self._audit(
-            operation,
-            params,
-            result,
-            caller=caller,
-            invocation_id=invocation_id,
-        )
+        # Paging a persisted result is deliberately a pure read. Do not turn
+        # it into a database write merely to audit the read; the controller
+        # persists the returned observation through its ordinary event path.
+        if operation != "read_tool_result":
+            self._audit(
+                operation,
+                params,
+                result,
+                caller=caller,
+                invocation_id=invocation_id,
+            )
         return result
 
     @staticmethod
@@ -1087,9 +1091,20 @@ class OperationsRegistry:
         if section is not None and (not isinstance(section, str) or not section.strip()):
             raise OperationValidationError("section muss eine nichtleere Zeichenfolge sein.")
 
-        row = self._conn.execute(
-            "SELECT role, content FROM nexus_task_events WHERE id=?", (event_id,)
-        ).fetchone()
+        # Enforce the read-only boundary in SQLite, independently of caller
+        # convention and of the registry's writable audit connection.
+        read_conn = sqlite3.connect(
+            f"file:{Path(self.db_path).resolve().as_posix()}?mode=ro",
+            uri=True,
+        )
+        read_conn.row_factory = sqlite3.Row
+        try:
+            read_conn.execute("PRAGMA query_only = ON")
+            row = read_conn.execute(
+                "SELECT role, content FROM nexus_task_events WHERE id=?", (event_id,)
+            ).fetchone()
+        finally:
+            read_conn.close()
         if row is None or row["role"] != "tool":
             return OperationResult("read_tool_result", False, [], 0, error_summary="tool result event not found")
         content = str(row["content"])
