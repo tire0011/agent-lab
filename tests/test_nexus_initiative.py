@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from modules.nexus_initiative import (
     KIND_IDEA,
@@ -116,6 +117,51 @@ class NexusInitiativeTests(unittest.TestCase):
         self.assertEqual(decision.decision, "busy")
         self.assertFalse(decision.acted)
         self.assertEqual(self.fx.adoption.started, [])
+
+    def test_stale_service_is_recorded_restarted_and_no_work_is_submitted(self):
+        restart = MagicMock()
+        issue_lister = MagicMock(return_value=[{"number": 441, "title": "work", "body": ""}])
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {
+                "git_revision": "aaaa111",
+                "checkout_revision": "bbbb222",
+                "stale": True,
+            }},
+            restart_hook=restart,
+            issue_lister=issue_lister,
+        )
+        self.addCleanup(svc.close)
+
+        decision = svc.tick()
+
+        self.assertEqual(decision.decision, "service_stale")
+        restart.assert_called_once_with()
+        issue_lister.assert_not_called()
+        self.assertEqual(self.fx.controller.issues, [])
+        entries = svc.history()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["decision"], "service_stale")
+        self.assertIn("aaaa111", entries[0]["detail"])
+        self.assertIn("bbbb222", entries[0]["detail"])
+
+    def test_fresh_service_allows_tick_to_proceed(self):
+        restart = MagicMock()
+        svc = self.fx.service(
+            diagnostics_client=lambda: {"service": {
+                "git_revision": "aaaa111",
+                "checkout_revision": "aaaa111",
+                "stale": False,
+            }},
+            restart_hook=restart,
+            issue_lister=lambda: [{"number": 441, "title": "work", "body": ""}],
+        )
+        self.addCleanup(svc.close)
+
+        decision = svc.tick()
+
+        self.assertEqual(decision.decision, "dispatched")
+        self.assertEqual(self.fx.controller.issues, [441])
+        restart.assert_not_called()
 
     def test_does_nothing_while_a_mailbox_task_runs(self):
         self.fx.add_approval("running")

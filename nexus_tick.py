@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.request
 from datetime import datetime, timezone
 
 from modules.logging_config import configure_logging
@@ -39,6 +40,22 @@ _PLANNER_STALL_SECONDS = 300
 
 # Things worth telling Claude about, collected during one tick (#365).
 _events: list[str] = []
+
+
+def _service_diagnostics() -> dict:
+    url = os.environ.get(
+        "NEXUS_DIAGNOSTICS_URL", "http://127.0.0.1:8000/diagnostics/public"
+    )
+    with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - fixed/operator URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _restart_stale_service() -> None:
+    from modules.task_finalization import TaskFinalizationCoordinator
+
+    TaskFinalizationCoordinator._restart_services(
+        TaskFinalizationCoordinator._restart_service_names()
+    )
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
@@ -205,6 +222,8 @@ def _build_service(args) -> NexusInitiativeService:
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
+        diagnostics_client=_service_diagnostics,
+        restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
 
