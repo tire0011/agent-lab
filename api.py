@@ -123,7 +123,27 @@ from modules.maintenance_service import (
 from nexus_mcp import create_mcp_mount
 from nexus_version import VERSION
 
+def _read_git_revision() -> str | None:
+    """Read the revision currently checked out, without retaining the result."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        revision = completed.stdout.strip()
+        return revision or None
+    except Exception:
+        return None
+
+
 _PROCESS_START_TIME = time.time()
+# Capture this while the module's code is being loaded.  Reading HEAD lazily
+# would describe a later checkout, not the revision this process is executing.
+_STARTUP_REVISION = _read_git_revision()
 configure_logging()
 _logger = logging.getLogger(__name__)
 _MCP_MOUNT = create_mcp_mount()
@@ -615,7 +635,14 @@ def authorize(x_api_key: str | None):
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", version=VERSION)
+    checkout_revision = _read_git_revision()
+    return HealthResponse(
+        status="ok",
+        version=VERSION,
+        git_revision=_STARTUP_REVISION,
+        checkout_revision=checkout_revision,
+        stale=_revisions_differ(_STARTUP_REVISION, checkout_revision),
+    )
 
 @app.get("/secure-health")
 def secure_health(x_api_key: str | None = Header(default=None)):
@@ -1644,21 +1671,9 @@ PUBLIC_LOGS_DEFAULT_LIMIT = 100
 PUBLIC_LOGS_MAX_LIMIT = 500
 
 
-@lru_cache(maxsize=1)
-def _git_revision() -> str | None:
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-        revision = completed.stdout.strip()
-        return revision or None
-    except Exception:
-        return None
+def _revisions_differ(startup: str | None, checkout: str | None) -> bool:
+    """Only claim staleness when both revisions could be determined."""
+    return startup is not None and checkout is not None and startup != checkout
 
 
 @lru_cache(maxsize=1)
@@ -1845,10 +1860,13 @@ def get_public_diagnostics(
     except Exception:
         mailbox_status = PublicDiagnosticMailboxStatus(status="unavailable", pending_count=0, latest_tasks=[])
 
+    checkout_revision = _read_git_revision()
     return PublicDiagnosticsResponse(
         service=PublicDiagnosticServiceStatus(
             status="ok",
-            git_revision=_git_revision(),
+            git_revision=_STARTUP_REVISION,
+            checkout_revision=checkout_revision,
+            stale=_revisions_differ(_STARTUP_REVISION, checkout_revision),
             deployment_time=_deployment_time(),
         ),
         mailbox=mailbox_status,

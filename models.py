@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class HealthResponse(BaseModel):
     status: str
     version: str
+    git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
 
 
 class StatusResponse(BaseModel):
@@ -468,6 +471,8 @@ class PublicDiagnosticExperiment(BaseModel):
 class PublicDiagnosticServiceStatus(BaseModel):
     status: str
     git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
     deployment_time: str | None = None
 
 

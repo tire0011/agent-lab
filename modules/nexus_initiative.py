@@ -157,6 +157,8 @@ class NexusInitiativeService:
         issue_commenter: Callable[[int, str], None] | None = None,
         proposal_creator: Callable[[str, str], None] | None = None,
         proposal_counter: Callable[[], int] | None = None,
+        diagnostics_client: Callable[[], dict[str, Any]] | None = None,
+        restart_hook: Callable[[], None] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -169,6 +171,8 @@ class NexusInitiativeService:
         self._issue_commenter = issue_commenter
         self._proposal_creator = proposal_creator
         self._proposal_counter = proposal_counter
+        self._diagnostics_client = diagnostics_client
+        self._restart_hook = restart_hook
         self._open_proposals = 0
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
@@ -732,6 +736,23 @@ class NexusInitiativeService:
 
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
+        stale = self._stale_service_revisions()
+        if stale is not None:
+            startup, checkout = stale
+            decision = self._record(InitiativeDecision(
+                "service_stale",
+                detail=f"git_revision={startup} checkout_revision={checkout}",
+                tick_id=tick_id,
+            ))
+            if self._restart_hook is not None:
+                try:
+                    self._restart_hook()
+                except Exception as exc:  # noqa: BLE001 - the activity must survive a failed hand-off
+                    logger.exception("initiative: stale service restart hand-off failed")
+                    decision.detail += f"; restart failed: {type(exc).__name__}: {exc}"[:500]
+                    self._record(decision, update=True)
+            return decision
+
         busy = self.busy_reason()
         if busy is not None:
             return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
@@ -768,6 +789,21 @@ class NexusInitiativeService:
             decision.detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._record(decision, update=True)
         return decision
+
+    def _stale_service_revisions(self) -> tuple[str, str] | None:
+        """Return the two revisions when live diagnostics prove the API is stale."""
+        if self._diagnostics_client is None:
+            return None
+        try:
+            payload = self._diagnostics_client()
+            service = payload.get("service", payload)
+            startup = service.get("git_revision")
+            checkout = service.get("checkout_revision")
+            if service.get("stale") is True and startup and checkout and startup != checkout:
+                return str(startup), str(checkout)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not disable initiative
+            logger.warning("initiative: service diagnostics failed: %s", exc)
+        return None
 
     def _earlier_attempts(self, issue_number: int) -> str:
         """How earlier experiments for this issue ended, for the retry (#374).
