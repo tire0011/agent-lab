@@ -106,7 +106,12 @@ class HealthEndpointTests(ApiTestsBase):
     def test_health_returns_ok(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok", "version": VERSION})
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["version"], VERSION)
+        self.assertIn("git_revision", body)
+        self.assertIn("checkout_revision", body)
+        self.assertIn("stale", body)
 
 
 class MailboxGithubWebhookTests(ApiTestsBase):
