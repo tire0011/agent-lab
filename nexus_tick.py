@@ -58,6 +58,19 @@ def _restart_stale_service() -> None:
     )
 
 
+def _checkout_revision(repo_root: str) -> str:
+    """Read the revision of the checkout executing this initiative tick."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
 def _list_open_issues(repo_root: str) -> list[dict]:
     """Return the open GitHub issue backlog available to Nexus.
 
@@ -223,6 +236,7 @@ def _build_service(args) -> NexusInitiativeService:
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
         diagnostics_client=_service_diagnostics,
+        checkout_revision=lambda: _checkout_revision(args.repo_root),
         restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
