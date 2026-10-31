@@ -80,6 +80,7 @@ class BaselineRecheckTests(unittest.TestCase):
             None, "", "stalled", True, None, 1, stalled=True,
             progress={"current_test": "test_sample.T.test_a"},
             failed_test_ids=["test_sample.T.test_a"],
+            observed_test_ids=["test_sample.T.test_a"],
         )
         with patch(
             "modules.experiment_service.service.run_verification_test_monitored",
@@ -110,6 +111,34 @@ class BaselineRecheckTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIsNone(result.baseline_test_classifications)
         runner.assert_called_once()
+
+    def test_uncollected_baseline_failure_is_not_pre_existing(self) -> None:
+        """A loader/selector failure on base cannot exculpate the change."""
+        self._commit("import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n")
+        (self.repo / "notes.txt").write_text("unrelated\n", encoding="utf-8")
+        experiment_failure = VerificationRunResult(
+            1, "", "import failed", False, None, 1,
+            failed_test_ids=["unittest.loader._FailedTest.test_a"],
+            observed_test_ids=["unittest.loader._FailedTest.test_a"],
+        )
+        baseline_loader_failure = VerificationRunResult(
+            1, "", "could not import requested test", False, None, 1,
+            failed_test_ids=["unittest.loader._FailedTest.test_a"],
+            # unittest can echo the exact synthetic selector even though no
+            # real test was collected.  It is still not baseline evidence.
+            observed_test_ids=["unittest.loader._FailedTest.test_a"],
+        )
+        with patch(
+            "modules.experiment_service.service.run_verification_test_monitored",
+            side_effect=[experiment_failure, baseline_loader_failure],
+        ):
+            result = self._verify()
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.baseline_test_classifications,
+            {"unittest.loader._FailedTest.test_a": "regression"},
+        )
 
 
 if __name__ == "__main__":

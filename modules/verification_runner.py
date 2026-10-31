@@ -201,6 +201,12 @@ class VerificationRunResult:
     tests_total: int | None = None
     #: Canonical unittest IDs which failed, errored, or were running at a stall.
     failed_test_ids: list[str] | None = None
+    #: Canonical unittest IDs which the runner actually observed starting.
+    #:
+    #: Baseline rechecks use this to distinguish a real result for the
+    #: requested test from loader/import errors, bad selectors, and zero-test
+    #: runs.  Those uncertain outcomes must never exculpate an experiment.
+    observed_test_ids: list[str] | None = None
 
     @property
     def output(self) -> str:
@@ -237,6 +243,7 @@ def run_verification_test_monitored(
     parser = UnittestStreamParser()
     tracker = ProgressTracker(expected_total=expected_total)
     failed_test_ids: set[str] = set()
+    observed_test_ids: set[str] = set()
     stdout_chunks: list[str] = []
 
     env = build_verification_test_env()
@@ -279,6 +286,8 @@ def run_verification_test_monitored(
             tracker.note_activity()
             for event in events:
                 tracker.record(event)
+                if event.kind == EVENT_START:
+                    observed_test_ids.add(event.test_id)
                 if event.kind == EVENT_END and event.result in FAILING_RESULTS:
                     failed_test_ids.add(event.test_id)
                 _log_test_event(test_log, event)
@@ -391,6 +400,7 @@ def run_verification_test_monitored(
         test_log_path=str(test_log.path),
         tests_total=total_tests,
         failed_test_ids=sorted(failed_test_ids),
+        observed_test_ids=sorted(observed_test_ids),
     )
 
 

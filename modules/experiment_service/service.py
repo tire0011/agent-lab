@@ -192,6 +192,11 @@ def _test_file_for_id(test_id: str) -> str | None:
             return "/".join(prefix) + ".py"
     return None
 
+
+def _is_real_test_id(test_id: str) -> bool:
+    """Whether *test_id* names a collected test rather than a loader error."""
+    return "._FailedTest." not in test_id and not test_id.startswith("unittest.loader._FailedTest")
+
 # Default interpreter used to run tests inside an experiment worktree.
 # Using the main repository's own virtualenv interpreter lets a fresh git
 # worktree (which has no virtualenv of its own) run the existing test
@@ -397,14 +402,24 @@ class ExperimentService:
                     config=config,
                     prune_logs=False,
                 )
-                # Only a clean pass proves that the experiment introduced a
-                # regression. Failure, error, and watchdog stall on base are
-                # all pre-existing by definition.
+                # A baseline result is evidence only when the requested test
+                # was actually collected.  In particular, an import-breaking
+                # regression can be reported as unittest.loader._FailedTest;
+                # rerunning that synthetic ID on base may fail to import or
+                # select anything.  Treat every such uncertain result as a
+                # regression so baseline checking can never hide a real one.
+                requested_test_observed = (
+                    _is_real_test_id(test_id)
+                    and test_id in (result.observed_test_ids or [])
+                )
+                baseline_failed = (
+                    result.exit_code != 0 or result.timed_out
+                    or result.process_died or result.exception is not None
+                )
                 classifications[test_id] = (
-                    "regression"
-                    if result.exit_code == 0 and not result.timed_out
-                    and not result.process_died and result.exception is None
-                    else "pre_existing"
+                    "pre_existing"
+                    if requested_test_observed and baseline_failed
+                    else "regression"
                 )
         except Exception as exc:  # noqa: BLE001 - uncertain baseline is never exculpatory
             elog.error(
@@ -413,15 +428,17 @@ class ExperimentService:
             )
             classifications = {test_id: "regression" for test_id in test_ids}
         finally:
-            if added:
+            if added or Path(baseline_path).exists():
                 _run_git(
                     ["worktree", "remove", "--force", baseline_path],
                     cwd=worktree_path, timeout=60, elog=elog, phase="verifying",
                 )
-                _run_git(
-                    ["worktree", "prune"], cwd=worktree_path, timeout=60,
-                    elog=elog, phase="verifying",
-                )
+            # Prune even when `worktree add` reported failure: git can leave
+            # administrative metadata after partially creating a worktree.
+            _run_git(
+                ["worktree", "prune"], cwd=worktree_path, timeout=60,
+                elog=elog, phase="verifying",
+            )
             shutil.rmtree(parent, ignore_errors=True)
 
         elog.info(
