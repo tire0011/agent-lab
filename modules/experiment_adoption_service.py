@@ -1725,7 +1725,7 @@ class ExperimentAdoptionService:
                 # diagnostic worktree is kept for.
                 conflicted_files = _safe_list(
                     self._git_stdout(
-                        ["diff", "--name-only", "--diff-filter=U"],
+                        ["diff", "--name-only", "--diff-filter=U", "--"],
                         str(integration_path),
                         elog,
                     ).splitlines()

@@ -718,7 +718,7 @@ class GitHubWorkTrackingService:
         ``base_sha`` is the target-branch commit the verified checkpoint
         was built on. It is stored because a verdict is only authoritative
         for adoption while the integration base is unchanged (#134): the
-        same checkpoint cherry-picked onto a moved base produces a tree CI
+        same checkpoint integrated onto a moved base can produce a tree CI
         never saw. Without it a reader cannot tell the two apart.
 
         Returns whether anything was stored. The most recent authoritative
@@ -809,7 +809,7 @@ class GitHubWorkTrackingService:
         When given, a verdict is only returned if it was recorded against
         that same base, which carries #134's rule into the durable store:
         a checkpoint verified on top of ``A`` says nothing about the tree
-        produced by cherry-picking it onto ``B``. A row with no recorded
+        produced by integrating it onto ``B``. A row with no recorded
         base predates this and cannot be shown to satisfy the rule, so it
         is not reused either - the caller falls back to live verification.
         """
