@@ -198,6 +198,11 @@ class VerificationRunResult:
     test_log_path: str | None = None
     #: Total tests reported by the suite itself, when it got that far.
     tests_total: int | None = None
+    #: Exact unittest IDs which completed unsuccessfully, plus the current
+    #: test when the watchdog stopped a stalled run.
+    failed_test_ids: tuple[str, ...] = ()
+    #: Result by exact ID for tests which reached a unittest verdict.
+    test_results: dict[str, str] | None = None
 
     @property
     def output(self) -> str:
@@ -233,6 +238,7 @@ def run_verification_test_monitored(
 
     parser = UnittestStreamParser()
     tracker = ProgressTracker(expected_total=expected_total)
+    test_results: dict[str, str] = {}
     stdout_chunks: list[str] = []
 
     env = build_verification_test_env()
@@ -276,6 +282,8 @@ def run_verification_test_monitored(
             for event in events:
                 tracker.record(event)
                 _log_test_event(test_log, event)
+                if event.kind == EVENT_END and event.result:
+                    test_results[event.test_id] = event.result
 
     def _drain_stdout() -> None:
         for chunk in _iter_chunks(process.stdout):
@@ -367,6 +375,15 @@ def run_verification_test_monitored(
             exit_code=exit_code, duration_ms=duration_ms, **final_snapshot,
         )
 
+    failed_ids = [
+        test_id for test_id, result in test_results.items()
+        if result in {"failed", "error", "unexpected_success"}
+    ]
+    if abort_reason == ABORT_STALLED:
+        stalled_test = (stall_snapshot or {}).get("current_test")
+        if stalled_test and stalled_test not in failed_ids:
+            failed_ids.append(str(stalled_test))
+
     return VerificationRunResult(
         None if (abort_reason is not None or process_died) else exit_code,
         stdout_text,
@@ -381,6 +398,8 @@ def run_verification_test_monitored(
         progress=final_snapshot,
         test_log_path=str(test_log.path),
         tests_total=total_tests,
+        failed_test_ids=tuple(failed_ids),
+        test_results=test_results,
     )
 
 

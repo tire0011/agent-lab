@@ -165,6 +165,8 @@ class Experiment:
     failure_type: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
+    base_commit_sha: str | None = None
+    test_failure_classification: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -219,6 +221,8 @@ class Experiment:
             "failure_type": self.failure_type,
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
+            "base_commit_sha": self.base_commit_sha,
+            "test_failure_classification": self.test_failure_classification,
         }
 
 
@@ -283,6 +287,11 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         policy_rule=row["policy_rule"] if "policy_rule" in row.keys() else None,
         quality_evaluation=(
             _json_or_none(row["quality_evaluation_json"]) if "quality_evaluation_json" in row.keys() else None
+        ),
+        base_commit_sha=row["base_commit_sha"] if "base_commit_sha" in row.keys() else None,
+        test_failure_classification=(
+            _json_or_none(row["test_failure_classification_json"])
+            if "test_failure_classification_json" in row.keys() else None
         ),
     )
 

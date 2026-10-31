@@ -201,7 +201,9 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             failure_phase TEXT NULL,
             failure_type TEXT NULL,
             policy_rule TEXT NULL,
-            quality_evaluation_json TEXT NULL
+            quality_evaluation_json TEXT NULL,
+            base_commit_sha TEXT NULL,
+            test_failure_classification_json TEXT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
@@ -305,6 +307,8 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("policy_replan_diagnostic_log", "TEXT"),
     ("policy_rule", "TEXT"),
     ("quality_evaluation_json", "TEXT"),
+    ("base_commit_sha", "TEXT"),
+    ("test_failure_classification_json", "TEXT"),
     # Which coding agent ran the implementation phase (codex | claude).
     ("implementation_provider", "TEXT"),
     ("cancelled_at", "TEXT"),

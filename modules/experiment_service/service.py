@@ -97,6 +97,30 @@ _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 # when it stalls; see modules.coding_worker.agent_watchdog_limits.
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
+_BASELINE_RECHECK_ENV_VAR = "NEXUS_BASELINE_RECHECK_SECONDS"
+_DEFAULT_BASELINE_RECHECK_SECONDS = 120.0
+
+
+def _baseline_recheck_seconds() -> float:
+    try:
+        value = float(os.environ.get(_BASELINE_RECHECK_ENV_VAR, ""))
+    except ValueError:
+        value = 0
+    return value if value > 0 else _DEFAULT_BASELINE_RECHECK_SECONDS
+
+
+def _test_file_candidates(test_id: str) -> set[str]:
+    """Possible repository paths for a unittest ID (discovery or package form)."""
+    if "_FailedTest" in test_id or not test_id:
+        return set()
+    parts = test_id.split(".")
+    candidates: set[str] = set()
+    for index, part in enumerate(parts):
+        if part.startswith("test_"):
+            candidates.add("/".join(parts[: index + 1]) + ".py")
+            candidates.add("tests/" + "/".join(parts[index:index + 1]) + ".py")
+            break
+    return candidates
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
@@ -1144,6 +1168,11 @@ class ExperimentService:
                     error=f"git worktree add failed: {create_proc.stderr.strip()[:2000]}",
                 )
                 return self.get_experiment(experiment_id)
+            base_proc = _run_git(
+                ["rev-parse", "HEAD"], cwd=worktree_path, elog=elog,
+                phase="implementation",
+            )
+            base_commit_sha = base_proc.stdout.strip() if base_proc.returncode == 0 else base_ref
         except (OSError, subprocess.SubprocessError) as exc:
             elog.error(
                 "implementation", "worktree_creation_exception",
@@ -1165,6 +1194,7 @@ class ExperimentService:
             experiment_id, STATUS_IMPLEMENTING,
             worktree_path=worktree_path,
             branch_name=branch_name,
+            base_commit_sha=base_commit_sha,
         )
 
         # ---- Single Codex implementation call -----------------------------
@@ -1405,6 +1435,98 @@ class ExperimentService:
                 "Could not publish interrupted implementation checkpoint", exc=exc,
             )
             return f"; GitHub checkpoint failed: {str(exc)[:1000]}"
+
+    def _recheck_failures_on_base(
+        self,
+        experiment_id: str,
+        test_ids: tuple[str, ...],
+        changed_files: set[str],
+        elog: ExperimentLogger,
+    ) -> dict[str, str] | None:
+        """Re-run exact failing IDs at the recorded base, conservatively.
+
+        ``None`` means no recheck was appropriate.  Anything the baseline
+        cannot positively map back to the requested test remains a regression.
+        """
+        if not test_ids:
+            return None
+        candidate_files = {path for test_id in test_ids for path in _test_file_candidates(test_id)}
+        if not candidate_files or candidate_files & changed_files:
+            return None
+
+        experiment = self.get_experiment(experiment_id)
+        if not experiment.base_commit_sha:
+            return None
+        deadline = _baseline_recheck_seconds()
+        classifications: dict[str, str] = {}
+        temp_root = tempfile.mkdtemp(prefix=f"nexus-baseline-{experiment_id[:8]}-")
+        base_worktree = str(Path(temp_root) / "worktree")
+        added = False
+        try:
+            add = _run_git(
+                ["worktree", "add", "--detach", base_worktree, experiment.base_commit_sha],
+                cwd=self.repo_root, timeout=60, elog=elog, phase="verifying",
+            )
+            if add.returncode != 0:
+                return {test_id: "regression" for test_id in test_ids}
+            added = True
+            for index, test_id in enumerate(test_ids):
+                # Loader pseudo-tests prove collection failed, not that the
+                # intended test existed and failed on the base revision.
+                if "_FailedTest" in test_id:
+                    classifications[test_id] = "regression"
+                    continue
+                config = WatchdogConfig(
+                    stall_timeout_seconds=deadline,
+                    check_interval_seconds=min(1.0, max(0.05, deadline / 10)),
+                    safety_cap_seconds=deadline + min(1.0, max(0.05, deadline / 10)),
+                )
+                baseline_id = test_id if test_id.startswith("tests.") else f"tests.{test_id}"
+                run = run_verification_test_monitored(
+                    [self.test_python_executable, "-m", "unittest", baseline_id, "-v"],
+                    cwd=base_worktree,
+                    run_id=f"{experiment_id}-baseline-{index}",
+                    config=config,
+                    expected_total=1,
+                    on_process=lambda process: self._track_process(experiment_id, process),
+                )
+                exact_result = (run.test_results or {}).get(baseline_id)
+                exact_stall = bool(
+                    run.stalled
+                    and (run.progress or {}).get("current_test") == baseline_id
+                )
+                classifications[test_id] = (
+                    "pre_existing"
+                    if exact_result in {"failed", "error", "unexpected_success"} or exact_stall
+                    else "regression"
+                )
+        except Exception as exc:  # noqa: BLE001 - ambiguity must preserve regression behavior
+            elog.warning(
+                "verifying", "baseline_recheck_failed",
+                "Could not complete baseline test recheck; preserving regression behavior",
+                reason=str(exc)[:1000],
+            )
+            for test_id in test_ids:
+                classifications.setdefault(test_id, "regression")
+        finally:
+            if added:
+                _run_git(
+                    ["worktree", "remove", "--force", base_worktree],
+                    cwd=self.repo_root, timeout=60, elog=elog, phase="verifying",
+                )
+            shutil.rmtree(temp_root, ignore_errors=True)
+            _run_git(
+                ["worktree", "prune"], cwd=self.repo_root, timeout=60,
+                elog=elog, phase="verifying",
+            )
+
+        elog.info(
+            "verifying", "baseline_recheck_classified",
+            "Classified verification failures against the base commit",
+            classifications=classifications,
+            base_commit_sha=experiment.base_commit_sha,
+        )
+        return classifications
 
     def _verify(
         self,
@@ -1647,6 +1769,16 @@ class ExperimentService:
                 tests_total=test_run.tests_total,
             )
 
+        failure_classification: dict[str, str] | None = None
+        if use_local_tests and test_run.failed_test_ids:
+            changed_files = set(parse_git_status_short(git_status).all_paths())
+            failure_classification = self._recheck_failures_on_base(
+                experiment_id,
+                test_run.failed_test_ids,
+                changed_files,
+                elog,
+            )
+
         test_output_capped = _truncate_text(test_output, self.max_test_output_bytes, label="test output")
 
         final_status = STATUS_SUCCEEDED
@@ -1744,6 +1876,17 @@ class ExperimentService:
                     "Exception while running deterministic quality evaluation", exc=exc,
                 )
 
+        if failure_classification and all(
+            verdict == "pre_existing" for verdict in failure_classification.values()
+        ):
+            ids = ", ".join(failure_classification)
+            final_status = STATUS_NEEDS_REVIEW
+            error = f"pre-existing failures on base: {ids}"
+            elog.warning(
+                "verifying", "pre_existing_failures_on_base", error,
+                classifications=failure_classification,
+            )
+
         with self._lock:
             row = self._conn.execute(
                 "SELECT COALESCE(MAX(iteration), -1) + 1 FROM verification_runs "
@@ -1770,6 +1913,9 @@ class ExperimentService:
             test_output=test_output_capped,
             error=error,
             quality_evaluation_json=json.dumps(quality_evaluation) if quality_evaluation is not None else None,
+            test_failure_classification_json=(
+                json.dumps(failure_classification) if failure_classification is not None else None
+            ),
         )
         if github_work_tracking is not None:
             try:
