@@ -195,6 +195,10 @@ Notes:
 - The trailing slash in `/mcp/` is part of the endpoint URL and should be kept
   in client configuration.
 
+The tool router itself (`find_tool`, `call_tool`) is a separate stdio server:
+`python -m modules.tool_router_mcp`. See `docs/issue-118-tool-router-mcp.md`,
+which includes the Copilot CLI setup.
+
 ## Adding ideas
 
 `POST /ideas` (authenticated with `x-api-key`, same as `/secure-health` and

@@ -392,6 +392,8 @@
   `modules/tool_loop_guard.py` (duplicate/non-progressing protection).
   Callers: `modules/task_orchestrator.py` (the persistent controller) and
   `modules/failure_analysis_service.py` (diagnosis, #172).
+  `modules/tool_router_mcp.py` exposes the same router to external MCP clients
+  over stdio, read-only (#118, `docs/issue-118-tool-router-mcp.md`).
 - `find_tool` resolves one plain-language capability request against the
   read-only catalog and returns that operation's schema; `call_tool` runs an
   operation only when a `find_tool` result in the same session already
