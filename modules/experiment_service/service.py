@@ -849,7 +849,11 @@ class ExperimentService:
         Verification runs the test suite under its own safety cap and may then
         start a repair agent, so it gets the larger of both.
         """
-        agent_cap = max(agent_watchdog_limits()[1], float(_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS))
+        # The implementation timeout is the phase's upper bound, not a floor.
+        # A deliberately shorter coding-agent cap must make a silent phase
+        # eligible for sweeping sooner, while an absent or oversized setting
+        # retains the three-hour implementation maximum.
+        agent_cap = min(agent_watchdog_limits()[1], float(_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS))
         if status == STATUS_VERIFYING:
             return max(agent_cap, float(self._get_test_watchdog_config().safety_cap_seconds))
         return agent_cap

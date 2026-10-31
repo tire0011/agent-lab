@@ -156,6 +156,37 @@ class StallSweepTests(unittest.TestCase):
             [experiment_id],
         )
 
+    def test_a_short_configured_agent_cap_is_honored_after_grace(self):
+        os.environ["NEXUS_AGENT_MAX_SECONDS"] = "3600"
+        experiment_id = self._experiment()
+        created_at = self.service.get_experiment(experiment_id).created_at
+        self.assertIsNotNone(created_at)
+        last_progress = datetime.fromisoformat(created_at)
+        deadline = last_progress + timedelta(seconds=3600 + DEFAULT_STALL_GRACE_SECONDS)
+
+        # The deadline includes the grace and is strict: logging exactly at
+        # the boundary is still within the limit.
+        self.assertEqual(self.service.sweep_stalled_experiments(deadline), [])
+        self.assertEqual(self.service.get_experiment(experiment_id).status, "implementing")
+        self.assertEqual(
+            self.service.sweep_stalled_experiments(deadline + timedelta(seconds=1)),
+            [experiment_id],
+        )
+        detected = [e for e in self._log_events(experiment_id) if e["event"] == "stalled_detected"]
+        self.assertEqual(detected[0]["limit_seconds"], 3600)
+        self.assertEqual(detected[0]["grace_seconds"], DEFAULT_STALL_GRACE_SECONDS)
+
+    def test_default_and_oversized_agent_caps_keep_the_three_hour_maximum(self):
+        self.assertEqual(
+            self.service._phase_hard_limit_seconds("implementing"),
+            3 * 60 * 60,
+        )
+        os.environ["NEXUS_AGENT_MAX_SECONDS"] = str(6 * 60 * 60)
+        self.assertEqual(
+            self.service._phase_hard_limit_seconds("implementing"),
+            3 * 60 * 60,
+        )
+
     def test_grace_parsing(self):
         self.assertEqual(stall_grace_seconds(""), DEFAULT_STALL_GRACE_SECONDS)
         self.assertEqual(stall_grace_seconds("600"), 600)
