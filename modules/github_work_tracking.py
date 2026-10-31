@@ -905,6 +905,48 @@ class GitHubWorkTrackingService:
                 exc_info=True,
             )
 
+        return self._poll_ci(
+            sha,
+            experiment_id=experiment_id,
+            integration_base=integration_base,
+            workflow=workflow,
+            start_timeout_seconds=start_timeout_seconds,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def wait_for_commit_ci(
+        self,
+        sha: str,
+        *,
+        experiment_id: str,
+        workflow: str = _DEFAULT_CI_WORKFLOW,
+        start_timeout_seconds: float = _DEFAULT_CI_START_TIMEOUT_SECONDS,
+        completion_timeout_seconds: float = _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _DEFAULT_CI_POLL_INTERVAL_SECONDS,
+    ) -> GitHubCIVerification:
+        """CI for one exact commit, such as the integrated tree adoption is about to merge."""
+        return self._poll_ci(
+            sha,
+            experiment_id=experiment_id,
+            integration_base="",
+            workflow=workflow,
+            start_timeout_seconds=start_timeout_seconds,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def _poll_ci(
+        self,
+        sha: str,
+        *,
+        experiment_id: str,
+        integration_base: str,
+        workflow: str,
+        start_timeout_seconds: float,
+        completion_timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> GitHubCIVerification:
         started_deadline = time.monotonic() + max(0.0, start_timeout_seconds)
         completion_deadline: float | None = None
         encoded_workflow = urllib.parse.quote(workflow, safe="")

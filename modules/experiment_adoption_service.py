@@ -1969,6 +1969,30 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
+            # CI ran on the experiment branch; what merges is that change on
+            # top of today's main. Test exactly that tree first (#455).
+            if published_sha and not (exact_ci and evidence.passed and published_sha == checkpoint_sha):
+                final_ci = self.github_work_tracking.wait_for_commit_ci(
+                    published_sha, experiment_id=experiment_id
+                )
+                if final_ci.status != "passed":
+                    keep_integration = True
+                    return self._finish_failure(
+                        experiment_id,
+                        reason=(
+                            f"CI on the integrated tree {published_sha[:12]} did not pass: "
+                            f"{final_ci.status} {final_ci.reason or final_ci.conclusion or ''}".strip()
+                        ),
+                        actual_files=actual_files,
+                        expected_files=expected_files,
+                        test_exit_code=test_exit_code,
+                        test_output=bounded_test_output,
+                        experiment_commit_sha=experiment_commit_sha,
+                        integrated_commit_sha=integrated_commit_sha,
+                        diagnostic_worktree_path=str(integration_path),
+                        elog=elog,
+                    )
+
             plan_title = ""
             if isinstance(experiment.plan, dict):
                 plan_title = str(experiment.plan.get("title") or "")
