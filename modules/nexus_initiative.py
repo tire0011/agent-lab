@@ -552,8 +552,31 @@ class NexusInitiativeService:
 
     # ---- the tick --------------------------------------------------------
 
+    def _sweep_stalled_experiments(self) -> None:
+        """Best-effort stall recovery before initiative gates are evaluated.
+
+        In particular this must precede ``busy_reason`` and the daily budget:
+        the stale experiment is exactly what can otherwise keep both gates
+        closed indefinitely.  Older/lightweight experiment-service doubles do
+        not necessarily expose the sweep yet, so keep that compatibility.
+        """
+        sweep = getattr(self.experiment_service, "sweep_stalled_experiments", None)
+        if not callable(sweep):
+            return
+        try:
+            stalled = sweep()
+        except Exception as exc:  # noqa: BLE001 - initiative must remain available
+            logger.warning("initiative: stalled-experiment sweep failed: %s", exc)
+            return
+        if stalled:
+            logger.warning(
+                "initiative: marked %d stalled experiment(s) failed before tick",
+                len(stalled),
+            )
+
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
+        self._sweep_stalled_experiments()
         busy = self.busy_reason()
         if busy is not None:
             return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))

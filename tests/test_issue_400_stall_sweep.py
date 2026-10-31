@@ -295,6 +295,46 @@ class StallSweepTests(unittest.TestCase):
         # One stalled attempt alone leaves the issue open for a retry.
         self.assertNotIn(388, initiative._linked_issue_numbers())
 
+    def test_initiative_tick_sweeps_before_checking_whether_work_is_busy(self):
+        experiment_id = self._experiment()
+        stale_now = datetime.now(timezone.utc) + PAST_THE_LIMIT
+        initiative = NexusInitiativeService(
+            db_path=self.db_path,
+            experiment_service=self.service,
+            issue_lister=lambda: [],
+            idea_lister=lambda: [],
+        )
+        self.addCleanup(initiative.close)
+        original_sweep = self.service.sweep_stalled_experiments
+
+        def sweep_at_stale_time():
+            return original_sweep(stale_now)
+
+        with mock.patch.object(
+            self.service, "sweep_stalled_experiments", wraps=sweep_at_stale_time
+        ) as sweep:
+            decision = initiative.tick()
+
+        sweep.assert_called_once_with()
+        self.assertEqual(decision.decision, "idle")
+        self.assertEqual(self.service.get_experiment(experiment_id).status, "failed")
+
+    def test_initiative_tick_continues_when_the_best_effort_sweep_fails(self):
+        initiative = NexusInitiativeService(
+            db_path=self.db_path,
+            experiment_service=self.service,
+            issue_lister=lambda: [],
+            idea_lister=lambda: [],
+        )
+        self.addCleanup(initiative.close)
+
+        with mock.patch.object(
+            self.service, "sweep_stalled_experiments", side_effect=RuntimeError("store unavailable")
+        ):
+            decision = initiative.tick()
+
+        self.assertEqual(decision.decision, "idle")
+
 
 class ProgressHeartbeatTests(unittest.TestCase):
     def test_a_live_worker_reports_progress_while_it_runs(self):
