@@ -28,6 +28,7 @@ _DEFAULT_CI_WORKFLOW = "tests.yml"
 _DEFAULT_CI_START_TIMEOUT_SECONDS = 90.0
 _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS = 1500.0
 _DEFAULT_CI_POLL_INTERVAL_SECONDS = 10.0
+_MAX_COMMIT_TITLE_CHARS = 72
 
 # The opening sentence of every lifecycle-readiness refusal. Exported so a
 # consumer that has only a *persisted* refusal text - written before the
@@ -52,6 +53,27 @@ def _slug(text: str, *, max_len: int = 48) -> str:
 
 def _normalise_title(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split())
+
+
+def _issue_commit_title(issue_title: str, issue_number: int, *, max_len: int = _MAX_COMMIT_TITLE_CHARS) -> str:
+    """Return ``<issue title> (#N)`` without a ``WIP:`` prefix, at most ``max_len`` chars (#423).
+
+    The planner reads main's ``git log`` to see which issues already landed;
+    a squash title naming only the experiment id cannot be linked back.
+    """
+    suffix = f" (#{issue_number})"
+    title = " ".join((issue_title or "").split())
+    while re.match(r"(?i)^wip:\s*", title):
+        title = re.sub(r"(?i)^wip:\s*", "", title, count=1)
+    title = title or f"Issue {issue_number}"
+    room = max(max_len - len(suffix), 1)
+    if len(title) > room:
+        title = title[:room].rstrip()
+    return title + suffix
+
+
+def _experiment_trailer(experiment_id: str | None) -> str:
+    return f"Nexus-Experiment: {experiment_id}" if experiment_id else ""
 
 
 def _infer_repository(repo_root: str) -> str | None:
@@ -590,6 +612,13 @@ class GitHubWorkTrackingService:
         ).stdout.strip()
         checkpoint_sha = checkpoint_base
         if tree_sha != base_tree:
+            if ref.issue_number:
+                checkpoint_message = (
+                    f"WIP: {_issue_commit_title(ref.issue_title, ref.issue_number)}\n\n"
+                    f"{_experiment_trailer(experiment_id)}"
+                )
+            else:
+                checkpoint_message = f"WIP: Nexus experiment {experiment_id[:8]}"
             checkpoint_sha = self._git(
                 [
                     "commit-tree",
@@ -597,7 +626,7 @@ class GitHubWorkTrackingService:
                     "-p",
                     checkpoint_base,
                     "-m",
-                    f"WIP: Nexus experiment {experiment_id[:8]}",
+                    checkpoint_message,
                 ],
                 cwd=worktree_path,
             ).stdout.strip()
@@ -1071,6 +1100,15 @@ class GitHubWorkTrackingService:
             return already_merged
 
         payload: dict[str, Any] = {"merge_method": "squash"}
+        if ref.issue_number:
+            # Without an explicit title GitHub reuses a single commit's
+            # message, so main would only show the experiment id (#423).
+            payload["commit_title"] = _issue_commit_title(ref.issue_title, ref.issue_number)
+            payload["commit_message"] = "\n\n".join(
+                part
+                for part in (f"Closes #{ref.issue_number}", _experiment_trailer(ref.experiment_id))
+                if part
+            )
         if expected_head_sha:
             payload["sha"] = expected_head_sha
         result = self._request(
@@ -1083,12 +1121,19 @@ class GitHubWorkTrackingService:
         self._close_completed_issue(ref)
         return str(result.get("sha") or expected_head_sha or "")
 
+    def comment(self, number: int, body: str) -> None:
+        """Comment on an issue or pull request (#396: review results)."""
+        self._request("POST", f"/repos/{self.repository}/issues/{number}/comments", {"body": body[:60000]})
+
     def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
-        self._request(
-            "PATCH",
-            f"/repos/{self.repository}/issues/{ref.issue_number}",
-            {"state": "closed", "state_reason": "completed"},
-        )
+        path = f"/repos/{self.repository}/issues/{ref.issue_number}"
+        try:
+            self._request("PATCH", path, {"state": "closed", "state_reason": "completed"})
+        except GitHubWorkTrackingError:
+            # The merge's "Fixes #N" can close the issue first; GitHub then
+            # answers 422 "closed by another request". Closed is closed.
+            if str((self._request("GET", path) or {}).get("state")) != "closed":
+                raise
 
     def _remote_branch_sha(self, branch_name: str) -> str:
         quoted = urllib.parse.quote(branch_name, safe="")

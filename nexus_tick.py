@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.request
 from datetime import datetime, timezone
 
 from modules.logging_config import configure_logging
@@ -39,6 +40,35 @@ _PLANNER_STALL_SECONDS = 300
 
 # Things worth telling Claude about, collected during one tick (#365).
 _events: list[str] = []
+
+
+def _service_diagnostics() -> dict:
+    url = os.environ.get(
+        "NEXUS_DIAGNOSTICS_URL", "http://127.0.0.1:8000/diagnostics/public"
+    )
+    with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - fixed/operator URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _restart_stale_service() -> None:
+    from modules.task_finalization import TaskFinalizationCoordinator
+
+    TaskFinalizationCoordinator._restart_services(
+        TaskFinalizationCoordinator._restart_service_names()
+    )
+
+
+def _checkout_revision(repo_root: str) -> str:
+    """Read the revision of the checkout executing this initiative tick."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
@@ -181,7 +211,11 @@ def _build_service(args) -> NexusInitiativeService:
     from modules.task_orchestrator import NexusTaskOrchestrator
 
     experiment_service = ExperimentService(db_path=args.db_path)
-    adoption_service = ExperimentAdoptionService(experiment_service=experiment_service)
+    from modules.nexus_reviewer import default_reviewer
+
+    adoption_service = ExperimentAdoptionService(
+        experiment_service=experiment_service, reviewer=default_reviewer(args.db_path),
+    )
     controller = None
     if not args.integration_only:
         registry = OperationsRegistry(experiment_service=experiment_service)
@@ -201,6 +235,9 @@ def _build_service(args) -> NexusInitiativeService:
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
+        diagnostics_client=_service_diagnostics,
+        checkout_revision=lambda: _checkout_revision(args.repo_root),
+        restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
 
@@ -262,8 +299,17 @@ def _wait_for_experiments() -> None:
     from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
     from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
 
-    for thread in threading.enumerate():
-        if thread.name.startswith((EXPERIMENT_THREAD_PREFIX, ADOPTION_THREAD_PREFIX)):
+    # A thread can start the next one - a controller session that resumes
+    # after a rejected experiment starts a new one (#388) - so look again
+    # until none is left.
+    while True:
+        pending = [
+            thread for thread in threading.enumerate()
+            if thread.is_alive() and thread.name.startswith((EXPERIMENT_THREAD_PREFIX, ADOPTION_THREAD_PREFIX))
+        ]
+        if not pending:
+            return
+        for thread in pending:
             logger.info("waiting for %s to finish", thread.name)
             thread.join()
 
@@ -365,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             if busy:
                 logger.info("would do nothing: %s", busy)
                 return 0
-            candidates = service.candidates()
+            candidates = service.candidates(record_skips=False)
             if not candidates:
                 logger.info("would do nothing: no actionable work")
                 return 0

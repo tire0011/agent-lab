@@ -101,6 +101,7 @@ from .policy import (
     _SECRET_NOUN_ALT,
     _SECRET_VERB_ALT,
     _check_goal_policy,
+    _goal_secret_warning,
     _infra_action_match_is_false_positive,
     _is_code_or_test_file,
     _policy_rule_for_reason,

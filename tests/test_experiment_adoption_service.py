@@ -497,6 +497,29 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
             self.fx.adoption_service.start_adoption(experiment_id)
         self.assertEqual(self.fx.adoption_service.get(experiment_id).status, STATUS_NEEDS_REVIEW)
 
+    def test_retry_adopts_the_earlier_attempts_commits_too(self):
+        # #455: a retry builds on the earlier attempt's commit; adopting only
+        # the retry's own commit lost that work (the reverted #410).
+        experiment_id = "e7" * 16
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["app.py"],
+            mutate={"app.py": "VALUE = 'retry'\n"},
+        )
+        worktree = self.fx.worktrees / f"exp-{experiment_id[:8]}"
+        git(worktree, "stash")
+        (worktree / "first_attempt.py").write_text("FIRST = True\n", encoding="utf-8")
+        git(worktree, "add", "first_attempt.py")
+        git(worktree, "commit", "-m", "earlier attempt")
+        git(worktree, "stash", "pop")
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertIn("FIRST = True", git(self.fx.repo, "show", "origin/main:first_attempt.py").stdout)
+        self.assertIn("retry", git(self.fx.repo, "show", "origin/main:app.py").stdout)
+
     def test_cherry_pick_conflict_keeps_diagnostic_worktree_and_skips_push(self):
         experiment_id = "b1" * 16
         self.fx.create_experiment(
@@ -511,7 +534,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         self.fx.adoption_service.start_adoption(experiment_id)
         adoption = self.fx.wait_terminal(experiment_id)
         self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
-        self.assertIn("Cherry-Pick", adoption.reason)
+        self.assertIn("Integrationskonflikt: app.py", adoption.reason)
         self.assertTrue(Path(adoption.diagnostic_worktree_path).exists())
 
     def test_integration_test_failure_prevents_push(self):

@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -270,8 +271,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         return _call_api(_api().status)
 
     @mcp.tool(description="GET /problems", structured_output=True)
-    def problems() -> dict[str, Any]:
-        return _call_api(_api().problems)
+    def problems(limit: int = 20, since: str | None = None) -> dict[str, Any]:
+        parsed_since = datetime.fromisoformat(since.replace("Z", "+00:00")) if since else None
+        return _call_api(_api().problems, limit=limit, since=parsed_since)
 
     @mcp.tool(description="GET /ideas", structured_output=True)
     def ideas() -> dict[str, Any]:

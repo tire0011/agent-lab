@@ -85,7 +85,7 @@ def _submit(svc: MailboxTaskService, exp_id: str) -> str:
         ("/agent/inbox/x.md", "sha", "task", "tester", "done", "2026-01-01T00:00:00Z"),
     )
     svc._conn.commit()
-    approval = svc.create_approval(msg.lastrowid, "Some task", "alice", "/f.md", "2026-01-01T00:00:00Z")
+    approval = svc.create_task(msg.lastrowid, "Some task", "alice", "/f.md", "2026-01-01T00:00:00Z")
     svc._conn.execute(
         "UPDATE mailbox_task_approvals SET status=?, experiment_id=? WHERE id=?",
         ("submitted", exp_id, approval.id),
@@ -286,7 +286,7 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
                VALUES (?, ?, ?, ?, ?, ?)""",
             ("/tmp/task.md", "abc", "task", "tester", "done", "2026-09-05T00:00:00Z"),
         )
-        approval = svc.create_approval(
+        approval = svc.create_task(
             message.lastrowid, "Add --version", "tester", "/tmp/task.md", "2026-09-05T00:00:00Z",
         )
         with svc._conn:
@@ -433,7 +433,7 @@ class FinalizationResumedRecoveryIntegrationTests(unittest.TestCase):
                VALUES (?, ?, ?, ?, ?, ?)""",
             ("/tmp/task.md", "abc", "task", "tester", "done", "2026-09-11T00:00:00Z"),
         )
-        approval = svc_1.create_approval(
+        approval = svc_1.create_task(
             message.lastrowid, "Add --version", "tester", "/tmp/task.md", "2026-09-11T00:00:00Z",
         )
         with svc_1._conn:

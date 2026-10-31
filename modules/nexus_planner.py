@@ -47,20 +47,57 @@ _EXPLORE = (
 )
 
 
+def _merge_label(status: str, reason: str) -> str:
+    """How the adoption ended, in the planner's words (#439)."""
+    if not status:
+        return "none"
+    if status in ("adopted", "succeeded"):
+        return "merged"
+    if status == "failed" and reason.startswith("Review by"):
+        return "blocked by review"
+    return status
+
+
+def _history_line(r: dict[str, str]) -> str:
+    """One recent experiment; with its merge outcome when that is known."""
+    if "adoption_status" not in r:
+        detail = r.get("error") or ""
+        head = f"- {r.get('status', '')}"
+    else:
+        reason = r.get("adoption_reason") or ""
+        detail = reason or r.get("error") or ""
+        head = f"- {r.get('status', '')} / merge: {_merge_label(r['adoption_status'], reason)}"
+    return f"{head}: {r.get('title', '')}" + (f" ({detail})" if detail else "")
+
+
+def _exhausted_section(exhausted: list[dict[str, Any]] | None) -> str:
+    """Issues Nexus stopped trying (#457): visible, but not a valid answer."""
+    if not exhausted:
+        return ""
+    lines = [
+        f"#{i['number']} {i['title']}: {' '.join(str(i['last_reason']).split())[:_REASON_CHARS]}"
+        for i in exhausted
+    ]
+    return (
+        "\n\nISSUES OUT OF ATTEMPTS:\n\n"
+        "You cannot pick these. Each shows the last failure. If that failure points "
+        "at a fault in your own pipeline, your suggested new issue may fix the cause.\n\n"
+        + "\n".join(lines)
+    )
+
+
 def planning_prompt(
     issues: list[dict[str, Any]],
     recent: list[dict[str, str]] | None = None,
     *,
     explore: bool = False,
+    exhausted: list[dict[str, Any]] | None = None,
 ) -> str:
     lines = []
     for issue in issues:
         body = " ".join(str(issue.get("body") or "").split())[:_BODY_CHARS]
         lines.append(f"#{issue['number']} {issue['title']}\n{body}")
-    history = [
-        f"- {r.get('status', '')}: {r.get('title', '')}" + (f" ({r['error']})" if r.get("error") else "")
-        for r in recent or []
-    ]
+    history = [_history_line(r) for r in recent or []]
     return (
         "You are Nexus, an independent agent that develops itself. Your own code "
         "lives in this repository, and you pick and do your own work. Below are "
@@ -79,7 +116,7 @@ def planning_prompt(
         '{"issue": <number>, "reason": "<one sentence why this is next>", '
         '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
         "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
-        "OPEN ISSUES:\n\n" + "\n\n".join(lines)
+        "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
     )
 
 
@@ -137,16 +174,19 @@ class IssuePlanner:
         self._explore = explore
 
     def choose(
-        self, issues: list[dict[str, Any]], recent: list[dict[str, str]] | None = None
+        self,
+        issues: list[dict[str, Any]],
+        recent: list[dict[str, str]] | None = None,
+        exhausted: list[dict[str, Any]] | None = None,
     ) -> PlanChoice | None:
         if not issues:
             return None
         allowed = {int(issue["number"]) for issue in issues}
         choice = None
         if self._explore is not None:
-            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True), allowed)
+            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, exhausted=exhausted), allowed)
         if choice is None:
-            choice = self._ask(self._complete, planning_prompt(issues, recent), allowed)
+            choice = self._ask(self._complete, planning_prompt(issues, recent, exhausted=exhausted), allowed)
         return choice
 
     @staticmethod

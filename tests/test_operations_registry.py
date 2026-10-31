@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from modules.operations_registry import (
     OperationResult,
@@ -90,6 +90,17 @@ class OperationsRegistryTests(unittest.TestCase):
             meminfo_path=str(self.meminfo),
         )
         self.addCleanup(self.registry.close)
+
+    def test_problems_list_passes_limit(self):
+        with patch("data_sources.list_problems", return_value=[]) as mocked:
+            result = self.registry.execute("problems_list", {"limit": 1})
+
+        self.assertTrue(result.success)
+        mocked.assert_called_once_with(
+            limit=1,
+            since=None,
+            experiment_db_path=self.registry.db_path,
+        )
 
     def test_catalog_lists_available_operations(self):
         catalog = self.registry.catalog()

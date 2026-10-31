@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, patch
 
 from models import Idea
 from modules.github_work_tracking import GitHubWorkTrackingError
+from modules.experiment_handover import HANDOVER_HEADING
 from modules.nexus_controller_service import NexusControllerService
+from modules.nexus_task_store import NexusTaskStore
 from modules.task_orchestrator import ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, TaskDecision
 
 
@@ -21,7 +23,7 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.orchestrator.experiment_service.db_path = str(Path(self.tmp.name) / "agent.db")
         self.orchestrator.operations_registry = SimpleNamespace(repo_root=Path(self.tmp.name))
         self.orchestrator.task_store = MagicMock()
-        self.orchestrator.task_store.history.return_value = []
+        self.orchestrator.task_store.user_inputs.return_value = []
         self.github = MagicMock()
         self.github.ensure_for_source.return_value = SimpleNamespace(
             issue_number=42, branch_name="nexus/42-controller"
@@ -131,10 +133,9 @@ class NexusControllerServiceTests(unittest.TestCase):
             session_id="session-1",
         )
         self.orchestrator.experiment_service.create_experiment.return_value = experiment
-        self.orchestrator.task_store.history.return_value = [
-            {"role": "user", "kind": "input", "content": "Improve model routing"},
-            {"role": "assistant", "kind": "clarification", "content": "Cost or latency?"},
-            {"role": "user", "kind": "input", "content": "Optimize for cost"},
+        self.orchestrator.task_store.user_inputs.return_value = [
+            "Improve model routing",
+            "Optimize for cost",
         ]
 
         self.service.reply("session-1", "Optimize for cost")
@@ -142,6 +143,56 @@ class NexusControllerServiceTests(unittest.TestCase):
         goal = self.orchestrator.experiment_service.create_experiment.call_args[0][0]
         self.assertIn("Improve model routing", goal)
         self.assertIn("Optimize for cost", goal)
+
+    def test_execution_goal_uses_full_original_input_and_followup(self):
+        store = NexusTaskStore(str(Path(self.tmp.name) / "goals.db"))
+        self.addCleanup(store.close)
+        session = store.get_or_create(source_type="issue", source_id="406")
+        original = "x" * 5000 + "\nUNIQUE-END-MARKER"
+        followup = "y" * 3000 + "\nFOLLOWUP-END-MARKER"
+        store.append_event(session.id, role="user", kind="input", content=original)
+        store.append_event(session.id, role="user", kind="input", content=followup)
+        self.orchestrator.task_store = store
+
+        goal = self.service._execution_goal(session.id, "fallback")
+
+        self.assertEqual(goal, f"{original}\n\nUser follow-up:\n{followup}")
+
+    def test_continue_path_passes_full_issue_body_before_handover(self):
+        store = NexusTaskStore(str(Path(self.tmp.name) / "continue.db"))
+        self.addCleanup(store.close)
+        session = store.get_or_create(source_type="issue", source_id="406-continue")
+        issue_body = "b" * 4000 + "\nISSUE-END-MARKER"
+        store.append_event(session.id, role="user", kind="input", content=issue_body)
+        self.orchestrator.task_store = store
+        self.orchestrator.experiment_service.create_experiment.return_value = SimpleNamespace(
+            id="exp-continue"
+        )
+        decision = TaskDecision(
+            action=ACTION_NEW_EXPERIMENT,
+            session_id=session.id,
+            experiment_handover=f"{HANDOVER_HEADING}\n\nNexus goal:\nfinish it",
+        )
+
+        with patch.object(self.service, "_start_experiment_thread"):
+            self.service._continue_after_experiment([decision])
+
+        goal = self.orchestrator.experiment_service.create_experiment.call_args.args[0]
+        self.assertEqual(goal.split(HANDOVER_HEADING, 1)[0].strip(), issue_body)
+
+    def test_execution_goal_cap_is_recorded(self):
+        store = NexusTaskStore(str(Path(self.tmp.name) / "truncated.db"))
+        self.addCleanup(store.close)
+        session = store.get_or_create(source_type="issue", source_id="406-large")
+        store.append_event(session.id, role="user", kind="input", content="z" * 25000)
+        self.orchestrator.task_store = store
+
+        goal = self.service._execution_goal(session.id, "fallback")
+
+        self.assertEqual(len(goal), 24000)
+        records = store.recent_events(session.id, role="tool", kind="goal_truncated")
+        self.assertEqual(len(records), 1)
+        self.assertIn("25000", records[0]["content"])
 
     def test_reply_resumes_same_persistent_session(self):
         self.orchestrator.continue_session.return_value = TaskDecision(
