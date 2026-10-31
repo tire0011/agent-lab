@@ -81,13 +81,16 @@ class ApiTestsBase(unittest.TestCase):
 
         self._orig_runs_dir = data_sources.RUNS_DIR
         self._orig_ideas_path = data_sources.IDEAS_PATH
+        self._orig_experiment_db_path = data_sources.EXPERIMENT_DB_PATH
         data_sources.RUNS_DIR = self.runs_dir
         data_sources.IDEAS_PATH = self.ideas_path
+        data_sources.EXPERIMENT_DB_PATH = Path(self.temp_dir.name) / "agent.db"
         self.addCleanup(self._restore_paths)
 
     def _restore_paths(self) -> None:
         data_sources.RUNS_DIR = self._orig_runs_dir
         data_sources.IDEAS_PATH = self._orig_ideas_path
+        data_sources.EXPERIMENT_DB_PATH = self._orig_experiment_db_path
 
     def _write_run(self, name: str, response: str, timestamp: str = "2026-08-10T00:00:00+00:00") -> None:
         (self.runs_dir / name).write_text(
@@ -103,7 +106,12 @@ class HealthEndpointTests(ApiTestsBase):
     def test_health_returns_ok(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok", "version": VERSION})
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["version"], VERSION)
+        self.assertIn("git_revision", body)
+        self.assertIn("checkout_revision", body)
+        self.assertIn("stale", body)
 
 
 class MailboxGithubWebhookTests(ApiTestsBase):
@@ -237,7 +245,7 @@ class WebClientTests(ApiTestsBase):
     def test_public_experiment_detail_fetch_path_is_preserved(self):
         javascript = self.client.get("/static/tasks.js").text
         fetch_block = javascript.split("async function fetchExperimentSummary(experimentId)", 1)[1].split(
-            "async function renderTaskApprovals(tasks)", 1
+            "// States left by the removed approval step (#264)", 1
         )[0]
         self.assertIn(
             "const path = state.apiKey ? `/experiments/${experimentId}` : `/experiments/${experimentId}/public`;",
@@ -346,6 +354,20 @@ class WebClientTests(ApiTestsBase):
         mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
         self.assertIn(".logs-status { align-items: flex-start; flex-direction: column;", mobile_rules)
 
+    def test_idea_input_is_multiline_textarea(self):
+        """Issue #351: the idea field is a ~3-row textarea capped at 500
+        characters, full width on mobile, and still read by overview.js."""
+        html = self.client.get("/").text
+        self.assertRegex(html, r'<textarea id="idea-input"[^>]*\smaxlength="500"')
+        self.assertRegex(html, r'<textarea id="idea-input"[^>]*\srows="3"')
+        self.assertNotIn('<input id="idea-input"', html)
+        stylesheet = self.client.get("/static/styles.css").text
+        mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
+        self.assertIn(".idea-form textarea, .idea-form button { flex-basis: 100%; }", mobile_rules)
+        javascript = self.client.get("/static/overview.js").text
+        self.assertIn('ideaInput: document.querySelector("#idea-input")', javascript)
+        self.assertIn("elements.ideaInput.value.trim()", javascript)
+
 
 class MailboxTaskDetailEndpointTests(ApiTestsBase):
     def test_mailbox_task_detail_exposes_full_experiment_id(self):
@@ -401,6 +423,18 @@ class StatusEndpointTests(ApiTestsBase):
 
 
 class ProblemsEndpointTests(ApiTestsBase):
+    def test_problems_passes_limit_and_since(self):
+        with patch.object(api, "list_problems", return_value=[]) as mocked:
+            response = self.client.get(
+                "/problems?limit=1&since=2026-10-01T00:00:00Z"
+            )
+        self.assertEqual(response.status_code, 200)
+        mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.kwargs["limit"], 1)
+        self.assertEqual(
+            mocked.call_args.kwargs["since"].isoformat(), "2026-10-01T00:00:00+00:00"
+        )
+
     def test_problems_empty_when_no_runs(self):
         response = self.client.get("/problems")
         self.assertEqual(response.status_code, 200)
@@ -691,7 +725,9 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         self.assertEqual(catalog.json()["count"], 1)
         execute = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git_log", "args": {"limit": 5}})
         self.assertEqual(execute.status_code, 200)
-        self.operations_service.execute.assert_called_with("git_log", {"limit": 5})
+        self.operations_service.execute.assert_called_with(
+            "git_log", {"limit": 5}, invocation_id=None
+        )
         self.assertEqual(execute.json()["output_lines"], ["abc init"])
 
     def test_operations_execute_maps_validation_errors_to_400(self):

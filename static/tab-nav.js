@@ -16,7 +16,7 @@ function activateTab(name) {
   for (const panel of tabPanels) {
     panel.hidden = panel.id !== `tab-${name}`;
   }
-  if (name === "tasks") loadTaskApprovals();
+  if (name === "tasks") loadMailboxTasks();
   if (name === "mailbox") loadMailboxMessages();
   if (name === "operations") loadOperationsCatalog();
   if (name === "logs") {

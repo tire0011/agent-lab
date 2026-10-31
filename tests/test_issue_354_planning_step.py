@@ -9,7 +9,7 @@ import json
 import unittest
 
 from modules.nexus_initiative import KIND_ISSUE
-from modules.nexus_planner import IssuePlanner, parse_choice
+from modules.nexus_planner import IssuePlanner, parse_choice, planning_prompt
 from tests.test_nexus_initiative import InitiativeFixture
 
 ISSUES = [
@@ -33,8 +33,8 @@ class _Planner:
         self.prompts.append(prompt)
         return self._raw
 
-    def choose(self, issues):
-        return self._planner.choose(issues)
+    def choose(self, issues, recent=None, exhausted=None):
+        return self._planner.choose(issues, recent, exhausted)
 
 
 class PlanningStepTests(unittest.TestCase):
@@ -131,6 +131,32 @@ class PlanningStepTests(unittest.TestCase):
         self.addCleanup(svc.close)
         self.assertEqual(svc.tick().decision, "dispatched")
         self.assertEqual(self.fx.controller.issues, [351])
+
+
+class PromptTests(unittest.TestCase):
+    def test_the_planner_is_asked_for_its_own_idea_and_to_skip_web_ui_work(self):
+        # #363: the owner wants Nexus's own ideas; the web UI is no longer a priority.
+        prompt = planning_prompt(ISSUES[:2])
+        self.assertIn("suggest exactly ONE new issue", prompt)
+        self.assertNotIn("null or", prompt)
+        self.assertIn("do not pick web UI work", prompt)
+
+
+class OwnExperienceTests(unittest.TestCase):
+    def test_the_planner_speaks_as_nexus_and_sees_its_recent_experiments(self):
+        # The owner wants Nexus's own ideas, drawn from what went wrong for it.
+        fx = InitiativeFixture()
+        fx.add_experiment("e1", "timed_out")
+        with __import__("sqlite3").connect(fx.db_path) as conn:
+            conn.execute("UPDATE experiments SET goal=?, ended_at='2026-10-26T19:00:00+00:00' WHERE id='e1'",
+                         ("GitHub Issue #235: Self-restart fallback\nmore",))
+        planner = _Planner(_answer(351))
+        svc = fx.service(issue_lister=lambda: ISSUES[:2], planner=planner)
+        self.addCleanup(svc.close)
+        svc.tick()
+        prompt = planner.prompts[0]
+        self.assertIn("You are Nexus, an independent agent", prompt)
+        self.assertIn("- timed_out / merge: none: GitHub Issue #235: Self-restart fallback", prompt)
 
 
 class ParseChoiceTests(unittest.TestCase):

@@ -615,7 +615,7 @@ class FinalizingMailboxTaskServiceTests(unittest.TestCase):
                VALUES (?, ?, ?, ?, ?, ?)""",
             ("/tmp/task.md", "abc", "task", "tester", "done", "2026-09-05T00:00:00Z"),
         )
-        approval = service.create_approval(
+        approval = service.create_task(
             message.lastrowid,
             "Add --version and /health version",
             "tester",

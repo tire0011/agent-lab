@@ -99,6 +99,23 @@ class NexusTaskStoreEventIdTests(unittest.TestCase):
         contents_unbounded = [event["content"] for event in unbounded]
         self.assertIn("later observation", contents_unbounded)
 
+    def test_user_inputs_are_full_ordered_and_skip_collector_internal_rows(self):
+        session = self.store.get_or_create(source_type="task", source_id="t-inputs")
+        original = "x" * 5000 + "\nUNIQUE-END-MARKER"
+        self.store.append_event(session.id, role="user", kind="input", content=original)
+        self.store.append_event(
+            session.id,
+            role="user",
+            kind="input",
+            content="internal lookup",
+            metadata={"knowledge_collector_internal": True},
+        )
+        self.store.append_event(session.id, role="assistant", kind="answer", content="reply")
+        self.store.append_event(session.id, role="user", kind="input", content="clarification")
+
+        self.assertEqual(self.store.user_inputs(session.id), [original, "clarification"])
+        self.assertEqual(len(self.store.history(session.id)[0]["content"]), 1800)
+
 
 if __name__ == "__main__":
     unittest.main()

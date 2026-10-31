@@ -33,6 +33,7 @@ _TERMINAL = {STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED}
 ROLE_CONTROLLER = "controller"
 ROLE_FAILURE_ANALYSIS = "failure_analysis"
 ROLE_LOCAL_WORKER = "local_worker"
+ROLE_TOOL_ROUTER = "tool_router"
 
 # Error classification (#167). A job's failure reason is part of the shared
 # observability contract: callers should be able to tell a wedged worker from

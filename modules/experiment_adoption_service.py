@@ -44,6 +44,10 @@ STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
 
+# Adoptions run in threads of this process; a short-lived caller such as the
+# initiative tick must wait for them before it exits (#358).
+ADOPTION_THREAD_PREFIX = "adopt-"
+
 _TERMINAL_STATUSES = {STATUS_ADOPTED, STATUS_NEEDS_REVIEW, STATUS_FAILED, STATUS_INTERRUPTED}
 _ACTIVE_STATUSES = {STATUS_QUEUED, STATUS_ADOPTING}
 
@@ -265,8 +269,11 @@ class ExperimentAdoptionService:
         worktrees_root: str | None = None,
         lock_path: str = _DEFAULT_LOCK_PATH,
         github_work_tracking: GitHubWorkTrackingService | None = None,
+        reviewer: Any | None = None,
     ) -> None:
         self.experiment_service = experiment_service
+        # Reviews the change before the merge (#396); None merges unreviewed.
+        self.reviewer = reviewer
         self.db_path = db_path
         self.repo_root = Path(repo_root)
         self.worktrees_root = Path(worktrees_root or getattr(experiment_service, "worktrees_root", str(Path.home() / "agent-worktrees")))
@@ -449,7 +456,7 @@ class ExperimentAdoptionService:
             args=(adoption_id, experiment_id),
             kwargs={"resume": True},
             daemon=True,
-            name=f"adopt-resume-{experiment_id[:8]}",
+            name=f"{ADOPTION_THREAD_PREFIX}resume-{experiment_id[:8]}",
         )
         self._threads[experiment_id] = thread
         thread.start()
@@ -1112,7 +1119,7 @@ class ExperimentAdoptionService:
             target=self._run_thread,
             args=(adoption_id, experiment_id),
             daemon=True,
-            name=f"adopt-{experiment_id[:8]}",
+            name=f"{ADOPTION_THREAD_PREFIX}{experiment_id[:8]}",
         )
         self._threads[experiment_id] = thread
         thread.start()
@@ -1417,7 +1424,9 @@ class ExperimentAdoptionService:
             return "Änderungen unter communication/outbox/ werden nicht automatisch übernommen."
         if lower == ".env" or lower.endswith("/.env") or lower.endswith(".pem"):
             return "Sensible Konfigurationsdateien werden nicht automatisch übernommen."
-        if "secret" in lower or "credential" in lower:
+        # Test files may be named after what they test (fixtures such as
+        # "print_vault_secrets.md"); the reviewer reads their content.
+        if ("secret" in lower or "credential" in lower) and not lower.startswith("tests/"):
             return "Potentiell sensible Dateien werden nicht automatisch übernommen."
         return None
 
@@ -1964,6 +1973,19 @@ class ExperimentAdoptionService:
                     draft=False,
                 )
                 self.github_work_tracking.mark_pull_request_ready(work_ref)
+                blocked = self._review_blocks(experiment_id, experiment.goal, work_ref, integration_path, elog)
+                if blocked is not None:
+                    return self._finish_failure(
+                        experiment_id,
+                        reason=blocked,
+                        actual_files=actual_files,
+                        expected_files=expected_files,
+                        test_exit_code=test_exit_code,
+                        test_output=bounded_test_output,
+                        experiment_commit_sha=experiment_commit_sha,
+                        integrated_commit_sha=integrated_commit_sha,
+                        elog=elog,
+                    )
                 published_sha = self.github_work_tracking.merge_and_complete(
                     work_ref,
                     expected_head_sha=published_sha,
@@ -2049,6 +2071,36 @@ class ExperimentAdoptionService:
         except Exception:  # noqa: BLE001 - classification must never fail the review
             logger.warning("could not classify GitHub lifecycle readiness", exc_info=True)
             return None
+
+    def _review_blocks(self, experiment_id, goal, work_ref, integration_path, elog) -> str | None:
+        """Review the change before the merge (#396); the reason if it is blocked.
+
+        The review result goes on the pull request either way. A review that
+        cannot run does not block: tests and the quality gate already passed.
+        """
+        if self.reviewer is None:
+            return None
+        try:
+            result = self.reviewer.review(
+                experiment_id=experiment_id,
+                goal=str(goal or ""),
+                worktree_path=str(integration_path),
+                base_sha=self._integration_base_sha(),
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken review must not block
+            logger.warning("adoption review failed for %s: %s", experiment_id, exc)
+            return None
+        from modules.nexus_reviewer import review_comment
+
+        if elog is not None:
+            elog.info("adoption", "review_completed", f"{result.reviewer}: {result.verdict}")
+        try:
+            self.github_work_tracking.comment(work_ref.pr_number, review_comment(result))
+        except Exception as exc:  # noqa: BLE001 - the comment is informational
+            logger.warning("could not post the review on PR #%s: %s", work_ref.pr_number, exc)
+        if result.blocks:
+            return f"Review by {result.reviewer} blocked the merge: {result.summary}"
+        return None
 
     def _finish_failure(
         self,

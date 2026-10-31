@@ -52,6 +52,7 @@ from modules.experiment_service import (
     _build_reformat_retry_prompt,
     _build_research_prompt,
     _check_goal_policy,
+    _goal_secret_warning,
     _extract_diagnostic_log,
     extract_single_json_object,
     parse_plan,
@@ -428,6 +429,42 @@ class ExperimentServiceTestCase(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(status.stdout.strip(), "")
+
+    def test_github_experiment_creates_worktree_from_issue_branch(self):
+        issue_branch = "nexus/322-continue-existing-work"
+        (self.repo_root / "continued.py").write_text("first experiment\n")
+        subprocess.run(["git", "-C", str(self.repo_root), "add", "continued.py"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo_root), "commit", "-q", "-m", "first experiment"],
+            check=True,
+        )
+        issue_sha = subprocess.run(
+            ["git", "-C", str(self.repo_root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(self.repo_root), "reset", "--hard", "HEAD^"], check=True)
+
+        github = MagicMock()
+        github.experiment_base_sha.return_value = issue_sha
+        github.checkpoint_experiment.return_value = SimpleNamespace(
+            branch_name=issue_branch,
+            checkpoint_sha="checkpoint-sha",
+        )
+        github.wait_for_ci.return_value = SimpleNamespace(
+            status="unavailable", commit_sha="checkpoint-sha", conclusion=None,
+            run_id=None, url=None, reason="no matching workflow run",
+        )
+        experiment = self.service.create_experiment(goal="Continue the existing change.")
+
+        result = self.service.run_experiment(
+            experiment.id, github_work_tracking=github
+        )
+
+        self.assertTrue((Path(result.worktree_path) / "continued.py").is_file())
+        github.experiment_base_sha.assert_called_once_with(experiment.id)
+        github.checkpoint_experiment.assert_called_once_with(
+            experiment.id, result.worktree_path
+        )
 
     def test_implementation_uses_workspace_write_only_in_worktree(self):
         experiment = self.service.create_experiment(goal="g")
@@ -811,13 +848,15 @@ class ExperimentServiceTestCase(unittest.TestCase):
         result = self.service.run_experiment(experiment.id)
         self.assertNotEqual(result.status, STATUS_REJECTED)
 
-    def test_goal_reading_secret_from_env_is_rejected(self):
+    def test_goal_reading_secret_from_env_only_warns(self):
+        # Issues usually describe secret handling rather than ask for it; the
+        # goal check only warns and the reviewer checks the actual change.
         experiment = self.service.create_experiment(
             goal="Read the API key from the environment and use it in requests."
         )
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
+        self.assertNotEqual(result.status, STATUS_REJECTED)
+        self.implementation_worker.run.assert_called()
 
     @unittest.skip("plan-specific check removed")
     def test_plan_touching_too_many_files_is_rejected(self):
@@ -910,6 +949,39 @@ class ExperimentServiceTestCase(unittest.TestCase):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_TIMED_OUT)
+
+    def test_overloaded_provider_falls_back_to_the_other_agent(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write",
+            error="API Error: 529 Overloaded. This is a server-side issue",
+        )
+        fallback = MagicMock()
+        fallback.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="real failure",
+        )
+        with patch("modules.experiment_service.service.other_provider", return_value="codex"), patch(
+            "modules.experiment_service.service.build_worker", return_value=fallback
+        ) as build:
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+        build.assert_called_once()
+        self.assertEqual(build.call_args.args[0], "codex")
+        fallback.run.assert_called_once()
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("real failure", result.error)
+
+    def test_other_errors_do_not_fall_back(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="kaboom",
+        )
+        with patch("modules.experiment_service.service.build_worker") as build:
+            experiment = self.service.create_experiment(goal="g")
+            self.service.run_experiment(experiment.id)
+        build.assert_not_called()
 
     # ------------------------------------------------------------------
     # needs_review when a safe test command cannot be determined
@@ -2287,6 +2359,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
     def test_successful_github_ci_skips_local_test_suite(self):
         github = MagicMock()
+        github.experiment_base_sha.return_value = "HEAD"
         github.checkpoint_experiment.return_value = SimpleNamespace(
             branch_name="nexus/103-ci",
             checkpoint_sha="exact-checkpoint-sha",
@@ -2321,6 +2394,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
     def test_failed_github_ci_skips_local_test_suite_and_fails(self):
         github = MagicMock()
+        github.experiment_base_sha.return_value = "HEAD"
         github.checkpoint_experiment.return_value = SimpleNamespace(
             branch_name="nexus/103-ci",
             checkpoint_sha="failed-checkpoint-sha",
@@ -2346,6 +2420,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
     def test_unavailable_github_ci_runs_local_fallback(self):
         github = MagicMock()
+        github.experiment_base_sha.return_value = "HEAD"
         github.checkpoint_experiment.return_value = SimpleNamespace(
             branch_name="nexus/103-ci",
             checkpoint_sha="fallback-checkpoint-sha",
@@ -2481,7 +2556,9 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         entries = self._read_log(experiment.id)
         progress = [e for e in entries if e["event"] == "test_progress"]
         self.assertTrue(progress, "expected test heartbeat entries in the experiment log")
-        self.assertIn("current_test", progress[-1])
+        # A tick that lands after the test finished reports "<between tests>"
+        # without current_test, so only some entry must name the running test.
+        self.assertTrue(any("current_test" in e for e in progress), progress)
         self.assertIn("last_progress_age_seconds", progress[-1])
 
         # Per-test detail must NOT be duplicated into the global log.
@@ -2830,14 +2907,16 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
     def test_check_goal_policy_allows_infra_action(self):
         self.assertIsNone(_check_goal_policy('create a new Azure VM'))
     def test_check_goal_policy_blocks_secret_action(self):
-        self.assertIsNotNone(_check_goal_policy("read the api key from environment"))
+        self.assertIsNotNone(_goal_secret_warning("read the api key from environment"))
+        # A warning only: the goal itself is not rejected.
+        self.assertIsNone(_check_goal_policy("read the api key from environment"))
 
     def test_check_goal_policy_allows_benign_goal(self):
         self.assertIsNone(_check_goal_policy("add unit tests for the cost monitor"))
 
     def test_check_goal_policy_allows_negated_mention(self):
         # "no secrets" / "without logging tokens" must not block.
-        self.assertIsNone(_check_goal_policy("Ensure no secrets are logged in the output."))
+        self.assertIsNone(_goal_secret_warning("Ensure no secrets are logged in the output."))
 
     def test_secret_policy_allows_llm_token_metric_contexts(self):
         safe_goals = (
@@ -2849,7 +2928,7 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         )
         for goal in safe_goals:
             with self.subTest(goal=goal):
-                self.assertIsNone(_check_goal_policy(goal))
+                self.assertIsNone(_goal_secret_warning(goal))
 
     def test_secret_policy_still_blocks_credential_tokens(self):
         unsafe_goals = (
@@ -2861,7 +2940,7 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         )
         for goal in unsafe_goals:
             with self.subTest(goal=goal):
-                reason = _check_goal_policy(goal)
+                reason = _goal_secret_warning(goal)
                 self.assertIsNotNone(reason)
                 self.assertIn("secret/credential action", reason)
 
@@ -3008,7 +3087,7 @@ class GitWorkflowPolicyRegressionTest(unittest.TestCase):
         self.assertIsNone(_check_goal_policy("Run pip install requests."))
         self.assertIsNone(_check_goal_policy("Delete the production server."))
         # Credential access and explicitly destructive shell/database actions remain blocked.
-        self.assertIsNotNone(_check_goal_policy("Read the API key from the environment."))
+        self.assertIsNotNone(_goal_secret_warning("Read the API key from the environment."))
         self.assertIsNotNone(_check_goal_policy("Run rm -rf on generated files."))
 
 class AutonomousVmMaintenancePolicyRegressionTest(unittest.TestCase):
@@ -3044,6 +3123,6 @@ class AutonomousVmMaintenancePolicyRegressionTest(unittest.TestCase):
         self.assertIsNone(plan_violates_policy(plan, raw))
 
     def test_remaining_secret_and_destructive_checks_still_apply(self):
-        self.assertIsNotNone(_check_goal_policy("Read the API key from the environment."))
+        self.assertIsNotNone(_goal_secret_warning("Read the API key from the environment."))
         self.assertIsNotNone(_check_goal_policy("Run rm -rf on generated files."))
         self.assertIsNotNone(_check_goal_policy("Drop table users from the database."))

@@ -4,17 +4,23 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from modules.coding_provider import (
     build_random_worker,
+    build_worker,
+    is_provider_overload,
+    other_provider,
     provider_of,
     random_worker_factory,
 )
@@ -42,8 +48,11 @@ from .models import (
     Experiment,
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
+    ExperimentNotCancellableError,
+    STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
+    STATUS_INTERRUPTED,
     STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_REJECTED,
@@ -51,9 +60,10 @@ from .models import (
     STATUS_SUCCEEDED,
     STATUS_TIMED_OUT,
     STATUS_VERIFYING,
+    _TERMINAL_STATUSES,
     _row_to_experiment,
 )
-from .policy import _check_goal_policy, _policy_rule_for_reason
+from .policy import _check_goal_policy, _goal_secret_warning, _policy_rule_for_reason
 from .prompts import _build_direct_implementation_prompt, _build_repair_implementation_prompt
 from .text_utils import _truncate_text, _utcnow_iso
 
@@ -64,7 +74,7 @@ logger = logging.getLogger("modules.experiment_service")
 # as a small fixed set here so lifecycle logging in ``_transition``/
 # ``_force_status`` stays centralized and consistent.
 _WARNING_STATUSES = frozenset(
-    {"rejected", "failed", "timed_out", "needs_review"}
+    {"rejected", "failed", "timed_out", "needs_review", "cancelled", "interrupted"}
 )
 
 # Subset of the above that represents an actual failure (as opposed to a
@@ -87,6 +97,50 @@ _DEFAULT_MAX_REPAIR_ITERATIONS = 2
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
+
+# Worktree retention (#376). Every experiment keeps its worktree after it ends
+# so it can be inspected, retried or adopted - but a full checkout per run on a
+# 1 GB VM silently exhausts the disk. Terminal experiments whose ``ended_at``
+# is older than this many hours have their worktree directory removed; the
+# experiment row, its log and its branch are kept. ``0`` disables cleanup, and
+# so does anything unparsable or negative: a typo must not start deleting.
+WORKTREE_RETENTION_ENV_VAR = "NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS"
+DEFAULT_WORKTREE_RETENTION_HOURS = 7 * 24
+
+# Adoption statuses that still need the experiment's worktree, whatever its age.
+_ADOPTION_TERMINAL_STATUSES = ("adopted", "needs_review", "failed", "interrupted")
+
+
+def worktree_retention_hours(raw: str | None = None) -> float:
+    """Configured worktree retention in hours; ``0`` disables cleanup."""
+    value = raw if raw is not None else os.environ.get(WORKTREE_RETENTION_ENV_VAR)
+    if value is None or not str(value).strip():
+        return float(DEFAULT_WORKTREE_RETENTION_HOURS)
+    try:
+        hours = float(str(value).strip())
+    except ValueError:
+        logger.warning("ignoring invalid %s value; worktree cleanup disabled", WORKTREE_RETENTION_ENV_VAR)
+        return 0.0
+    return hours if hours > 0 and hours != float("inf") else 0.0
+
+
+def _parse_utc(timestamp: str | None) -> datetime | None:
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(timestamp))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@dataclass
+class WorktreeCleanupResult:
+    """What one worktree retention pass did, for logging and tests."""
+
+    retention_hours: float
+    removed: list[str] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
 
 # Progress-aware local verification (#209). The verification subprocess is no
 # longer bounded by a fixed wall-clock timeout, adaptive or not: a wall-clock
@@ -170,6 +224,8 @@ class ExperimentService:
         test_safety_cap_seconds: float | None = None,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
         rng: Any | None = None,
+        base_ref: str = "HEAD",
+        test_command: list[str] | None = None,
     ) -> None:
         """
         Parameters
@@ -239,6 +295,14 @@ class ExperimentService:
             All three are passed through as written when set explicitly, and
             clamped to safe floors when they come from the environment - see
             ``WatchdogConfig.resolve``.
+        base_ref:
+            Commit an experiment's worktree starts from, unless the GitHub
+            lifecycle supplies one. The benchmark (#343) pins this; everything
+            else keeps ``HEAD``.
+        test_command:
+            Verification argv template replacing the built-in suite run;
+            ``{python}`` becomes ``test_python_executable``. For trusted callers
+            only: it must never be built from plan or model output.
         """
         self.selection_worker = (
             selection_worker
@@ -262,6 +326,8 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
+        self.base_ref = base_ref
+        self.test_command = test_command
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
         # cleanliness is asserted directly, so the log directory must never
@@ -275,9 +341,65 @@ class ExperimentService:
         conn.row_factory = sqlite3.Row
         self._conn = conn
         self._lock = threading.Lock()
+        self._active_processes: dict[str, subprocess.Popen] = {}
+        self._process_lock = threading.Lock()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _track_process(self, experiment_id: str, process: subprocess.Popen | None) -> None:
+        with self._process_lock:
+            if process is None:
+                self._active_processes.pop(experiment_id, None)
+            else:
+                self._active_processes[experiment_id] = process
+        # Close the narrow race where cancellation commits after the caller
+        # starts a phase but before that phase publishes its Popen handle.
+        if process is not None and self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            self._terminate_process(process)
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            process.wait(timeout=2)
+
+    def cancel_experiment(self, experiment_id: str, cancelled_by: str) -> Experiment:
+        """Cancel an active implementation or verification and retain its worktree."""
+        experiment = self.resolve_experiment(experiment_id)
+        actor = (cancelled_by or "api").strip()[:200] or "api"
+        now = _utcnow_iso()
+        moved = False
+        for status in (STATUS_IMPLEMENTING, STATUS_VERIFYING):
+            if self._transition(
+                experiment.id, status, STATUS_CANCELLED,
+                ended_at=now, cancelled_at=now, cancelled_by=actor,
+                error=f"cancelled by {actor}",
+            ):
+                moved = True
+                break
+        if not moved:
+            current = self.get_experiment(experiment.id)
+            raise ExperimentNotCancellableError(
+                f"experiment {experiment.id!r} cannot be cancelled from status {current.status!r}"
+            )
+
+        with self._process_lock:
+            process = self._active_processes.get(experiment.id)
+        if process is not None:
+            self._terminate_process(process)
+        return self.get_experiment(experiment.id)
 
     # ------------------------------------------------------------------
     # verification test watchdog (#209)
@@ -579,6 +701,11 @@ class ExperimentService:
         values.append(experiment_id)
 
         with self._lock, self._conn:
+            current = self._conn.execute(
+                "SELECT status FROM experiments WHERE id = ?", (experiment_id,)
+            ).fetchone()
+            if current is not None and current[0] == STATUS_CANCELLED and status != STATUS_CANCELLED:
+                return
             self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} WHERE id = ?",
                 values,
@@ -615,11 +742,11 @@ class ExperimentService:
         )
 
     # ------------------------------------------------------------------
-    # mark_interrupted_experiments_failed — startup recovery (#281)
+    # mark_interrupted_experiments_failed — startup recovery (#281, #371)
     # ------------------------------------------------------------------
 
     def mark_interrupted_experiments_failed(self) -> list[str]:
-        """Mark experiments orphaned by a service restart as ``failed``.
+        """Reconcile experiments orphaned by a service restart.
 
         An experiment runs in a daemon thread of the ``agent-api`` process, so
         a restart kills it mid-flight and leaves its row in ``implementing`` or
@@ -632,7 +759,13 @@ class ExperimentService:
         ``MailboxTaskService.resume_finished_experiments``) and decide whether
         the task continues or ends.
 
-        Returns the list of experiment ids that were marked.
+        Implementation and verification runs become the distinct terminal
+        ``interrupted`` state. The legacy ``selecting`` phase still becomes
+        ``failed`` so old persisted rows retain their previous recovery
+        behaviour. Worktrees and their database references are deliberately
+        retained for inspection or retry.
+
+        Returns the list of experiment ids that were reconciled.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -642,11 +775,19 @@ class ExperimentService:
         marked: list[str] = []
         for row in rows:
             # Conditional per row: a status that moved on in between is left alone.
+            terminal_status = (
+                STATUS_FAILED if row["status"] == STATUS_SELECTING else STATUS_INTERRUPTED
+            )
             if self._transition(
-                row["id"], row["status"], STATUS_FAILED,
+                row["id"], row["status"], terminal_status,
                 ended_at=_utcnow_iso(),
                 error=_INTERRUPTED_BY_RESTART_ERROR,
             ):
+                # A newly constructed service has no live handles, but clearing
+                # the registry here also makes explicit/in-process startup
+                # reconciliation safe and prevents stale cancellation targets.
+                with self._process_lock:
+                    self._active_processes.pop(row["id"], None)
                 marked.append(row["id"])
         return marked
 
@@ -737,19 +878,28 @@ class ExperimentService:
                 policy_rule=_policy_rule_for_reason(rejection_reason),
             )
             return self.get_experiment(experiment_id)
+        secret_warning = _goal_secret_warning(experiment.goal)
+        if secret_warning is not None:
+            elog.warning(
+                "implementing", "goal_policy_warning",
+                f"Goal may describe a secret action; continuing, the reviewer checks the change: {secret_warning}",
+            )
 
         # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
+        base_ref = self.base_ref
+        if github_work_tracking is not None:
+            base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
         elog.debug(
             "implementation", "worktree_check",
-            f"Creating isolated git worktree at branch {branch_name}",
+            f"Creating isolated git worktree at branch {branch_name} from {base_ref}",
         )
         try:
             Path(self.worktrees_root).mkdir(parents=True, exist_ok=True)
             create_proc = _run_git(
-                ["worktree", "add", "-b", branch_name, worktree_path, "HEAD"],
+                ["worktree", "add", "-b", branch_name, worktree_path, base_ref],
                 cwd=self.repo_root,
                 timeout=60,
                 elog=elog,
@@ -819,7 +969,43 @@ class ExperimentService:
             stall_seconds=stall_seconds,
             experiment_logger=elog,
             phase="implementation",
+            on_process=lambda process: self._track_process(experiment_id, process),
         )
+
+        fallback = other_provider(implementation_provider) if implementation_provider else None
+        if (
+            implementation_result.error
+            and not implementation_result.timed_out
+            and is_provider_overload(implementation_result.error)
+            and fallback is not None
+            and self.get_experiment(experiment_id).status != STATUS_CANCELLED
+        ):
+            # The provider was overloaded, not the work wrong: let the other
+            # coding agent do it instead of failing the experiment.
+            elog.warning(
+                "implementation", "implementation_provider_fallback",
+                f"{implementation_provider} is overloaded; implementation runs on {fallback}",
+                provider=fallback,
+            )
+            worker = build_worker(fallback, db_path=self.db_path)
+            implementation_provider = fallback
+            self._force_status(
+                experiment_id, STATUS_IMPLEMENTING,
+                implementation_provider=implementation_provider,
+            )
+            implementation_result = worker.run(
+                task=implementation_prompt,
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=max_seconds,
+                stall_seconds=stall_seconds,
+                experiment_logger=elog,
+                phase="implementation",
+                on_process=lambda process: self._track_process(experiment_id, process),
+            )
+
+        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            return self.get_experiment(experiment_id)
 
         if implementation_result.timed_out:
             checkpoint_error = self._checkpoint_interrupted_work(
@@ -863,6 +1049,9 @@ class ExperimentService:
             implementation_usage_json=json.dumps(implementation_result.usage)
             if implementation_result.usage else None,
         )
+
+        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            return self.get_experiment(experiment_id)
 
         # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
@@ -957,7 +1146,10 @@ class ExperimentService:
                 stall_seconds=agent_watchdog_limits()[0],
                 experiment_logger=elog,
                 phase="implementation_repair",
+                on_process=lambda process: self._track_process(experiment_id, process),
             )
+            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+                return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:
                 self._force_status(
                     experiment_id,
@@ -1135,7 +1327,7 @@ class ExperimentService:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
-        test_command_template = _TEST_COMMANDS.get(test_command_key)
+        test_command_template = self.test_command or _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
             if test_command_template is not None
@@ -1198,7 +1390,10 @@ class ExperimentService:
                 # suite runs; the per-test entries stay in the dedicated test
                 # log rather than flooding this one.
                 on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
+                on_process=lambda process: self._track_process(experiment_id, process),
             )
+            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+                return self.get_experiment(experiment_id)
             test_exit_code = test_run.exit_code
             test_output = test_run.output
             test_timed_out = test_run.timed_out
@@ -1398,7 +1593,7 @@ class ExperimentService:
         return self.get_experiment(experiment_id)
 
     # ------------------------------------------------------------------
-    # Cleanup — explicit only, never automatic
+    # Cleanup — explicit removal of worktree and branch
     # ------------------------------------------------------------------
 
     def cleanup_worktree(self, experiment_id: str) -> None:
@@ -1421,3 +1616,120 @@ class ExperimentService:
         if experiment.branch_name:
             _run_git(["branch", "-D", experiment.branch_name], cwd=self.repo_root, elog=elog, phase="cleanup")
         elog.info("cleanup", "worktree_cleanup_done", "Experiment worktree and branch cleanup finished")
+
+    # ------------------------------------------------------------------
+    # Worktree retention (#376) — startup and periodic, terminal runs only
+    # ------------------------------------------------------------------
+
+    def cleanup_expired_worktrees(
+        self, retention_hours: float | None = None, *, now: datetime | None = None
+    ) -> WorktreeCleanupResult:
+        """Remove worktrees of terminal experiments that ended over ``retention_hours`` ago.
+
+        ``retention_hours`` defaults to ``NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS``
+        (see ``worktree_retention_hours``); ``0`` disables the pass. Only the
+        worktree directory goes: the experiment row (including its
+        ``worktree_path``), its JSONL log and its branch are kept, so the
+        record stays complete and committed work stays recoverable.
+
+        A worktree is never removed while its experiment is non-terminal, has
+        no ``ended_at``, ended within the retention window, or has an adoption
+        that has not finished, nor when its path lies outside
+        ``worktrees_root``. Already-missing directories are skipped silently,
+        so repeated passes are no-ops. A failure on one worktree is recorded
+        (activity log, experiment log) and does not stop the others.
+        """
+        hours = worktree_retention_hours() if retention_hours is None else max(0.0, float(retention_hours))
+        result = WorktreeCleanupResult(retention_hours=hours)
+        if hours <= 0:
+            return result
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=hours)
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ended_at, worktree_path FROM experiments "
+                f"WHERE status IN ({', '.join('?' * len(_TERMINAL_STATUSES))}) "
+                "AND worktree_path IS NOT NULL AND worktree_path != ''",
+                _TERMINAL_STATUSES,
+            ).fetchall()
+        for row in rows:
+            ended_at = _parse_utc(row["ended_at"])
+            if ended_at is None or ended_at > cutoff:
+                continue
+            path = Path(row["worktree_path"])
+            if not path.exists() and not path.is_symlink():
+                continue
+            try:
+                if self._remove_expired_worktree(row["id"], path, hours):
+                    result.removed.append(row["id"])
+            except Exception as exc:  # noqa: BLE001 - one bad worktree must not stop the pass
+                reason = sanitized_reason(f"{type(exc).__name__}: {exc}")
+                result.errors[row["id"]] = reason
+                self._record_worktree_cleanup_error(row["id"], str(path), reason)
+        return result
+
+    def _remove_expired_worktree(self, experiment_id: str, path: Path, hours: float) -> bool:
+        """Remove one expired worktree; ``False`` if it turned out to be still needed."""
+        terminal = ", ".join("?" * len(_TERMINAL_STATUSES))
+        finished = ", ".join("?" * len(_ADOPTION_TERMINAL_STATUSES))
+        with self._lock:
+            # Re-checked right before deleting: an adoption may have been
+            # queued since the candidates were listed.
+            still_expired = self._conn.execute(
+                f"SELECT 1 FROM experiments e WHERE e.id = ? AND e.status IN ({terminal}) "
+                "AND NOT EXISTS (SELECT 1 FROM experiment_adoptions a "
+                f"WHERE a.experiment_id = e.id AND a.status NOT IN ({finished}))",
+                (experiment_id, *_TERMINAL_STATUSES, *_ADOPTION_TERMINAL_STATUSES),
+            ).fetchone()
+        if still_expired is None:
+            return False
+
+        root = Path(self.worktrees_root).resolve()
+        if path.is_symlink() or root not in path.resolve().parents:
+            raise ValueError(f"refusing to remove {path}: not a directory inside {root}")
+
+        elog = self.get_experiment_logger(experiment_id)
+        try:
+            # Unregisters the worktree from the main repository; the rmtree
+            # below is what actually guarantees the directory is gone.
+            _run_git(
+                ["worktree", "remove", "--force", str(path)],
+                cwd=self.repo_root, elog=elog, phase="cleanup",
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("git worktree remove failed for %s: %s", path, exc)
+        if path.exists():
+            shutil.rmtree(path)
+
+        message = f"Removed worktree {path} after the {hours:g} h retention window"
+        with self._lock, self._conn:
+            insert_activity(
+                self._conn,
+                timestamp=_utcnow_iso(),
+                entity_type="experiment",
+                entity_id=experiment_id,
+                event="worktree_removed",
+                message=message,
+            )
+        logger.info("experiment %s: %s", experiment_id, message)
+        elog.info("cleanup", "worktree_retention_removed", message, worktree_path=str(path))
+        return True
+
+    def _record_worktree_cleanup_error(self, experiment_id: str, path: str, reason: str) -> None:
+        logger.warning("experiment %s: could not remove expired worktree %s: %s", experiment_id, path, reason)
+        try:
+            with self._lock, self._conn:
+                insert_activity(
+                    self._conn,
+                    timestamp=_utcnow_iso(),
+                    entity_type="experiment",
+                    entity_id=experiment_id,
+                    event="worktree_cleanup_failed",
+                    message=reason,
+                )
+            self.get_experiment_logger(experiment_id).error(
+                "cleanup", "worktree_retention_failed",
+                "Could not remove expired worktree", worktree_path=path, reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - recording is best effort
+            logger.warning("could not record worktree cleanup failure for %s: %s", experiment_id, exc)

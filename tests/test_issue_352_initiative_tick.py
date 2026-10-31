@@ -32,6 +32,6 @@ def test_production_tick_enables_issue_controller():
 
     exec_start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
     assert exec_start == (
-        "ExecStart=/agent/.venv/bin/python /agent/nexus_tick.py --daily-budget 5"
+        "ExecStart=/agent/.venv/bin/python /agent/nexus_tick.py --daily-budget 15"
     )
     assert "--integration-only" not in exec_start

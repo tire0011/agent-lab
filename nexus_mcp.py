@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -205,6 +206,19 @@ def _call_api(route, /, *args: Any, **kwargs: Any) -> Any:
         raise ValueError(f"{exc.status_code}: {detail}") from exc
 
 
+def _read_command(argv: list[str], *, as_json: bool = False) -> Any:
+    """Run a read-only command in the Nexus checkout (#384)."""
+    import json as _json
+
+    proc = subprocess.run(
+        argv, cwd=os.environ.get("AGENT_FS_ROOT", "/agent"),
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise ValueError(proc.stderr.strip()[:400] or f"{argv[0]} exited {proc.returncode}")
+    return _json.loads(proc.stdout or "[]") if as_json else proc.stdout
+
+
 def _validate_limit(limit: int, *, minimum: int, maximum: int) -> int:
     if limit < minimum or limit > maximum:
         raise ValueError(f"invalid limit: must be between {minimum} and {maximum}")
@@ -257,8 +271,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         return _call_api(_api().status)
 
     @mcp.tool(description="GET /problems", structured_output=True)
-    def problems() -> dict[str, Any]:
-        return _call_api(_api().problems)
+    def problems(limit: int = 20, since: str | None = None) -> dict[str, Any]:
+        parsed_since = datetime.fromisoformat(since.replace("Z", "+00:00")) if since else None
+        return _call_api(_api().problems, limit=limit, since=parsed_since)
 
     @mcp.tool(description="GET /ideas", structured_output=True)
     def ideas() -> dict[str, Any]:
@@ -473,6 +488,28 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             x_api_key=_internal_api_key(),
             service=nexus_api._resolve_maintenance_service(),
         )
+
+    @mcp.tool(
+        description=(
+            "GitHub issues of the Nexus repository: number, title, state, labels, body. "
+            "state is 'open', 'closed' or 'all'; limit 1-200."
+        ),
+        structured_output=True,
+    )
+    def github_issues(state: str = "open", limit: int = 50) -> dict[str, Any]:
+        if state not in ("open", "closed", "all"):
+            raise ValueError("invalid state: must be open, closed or all")
+        limit = _validate_limit(limit, minimum=1, maximum=200)
+        return {"issues": _read_command(
+            ["gh", "issue", "list", "--state", state, "--limit", str(limit),
+             "--json", "number,title,state,labels,body,closedAt"],
+            as_json=True,
+        )}
+
+    @mcp.tool(description="Recent commits of the Nexus repository (git log); limit 1-200.", structured_output=True)
+    def git_log(limit: int = 30) -> dict[str, Any]:
+        limit = _validate_limit(limit, minimum=1, maximum=200)
+        return {"log": _read_command(["git", "log", f"-{limit}", "--format=%h %ad %s", "--date=short"])}
 
     # ------------------------------------------------------------------
     # Write tools — only active when MCP_WRITE_ENABLED=true

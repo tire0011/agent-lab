@@ -251,6 +251,39 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(parent, worktree_head)
 
+    def test_existing_issue_branch_is_fetched_as_next_experiment_base_and_checkpoints(self):
+        repo, _, ref, _ = self._checkpoint_repo()
+        self.service.repo_root = str(repo)
+        (repo / "continued.py").write_text("first experiment\n", encoding="utf-8")
+        subprocess.run(["git", "add", "continued.py"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "first experiment"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        issue_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            text=True, capture_output=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "push", "origin", f"HEAD:refs/heads/{ref.branch_name}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        self.fake.refs[ref.branch_name] = issue_sha
+
+        base_sha = self.service.experiment_base_sha("checkpoint-exp")
+        self.assertEqual(base_sha, issue_sha)
+
+        (repo / "second.py").write_text("second experiment\n", encoding="utf-8")
+        published = self.service.checkpoint_experiment("checkpoint-exp", str(repo))
+
+        self.assertIsNotNone(published.checkpoint_sha)
+        remote_text = subprocess.run(
+            ["git", f"--git-dir={Path(self.tmp.name) / 'remote.git'}", "show",
+             f"{ref.branch_name}:continued.py"],
+            check=True, text=True, capture_output=True,
+        ).stdout
+        self.assertEqual(remote_text, "first experiment\n")
+
     def test_checkpoint_rejects_issue_branch_commit_missing_from_worktree(self):
         repo, _, ref, base_sha = self._checkpoint_repo()
         (repo / "committed.py").write_text("experiment progress\n", encoding="utf-8")
@@ -329,6 +362,30 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         stored = self.service.for_experiment("exp-merge")
         self.assertEqual(stored.pr_number, 100)
         self.assertEqual(stored.branch_name, "nexus/42-github-lifecycle")
+
+    def test_issue_closed_by_the_merge_itself_is_not_an_error(self):
+        source = SimpleNamespace(
+            source_type="issue",
+            source_id="42",
+            title="GitHub lifecycle",
+            content="GitHub Issue #42: GitHub lifecycle",
+        )
+        ref = self.service.bind_experiment(self.service.ensure_for_source(source), "exp-raced")
+        ref = self.service.ensure_pull_request(ref, title="Implement", body="Fixes #42")
+        fake = self.fake
+        original = fake.__call__
+
+        def racing(method, path, payload=None):
+            # "Fixes #42" closed the issue first; GitHub refuses the second close.
+            if method == "PATCH" and path.endswith("/issues/42") and (payload or {}).get("state") == "closed":
+                fake.issues[42]["state"] = "closed"
+                raise GitHubWorkTrackingError(
+                    'GitHub HTTP 422: {"message":"This issue was closed by another request."}'
+                )
+            return original(method, path, payload)
+
+        self.service._request = racing
+        self.assertEqual(self.service.merge_and_complete(ref, expected_head_sha="head-sha"), "merged-sha")
 
     def test_failed_verification_is_written_to_existing_draft_pr(self):
         source = SimpleNamespace(

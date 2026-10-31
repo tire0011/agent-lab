@@ -13,6 +13,9 @@ from typing import Any
 from modules.redaction import redact_secrets
 
 MAX_HANDOVER_CHARS = 12000
+HANDOVER_HEADING = "What Nexus already found (handover):"
+# Appended to an issue that is tried again (#374): how earlier attempts ended.
+EARLIER_ATTEMPTS_HEADING = "Earlier attempts at this issue (do not repeat their mistakes):"
 _MAX_SECTION_ITEM_CHARS = 1500
 _MAX_ATTEMPT_CHARS = 300
 
@@ -65,7 +68,7 @@ def experiment_handover(nexus_goal: Any, observations: list[dict[str, Any]]) -> 
         sections.append("Earlier attempts in this run:\n" + "\n".join(attempts))
     if not sections:
         return ""
-    handover = "What Nexus already found (handover):\n\n" + "\n\n".join(sections)
+    handover = HANDOVER_HEADING + "\n\n" + "\n\n".join(sections)
     return _clip(handover, MAX_HANDOVER_CHARS)
 
 

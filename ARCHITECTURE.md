@@ -125,7 +125,7 @@
 - Mailbox repository: the checkout configured by `AGENT_MAILBOX_REPO_PATH`
 - Inbox: root-level `inbox/` — Markdown files with YAML front matter
 - Outbox: root-level `outbox/` — response files written per processed message
-- Message types: `idea` (appended to IDEAS.md), `task` (body stored, `pending_approval` record created in `mailbox_task_approvals`), `question` (acknowledged), `context` (stored in `knowledge` table)
+- Message types: `idea` (appended to IDEAS.md), `task` (body stored, `queued` record created in `mailbox_task_approvals` and handed to Nexus), `question` (acknowledged), `context` (stored in `knowledge` table)
 - Safety: max 64 KB, no binary/symlinks/path-traversal, secret pattern detection, max 3 retries
 - Git integration: commits outbox + IDEAS.md (idea type only), pushes to tracked branch
 - Lock: `state/mailbox.lock` via `fcntl.flock` prevents concurrent runs on the Ubuntu deployment; the implementation includes a Windows fallback for portable local checks
@@ -191,14 +191,15 @@
   is computed, so a further restart replays the same cached reply instead
   of re-deriving or duplicating it.
 
-### 7) Mailbox task approval bridge
+### 7) Mailbox task bridge
 
 - Module: `modules/mailbox/task_service.py`
-- Table: `mailbox_task_approvals` in SQLite
-- State machine: `pending_approval → approved → submitted → running → succeeded / failed / needs_review`
-- Human operators approve/reject via authenticated API (`POST /mailbox/tasks/{id}/approve`) or Web UI
-- On approval, `ExperimentService.create_experiment` + `run_experiment` run in a daemon thread
-- `MailboxTaskWorker` daemon polls every 10 s (`submit_approved` + `poll_running`)
+- Table: `mailbox_task_approvals` in SQLite (name kept from the removed approval step, #264)
+- State machine: `queued → submitted → running → succeeded / failed / needs_review`
+- No approval step: a queued task is handed to the local Nexus controller, which chooses the action
+- For `new_experiment`, `ExperimentService.create_experiment` + `run_experiment` run in a daemon thread
+- `MailboxTaskWorker` daemon polls every 10 s (`submit_queued` + `poll_running`)
+- Legacy `pending_approval`/`rejected` rows stay readable and are never run; `approved` rows were migrated to `queued`
 - Terminal states write outbox files; `failed`/`needs_review` also write a problem JSON to `state/runs/`
 
 ### 8) Adoption restart recovery
@@ -253,7 +254,9 @@
   reported through `abandoned_work()` and otherwise ignored — see D-017.
 - Audit: `nexus_initiative_log` records every tick (decision, chosen source,
   reason, what else was considered, failure detail), readable via
-  `NexusInitiativeService.history()`.
+  `NexusInitiativeService.history()`. An open issue out of attempts is logged
+  as `skipped_attempts_exhausted` once per set of experiments, gets one GitHub
+  comment and is listed in the planning prompt, but stays unselectable.
 
 ### 10) Work heartbeats (explicit liveness)
 
@@ -391,6 +394,8 @@
   `modules/tool_loop_guard.py` (duplicate/non-progressing protection).
   Callers: `modules/task_orchestrator.py` (the persistent controller) and
   `modules/failure_analysis_service.py` (diagnosis, #172).
+  `modules/tool_router_mcp.py` exposes the same router to external MCP clients
+  over stdio, read-only (#118, `docs/issue-118-tool-router-mcp.md`).
 - `find_tool` resolves one plain-language capability request against the
   read-only catalog and returns that operation's schema; `call_tool` runs an
   operation only when a `find_tool` result in the same session already
@@ -503,7 +508,7 @@
 2. **Persistent storage**
    - Keep SQLite-backed structured run store and evolve reporting/migrations as needed.
 3. **Benchmark harness**
-   - Reproducible V0 vs V1 comparison pipeline.
+   - Reproducible V0 vs V1 comparison pipeline. For `new_experiment` this exists: see `benchmarks/README.md`.
 4. **Provider abstraction layer**
    - Decouple agent runtime from single provider/model.
 5. **Evaluation gate**
@@ -519,6 +524,6 @@
 ## Known gaps
 
 - No persistent relational metrics store yet.
-- No formal benchmark suite checked into repo yet.
+- The experiment benchmark (`benchmarks/`, #343) has no stored baseline yet.
 - No finalized policy/eval framework for autonomous self-modification yet.
 - External ChatGPT-to-endpoint integration is not yet dependable.

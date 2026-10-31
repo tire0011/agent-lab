@@ -91,7 +91,7 @@
             <div id="ideas-content" class="list-state" aria-live="polite">Wird geladen …</div>
             <form id="idea-form" class="idea-form">
               <label for="idea-input" class="sr-only">Neue Idee</label>
-              <input id="idea-input" type="text" maxlength="500" placeholder="Neue Idee …" required>
+              <textarea id="idea-input" rows="3" maxlength="500" placeholder="Neue Idee …" required></textarea>
               <button id="idea-submit" type="submit">Idee hinzufügen</button>
               <span id="idea-state" class="muted" aria-live="polite"></span>
             </form>
@@ -126,12 +126,12 @@
         <section class="card">
           <div class="card-heading">
             <h2>Mailbox-Aufträge</h2>
-            <span id="task-approvals-count" class="count">–</span>
+            <span id="mailbox-tasks-count" class="count">–</span>
           </div>
           <div class="row-actions">
             <button id="task-load-button" type="button" class="secondary">Aktualisieren</button>
           </div>
-          <div id="task-approvals-content" class="list-state" aria-live="polite">Wird geladen …</div>
+          <div id="mailbox-tasks-content" class="list-state" aria-live="polite">Wird geladen …</div>
         </section>
 
         <section class="card" id="task-detail-section" hidden>

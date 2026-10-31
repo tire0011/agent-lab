@@ -35,24 +35,88 @@ class PlanChoice:
     proposal_body: str = ""
 
 
-def planning_prompt(issues: list[dict[str, Any]]) -> str:
+_EXPLORE = (
+    "Before you decide, explore as much as you need. You are in your own "
+    "repository: read and search all of your code, tests and docs (Read, Glob, "
+    "Grep). The nexus MCP tools give you everything else, for example "
+    "github_issues (open and closed, full text), experiments_list, "
+    "experiment_get, experiment_logs, activity_list, problems and git_log. The "
+    "lists below are only a summary. Before you suggest a new issue, check the "
+    "code and the closed issues that it is not already done. If a read tool you "
+    "would need is missing, adding it is a good idea of your own.\n\n"
+)
+
+
+def _merge_label(status: str, reason: str) -> str:
+    """How the adoption ended, in the planner's words (#439)."""
+    if not status:
+        return "none"
+    if status in ("adopted", "succeeded"):
+        return "merged"
+    if status == "failed" and reason.startswith("Review by"):
+        return "blocked by review"
+    return status
+
+
+def _history_line(r: dict[str, str]) -> str:
+    """One recent experiment; with its merge outcome when that is known."""
+    if "adoption_status" not in r:
+        detail = r.get("error") or ""
+        head = f"- {r.get('status', '')}"
+    else:
+        reason = r.get("adoption_reason") or ""
+        detail = reason or r.get("error") or ""
+        head = f"- {r.get('status', '')} / merge: {_merge_label(r['adoption_status'], reason)}"
+    return f"{head}: {r.get('title', '')}" + (f" ({detail})" if detail else "")
+
+
+def _exhausted_section(exhausted: list[dict[str, Any]] | None) -> str:
+    """Issues Nexus stopped trying (#457): visible, but not a valid answer."""
+    if not exhausted:
+        return ""
+    lines = [
+        f"#{i['number']} {i['title']}: {' '.join(str(i['last_reason']).split())[:_REASON_CHARS]}"
+        for i in exhausted
+    ]
+    return (
+        "\n\nISSUES OUT OF ATTEMPTS:\n\n"
+        "You cannot pick these. Each shows the last failure. If that failure points "
+        "at a fault in your own pipeline, your suggested new issue may fix the cause.\n\n"
+        + "\n".join(lines)
+    )
+
+
+def planning_prompt(
+    issues: list[dict[str, Any]],
+    recent: list[dict[str, str]] | None = None,
+    *,
+    explore: bool = False,
+    exhausted: list[dict[str, Any]] | None = None,
+) -> str:
     lines = []
     for issue in issues:
         body = " ".join(str(issue.get("body") or "").split())[:_BODY_CHARS]
         lines.append(f"#{issue['number']} {issue['title']}\n{body}")
+    history = [_history_line(r) for r in recent or []]
     return (
-        "You plan the next piece of work for Nexus, a self-developing agent whose "
-        "code lives in this repository. Below are its open GitHub issues.\n\n"
-        "Pick the ONE issue that is the most useful to work on next. Prefer issues "
-        "that are concrete and small enough for one change with tests, and that "
-        "unblock or simplify later work. Skip issues that need a human decision, a "
-        "purchase, or setup outside the repository.\n\n"
-        "Optionally suggest ONE new issue, but only for a clearly missing, concrete "
-        "improvement that no listed issue covers.\n\n"
+        "You are Nexus, an independent agent that develops itself. Your own code "
+        "lives in this repository, and you pick and do your own work. Below are "
+        "your open GitHub issues and how your most recent experiments ended.\n\n"
+        + (_EXPLORE if explore else "") +
+        "Pick the ONE issue that is the most useful for you to work on next. Prefer "
+        "issues that are concrete and small enough for one change with tests, and "
+        "that unblock or simplify later work. Skip issues that need a human "
+        "decision, a purchase, or setup outside the repository. The web UI is not "
+        "a priority: do not pick web UI work.\n\n"
+        "Also suggest exactly ONE new issue of your own: a concrete, testable "
+        "improvement that no listed issue covers and that makes you work more "
+        "reliably or more autonomously. Base it on your own experience: what went "
+        "wrong or slowed you down in your recent experiments. No web UI work.\n\n"
         "Answer with exactly one JSON object and nothing else:\n"
         '{"issue": <number>, "reason": "<one sentence why this is next>", '
-        '"proposal": null or {"title": "...", "body": "what to change, where, how to test"}}\n\n'
-        "OPEN ISSUES:\n\n" + "\n\n".join(lines)
+        '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
+        "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
+        "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
     )
 
 
@@ -94,20 +158,45 @@ def parse_choice(raw: str, allowed: set[int]) -> PlanChoice | None:
 
 
 class IssuePlanner:
-    """Ask *complete* (prompt -> raw answer) which open issue comes next."""
+    """Ask a model which open issue comes next.
 
-    def __init__(self, complete: Callable[[str], str]) -> None:
+    *explore* (prompt -> raw answer) is an agent that can read the code and
+    use read-only tools (#384); *complete* is a single model call, used alone
+    or when exploring fails.
+    """
+
+    def __init__(
+        self,
+        complete: Callable[[str], str],
+        explore: Callable[[str], str] | None = None,
+    ) -> None:
         self._complete = complete
+        self._explore = explore
 
-    def choose(self, issues: list[dict[str, Any]]) -> PlanChoice | None:
+    def choose(
+        self,
+        issues: list[dict[str, Any]],
+        recent: list[dict[str, str]] | None = None,
+        exhausted: list[dict[str, Any]] | None = None,
+    ) -> PlanChoice | None:
         if not issues:
             return None
+        allowed = {int(issue["number"]) for issue in issues}
+        choice = None
+        if self._explore is not None:
+            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, exhausted=exhausted), allowed)
+        if choice is None:
+            choice = self._ask(self._complete, planning_prompt(issues, recent, exhausted=exhausted), allowed)
+        return choice
+
+    @staticmethod
+    def _ask(model: Callable[[str], str], prompt: str, allowed: set[int]) -> PlanChoice | None:
         try:
-            raw = self._complete(planning_prompt(issues))
+            raw = model(prompt)
         except Exception as exc:  # noqa: BLE001 - no plan is a valid outcome
             logger.warning("planner: model call failed: %s", exc)
             return None
-        choice = parse_choice(raw, {int(issue["number"]) for issue in issues})
+        choice = parse_choice(raw, allowed)
         if choice is None:
             logger.warning("planner: no usable choice in answer %r", (raw or "")[:300])
         return choice

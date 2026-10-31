@@ -21,6 +21,10 @@ from modules.task_orchestrator import (
     TaskDecision,
 )
 
+# Experiments run in threads of this process; a short-lived caller such as
+# the initiative tick must wait for them before it exits (#358).
+EXPERIMENT_THREAD_PREFIX = "nexus-controller-exp-"
+
 
 class NexusControllerService:
     """Feed heterogeneous work into one persistent local-LLM controller.
@@ -162,22 +166,29 @@ class NexusControllerService:
         history/memory but are not copied verbatim into an implementation goal.
         """
         try:
-            history = self.orchestrator.task_store.history(
-                session_id,
-                limit=50,
-                max_chars=20000,
-            )
+            stored_inputs = self.orchestrator.task_store.user_inputs(session_id)
         except Exception:
             return fallback
         user_inputs = [
-            str(event.get("content", "")).strip()
-            for event in history
-            if event.get("role") == "user" and event.get("kind") == "input"
+            str(content).strip()
+            for content in stored_inputs
         ]
         user_inputs = [item for item in user_inputs if item]
         if not user_inputs:
             return fallback
-        return "\n\nUser follow-up:\n".join(user_inputs)[:24000]
+        goal = "\n\nUser follow-up:\n".join(user_inputs)
+        if len(goal) <= 24000:
+            return goal
+        try:
+            self.orchestrator.task_store.append_event(
+                session_id,
+                role="tool",
+                kind="goal_truncated",
+                content=f"Execution goal truncated from {len(goal)} to 24000 characters.",
+            )
+        except Exception:
+            pass
+        return goal[:24000]
 
     def _execute(
         self,
@@ -300,5 +311,5 @@ class NexusControllerService:
         threading.Thread(
             target=run,
             daemon=True,
-            name=f"nexus-controller-exp-{experiment_id[:8]}",
+            name=f"{EXPERIMENT_THREAD_PREFIX}{experiment_id[:8]}",
         ).start()

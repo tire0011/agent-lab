@@ -119,6 +119,9 @@ class CodexWorker:
     db_path:
         Optional path to the SQLite run store for audit entries.
         Pass ``None`` to skip audit logging.
+    model:
+        Optional model override. When unset, the CLI's own configured model
+        is used.
     """
 
     #: Provider name recorded on every result this worker produces.
@@ -129,10 +132,12 @@ class CodexWorker:
         codex_bin: str = _DEFAULT_CODEX_BIN,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
         db_path: str | None = None,
+        model: str | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.max_output_bytes = max_output_bytes
         self._db_path = db_path
+        self.model = model
 
     # ------------------------------------------------------------------
     # Public API
@@ -149,6 +154,7 @@ class CodexWorker:
         experiment_logger: Any | None = None,
         phase: str = "codex",
         stall_seconds: float | None = None,
+        on_process: Any | None = None,
     ) -> CodexResult:
         """Execute *task* non-interactively via ``codex exec``.
 
@@ -242,7 +248,7 @@ class CodexWorker:
                     timeout_seconds=timeout_seconds,
                 )
 
-            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds)
+            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process)
         finally:
             if schema_path is not None:
                 try:
@@ -321,6 +327,8 @@ class CodexWorker:
             "--json",
             "-C", working_dir,
         ]
+        if self.model:
+            cmd += ["--model", self.model]
         if skip_git_repo_check:
             cmd.append("--skip-git-repo-check")
         # --approve-for-me is only compatible with workspace-write, and the
@@ -354,6 +362,7 @@ class CodexWorker:
         task: str,
         sandbox: str,
         stall_seconds: float | None = None,
+        on_process: Any | None = None,
     ) -> CodexResult:
         timed_out = False
         proc_error: str | None = None
@@ -367,6 +376,7 @@ class CodexWorker:
                 watched = run_watched(
                     cmd, cwd=working_dir, env=self._safe_env(),
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
+                    on_process=on_process,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:
