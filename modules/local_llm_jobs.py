@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -45,10 +46,20 @@ ERROR_KIND_INTERRUPTED = "interrupted"
 ERROR_KIND_STUCK = "stuck"
 ERROR_KIND_UNKNOWN = "unknown"
 
-# How long a `running` job may outlive the client watchdog before it is
-# treated as stuck. The watchdog is the HTTP read timeout the worker itself
-# uses, so anything still `running` well past it means the worker - not the
-# model - is wedged, and a waiter would otherwise block forever.
+# The watchdog: one hard deadline for a whole local model call (#236), so a
+# hung call fails in bounded time and its caller can move on - the controller
+# to the external-provider fallback. 900s sits above nearly all real VM jobs
+# (controller p50 ~2min, p95 ~9min, p99 ~15min). The bounds only catch
+# misconfiguration: the floor is below a typical call on purpose, so an
+# operator can still ask for a fast fallback.
+_WATCHDOG_ENV_VAR = "NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS"
+_DEFAULT_WATCHDOG_SECONDS = 900.0
+_MIN_WATCHDOG_SECONDS = 60.0
+_MAX_WATCHDOG_SECONDS = 7200.0
+# How long a `running` job may outlive the watchdog before it is treated as
+# stuck. The worker enforces the watchdog itself, so anything still `running`
+# well past it means the worker - not the model - is wedged, and a waiter
+# would otherwise block forever.
 _STUCK_GRACE_SECONDS = 120.0
 # Cheap opportunistic sweep: at most one stuck-job UPDATE per interval, no
 # extra thread. Waiters poll anyway, so this is where liveness is enforced.
@@ -81,6 +92,21 @@ _DIAG_TIMEOUT_SECONDS = 3
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def local_llm_watchdog_seconds() -> float:
+    """The configured deadline for one local model call, clamped to its bounds."""
+    raw = os.environ.get(_WATCHDOG_ENV_VAR, "").strip()
+    if not raw:
+        return _DEFAULT_WATCHDOG_SECONDS
+    try:
+        watchdog = float(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "%s=%r is not a number; using %.0fs", _WATCHDOG_ENV_VAR, raw, _DEFAULT_WATCHDOG_SECONDS
+        )
+        return _DEFAULT_WATCHDOG_SECONDS
+    return max(_MIN_WATCHDOG_SECONDS, min(watchdog, _MAX_WATCHDOG_SECONDS))
 
 
 class LocalLlmJobError(RuntimeError):
@@ -235,8 +261,7 @@ class LocalLlmJobService:
         idle_poll_interval: float | None = None,
     ) -> None:
         self.db_path = db_path
-        watchdog = float(os.environ.get("NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS", "3600"))
-        watchdog = max(300.0, min(watchdog, 7200.0))
+        watchdog = local_llm_watchdog_seconds()
         self.watchdog_seconds = watchdog
         self.llama = llama_client or LlamaCppClient(timeout=watchdog)
         self.poll_interval = max(0.05, poll_interval)
@@ -752,6 +777,20 @@ class LocalLlmJobService:
             separators=(",", ":"),
         )
 
+    async def _within_watchdog(self, completion: Coroutine[Any, Any, str]) -> str:
+        """Await one model call, abandoning it at the watchdog deadline (#236).
+
+        The HTTP client's timeout alone cannot promise this: it limits each
+        read, so a server that keeps trickling bytes would never trip it. On
+        expiry the request is cancelled, which closes its connection.
+        """
+        try:
+            return await asyncio.wait_for(completion, timeout=self.watchdog_seconds)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"local model call exceeded the {self.watchdog_seconds:.0f}s watchdog"
+            ) from exc
+
     def _run(self, job_id: str) -> None:
         """Execute a job this worker has already claimed.
 
@@ -798,14 +837,18 @@ class LocalLlmJobService:
             if row["system"]:
                 completion_options["system"] = str(row["system"])
             if row["top_logprobs"]:
-                result = asyncio.run(self._logprob_completion(row, max_tokens))
+                result = asyncio.run(
+                    self._within_watchdog(self._logprob_completion(row, max_tokens))
+                )
             else:
                 result = asyncio.run(
-                    self.llama.complete(
-                        prompt=str(row["prompt"]),
-                        temperature=float(row["temperature"]),
-                        max_tokens=max_tokens,
-                        **completion_options,
+                    self._within_watchdog(
+                        self.llama.complete(
+                            prompt=str(row["prompt"]),
+                            temperature=float(row["temperature"]),
+                            max_tokens=max_tokens,
+                            **completion_options,
+                        )
                     )
                 )
         except Exception as exc:  # noqa: BLE001

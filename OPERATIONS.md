@@ -513,6 +513,18 @@ result with a reason, not as an operation fault. The failure-analysis routine re
 the same backend, so a diagnosis and an operator looking at the same task see
 the same facts.
 
+### Local LLM call timeout (#236)
+
+`NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS` limits one local model call, for every
+role. Default 900 (15 minutes), clamped to 60-7200; an invalid value logs a
+warning and uses the default. VM jobs up to 2026-10-31: controller p50 ~2 min,
+p95 ~9 min, p99 ~15 min, so about 1% of controller calls exceed the default.
+
+A controller call that reaches it logs `controller_local_inference_failed` with
+`error_kind=timeout`, and the job row keeps that `error_kind`. The turn then goes
+to the external-provider fallback. Time queued behind another job is not part
+of the limit: each job in the queue has its own.
+
 ### Inspecting one local LLM job (#259)
 
 `nexus debug llm-job <job-id> [--result|--prompt]` reads one `local_llm_jobs`

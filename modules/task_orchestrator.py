@@ -27,6 +27,7 @@ from modules.local_llm_jobs import (
     LocalLlmJobError,
     LocalLlmJobService,
     acquire_local_llm_job_service,
+    local_llm_watchdog_seconds,
     release_local_llm_job_service,
 )
 from modules.escalation_probes import (
@@ -415,9 +416,7 @@ class NexusTaskOrchestrator:
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
-        job_watchdog = float(os.environ.get("NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS", "3600"))
-        job_watchdog = max(300.0, min(job_watchdog, 7200.0))
-        self.llama = llama_client or LlamaCppClient(timeout=job_watchdog)
+        self.llama = llama_client or LlamaCppClient(timeout=local_llm_watchdog_seconds())
         self.max_steps = max(1, min(max_steps, 10))
         db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
         self.loop_guard = PersistentToolLoopGuard(
@@ -1654,9 +1653,12 @@ class NexusTaskOrchestrator:
         except LocalLlmJobError as exc:
             failure = str(exc)[:1000]
             logger.error(
-                "%s_local_inference_failed session_id=%s error=%s; attempting external fallback",
+                "%s_local_inference_failed session_id=%s error_kind=%s job_id=%s error=%s; "
+                "attempting external fallback",
                 role,
                 session_id,
+                exc.kind,
+                job_id,
                 failure,
             )
             if task_logger is not None:
@@ -1665,6 +1667,8 @@ class NexusTaskOrchestrator:
                     f"{role}_local_inference_failed",
                     failure,
                     session_id=session_id,
+                    error_kind=exc.kind,
+                    job_id=job_id,
                 )
             if budget_plan is None:
                 raise TaskOrchestratorError(f"local LLM job failed: {failure}") from exc
@@ -3313,9 +3317,8 @@ Decide the next step now. Return JSON only.
             action=ACTION_MISSING_CAPABILITY,
             reason=reason,
             message=(
-                "Nexus could not take this controller turn: local inference "
-                "failed and no external provider is available. This needs "
-                "human review before retrying."
+                f"Nexus could not take this controller turn: {reason}. "
+                "This needs human review before retrying."
             ),
             observations=observations,
             session_id=session_id,
