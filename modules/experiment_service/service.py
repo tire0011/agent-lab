@@ -49,6 +49,7 @@ from .models import (
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
     ExperimentNotCancellableError,
+    PIPELINE_CRASH_ERROR_PREFIX,
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
@@ -853,7 +854,7 @@ class ExperimentService:
                 experiment_id,
                 STATUS_FAILED,
                 ended_at=_utcnow_iso(),
-                error=f"unhandled exception in experiment pipeline: {exc}",
+                error=f"{PIPELINE_CRASH_ERROR_PREFIX}{exc}",
             )
             return self.get_experiment(experiment_id)
 

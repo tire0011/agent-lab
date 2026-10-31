@@ -257,6 +257,9 @@
   `NexusInitiativeService.history()`. An open issue out of attempts is logged
   as `skipped_attempts_exhausted` once per set of experiments, gets one GitHub
   comment and is listed in the planning prompt, but stays unselectable.
+  A pipeline crash is not an attempt (#467): after two crashes the issue is
+  reported the same way, but returns once the local `origin/main` ref has a
+  commit newer than the last crash. Crashes stay in the daily budget.
 
 ### 10) Work heartbeats (explicit liveness)
 
