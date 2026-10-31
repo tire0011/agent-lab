@@ -74,6 +74,24 @@ API at startup and every `nexus_tick` run remove those that are no longer needed
   `worktree_removed` activity event, and each failure as
   `worktree_cleanup_failed`. A failure never blocks startup or a tick.
 
+Optional, for the experiment stall sweep (issue #400). The API every 5 minutes,
+and every `nexus_tick` run (at the start and every 5 minutes while it waits for
+its experiment), fail active experiments (`queued`, `selecting`,
+`implementing`, `verifying`) whose newest experiment log entry or activity
+event is older than the phase's hard limit (the coding agent cap,
+`NEXUS_AGENT_MAX_SECONDS`, default and upper bound 3 h, a shorter value applies;
+for `verifying` the larger of that and `NEXUS_TEST_SAFETY_CAP_SECONDS`) plus a
+grace. The worker's process group, if
+still recorded and alive, is stopped; the experiment becomes `failed` with the
+error `stalled: no progress for <N>s in phase <phase>` and its log gets a
+`stalled_detected` entry naming the last event seen. A live coding agent logs
+`coding_agent_progress` every 10 minutes, so a healthy run never reaches the
+limit. A stalled experiment counts as a failed attempt for issue retries (#374).
+
+- `NEXUS_EXPERIMENT_STALL_GRACE_SECONDS` (default 900, i.e. 15 minutes) - the
+  grace on top of the phase limit. An unparsable or negative value falls back
+  to the default.
+
 Optional, for the local verification test watchdog (issue #209). Local
 verification is bounded by *progress*, not by a fixed wall-clock timeout: the
 run continues for as long as tests keep starting and finishing.

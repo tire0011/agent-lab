@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -24,7 +25,12 @@ from modules.coding_provider import (
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
-from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
+from modules.central_logging import (
+    DEFAULT_LOG_DIR,
+    ExperimentLogger,
+    _tail_read_lines,
+    sanitize_command,
+)
 from modules.redaction import sanitized_reason
 from modules.run_store import (
     DEFAULT_DB_PATH,
@@ -106,6 +112,42 @@ DEFAULT_WORKTREE_RETENTION_HOURS = 7 * 24
 
 # Adoption statuses that still need the experiment's worktree, whatever its age.
 _ADOPTION_TERMINAL_STATUSES = ("adopted", "needs_review", "failed", "interrupted")
+
+# Stall sweep (#400). Experiment deac59fb logged ``codex_call_start`` and then
+# nothing for 11 hours; neither the absolute cap nor the progress watchdog left
+# a trace, and only a service restart ended it. The sweep runs periodically and
+# fails an active experiment whose newest log or activity event is older than
+# its phase's hard limit plus this grace. A live worker logs
+# ``coding_agent_progress`` every 10 minutes, so a healthy run never gets near
+# the limit.
+STALL_GRACE_ENV_VAR = "NEXUS_EXPERIMENT_STALL_GRACE_SECONDS"
+DEFAULT_STALL_GRACE_SECONDS = 15 * 60
+_STALLED_ERROR_PREFIX = "stalled: "
+_STALL_SWEEP_STATUSES = (STATUS_QUEUED, STATUS_SELECTING, STATUS_IMPLEMENTING, STATUS_VERIFYING)
+# Time a stalled worker's process group gets after SIGTERM before SIGKILL.
+_STALL_TERMINATE_GRACE_SECONDS = 5.0
+# Only the end of an experiment log is read to find its newest entry.
+_STALL_LOG_TAIL_BYTES = 64 * 1024
+
+
+def stall_grace_seconds(raw: str | None = None) -> float:
+    """Configured stall grace in seconds; a typo falls back to the default."""
+    value = raw if raw is not None else os.environ.get(STALL_GRACE_ENV_VAR)
+    if value is None or not str(value).strip():
+        return float(DEFAULT_STALL_GRACE_SECONDS)
+    try:
+        seconds = float(str(value).strip())
+    except ValueError:
+        logger.warning("ignoring invalid %s value; using the default", STALL_GRACE_ENV_VAR)
+        return float(DEFAULT_STALL_GRACE_SECONDS)
+    if seconds < 0 or seconds != seconds or seconds == float("inf"):
+        return float(DEFAULT_STALL_GRACE_SECONDS)
+    return seconds
+
+
+def _is_stalled(status: str | None, error: str | None) -> bool:
+    """Whether the stall sweep ended this experiment (#400)."""
+    return status == STATUS_FAILED and str(error or "").startswith(_STALLED_ERROR_PREFIX)
 
 
 def worktree_retention_hours(raw: str | None = None) -> float:
@@ -338,10 +380,27 @@ class ExperimentService:
                 self._active_processes.pop(experiment_id, None)
             else:
                 self._active_processes[experiment_id] = process
-        # Close the narrow race where cancellation commits after the caller
-        # starts a phase but before that phase publishes its Popen handle.
-        if process is not None and self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+        # Workers run in their own process group (start_new_session). The id is
+        # persisted so a stall sweep in another process can stop it (#400).
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE experiments SET worker_pgid = ? WHERE id = ?",
+                (process.pid if process is not None else None, experiment_id),
+            )
+        # Close the narrow race where cancellation (or the stall sweep)
+        # commits after the caller starts a phase but before that phase
+        # publishes its Popen handle.
+        if process is not None and self._ended_from_outside(experiment_id):
             self._terminate_process(process)
+
+    def _ended_from_outside(self, experiment_id: str) -> bool:
+        """Cancelled by an operator or failed by the stall sweep while running.
+
+        The pipeline thread checks this after every blocking step and stops
+        instead of overwriting the outcome.
+        """
+        experiment = self.get_experiment(experiment_id)
+        return experiment.status == STATUS_CANCELLED or _is_stalled(experiment.status, experiment.error)
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen) -> None:
@@ -687,9 +746,13 @@ class ExperimentService:
 
         with self._lock, self._conn:
             current = self._conn.execute(
-                "SELECT status FROM experiments WHERE id = ?", (experiment_id,)
+                "SELECT status, error FROM experiments WHERE id = ?", (experiment_id,)
             ).fetchone()
             if current is not None and current[0] == STATUS_CANCELLED and status != STATUS_CANCELLED:
+                return
+            # The pipeline thread of a stalled experiment may still wake up
+            # once its worker is stopped; the stall verdict stands (#400).
+            if current is not None and _is_stalled(current[0], current[1]):
                 return
             self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} WHERE id = ?",
@@ -777,6 +840,174 @@ class ExperimentService:
         return marked
 
     # ------------------------------------------------------------------
+    # sweep_stalled_experiments — periodic stall detection (#400)
+    # ------------------------------------------------------------------
+
+    def _phase_hard_limit_seconds(self, status: str) -> float:
+        """Longest a phase may legitimately go without a single log entry.
+
+        Verification runs the test suite under its own safety cap and may then
+        start a repair agent, so it gets the larger of both.
+        """
+        # The implementation timeout is the phase's upper bound, not a floor.
+        # A deliberately shorter coding-agent cap must make a silent phase
+        # eligible for sweeping sooner, while an absent or oversized setting
+        # retains the three-hour implementation maximum.
+        agent_cap = min(agent_watchdog_limits()[1], float(_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS))
+        if status == STATUS_VERIFYING:
+            return max(agent_cap, float(self._get_test_watchdog_config().safety_cap_seconds))
+        return agent_cap
+
+    def _newest_log_entry(self, experiment_id: str) -> tuple[datetime | None, str]:
+        """Timestamp and event of the newest entry in the experiment's JSONL log."""
+        newest: datetime | None = None
+        event = ""
+        # A rotation leaves the active file briefly empty; the previous one
+        # then holds the newest entry.
+        for name in (f"{experiment_id}.jsonl", f"{experiment_id}-1.jsonl"):
+            path = Path(self.experiment_log_dir) / name
+            try:
+                lines = _tail_read_lines(path, _STALL_LOG_TAIL_BYTES)
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                stamp = _parse_utc(entry.get("timestamp"))
+                if stamp is not None and (newest is None or stamp >= newest):
+                    newest, event = stamp, str(entry.get("event") or "")
+            if newest is not None:
+                break
+        return newest, event
+
+    def _last_progress(self, experiment_id: str, row: sqlite3.Row) -> tuple[datetime | None, str]:
+        """Newest sign of life: log entry, activity event or lifecycle stamp."""
+        seen: list[tuple[datetime, str]] = []
+        log_at, log_event = self._newest_log_entry(experiment_id)
+        if log_at is not None:
+            seen.append((log_at, log_event or "log_entry"))
+        with self._lock:
+            activity = self._conn.execute(
+                "SELECT timestamp, event FROM activity_log "
+                "WHERE entity_type = 'experiment' AND entity_id = ? ORDER BY id DESC LIMIT 1",
+                (experiment_id,),
+            ).fetchone()
+        if activity is not None:
+            stamp = _parse_utc(activity[0])
+            if stamp is not None:
+                seen.append((stamp, f"activity:{activity[1]}"))
+        for column in ("created_at", "implementation_started_at", "implementation_ended_at"):
+            stamp = _parse_utc(row[column])
+            if stamp is not None:
+                seen.append((stamp, column))
+        if not seen:
+            return None, ""
+        return max(seen, key=lambda item: item[0])
+
+    def _stop_stalled_worker(self, experiment_id: str, pgid: int | None) -> str:
+        """Stop the worker's process group; returns what happened, never raises."""
+        with self._process_lock:
+            process = self._active_processes.pop(experiment_id, None)
+        if process is not None:
+            try:
+                self._terminate_process(process)
+            except (OSError, subprocess.SubprocessError) as exc:
+                return f"terminate failed: {type(exc).__name__}"
+            return "terminated"
+        if not pgid:
+            return "no worker recorded"
+        pgid = int(pgid)
+        # Never signal this process's own group, init or anything below it.
+        if pgid <= 1 or pgid == os.getpgrp():
+            return "refused to signal own process group"
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return "worker no longer running"
+        except PermissionError:
+            return "not permitted to signal worker"
+        deadline = time.monotonic() + _STALL_TERMINATE_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return "terminated"
+            time.sleep(0.1)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        return "terminated"
+
+    def sweep_stalled_experiments(self, now: datetime | None = None) -> list[str]:
+        """Fail active experiments that logged nothing past their phase limit.
+
+        Startup reconciliation (#371) only helps when the process restarts; a
+        worker that hangs silently in a live process kept its experiment
+        ``implementing`` for 11 hours (#400), blocking the issue, the daily
+        budget and the retry logic. An experiment whose newest experiment log
+        entry or activity event is older than the phase's hard limit plus the
+        grace (``NEXUS_EXPERIMENT_STALL_GRACE_SECONDS``) is moved to
+        ``failed`` with a ``stalled:`` error, and its worker's process group,
+        if still alive, is stopped. Anything that logged within the limit is
+        never touched. Idempotent: a swept experiment is terminal.
+
+        Returns the ids of the experiments marked stalled.
+        """
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        grace = stall_grace_seconds()
+        placeholders = ", ".join("?" * len(_STALL_SWEEP_STATUSES))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM experiments WHERE status IN ({placeholders})",
+                _STALL_SWEEP_STATUSES,
+            ).fetchall()
+        stalled: list[str] = []
+        for row in rows:
+            experiment_id, phase = row["id"], row["status"]
+            limit = self._phase_hard_limit_seconds(phase)
+            last_at, last_event = self._last_progress(experiment_id, row)
+            if last_at is None:
+                continue  # nothing to judge by; never guess
+            silent = (now - last_at).total_seconds()
+            if silent <= limit + grace:
+                continue
+            error = f"{_STALLED_ERROR_PREFIX}no progress for {int(silent)}s in phase {phase}"
+            # Claim the row first, conditionally: an experiment that moved on
+            # in between is left alone, and once it is failed the pipeline
+            # thread woken by the stopped worker cannot overwrite the verdict.
+            if not self._transition(
+                experiment_id, phase, STATUS_FAILED,
+                ended_at=now.isoformat(), error=error, worker_pgid=None,
+            ):
+                continue
+            worker = self._stop_stalled_worker(experiment_id, row["worker_pgid"])
+            self.get_experiment_logger(experiment_id).error(
+                phase, "stalled_detected",
+                f"No progress for {int(silent)}s in phase {phase} "
+                f"(limit {int(limit)}s + grace {int(grace)}s); last event "
+                f"{last_event or 'unknown'} at {last_at.isoformat()}; worker: {worker}",
+                last_event=last_event,
+                last_event_at=last_at.isoformat(),
+                silent_seconds=int(silent),
+                limit_seconds=int(limit),
+                grace_seconds=int(grace),
+                worker=worker,
+            )
+            logger.warning(
+                "experiment %s stalled in phase %s: no progress for %ds (last event %s at %s); worker: %s",
+                experiment_id, phase, int(silent), last_event, last_at.isoformat(), worker,
+            )
+            stalled.append(experiment_id)
+        return stalled
+
+    # ------------------------------------------------------------------
     # run_experiment — the whole pipeline, single entry point
     # ------------------------------------------------------------------
 
@@ -812,23 +1043,38 @@ class ExperimentService:
                 f"{current.status!r} (only {STATUS_QUEUED!r} experiments can run)"
             )
 
+        phase = {"name": "pipeline"}
         try:
-            return self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
+            return self._run_pipeline(
+                experiment_id,
+                github_work_tracking=github_work_tracking,
+                phase=phase,
+            )
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
+            failure_phase = phase["name"]
+            failure_type = type(exc).__name__
             elog.error(
-                "pipeline", "unhandled_exception",
+                failure_phase, "unhandled_exception",
                 "Unhandled exception in experiment pipeline; forcing status=failed",
-                exc=exc,
+                exc=exc, failure_phase=failure_phase, failure_type=failure_type,
             )
             self._force_status(
                 experiment_id,
                 STATUS_FAILED,
                 ended_at=_utcnow_iso(),
-                error=f"unhandled exception in experiment pipeline: {exc}",
+                failure_phase=failure_phase,
+                failure_type=failure_type,
+                error=f"unhandled {failure_type} in phase {failure_phase}: {exc}",
             )
             return self.get_experiment(experiment_id)
 
-    def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
+    def _run_pipeline(
+        self,
+        experiment_id: str,
+        *,
+        github_work_tracking: Any | None = None,
+        phase: dict[str, str] | None = None,
+    ) -> Experiment:
         """Single-call implementation pipeline.
 
         Phases (in order):
@@ -847,8 +1093,10 @@ class ExperimentService:
         """
         experiment = self.get_experiment(experiment_id)
         elog = self.get_experiment_logger(experiment_id)
+        phase = phase if phase is not None else {"name": "pipeline"}
 
         # ---- Security check: apply safety denylist to the raw goal --------
+        phase["name"] = "goal_policy"
         rejection_reason = _check_goal_policy(experiment.goal)
         if rejection_reason is not None:
             elog.warning(
@@ -869,8 +1117,10 @@ class ExperimentService:
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
         base_ref = "HEAD"
         if github_work_tracking is not None:
+            phase["name"] = "github_branch"
             base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
+        phase["name"] = "worktree"
         elog.debug(
             "implementation", "worktree_check",
             f"Creating isolated git worktree at branch {branch_name} from {base_ref}",
@@ -918,6 +1168,7 @@ class ExperimentService:
         )
 
         # ---- Single Codex implementation call -----------------------------
+        phase["name"] = "implementation"
         elog.info(
             "implementation", "implementation_started",
             "Starting implementation (single coding-agent call: analyse, plan, implement)",
@@ -951,7 +1202,7 @@ class ExperimentService:
             on_process=lambda process: self._track_process(experiment_id, process),
         )
 
-        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+        if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
 
         if implementation_result.timed_out:
@@ -997,10 +1248,11 @@ class ExperimentService:
             if implementation_result.usage else None,
         )
 
-        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+        if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
 
         # ---- Verification -------------------------------------------------
+        phase["name"] = "quality_gate"
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
         result = self._verify(
             experiment_id,
@@ -1011,6 +1263,7 @@ class ExperimentService:
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
+            phase=phase,
         )
 
     def _record_verification_run(
@@ -1039,8 +1292,10 @@ class ExperimentService:
     def _repair_failed_verification(
         self, experiment_id: str, worktree_path: str, elog: ExperimentLogger,
         result: Experiment, *, github_work_tracking: Any | None = None,
+        phase: dict[str, str] | None = None,
     ) -> Experiment:
         """Give actionable test failures a small number of focused repair attempts."""
+        phase = phase if phase is not None else {"name": "quality_gate"}
         if result.status != STATUS_FAILED or result.test_exit_code is None:
             return result
 
@@ -1085,6 +1340,10 @@ class ExperimentService:
                 iteration=repair_iteration,
                 provider=provider_of(worker) or "",
             )
+            # Update the shared pipeline phase before invoking the worker so
+            # an exception raised by the repair agent is attributed to the
+            # existing implementation_repair elog phase.
+            phase["name"] = "implementation_repair"
             repair_result = worker.run(
                 task=_build_repair_implementation_prompt(result.goal, feedback),
                 working_dir=worktree_path,
@@ -1095,7 +1354,7 @@ class ExperimentService:
                 phase="implementation_repair",
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
-            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:
                 self._force_status(
@@ -1106,6 +1365,7 @@ class ExperimentService:
                 )
                 return self.get_experiment(experiment_id)
 
+            phase["name"] = "quality_gate"
             result = self._verify(
                 experiment_id, worktree_path, elog,
                 github_work_tracking=github_work_tracking,
@@ -1339,7 +1599,7 @@ class ExperimentService:
                 on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
-            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             test_exit_code = test_run.exit_code
             test_output = test_run.output

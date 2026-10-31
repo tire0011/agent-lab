@@ -289,6 +289,8 @@ class ExperimentSummary(BaseModel):
     branch_name: str | None = None
     test_exit_code: int | None = None
     error: str | None = None
+    failure_phase: str | None = None
+    failure_type: str | None = None
 
 
 class ExperimentDetail(BaseModel):
@@ -342,6 +344,8 @@ class ExperimentDetail(BaseModel):
     diff_stat: str | None = None
     diff_text: str | None = None
     error: str | None = None
+    failure_phase: str | None = None
+    failure_type: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
     adoption: ExperimentAdoptionStatus | None = None

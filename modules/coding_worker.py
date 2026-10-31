@@ -182,6 +182,10 @@ CAPTURE_HEAD_BYTES = 64 * 1024
 CAPTURE_TAIL_BYTES = 1024 * 1024
 # Time the agent's process group gets to exit after SIGTERM before SIGKILL.
 TERMINATE_GRACE_SECONDS = 10.0
+# While the agent is alive a progress entry is logged at least this often
+# (#400), so the experiment stall sweep has something to read and a silent
+# worker stands out in the log.
+PROGRESS_HEARTBEAT_SECONDS = 10 * 60
 
 
 def _env_seconds(env: Mapping[str, str], key: str, *, default: float, floor: float) -> float:
@@ -266,6 +270,8 @@ def run_watched(
     poll_seconds: float = 1.0,
     grace_seconds: float = TERMINATE_GRACE_SECONDS,
     on_process: Callable[[subprocess.Popen | None], None] | None = None,
+    on_heartbeat: Callable[[float, float], None] | None = None,
+    heartbeat_seconds: float = PROGRESS_HEARTBEAT_SECONDS,
 ) -> WatchedRun:
     """Run *cmd* and stop it only when it stalls or reaches the absolute cap.
 
@@ -273,6 +279,9 @@ def run_watched(
     process group, so stopping it also stops the commands it started; after
     a normal exit, leftovers of that group are stopped too. Raises ``OSError``
     (including ``FileNotFoundError``) when the process cannot be started.
+
+    While the agent runs, *on_heartbeat* is called every *heartbeat_seconds*
+    with the runtime and the seconds since its last output line.
     """
     proc = subprocess.Popen(
         cmd,
@@ -310,9 +319,16 @@ def run_watched(
             pass
 
     started = time.monotonic()
+    last_heartbeat = started
     stop_reason: str | None = None
     while proc.poll() is None:
         now = time.monotonic()
+        if on_heartbeat is not None and now - last_heartbeat >= heartbeat_seconds:
+            last_heartbeat = now
+            try:
+                on_heartbeat(now - started, now - last_output[0])
+            except Exception:  # noqa: BLE001 - logging must not stop the watchdog
+                pass
         if now - last_output[0] > stall_seconds:
             stop_reason = STOP_STALLED
         elif now - started > max_seconds:
@@ -334,6 +350,26 @@ def run_watched(
         stderr=stderr_capture.text(),
         stop_reason=stop_reason,
     )
+
+
+def progress_heartbeat(
+    experiment_logger: Any | None, phase: str, agent: str
+) -> Callable[[float, float], None] | None:
+    """``on_heartbeat`` that logs ``coding_agent_progress`` to an experiment log."""
+    if experiment_logger is None:
+        return None
+
+    def beat(runtime_seconds: float, silent_seconds: float) -> None:
+        experiment_logger.info(
+            phase, "coding_agent_progress",
+            f"{agent} still running after {int(runtime_seconds)}s; "
+            f"last output {int(silent_seconds)}s ago",
+            agent=agent,
+            runtime_seconds=int(runtime_seconds),
+            silent_seconds=int(silent_seconds),
+        )
+
+    return beat
 
 
 def watchdog_error(agent: str, run: WatchedRun, stall_seconds: float, max_seconds: float) -> str:

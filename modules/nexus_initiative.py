@@ -61,6 +61,8 @@ _DEFAULT_DAILY_BUDGET = 5
 _MAX_OPEN_PROPOSALS = 3
 
 # A failed issue experiment may be retried; the second failure ends it (#374).
+# A stalled experiment is failed by the stall sweep (#400) and counts through
+# "failed".
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted")
 _MAX_ISSUE_ATTEMPTS = 2
 

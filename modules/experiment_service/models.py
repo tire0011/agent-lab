@@ -161,6 +161,8 @@ class Experiment:
     diff_stat: str | None = None
     diff_text: str | None = None
     error: str | None = None
+    failure_phase: str | None = None
+    failure_type: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
 
@@ -213,6 +215,8 @@ class Experiment:
             "diff_stat": self.diff_stat,
             "diff_text": self.diff_text,
             "error": self.error,
+            "failure_phase": self.failure_phase,
+            "failure_type": self.failure_type,
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
         }
@@ -274,6 +278,8 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         diff_stat=row["diff_stat"],
         diff_text=row["diff_text"],
         error=row["error"],
+        failure_phase=row["failure_phase"] if "failure_phase" in row.keys() else None,
+        failure_type=row["failure_type"] if "failure_type" in row.keys() else None,
         policy_rule=row["policy_rule"] if "policy_rule" in row.keys() else None,
         quality_evaluation=(
             _json_or_none(row["quality_evaluation_json"]) if "quality_evaluation_json" in row.keys() else None

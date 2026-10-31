@@ -169,6 +169,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             ended_at TEXT NULL,
             cancelled_at TEXT NULL,
             cancelled_by TEXT NULL,
+            worker_pgid INTEGER NULL,
             plan_json TEXT NULL,
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
@@ -197,6 +198,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             diff_stat TEXT NULL,
             diff_text TEXT NULL,
             error TEXT NULL,
+            failure_phase TEXT NULL,
+            failure_type TEXT NULL,
             policy_rule TEXT NULL,
             quality_evaluation_json TEXT NULL
         );
@@ -306,6 +309,11 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("implementation_provider", "TEXT"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
+    ("failure_phase", "TEXT"),
+    ("failure_type", "TEXT"),
+    # Process group of the live worker, so the stall sweep (#400) can stop it
+    # from another process; NULL while no worker runs.
+    ("worker_pgid", "INTEGER"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

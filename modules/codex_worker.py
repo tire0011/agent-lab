@@ -38,6 +38,7 @@ from modules.coding_worker import (
     WorkerConfigError,
     WorkerResult,
     filtered_env,
+    progress_heartbeat,
     run_watched,
     truncate_output,
     validate_worker_config,
@@ -243,7 +244,10 @@ class CodexWorker:
                     timeout_seconds=timeout_seconds,
                 )
 
-            result = self._execute(cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process)
+            result = self._execute(
+                cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process,
+                on_heartbeat=progress_heartbeat(experiment_logger, phase, "Codex"),
+            )
         finally:
             if schema_path is not None:
                 try:
@@ -356,6 +360,7 @@ class CodexWorker:
         sandbox: str,
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        on_heartbeat: Any | None = None,
     ) -> CodexResult:
         timed_out = False
         proc_error: str | None = None
@@ -370,6 +375,7 @@ class CodexWorker:
                     cmd, cwd=working_dir, env=self._safe_env(),
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
                     on_process=on_process,
+                    on_heartbeat=on_heartbeat,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:
