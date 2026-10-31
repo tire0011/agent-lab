@@ -556,43 +556,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
             self.implementation_worker.run.call_args_list[1].kwargs["task"],
         )
 
-    def test_repair_agent_crash_records_implementation_repair_phase(self):
-        (self.repo_root / "tests" / "test_placeholder.py").write_text(
-            "import unittest\n\n"
-            "class T(unittest.TestCase):\n"
-            "    def test_fail(self):\n"
-            "        self.assertTrue(False)\n"
-        )
-        subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=True)
-        subprocess.run(
-            ["git", "-C", str(self.repo_root), "commit", "-q", "-m", "failing test"],
-            check=True,
-        )
-        implement = _write_affected_files_side_effect()
-        calls = 0
-
-        def crashing_repair_worker(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise GitHubWorkTrackingError("HTTP 422 during repair")
-            return implement(*args, **kwargs)
-
-        self.implementation_worker.run.side_effect = crashing_repair_worker
-        self.service.test_python_executable = sys.executable
-        experiment = self.service.create_experiment(goal="Fix the failing test.")
-
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_FAILED)
-        self.assertEqual(calls, 2)
-        self.assertEqual(result.failure_phase, "implementation_repair")
-        self.assertEqual(result.failure_type, "GitHubWorkTrackingError")
-        self.assertIn(
-            "unhandled GitHubWorkTrackingError in phase implementation_repair",
-            result.error,
-        )
-
     def test_default_test_command_uses_verbose_unittest_discover(self):
         """Verbose, because the progress watchdog (#209) reads the per-test
         stream to know which test is running; the runner strips those lines

@@ -1064,7 +1064,6 @@ class ExperimentService:
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
-            phase=phase,
         )
 
     def _record_verification_run(
@@ -1093,10 +1092,8 @@ class ExperimentService:
     def _repair_failed_verification(
         self, experiment_id: str, worktree_path: str, elog: ExperimentLogger,
         result: Experiment, *, github_work_tracking: Any | None = None,
-        phase: dict[str, str] | None = None,
     ) -> Experiment:
         """Give actionable test failures a small number of focused repair attempts."""
-        phase = phase if phase is not None else {"name": "quality_gate"}
         if result.status != STATUS_FAILED or result.test_exit_code is None:
             return result
 
@@ -1141,10 +1138,6 @@ class ExperimentService:
                 iteration=repair_iteration,
                 provider=provider_of(worker) or "",
             )
-            # Update the shared pipeline phase before invoking the worker so
-            # an exception raised by the repair agent is attributed to the
-            # existing implementation_repair elog phase.
-            phase["name"] = "implementation_repair"
             repair_result = worker.run(
                 task=_build_repair_implementation_prompt(result.goal, feedback),
                 working_dir=worktree_path,
@@ -1166,7 +1159,6 @@ class ExperimentService:
                 )
                 return self.get_experiment(experiment_id)
 
-            phase["name"] = "quality_gate"
             result = self._verify(
                 experiment_id, worktree_path, elog,
                 github_work_tracking=github_work_tracking,
