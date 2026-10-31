@@ -144,18 +144,21 @@ def _test_summary(output: str | None) -> str | None:
     return f"{match.group(1)} tests ran" if match else None
 
 
-def _final_issue_progress(experiment: Experiment) -> tuple[str, str | None] | None:
-    """The Issue progress state and detail for a finished pipeline, if any."""
+def _final_issue_progress(experiment: Experiment) -> tuple[tuple[str, str | None], ...]:
+    """The Issue progress states and details for a finished pipeline."""
     if experiment.status == STATUS_SUCCEEDED:
         summary = _test_summary(experiment.test_output)
-        return "verification_passed", f"Tests: {summary}." if summary else None
+        return (
+            ("verification_passed", f"Tests: {summary}." if summary else None),
+            ("completed", None),
+        )
     reason = sanitized_reason(experiment.error)
     detail = f"Reason: {reason}" if reason else None
     if experiment.status == STATUS_NEEDS_REVIEW:
-        return "needs_review", detail
+        return (("needs_review", detail),)
     if experiment.status in {STATUS_FAILED, STATUS_TIMED_OUT, STATUS_REJECTED}:
-        return "failed", detail
-    return None
+        return (("failed", detail),)
+    return ()
 
 
 def _parse_utc(timestamp: str | None) -> datetime | None:
@@ -865,9 +868,8 @@ class ExperimentService:
                 error=f"unhandled exception in experiment pipeline: {exc}",
             )
             result = self.get_experiment(experiment_id)
-        final = _final_issue_progress(result)
-        if final is not None:
-            _report_issue_progress(github_work_tracking, experiment_id, final[0], final[1])
+        for state, detail in _final_issue_progress(result):
+            _report_issue_progress(github_work_tracking, experiment_id, state, detail)
         return result
 
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:

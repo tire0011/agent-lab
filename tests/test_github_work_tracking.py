@@ -444,11 +444,14 @@ class GitHubWorkTrackingTests(unittest.TestCase):
 
         self.assertEqual(
             outcome("succeeded", test_output="===== 18 passed in 0.4s ====="),
-            ("verification_passed", "Tests: 18 passed in 0.4s."),
+            (
+                ("verification_passed", "Tests: 18 passed in 0.4s."),
+                ("completed", None),
+            ),
         )
-        self.assertEqual(outcome("needs_review", error="gate unsure"), ("needs_review", "Reason: gate unsure"))
-        self.assertEqual(outcome("timed_out", error="watchdog"), ("failed", "Reason: watchdog"))
-        self.assertIsNone(outcome("cancelled"))
+        self.assertEqual(outcome("needs_review", error="gate unsure"), (("needs_review", "Reason: gate unsure"),))
+        self.assertEqual(outcome("timed_out", error="watchdog"), (("failed", "Reason: watchdog"),))
+        self.assertEqual(outcome("cancelled"), ())
 
     def _bind_checkpoint(self, sha: str = "checkpoint-sha"):
         ref = self.service.bind_experiment(
