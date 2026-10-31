@@ -58,6 +58,13 @@ a clean finish from work that simply went quiet, reports the last healthy
 heartbeat and the last meaningful event, and says ``unknown`` - with the
 missing evidence named - whenever the record is too thin or contradicts
 itself. It also carries a retry *hint*; nothing here retries.
+
+A task or experiment usually has no claim of its own, so the controller session
+driving it speaks for it while it is still working: that session's heartbeat
+and its durable reconciliation to ``abandoned`` are this work's liveness
+evidence, however the session is linked. Once the subject itself has reached a
+terminal state its own record decides; a session ending then is not the work
+ending.
 """
 
 from __future__ import annotations
@@ -66,7 +73,7 @@ import json
 import logging
 import re
 import sqlite3
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -565,12 +572,16 @@ EVIDENCE_NONE = "none"
 _REASON_HEARTBEAT_TIMEOUT = "heartbeat_timeout"
 _REASON_TURN_FAILED = "turn_failed"
 _REASON_TURN_CANCELLED = "turn_cancelled"
+_STATUS_ABANDONED = "abandoned"
 _FAILURE_REASONS = frozenset({_REASON_HEARTBEAT_TIMEOUT, _REASON_TURN_FAILED})
 # What startup recovery writes on an experiment its restart orphaned (#281).
 _RESTART_ERROR_MARKER = "interrupted by service restart"
 # Log events that only say "still alive" - liveness evidence, but not the
 # "last meaningful step" an operator is asking about.
 _LIVENESS_LOG_EVENTS = frozenset({"test_progress", "heartbeat"})
+# Journal entries a reaper writes *about* a session. They record its end, not
+# what its worker was doing when it stopped.
+_REAPER_SESSION_EVENTS = frozenset({_REASON_HEARTBEAT_TIMEOUT, _STATUS_ABANDONED})
 
 
 @dataclass(slots=True)
@@ -614,6 +625,9 @@ def classify_outcome(
     last_heartbeat_at: Any = None,
     recorded_heartbeat_at: Any = None,
     own_claim: bool = False,
+    driver_status: str | None = None,
+    driver_terminal_reason: str | None = None,
+    driver_ended_at: Any = None,
     last_log_at: Any = None,
     last_event: dict[str, Any] | None = None,
     updated_at: Any = None,
@@ -633,6 +647,10 @@ def classify_outcome(
       to a controller session that merely drives it,
     * ``recorded_heartbeat_at`` - the heartbeat a reconciliation preserved in
       its event after clearing the column,
+    * ``driver_status``/``driver_terminal_reason``/``driver_ended_at`` - how the
+      controller session driving this work ended, when ``own_claim`` is False.
+      They only speak for work that is still working: a driver that was
+      reconciled as abandoned is durable evidence its worker is gone,
     * ``last_log_at`` - the newest structured log entry (liveness, weaker),
     * ``last_event`` - the newest *meaningful* event, reported as-is,
     * ``restart_evidence`` - an explicit restart marker found elsewhere (e.g.
@@ -646,6 +664,7 @@ def classify_outcome(
     status_text = (status or "").strip() or None
     reason = (terminal_reason or "").strip() or None
     error_text = (error or "").strip() or None
+    driver_reason = (driver_terminal_reason or "").strip() or None
     heartbeat_age = heartbeat_age_seconds(last_heartbeat_at, now=reference)
     log_age = heartbeat_age_seconds(last_log_at, now=reference)
     last_healthy = (
@@ -683,6 +702,30 @@ def classify_outcome(
             return ""
         step = last_event.get("phase") or last_event.get("kind") or last_event.get("event")
         return f" (last step: {step})" if step else ""
+
+    def active_since(moment: Any) -> bool:
+        """Is this work still logging, later than *moment*, within the timeout?"""
+        since = parse_timestamp(moment)
+        activity = parse_timestamp(last_log_at)
+        return (
+            not own_claim
+            and since is not None
+            and activity is not None
+            and activity > since
+            and log_age is not None
+            and log_age <= timeout
+        )
+
+    def contradicted_by_logs(driver_state: str) -> OutcomeDiagnosis:
+        gaps.append("structured logs continue after the controller session stopped")
+        return result(
+            OUTCOME_UNKNOWN,
+            f"contradictory record: the driving session {driver_state}, but this "
+            f"work logged {int(log_age or 0)}s ago, later than that",
+            evidence=EVIDENCE_NONE,
+            retry=RETRY_INSUFFICIENT_EVIDENCE,
+            conclusive=False,
+        )
 
     # -- inconsistent records: say so rather than pick a side --------------
     if lifecycle == LIFECYCLE_UNKNOWN:
@@ -823,6 +866,38 @@ def classify_outcome(
         )
 
     # -- still working: only liveness can tell healthy from abandoned ------
+    if (
+        not own_claim
+        and heartbeat_age is None
+        and (driver_reason == _REASON_HEARTBEAT_TIMEOUT or driver_status == _STATUS_ABANDONED)
+    ):
+        if active_since(driver_ended_at):
+            return contradicted_by_logs("was reconciled as abandoned")
+        reason = driver_reason
+        if driver_reason == _REASON_HEARTBEAT_TIMEOUT:
+            return result(
+                OUTCOME_STALE,
+                f"still {status_text!r}, but the controller session driving it stopped "
+                "sending heartbeats and was reconciled as abandoned"
+                + (f" (last heartbeat {last_healthy})" if last_healthy else "")
+                + where(),
+                evidence=EVIDENCE_HEARTBEAT,
+                retry=RETRY_POSSIBLE,
+                cause="worker disappeared (crash, kill or restart - not distinguishable "
+                "from the record)",
+            )
+        gaps.append(
+            "driving session marked abandoned without a heartbeat timeout; the "
+            "verdict came from row inactivity, not from a heartbeat"
+        )
+        return result(
+            OUTCOME_STALE,
+            f"still {status_text!r}, but the controller session driving it was marked "
+            "abandoned after a long period without activity" + where(),
+            evidence=EVIDENCE_ROW,
+            retry=RETRY_POSSIBLE,
+            conclusive=False,
+        )
     if heartbeat_age is not None:
         if heartbeat_age <= timeout:
             return result(
@@ -832,6 +907,8 @@ def classify_outcome(
                 evidence=EVIDENCE_HEARTBEAT,
                 retry=RETRY_NOT_NEEDED,
             )
+        if active_since(last_heartbeat_at):
+            return contradicted_by_logs(f"stopped heartbeating {int(heartbeat_age)}s ago")
         return result(
             OUTCOME_STALE,
             f"heartbeats stopped {int(heartbeat_age)}s ago (timeout {timeout}s) while "
@@ -1292,7 +1369,9 @@ class NexusDiagnostics:
 
         self._attach_github(state, experiment_id=experiment_id, source_id=None)
         self._attach_adoption(state, experiment_id=experiment_id)
-        session = self._session_for(experiment_id, experiment_id)
+        session = self._session_for(
+            experiment_id, experiment_id, task_id=state.correlation_ids.get("mailbox_task_id")
+        )
         self._attach_session(state, session)
         self._assess(state, session)
         return state
@@ -1405,16 +1484,22 @@ class NexusDiagnostics:
             if not state.last_error:
                 state.last_error = _text(_column(row, "reason"), _MAX_ERROR_CHARS)
 
-    def _session_for(self, subject_id: str, experiment_id: Any) -> sqlite3.Row | None:
+    def _session_for(
+        self, subject_id: str, experiment_id: Any, *, task_id: str | None = None
+    ) -> sqlite3.Row | None:
         """The controller session driving this work, when one claimed it.
 
         Preferred over every other progress signal because it is the only
         one that means "a worker said it was alive" rather than "something
-        happened".
+        happened". An experiment is rarely a session's source: the session
+        belongs to the task that started it, or waits on it by id, so both
+        links are followed and the same work finds the same session from
+        either side.
         """
         candidates = [subject_id]
-        if experiment_id and str(experiment_id) != subject_id:
-            candidates.append(str(experiment_id))
+        for linked in (experiment_id, task_id):
+            if linked and str(linked) not in candidates:
+                candidates.append(str(linked))
         for candidate in candidates:
             row = self._fetchone(
                 """SELECT * FROM nexus_task_sessions
@@ -1426,6 +1511,14 @@ class NexusDiagnostics:
             )
             if row is not None:
                 return row
+        if experiment_id:
+            return self._fetchone(
+                """SELECT * FROM nexus_task_sessions
+                    WHERE waiting_experiment_id = ?
+                 ORDER BY updated_at DESC
+                    LIMIT 1""",
+                (str(experiment_id),),
+            )
         return None
 
     def _attach_session(self, state: LifecycleState, session: sqlite3.Row | None) -> None:
@@ -1453,8 +1546,10 @@ class NexusDiagnostics:
 
         ``own_claim`` is True only when *session* is the subject itself: then
         its ``terminal_reason`` is this work's terminal record. A session that
-        merely drives a task contributes its heartbeat, but its turn ending is
-        not the task ending.
+        merely drives a task contributes its heartbeat and how it ended, which
+        :func:`classify_outcome` only applies to work that is still working:
+        its turn ending is not the task ending, but its worker vanishing is
+        the task's liveness evidence.
         """
         log_entries = self._recent_log_entries(state.correlation_ids)
         last_log_at = None
@@ -1479,6 +1574,11 @@ class NexusDiagnostics:
             last_heartbeat_at=heartbeat,
             recorded_heartbeat_at=_recorded_heartbeat(events),
             own_claim=own_claim,
+            driver_status=None if own_claim else _column(session, "status"),
+            driver_terminal_reason=None if own_claim else _column(session, "terminal_reason"),
+            driver_ended_at=(
+                None if own_claim else _reconciled_at(events) or _column(session, "updated_at")
+            ),
             last_log_at=last_log_at,
             last_event=_last_meaningful_event(log_entries, events),
             updated_at=state.updated_at or state.created_at,
@@ -1486,6 +1586,14 @@ class NexusDiagnostics:
             stale_after_seconds=self.stale_after_seconds,
             now=self._now(),
         )
+        if state.outcome.outcome == OUTCOME_STALE and state.progress.state == PROGRESS_RUNNING:
+            # Progress takes the newest timestamp, so a fresh ``updated_at`` can
+            # read as movement after the heartbeat evidence has said otherwise.
+            state.progress = replace(
+                state.progress,
+                state=PROGRESS_INTERRUPTED,
+                reason=state.outcome.explanation,
+            )
 
     def _session_events(self, session_id: str, *, limit: int = 20) -> list[sqlite3.Row]:
         """The controller journal's newest entries for one session, newest first."""
@@ -1877,13 +1985,22 @@ def _recorded_heartbeat(events: Sequence[Any]) -> str | None:
     return None
 
 
+def _reconciled_at(events: Sequence[Any]) -> str | None:
+    """When a reconciliation declared this session's worker gone, if one did."""
+    for event in events:
+        if _column(event, "kind") == _REASON_HEARTBEAT_TIMEOUT:
+            return _column(event, "created_at")
+    return None
+
+
 def _last_meaningful_event(
     log_entries: Sequence[dict[str, Any]], events: Sequence[Any]
 ) -> dict[str, Any] | None:
     """The newest step of the work itself, across logs and the session journal.
 
     Liveness ticks are skipped: "tests 40/80 completed" says the worker was
-    alive, not what it was doing when it stopped.
+    alive, not what it was doing when it stopped. So are a reaper's own journal
+    entries, which would otherwise always be the newest step of stale work.
     """
     candidates: list[tuple[datetime, dict[str, Any]]] = []
     for entry in log_entries:
@@ -1906,6 +2023,8 @@ def _last_meaningful_event(
             )
         )
     for event in events:
+        if _column(event, "kind") in _REAPER_SESSION_EVENTS:
+            continue
         parsed = parse_timestamp(_column(event, "created_at"))
         if parsed is None:
             continue
@@ -2142,10 +2261,12 @@ __all__ = [
     "LLM_JOB_VIEWS",
     "LifecycleState",
     "NexusDiagnostics",
+    "OutcomeDiagnosis",
     "ProgressVerdict",
     "SERVICE_ALIASES",
     "ServiceLogs",
     "assess_progress",
+    "classify_outcome",
     "render_llm_job",
     "render_report",
     "render_service_logs",

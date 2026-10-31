@@ -504,6 +504,16 @@ the `heartbeat_timeout` event once a stale claim was reconciled),
 `insufficient_evidence`). A restart is only reported when one was recorded;
 silence alone is `stale`, because a crash leaves the same silence.
 
+A task or experiment normally has no claim of its own, so while it is still
+working the controller session driving it speaks for it - linked by the
+session's source, the task's experiment, or `waiting_experiment_id`. A session
+reconciled with `heartbeat_timeout` makes the work conclusively `stale`, and
+`progress` then reads `interrupted`, whatever `updated_at` says; a session
+abandoned by the older inactivity sweep gives an inconclusive `stale`. If the
+work kept logging after that session stopped, the two records disagree and the
+outcome is `unknown`. A subject that already reached a terminal state keeps its
+own outcome: a session ending later says nothing about finished work.
+
 Output is bounded by default (50 log entries; `lines=` up to 500).
 
 ### Worked example: a branch appeared but nothing followed

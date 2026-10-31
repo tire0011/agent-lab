@@ -224,6 +224,104 @@ class ClassifyOutcomeTests(unittest.TestCase):
                 self.assertEqual(RETRY_INSUFFICIENT_EVIDENCE, result.retry)
 
 
+class DriverSessionRuleTests(unittest.TestCase):
+    """How the session driving a subject without its own claim is weighed."""
+
+    def classify(self, lifecycle: str = LIFECYCLE_RUNNING, **kwargs):
+        kwargs.setdefault("status", "running")
+        kwargs.setdefault("stale_after_seconds", 900)
+        return classify_outcome(lifecycle, now=NOW, **kwargs)
+
+    def reconciled(self, **kwargs):
+        return self.classify(
+            driver_status="abandoned",
+            driver_terminal_reason="heartbeat_timeout",
+            driver_ended_at=_ago(10),
+            recorded_heartbeat_at=_ago(30),
+            **kwargs,
+        )
+
+    def test_reconciled_driver_is_conclusively_stale(self) -> None:
+        result = self.reconciled(updated_at=_ago(1))
+        self.assertEqual(OUTCOME_STALE, result.outcome)
+        self.assertTrue(result.conclusive)
+        self.assertEqual(EVIDENCE_HEARTBEAT, result.evidence)
+        self.assertEqual("heartbeat_timeout", result.terminal_reason)
+        self.assertEqual(_ago(30), result.last_healthy_heartbeat_at)
+        self.assertEqual(RETRY_POSSIBLE, result.retry)
+        self.assertEqual([], result.evidence_gaps)
+
+    def test_queued_work_is_stale_too_once_its_driver_was_reconciled(self) -> None:
+        result = self.reconciled(lifecycle=LIFECYCLE_QUEUED, updated_at=_ago(1))
+        self.assertEqual(OUTCOME_STALE, result.outcome)
+
+    def test_logs_from_before_the_reconciliation_do_not_outvote_it(self) -> None:
+        result = self.reconciled(last_log_at=_ago(11))
+        self.assertEqual(OUTCOME_STALE, result.outcome)
+        self.assertTrue(result.conclusive)
+
+    def test_logs_after_the_reconciliation_are_a_contradiction(self) -> None:
+        result = self.reconciled(last_log_at=_ago(2))
+        self.assertEqual(OUTCOME_UNKNOWN, result.outcome)
+        self.assertFalse(result.conclusive)
+        self.assertTrue(result.evidence_gaps)
+        self.assertEqual(RETRY_INSUFFICIENT_EVIDENCE, result.retry)
+
+    def test_old_logs_after_the_reconciliation_are_no_sign_of_life(self) -> None:
+        result = self.classify(
+            driver_status="abandoned",
+            driver_terminal_reason="heartbeat_timeout",
+            driver_ended_at=_ago(60),
+            last_log_at=_ago(40),
+        )
+        self.assertEqual(OUTCOME_STALE, result.outcome)
+
+    def test_expired_driver_heartbeat_with_later_fresh_logs_is_a_contradiction(self) -> None:
+        result = self.classify(last_heartbeat_at=_ago(40), last_log_at=_ago(2))
+        self.assertEqual(OUTCOME_UNKNOWN, result.outcome)
+        self.assertFalse(result.conclusive)
+
+    def test_expired_own_heartbeat_is_not_outvoted_by_logs(self) -> None:
+        result = self.classify(
+            last_heartbeat_at=_ago(40), own_claim=True, last_log_at=_ago(2)
+        )
+        self.assertEqual(OUTCOME_STALE, result.outcome)
+
+    def test_driver_abandoned_by_inactivity_is_only_inconclusively_stale(self) -> None:
+        result = self.classify(driver_status="abandoned", driver_ended_at=_ago(10))
+        self.assertEqual(OUTCOME_STALE, result.outcome)
+        self.assertFalse(result.conclusive)
+        self.assertEqual(RETRY_INSUFFICIENT_EVIDENCE, result.retry)
+        self.assertTrue(result.evidence_gaps)
+
+    def test_a_driver_ending_does_not_override_a_terminal_subject(self) -> None:
+        cases = {
+            OUTCOME_SUCCEEDED: (LIFECYCLE_SUCCEEDED, "succeeded"),
+            OUTCOME_FAILED: (LIFECYCLE_FAILED, "failed"),
+            OUTCOME_WAITING: (LIFECYCLE_WAITING, "pending_approval"),
+        }
+        for expected, (lifecycle, status) in cases.items():
+            with self.subTest(expected):
+                result = self.classify(
+                    lifecycle,
+                    status=status,
+                    driver_status="abandoned",
+                    driver_terminal_reason="heartbeat_timeout",
+                    driver_ended_at=_ago(10),
+                )
+                self.assertEqual(expected, result.outcome)
+                self.assertIsNone(result.terminal_reason)
+
+    def test_a_driver_that_ended_normally_says_nothing_about_liveness(self) -> None:
+        result = self.classify(
+            driver_status="action_selected",
+            driver_terminal_reason="start_experiment",
+            driver_ended_at=_ago(10),
+            updated_at=_ago(1),
+        )
+        self.assertEqual(OUTCOME_UNKNOWN, result.outcome)
+
+
 class SessionOutcomeTests(DiagnosticsFixture):
     """Controller sessions, driven through the real #162 store methods."""
 
@@ -298,6 +396,8 @@ class SessionOutcomeTests(DiagnosticsFixture):
         self.assertEqual(OUTCOME_STALE, state.outcome.outcome)
         self.assertEqual(old, state.outcome.last_healthy_heartbeat_at)
         self.assertEqual("heartbeat_timeout", state.outcome.terminal_reason)
+        # The reaper's own journal entry is not the worker's last step.
+        self.assertEqual("tool_call", state.outcome.last_event["kind"])
 
     def test_live_claim_is_running(self) -> None:
         session_id = self.add_session(source_id="t-live", heartbeat_minutes_ago=0.2)
@@ -326,6 +426,95 @@ class TaskAndExperimentOutcomeTests(DiagnosticsFixture):
         # An interrupted run is exactly what `last-failure` exists to find.
         report = diagnostics.last_failure()
         self.assertEqual(task_id, report.lifecycle.subject_id)
+
+    def reconcile(self, session_id: str, heartbeat_minutes_ago: float = 30) -> str:
+        """Expire a claim and reconcile it through the real #162 store path."""
+        store = NexusTaskStore(db_path=self.db_path)
+        self.addCleanup(store.close)
+        old = _iso(heartbeat_minutes_ago)
+        self.conn.execute(
+            "UPDATE nexus_task_sessions SET status='active', last_heartbeat_at=? WHERE id=?",
+            (old, session_id),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            [session_id], [session.id for session in store.reconcile_stale_heartbeats(60)]
+        )
+        return old
+
+    def assert_conclusively_stale(self, state, heartbeat: str) -> None:
+        self.assertEqual(OUTCOME_STALE, state.outcome.outcome)
+        self.assertTrue(state.outcome.conclusive)
+        self.assertEqual(EVIDENCE_HEARTBEAT, state.outcome.evidence)
+        self.assertEqual(heartbeat, state.outcome.last_healthy_heartbeat_at)
+        self.assertEqual("heartbeat_timeout", state.outcome.terminal_reason)
+        self.assertEqual(RETRY_POSSIBLE, state.outcome.retry)
+        self.assertEqual("interrupted", state.progress.state)
+
+    def test_running_task_inherits_its_reconciled_session(self) -> None:
+        """The review finding on PR #405: this used to read as ``unknown``."""
+        task_id = self.add_task(status="running")
+        heartbeat = self.reconcile(self.add_session(source_id=task_id))
+        self.assert_conclusively_stale(self.diagnostics().status(task_id), heartbeat)
+
+    def test_older_logs_do_not_turn_a_reconciled_task_into_running(self) -> None:
+        experiment_id = self.add_experiment(status="implementing")
+        task_id = self.add_task(status="running", experiment_id=experiment_id)
+        self.write_log(
+            f"{experiment_id}.jsonl",
+            [self.log_entry(minutes_ago=2, event="branch_created", message="branch ok")],
+        )
+        heartbeat = self.reconcile(self.add_session(source_id=task_id))
+        state = self.diagnostics(stale_after_seconds=900).status(task_id)
+        self.assert_conclusively_stale(state, heartbeat)
+        self.assertEqual("branch_created", state.outcome.last_event["kind"])
+
+    def test_logs_after_the_reconciliation_leave_the_task_unknown(self) -> None:
+        experiment_id = self.add_experiment(status="implementing")
+        task_id = self.add_task(status="running", experiment_id=experiment_id)
+        self.reconcile(self.add_session(source_id=task_id))
+        self.write_log(
+            f"{experiment_id}.jsonl",
+            [self.log_entry(minutes_ago=-0.1, event="tests_started", message="still going")],
+        )
+        outcome = self.diagnostics(stale_after_seconds=900).status(task_id).outcome
+        self.assertEqual(OUTCOME_UNKNOWN, outcome.outcome)
+        self.assertFalse(outcome.conclusive)
+
+    def test_experiment_finds_the_reconciled_session_through_its_task(self) -> None:
+        experiment_id = self.add_experiment(status="implementing")
+        task_id = self.add_task(status="running", experiment_id=experiment_id)
+        heartbeat = self.reconcile(self.add_session(source_id=task_id))
+        self.assert_conclusively_stale(self.diagnostics().status(experiment_id), heartbeat)
+
+    def test_experiment_finds_the_session_waiting_on_it(self) -> None:
+        experiment_id = self.add_experiment(status="implementing")
+        session_id = self.add_session(source_id="some-idea")
+        self.conn.execute(
+            "UPDATE nexus_task_sessions SET waiting_experiment_id=? WHERE id=?",
+            (experiment_id, session_id),
+        )
+        self.conn.commit()
+        heartbeat = self.reconcile(session_id)
+        self.assert_conclusively_stale(self.diagnostics().status(experiment_id), heartbeat)
+
+    def test_a_finished_experiment_keeps_its_outcome_after_its_session_died(self) -> None:
+        experiment_id = self.add_experiment(status="succeeded", ended_at=_iso(40))
+        task_id = self.add_task(status="succeeded", experiment_id=experiment_id)
+        self.reconcile(self.add_session(source_id=task_id))
+        self.assertEqual(OUTCOME_SUCCEEDED, self.diagnostics().status(task_id).outcome.outcome)
+
+    def test_a_reconciled_task_is_found_by_last_failure_and_rendered(self) -> None:
+        task_id = self.add_task(status="running")
+        heartbeat = self.reconcile(self.add_session(source_id=task_id))
+        report = self.diagnostics().last_failure()
+        self.assertEqual(task_id, report.lifecycle.subject_id)
+        lines = render_report(report)
+        self.assertIn("outcome: stale", lines)
+        self.assertIn(f"last_healthy_heartbeat_at: {heartbeat}", lines)
+        context = _with_lifecycle_context({}, report.lifecycle)
+        self.assertEqual("stale", context["nexus_outcome"])
+        self.assertEqual(heartbeat, context["nexus_last_healthy_heartbeat_at"])
 
     def test_cancelled_experiment(self) -> None:
         experiment_id = self.add_experiment(
@@ -381,6 +570,26 @@ class OutcomeApiTests(DiagnosticsFixture):
         self.assertEqual("succeeded", outcome["outcome"])
         self.assertTrue(outcome["conclusive"])
         self.assertEqual("not_needed", outcome["retry"])
+
+    def test_status_route_reports_a_reconciled_session_on_its_task(self) -> None:
+        diagnostics = NexusDiagnostics(db_path=self.db_path, log_dir=self.log_dir)
+        self.addCleanup(diagnostics.close)
+        api.app.dependency_overrides[api.get_nexus_diagnostics] = lambda: diagnostics
+        self.addCleanup(api.app.dependency_overrides.clear)
+        task_id = self.add_task(status="running")
+        session_id = self.add_session(source_id=task_id, heartbeat_minutes_ago=30)
+        store = NexusTaskStore(db_path=self.db_path)
+        self.addCleanup(store.close)
+        self.assertEqual(1, len(store.reconcile_stale_heartbeats(60)))
+
+        response = TestClient(api.app).get(
+            f"/diagnostics/status/{task_id}", headers={"x-api-key": api.API_KEY}
+        )
+        self.assertEqual(200, response.status_code)
+        lifecycle = response.json()["lifecycle"]
+        self.assertEqual("stale", lifecycle["outcome"]["outcome"])
+        self.assertTrue(lifecycle["outcome"]["conclusive"])
+        self.assertEqual(session_id, lifecycle["correlation_ids"]["session_id"])
 
 
 if __name__ == "__main__":  # pragma: no cover
