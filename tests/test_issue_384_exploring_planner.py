@@ -41,7 +41,10 @@ class ToolClassificationTests(unittest.TestCase):
         self.assertFalse(set(READ_ONLY_TOOLS) & set(WRITE_TOOLS))
 
     def test_the_planner_gets_issue_and_history_tools_but_no_shell(self):
-        for name in ("github_issues", "git_log", "experiments_list", "experiment_logs"):
+        for name in (
+            "github_issues", "git_log", "experiments_list", "experiment_logs",
+            "experiments_gate_recheck",
+        ):
             self.assertIn(name, READ_ONLY_TOOLS)
         for name in ("shell", "git_pull", "experiment_start", "chat"):
             self.assertNotIn(name, READ_ONLY_TOOLS)
