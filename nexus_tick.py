@@ -399,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
     # included.
     if not args.dry_run:
         _reconcile_stale_claims(args.db_path)
+        from modules.main_guard import guard_main
+
+        reverted = guard_main(args.repo_root)
+        if reverted:
+            logger.warning("main guard: %s", reverted)
+            _events.append(reverted)
 
     service = _build_service(args)
     try:
