@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.experiment_service import policy as goal_policy
+from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
 from modules.nexus_planner import PROPOSAL_LABEL
 from modules.nexus_sources import issue_source
 from modules.redaction import sanitized_reason
@@ -78,7 +79,8 @@ _MAX_OPEN_PROPOSALS = 3
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
 # An open issue that used up its attempts is reported, not dropped silently
-# (#457). It stays unselectable until a human acts.
+# (#457). It stays unselectable until a human acts, unless only pipeline crashes
+# stopped it (#467): those end with a newer commit on origin/main.
 DECISION_SKIPPED_ATTEMPTS_EXHAUSTED = "skipped_attempts_exhausted"
 
 # An issue the goal policy rejects is not sent (#408): the experiment would be
@@ -92,10 +94,19 @@ _GOAL_POLICY_REASON_PREFIXES = tuple(
 
 
 def _is_provider_overload(status: Any, error: Any) -> bool:
-    """A run that failed because the coding agent's API was overloaded."""
+    """A run that failed because the coding agent's API was overloaded.
+
+    A crash may quote "429" or "rate limit", but it stays a crash: an overload
+    is free of every limit, and a crash loop must not be.
+    """
     from modules.coding_provider import is_provider_overload
 
-    return status == "failed" and is_provider_overload(error)
+    return status == "failed" and is_provider_overload(error) and not _is_pipeline_crash(status, error)
+
+
+def _is_pipeline_crash(status: Any, error: Any) -> bool:
+    """A run Nexus's own pipeline crashed in: no coding work was judged (#467)."""
+    return status == "failed" and str(error or "").startswith(PIPELINE_CRASH_ERROR_PREFIX)
 
 
 def _is_goal_policy_rejection(status: Any, error: Any) -> bool:
@@ -128,6 +139,11 @@ def _parse_timestamp(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _last_reason(attempts: dict[str, tuple[str, str]]) -> str:
+    """The newest of ``experiment -> (when, why)``, safe to show on GitHub."""
+    return sanitized_reason(" ".join(max(attempts.values())[1].split())) or "no reason recorded"
 
 
 @dataclass(slots=True)
@@ -177,6 +193,7 @@ class NexusInitiativeService:
         diagnostics_client: Callable[[], dict[str, Any]] | None = None,
         checkout_revision: Callable[[], str] | None = None,
         restart_hook: Callable[[], None] | None = None,
+        main_commit_date: Callable[[], str] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -192,6 +209,7 @@ class NexusInitiativeService:
         self._diagnostics_client = diagnostics_client
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
+        self._main_commit_date = main_commit_date
         self._open_proposals = 0
         self._exhausted_issues: list[dict[str, Any]] = []
         if daily_budget is None:
@@ -322,6 +340,9 @@ class NexusInitiativeService:
             (since, REVIEW_RETRY_REASON),
         ).fetchone()
         spent = int(row["n"]) if row else 0
+        # Crashes stay in the budget, unlike overloads (#467): an overload was
+        # refused before any work, a crash can come after a paid coding run, and
+        # this budget is the only limit across issues on a broken pipeline.
         return max(0, spent - self._overloaded_since(since))
 
     def _overloaded_since(self, since: str) -> int:
@@ -572,13 +593,22 @@ class NexusInitiativeService:
             reported[key] = (tick_id, detail)
         if detail.get("commented") or self._issue_commenter is None:
             return
+        if attempts.get("pipeline_crash"):
+            stop = f"Nexus paused this issue: its own pipeline crashed {_MAX_ISSUE_ATTEMPTS} times or more."
+            how_on = (
+                "The crash says nothing about this issue. It returns on its own once "
+                "origin/main has a commit newer than the last crash; no human decision is needed."
+            )
+        else:
+            stop = f"Nexus stopped working on this issue: it used up its {_MAX_ISSUE_ATTEMPTS} attempts."
+            how_on = "Nexus does not start it again on its own; a human has to decide how it goes on."
         try:
             self._issue_commenter(
                 int(ref),
-                f"Nexus stopped working on this issue: it used up its {_MAX_ISSUE_ATTEMPTS} attempts.\n\n"
+                f"{stop}\n\n"
                 f"Experiments: {', '.join(detail['experiment_ids'])}\n"
                 f"Last failure: {detail['last_reason']}\n\n"
-                "Nexus does not start it again on its own; a human has to decide how it goes on.",
+                f"{how_on}",
             )
         except Exception as exc:  # noqa: BLE001 - tried again on the next tick
             logger.warning("initiative: out-of-attempts comment failed for #%s: %s", ref, exc)
@@ -599,9 +629,15 @@ class NexusInitiativeService:
         experiment, or a link without a known experiment, keeps it blocked,
         and such an issue is not reported as out of attempts (#457): its work
         has not stopped.
+
+        A pipeline crash is not an attempt (#467). ``_MAX_ISSUE_ATTEMPTS``
+        crashes block the issue until origin/main has a commit newer than the
+        last crash, so a broken pipeline gets one more run per commit.
         """
         # issue -> experiment -> (when, why it failed)
         failed: dict[int, dict[str, tuple[str, str]]] = {}
+        # issue -> experiment -> (when it ended, the crash)
+        crashes: dict[int, dict[str, tuple[str, str]]] = {}
         blocked: set[int] = set()
         for table in ("github_experiment_links", "github_work_links"):
             try:
@@ -633,6 +669,12 @@ class NexusInitiativeService:
                 # An overloaded provider says nothing about the issue: not an attempt.
                 if _is_provider_overload(row["status"], row["error"]):
                     continue
+                if _is_pipeline_crash(row["status"], row["error"]):
+                    crashes.setdefault(number, {})[str(row["experiment_id"])] = (
+                        str(row["ended_at"] or ""),
+                        str(row["error"]),
+                    )
+                    continue
                 # A review that blocked the merge (#396) fails the adoption of
                 # a succeeded experiment: that is a failed attempt too.
                 merge_stopped = self._merge_stopped(row)
@@ -649,14 +691,36 @@ class NexusInitiativeService:
         exhausted = {
             number: {
                 "experiment_ids": sorted(attempts),
-                "last_reason": sanitized_reason(" ".join(max(attempts.values())[1].split()))
-                or "no reason recorded",
+                "last_reason": _last_reason(attempts),
             }
             for number, attempts in failed.items()
             if len(attempts) >= _MAX_ISSUE_ATTEMPTS and number not in blocked
         }
         blocked.update(n for n, attempts in failed.items() if len(attempts) >= _MAX_ISSUE_ATTEMPTS)
+        crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
+        main_commit = self._main_commit_time() if crash_limited else None
+        for number, attempts in crash_limited.items():
+            ended = [_parse_timestamp(when) for when, _ in attempts.values()]
+            if main_commit is not None and all(ended) and main_commit > max(ended):
+                continue
+            if number not in blocked:
+                exhausted[number] = {
+                    "experiment_ids": sorted(attempts),
+                    "last_reason": _last_reason(attempts),
+                    "pipeline_crash": True,
+                }
+            blocked.add(number)
         return blocked, exhausted
+
+    def _main_commit_time(self) -> datetime | None:
+        """When origin/main last moved, from the local ref; ``None`` if unreadable."""
+        if self._main_commit_date is None:
+            return None
+        try:
+            return _parse_timestamp(self._main_commit_date())
+        except Exception as exc:  # noqa: BLE001 - an unreadable date keeps the block
+            logger.warning("initiative: cannot read the origin/main commit date: %s", exc)
+            return None
 
     def _merge_stopped(self, row: sqlite3.Row) -> bool:
         """The experiment succeeded but its merge stopped for good.

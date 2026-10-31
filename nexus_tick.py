@@ -71,6 +71,19 @@ def _checkout_revision(repo_root: str) -> str:
     return proc.stdout.strip()
 
 
+def _main_commit_date(repo_root: str) -> str:
+    """Read the date of the newest commit on the local ``origin/main`` ref."""
+    proc = subprocess.run(
+        ["git", "log", "-1", "--format=%cI", "origin/main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
 def _list_open_issues(repo_root: str) -> list[dict]:
     """Return the open GitHub issue backlog available to Nexus.
 
@@ -237,6 +250,7 @@ def _build_service(args) -> NexusInitiativeService:
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
         diagnostics_client=_service_diagnostics,
         checkout_revision=lambda: _checkout_revision(args.repo_root),
+        main_commit_date=lambda: _main_commit_date(args.repo_root),
         restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
