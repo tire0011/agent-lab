@@ -534,6 +534,20 @@ class ExperimentService:
             ).fetchall()
         return [_row_to_experiment(row) for row in rows]
 
+    def list_gate_recheck_candidates(self) -> list[Experiment]:
+        """Return only terminal runs eligible for a read-only gate recheck."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM experiments
+                WHERE status = ?
+                   OR (status = ? AND error LIKE 'quality evaluation:%')
+                ORDER BY created_at DESC, id DESC
+                """,
+                (STATUS_REJECTED, STATUS_NEEDS_REVIEW),
+            ).fetchall()
+        return [_row_to_experiment(row) for row in rows]
+
     # ------------------------------------------------------------------
     # list_activity — persistent activity log (experiment lifecycle events)
     # ------------------------------------------------------------------

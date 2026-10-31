@@ -348,6 +348,15 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(
+        description="Re-check rejected and quality-review experiments against current gates (read-only).",
+        structured_output=True,
+    )
+    def experiments_gate_recheck() -> dict[str, Any]:
+        from modules.experiment_service.gate_recheck import gate_recheck
+
+        return {"experiments": gate_recheck(_api()._resolve_experiment_service())}
+
     @mcp.tool(description="GET /experiments/{experiment_id}", structured_output=True)
     def experiment_get(experiment_id: str) -> dict[str, Any]:
         nexus_api = _api()
