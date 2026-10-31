@@ -609,6 +609,18 @@ Decision log for architecture and operating choices.
 - Evidence: `tests/test_benchmark.py`.
 - Revisit if: the task set stops representing what `new_experiment` is asked to do.
 
+### D-026: The tool-router MCP server is never the controller
+
+- Status: Accepted
+- Decision: `modules/tool_router_mcp.py` runs `NexusToolRouter` with
+  `controller=False`, and its grants live in memory for one stdio process.
+- Why: `service_restart` and `machine_reboot` are `controller_allowed` for the
+  controller's own session. A local MCP client exists to test the router
+  contract and must not inherit restart rights through it.
+- Evidence: `tests/test_issue_118_tool_router_mcp.py`.
+- Revisit if: an external client needs a mutating operation; that needs its own
+  authorization rule, not the controller flag.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

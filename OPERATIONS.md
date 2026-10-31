@@ -657,6 +657,15 @@ curl -s -X POST .../maintenance/execute \
 
 ---
 
+## Tool-router MCP stdio server
+
+`python -m modules.tool_router_mcp` runs from the repository root and exposes
+only `find_tool` and `call_tool`, read-only, for one client per process. It is
+not a service: the MCP client starts it. Setup and Copilot CLI registration are
+in `docs/issue-118-tool-router-mcp.md`.
+
+---
+
 ## MCP write tools (`MCP_WRITE_ENABLED`)
 
 The MCP server exposes write-capable tools (shell, git_pull, service_restart, …)
