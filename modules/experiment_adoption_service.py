@@ -1683,30 +1683,45 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            cherry_pick = _run_git(
-                ["cherry-pick", "--no-commit", experiment_commit_sha or "HEAD"],
+            # The whole change since the experiment branch left main, not
+            # only its last commit: a retry builds on the earlier attempt's
+            # commits, and picking just its own commit either conflicts or
+            # lands half a change (#455, the reverted #410).
+            squash = _run_git(
+                ["merge", "--squash", experiment_commit_sha or "HEAD"],
                 cwd=str(integration_path),
                 timeout=120,
                 elog=elog,
                 phase="adoption",
             )
-            if cherry_pick.returncode != 0:
+            if squash.returncode != 0:
                 keep_integration = True
-                _run_git(
-                    ["cherry-pick", "--abort"],
-                    cwd=str(integration_path),
-                    timeout=60,
-                    elog=elog,
-                    phase="adoption",
-                )
+                conflicted = self._git_stdout(
+                    ["diff", "--name-only", "--diff-filter=U"], str(integration_path), elog
+                ).split()
+                _run_git(["reset", "--hard", "HEAD"], cwd=str(integration_path), timeout=60, elog=elog, phase="adoption")
                 return self._finish_review(
                     experiment_id,
-                    reason="Integrationskonflikt beim Cherry-Pick.",
+                    reason="Integrationskonflikt: " + (", ".join(conflicted[:10]) or "merge failed"),
                     actual_files=actual_files,
                     expected_files=expected_files,
                     diagnostic_worktree_path=str(integration_path),
                     elog=elog,
                 )
+            # Earlier attempts' files were never checked by an adoption.
+            staged = self._git_stdout(["diff", "--cached", "--name-only"], str(integration_path), elog).split()
+            for rel_path in staged:
+                denied = self._denied_path_reason(rel_path)
+                if denied is not None:
+                    keep_integration = True
+                    return self._finish_review(
+                        experiment_id,
+                        reason=denied,
+                        actual_files=actual_files,
+                        expected_files=expected_files,
+                        diagnostic_worktree_path=str(integration_path),
+                        elog=elog,
+                    )
 
             evidence = self._exact_commit_ci(experiment_id, phase="adoption", elog=elog)
             ci = evidence.verification
