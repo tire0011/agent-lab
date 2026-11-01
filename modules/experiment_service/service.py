@@ -961,6 +961,8 @@ class ExperimentService:
             "Starting implementation (single coding-agent call: analyse, plan, implement)",
         )
         implementation_prompt = _build_direct_implementation_prompt(experiment.goal)
+        if github_work_tracking is not None:
+            implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
         implementation_task_id = uuid.uuid4().hex
         worker = self.worker_factory(worktree_path)
         # Which coding agent got this experiment is recorded before the call,
@@ -1081,6 +1083,44 @@ class ExperimentService:
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
+        )
+
+    def _merge_current_main(self, worktree_path: str, elog: ExperimentLogger) -> str:
+        """Bring today's main into a retry's issue branch (#478).
+
+        A retry continues the issue branch, which can lag far behind main;
+        its change then conflicts at adoption every time. Merging main first
+        lets the coding agent resolve a conflict once, in the experiment,
+        where tests and review still check it. Returns a note for the prompt
+        when conflict markers are left to resolve, else "".
+        """
+        def git(*args: str) -> subprocess.CompletedProcess:
+            return _run_git(
+                ["-c", "user.name=Nexus", "-c", "user.email=nexus@agent-lab.local", *args],
+                cwd=worktree_path, timeout=120, elog=elog, phase="implementation",
+            )
+
+        if git("fetch", "--no-tags", "origin", "main").returncode != 0:
+            return ""
+        if git("merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD").returncode == 0:
+            return ""
+        if git("merge", "--no-edit", "FETCH_HEAD").returncode == 0:
+            elog.info("implementation", "base_merged_clean", "Merged current main into the issue branch")
+            return ""
+        conflicted = git("diff", "--name-only", "--diff-filter=U").stdout.split()
+        if not conflicted:
+            git("merge", "--abort")
+            return ""
+        git("add", "-A")
+        git("commit", "--no-verify", "-m", "Merge main; conflicts left for the coding agent")
+        elog.warning(
+            "implementation", "base_merge_conflict",
+            f"Merging current main left conflicts in: {', '.join(conflicted[:20])}",
+        )
+        return (
+            "FIRST: merging the current main into this branch left conflict markers "
+            "(<<<<<<<, =======, >>>>>>>) in: " + ", ".join(conflicted[:20]) + ". Resolve "
+            "them, keeping what both sides intended, then do the task below.\n\n"
         )
 
     def _record_verification_run(
