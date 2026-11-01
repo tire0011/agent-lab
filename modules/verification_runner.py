@@ -50,6 +50,7 @@ from modules.test_progress import (
     ProgressTracker,
     UnittestStreamParser,
     format_stall_diagnostics,
+    parse_failed_test_ids,
     parse_total_tests,
 )
 from modules.test_run_log import VerificationTestLog, prune_test_logs
@@ -201,6 +202,8 @@ class VerificationRunResult:
     tests_total: int | None = None
     #: Canonical unittest IDs which failed, errored, or were running at a stall.
     failed_test_ids: list[str] | None = None
+    #: The test the watchdog found running when it aborted the run, if any.
+    aborted_test_id: str | None = None
     #: Canonical unittest IDs which the runner actually observed starting.
     #:
     #: Baseline rechecks use this to distinguish a real result for the
@@ -349,6 +352,11 @@ def run_verification_test_monitored(
     tracker.set_total_tests(total_tests)
 
     exit_code = process.returncode
+    # The closing report is authoritative once the suite got that far; the live
+    # events only have to stand in for a run that was aborted before it.
+    reported_failures = parse_failed_test_ids(stderr_text)
+    if total_tests is not None and (reported_failures or exit_code == 0):
+        failed_test_ids = reported_failures
     if on_process is not None:
         on_process(None)
     # A negative return code means a signal, not a verdict: the suite never
@@ -360,6 +368,7 @@ def run_verification_test_monitored(
     test_log.write_heartbeat(final_snapshot)
 
     diagnostics: str | None = None
+    aborted_test_id: str | None = None
     if process_died:
         diagnostics = format_stall_diagnostics(
             final_snapshot,
@@ -377,7 +386,8 @@ def run_verification_test_monitored(
         test_log.log_run_event(abort_reason, diagnostics, **(stall_snapshot or final_snapshot))
         current_test = (stall_snapshot or final_snapshot).get("current_test")
         if current_test:
-            failed_test_ids.add(str(current_test))
+            aborted_test_id = str(current_test)
+            failed_test_ids.add(aborted_test_id)
     else:
         test_log.log_run_event(
             "test_run_finished",
@@ -400,6 +410,7 @@ def run_verification_test_monitored(
         test_log_path=str(test_log.path),
         tests_total=total_tests,
         failed_test_ids=sorted(failed_test_ids),
+        aborted_test_id=aborted_test_id,
         observed_test_ids=sorted(observed_test_ids),
     )
 

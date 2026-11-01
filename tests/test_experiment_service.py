@@ -551,6 +551,41 @@ class ExperimentServiceTestCase(unittest.TestCase):
         runs = self.service.list_verification_runs(experiment.id)
         self.assertEqual([run["status"] for run in runs], [STATUS_NEEDS_REVIEW])
 
+    def test_failed_verification_gets_bounded_repair_in_same_worktree(self):
+        calls = 0
+
+        def repairable_worker(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            worktree = Path(kwargs["working_dir"])
+            (worktree / "implementation.py").write_text('"""implemented."""\n')
+            assertion = "self.assertTrue(False)" if calls == 1 else "self.assertTrue(True)"
+            (worktree / "tests" / "test_added.py").write_text(
+                "import unittest\n\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_new(self):\n"
+                f"        {assertion}\n"
+            )
+            return _make_result(sandbox="workspace-write")
+
+        self.implementation_worker.run.side_effect = repairable_worker
+        self.service.test_python_executable = sys.executable
+        experiment = self.service.create_experiment(goal="Fix the failing test.")
+        result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.assertEqual(calls, 2)
+        runs = self.service.list_verification_runs(experiment.id)
+        self.assertEqual([run["status"] for run in runs], [STATUS_FAILED, STATUS_SUCCEEDED])
+        self.assertEqual(
+            self.implementation_worker.run.call_args_list[1].kwargs["phase"],
+            "implementation_repair",
+        )
+        self.assertIn(
+            "tests failed",
+            self.implementation_worker.run.call_args_list[1].kwargs["task"],
+        )
+
     def test_default_test_command_uses_verbose_unittest_discover(self):
         """Verbose, because the progress watchdog (#209) reads the per-test
         stream to know which test is running; the runner strips those lines
