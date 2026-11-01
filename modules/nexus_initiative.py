@@ -97,11 +97,17 @@ def _is_provider_overload(status: Any, error: Any) -> bool:
     """A run that failed because the coding agent's API was overloaded.
 
     A crash may quote "429" or "rate limit", but it stays a crash: an overload
-    is free of every limit, and a crash loop must not be.
+    is free of every limit, and a crash loop must not be. Neither is a test
+    failure an overload because the failing test is called test_rate_limit_*.
     """
     from modules.coding_provider import is_provider_overload
 
-    return status == "failed" and is_provider_overload(error) and not _is_pipeline_crash(status, error)
+    return (
+        status == "failed"
+        and is_provider_overload(error)
+        and not _is_pipeline_crash(status, error)
+        and not str(error or "").startswith("tests failed")
+    )
 
 
 def _is_pipeline_crash(status: Any, error: Any) -> bool:

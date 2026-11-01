@@ -27,6 +27,7 @@ from modules.coding_provider import (
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
+from modules.github_work_tracking import failing_test_names
 from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import (
@@ -85,6 +86,7 @@ _WARNING_STATUSES = frozenset(
 _ERROR_STATUSES = frozenset({"failed", "timed_out"})
 
 _DEFAULT_MAX_TEST_OUTPUT_BYTES = 32 * 1024
+_MAX_ERROR_TEST_NAMES = 3
 _DEFAULT_MAX_DIFF_BYTES = 64 * 1024
 _DEFAULT_MAX_RAW_MESSAGE_BYTES = 16 * 1024
 _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES = 64 * 1024
@@ -1366,6 +1368,7 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         test_timed_out = False
+        ci_failure_detail = None
         if not use_local_tests:
             test_command = ["GitHub Actions", "tests.yml", ci_verification.commit_sha]
             test_exit_code = 0 if ci_verification.status == "passed" else 1
@@ -1375,6 +1378,10 @@ class ExperimentService:
                 f"{ci_verification.conclusion or 'unknown'}."
                 + (f" {ci_verification.url}" if ci_verification.url else "")
             )
+            # The first line stays as it is: ci_evidence_backfill parses it.
+            ci_failure_detail = getattr(ci_verification, "failure_detail", None)
+            if ci_failure_detail:
+                test_output = f"{test_output}\n{ci_failure_detail}"
         else:
             watchdog = self._get_test_watchdog_config()
             expected_total = self._get_expected_test_total()
@@ -1497,6 +1504,9 @@ class ExperimentService:
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"
+            failing_tests = failing_test_names(ci_failure_detail, limit=_MAX_ERROR_TEST_NAMES)
+            if failing_tests:
+                error = f"{error}: {', '.join(failing_tests)}"
             elog.error(
                 "verifying",
                 "tests_failed" if repair_iteration == 0 else "tests_failed_repair",

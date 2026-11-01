@@ -112,7 +112,8 @@ def _parse_authoritative_ci(row: sqlite3.Row, checkpoint_sha: str):
     workflow = str(command[1] or "").strip()
     if not workflow:
         return None
-    match = _CI_OUTPUT_RE.fullmatch(str(row["output"] or "").strip())
+    # Later lines carry the failure detail of a red run (#472).
+    match = _CI_OUTPUT_RE.fullmatch(str(row["output"] or "").strip().partition("\n")[0].strip())
     if match is None or match.group("commit").lower() != checkpoint_sha:
         return None
 
