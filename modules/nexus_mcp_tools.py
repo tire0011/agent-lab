@@ -34,6 +34,7 @@ READ_ONLY_TOOLS: tuple[str, ...] = (
     "maintenance_status_get",
     "maintenance_audit_get",
     "github_issues",
+    "github_issue",
     "git_log",
 )
 
