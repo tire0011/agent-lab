@@ -358,7 +358,22 @@ _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS = [
     ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("publish_last_error", "TEXT"),
     ("outbox_content", "TEXT"),
+    ("merge_forbidden", "INTEGER NOT NULL DEFAULT 0"),
+    ("merge_constraint_reason", "TEXT"),
 ]
+
+
+def record_merge_constraint(conn: sqlite3.Connection, approval_id: str, task_body: str | None) -> None:
+    """Persist a task's explicit no-merge instruction on its approval (#185)."""
+    from modules.work_directives import parse_work_directives
+
+    directives = parse_work_directives(task_body)
+    if directives.forbid_merge:
+        conn.execute(
+            """UPDATE mailbox_task_approvals
+               SET merge_forbidden=1, merge_constraint_reason=? WHERE id=?""",
+            (directives.merge_constraint_reason, approval_id),
+        )
 
 
 def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
@@ -386,6 +401,8 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             publish_last_error TEXT NULL,
             result_summary TEXT NULL,
             error TEXT NULL,
+            merge_forbidden INTEGER NOT NULL DEFAULT 0,
+            merge_constraint_reason TEXT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -451,6 +468,15 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             (approval_id, msg_id, task_body, created_by or "", file_path or "",
              received_at or now, status, error, now, now),
         )
+
+    # Rows created before the structured constraint, and the orphans above,
+    # keep their original body: a restart must not forget an older
+    # "do not merge" instruction.
+    candidates = conn.execute(
+        "SELECT id, task_body FROM mailbox_task_approvals WHERE merge_forbidden=0"
+    ).fetchall()
+    for approval_id, task_body in candidates:
+        record_merge_constraint(conn, approval_id, task_body)
 
 
 def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
