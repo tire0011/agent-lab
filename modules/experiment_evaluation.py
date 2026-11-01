@@ -42,6 +42,7 @@ Two entry points are used by ``ExperimentService``:
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -195,15 +196,62 @@ def parse_git_status_short(git_status_text: str | None) -> ChangedFiles:
 _GOAL_PATH_RE = re.compile(r"\b[\w][\w-]*(?:/[\w.-]+)+\.[A-Za-z0-9]{1,8}\b")
 
 
+# A section heading at the start of a line: "Change:", "**Change**", "## Change".
+_SECTION_HEADING_RE = re.compile(
+    r"^[ \t]*(?:#+[ \t]*|\*\*)?(problem|change|changes|test|tests|why|context|background|notes?)\b"
+    r"(?:\*\*|[ \t]*:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _change_section(task: str) -> str:
+    """The Change section of an issue that has sections, else the whole text.
+
+    Problem and Test sections name files that already exist or test fixtures
+    (#416: example paths made #403 and #416 fail their own gate).
+    """
+    headings = list(_SECTION_HEADING_RE.finditer(task))
+    for index, heading in enumerate(headings):
+        if heading.group(1).lower() in ("change", "changes"):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(task)
+            return task[heading.start():end]
+    return task
+
+
 def extract_explicit_goal_artifacts(goal: str) -> list[str]:
+    # Only the task itself names files to create. The handover appended to it
+    # (#263) quotes whatever Nexus looked at - file listings, command output -
+    # and made ".git/hooks/*.sample" a required artifact for #349.
+    from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
+
+    task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+    task = _change_section(task)
     found: list[str] = []
-    for match in _GOAL_PATH_RE.finditer(goal or ""):
+    for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
-        if is_test_path(path) or is_ignored_support_path(path):
+        if match.start() > 0 and task[match.start() - 1] == ".":
+            # "\b" starts the match after a leading dot: ".git/hooks/x" would
+            # become "git/hooks/x". Dot paths are never artifacts (#403).
+            continue
+        if path.startswith("git/"):
+            # The same paths quoted from gate output, already without the dot;
+            # the repository has no git/ directory (#403).
+            continue
+        if is_test_path(path) or is_ignored_support_path(path) or _is_placeholder_path(path):
             continue
         if path not in found:
             found.append(path)
     return found[:10]
+
+
+# Example names in an issue ("modules/a.py", "new_thing.py") are not files
+# the change must create (#433, #455).
+_PLACEHOLDER_STEMS = frozenset({"foo", "bar", "baz", "example", "new_thing", "some_file", "my_module"})
+
+
+def _is_placeholder_path(path: str) -> bool:
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    return len(stem) == 1 or stem in _PLACEHOLDER_STEMS
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +429,19 @@ class EvaluationResult:
         }
 
 
+def _git_ignored(path: str, worktree_path: str | None) -> bool:
+    """True if git ignores *path* in *worktree_path*; never raises."""
+    if not worktree_path or not path:
+        return False
+    try:
+        return subprocess.run(
+            ["git", "-C", worktree_path, "check-ignore", "-q", "--", _normalize_path(path)],
+            capture_output=True, timeout=10, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _artifact_exists(artifact: str, worktree_path: str | None) -> bool:
     """True if *artifact* exists as a real file inside *worktree_path*.
 
@@ -470,6 +531,9 @@ def evaluate_implementation(
             required_artifacts = extract_explicit_goal_artifacts(goal)
         expected_files = required_artifacts
 
+        # A git-ignored path (runtime state such as state/mailbox.lock) can
+        # never be committed, so it cannot be a required artifact (#185).
+        required_artifacts = [a for a in required_artifacts if not _git_ignored(a, worktree_path)]
         missing_artifacts = [a for a in required_artifacts if not _artifact_exists(a, worktree_path)]
         if missing_artifacts:
             checks.append(EvaluationCheck(

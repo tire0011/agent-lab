@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.request
 from datetime import datetime, timezone
 
 from modules.logging_config import configure_logging
@@ -33,8 +34,54 @@ logger = logging.getLogger("nexus_tick")
 
 _ISSUE_LIMIT = 100
 
+# The exploring planner (#384) reads code and calls tools; bound it.
+_PLANNER_TIMEOUT_SECONDS = 900
+_PLANNER_STALL_SECONDS = 300
+
 # Things worth telling Claude about, collected during one tick (#365).
 _events: list[str] = []
+
+
+def _service_diagnostics() -> dict:
+    url = os.environ.get(
+        "NEXUS_DIAGNOSTICS_URL", "http://127.0.0.1:8000/diagnostics/public"
+    )
+    with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - fixed/operator URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _restart_stale_service() -> None:
+    from modules.task_finalization import TaskFinalizationCoordinator
+
+    TaskFinalizationCoordinator._restart_services(
+        TaskFinalizationCoordinator._restart_service_names()
+    )
+
+
+def _checkout_revision(repo_root: str) -> str:
+    """Read the revision of the checkout executing this initiative tick."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _main_commit_date(repo_root: str) -> str:
+    """Read the date of the newest commit on the local ``origin/main`` ref."""
+    proc = subprocess.run(
+        ["git", "log", "-1", "--format=%cI", "origin/main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
@@ -110,8 +157,47 @@ def _count_open_proposals(repo_root: str) -> int:
     return len(json.loads(proc.stdout or "[]"))
 
 
-def _planner():
-    """The planning step runs on Azure, like the controller (#337, #354)."""
+def _explore_with_claude(repo_root: str, prompt: str) -> str:
+    """Plan as a read-only Claude agent with the Nexus MCP read tools (#384)."""
+    import tempfile
+
+    from modules.claude_worker import ClaudeWorker
+    from modules.nexus_mcp_tools import READ_ONLY_TOOLS, WRITE_TOOLS
+
+    key = os.environ.get("AGENT_API_KEY", "")
+    if not key:
+        raise RuntimeError("AGENT_API_KEY is not set")
+    config = {"mcpServers": {"nexus": {
+        "type": "http",
+        "url": os.environ.get("NEXUS_MCP_URL", "http://127.0.0.1:8000/mcp/"),
+        "headers": {"x-api-key": key},
+    }}}
+    allowed = ",".join(f"mcp__nexus__{name}" for name in READ_ONLY_TOOLS)
+    # Not pre-approved is already denied; naming the write tools makes it explicit.
+    denied = ",".join(f"mcp__nexus__{name}" for name in WRITE_TOOLS)
+    with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+        json.dump(config, handle)
+        handle.flush()
+        result = ClaudeWorker().run(
+            task=prompt,
+            working_dir=repo_root,
+            sandbox="read-only",
+            timeout_seconds=_PLANNER_TIMEOUT_SECONDS,
+            stall_seconds=_PLANNER_STALL_SECONDS,
+            phase="planning",
+            extra_args=[
+                "--mcp-config", handle.name,
+                "--allowedTools", allowed,
+                "--disallowedTools", denied,
+            ],
+        )
+    if not result.success:
+        raise RuntimeError(result.error or "claude planning failed")
+    return result.final_message or ""
+
+
+def _planner(repo_root: str):
+    """Plan as an exploring agent; a single Azure call is the fallback (#337, #354, #384)."""
     import asyncio
 
     from modules.nexus_delegation import NexusDelegationService
@@ -127,7 +213,7 @@ def _planner():
             raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
         return str(result.get("content") or "")
 
-    return IssuePlanner(complete)
+    return IssuePlanner(complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt))
 
 
 def _build_service(args) -> NexusInitiativeService:
@@ -138,7 +224,11 @@ def _build_service(args) -> NexusInitiativeService:
     from modules.task_orchestrator import NexusTaskOrchestrator
 
     experiment_service = ExperimentService(db_path=args.db_path)
-    adoption_service = ExperimentAdoptionService(experiment_service=experiment_service)
+    from modules.nexus_reviewer import default_reviewer
+
+    adoption_service = ExperimentAdoptionService(
+        experiment_service=experiment_service, reviewer=default_reviewer(args.db_path),
+    )
     controller = None
     if not args.integration_only:
         registry = OperationsRegistry(experiment_service=experiment_service)
@@ -154,10 +244,14 @@ def _build_service(args) -> NexusInitiativeService:
         adoption_service=adoption_service,
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
-        planner=_planner() if controller else None,
+        planner=_planner(args.repo_root) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
+        diagnostics_client=_service_diagnostics,
+        checkout_revision=lambda: _checkout_revision(args.repo_root),
+        main_commit_date=lambda: _main_commit_date(args.repo_root),
+        restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
 
@@ -190,6 +284,25 @@ def _reconcile_stale_claims(db_path: str) -> None:
                 pass
 
 
+def _cleanup_expired_worktrees(service) -> None:
+    """Remove worktrees of terminal experiments past their retention (#376).
+
+    The API only cleans up at startup; the tick is what keeps a long-running
+    deployment from filling its disk. Never fails the tick.
+    """
+    experiment_service = getattr(service, "experiment_service", None)
+    if experiment_service is None:
+        return
+    try:
+        result = experiment_service.cleanup_expired_worktrees()
+        if result.removed:
+            logger.info("removed %d expired experiment worktree(s)", len(result.removed))
+        for experiment_id, reason in result.errors.items():
+            logger.warning("could not remove worktree of experiment %s: %s", experiment_id, reason)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not break a tick
+        logger.warning("could not clean up expired experiment worktrees: %s", exc)
+
+
 def _wait_for_experiments() -> None:
     """Keep the process alive until the work it started has ended (#358).
 
@@ -200,8 +313,17 @@ def _wait_for_experiments() -> None:
     from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
     from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
 
-    for thread in threading.enumerate():
-        if thread.name.startswith((EXPERIMENT_THREAD_PREFIX, ADOPTION_THREAD_PREFIX)):
+    # A thread can start the next one - a controller session that resumes
+    # after a rejected experiment starts a new one (#388) - so look again
+    # until none is left.
+    while True:
+        pending = [
+            thread for thread in threading.enumerate()
+            if thread.is_alive() and thread.name.startswith((EXPERIMENT_THREAD_PREFIX, ADOPTION_THREAD_PREFIX))
+        ]
+        if not pending:
+            return
+        for thread in pending:
             logger.info("waiting for %s to finish", thread.name)
             thread.join()
 
@@ -277,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
     # included.
     if not args.dry_run:
         _reconcile_stale_claims(args.db_path)
+        from modules.main_guard import guard_main
+
+        reverted = guard_main(args.repo_root)
+        if reverted:
+            logger.warning("main guard: %s", reverted)
+            _events.append(reverted)
 
     service = _build_service(args)
     try:
@@ -303,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             if busy:
                 logger.info("would do nothing: %s", busy)
                 return 0
-            candidates = service.candidates()
+            candidates = service.candidates(record_skips=False)
             if not candidates:
                 logger.info("would do nothing: no actionable work")
                 return 0
@@ -325,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if decision.decision != "error" else 1
     finally:
         _wait_for_experiments()
+        if not args.dry_run:
+            _cleanup_expired_worktrees(service)
         service.close()
         if not args.dry_run:
             if decision is not None and decision.decision == "error":

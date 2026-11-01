@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - 'nexus/**'
+      # A red main after a Nexus merge is reverted by the tick (modules/main_guard.py).
+      - main
   pull_request:
     branches: [main]
   workflow_dispatch:

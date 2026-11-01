@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.nexus_reviewer import default_reviewer
 from modules.experiment_adoption_service import (
     _NullExperimentLogger,
     STATUS_ADOPTED,
@@ -58,7 +59,7 @@ _DEFAULT_RESTART_TIMEOUT_SECONDS = 600
 # one that works may stop this very process before it returns.
 _RESTART_FAILURE_WINDOW_SECONDS = 5
 _ACTIVE_APPROVAL_STATUSES = {
-    "pending_approval", "approved", "submitted", "running", "nexus_deciding",
+    "queued", "pending_approval", "approved", "submitted", "running", "nexus_deciding",
 }
 # Restarted after an adopted change. scripts/setup-nexus-permissions.sh grants
 # the service user exactly the transient-unit command assembled below.
@@ -133,6 +134,7 @@ class TaskFinalizationCoordinator:
             db_path=db_path,
             repo_root=str(self.repo_root),
             github_work_tracking=github_work_tracking,
+            reviewer=default_reviewer(db_path),
         )
         self._owns_adoption_service = adoption_service is None
         self._restart_runner = restart_runner or self._restart_services

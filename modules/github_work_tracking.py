@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.redaction import redact_credentials
 from modules.run_store import DEFAULT_DB_PATH, _connect
 from modules.work_directives import WorkDirectives, parse_work_directives
 
@@ -29,6 +30,27 @@ _DEFAULT_CI_WORKFLOW = "tests.yml"
 _DEFAULT_CI_START_TIMEOUT_SECONDS = 90.0
 _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS = 1500.0
 _DEFAULT_CI_POLL_INTERVAL_SECONDS = 10.0
+_MAX_COMMIT_TITLE_CHARS = 72
+_MAX_CI_FAILURE_DETAIL_CHARS = 8000
+_MAX_CI_FAILURE_TAIL_LINES = 80
+_MAX_CI_FAILED_TEST_LINES = 30
+_MAX_CI_FAILURE_LINE_CHARS = 200
+_CI_FAILED_CONCLUSIONS = ("failure", "timed_out")
+_CI_JOB_LOG_PATH_RE = re.compile(r"/actions/jobs/\d+/logs$")
+# Every line of a job log starts with its own timestamp. Dropping it keeps the
+# detail readable and keeps two identical failures from fingerprinting apart.
+_CI_LOG_PREFIX_RE = re.compile(r"^\ufeff?(?:\d{4}-\d{2}-\d{2}T[\d:.]+Z ?)?")
+_CI_LOG_COLOR_RE = re.compile(r"\x1b\[[0-9;]*m")
+# CI runs pytest (scripts/run_tests_ci.py), the local fallback runs unittest.
+# Each form is anchored to the shape of a test id, so that a line such as pip's
+# "ERROR: Could not find a version" or a log record is not taken for a test.
+_CI_FAILED_TEST_RE = re.compile(
+    r"^(?:"
+    r"(?:FAIL|ERROR): (?P<unittest>\S+(?: \([\w.]+\))?)"
+    r"|(?:FAILED|ERROR) (?P<pytest>\S+\.py(?:::.+?)?)(?: - .*)?"
+    r"|_+ ERROR (?:collecting|at \w+ of) (?P<section>\S+) _+"
+    r")$"
+)
 
 # The opening sentence of every lifecycle-readiness refusal. Exported so a
 # consumer that has only a *persisted* refusal text - written before the
@@ -53,6 +75,75 @@ def _slug(text: str, *, max_len: int = 48) -> str:
 
 def _normalise_title(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split())
+
+
+def _issue_commit_title(issue_title: str, issue_number: int, *, max_len: int = _MAX_COMMIT_TITLE_CHARS) -> str:
+    """Return ``<issue title> (#N)`` without a ``WIP:`` prefix, at most ``max_len`` chars (#423).
+
+    The planner reads main's ``git log`` to see which issues already landed;
+    a squash title naming only the experiment id cannot be linked back.
+    """
+    suffix = f" (#{issue_number})"
+    title = " ".join((issue_title or "").split())
+    while re.match(r"(?i)^wip:\s*", title):
+        title = re.sub(r"(?i)^wip:\s*", "", title, count=1)
+    title = title or f"Issue {issue_number}"
+    room = max(max_len - len(suffix), 1)
+    if len(title) > room:
+        title = title[:room].rstrip()
+    return title + suffix
+
+
+def _failing_test_line(line: str) -> str | None:
+    match = _CI_FAILED_TEST_RE.match(line.strip())
+    if match is None:
+        return None
+    return match.group("unittest") or match.group("pytest") or match.group("section")
+
+
+def failing_test_names(text: str | None, *, limit: int | None = None) -> list[str]:
+    """The distinct failing tests named in CI output, in the order they appear."""
+    names: list[str] = []
+    for line in (text or "").splitlines():
+        name = _failing_test_line(line)
+        if name and name not in names:
+            names.append(name)
+    return names[:limit]
+
+
+def _ci_failure_detail_text(job: str, step: str | None, log: str) -> str:
+    """Job, step, failing tests and log tail, redacted and within the cap.
+
+    Redaction runs over the whole log first: a cut made earlier could split a
+    secret into a piece the patterns no longer recognize.
+    """
+    lines = [
+        _CI_LOG_COLOR_RE.sub("", _CI_LOG_PREFIX_RE.sub("", line))
+        for line in redact_credentials(log).splitlines()
+    ]
+    head = [f"Failed job: {redact_credentials(job)[:_MAX_CI_FAILURE_LINE_CHARS]}"]
+    if step:
+        head.append(f"Failed step: {redact_credentials(step)[:_MAX_CI_FAILURE_LINE_CHARS]}")
+    failed = list(dict.fromkeys(line.strip() for line in lines if _failing_test_line(line)))
+    if failed:
+        head.append("Failing tests:")
+        head.extend(
+            line[:_MAX_CI_FAILURE_LINE_CHARS] for line in failed[:_MAX_CI_FAILED_TEST_LINES]
+        )
+    head.append("Log tail:\n")
+    prefix = "\n".join(head)
+
+    # What follows the failed step's closing error is post-job cleanup.
+    errors = [index for index, line in enumerate(lines) if line.startswith("##[error]")]
+    if errors:
+        lines = lines[: errors[-1] + 1]
+    tail = "\n".join(lines[-_MAX_CI_FAILURE_TAIL_LINES:])
+    room = _MAX_CI_FAILURE_DETAIL_CHARS - len(prefix)
+    return prefix + tail[-room:]
+
+
+def _experiment_trailer(experiment_id: str | None) -> str:
+    return f"Nexus-Experiment: {experiment_id}" if experiment_id else ""
 
 
 def _infer_repository(repo_root: str) -> str | None:
@@ -102,6 +193,24 @@ class GitHubCIVerification:
     run_id: int | None = None
     url: str | None = None
     reason: str | None = None
+    failure_detail: str | None = None
+
+
+class _CrossHostRedirectDropsToken(urllib.request.HTTPRedirectHandler):
+    """Keep the token on GitHub: a job log redirects to third-party storage."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if (
+            redirected is not None
+            and urllib.parse.urlsplit(newurl).hostname
+            != urllib.parse.urlsplit(req.full_url).hostname
+        ):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+_GITHUB_OPENER = urllib.request.build_opener(_CrossHostRedirectDropsToken)
 
 
 class GitHubWorkTrackingError(RuntimeError):
@@ -595,6 +704,13 @@ class GitHubWorkTrackingService:
         ).stdout.strip()
         checkpoint_sha = checkpoint_base
         if tree_sha != base_tree:
+            if ref.issue_number:
+                checkpoint_message = (
+                    f"WIP: {_issue_commit_title(ref.issue_title, ref.issue_number)}\n\n"
+                    f"{_experiment_trailer(experiment_id)}"
+                )
+            else:
+                checkpoint_message = f"WIP: Nexus experiment {experiment_id[:8]}"
             checkpoint_sha = self._git(
                 [
                     "commit-tree",
@@ -602,7 +718,7 @@ class GitHubWorkTrackingService:
                     "-p",
                     checkpoint_base,
                     "-m",
-                    f"WIP: Nexus experiment {experiment_id[:8]}",
+                    checkpoint_message,
                 ],
                 cwd=worktree_path,
             ).stdout.strip()
@@ -881,6 +997,48 @@ class GitHubWorkTrackingService:
                 exc_info=True,
             )
 
+        return self._poll_ci(
+            sha,
+            experiment_id=experiment_id,
+            integration_base=integration_base,
+            workflow=workflow,
+            start_timeout_seconds=start_timeout_seconds,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def wait_for_commit_ci(
+        self,
+        sha: str,
+        *,
+        experiment_id: str,
+        workflow: str = _DEFAULT_CI_WORKFLOW,
+        start_timeout_seconds: float = _DEFAULT_CI_START_TIMEOUT_SECONDS,
+        completion_timeout_seconds: float = _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _DEFAULT_CI_POLL_INTERVAL_SECONDS,
+    ) -> GitHubCIVerification:
+        """CI for one exact commit, such as the integrated tree adoption is about to merge."""
+        return self._poll_ci(
+            sha,
+            experiment_id=experiment_id,
+            integration_base="",
+            workflow=workflow,
+            start_timeout_seconds=start_timeout_seconds,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def _poll_ci(
+        self,
+        sha: str,
+        *,
+        experiment_id: str,
+        integration_base: str,
+        workflow: str,
+        start_timeout_seconds: float,
+        completion_timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> GitHubCIVerification:
         started_deadline = time.monotonic() + max(0.0, start_timeout_seconds)
         completion_deadline: float | None = None
         encoded_workflow = urllib.parse.quote(workflow, safe="")
@@ -921,12 +1079,14 @@ class GitHubWorkTrackingService:
                 if str(run.get("status") or "").lower() == "completed":
                     conclusion = str(run.get("conclusion") or "unknown").lower()
                     run_sha = str(run.get("head_sha") or "").strip()
+                    failure_detail = None
                     if conclusion == "success":
                         status = "passed"
                         reason = None
                     elif conclusion == "failure":
                         status = "failed"
                         reason = None
+                        failure_detail = self._ci_failure_detail(run.get("id"))
                     else:
                         status = "unavailable"
                         reason = f"GitHub Actions completed without authoritative result: {conclusion}"
@@ -937,6 +1097,7 @@ class GitHubWorkTrackingService:
                         run_id=int(run["id"]) if run.get("id") is not None else None,
                         url=str(run.get("html_url") or "") or None,
                         reason=reason,
+                        failure_detail=failure_detail,
                     )
                     # Persist here, at the single point that knows the
                     # verdict is authoritative and which commit it is for,
@@ -982,6 +1143,39 @@ class GitHubWorkTrackingService:
                 )
 
             time.sleep(max(0.01, poll_interval_seconds))
+
+    def _ci_failure_detail(self, run_id: Any) -> str | None:
+        """What failed in a red run, or ``None`` if GitHub would not say.
+
+        Best effort: the verdict is already settled, so nothing that goes wrong
+        here, not even a malformed response, may change it.
+        """
+        try:
+            response = self._request(
+                "GET", f"/repos/{self.repository}/actions/runs/{int(run_id)}/jobs"
+            )
+            job = next(
+                job for job in response.get("jobs") or []
+                if str(job.get("conclusion") or "") in _CI_FAILED_CONCLUSIONS
+            )
+            step = next(
+                (
+                    step for step in job.get("steps") or []
+                    if str(step.get("conclusion") or "") in _CI_FAILED_CONCLUSIONS
+                ),
+                {},
+            )
+            log = self._request(
+                "GET", f"/repos/{self.repository}/actions/jobs/{int(job['id'])}/logs"
+            )
+            if not isinstance(log, str):
+                raise GitHubWorkTrackingError("GitHub returned no job log text")
+            return _ci_failure_detail_text(
+                str(job.get("name") or "unknown"), step.get("name"), log
+            )
+        except Exception:  # noqa: BLE001 - never let this touch the verdict
+            logger.warning("could not read failure detail of CI run %s", run_id, exc_info=True)
+            return None
 
     def publish_final_tree(
         self,
@@ -1136,6 +1330,15 @@ class GitHubWorkTrackingService:
             raise MergeForbiddenError(refusal)
 
         payload: dict[str, Any] = {"merge_method": "squash"}
+        if ref.issue_number:
+            # Without an explicit title GitHub reuses a single commit's
+            # message, so main would only show the experiment id (#423).
+            payload["commit_title"] = _issue_commit_title(ref.issue_title, ref.issue_number)
+            payload["commit_message"] = "\n\n".join(
+                part
+                for part in (f"Closes #{ref.issue_number}", _experiment_trailer(ref.experiment_id))
+                if part
+            )
         if expected_head_sha:
             payload["sha"] = expected_head_sha
         result = self._request(
@@ -1148,12 +1351,19 @@ class GitHubWorkTrackingService:
         self._close_completed_issue(ref)
         return str(result.get("sha") or expected_head_sha or "")
 
+    def comment(self, number: int, body: str) -> None:
+        """Comment on an issue or pull request (#396: review results)."""
+        self._request("POST", f"/repos/{self.repository}/issues/{number}/comments", {"body": body[:60000]})
+
     def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
-        self._request(
-            "PATCH",
-            f"/repos/{self.repository}/issues/{ref.issue_number}",
-            {"state": "closed", "state_reason": "completed"},
-        )
+        path = f"/repos/{self.repository}/issues/{ref.issue_number}"
+        try:
+            self._request("PATCH", path, {"state": "closed", "state_reason": "completed"})
+        except GitHubWorkTrackingError:
+            # The merge's "Fixes #N" can close the issue first; GitHub then
+            # answers 422 "closed by another request". Closed is closed.
+            if str((self._request("GET", path) or {}).get("state")) != "closed":
+                raise
 
     def _remote_branch_sha(self, branch_name: str) -> str:
         quoted = urllib.parse.quote(branch_name, safe="")
@@ -1279,11 +1489,17 @@ class GitHubWorkTrackingService:
         sha = str(((base.get("object") or {}).get("sha") or "")).strip()
         if not sha:
             raise GitHubWorkTrackingError("could not resolve target branch SHA")
-        self._request(
-            "POST",
-            f"/repos/{self.repository}/git/refs",
-            {"ref": f"refs/heads/{branch_name}", "sha": sha},
-        )
+        try:
+            self._request(
+                "POST",
+                f"/repos/{self.repository}/git/refs",
+                {"ref": f"refs/heads/{branch_name}", "sha": sha},
+            )
+        except GitHubWorkTrackingError as exc:
+            # The branch exists (a retry, #374, or a lookup that missed it):
+            # that is the state this method ensures, not a failure.
+            if "HTTP 422" not in str(exc) or "Reference already exists" not in str(exc):
+                raise
 
     def _find_by_source(self, source_type: str, source_id: str) -> GitHubWorkRef | None:
         row = self._conn.execute(
@@ -1401,13 +1617,17 @@ class GitHubWorkTrackingService:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                raw = response.read().decode("utf-8")
+            with _GITHUB_OPENER.open(request, timeout=20) as response:
+                body = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
             raise GitHubWorkTrackingError(f"GitHub HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise GitHubWorkTrackingError(f"GitHub request failed: {exc}") from exc
+        # The one endpoint here that answers with plain text, not JSON.
+        if _CI_JOB_LOG_PATH_RE.search(path):
+            return body.decode("utf-8", errors="replace")
+        raw = body.decode("utf-8")
         if not raw:
             return {}
         try:

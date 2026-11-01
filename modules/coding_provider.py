@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -189,6 +190,22 @@ def choose_provider(
         raise
     finally:
         conn.close()
+
+
+_OVERLOAD_RE = re.compile(r"\b(?:529|429)\b|overloaded|rate[ _-]?limit", re.IGNORECASE)
+
+
+def is_provider_overload(error: Any) -> bool:
+    """The provider was busy, not the work wrong ("API Error: 529 Overloaded")."""
+    return bool(_OVERLOAD_RE.search(str(error or "")))
+
+
+def other_provider(provider: str | None) -> str | None:
+    """Another allowed provider with an installed CLI, for when *provider* is overloaded."""
+    for candidate in allowed_providers():
+        if candidate != provider and is_available(candidate):
+            return candidate
+    return None
 
 
 def provider_of(worker: Any, default: str | None = None) -> str | None:

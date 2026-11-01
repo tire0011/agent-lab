@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class HealthResponse(BaseModel):
     status: str
     version: str
+    git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
 
 
 class StatusResponse(BaseModel):
@@ -24,9 +27,12 @@ class StatusResponse(BaseModel):
 class Problem(BaseModel):
     id: str
     source: str
+    issue_number: int | None = None
     summary: str
     detail: str
     timestamp: str
+    failure_phase: str | None = None
+    failure_type: str | None = None
 
 
 class ProblemsResponse(BaseModel):
@@ -167,10 +173,6 @@ class MailboxTaskApprovalsResponse(BaseModel):
     tasks: list[MailboxTaskApproval]
 
 
-class MailboxTaskRejectRequest(BaseModel):
-    reason: str = Field(min_length=1, max_length=500)
-
-
 # ---------------------------------------------------------------------------
 # Experiment activity log models
 # ---------------------------------------------------------------------------
@@ -226,6 +228,15 @@ class OperationsExecuteArgs(BaseModel):
 class OperationsExecuteRequest(BaseModel):
     operation: str = Field(min_length=1, max_length=80)
     args: OperationsExecuteArgs = Field(default_factory=OperationsExecuteArgs)
+    invocation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Stable key for an operation attempt. Callers that retry after a timeout "
+            "or restart must reuse the same value to receive the recorded result."
+        ),
+    )
 
 
 class OperationArgumentDefinition(BaseModel):
@@ -460,6 +471,8 @@ class PublicDiagnosticExperiment(BaseModel):
 class PublicDiagnosticServiceStatus(BaseModel):
     status: str
     git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
     deployment_time: str | None = None
 
 
