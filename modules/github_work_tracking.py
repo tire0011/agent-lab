@@ -108,6 +108,10 @@ class GitHubWorkTrackingError(RuntimeError):
     pass
 
 
+class MergeForbiddenError(GitHubWorkTrackingError):
+    """The originating task forbids this merge; the pull request stays open."""
+
+
 Transport = Callable[[str, str, dict[str, Any] | None], Any]
 
 
@@ -1058,25 +1062,63 @@ class GitHubWorkTrackingService:
             return None
         return str(pull.get("merge_commit_sha") or "") or None
 
+    def merge_refusal(self, ref: GitHubWorkRef) -> str | None:
+        """Why this pull request must stay unmerged, if a task forbids it (#185).
+
+        A retry rebinds the task to a new experiment, so the task is found
+        through its source and through the pull request as well. The body is
+        read too: a follow-up may have added the instruction after intake.
+        """
+        try:
+            rows = self._conn.execute(
+                """SELECT merge_forbidden, merge_constraint_reason, task_body
+                   FROM mailbox_task_approvals
+                   WHERE experiment_id=? OR (id=? AND ?='task')
+                      OR id IN (SELECT source_id FROM github_work_links
+                                WHERE source_type='task' AND pr_number=?)
+                      OR experiment_id IN (SELECT experiment_id FROM github_work_links WHERE pr_number=?
+                                           UNION
+                                           SELECT experiment_id FROM github_experiment_links WHERE pr_number=?)""",
+                (ref.experiment_id, ref.source_id, ref.source_type, ref.pr_number, ref.pr_number, ref.pr_number),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            # Only a database that never hosted mailbox tasks has no
+            # constraint; anything else must stop the merge.
+            if "no such table: mailbox_task_approvals" not in str(exc):
+                raise
+            return None
+        for row in rows:
+            detail = (
+                row["merge_constraint_reason"]
+                if row["merge_forbidden"]
+                else parse_work_directives(row["task_body"]).merge_constraint_reason
+            )
+            if row["merge_forbidden"] or detail:
+                return f"merge refused: {detail or 'explicit do not merge instruction'}; pull request remains open for review"
+        return None
+
+    def refuse_merge(self, ref: GitHubWorkRef) -> str | None:
+        """``merge_refusal``, with an active refusal recorded in the audit log."""
+        refusal = self.merge_refusal(ref)
+        if refusal is None:
+            return None
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO operations_audit
+                   (id, timestamp, operation, args_json, success, duration_ms, error_summary)
+                   VALUES (?, ?, 'merge_pull_request', ?, 0, 0, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    _utcnow_iso(),
+                    json.dumps({"pr_number": ref.pr_number, "experiment_id": ref.experiment_id}),
+                    refusal,
+                ),
+            )
+        return refusal
+
     def merge_and_complete(self, ref: GitHubWorkRef, *, expected_head_sha: str | None = None) -> str:
         if ref.pr_number is None:
             raise GitHubWorkTrackingError("cannot merge work without a pull request")
-
-        refusal = self._merge_refusal(ref)
-        if refusal is not None:
-            with self._conn:
-                self._conn.execute(
-                    """INSERT INTO operations_audit
-                       (id, timestamp, operation, args_json, success, duration_ms, error_summary)
-                       VALUES (?, ?, 'merge_pull_request', ?, 0, 0, ?)""",
-                    (
-                        uuid.uuid4().hex,
-                        _utcnow_iso(),
-                        json.dumps({"pr_number": ref.pr_number, "experiment_id": ref.experiment_id}),
-                        refusal,
-                    ),
-                )
-            raise GitHubWorkTrackingError(refusal)
 
         # A pull request that GitHub already reports as merged must never be
         # merged a second time: after a restart mid-adoption the merge may
@@ -1086,6 +1128,12 @@ class GitHubWorkTrackingService:
         if already_merged is not None:
             self._close_completed_issue(ref)
             return already_merged
+
+        # The one gate in front of the merge call, so that no caller - neither
+        # green CI, nor a restart, nor a retry - can get around the task (#185).
+        refusal = self.refuse_merge(ref)
+        if refusal is not None:
+            raise MergeForbiddenError(refusal)
 
         payload: dict[str, Any] = {"merge_method": "squash"}
         if expected_head_sha:
@@ -1099,27 +1147,6 @@ class GitHubWorkTrackingService:
             raise GitHubWorkTrackingError(str(result.get("message") or "GitHub did not merge the pull request"))
         self._close_completed_issue(ref)
         return str(result.get("sha") or expected_head_sha or "")
-
-    def _merge_refusal(self, ref: GitHubWorkRef) -> str | None:
-        try:
-            row = self._conn.execute(
-                """SELECT merge_constraint_reason FROM mailbox_task_approvals
-                   WHERE merge_forbidden=1 AND (
-                       (id=? AND ?='task') OR experiment_id=?
-                   ) LIMIT 1""",
-                (ref.source_id, ref.source_type, ref.experiment_id),
-            ).fetchone()
-        except sqlite3.OperationalError as exc:
-            # This service is also usable standalone in tools/tests whose DB
-            # has never hosted mailbox tasks. Only that absent-table case is
-            # equivalent to there being no task constraint.
-            if "no such table: mailbox_task_approvals" not in str(exc):
-                raise
-            return None
-        if row is None:
-            return None
-        detail = str(row["merge_constraint_reason"] or "explicit do not merge instruction")
-        return f"merge refused: {detail}; pull request remains open for review"
 
     def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
         self._request(

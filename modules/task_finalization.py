@@ -20,6 +20,7 @@ from modules.experiment_adoption_service import (
     STATUS_FAILED,
     STATUS_INTERRUPTED,
     STATUS_NEEDS_REVIEW,
+    STATUS_READY_FOR_REVIEW,
     STATUS_NOT_STARTED,
     STATUS_QUEUED,
     ExperimentAdoptionError,
@@ -40,6 +41,7 @@ PHASE_RESTART_REQUESTED = "restart_requested"
 PHASE_VALIDATING_LIVE = "validating_live"
 PHASE_SUCCEEDED = "succeeded"
 PHASE_NEEDS_REVIEW = "needs_review"
+PHASE_READY_FOR_REVIEW = "ready_for_review"
 
 # Prefix of the error a finalization attempt records when adoption could
 # not even be started. It is a shared constant because the needs_review
@@ -170,6 +172,15 @@ class TaskFinalizationCoordinator:
     def advance(self, approval: Any, experiment: Any) -> FinalizationResult:
         state = self._get_or_create(str(approval.id), str(experiment.id))
         adoption = self.adoption_service.get(str(experiment.id))
+
+        if adoption.status == STATUS_READY_FOR_REVIEW:
+            state.phase = PHASE_READY_FOR_REVIEW
+            self._save(state)
+            return FinalizationResult(
+                PHASE_READY_FOR_REVIEW,
+                state.phase,
+                f"pull request open, not merged: {getattr(adoption, 'reason', None) or 'the task forbids the merge'}",
+            )
 
         superseded: Any | None = None
         review_retry: Any | None = None

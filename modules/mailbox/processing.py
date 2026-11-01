@@ -111,28 +111,26 @@ def _process_task(
         logger.warning("_process_task: failed to store task_body for msg %s", db_msg_id)
 
     try:
-        from .task_service import _merge_constraint
-
         existing = conn.execute(
             "SELECT id FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
             (db_msg_id,),
         ).fetchone()
         if not existing:
             import uuid as _uuid
+            from modules.run_store.schema import record_merge_constraint
+
             now = _now_iso()
             approval_id = _uuid.uuid4().hex
-            merge_forbidden, merge_reason = _merge_constraint(msg.body)
             conn.execute(
                 """
                 INSERT INTO mailbox_task_approvals
                     (id, mailbox_msg_id, task_body, sender, file_path,
-                     received_at, status, merge_forbidden, merge_constraint_reason,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?)
+                     received_at, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
                 """,
-                (approval_id, db_msg_id, msg.body, msg.created_by, str(msg.file_path),
-                 now, int(merge_forbidden), merge_reason, now, now),
+                (approval_id, db_msg_id, msg.body, msg.created_by, str(msg.file_path), now, now, now),
             )
+            record_merge_constraint(conn, approval_id, msg.body)
             conn.commit()
     except Exception:
         logger.warning("_process_task: failed to create approval for msg %s", db_msg_id, exc_info=True)

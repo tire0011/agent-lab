@@ -26,6 +26,7 @@ from modules.github_work_tracking import (
     LIFECYCLE_READINESS_MESSAGE,
     GitHubCIVerification,
     GitHubWorkTrackingError,
+    MergeForbiddenError,
     GitHubWorkTrackingService,
 )
 from modules.mailbox import MailboxLock
@@ -43,12 +44,17 @@ STATUS_ADOPTED = "adopted"
 STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
+# Everything but the merge is done: the task forbids it (#185). Not a
+# needs_review, which Nexus would try again.
+STATUS_READY_FOR_REVIEW = "ready_for_review"
 
 # Adoptions run in threads of this process; a short-lived caller such as the
 # initiative tick must wait for them before it exits (#358).
 ADOPTION_THREAD_PREFIX = "adopt-"
 
-_TERMINAL_STATUSES = {STATUS_ADOPTED, STATUS_NEEDS_REVIEW, STATUS_FAILED, STATUS_INTERRUPTED}
+_TERMINAL_STATUSES = {
+    STATUS_ADOPTED, STATUS_NEEDS_REVIEW, STATUS_FAILED, STATUS_INTERRUPTED, STATUS_READY_FOR_REVIEW,
+}
 _ACTIVE_STATUSES = {STATUS_QUEUED, STATUS_ADOPTING}
 
 _DEFAULT_GIT_TIMEOUT_SECONDS = 60
@@ -396,13 +402,13 @@ class ExperimentAdoptionService:
             )
             return False
 
-        merge_blocker = self._merge_forbidden_reason(experiment_id)
-        if merge_blocker is not None:
+        merge_refusal = self._merge_refusal_for(experiment_id)
+        if merge_refusal is not None:
             self._set_status(
                 experiment_id,
-                STATUS_NEEDS_REVIEW,
+                STATUS_READY_FOR_REVIEW,
                 ended_at=_utcnow_iso(),
-                reason=sanitized_reason(merge_blocker),
+                reason=sanitized_reason(merge_refusal),
                 updated_at=_utcnow_iso(),
             )
             return False
@@ -480,18 +486,12 @@ class ExperimentAdoptionService:
             return "the experiment worktree is no longer available"
         return None
 
-    def _merge_forbidden_reason(self, experiment_id: str) -> str | None:
-        """Read the originating task's durable merge prohibition."""
-        with self._lock:
-            row = self._conn.execute(
-                """SELECT merge_constraint_reason FROM mailbox_task_approvals
-                   WHERE experiment_id=? AND merge_forbidden=1 LIMIT 1""",
-                (experiment_id,),
-            ).fetchone()
-        if row is None:
+    def _merge_refusal_for(self, experiment_id: str) -> str | None:
+        """The no-merge constraint on an experiment's existing pull request."""
+        work_ref = self.github_work_tracking.for_experiment(experiment_id)
+        if work_ref is None or work_ref.pr_number is None:
             return None
-        detail = str(row["merge_constraint_reason"] or "explicit do not merge instruction")
-        return f"merge refused: {detail}; pull request is ready for review and was not merged"
+        return self.github_work_tracking.merge_refusal(work_ref)
 
     def _merged_sha_for(self, experiment_id: str) -> str | None:
         try:
@@ -1025,6 +1025,12 @@ class ExperimentAdoptionService:
         if existing.status in {STATUS_ADOPTED, STATUS_QUEUED, STATUS_ADOPTING} or (
             existing.status == STATUS_NEEDS_REVIEW and not reopening_review
         ):
+            return existing
+        if existing.status == STATUS_READY_FOR_REVIEW:
+            # Asking again changes nothing, but the refusal is recorded (#185).
+            work_ref = self.github_work_tracking.for_experiment(experiment_id)
+            if work_ref is not None:
+                self.github_work_tracking.refuse_merge(work_ref)
             return existing
 
         restarting_failure = (
@@ -1992,28 +1998,26 @@ class ExperimentAdoptionService:
                     draft=False,
                 )
                 self.github_work_tracking.mark_pull_request_ready(work_ref)
-                merge_blocker = self._merge_forbidden_reason(experiment_id)
-                if merge_blocker is not None:
-                    elog.warning(
-                        "adoption", "merge_refused", merge_blocker,
-                        pull_request_number=work_ref.pr_number,
-                    )
-                    return self._finish_review(
-                        experiment_id,
-                        reason=merge_blocker,
-                        actual_files=actual_files,
-                        expected_files=expected_files,
-                        test_exit_code=test_exit_code,
-                        test_output=bounded_test_output,
-                        experiment_commit_sha=experiment_commit_sha,
-                        integrated_commit_sha=integrated_commit_sha,
-                        diagnostic_worktree_path=str(integration_path),
-                        elog=elog,
-                    )
                 published_sha = self.github_work_tracking.merge_and_complete(
                     work_ref,
                     expected_head_sha=published_sha,
                 ) or published_sha
+            except MergeForbiddenError as exc:
+                elog.warning(
+                    "adoption", "merge_refused", str(exc),
+                    pull_request_number=work_ref.pr_number,
+                )
+                return self._finish_review(
+                    experiment_id,
+                    reason=str(exc),
+                    status=STATUS_READY_FOR_REVIEW,
+                    actual_files=actual_files,
+                    expected_files=expected_files,
+                    test_exit_code=test_exit_code,
+                    test_output=bounded_test_output,
+                    experiment_commit_sha=experiment_commit_sha,
+                    integrated_commit_sha=integrated_commit_sha,
+                )
             except GitHubWorkTrackingError as exc:
                 keep_integration = True
                 return self._finish_review(
@@ -2141,6 +2145,7 @@ class ExperimentAdoptionService:
         integrated_commit_sha: str | None = None,
         diagnostic_worktree_path: str | None = None,
         review_blocker: str | None = None,
+        status: str = STATUS_NEEDS_REVIEW,
         elog=None,
     ) -> ExperimentAdoption:
         """Park the adoption for review.
@@ -2161,7 +2166,7 @@ class ExperimentAdoptionService:
             )
         self._set_status(
             experiment_id,
-            STATUS_NEEDS_REVIEW,
+            status,
             review_blocker=review_blocker,
             ended_at=_utcnow_iso(),
             experiment_commit_sha=experiment_commit_sha,

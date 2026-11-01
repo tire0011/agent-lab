@@ -35,7 +35,7 @@ function startAdoptionPolling(experimentId) {
     try {
       const adoption = await requestJson(`/experiments/${encodeURIComponent(experimentId)}/adoption`, { headers: authHeaders() });
       updateAdoptionUi(adoption);
-      if (["adopted", "needs_review", "failed", "interrupted"].includes(adoption.status)) {
+      if (["adopted", "needs_review", "ready_for_review", "failed", "interrupted"].includes(adoption.status)) {
         stopAdoptionPolling();
       }
     } catch {

@@ -32,7 +32,7 @@ from modules.outbox_publisher import (
     TaskApprovalOutboxPublisher,
 )
 from modules.run_store import DEFAULT_DB_PATH, init_db
-from modules.work_directives import parse_work_directives
+from modules.run_store.schema import record_merge_constraint
 # ``modules.task_orchestrator`` is imported lazily, not here. It imports
 # ``modules.mailbox.development``, which runs this package's ``__init__`` and
 # comes straight back to this module - so importing the orchestrator *first*
@@ -59,23 +59,20 @@ _STATUS_NEEDS_REVIEW = "needs_review"
 # Nexus decides what follows a failed experiment; poll_running keeps out (#263).
 _STATUS_NEXUS_DECIDING = "nexus_deciding"
 
-_TERMINAL_STATUSES = {
-    _STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STATUS_NEEDS_REVIEW,
-    "ready_for_review",
-}
+_TERMINAL_STATUSES = {_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STATUS_NEEDS_REVIEW}
 _NON_TERMINAL_STATUSES = {
     _STATUS_PENDING, _STATUS_APPROVED, _STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_NEXUS_DECIDING,
 }
 _EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected", "interrupted"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
 _EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review", "interrupted"}
+# Verified, and left open because the task forbids the merge (#185).
+_STATUS_READY_FOR_REVIEW = "ready_for_review"
+_TERMINAL_STATUSES.add(_STATUS_READY_FOR_REVIEW)
 # After a failed experiment Nexus may try again, but a task gets at most this
 # many experiments in total (#263 step 4).
 _MAX_EXPERIMENTS_PER_TASK = 2
 _REJECTION_REASON_RE = re.compile(r"^[\w\s.,!?()\'\"\-]{1,500}$")
-def _merge_constraint(task_body: str | None) -> tuple[bool, str | None]:
-    directives = parse_work_directives(task_body)
-    return directives.forbid_merge, directives.merge_constraint_reason
 
 
 class ApprovalNotFoundError(LookupError):
@@ -375,12 +372,11 @@ class MailboxTaskService:
                 return _row_to_approval(existing)
             approval_id = uuid.uuid4().hex
             now = _now_iso()
-            merge_forbidden, merge_reason = _merge_constraint(task_body)
             self._conn.execute(
                 """INSERT INTO mailbox_task_approvals
                    (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-                    status, merge_forbidden, merge_constraint_reason, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     approval_id,
                     mailbox_msg_id,
@@ -389,12 +385,11 @@ class MailboxTaskService:
                     file_path,
                     received_at,
                     _STATUS_PENDING,
-                    int(merge_forbidden),
-                    merge_reason,
                     now,
                     now,
                 ),
             )
+            record_merge_constraint(self._conn, approval_id, task_body)
             self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)

@@ -74,9 +74,15 @@ def _no_new_patterns(noun: str) -> tuple[re.Pattern[str], ...]:
 
 _NO_NEW_ISSUE_RES = _no_new_patterns("issue")
 _NO_NEW_BRANCH_RES = _no_new_patterns("branch")
+# Deliberately broad, also for a quoted mention: a wrong match leaves a pull
+# request open for a human, a missed one is an irreversible merge (#185).
 _NO_MERGE_RE = re.compile(
-    r"\b(?:do\s+not|don't|must\s+not|never)\s+(?:automatically\s+)?merge\b"
-    r"|\bleave\s+(?:the\s+)?(?:pull\s+request|pr)\s+(?:open|unmerged)\b",
+    r"\b(?:do\s+not|don['\u2019]t|must\s+not|should\s+not|never)\s+"
+    r"(?:auto(?:matically)?[\s-]*)?merge\b"
+    r"|\bwithout\s+merging\b"
+    r"|\bstop\s+before\s+(?:the\s+|any\s+)?merg(?:e|ing)\b"
+    r"|\bleave\s+(?:the\s+|this\s+)?(?:pull\s+request|pr)\s+(?:open|unmerged)\b"
+    r"|\bnicht\s+(?:automatisch\s+)?(?:mergen|zusammenf(?:\u00fc|ue)hren)\b",
     re.IGNORECASE,
 )
 

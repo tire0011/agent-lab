@@ -6,7 +6,6 @@ from typing import Any
 from . import task_service as _base
 
 logger = logging.getLogger(__name__)
-_STATUS_READY_FOR_REVIEW = "ready_for_review"
 
 
 class FinalizingMailboxTaskService(_base.MailboxTaskService):
@@ -170,6 +169,22 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
             )
             return
 
+        if result.status == _base._STATUS_READY_FOR_REVIEW:
+            task_log.info(
+                "finalization",
+                "merge_refused",
+                result.summary,
+                experiment_id=exp.id,
+                finalization_phase=result.phase,
+            )
+            self._transition_finalization_terminal(
+                approval,
+                exp,
+                _base._STATUS_READY_FOR_REVIEW,
+                f"status=ready_for_review; not merged; {result.summary}",
+            )
+            return
+
         task_log.warning(
             "finalization",
             "finalization_needs_review",
@@ -177,20 +192,6 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
             experiment_id=exp.id,
             finalization_phase=result.phase,
         )
-        if bool(getattr(approval, "merge_forbidden", False)):
-            summary = (
-                "ready_for_review; CI/verification passed; not merged because "
-                f"{getattr(approval, 'merge_constraint_reason', None) or 'the task forbids merge'}"
-            )
-            task_log.info(
-                "finalization", "merge_refused", summary,
-                experiment_id=exp.id,
-                finalization_phase="ready_for_review",
-            )
-            self._transition_finalization_terminal(
-                approval, exp, _STATUS_READY_FOR_REVIEW, summary
-            )
-            return
         self._transition_finalization_terminal(
             approval,
             exp,

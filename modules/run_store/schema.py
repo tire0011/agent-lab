@@ -362,6 +362,19 @@ _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS = [
 ]
 
 
+def record_merge_constraint(conn: sqlite3.Connection, approval_id: str, task_body: str | None) -> None:
+    """Persist a task's explicit no-merge instruction on its approval (#185)."""
+    from modules.work_directives import parse_work_directives
+
+    directives = parse_work_directives(task_body)
+    if directives.forbid_merge:
+        conn.execute(
+            """UPDATE mailbox_task_approvals
+               SET merge_forbidden=1, merge_constraint_reason=? WHERE id=?""",
+            (directives.merge_constraint_reason, approval_id),
+        )
+
+
 def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
     """Create mailbox_task_approvals table and backfill from existing task messages."""
     conn.executescript(
@@ -446,23 +459,14 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
              received_at or now, now, now),
         )
 
-    # Existing task rows predate the structured constraint. Re-parse their
-    # original, durable body during the additive migration so a restart after
-    # this release cannot forget an older "do not merge" instruction.
-    from modules.work_directives import parse_work_directives
-
+    # Rows created before the structured constraint, and the orphans above,
+    # keep their original body: a restart must not forget an older
+    # "do not merge" instruction.
     candidates = conn.execute(
-        """SELECT id, task_body FROM mailbox_task_approvals
-           WHERE merge_forbidden=0"""
+        "SELECT id, task_body FROM mailbox_task_approvals WHERE merge_forbidden=0"
     ).fetchall()
     for approval_id, task_body in candidates:
-        directives = parse_work_directives(task_body)
-        if directives.forbid_merge:
-            conn.execute(
-                """UPDATE mailbox_task_approvals
-                   SET merge_forbidden=1, merge_constraint_reason=? WHERE id=?""",
-                (directives.merge_constraint_reason, approval_id),
-            )
+        record_merge_constraint(conn, approval_id, task_body)
 
 
 def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
