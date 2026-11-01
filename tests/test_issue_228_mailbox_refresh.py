@@ -223,9 +223,31 @@ class ServiceRestartReportingTests(unittest.TestCase):
         reporting it as complete.
         """
         body = self._body({"agent-api": "restart scheduled (this process is being replaced)"})
-        self.assertIn("Restarting shortly", body)
+        self.assertIn("Restart scheduled", body)
         self.assertNotIn("Not running the new code", body)
         self.assertNotIn("incomplete", body)
+
+    def test_a_fallback_restart_is_reported_as_unknown_not_failed(self):
+        body = self._body(
+            {"agent-api": "restart scheduled via fallback; outcome unknown"}
+        )
+        self.assertIn("Restart outcome unknown", body)
+        self.assertIn("verify the service", body)
+        self.assertNotIn("Not running the new code", body)
+        self.assertNotIn("incomplete", body)
+
+    def test_a_not_restarted_result_keeps_the_refresh_incomplete(self):
+        body = self._body(
+            {
+                "agent-api": (
+                    "error: not restarted; transient restart failed: exit 1: denied; "
+                    "fallback failed: exit 5: failed"
+                )
+            }
+        )
+        self.assertIn("Refresh incomplete", body)
+        self.assertIn("Not running the new code", body)
+        self.assertIn("not restarted", body)
 
     def test_an_all_restarted_refresh_is_complete(self):
         body = self._body({"agent-api": "restarted"})
