@@ -93,6 +93,7 @@ def planning_prompt(
     *,
     explore: bool = False,
     exhausted: list[dict[str, Any]] | None = None,
+    proposals: list[str] | None = None,
 ) -> str:
     lines = []
     for issue in issues:
@@ -118,6 +119,17 @@ def planning_prompt(
         '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
         "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
         "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
+        + _proposals_section(proposals)
+    )
+
+
+def _proposals_section(proposals: list[str] | None) -> str:
+    """Your own suggestions still waiting for the owner, so you do not repeat them."""
+    if not proposals:
+        return ""
+    return (
+        "\n\nYOUR OPEN PROPOSALS (waiting for the owner; do not suggest these or "
+        "near-duplicates again):\n\n" + "\n".join(f"- {title}" for title in proposals)
     )
 
 
@@ -179,15 +191,16 @@ class IssuePlanner:
         issues: list[dict[str, Any]],
         recent: list[dict[str, str]] | None = None,
         exhausted: list[dict[str, Any]] | None = None,
+        proposals: list[str] | None = None,
     ) -> PlanChoice | None:
         if not issues:
             return None
         allowed = {int(issue["number"]) for issue in issues}
         choice = None
         if self._explore is not None:
-            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, exhausted=exhausted), allowed)
+            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, exhausted=exhausted, proposals=proposals), allowed)
         if choice is None:
-            choice = self._ask(self._complete, planning_prompt(issues, recent, exhausted=exhausted), allowed)
+            choice = self._ask(self._complete, planning_prompt(issues, recent, exhausted=exhausted, proposals=proposals), allowed)
         return choice
 
     @staticmethod
