@@ -93,7 +93,7 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
                 self._advance_verified(approval, exp)
             elif exp.status in _base._EXP_FAILED_TERMINAL and self._nexus_decides_failure(approval):
                 continue
-            elif exp.status in ("failed", "timed_out"):
+            elif exp.status in ("failed", "timed_out", "interrupted"):
                 self._transition_terminal(approval, _base._STATUS_FAILED, exp)
             elif exp.status == "needs_review":
                 self._transition_terminal(approval, _base._STATUS_NEEDS_REVIEW, exp)
@@ -166,6 +166,22 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
                 exp,
                 _base._STATUS_SUCCEEDED,
                 f"finalization={result.phase}; {result.summary}",
+            )
+            return
+
+        if result.status == _base._STATUS_READY_FOR_REVIEW:
+            task_log.info(
+                "finalization",
+                "merge_refused",
+                result.summary,
+                experiment_id=exp.id,
+                finalization_phase=result.phase,
+            )
+            self._transition_finalization_terminal(
+                approval,
+                exp,
+                _base._STATUS_READY_FOR_REVIEW,
+                f"status=ready_for_review; not merged; {result.summary}",
             )
             return
 

@@ -45,10 +45,13 @@ from modules.verification_runner import run_verification_test_monitored
 annotations = __future__.annotations
 
 from .git_utils import _run_git
+from .gate_recheck import gate_recheck
 from .models import (
     EXPERIMENT_STATUSES,
     STATUS_FAILED,
+    STATUS_CANCELLED,
     STATUS_IMPLEMENTING,
+    STATUS_INTERRUPTED,
     STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_REJECTED,
@@ -58,6 +61,7 @@ from .models import (
     STATUS_VERIFYING,
     Experiment,
     ExperimentNotFoundError,
+    ExperimentNotCancellableError,
     ExperimentNotRunnableError,
     ExperimentPlan,
     _STATE_TRANSITIONS,
@@ -97,6 +101,7 @@ from .policy import (
     _SECRET_NOUN_ALT,
     _SECRET_VERB_ALT,
     _check_goal_policy,
+    _goal_secret_warning,
     _infra_action_match_is_false_positive,
     _is_code_or_test_file,
     _policy_rule_for_reason,
@@ -136,8 +141,12 @@ from .service import (
     _TEST_COMMANDS,
     _TEST_TOTAL_SETTING_KEY,
     _WARNING_STATUSES,
+    DEFAULT_WORKTREE_RETENTION_HOURS,
+    WORKTREE_RETENTION_ENV_VAR,
     ExperimentService,
+    WorktreeCleanupResult,
     logger,
+    worktree_retention_hours,
 )
 from .text_utils import (
     _DIAGNOSTIC_EVENT_TYPES,

@@ -1,9 +1,10 @@
-"""#281: experiments cut off by a service restart must not stay active forever.
+"""#281/#371: interrupted experiments must not stay active forever.
 
 The experiment thread dies with the ``agent-api`` process. At startup every
 experiment still in ``selecting``/``implementing``/``verifying`` is therefore
-orphaned; it is marked ``failed`` with ``interrupted by service restart`` so
-the Nexus session waiting on it resumes and the task continues or ends.
+orphaned. Legacy ``selecting`` rows are marked ``failed``; ``implementing`` and
+``verifying`` rows become ``interrupted``. Every reconciled row records the
+restart explanation so the Nexus session waiting on it can resume safely.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import api
 from modules.experiment_service import (
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
+    STATUS_INTERRUPTED,
     STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_SELECTING,
@@ -58,7 +60,7 @@ class MarkInterruptedExperimentsTests(unittest.TestCase):
         self.service = _make_experiment_service(self.tmp.name)
         self.addCleanup(self.service.close)
 
-    def test_active_experiments_become_failed(self):
+    def test_active_experiments_are_reconciled_to_terminal_states(self):
         ids = {
             status: _with_status(self.service, status)
             for status in (STATUS_SELECTING, STATUS_IMPLEMENTING, STATUS_VERIFYING)
@@ -67,16 +69,26 @@ class MarkInterruptedExperimentsTests(unittest.TestCase):
         marked = self.service.mark_interrupted_experiments_failed()
 
         self.assertEqual(set(marked), set(ids.values()))
-        for experiment_id in ids.values():
+        expected = {
+            STATUS_SELECTING: STATUS_FAILED,
+            STATUS_IMPLEMENTING: STATUS_INTERRUPTED,
+            STATUS_VERIFYING: STATUS_INTERRUPTED,
+        }
+        for original_status, experiment_id in ids.items():
             experiment = self.service.get_experiment(experiment_id)
-            self.assertEqual(experiment.status, STATUS_FAILED)
+            self.assertEqual(experiment.status, expected[original_status])
             self.assertEqual(experiment.error, "interrupted by service restart")
             self.assertIsNotNone(experiment.ended_at)
 
     def test_queued_and_terminal_experiments_are_untouched(self):
         untouched = {
             status: _with_status(self.service, status)
-            for status in (STATUS_QUEUED, STATUS_SUCCEEDED, STATUS_NEEDS_REVIEW)
+            for status in (
+                STATUS_QUEUED,
+                STATUS_SUCCEEDED,
+                STATUS_NEEDS_REVIEW,
+                STATUS_INTERRUPTED,
+            )
         }
 
         self.assertEqual(self.service.mark_interrupted_experiments_failed(), [])
@@ -87,19 +99,29 @@ class MarkInterruptedExperimentsTests(unittest.TestCase):
             self.assertIsNone(experiment.error)
 
     def test_idempotent_and_recorded_in_activity(self):
-        experiment_id = _with_status(self.service, STATUS_VERIFYING)
+        experiment_ids = {
+            status: _with_status(self.service, status)
+            for status in (STATUS_IMPLEMENTING, STATUS_VERIFYING)
+        }
 
-        self.assertEqual(self.service.mark_interrupted_experiments_failed(), [experiment_id])
-        self.assertEqual(self.service.mark_interrupted_experiments_failed(), [])
+        self.assertEqual(
+            set(self.service.mark_interrupted_experiments_failed()),
+            set(experiment_ids.values()),
+        )
+        restarted = _make_experiment_service(self.tmp.name)
+        self.addCleanup(restarted.close)
+        self.assertEqual(restarted.mark_interrupted_experiments_failed(), [])
 
-        changes = [
-            entry for entry in self.service.list_activity(experiment_id=experiment_id)
-            if entry.get("event") == "status_changed"
-        ]
-        self.assertEqual(len(changes), 1)
-        self.assertEqual(changes[0]["from_status"], STATUS_VERIFYING)
-        self.assertEqual(changes[0]["to_status"], STATUS_FAILED)
-        self.assertEqual(changes[0]["message"], "interrupted by service restart")
+        for original_status, experiment_id in experiment_ids.items():
+            changes = [
+                entry
+                for entry in restarted.list_activity(experiment_id=experiment_id)
+                if entry.get("event") == "status_changed"
+            ]
+            self.assertEqual(len(changes), 1)
+            self.assertEqual(changes[0]["from_status"], original_status)
+            self.assertEqual(changes[0]["to_status"], STATUS_INTERRUPTED)
+            self.assertEqual(changes[0]["message"], "interrupted by service restart")
 
     def test_never_restarts_work(self):
         _with_status(self.service, STATUS_IMPLEMENTING)
@@ -108,6 +130,31 @@ class MarkInterruptedExperimentsTests(unittest.TestCase):
             self.service.mark_interrupted_experiments_failed()
         run.assert_not_called()
         verify.assert_not_called()
+
+    def test_reconciliation_clears_worker_bookkeeping_and_preserves_worktree(self):
+        experiment_id = _with_status(self.service, STATUS_IMPLEMENTING)
+        worktree = Path(self.tmp.name) / "worktrees" / experiment_id
+        worktree.mkdir(parents=True)
+        marker = worktree / "unfinished.txt"
+        marker.write_text("retain me", encoding="utf-8")
+        with self.service._conn:
+            self.service._conn.execute(
+                "UPDATE experiments SET worktree_path = ? WHERE id = ?",
+                (str(worktree), experiment_id),
+            )
+        worker_handle = MagicMock()
+        self.service._active_processes[experiment_id] = worker_handle
+
+        self.assertEqual(
+            self.service.mark_interrupted_experiments_failed(), [experiment_id]
+        )
+
+        self.assertNotIn(experiment_id, self.service._active_processes)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "retain me")
+        self.assertEqual(
+            self.service.get_experiment(experiment_id).worktree_path, str(worktree)
+        )
+        worker_handle.assert_not_called()
 
 
 class WaitingSessionResumesTests(unittest.TestCase):

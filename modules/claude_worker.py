@@ -217,6 +217,8 @@ class ClaudeWorker:
         experiment_logger: Any | None = None,
         phase: str = "claude",
         stall_seconds: float | None = None,
+        on_process: Any | None = None,
+        extra_args: list[str] | None = None,
     ) -> WorkerResult:
         """Execute *task* non-interactively via the ``claude`` CLI.
 
@@ -274,6 +276,8 @@ class ClaudeWorker:
 
         # A progress-watched run (#327) streams events so every step shows up.
         cmd = self._build_command(sandbox, output_schema, stream=stall_seconds is not None)
+        # E.g. an MCP server and its pre-approved read tools for the planner (#384).
+        cmd += list(extra_args or [])
 
         if experiment_logger is not None:
             experiment_logger.debug(
@@ -283,7 +287,7 @@ class ClaudeWorker:
                 timeout_seconds=timeout_seconds,
             )
 
-        result = self._execute(cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds)
+        result = self._execute(cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process)
 
         if experiment_logger is not None:
             self._log_result(experiment_logger, phase, cmd, working_dir, result)
@@ -411,6 +415,7 @@ class ClaudeWorker:
         timeout_seconds: int,
         sandbox: str,
         stall_seconds: float | None = None,
+        on_process: Any | None = None,
     ) -> WorkerResult:
         timed_out = False
         proc_error: str | None = None
@@ -424,6 +429,7 @@ class ClaudeWorker:
                 watched = run_watched(
                     cmd, cwd=working_dir, env=self._safe_env(), input_text=task,
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
+                    on_process=on_process,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:

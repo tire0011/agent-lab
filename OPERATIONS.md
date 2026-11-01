@@ -59,6 +59,21 @@ Optional, for controller work liveness (see ARCHITECTURE.md section 10):
   fallback, which now only applies to sessions that never reported a
   heartbeat at all.
 
+Optional, for experiment worktree retention (issue #376). Every experiment
+keeps its worktree under `~/agent-worktrees/<experiment-id>` after it ends; the
+API at startup and every `nexus_tick` run remove those that are no longer needed.
+
+- `NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS` (default 168, i.e. 7 days) - how
+  long after its `ended_at` a terminal experiment (`succeeded`, `failed`,
+  `interrupted`, `timed_out`, `needs_review`, `cancelled`, `rejected`) keeps its
+  worktree. Only the directory is removed: the experiment row, its log and its
+  branch are kept. Worktrees of non-terminal experiments, of experiments with
+  an unfinished adoption, of experiments with no `ended_at`, and paths outside
+  the worktrees root are never touched. `0` disables cleanup, and so does an
+  unparsable or negative value. Each removal is recorded as a
+  `worktree_removed` activity event, and each failure as
+  `worktree_cleanup_failed`. A failure never blocks startup or a tick.
+
 Optional, for the local verification test watchdog (issue #209). Local
 verification is bounded by *progress*, not by a fixed wall-clock timeout: the
 run continues for as long as tests keep starting and finishing.
@@ -133,9 +148,9 @@ error.
 
 - Public health endpoint: `GET /health`
 - Protected endpoint example: `GET /secure-health` requires `x-api-key` header
-- Task approval endpoints: `GET /mailbox/tasks`, `POST /mailbox/tasks/{id}/approve|reject` — require `x-api-key`
+- Mailbox task endpoints (read-only): `GET /mailbox/tasks`, `GET /mailbox/tasks/{id}` — require `x-api-key`
 - GitHub mailbox webhook: `POST /mailbox/webhook/github` — authenticated via `X-Hub-Signature-256`
-- `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for approved tasks to submit
+- `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for queued tasks to hand to Nexus
 
 ## Operational checks
 
@@ -143,7 +158,7 @@ error.
 2. Verify protected endpoint rejects missing/invalid key.
 3. Validate agent run writes new artifact in `state/runs/`.
 4. Review run logs for token/runtime anomalies.
-5. Check `GET /mailbox/tasks` for pending approvals requiring human review.
+5. Check `GET /mailbox/tasks` for tasks in `needs_review`.
 
 ## Security operations
 
@@ -212,6 +227,13 @@ ls -R /var/lib/nexus/runtime-archive/
 
 Experiments should still run on their own branches; this is a safety net, not
 the normal workflow.
+
+## Experiment benchmark (#343)
+
+`scripts/run_benchmark.py` runs the frozen task set through `ExperimentService`
+and compares a run to a stored baseline; see `benchmarks/README.md`. A run makes
+billed coding-agent calls. Results stay in `benchmark.db`, not in the production
+database.
 
 ## Known limitations
 
@@ -513,6 +535,18 @@ result with a reason, not as an operation fault. The failure-analysis routine re
 the same backend, so a diagnosis and an operator looking at the same task see
 the same facts.
 
+### Local LLM call timeout (#236)
+
+`NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS` limits one local model call, for every
+role. Default 900 (15 minutes), clamped to 60-7200; an invalid value logs a
+warning and uses the default. VM jobs up to 2026-10-31: controller p50 ~2 min,
+p95 ~9 min, p99 ~15 min, so about 1% of controller calls exceed the default.
+
+A controller call that reaches it logs `controller_local_inference_failed` with
+`error_kind=timeout`, and the job row keeps that `error_kind`. The turn then goes
+to the external-provider fallback. Time queued behind another job is not part
+of the limit: each job in the queue has its own.
+
 ### Inspecting one local LLM job (#259)
 
 `nexus debug llm-job <job-id> [--result|--prompt]` reads one `local_llm_jobs`
@@ -632,6 +666,15 @@ curl -s -X POST .../maintenance/execute \
   (disabled by default, two tokens, optional expiry), not a name list.
 - All output is truncated and redacted (API keys, tokens, secrets).
 - Every operation call is written to an in-memory audit log (`GET /maintenance/audit`).
+
+---
+
+## Tool-router MCP stdio server
+
+`python -m modules.tool_router_mcp` runs from the repository root and exposes
+only `find_tool` and `call_tool`, read-only, for one client per process. It is
+not a service: the MCP client starts it. Setup and Copilot CLI registration are
+in `docs/issue-118-tool-router-mcp.md`.
 
 ---
 
