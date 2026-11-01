@@ -218,6 +218,7 @@ class NexusInitiativeService:
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
         self._open_proposals = 0
+        self._open_proposal_titles: list[str] = []
         self._exhausted_issues: list[dict[str, Any]] = []
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
@@ -438,6 +439,7 @@ class NexusInitiativeService:
         policy_hash = _policy_hash()
         candidates: list[Candidate] = []
         self._open_proposals = 0
+        self._open_proposal_titles: list[str] = []
         self._exhausted_issues = []
         for issue in issues:
             number = issue.get("number")
@@ -448,6 +450,7 @@ class NexusInitiativeService:
             if PROPOSAL_LABEL in labels:
                 # Waits for a human to review it and remove the label (#354).
                 self._open_proposals += 1
+                self._open_proposal_titles.append(str(issue.get("title") or ""))
                 continue
             if number is None or int(number) in linked:
                 if number is not None and int(number) in exhausted:
@@ -916,6 +919,7 @@ class NexusInitiativeService:
             [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues],
             recent=self._recent_experiments(),
             exhausted=self._exhausted_issues,
+            proposals=self._open_proposal_titles,
         )
         if choice is None:
             return []
