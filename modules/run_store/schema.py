@@ -173,6 +173,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             plan_json TEXT NULL,
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
+            base_commit_sha TEXT NULL,
             selection_task_id TEXT NULL,
             reformat_retry_task_id TEXT NULL,
             reformat_retry_runtime_ms INTEGER NULL,
@@ -202,8 +203,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             failure_type TEXT NULL,
             policy_rule TEXT NULL,
             quality_evaluation_json TEXT NULL,
-            base_commit_sha TEXT NULL,
-            test_failure_classification_json TEXT NULL
+            baseline_test_classifications_json TEXT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
@@ -307,14 +307,14 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("policy_replan_diagnostic_log", "TEXT"),
     ("policy_rule", "TEXT"),
     ("quality_evaluation_json", "TEXT"),
-    ("base_commit_sha", "TEXT"),
-    ("test_failure_classification_json", "TEXT"),
+    ("baseline_test_classifications_json", "TEXT"),
     # Which coding agent ran the implementation phase (codex | claude).
     ("implementation_provider", "TEXT"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
     ("failure_phase", "TEXT"),
     ("failure_type", "TEXT"),
+    ("base_commit_sha", "TEXT"),
     # Process group of the live worker, so the stall sweep (#400) can stop it
     # from another process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),

@@ -42,6 +42,7 @@ from modules.run_store import (
 )
 from modules.test_run_log import global_heartbeat_bridge
 from modules.verification_runner import (
+    VerificationRunResult,
     WatchdogConfig,
     run_verification_test_monitored,
 )
@@ -97,30 +98,8 @@ _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 # when it stalls; see modules.coding_worker.agent_watchdog_limits.
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
-_BASELINE_RECHECK_ENV_VAR = "NEXUS_BASELINE_RECHECK_SECONDS"
-_DEFAULT_BASELINE_RECHECK_SECONDS = 120.0
-
-
-def _baseline_recheck_seconds() -> float:
-    try:
-        value = float(os.environ.get(_BASELINE_RECHECK_ENV_VAR, ""))
-    except ValueError:
-        value = 0
-    return value if value > 0 else _DEFAULT_BASELINE_RECHECK_SECONDS
-
-
-def _test_file_candidates(test_id: str) -> set[str]:
-    """Possible repository paths for a unittest ID (discovery or package form)."""
-    if "_FailedTest" in test_id or not test_id:
-        return set()
-    parts = test_id.split(".")
-    candidates: set[str] = set()
-    for index, part in enumerate(parts):
-        if part.startswith("test_"):
-            candidates.add("/".join(parts[: index + 1]) + ".py")
-            candidates.add("tests/" + "/".join(parts[index:index + 1]) + ".py")
-            break
-    return candidates
+BASELINE_RECHECK_ENV_VAR = "NEXUS_BASELINE_RECHECK_SECONDS"
+DEFAULT_BASELINE_RECHECK_SECONDS = 120.0
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
@@ -243,6 +222,46 @@ _TEST_COMMANDS: dict[str, list[str]] = {
     "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-v"],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
+
+
+def _is_real_test_id(test_id: str) -> bool:
+    """Whether *test_id* names a collected test rather than a loader error."""
+    return "_FailedTest." not in test_id
+
+
+def _test_file_for_id(test_id: str) -> str | None:
+    """Source file of a canonical ID from ``unittest discover -s tests``.
+
+    A loader error is named ``unittest.loader._FailedTest.<module>``; the file
+    it points at is that of *<module>*, which could not be imported.
+    """
+    _, marker, loader_target = test_id.rpartition("_FailedTest.")
+    parts = (loader_target if marker else test_id).split(".")
+    if parts[0] == "tests":
+        parts = parts[1:]
+    for index, part in enumerate(parts):
+        if part.startswith("test"):
+            return "/".join(["tests", *parts[: index + 1]]) + ".py"
+    return None
+
+
+def _baseline_verdict(test_id: str, result: VerificationRunResult) -> str:
+    """Classify one test from its run at the base commit.
+
+    Only a result for this very test exculpates the change. Selecting by
+    ``-k`` matches substrings, so the run's exit code alone may belong to a
+    sibling; and a run which never started the test (a deadline hit while
+    importing, a selector that matched nothing) says nothing about it.
+    """
+    run_failed = result.timed_out or result.exit_code not in (0, None)
+    if (
+        run_failed
+        and test_id in (result.observed_test_ids or [])
+        and test_id in (result.failed_test_ids or [])
+    ):
+        return "pre_existing"
+    return "regression"
+
 
 # Default interpreter used to run tests inside an experiment worktree.
 # Using the main repository's own virtualenv interpreter lets a fresh git
@@ -394,6 +413,182 @@ class ExperimentService:
         self._lock = threading.Lock()
         self._active_processes: dict[str, subprocess.Popen] = {}
         self._process_lock = threading.Lock()
+
+    @staticmethod
+    def _baseline_recheck_seconds() -> float:
+        try:
+            value = float(os.environ.get(BASELINE_RECHECK_ENV_VAR, ""))
+        except ValueError:
+            return DEFAULT_BASELINE_RECHECK_SECONDS
+        return value if 0 < value < float("inf") else DEFAULT_BASELINE_RECHECK_SECONDS
+
+    def _classify_failures_against_base(
+        self,
+        experiment_id: str,
+        worktree_path: str,
+        test_run: VerificationRunResult,
+        elog: ExperimentLogger,
+    ) -> dict[str, str] | None:
+        """Tell pre-existing failures from regressions; None when not applicable.
+
+        Everything that leaves the answer open returns None or ``regression``,
+        which both keep today's outcome: a doubtful recheck must never excuse
+        a change.
+        """
+        failed_ids = list(test_run.failed_test_ids or [])
+        if test_run.exit_code == 0 or not failed_ids:
+            return None
+        if test_run.process_died or test_run.exception is not None:
+            return None
+        # Without the test that stalled, the abort itself stays unexplained
+        # however the failures before it turn out.
+        if test_run.timed_out and not test_run.aborted_test_id:
+            return None
+        base_commit = self.get_experiment(experiment_id).base_commit_sha
+        if not base_commit:
+            elog.info(
+                "verifying", "baseline_recheck_skipped",
+                "Experiment has no recorded base commit", reason="no_base_commit",
+            )
+            return None
+        try:
+            changed_files = self._files_changed_since(base_commit, worktree_path, elog)
+            if {_test_file_for_id(test_id) for test_id in failed_ids} & changed_files:
+                elog.info(
+                    "verifying", "baseline_recheck_skipped",
+                    "A failing test file is part of this experiment's change",
+                    reason="test_file_changed",
+                )
+                return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            elog.error(
+                "verifying", "baseline_recheck_failed",
+                "Could not determine this experiment's changed files", exc=exc,
+            )
+            return None
+        return self._baseline_recheck(
+            experiment_id, worktree_path, base_commit, failed_ids, elog,
+        )
+
+    @staticmethod
+    def _files_changed_since(
+        base_commit: str, worktree_path: str, elog: ExperimentLogger,
+    ) -> set[str]:
+        """Paths differing from *base_commit*, committed or not.
+
+        ``git status`` alone would miss the work once a GitHub checkpoint has
+        committed it.
+        """
+        changed: set[str] = set()
+        for args in (
+            ["diff", "--name-only", "--no-renames", base_commit],
+            ["ls-files", "--others", "--exclude-standard"],
+        ):
+            proc = _run_git(args, cwd=worktree_path, elog=elog, phase="verifying")
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, proc.args, output=proc.stdout, stderr=proc.stderr,
+                )
+            changed.update(line for line in proc.stdout.splitlines() if line)
+        return changed
+
+    def _baseline_recheck(
+        self,
+        experiment_id: str,
+        worktree_path: str,
+        base_commit: str,
+        test_ids: list[str],
+        elog: ExperimentLogger,
+    ) -> dict[str, str]:
+        """Run each implicated test once at the unchanged experiment base."""
+        deadline = self._baseline_recheck_seconds()
+        classifications = dict.fromkeys(test_ids, "regression")
+        parent: str | None = None
+        baseline_path: str | None = None
+        try:
+            parent = tempfile.mkdtemp(prefix="nexus-baseline-")
+            baseline_path = str(Path(parent) / "worktree")
+            proc = _run_git(
+                ["worktree", "add", "--detach", baseline_path, base_commit],
+                cwd=worktree_path, timeout=60, elog=elog, phase="verifying",
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or "git worktree add failed")
+            config = WatchdogConfig(
+                stall_timeout_seconds=deadline,
+                check_interval_seconds=min(1.0, deadline),
+                safety_cap_seconds=deadline,
+            )
+            for index, test_id in enumerate(test_ids):
+                test_file = _test_file_for_id(test_id)
+                # A loader error has no test to select, on base or anywhere.
+                if test_file is None or not _is_real_test_id(test_id):
+                    continue
+                if self._ended_from_outside(experiment_id):
+                    break
+                # Same discovery root as the full run, so the IDs line up.
+                command = [
+                    self.test_python_executable, "-m", "unittest", "discover",
+                    "-s", "tests", "-p", Path(test_file).name, "-k", test_id, "-v",
+                ]
+                result = run_verification_test_monitored(
+                    command,
+                    cwd=baseline_path,
+                    run_id=f"{experiment_id}-baseline-{index}",
+                    config=config,
+                    on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
+                    prune_logs=False,
+                    on_process=lambda process: self._track_process(experiment_id, process),
+                )
+                classifications[test_id] = _baseline_verdict(test_id, result)
+        except Exception as exc:  # noqa: BLE001 - uncertain baseline is never exculpatory
+            elog.error(
+                "verifying", "baseline_recheck_failed",
+                "Could not complete verification against the base commit", exc=exc,
+            )
+            classifications = dict.fromkeys(test_ids, "regression")
+        finally:
+            self._remove_baseline_worktree(worktree_path, parent, baseline_path, elog)
+
+        elog.info(
+            "verifying", "baseline_recheck_classified",
+            "Classified failing tests against the experiment base commit",
+            classifications=classifications,
+            deadline_seconds=deadline,
+            base_commit=base_commit,
+        )
+        return classifications
+
+    @staticmethod
+    def _remove_baseline_worktree(
+        worktree_path: str, parent: str | None, baseline_path: str | None,
+        elog: ExperimentLogger,
+    ) -> None:
+        try:
+            if baseline_path is not None and Path(baseline_path).exists():
+                _run_git(
+                    ["worktree", "remove", "--force", baseline_path],
+                    cwd=worktree_path, timeout=60, elog=elog, phase="verifying",
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            elog.error(
+                "verifying", "baseline_worktree_remove_failed",
+                "Could not remove the temporary base worktree", exc=exc,
+            )
+        if parent is not None:
+            shutil.rmtree(parent, ignore_errors=True)
+        try:
+            # After the directory is gone, so this also clears what a failed
+            # add or remove left behind in the shared worktree metadata.
+            _run_git(
+                ["worktree", "prune"], cwd=worktree_path, timeout=60,
+                elog=elog, phase="verifying",
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            elog.error(
+                "verifying", "baseline_worktree_remove_failed",
+                "Could not prune the temporary base worktree", exc=exc,
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -1168,11 +1363,6 @@ class ExperimentService:
                     error=f"git worktree add failed: {create_proc.stderr.strip()[:2000]}",
                 )
                 return self.get_experiment(experiment_id)
-            base_proc = _run_git(
-                ["rev-parse", "HEAD"], cwd=worktree_path, elog=elog,
-                phase="implementation",
-            )
-            base_commit_sha = base_proc.stdout.strip() if base_proc.returncode == 0 else base_ref
         except (OSError, subprocess.SubprocessError) as exc:
             elog.error(
                 "implementation", "worktree_creation_exception",
@@ -1190,6 +1380,11 @@ class ExperimentService:
             "implementation", "worktree_created",
             f"Git worktree created at {branch_name}",
         )
+        base_sha_proc = _run_git(
+            ["rev-parse", "HEAD"], cwd=worktree_path, timeout=30,
+            elog=elog, phase="implementation",
+        )
+        base_commit_sha = base_sha_proc.stdout.strip() if base_sha_proc.returncode == 0 else None
         self._force_status(
             experiment_id, STATUS_IMPLEMENTING,
             worktree_path=worktree_path,
@@ -1436,98 +1631,6 @@ class ExperimentService:
             )
             return f"; GitHub checkpoint failed: {str(exc)[:1000]}"
 
-    def _recheck_failures_on_base(
-        self,
-        experiment_id: str,
-        test_ids: tuple[str, ...],
-        changed_files: set[str],
-        elog: ExperimentLogger,
-    ) -> dict[str, str] | None:
-        """Re-run exact failing IDs at the recorded base, conservatively.
-
-        ``None`` means no recheck was appropriate.  Anything the baseline
-        cannot positively map back to the requested test remains a regression.
-        """
-        if not test_ids:
-            return None
-        candidate_files = {path for test_id in test_ids for path in _test_file_candidates(test_id)}
-        if not candidate_files or candidate_files & changed_files:
-            return None
-
-        experiment = self.get_experiment(experiment_id)
-        if not experiment.base_commit_sha:
-            return None
-        deadline = _baseline_recheck_seconds()
-        classifications: dict[str, str] = {}
-        temp_root = tempfile.mkdtemp(prefix=f"nexus-baseline-{experiment_id[:8]}-")
-        base_worktree = str(Path(temp_root) / "worktree")
-        added = False
-        try:
-            add = _run_git(
-                ["worktree", "add", "--detach", base_worktree, experiment.base_commit_sha],
-                cwd=self.repo_root, timeout=60, elog=elog, phase="verifying",
-            )
-            if add.returncode != 0:
-                return {test_id: "regression" for test_id in test_ids}
-            added = True
-            for index, test_id in enumerate(test_ids):
-                # Loader pseudo-tests prove collection failed, not that the
-                # intended test existed and failed on the base revision.
-                if "_FailedTest" in test_id:
-                    classifications[test_id] = "regression"
-                    continue
-                config = WatchdogConfig(
-                    stall_timeout_seconds=deadline,
-                    check_interval_seconds=min(1.0, max(0.05, deadline / 10)),
-                    safety_cap_seconds=deadline + min(1.0, max(0.05, deadline / 10)),
-                )
-                baseline_id = test_id if test_id.startswith("tests.") else f"tests.{test_id}"
-                run = run_verification_test_monitored(
-                    [self.test_python_executable, "-m", "unittest", baseline_id, "-v"],
-                    cwd=base_worktree,
-                    run_id=f"{experiment_id}-baseline-{index}",
-                    config=config,
-                    expected_total=1,
-                    on_process=lambda process: self._track_process(experiment_id, process),
-                )
-                exact_result = (run.test_results or {}).get(baseline_id)
-                exact_stall = bool(
-                    run.stalled
-                    and (run.progress or {}).get("current_test") == baseline_id
-                )
-                classifications[test_id] = (
-                    "pre_existing"
-                    if exact_result in {"failed", "error", "unexpected_success"} or exact_stall
-                    else "regression"
-                )
-        except Exception as exc:  # noqa: BLE001 - ambiguity must preserve regression behavior
-            elog.warning(
-                "verifying", "baseline_recheck_failed",
-                "Could not complete baseline test recheck; preserving regression behavior",
-                reason=str(exc)[:1000],
-            )
-            for test_id in test_ids:
-                classifications.setdefault(test_id, "regression")
-        finally:
-            if added:
-                _run_git(
-                    ["worktree", "remove", "--force", base_worktree],
-                    cwd=self.repo_root, timeout=60, elog=elog, phase="verifying",
-                )
-            shutil.rmtree(temp_root, ignore_errors=True)
-            _run_git(
-                ["worktree", "prune"], cwd=self.repo_root, timeout=60,
-                elog=elog, phase="verifying",
-            )
-
-        elog.info(
-            "verifying", "baseline_recheck_classified",
-            "Classified verification failures against the base commit",
-            classifications=classifications,
-            base_commit_sha=experiment.base_commit_sha,
-        )
-        return classifications
-
     def _verify(
         self,
         experiment_id: str,
@@ -1680,6 +1783,7 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         test_timed_out = False
+        baseline_classifications: dict[str, str] | None = None
         if not use_local_tests:
             test_command = ["GitHub Actions", "tests.yml", ci_verification.commit_sha]
             test_exit_code = 0 if ci_verification.status == "passed" else 1
@@ -1728,6 +1832,12 @@ class ExperimentService:
             test_timed_out = test_run.timed_out
             self._remember_test_total(test_run.tests_total)
 
+            baseline_classifications = self._classify_failures_against_base(
+                experiment_id, worktree_path, test_run, elog,
+            )
+            if self._ended_from_outside(experiment_id):
+                return self.get_experiment(experiment_id)
+
         if use_local_tests and test_run.timed_out:
             elog.log_process(
                 "verifying",
@@ -1769,22 +1879,23 @@ class ExperimentService:
                 tests_total=test_run.tests_total,
             )
 
-        failure_classification: dict[str, str] | None = None
-        if use_local_tests and test_run.failed_test_ids:
-            changed_files = set(parse_git_status_short(git_status).all_paths())
-            failure_classification = self._recheck_failures_on_base(
-                experiment_id,
-                test_run.failed_test_ids,
-                changed_files,
-                elog,
-            )
-
         test_output_capped = _truncate_text(test_output, self.max_test_output_bytes, label="test output")
 
         final_status = STATUS_SUCCEEDED
         error: str | None = None
         quality_evaluation: dict[str, Any] | None = None
-        if diff_check_issue:
+        all_failures_pre_existing = bool(baseline_classifications) and all(
+            value == "pre_existing" for value in baseline_classifications.values()
+        )
+        if all_failures_pre_existing:
+            final_status = STATUS_NEEDS_REVIEW
+            error = "pre-existing failures on base: " + ", ".join(
+                sorted(baseline_classifications)
+            )
+            if diff_check_issue:
+                error += f"; git diff --check reported issues: {str(diff_check_issue)[:500]}"
+            elog.warning("verifying", "baseline_pre_existing_failures", error)
+        elif diff_check_issue:
             final_status = STATUS_NEEDS_REVIEW
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
             elog.warning("verifying", "diff_check_issue", f"git diff --check reported issues: {diff_check_issue}")
@@ -1876,17 +1987,6 @@ class ExperimentService:
                     "Exception while running deterministic quality evaluation", exc=exc,
                 )
 
-        if failure_classification and all(
-            verdict == "pre_existing" for verdict in failure_classification.values()
-        ):
-            ids = ", ".join(failure_classification)
-            final_status = STATUS_NEEDS_REVIEW
-            error = f"pre-existing failures on base: {ids}"
-            elog.warning(
-                "verifying", "pre_existing_failures_on_base", error,
-                classifications=failure_classification,
-            )
-
         with self._lock:
             row = self._conn.execute(
                 "SELECT COALESCE(MAX(iteration), -1) + 1 FROM verification_runs "
@@ -1913,8 +2013,9 @@ class ExperimentService:
             test_output=test_output_capped,
             error=error,
             quality_evaluation_json=json.dumps(quality_evaluation) if quality_evaluation is not None else None,
-            test_failure_classification_json=(
-                json.dumps(failure_classification) if failure_classification is not None else None
+            baseline_test_classifications_json=(
+                json.dumps(baseline_classifications)
+                if baseline_classifications is not None else None
             ),
         )
         if github_work_tracking is not None:

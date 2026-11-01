@@ -107,6 +107,13 @@ run continues for as long as tests keep starting and finishing.
   permanently orphaned process only; it must never be the mechanism that ends
   a healthy run, so it is clamped to at least 30 min and always kept above the
   stall timeout.
+- `NEXUS_BASELINE_RECHECK_SECONDS` (default 120) - deadline for each failing
+  or stalled test when it is re-run at the experiment's base commit (#386). The
+  recheck runs only for local verification, and only if no failing test file
+  is part of the change. If every failure also fails on base, the experiment
+  ends `needs_review` with the classification in
+  `baseline_test_classifications_json`; a test that passes on base, or whose
+  base run shows nothing about it, is a `regression` and keeps the old outcome.
 - `NEXUS_TEST_LOG_DIR` (default `<AGENT_LOG_DIR>/test-runs`) - where the
   dedicated per-test logs and heartbeat files are written. They are kept out
   of the global Nexus feed deliberately: the feed would otherwise gain ~3800

@@ -46,9 +46,11 @@ from typing import Any, Callable, Mapping, Sequence
 from modules.test_progress import (
     EVENT_END,
     EVENT_START,
+    FAILING_RESULTS,
     ProgressTracker,
     UnittestStreamParser,
     format_stall_diagnostics,
+    parse_failed_test_ids,
     parse_total_tests,
 )
 from modules.test_run_log import VerificationTestLog, prune_test_logs
@@ -198,11 +200,16 @@ class VerificationRunResult:
     test_log_path: str | None = None
     #: Total tests reported by the suite itself, when it got that far.
     tests_total: int | None = None
-    #: Exact unittest IDs which completed unsuccessfully, plus the current
-    #: test when the watchdog stopped a stalled run.
-    failed_test_ids: tuple[str, ...] = ()
-    #: Result by exact ID for tests which reached a unittest verdict.
-    test_results: dict[str, str] | None = None
+    #: Canonical unittest IDs which failed, errored, or were running at a stall.
+    failed_test_ids: list[str] | None = None
+    #: The test the watchdog found running when it aborted the run, if any.
+    aborted_test_id: str | None = None
+    #: Canonical unittest IDs which the runner actually observed starting.
+    #:
+    #: Baseline rechecks use this to distinguish a real result for the
+    #: requested test from loader/import errors, bad selectors, and zero-test
+    #: runs.  Those uncertain outcomes must never exculpate an experiment.
+    observed_test_ids: list[str] | None = None
 
     @property
     def output(self) -> str:
@@ -238,7 +245,8 @@ def run_verification_test_monitored(
 
     parser = UnittestStreamParser()
     tracker = ProgressTracker(expected_total=expected_total)
-    test_results: dict[str, str] = {}
+    failed_test_ids: set[str] = set()
+    observed_test_ids: set[str] = set()
     stdout_chunks: list[str] = []
 
     env = build_verification_test_env()
@@ -281,9 +289,11 @@ def run_verification_test_monitored(
             tracker.note_activity()
             for event in events:
                 tracker.record(event)
+                if event.kind == EVENT_START:
+                    observed_test_ids.add(event.test_id)
+                if event.kind == EVENT_END and event.result in FAILING_RESULTS:
+                    failed_test_ids.add(event.test_id)
                 _log_test_event(test_log, event)
-                if event.kind == EVENT_END and event.result:
-                    test_results[event.test_id] = event.result
 
     def _drain_stdout() -> None:
         for chunk in _iter_chunks(process.stdout):
@@ -342,6 +352,11 @@ def run_verification_test_monitored(
     tracker.set_total_tests(total_tests)
 
     exit_code = process.returncode
+    # The closing report is authoritative once the suite got that far; the live
+    # events only have to stand in for a run that was aborted before it.
+    reported_failures = parse_failed_test_ids(stderr_text)
+    if total_tests is not None and (reported_failures or exit_code == 0):
+        failed_test_ids = reported_failures
     if on_process is not None:
         on_process(None)
     # A negative return code means a signal, not a verdict: the suite never
@@ -353,6 +368,7 @@ def run_verification_test_monitored(
     test_log.write_heartbeat(final_snapshot)
 
     diagnostics: str | None = None
+    aborted_test_id: str | None = None
     if process_died:
         diagnostics = format_stall_diagnostics(
             final_snapshot,
@@ -368,21 +384,16 @@ def run_verification_test_monitored(
         diagnostics = format_stall_diagnostics(stall_snapshot or final_snapshot, title=title)
         stderr_text += f"\n[{diagnostics}]\n"
         test_log.log_run_event(abort_reason, diagnostics, **(stall_snapshot or final_snapshot))
+        current_test = (stall_snapshot or final_snapshot).get("current_test")
+        if current_test:
+            aborted_test_id = str(current_test)
+            failed_test_ids.add(aborted_test_id)
     else:
         test_log.log_run_event(
             "test_run_finished",
             f"Verification test run finished with exit code {exit_code}",
             exit_code=exit_code, duration_ms=duration_ms, **final_snapshot,
         )
-
-    failed_ids = [
-        test_id for test_id, result in test_results.items()
-        if result in {"failed", "error", "unexpected_success"}
-    ]
-    if abort_reason == ABORT_STALLED:
-        stalled_test = (stall_snapshot or {}).get("current_test")
-        if stalled_test and stalled_test not in failed_ids:
-            failed_ids.append(str(stalled_test))
 
     return VerificationRunResult(
         None if (abort_reason is not None or process_died) else exit_code,
@@ -398,8 +409,9 @@ def run_verification_test_monitored(
         progress=final_snapshot,
         test_log_path=str(test_log.path),
         tests_total=total_tests,
-        failed_test_ids=tuple(failed_ids),
-        test_results=test_results,
+        failed_test_ids=sorted(failed_test_ids),
+        aborted_test_id=aborted_test_id,
+        observed_test_ids=sorted(observed_test_ids),
     )
 
 
