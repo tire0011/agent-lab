@@ -246,6 +246,31 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_a_red_run_with_failure_detail_is_still_parsed(self):
+        """The first line is the evidence; what follows it is detail (#472)."""
+        self._insert_legacy_ci_run(
+            output=(
+                f"GitHub Actions run {self.run_id} for commit {self.checkpoint_sha} "
+                "completed with conclusion failure. "
+                f"https://example.invalid/actions/runs/{self.run_id}\n"
+                "Failed job: unittest\n"
+                "Failed step: Run tests\n"
+                "Failing tests:\n"
+                "FAILED tests/test_a.py::test_one - boom\n"
+            ),
+            exit_code=1,
+        )
+
+        tracking, _ = self._restart_current_code_without_credentials()
+
+        details = tracking.recorded_ci_details(self.checkpoint_sha)
+        self.assertEqual(details["status"], "failed")
+        self.assertEqual(details["conclusion"], "failure")
+        self.assertEqual(details["run_id"], self.run_id)
+        self.assertEqual(
+            details["url"], f"https://example.invalid/actions/runs/{self.run_id}"
+        )
+
     def test_mismatched_ci_identity_is_not_backfilled(self):
         other_sha = "a" * 40
         self._insert_legacy_ci_run(
