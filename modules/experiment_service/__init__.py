@@ -45,6 +45,7 @@ from modules.verification_runner import run_verification_test_monitored
 annotations = __future__.annotations
 
 from .git_utils import _run_git
+from .gate_recheck import gate_recheck
 from .models import (
     EXPERIMENT_STATUSES,
     STATUS_FAILED,

@@ -27,8 +27,10 @@ from typing import Any, Callable
 
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
+from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
 from modules.nexus_planner import PROPOSAL_LABEL
 from modules.nexus_sources import issue_source
+from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,10 @@ _MAX_OPEN_PROPOSALS = 3
 # gate that stopped it may have been fixed since (#185, #349, #378).
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
+# An open issue that used up its attempts is reported, not dropped silently
+# (#457). It stays unselectable until a human acts, unless only pipeline crashes
+# stopped it (#467): those end with a newer commit on origin/main.
+DECISION_SKIPPED_ATTEMPTS_EXHAUSTED = "skipped_attempts_exhausted"
 
 # An issue the goal policy rejects is not sent (#408): the experiment would be
 # rejected before any work, at the cost of a tick and a budget slot.
@@ -89,10 +95,25 @@ _GOAL_POLICY_REASON_PREFIXES = tuple(
 
 
 def _is_provider_overload(status: Any, error: Any) -> bool:
-    """A run that failed because the coding agent's API was overloaded."""
+    """A run that failed because the coding agent's API was overloaded.
+
+    A crash may quote "429" or "rate limit", but it stays a crash: an overload
+    is free of every limit, and a crash loop must not be. Neither is a test
+    failure an overload because the failing test is called test_rate_limit_*.
+    """
     from modules.coding_provider import is_provider_overload
 
-    return status == "failed" and is_provider_overload(error)
+    return (
+        status == "failed"
+        and is_provider_overload(error)
+        and not _is_pipeline_crash(status, error)
+        and not str(error or "").startswith("tests failed")
+    )
+
+
+def _is_pipeline_crash(status: Any, error: Any) -> bool:
+    """A run Nexus's own pipeline crashed in: no coding work was judged (#467)."""
+    return status == "failed" and str(error or "").startswith(PIPELINE_CRASH_ERROR_PREFIX)
 
 
 def _is_goal_policy_rejection(status: Any, error: Any) -> bool:
@@ -127,6 +148,11 @@ def _parse_timestamp(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _last_reason(attempts: dict[str, tuple[str, str]]) -> str:
+    """The newest of ``experiment -> (when, why)``, safe to show on GitHub."""
+    return sanitized_reason(" ".join(max(attempts.values())[1].split())) or "no reason recorded"
+
+
 @dataclass(slots=True)
 class Candidate:
     kind: str
@@ -140,7 +166,9 @@ class Candidate:
 class InitiativeDecision:
     """What the tick decided, and why. Persisted before anything is dispatched."""
 
-    decision: str  # "dispatched" | "idle" | "busy" | "budget_exhausted" | "error" | "skipped_goal_policy"
+    # "dispatched" | "idle" | "busy" | "budget_exhausted" | "error"
+    # | "skipped_goal_policy" | "skipped_attempts_exhausted"
+    decision: str
     candidate: Candidate | None = None
     considered: list[Candidate] = field(default_factory=list)
     detail: str = ""
@@ -172,6 +200,7 @@ class NexusInitiativeService:
         diagnostics_client: Callable[[], dict[str, Any]] | None = None,
         checkout_revision: Callable[[], str] | None = None,
         restart_hook: Callable[[], None] | None = None,
+        main_commit_date: Callable[[], str] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -187,7 +216,9 @@ class NexusInitiativeService:
         self._diagnostics_client = diagnostics_client
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
+        self._main_commit_date = main_commit_date
         self._open_proposals = 0
+        self._exhausted_issues: list[dict[str, Any]] = []
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
             try:
@@ -316,6 +347,9 @@ class NexusInitiativeService:
             (since, REVIEW_RETRY_REASON),
         ).fetchone()
         spent = int(row["n"]) if row else 0
+        # Crashes stay in the budget, unlike overloads (#467): an overload was
+        # refused before any work, a crash can come after a paid coding run, and
+        # this budget is the only limit across issues on a broken pipeline.
         return max(0, spent - self._overloaded_since(since))
 
     def _overloaded_since(self, since: str) -> int:
@@ -397,12 +431,14 @@ class NexusInitiativeService:
         except Exception as exc:  # noqa: BLE001 - a source outage must not stop the tick
             logger.warning("initiative: issue lookup failed: %s", exc)
             return []
-        linked = self._linked_issue_numbers()
+        linked, exhausted = self._issue_attempts()
+        reported = self._exhausted_reports()
         review_blocked = self._review_blocked_issues()
         skipped = self._goal_policy_skips()
         policy_hash = _policy_hash()
         candidates: list[Candidate] = []
         self._open_proposals = 0
+        self._exhausted_issues = []
         for issue in issues:
             number = issue.get("number")
             labels = {
@@ -414,6 +450,8 @@ class NexusInitiativeService:
                 self._open_proposals += 1
                 continue
             if number is None or int(number) in linked:
+                if number is not None and int(number) in exhausted:
+                    self._note_exhausted(issue, exhausted[int(number)], reported, record=record_skips)
                 continue
             candidate = Candidate(
                 kind=KIND_ISSUE,
@@ -508,14 +546,105 @@ class NexusInitiativeService:
             skipped.add((candidate.ref, issue_hash, policy_hash))
         return True
 
-    def _linked_issue_numbers(self) -> set[int]:
-        """Issues not to start again (#374).
+    def _exhausted_reports(self) -> dict[tuple[str, tuple[str, ...]], tuple[str, dict[str, Any]]]:
+        """``(issue, experiment IDs) -> (tick id, detail)`` of earlier reports."""
+        rows = self._conn.execute(
+            "SELECT tick_id, source_ref, detail FROM nexus_initiative_log WHERE decision = ?",
+            (DECISION_SKIPPED_ATTEMPTS_EXHAUSTED,),
+        ).fetchall()
+        found: dict[tuple[str, tuple[str, ...]], tuple[str, dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except ValueError:
+                continue
+            key = (str(row["source_ref"]), tuple(detail.get("experiment_ids") or ()))
+            found[key] = (str(row["tick_id"]), detail)
+        return found
+
+    def _note_exhausted(
+        self,
+        issue: dict[str, Any],
+        attempts: dict[str, Any],
+        reported: dict[tuple[str, tuple[str, ...]], tuple[str, dict[str, Any]]],
+        *,
+        record: bool,
+    ) -> None:
+        """Show this issue to the planner, and report the stop once (#457).
+
+        One log entry per issue and set of experiment IDs. The comment is
+        tracked in that entry: GitHub may be down when the entry is written,
+        and without this a failed comment would never be posted.
+        """
+        ref = str(issue["number"])
+        title = str(issue.get("title") or f"Issue #{ref}")[:200]
+        self._exhausted_issues.append(
+            {"number": int(ref), "title": title, "last_reason": attempts["last_reason"]}
+        )
+        if not record:
+            return
+        key = (ref, tuple(attempts["experiment_ids"]))
+        if key in reported:
+            tick_id, detail = reported[key]
+        else:
+            logger.info("initiative: issue #%s is out of attempts: %s", ref, attempts["last_reason"])
+            tick_id, detail = uuid.uuid4().hex, {**attempts, "commented": False}
+            self._record(
+                InitiativeDecision(
+                    DECISION_SKIPPED_ATTEMPTS_EXHAUSTED,
+                    candidate=Candidate(KIND_ISSUE, ref, title, attempts["last_reason"]),
+                    detail=json.dumps(detail),
+                    tick_id=tick_id,
+                )
+            )
+            reported[key] = (tick_id, detail)
+        if detail.get("commented") or self._issue_commenter is None:
+            return
+        if attempts.get("pipeline_crash"):
+            stop = f"Nexus paused this issue: its own pipeline crashed {_MAX_ISSUE_ATTEMPTS} times or more."
+            how_on = (
+                "The crash says nothing about this issue. It returns on its own once "
+                "origin/main has a commit newer than the last crash; no human decision is needed."
+            )
+        else:
+            stop = f"Nexus stopped working on this issue: it used up its {_MAX_ISSUE_ATTEMPTS} attempts."
+            how_on = "Nexus does not start it again on its own; a human has to decide how it goes on."
+        try:
+            self._issue_commenter(
+                int(ref),
+                f"{stop}\n\n"
+                f"Experiments: {', '.join(detail['experiment_ids'])}\n"
+                f"Last failure: {detail['last_reason']}\n\n"
+                f"{how_on}",
+            )
+        except Exception as exc:  # noqa: BLE001 - tried again on the next tick
+            logger.warning("initiative: out-of-attempts comment failed for #%s: %s", ref, exc)
+            return
+        detail["commented"] = True
+        self._record(
+            InitiativeDecision(
+                DECISION_SKIPPED_ATTEMPTS_EXHAUSTED, detail=json.dumps(detail), tick_id=tick_id
+            ),
+            update=True,
+        )
+
+    def _issue_attempts(self) -> tuple[set[int], dict[int, dict[str, Any]]]:
+        """Issues not to start again (#374), and those among them out of attempts.
 
         An issue is free again after a failed experiment, up to
         ``_MAX_ISSUE_ATTEMPTS`` failed attempts. A running or succeeded
-        experiment, or a link without a known experiment, keeps it blocked.
+        experiment, or a link without a known experiment, keeps it blocked,
+        and such an issue is not reported as out of attempts (#457): its work
+        has not stopped.
+
+        A pipeline crash is not an attempt (#467). ``_MAX_ISSUE_ATTEMPTS``
+        crashes block the issue until origin/main has a commit newer than the
+        last crash, so a broken pipeline gets one more run per commit.
         """
-        failed: dict[int, set[str]] = {}
+        # issue -> experiment -> (when, why it failed)
+        failed: dict[int, dict[str, tuple[str, str]]] = {}
+        # issue -> experiment -> (when it ended, the crash)
+        crashes: dict[int, dict[str, tuple[str, str]]] = {}
         blocked: set[int] = set()
         for table in ("github_experiment_links", "github_work_links"):
             try:
@@ -523,7 +652,8 @@ class NexusInitiativeService:
                     f"""
                     SELECT l.issue_number AS issue_number,
                            l.experiment_id AS experiment_id, e.status AS status,
-                           e.error AS error, a.status AS adoption_status
+                           e.error AS error, e.created_at AS created_at, e.ended_at AS ended_at,
+                           a.status AS adoption_status, a.reason AS adoption_reason
                     FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
                     LEFT JOIN experiment_adoptions a ON a.experiment_id = l.experiment_id
                     """
@@ -535,6 +665,10 @@ class NexusInitiativeService:
                     number = int(row["issue_number"])
                 except (TypeError, ValueError):
                     continue
+                # ensure_for_source records the source before any experiment
+                # exists (#464): a link without an experiment is no work.
+                if row["experiment_id"] is None:
+                    continue
                 # A goal-policy rejection is neither an attempt nor a block
                 # (#408): the preflight in _issue_candidates judges the text.
                 if _is_goal_policy_rejection(row["status"], row["error"]):
@@ -542,14 +676,58 @@ class NexusInitiativeService:
                 # An overloaded provider says nothing about the issue: not an attempt.
                 if _is_provider_overload(row["status"], row["error"]):
                     continue
+                if _is_pipeline_crash(row["status"], row["error"]):
+                    crashes.setdefault(number, {})[str(row["experiment_id"])] = (
+                        str(row["ended_at"] or ""),
+                        str(row["error"]),
+                    )
+                    continue
                 # A review that blocked the merge (#396) fails the adoption of
                 # a succeeded experiment: that is a failed attempt too.
-                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or self._merge_stopped(row):
-                    failed.setdefault(number, set()).add(str(row["experiment_id"]))
+                merge_stopped = self._merge_stopped(row)
+                if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or merge_stopped:
+                    first, second = row["adoption_reason"], row["error"]
+                    if not merge_stopped:
+                        first, second = second, first
+                    failed.setdefault(number, {})[str(row["experiment_id"])] = (
+                        str(row["created_at"] or row["ended_at"] or ""),
+                        str(first or second or ""),
+                    )
                 else:
                     blocked.add(number)
-        blocked.update(n for n, ids in failed.items() if len(ids) >= _MAX_ISSUE_ATTEMPTS)
-        return blocked
+        exhausted = {
+            number: {
+                "experiment_ids": sorted(attempts),
+                "last_reason": _last_reason(attempts),
+            }
+            for number, attempts in failed.items()
+            if len(attempts) >= _MAX_ISSUE_ATTEMPTS and number not in blocked
+        }
+        blocked.update(n for n, attempts in failed.items() if len(attempts) >= _MAX_ISSUE_ATTEMPTS)
+        crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
+        main_commit = self._main_commit_time() if crash_limited else None
+        for number, attempts in crash_limited.items():
+            ended = [_parse_timestamp(when) for when, _ in attempts.values()]
+            if main_commit is not None and all(ended) and main_commit > max(ended):
+                continue
+            if number not in blocked:
+                exhausted[number] = {
+                    "experiment_ids": sorted(attempts),
+                    "last_reason": _last_reason(attempts),
+                    "pipeline_crash": True,
+                }
+            blocked.add(number)
+        return blocked, exhausted
+
+    def _main_commit_time(self) -> datetime | None:
+        """When origin/main last moved, from the local ref; ``None`` if unreadable."""
+        if self._main_commit_date is None:
+            return None
+        try:
+            return _parse_timestamp(self._main_commit_date())
+        except Exception as exc:  # noqa: BLE001 - an unreadable date keeps the block
+            logger.warning("initiative: cannot read the origin/main commit date: %s", exc)
+            return None
 
     def _merge_stopped(self, row: sqlite3.Row) -> bool:
         """The experiment succeeded but its merge stopped for good.
@@ -737,6 +915,7 @@ class NexusInitiativeService:
         choice = self._planner.choose(
             [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues],
             recent=self._recent_experiments(),
+            exhausted=self._exhausted_issues,
         )
         if choice is None:
             return []

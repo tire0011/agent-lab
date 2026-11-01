@@ -33,6 +33,17 @@ class ProviderOverloadTests(unittest.TestCase):
         self.assertTrue(is_provider_overload("HTTP 429 rate limit exceeded"))
         self.assertFalse(is_provider_overload("tests failed"))
 
+    def test_a_failing_test_named_after_an_overload_is_no_overload(self):
+        """The error names the failing tests now (#472); those still cost an attempt."""
+        from modules.nexus_initiative import _is_provider_overload
+
+        self.assertFalse(
+            _is_provider_overload(
+                "failed", "tests failed (exit code 1): tests/test_a.py::test_rate_limit_resets"
+            )
+        )
+        self.assertTrue(_is_provider_overload("failed", "API Error: 529 Overloaded"))
+
     def test_overloaded_runs_do_not_use_up_the_issue(self):
         for i in range(3):
             self._attempt(f"e{i}", OVERLOAD)

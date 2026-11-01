@@ -254,7 +254,12 @@
   reported through `abandoned_work()` and otherwise ignored — see D-017.
 - Audit: `nexus_initiative_log` records every tick (decision, chosen source,
   reason, what else was considered, failure detail), readable via
-  `NexusInitiativeService.history()`.
+  `NexusInitiativeService.history()`. An open issue out of attempts is logged
+  as `skipped_attempts_exhausted` once per set of experiments, gets one GitHub
+  comment and is listed in the planning prompt, but stays unselectable.
+  A pipeline crash is not an attempt (#467): after two crashes the issue is
+  reported the same way, but returns once the local `origin/main` ref has a
+  commit newer than the last crash. Crashes stay in the daily budget.
 
 ### 10) Work heartbeats (explicit liveness)
 
@@ -369,11 +374,13 @@
   `error_kind`, and the session they belong to. `role` is observability
   only - it never changes how a job runs - so one feature's local-model
   traffic can be read back without filtering another's.
-- No caller-side deadline. A waiter blocks for as long as the job legitimately
-  takes; the service's own watchdog
-  (`NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS`, default 1h, clamped 5m-2h) is the
-  HTTP read timeout, and a `running` job that outlives it by the grace window
-  is swept to `failed` with `error_kind=stuck`, which releases its waiter.
+- No caller-side deadline. A waiter blocks until its job is terminal; the
+  service's own watchdog (`NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS`, default 15m,
+  clamped 1m-2h) is one hard deadline per model call, for every role. A call
+  that reaches it is cancelled and fails with `error_kind=timeout` (#236),
+  and a `running` job that outlives it by the grace window (a wedged worker)
+  is swept to `failed` with `error_kind=stuck`. Either way the waiter is
+  released; the controller then uses its external-provider fallback.
 - Terminal writes are guarded by status *and* ownership: a job cancelled
   (`cancel()`), swept as stuck, or reclaimed from a lapsed lease while its
   request was still in flight stays terminal, and the late result is
@@ -390,6 +397,8 @@
   `modules/tool_loop_guard.py` (duplicate/non-progressing protection).
   Callers: `modules/task_orchestrator.py` (the persistent controller) and
   `modules/failure_analysis_service.py` (diagnosis, #172).
+  `modules/tool_router_mcp.py` exposes the same router to external MCP clients
+  over stdio, read-only (#118, `docs/issue-118-tool-router-mcp.md`).
 - `find_tool` resolves one plain-language capability request against the
   read-only catalog and returns that operation's schema; `call_tool` runs an
   operation only when a `find_tool` result in the same session already

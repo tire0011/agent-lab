@@ -35,6 +35,7 @@ from modules.outbox_publisher import (
     TaskApprovalOutboxPublisher,
 )
 from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.run_store.schema import record_merge_constraint
 # ``modules.task_orchestrator`` is imported lazily, not here. It imports
 # ``modules.mailbox.development``, which runs this package's ``__init__`` and
 # comes straight back to this module - so importing the orchestrator *first*
@@ -76,6 +77,9 @@ _NON_TERMINAL_STATUSES = {
 _EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected", "interrupted"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
 _EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review", "interrupted"}
+# Verified, and left open because the task forbids the merge (#185).
+_STATUS_READY_FOR_REVIEW = "ready_for_review"
+_TERMINAL_STATUSES.add(_STATUS_READY_FOR_REVIEW)
 # After a failed experiment Nexus may try again, but a task gets at most this
 # many experiments in total (#263 step 4).
 _MAX_EXPERIMENTS_PER_TASK = 2
@@ -95,6 +99,7 @@ class MailboxTaskApproval:
         "received_at", "status", "approved_at", "rejected_at",
         "rejection_reason", "experiment_id", "outbox_file",
         "publish_status", "publish_commit_sha", "result_summary", "error",
+        "merge_forbidden", "merge_constraint_reason",
         "created_at", "updated_at",
     )
 
@@ -394,6 +399,7 @@ class MailboxTaskService:
                     now,
                 ),
             )
+            record_merge_constraint(self._conn, approval_id, task_body)
             self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)

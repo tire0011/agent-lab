@@ -11,11 +11,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.redaction import redact_credentials
 from modules.run_store import DEFAULT_DB_PATH, _connect
 from modules.work_directives import WorkDirectives, parse_work_directives
 
@@ -29,6 +31,26 @@ _DEFAULT_CI_START_TIMEOUT_SECONDS = 90.0
 _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS = 1500.0
 _DEFAULT_CI_POLL_INTERVAL_SECONDS = 10.0
 _MAX_COMMIT_TITLE_CHARS = 72
+_MAX_CI_FAILURE_DETAIL_CHARS = 8000
+_MAX_CI_FAILURE_TAIL_LINES = 80
+_MAX_CI_FAILED_TEST_LINES = 30
+_MAX_CI_FAILURE_LINE_CHARS = 200
+_CI_FAILED_CONCLUSIONS = ("failure", "timed_out")
+_CI_JOB_LOG_PATH_RE = re.compile(r"/actions/jobs/\d+/logs$")
+# Every line of a job log starts with its own timestamp. Dropping it keeps the
+# detail readable and keeps two identical failures from fingerprinting apart.
+_CI_LOG_PREFIX_RE = re.compile(r"^\ufeff?(?:\d{4}-\d{2}-\d{2}T[\d:.]+Z ?)?")
+_CI_LOG_COLOR_RE = re.compile(r"\x1b\[[0-9;]*m")
+# CI runs pytest (scripts/run_tests_ci.py), the local fallback runs unittest.
+# Each form is anchored to the shape of a test id, so that a line such as pip's
+# "ERROR: Could not find a version" or a log record is not taken for a test.
+_CI_FAILED_TEST_RE = re.compile(
+    r"^(?:"
+    r"(?:FAIL|ERROR): (?P<unittest>\S+(?: \([\w.]+\))?)"
+    r"|(?:FAILED|ERROR) (?P<pytest>\S+\.py(?:::.+?)?)(?: - .*)?"
+    r"|_+ ERROR (?:collecting|at \w+ of) (?P<section>\S+) _+"
+    r")$"
+)
 
 # The opening sentence of every lifecycle-readiness refusal. Exported so a
 # consumer that has only a *persisted* refusal text - written before the
@@ -70,6 +92,54 @@ def _issue_commit_title(issue_title: str, issue_number: int, *, max_len: int = _
     if len(title) > room:
         title = title[:room].rstrip()
     return title + suffix
+
+
+def _failing_test_line(line: str) -> str | None:
+    match = _CI_FAILED_TEST_RE.match(line.strip())
+    if match is None:
+        return None
+    return match.group("unittest") or match.group("pytest") or match.group("section")
+
+
+def failing_test_names(text: str | None, *, limit: int | None = None) -> list[str]:
+    """The distinct failing tests named in CI output, in the order they appear."""
+    names: list[str] = []
+    for line in (text or "").splitlines():
+        name = _failing_test_line(line)
+        if name and name not in names:
+            names.append(name)
+    return names[:limit]
+
+
+def _ci_failure_detail_text(job: str, step: str | None, log: str) -> str:
+    """Job, step, failing tests and log tail, redacted and within the cap.
+
+    Redaction runs over the whole log first: a cut made earlier could split a
+    secret into a piece the patterns no longer recognize.
+    """
+    lines = [
+        _CI_LOG_COLOR_RE.sub("", _CI_LOG_PREFIX_RE.sub("", line))
+        for line in redact_credentials(log).splitlines()
+    ]
+    head = [f"Failed job: {redact_credentials(job)[:_MAX_CI_FAILURE_LINE_CHARS]}"]
+    if step:
+        head.append(f"Failed step: {redact_credentials(step)[:_MAX_CI_FAILURE_LINE_CHARS]}")
+    failed = list(dict.fromkeys(line.strip() for line in lines if _failing_test_line(line)))
+    if failed:
+        head.append("Failing tests:")
+        head.extend(
+            line[:_MAX_CI_FAILURE_LINE_CHARS] for line in failed[:_MAX_CI_FAILED_TEST_LINES]
+        )
+    head.append("Log tail:\n")
+    prefix = "\n".join(head)
+
+    # What follows the failed step's closing error is post-job cleanup.
+    errors = [index for index, line in enumerate(lines) if line.startswith("##[error]")]
+    if errors:
+        lines = lines[: errors[-1] + 1]
+    tail = "\n".join(lines[-_MAX_CI_FAILURE_TAIL_LINES:])
+    room = _MAX_CI_FAILURE_DETAIL_CHARS - len(prefix)
+    return prefix + tail[-room:]
 
 
 def _experiment_trailer(experiment_id: str | None) -> str:
@@ -123,10 +193,32 @@ class GitHubCIVerification:
     run_id: int | None = None
     url: str | None = None
     reason: str | None = None
+    failure_detail: str | None = None
+
+
+class _CrossHostRedirectDropsToken(urllib.request.HTTPRedirectHandler):
+    """Keep the token on GitHub: a job log redirects to third-party storage."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if (
+            redirected is not None
+            and urllib.parse.urlsplit(newurl).hostname
+            != urllib.parse.urlsplit(req.full_url).hostname
+        ):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+_GITHUB_OPENER = urllib.request.build_opener(_CrossHostRedirectDropsToken)
 
 
 class GitHubWorkTrackingError(RuntimeError):
     pass
+
+
+class MergeForbiddenError(GitHubWorkTrackingError):
+    """The originating task forbids this merge; the pull request stays open."""
 
 
 Transport = Callable[[str, str, dict[str, Any] | None], Any]
@@ -905,6 +997,48 @@ class GitHubWorkTrackingService:
                 exc_info=True,
             )
 
+        return self._poll_ci(
+            sha,
+            experiment_id=experiment_id,
+            integration_base=integration_base,
+            workflow=workflow,
+            start_timeout_seconds=start_timeout_seconds,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def wait_for_commit_ci(
+        self,
+        sha: str,
+        *,
+        experiment_id: str,
+        workflow: str = _DEFAULT_CI_WORKFLOW,
+        start_timeout_seconds: float = _DEFAULT_CI_START_TIMEOUT_SECONDS,
+        completion_timeout_seconds: float = _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = _DEFAULT_CI_POLL_INTERVAL_SECONDS,
+    ) -> GitHubCIVerification:
+        """CI for one exact commit, such as the integrated tree adoption is about to merge."""
+        return self._poll_ci(
+            sha,
+            experiment_id=experiment_id,
+            integration_base="",
+            workflow=workflow,
+            start_timeout_seconds=start_timeout_seconds,
+            completion_timeout_seconds=completion_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def _poll_ci(
+        self,
+        sha: str,
+        *,
+        experiment_id: str,
+        integration_base: str,
+        workflow: str,
+        start_timeout_seconds: float,
+        completion_timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> GitHubCIVerification:
         started_deadline = time.monotonic() + max(0.0, start_timeout_seconds)
         completion_deadline: float | None = None
         encoded_workflow = urllib.parse.quote(workflow, safe="")
@@ -945,12 +1079,14 @@ class GitHubWorkTrackingService:
                 if str(run.get("status") or "").lower() == "completed":
                     conclusion = str(run.get("conclusion") or "unknown").lower()
                     run_sha = str(run.get("head_sha") or "").strip()
+                    failure_detail = None
                     if conclusion == "success":
                         status = "passed"
                         reason = None
                     elif conclusion == "failure":
                         status = "failed"
                         reason = None
+                        failure_detail = self._ci_failure_detail(run.get("id"))
                     else:
                         status = "unavailable"
                         reason = f"GitHub Actions completed without authoritative result: {conclusion}"
@@ -961,6 +1097,7 @@ class GitHubWorkTrackingService:
                         run_id=int(run["id"]) if run.get("id") is not None else None,
                         url=str(run.get("html_url") or "") or None,
                         reason=reason,
+                        failure_detail=failure_detail,
                     )
                     # Persist here, at the single point that knows the
                     # verdict is authoritative and which commit it is for,
@@ -1006,6 +1143,39 @@ class GitHubWorkTrackingService:
                 )
 
             time.sleep(max(0.01, poll_interval_seconds))
+
+    def _ci_failure_detail(self, run_id: Any) -> str | None:
+        """What failed in a red run, or ``None`` if GitHub would not say.
+
+        Best effort: the verdict is already settled, so nothing that goes wrong
+        here, not even a malformed response, may change it.
+        """
+        try:
+            response = self._request(
+                "GET", f"/repos/{self.repository}/actions/runs/{int(run_id)}/jobs"
+            )
+            job = next(
+                job for job in response.get("jobs") or []
+                if str(job.get("conclusion") or "") in _CI_FAILED_CONCLUSIONS
+            )
+            step = next(
+                (
+                    step for step in job.get("steps") or []
+                    if str(step.get("conclusion") or "") in _CI_FAILED_CONCLUSIONS
+                ),
+                {},
+            )
+            log = self._request(
+                "GET", f"/repos/{self.repository}/actions/jobs/{int(job['id'])}/logs"
+            )
+            if not isinstance(log, str):
+                raise GitHubWorkTrackingError("GitHub returned no job log text")
+            return _ci_failure_detail_text(
+                str(job.get("name") or "unknown"), step.get("name"), log
+            )
+        except Exception:  # noqa: BLE001 - never let this touch the verdict
+            logger.warning("could not read failure detail of CI run %s", run_id, exc_info=True)
+            return None
 
     def publish_final_tree(
         self,
@@ -1086,6 +1256,60 @@ class GitHubWorkTrackingService:
             return None
         return str(pull.get("merge_commit_sha") or "") or None
 
+    def merge_refusal(self, ref: GitHubWorkRef) -> str | None:
+        """Why this pull request must stay unmerged, if a task forbids it (#185).
+
+        A retry rebinds the task to a new experiment, so the task is found
+        through its source and through the pull request as well. The body is
+        read too: a follow-up may have added the instruction after intake.
+        """
+        try:
+            rows = self._conn.execute(
+                """SELECT merge_forbidden, merge_constraint_reason, task_body
+                   FROM mailbox_task_approvals
+                   WHERE experiment_id=? OR (id=? AND ?='task')
+                      OR id IN (SELECT source_id FROM github_work_links
+                                WHERE source_type='task' AND pr_number=?)
+                      OR experiment_id IN (SELECT experiment_id FROM github_work_links WHERE pr_number=?
+                                           UNION
+                                           SELECT experiment_id FROM github_experiment_links WHERE pr_number=?)""",
+                (ref.experiment_id, ref.source_id, ref.source_type, ref.pr_number, ref.pr_number, ref.pr_number),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            # Only a database that never hosted mailbox tasks has no
+            # constraint; anything else must stop the merge.
+            if "no such table: mailbox_task_approvals" not in str(exc):
+                raise
+            return None
+        for row in rows:
+            detail = (
+                row["merge_constraint_reason"]
+                if row["merge_forbidden"]
+                else parse_work_directives(row["task_body"]).merge_constraint_reason
+            )
+            if row["merge_forbidden"] or detail:
+                return f"merge refused: {detail or 'explicit do not merge instruction'}; pull request remains open for review"
+        return None
+
+    def refuse_merge(self, ref: GitHubWorkRef) -> str | None:
+        """``merge_refusal``, with an active refusal recorded in the audit log."""
+        refusal = self.merge_refusal(ref)
+        if refusal is None:
+            return None
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO operations_audit
+                   (id, timestamp, operation, args_json, success, duration_ms, error_summary)
+                   VALUES (?, ?, 'merge_pull_request', ?, 0, 0, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    _utcnow_iso(),
+                    json.dumps({"pr_number": ref.pr_number, "experiment_id": ref.experiment_id}),
+                    refusal,
+                ),
+            )
+        return refusal
+
     def merge_and_complete(self, ref: GitHubWorkRef, *, expected_head_sha: str | None = None) -> str:
         if ref.pr_number is None:
             raise GitHubWorkTrackingError("cannot merge work without a pull request")
@@ -1098,6 +1322,12 @@ class GitHubWorkTrackingService:
         if already_merged is not None:
             self._close_completed_issue(ref)
             return already_merged
+
+        # The one gate in front of the merge call, so that no caller - neither
+        # green CI, nor a restart, nor a retry - can get around the task (#185).
+        refusal = self.refuse_merge(ref)
+        if refusal is not None:
+            raise MergeForbiddenError(refusal)
 
         payload: dict[str, Any] = {"merge_method": "squash"}
         if ref.issue_number:
@@ -1387,13 +1617,17 @@ class GitHubWorkTrackingService:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                raw = response.read().decode("utf-8")
+            with _GITHUB_OPENER.open(request, timeout=20) as response:
+                body = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
             raise GitHubWorkTrackingError(f"GitHub HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise GitHubWorkTrackingError(f"GitHub request failed: {exc}") from exc
+        # The one endpoint here that answers with plain text, not JSON.
+        if _CI_JOB_LOG_PATH_RE.search(path):
+            return body.decode("utf-8", errors="replace")
+        raw = body.decode("utf-8")
         if not raw:
             return {}
         try:

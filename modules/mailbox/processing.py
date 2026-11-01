@@ -117,6 +117,8 @@ def _process_task(
         ).fetchone()
         if not existing:
             import uuid as _uuid
+            from modules.run_store.schema import record_merge_constraint
+
             now = _now_iso()
             approval_id = _uuid.uuid4().hex
             conn.execute(
@@ -128,6 +130,7 @@ def _process_task(
                 """,
                 (approval_id, db_msg_id, msg.body, msg.created_by, str(msg.file_path), now, now, now),
             )
+            record_merge_constraint(conn, approval_id, msg.body)
             conn.commit()
     except Exception:
         logger.warning("_process_task: failed to create task record for msg %s", db_msg_id, exc_info=True)

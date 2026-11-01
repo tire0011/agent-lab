@@ -230,11 +230,29 @@ def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     found: list[str] = []
     for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
-        if is_test_path(path) or is_ignored_support_path(path):
+        if match.start() > 0 and task[match.start() - 1] == ".":
+            # "\b" starts the match after a leading dot: ".git/hooks/x" would
+            # become "git/hooks/x". Dot paths are never artifacts (#403).
+            continue
+        if path.startswith("git/"):
+            # The same paths quoted from gate output, already without the dot;
+            # the repository has no git/ directory (#403).
+            continue
+        if is_test_path(path) or is_ignored_support_path(path) or _is_placeholder_path(path):
             continue
         if path not in found:
             found.append(path)
     return found[:10]
+
+
+# Example names in an issue ("modules/a.py", "new_thing.py") are not files
+# the change must create (#433, #455).
+_PLACEHOLDER_STEMS = frozenset({"foo", "bar", "baz", "example", "new_thing", "some_file", "my_module"})
+
+
+def _is_placeholder_path(path: str) -> bool:
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    return len(stem) == 1 or stem in _PLACEHOLDER_STEMS
 
 
 # ---------------------------------------------------------------------------

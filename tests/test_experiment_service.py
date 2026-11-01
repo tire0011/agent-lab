@@ -466,6 +466,80 @@ class ExperimentServiceTestCase(unittest.TestCase):
             experiment.id, result.worktree_path
         )
 
+    def _run_against_red_ci(self, *details: str | None):
+        """One experiment whose checkpoints CI rejects with *details* in turn (#472)."""
+        github = MagicMock()
+        github.experiment_base_sha.return_value = subprocess.run(
+            ["git", "-C", str(self.repo_root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        github.checkpoint_experiment.return_value = SimpleNamespace(
+            branch_name="nexus/issue-472", checkpoint_sha="checkpoint-sha",
+        )
+        github.wait_for_ci.side_effect = [
+            SimpleNamespace(
+                status="failed", commit_sha="a" * 40, conclusion="failure",
+                run_id=55, url="https://example.invalid/runs/55", reason=None,
+                failure_detail=detail,
+            )
+            for detail in details
+        ]
+        self.service.max_repair_iterations = len(details) - 1
+        experiment = self.service.create_experiment(goal="Change it.")
+        result = self.service.run_experiment(experiment.id, github_work_tracking=github)
+        return result, self.service.list_verification_runs(experiment.id)
+
+    def _ci_detail(self, *tests: str) -> str:
+        return "Failed job: unittest\nFailed step: Run tests\nFailing tests:\n" + "\n".join(
+            f"FAILED {test} - AssertionError" for test in tests
+        )
+
+    def test_the_repair_prompt_names_the_test_ci_rejected(self):
+        self._run_against_red_ci(
+            self._ci_detail("tests/test_a.py::test_one"),
+            self._ci_detail("tests/test_a.py::test_two"),
+        )
+
+        repair = self.implementation_worker.run.call_args_list[1].kwargs
+        self.assertEqual(repair["phase"], "implementation_repair")
+        self.assertIn("tests/test_a.py::test_one", repair["task"])
+        self.assertIn("Failed step: Run tests", repair["task"])
+
+    def test_the_error_names_the_first_failing_tests(self):
+        result, _ = self._run_against_red_ci(
+            self._ci_detail(*(f"tests/test_a.py::test_{index}" for index in range(5)))
+        )
+
+        self.assertEqual(
+            result.error,
+            "tests failed (exit code 1): tests/test_a.py::test_0, "
+            "tests/test_a.py::test_1, tests/test_a.py::test_2",
+        )
+
+    def test_without_failure_detail_the_error_keeps_its_old_form(self):
+        result, runs = self._run_against_red_ci(None)
+
+        self.assertEqual(result.error, "tests failed (exit code 1)")
+        self.assertNotIn("\n", runs[0]["output"])
+
+    def test_the_first_line_of_the_output_is_unchanged(self):
+        result, _ = self._run_against_red_ci(self._ci_detail("tests/test_a.py::test_one"))
+
+        self.assertEqual(
+            result.test_output.splitlines()[0],
+            f"GitHub Actions run 55 for commit {'a' * 40} completed with conclusion "
+            "failure. https://example.invalid/runs/55",
+        )
+
+    def test_different_failing_tests_have_different_fingerprints(self):
+        _, runs = self._run_against_red_ci(
+            self._ci_detail("tests/test_a.py::test_one"),
+            self._ci_detail("tests/test_a.py::test_two"),
+        )
+
+        self.assertEqual(len(runs), 2)
+        self.assertNotEqual(runs[0]["failure_fingerprint"], runs[1]["failure_fingerprint"])
+
     def test_implementation_uses_workspace_write_only_in_worktree(self):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
