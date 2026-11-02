@@ -2,7 +2,7 @@ import json
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
@@ -40,7 +40,7 @@ class DiagnosticsPublicApiTests(unittest.TestCase):
         mailbox.list_recent.return_value = [
             SimpleNamespace(
                 id="m1",
-                status="approved",
+                status="queued",
                 received_at="2026-08-13T11:00:00+00:00",
                 experiment_id=self.failed.id,
             )
@@ -118,6 +118,26 @@ class DiagnosticsPublicApiTests(unittest.TestCase):
         self.assertEqual(body["service"]["status"], "ok")
         self.assertIn("git_revision", body["service"])
         self.assertIn("deployment_time", body["service"])
+
+    def test_service_status_distinguishes_startup_from_checkout_revision(self):
+        with patch.object(api, "_STARTUP_REVISION", "aaaa111"), patch.object(
+            api, "_read_git_revision", return_value="bbbb222"
+        ):
+            diagnostics = self.client.get("/diagnostics/public").json()["service"]
+            health = self.client.get("/health").json()
+
+        for service in (diagnostics, health):
+            self.assertEqual(service["git_revision"], "aaaa111")
+            self.assertEqual(service["checkout_revision"], "bbbb222")
+            self.assertTrue(service["stale"])
+
+    def test_service_status_is_fresh_when_revisions_match(self):
+        with patch.object(api, "_STARTUP_REVISION", "aaaa111"), patch.object(
+            api, "_read_git_revision", return_value="aaaa111"
+        ):
+            service = self.client.get("/diagnostics/public").json()["service"]
+
+        self.assertFalse(service["stale"])
 
 
 if __name__ == "__main__":

@@ -74,6 +74,17 @@ def _no_new_patterns(noun: str) -> tuple[re.Pattern[str], ...]:
 
 _NO_NEW_ISSUE_RES = _no_new_patterns("issue")
 _NO_NEW_BRANCH_RES = _no_new_patterns("branch")
+# Deliberately broad, also for a quoted mention: a wrong match leaves a pull
+# request open for a human, a missed one is an irreversible merge (#185).
+_NO_MERGE_RE = re.compile(
+    r"\b(?:do\s+not|don['\u2019]t|must\s+not|should\s+not|never)\s+"
+    r"(?:auto(?:matically)?[\s-]*)?merge\b"
+    r"|\bwithout\s+merging\b"
+    r"|\bstop\s+before\s+(?:the\s+|any\s+)?merg(?:e|ing)\b"
+    r"|\bleave\s+(?:the\s+|this\s+)?(?:pull\s+request|pr)\s+(?:open|unmerged)\b"
+    r"|\bnicht\s+(?:automatisch\s+)?(?:mergen|zusammenf(?:\u00fc|ue)hren)\b",
+    re.IGNORECASE,
+)
 
 _BRANCH_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}"
 _BRANCH_TARGET_RES = (
@@ -101,6 +112,8 @@ class WorkDirectives:
     forbid_new_issue: bool = False
     branch_name: str | None = None
     forbid_new_branch: bool = False
+    forbid_merge: bool = False
+    merge_constraint_reason: str | None = None
 
     @property
     def requires_issue_reuse(self) -> bool:
@@ -128,12 +141,17 @@ def parse_work_directives(text: str | None) -> WorkDirectives:
         # that is a plain "no directive" or an ambiguity it must refuse.
         issue_number = None
 
+    merge_match = _NO_MERGE_RE.search(source)
     return WorkDirectives(
         issue_number=issue_number,
         mentioned_issue_numbers=mentions,
         forbid_new_issue=forbid_new_issue,
         branch_name=_find_branch(source),
         forbid_new_branch=any(pattern.search(source) for pattern in _NO_NEW_BRANCH_RES),
+        forbid_merge=merge_match is not None,
+        merge_constraint_reason=(
+            f"explicit task constraint: {merge_match.group(0)}" if merge_match else None
+        ),
     )
 
 

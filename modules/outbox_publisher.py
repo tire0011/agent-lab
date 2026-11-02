@@ -806,7 +806,7 @@ class OperationChainOutboxPublisher(_TablePublisher):
 
 
 class TaskApprovalOutboxPublisher(_TablePublisher):
-    """Publishes task-approval outbox results."""
+    """Publishes mailbox task results (file name kept from the approval era, #264)."""
 
     _TABLE = "mailbox_task_approvals"
     _ID_COLUMN = "id"

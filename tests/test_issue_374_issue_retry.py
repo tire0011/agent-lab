@@ -41,13 +41,16 @@ class IssueRetryTests(unittest.TestCase):
         self.assertEqual(self._tick().decision, "idle")
         self.assertEqual(self.fx.controller.issues, [])
 
-    def test_a_succeeded_or_review_experiment_still_blocks(self):
-        for status in ("succeeded", "needs_review"):
-            with self.subTest(status=status):
-                self.fx = InitiativeFixture()
-                self._attempt("e1", status)
-                self._tick()
-                self.assertEqual(self.fx.controller.issues, [])
+    def test_a_succeeded_experiment_still_blocks(self):
+        self._attempt("e1", "succeeded")
+        self._tick()
+        self.assertEqual(self.fx.controller.issues, [])
+
+    def test_needs_review_counts_as_a_failed_attempt(self):
+        # A false gate left #185, #349 and #378 stuck in needs_review.
+        self._attempt("e1", "needs_review")
+        self.assertEqual(self._tick().decision, "dispatched")
+        self.assertEqual(self.fx.controller.issues, [235])
 
     def test_a_failure_next_to_a_success_still_blocks(self):
         self._attempt("e1", "failed")

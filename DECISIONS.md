@@ -558,6 +558,17 @@ Decision log for architecture and operating choices.
   longer than the stale timeout. The fix there is a per-phase timeout, not
   dropping the derivation.
 
+### D-027: An explicit "do not merge" stops every merge at one gate
+
+- Status: Accepted
+- Decision: A task's no-merge instruction is stored on its approval, and
+  `GitHubWorkTrackingService.merge_and_complete` refuses and audits the merge
+  for the experiment, the task and the pull request. Adoption and task end at
+  `ready_for_review`, which Nexus neither retries nor resumes. Only a human
+  merges such a pull request (#185).
+- Why: Green CI merged PR #182 although its task said not to. The detection is
+  broad on purpose: a wrong match costs a review, a missed one is irreversible.
+
 ### D-024: The mailbox inbox is the queue, and lock contention is not a failure
 
 - Status: Accepted
@@ -596,6 +607,30 @@ Decision log for architecture and operating choices.
 - Evidence: `tests/test_mailbox_drain.py`.
 - Revisit if: a single message's processing routinely outruns the timer period.
   The fix there is bounding per-message work, not removing the drain.
+
+### D-025: The experiment benchmark measures at the worker and stores outside production
+
+- Status: Accepted
+- Decision: `benchmarks/tasks/*.md` are merged issues pinned to the commit they
+  started from, scored by tests, expected files and the evaluation verdict. Runs
+  go to a separate `benchmark.db`; usage is counted around the worker.
+- Why: in the production database adoption, the planner and `problems` would act
+  on benchmark experiments. `implementation_usage` keeps only the first call, so
+  a model that needs repairs would look cheaper than one that does not.
+- Evidence: `tests/test_benchmark.py`.
+- Revisit if: the task set stops representing what `new_experiment` is asked to do.
+
+### D-026: The tool-router MCP server is never the controller
+
+- Status: Accepted
+- Decision: `modules/tool_router_mcp.py` runs `NexusToolRouter` with
+  `controller=False`, and its grants live in memory for one stdio process.
+- Why: `service_restart` and `machine_reboot` are `controller_allowed` for the
+  controller's own session. A local MCP client exists to test the router
+  contract and must not inherit restart rights through it.
+- Evidence: `tests/test_issue_118_tool_router_mcp.py`.
+- Revisit if: an external client needs a mutating operation; that needs its own
+  authorization rule, not the controller flag.
 
 ## Under evaluation
 

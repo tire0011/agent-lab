@@ -287,6 +287,31 @@ _CREDENTIAL_QUALIFIED_TOKEN_REGEX = re.compile(
 )
 
 
+_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (("`", "`"), ('"', '"'), ("“", "”"), ("'", "'"))
+
+
+def _is_quoted(preceding_text: str, following_text: str) -> bool:
+    """True when the match sits inside quotes on its own line (goal text only).
+
+    Quoted text is a mention - typically a past rejection reason cited in an
+    issue (#395: "rejected ... for the same reason ('prints the actual api
+    key')") - not an action the goal asks for. An apostrophe inside a word
+    ("doesn't") is not an opening quote.
+    """
+    before = preceding_text.rsplit("\n", 1)[-1]
+    after = following_text.split("\n", 1)[0]
+    for opening, closing in _QUOTE_PAIRS:
+        start = before.rfind(opening)
+        if start < 0 or closing not in after:
+            continue
+        if opening == closing and before.count(opening) % 2 == 0:
+            continue
+        if opening == "'" and start > 0 and before[start - 1].isalnum():
+            continue
+        return True
+    return False
+
+
 def _secret_action_match_is_false_positive(
     matched_text: str,
     preceding_text: str = "",
@@ -422,11 +447,27 @@ def _check_goal_policy(goal: str) -> str | None:
     for keyword in _REJECT_KEYWORDS:
         if keyword in haystack:
             return f"goal mentions disallowed keyword: {keyword!r}"
+    return None
+
+
+def _goal_secret_warning(goal: str) -> str | None:
+    """Flag a goal that reads like a secret/credential action.
+
+    Only a warning, not a rejection: issues come from the own repository and
+    usually *describe* such actions (a leak to fix, a quoted rejection), which
+    the regexes cannot tell apart. The reviewer checks the actual change
+    before it is merged.
+    """
+    haystack = (goal or "").lower()
     for regex in _SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
             following = haystack[match.end():min(len(haystack), match.end() + 120)]
             if _secret_action_match_is_false_positive(match.group(0), preceding, following):
+                continue
+            # Goal text only: a plan is checked as raw JSON, where every value
+            # is in quotes.
+            if _is_quoted(preceding, following):
                 continue
             return (
                 "goal describes an actual secret/credential action: "

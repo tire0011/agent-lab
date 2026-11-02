@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class HealthResponse(BaseModel):
     status: str
     version: str
+    git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
 
 
 class StatusResponse(BaseModel):
@@ -24,9 +27,12 @@ class StatusResponse(BaseModel):
 class Problem(BaseModel):
     id: str
     source: str
+    issue_number: int | None = None
     summary: str
     detail: str
     timestamp: str
+    failure_phase: str | None = None
+    failure_type: str | None = None
 
 
 class ProblemsResponse(BaseModel):
@@ -166,10 +172,6 @@ class MailboxTaskApproval(BaseModel):
 class MailboxTaskApprovalsResponse(BaseModel):
     count: int
     tasks: list[MailboxTaskApproval]
-
-
-class MailboxTaskRejectRequest(BaseModel):
-    reason: str = Field(min_length=1, max_length=500)
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +472,8 @@ class PublicDiagnosticExperiment(BaseModel):
 class PublicDiagnosticServiceStatus(BaseModel):
     status: str
     git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
     deployment_time: str | None = None
 
 

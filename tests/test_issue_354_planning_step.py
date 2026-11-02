@@ -33,8 +33,8 @@ class _Planner:
         self.prompts.append(prompt)
         return self._raw
 
-    def choose(self, issues, recent=None):
-        return self._planner.choose(issues, recent)
+    def choose(self, issues, recent=None, exhausted=None, proposals=None, decisions=None):
+        return self._planner.choose(issues, recent, exhausted)
 
 
 class PlanningStepTests(unittest.TestCase):
@@ -156,7 +156,7 @@ class OwnExperienceTests(unittest.TestCase):
         svc.tick()
         prompt = planner.prompts[0]
         self.assertIn("You are Nexus, an independent agent", prompt)
-        self.assertIn("- timed_out: GitHub Issue #235: Self-restart fallback", prompt)
+        self.assertIn("- timed_out / merge: none: GitHub Issue #235: Self-restart fallback", prompt)
 
 
 class ParseChoiceTests(unittest.TestCase):

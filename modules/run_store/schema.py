@@ -169,6 +169,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             ended_at TEXT NULL,
             cancelled_at TEXT NULL,
             cancelled_by TEXT NULL,
+            worker_pgid INTEGER NULL,
             plan_json TEXT NULL,
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
@@ -279,6 +280,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_operation_log(conn)
     _migrate_failure_analyses(conn)
     _migrate_router_tables(conn)
+    _migrate_benchmark_runs(conn)
     conn.commit()
     return conn
 
@@ -306,6 +308,9 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("implementation_provider", "TEXT"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
+    # Process group of the live worker, so the stall sweep (#400) can stop it
+    # from another process; NULL while no worker runs.
+    ("worker_pgid", "INTEGER"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
@@ -357,8 +362,26 @@ _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS = [
     ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("publish_last_error", "TEXT"),
     ("outbox_content", "TEXT"),
+<<<<<<< HEAD
     ("idempotency_key", "TEXT"),
+=======
+    ("merge_forbidden", "INTEGER NOT NULL DEFAULT 0"),
+    ("merge_constraint_reason", "TEXT"),
+>>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
 ]
+
+
+def record_merge_constraint(conn: sqlite3.Connection, approval_id: str, task_body: str | None) -> None:
+    """Persist a task's explicit no-merge instruction on its approval (#185)."""
+    from modules.work_directives import parse_work_directives
+
+    directives = parse_work_directives(task_body)
+    if directives.forbid_merge:
+        conn.execute(
+            """UPDATE mailbox_task_approvals
+               SET merge_forbidden=1, merge_constraint_reason=? WHERE id=?""",
+            (directives.merge_constraint_reason, approval_id),
+        )
 
 
 def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
@@ -386,6 +409,8 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             publish_last_error TEXT NULL,
             result_summary TEXT NULL,
             error TEXT NULL,
+            merge_forbidden INTEGER NOT NULL DEFAULT 0,
+            merge_constraint_reason TEXT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -404,6 +429,7 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE mailbox_task_approvals ADD COLUMN {column_name} {column_type}"
             )
 
+<<<<<<< HEAD
     # Idempotency keys (#378): a redelivered message must map back to its
     # original task. Rows from before the key existed get the key their
     # message would derive today (``modules/mailbox/task_ingest.py``), so a
@@ -432,6 +458,17 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
 
     # Backfill: create pending_approval records for any task messages that
     # don't already have one.
+=======
+    # The approval step is gone (#264). An approved task was only waiting for
+    # the worker, which now takes queued ones. Old pending_approval and
+    # rejected rows stay as they are: readable, never run.
+    conn.execute(
+        "UPDATE mailbox_task_approvals SET status='queued' WHERE status='approved'"
+    )
+
+    # Backfill: create task records for any task messages that don't already
+    # have one. A task whose body was not stored is not handed to Nexus.
+>>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
     import uuid
     from datetime import datetime, timezone
 
@@ -450,6 +487,7 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
 
     for row in orphan_tasks:
         msg_id, created_by, file_path, received_at, task_body, outbox_file = row
+        status, error = "queued", None
         if not task_body:
             fallback = (
                 "[Task body was not stored at processing time."
@@ -457,18 +495,36 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
                 + "]"
             )
             task_body = fallback
+            status, error = "needs_review", "task body was not stored; not handed to Nexus"
         approval_id = uuid.uuid4().hex
         conn.execute(
             """
             INSERT INTO mailbox_task_approvals
                 (id, mailbox_msg_id, task_body, sender, file_path, received_at,
+<<<<<<< HEAD
                  status, idempotency_key, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?)
             ON CONFLICT(idempotency_key) DO NOTHING
             """,
             (approval_id, msg_id, task_body, created_by or "", file_path or "",
              received_at or now, f"mailbox-msg:{msg_id}", now, now),
+=======
+                 status, error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (approval_id, msg_id, task_body, created_by or "", file_path or "",
+             received_at or now, status, error, now, now),
+>>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
         )
+
+    # Rows created before the structured constraint, and the orphans above,
+    # keep their original body: a restart must not forget an older
+    # "do not merge" instruction.
+    candidates = conn.execute(
+        "SELECT id, task_body FROM mailbox_task_approvals WHERE merge_forbidden=0"
+    ).fetchall()
+    for approval_id, task_body in candidates:
+        record_merge_constraint(conn, approval_id, task_body)
 
 
 def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
@@ -797,4 +853,42 @@ def _migrate_operation_log(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_log_invocation_id "
         "ON operation_log(invocation_id) WHERE invocation_id IS NOT NULL"
+    )
+
+
+def _migrate_benchmark_runs(conn: sqlite3.Connection) -> None:
+    """Create benchmark_runs table (#343), one row per task of a benchmark run."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS benchmark_runs (
+            run_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            task_sha256 TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            provider TEXT NULL,
+            model TEXT NULL,
+            prompt_name TEXT NOT NULL,
+            prompt_sha256 TEXT NOT NULL,
+            experiment_id TEXT NULL,
+            status TEXT NOT NULL,
+            score REAL NOT NULL,
+            tests_green INTEGER NOT NULL CHECK (tests_green IN (0, 1)),
+            expected_files_touched INTEGER NOT NULL,
+            expected_files_total INTEGER NOT NULL,
+            evaluation_outcome TEXT NULL,
+            input_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            runtime_ms INTEGER NOT NULL,
+            estimated_cost REAL NULL,
+            currency TEXT NULL,
+            peak_memory_bytes INTEGER NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            error TEXT NULL,
+            PRIMARY KEY (run_id, task_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_benchmark_runs_started_at
+            ON benchmark_runs(started_at);
+        """
     )

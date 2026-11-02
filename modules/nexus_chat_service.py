@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
 from modules.experiment_handover import with_handover
+from modules.experiment_service import ExperimentAlreadyActiveError
 from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
@@ -222,7 +223,19 @@ class NexusChatService:
                         content=goal,
                     )
                 )
-                experiment = self.experiment_service.create_experiment(goal)
+                try:
+                    experiment = self.experiment_service.create_experiment(goal)
+                except ExperimentAlreadyActiveError as exc:
+                    return NexusChatResult(
+                        reply=(
+                            "Für dieses GitHub-Issue läuft bereits ein Experiment "
+                            f"({exc.experiment_id}, Status: {exc.status})."
+                        ),
+                        session_id=decision.session_id,
+                        action=decision.action,
+                        experiment_id=exc.experiment_id,
+                        status="already_active",
+                    )
                 self.github_work_tracking.bind_experiment(work_ref, experiment.id)
                 # Nexus pauses on the experiment and continues the moment it ends (#263).
                 orchestrator.task_store.wait_for_experiment(decision.session_id, experiment.id)
