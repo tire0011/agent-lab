@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
@@ -157,6 +157,41 @@ def _count_open_proposals(repo_root: str) -> int:
     return len(json.loads(proc.stdout or "[]"))
 
 
+def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[dict[str, str]]:
+    """Proposals the owner closed lately, with the closing comment as the reason.
+
+    A rejected proposal keeps its label; its last comment says why. The
+    planner sees these so it does not suggest the same thing again.
+    """
+    from modules.nexus_planner import PROPOSAL_LABEL
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    proc = subprocess.run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/issues?state=closed&labels={PROPOSAL_LABEL}"
+         f"&since={since}&per_page={limit}"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+    decisions = []
+    for issue in json.loads(proc.stdout or "[]")[:limit]:
+        if issue.get("state_reason") == "completed":
+            decisions.append({"title": str(issue.get("title") or ""), "reason": "implemented"})
+            continue
+        comments = subprocess.run(
+            ["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{issue['number']}/comments?per_page=100"],
+            cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+        )
+        bodies = json.loads(comments.stdout or "[]") if comments.returncode == 0 else []
+        reason = str(bodies[-1].get("body") or "") if bodies else ""
+        reason = reason.split("\n---\n", 1)[0]
+        decisions.append({
+            "title": str(issue.get("title") or ""),
+            "reason": " ".join(reason.split())[:400] or f"closed ({issue.get('state_reason') or 'no reason'})",
+        })
+    return decisions
+
+
 def _explore_with_claude(repo_root: str, prompt: str) -> str:
     """Plan as a read-only Claude agent with the Nexus MCP read tools (#384)."""
     import tempfile
@@ -248,6 +283,7 @@ def _build_service(args) -> NexusInitiativeService:
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
+        decision_lister=lambda: _owner_decisions(args.repo_root),
         diagnostics_client=_service_diagnostics,
         checkout_revision=lambda: _checkout_revision(args.repo_root),
         main_commit_date=lambda: _main_commit_date(args.repo_root),

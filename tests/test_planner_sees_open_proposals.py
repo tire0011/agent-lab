@@ -22,7 +22,7 @@ class PlannerSeesOpenProposalsTest(unittest.TestCase):
         seen = {}
 
         class Planner:
-            def choose(self, issues, recent=None, exhausted=None, proposals=None):
+            def choose(self, issues, recent=None, exhausted=None, proposals=None, decisions=None):
                 seen["proposals"] = proposals
                 return None
 

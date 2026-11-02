@@ -210,6 +210,7 @@ class NexusInitiativeService:
         issue_commenter: Callable[[int, str], None] | None = None,
         proposal_creator: Callable[[str, str], None] | None = None,
         proposal_counter: Callable[[], int] | None = None,
+        decision_lister: Callable[[], list[dict[str, str]]] | None = None,
         diagnostics_client: Callable[[], dict[str, Any]] | None = None,
         checkout_revision: Callable[[], str] | None = None,
         restart_hook: Callable[[], None] | None = None,
@@ -226,6 +227,7 @@ class NexusInitiativeService:
         self._issue_commenter = issue_commenter
         self._proposal_creator = proposal_creator
         self._proposal_counter = proposal_counter
+        self._decision_lister = decision_lister
         self._diagnostics_client = diagnostics_client
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
@@ -949,6 +951,7 @@ class NexusInitiativeService:
             recent=self._recent_experiments(),
             exhausted=self._exhausted_issues,
             proposals=self._open_proposal_titles,
+            decisions=self._owner_decisions(),
         )
         if choice is None:
             return []
@@ -958,6 +961,16 @@ class NexusInitiativeService:
         if choice.proposal_title and self._proposal_slot_free():
             chosen.payload["proposal"] = {"title": choice.proposal_title, "body": choice.proposal_body}
         return [chosen]
+
+    def _owner_decisions(self) -> list[dict[str, str]]:
+        """Proposals the owner closed, with why; none when they cannot be read."""
+        if self._decision_lister is None:
+            return []
+        try:
+            return list(self._decision_lister() or [])
+        except Exception as exc:  # noqa: BLE001 - planning goes on without them
+            logger.warning("initiative: owner decisions unavailable: %s", exc)
+            return []
 
     def _proposal_slot_free(self) -> bool:
         """Fewer than three proposals are open; unknown counts as full.
