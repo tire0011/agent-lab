@@ -33,7 +33,7 @@ class _Planner:
         self.prompts.append(prompt)
         return self._raw
 
-    def choose(self, issues, recent=None, exhausted=None, proposals=None):
+    def choose(self, issues, recent=None, exhausted=None, proposals=None, decisions=None):
         return self._planner.choose(issues, recent, exhausted)
 
 

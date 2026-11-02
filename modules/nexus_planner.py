@@ -94,6 +94,7 @@ def planning_prompt(
     explore: bool = False,
     exhausted: list[dict[str, Any]] | None = None,
     proposals: list[str] | None = None,
+    decisions: list[dict[str, str]] | None = None,
 ) -> str:
     lines = []
     for issue in issues:
@@ -119,7 +120,19 @@ def planning_prompt(
         '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
         "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
         "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
-        + _proposals_section(proposals)
+        + _proposals_section(proposals) + _decisions_section(decisions)
+    )
+
+
+def _decisions_section(decisions: list[dict[str, str]] | None) -> str:
+    """Proposals the owner closed and why, so the planner respects those decisions."""
+    if not decisions:
+        return ""
+    return (
+        "\n\nOWNER DECISIONS (proposals the owner closed, and why). Do not suggest "
+        "anything that contradicts these unless you have new evidence, and then say "
+        "what is new:\n\n"
+        + "\n".join(f"- {d.get('title', '')}: {d.get('reason', '')}" for d in decisions)
     )
 
 
@@ -192,15 +205,16 @@ class IssuePlanner:
         recent: list[dict[str, str]] | None = None,
         exhausted: list[dict[str, Any]] | None = None,
         proposals: list[str] | None = None,
+        decisions: list[dict[str, str]] | None = None,
     ) -> PlanChoice | None:
         if not issues:
             return None
         allowed = {int(issue["number"]) for issue in issues}
         choice = None
         if self._explore is not None:
-            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, exhausted=exhausted, proposals=proposals), allowed)
+            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, exhausted=exhausted, proposals=proposals, decisions=decisions), allowed)
         if choice is None:
-            choice = self._ask(self._complete, planning_prompt(issues, recent, exhausted=exhausted, proposals=proposals), allowed)
+            choice = self._ask(self._complete, planning_prompt(issues, recent, exhausted=exhausted, proposals=proposals, decisions=decisions), allowed)
         return choice
 
     @staticmethod
