@@ -28,17 +28,13 @@ from modules.coding_provider import (
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
-<<<<<<< HEAD
 from modules.central_logging import (
     DEFAULT_LOG_DIR,
     ExperimentLogger,
     _tail_read_lines,
     sanitize_command,
 )
-=======
 from modules.github_work_tracking import failing_test_names
-from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
->>>>>>> 685ee62ec2f1ff8ee7c85a2388a01d117b14649c
 from modules.redaction import sanitized_reason
 from modules.run_store import (
     DEFAULT_DB_PATH,
@@ -1266,9 +1262,6 @@ class ExperimentService:
             on_process=lambda process: self._track_process(experiment_id, process),
         )
 
-<<<<<<< HEAD
-        if self._ended_from_outside(experiment_id):
-=======
         fallback = other_provider(implementation_provider) if implementation_provider else None
         if (
             implementation_result.error
@@ -1301,8 +1294,7 @@ class ExperimentService:
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
 
-        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
->>>>>>> 685ee62ec2f1ff8ee7c85a2388a01d117b14649c
+        if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
 
         if implementation_result.timed_out:

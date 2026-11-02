@@ -283,17 +283,23 @@ class StallSweepTests(unittest.TestCase):
             db_path=self.db_path, experiment_service=self.service, idea_lister=lambda: [],
         )
         self.addCleanup(initiative.close)
-        self.assertIn(388, initiative._linked_issue_numbers())  # still running
+        blocked, exhausted = initiative._issue_attempts()
+        self.assertIn(388, blocked)  # still running
+        self.assertNotIn(388, exhausted)
 
         self.service.sweep_stalled_experiments(datetime.now(timezone.utc) + PAST_THE_LIMIT)
 
         # Two failed attempts now: blocked for good, and nothing counts as busy.
-        self.assertIn(388, initiative._linked_issue_numbers())
+        blocked, exhausted = initiative._issue_attempts()
+        self.assertIn(388, blocked)
+        self.assertIn(388, exhausted)
         self.assertIsNone(initiative.busy_reason())
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM github_experiment_links WHERE experiment_id = ?", (first,))
         # One stalled attempt alone leaves the issue open for a retry.
-        self.assertNotIn(388, initiative._linked_issue_numbers())
+        blocked, exhausted = initiative._issue_attempts()
+        self.assertNotIn(388, blocked)
+        self.assertNotIn(388, exhausted)
 
     def test_initiative_tick_sweeps_before_checking_whether_work_is_busy(self):
         experiment_id = self._experiment()
