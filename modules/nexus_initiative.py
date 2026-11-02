@@ -111,6 +111,19 @@ def _is_provider_overload(status: Any, error: Any) -> bool:
     )
 
 
+def _is_integration_conflict(adoption_status: Any, adoption_reason: Any) -> bool:
+    """An adoption stopped only because the branch no longer merges into main (#485).
+
+    The newer text lists the files ("Integrationskonflikt: a.py"); older
+    adoptions recorded "Integrationskonflikt beim Cherry-Pick.".
+    """
+    if adoption_status not in ("needs_review", "failed"):
+        return False
+    reason = str(adoption_reason or "").strip()
+    # The prefix covers both texts.
+    return reason.startswith("Integrationskonflikt")
+
+
 def _is_pipeline_crash(status: Any, error: Any) -> bool:
     """A run Nexus's own pipeline crashed in: no coding work was judged (#467)."""
     return status == "failed" and str(error or "").startswith(PIPELINE_CRASH_ERROR_PREFIX)
@@ -643,9 +656,16 @@ class NexusInitiativeService:
         A pipeline crash is not an attempt (#467). ``_MAX_ISSUE_ATTEMPTS``
         crashes block the issue until origin/main has a commit newer than the
         last crash, so a broken pipeline gets one more run per commit.
+
+        The newest integration-conflict stop of an issue is not an attempt
+        (#485): its retry merges current main first. An older conflict stop
+        counts, so a retry that conflicts again uses up the attempts.
         """
         # issue -> experiment -> (when, why it failed)
         failed: dict[int, dict[str, tuple[str, str]]] = {}
+        # issues with an adoption stopped by a merge conflict; exactly one
+        # such stop, the newest, is left out of the count
+        conflicted: set[int] = set()
         # issue -> experiment -> (when it ended, the crash)
         crashes: dict[int, dict[str, tuple[str, str]]] = {}
         blocked: set[int] = set()
@@ -696,17 +716,26 @@ class NexusInitiativeService:
                         str(row["created_at"] or row["ended_at"] or ""),
                         str(first or second or ""),
                     )
+                    if merge_stopped and _is_integration_conflict(
+                        row["adoption_status"], row["adoption_reason"]
+                    ):
+                        conflicted.add(number)
                 else:
                     blocked.add(number)
+        # The exempted stop still names the experiments and the last reason.
+        counted = {
+            number: len(attempts) - (number in conflicted)
+            for number, attempts in failed.items()
+        }
         exhausted = {
             number: {
                 "experiment_ids": sorted(attempts),
                 "last_reason": _last_reason(attempts),
             }
             for number, attempts in failed.items()
-            if len(attempts) >= _MAX_ISSUE_ATTEMPTS and number not in blocked
+            if counted[number] >= _MAX_ISSUE_ATTEMPTS and number not in blocked
         }
-        blocked.update(n for n, attempts in failed.items() if len(attempts) >= _MAX_ISSUE_ATTEMPTS)
+        blocked.update(n for n, count in counted.items() if count >= _MAX_ISSUE_ATTEMPTS)
         crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
         main_commit = self._main_commit_time() if crash_limited else None
         for number, attempts in crash_limited.items():

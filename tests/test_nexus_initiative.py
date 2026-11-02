@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from modules import nexus_initiative
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.nexus_initiative import (
@@ -620,6 +621,99 @@ class IssuesOutOfAttemptsTests(unittest.TestCase):
         self.assertEqual(svc.tick().candidate.ref, "232")
 
         self.assertEqual(self._entries(svc), [])
+
+    # --- #485: the newest integration conflict is not an attempt ---
+
+    def _conflict(self, exp_id, reason="Integrationskonflikt: a.py", *, adoption="failed", ended):
+        self._fail(exp_id, status="succeeded", adoption=adoption, reason=reason, ended=ended)
+
+    def _attempts(self):
+        # These review stops cannot resume, like a real adoption would judge them.
+        self.fx.adoption.assess_failure = lambda _id: SimpleNamespace(retryable=False)
+        svc = self._service(issues=self.ISSUES[:1])
+        return svc._issue_attempts()
+
+    def test_a_single_integration_conflict_leaves_the_issue_free(self):
+        self._conflict("e1", ended="2026-10-01T00:00:00+00:00")
+
+        blocked, exhausted = self._attempts()
+
+        self.assertNotIn(232, blocked)
+        self.assertNotIn(232, exhausted)
+
+    def test_a_real_failure_plus_a_conflict_leaves_one_more_attempt(self):
+        self.assertEqual(nexus_initiative._MAX_ISSUE_ATTEMPTS, 2)
+        self._fail("e1", error="tests failed", ended="2026-10-01T00:00:00+00:00")
+        self._conflict("e2", ended="2026-10-02T00:00:00+00:00")
+
+        blocked, exhausted = self._attempts()
+        self.assertNotIn(232, blocked)
+        self.assertNotIn(232, exhausted)
+
+        self._conflict("e3", adoption="needs_review", ended="2026-10-03T00:00:00+00:00")
+        blocked, exhausted = self._attempts()
+        self.assertIn(232, blocked)
+        self.assertIn(232, exhausted)
+
+    def test_two_conflicts_old_and_new_text_allow_exactly_one_more_experiment(self):
+        self._conflict("e1", "Integrationskonflikt beim Cherry-Pick.", ended="2026-10-01T00:00:00+00:00")
+        self._conflict("e2", "Integrationskonflikt: service.py", ended="2026-10-02T00:00:00+00:00")
+
+        blocked, exhausted = self._attempts()
+        self.assertNotIn(232, blocked)
+        self.assertNotIn(232, exhausted)
+
+        # The retry that merged main conflicts again: now the issue is done.
+        self._conflict("e3", "Integrationskonflikt: nexus_initiative.py", ended="2026-10-03T00:00:00+00:00")
+        blocked, exhausted = self._attempts()
+        self.assertIn(232, blocked)
+        self.assertEqual(exhausted[232]["experiment_ids"], ["e1", "e2", "e3"])
+        self.assertEqual(exhausted[232]["last_reason"], "Integrationskonflikt: nexus_initiative.py")
+
+    def test_a_further_conflict_is_reported_with_the_conflict_reason(self):
+        self._conflict("e1", ended="2026-10-01T00:00:00+00:00")
+        self._conflict("e2", ended="2026-10-02T00:00:00+00:00")
+        self._conflict("e3", "Integrationskonflikt: b.py", ended="2026-10-03T00:00:00+00:00")
+        self.fx.adoption.assess_failure = lambda _id: SimpleNamespace(retryable=False)
+        svc = self._service(issues=self.ISSUES[:1])
+
+        self.assertEqual(svc.tick().decision, "idle")
+
+        entries = self._entries(svc)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(json.loads(entries[0]["detail"])["last_reason"], "Integrationskonflikt: b.py")
+        self.assertIn("Last failure: Integrationskonflikt: b.py", self.comments[0][1])
+
+    def test_conflicts_alone_cannot_loop_forever(self):
+        for day in range(1, 10):
+            self._conflict(f"e{day}", ended=f"2026-10-0{day}T00:00:00+00:00")
+            blocked, _ = self._attempts()
+            if 232 in blocked:
+                break
+        self.assertEqual(day, nexus_initiative._MAX_ISSUE_ATTEMPTS + 1)
+
+    def test_other_review_stops_still_count(self):
+        self._fail(
+            "e1", status="succeeded", adoption="failed", reason="denied path: deploy/x",
+            ended="2026-10-01T00:00:00+00:00",
+        )
+        self._fail(
+            "e2", status="succeeded", adoption="needs_review", reason="Review blocked the merge",
+            ended="2026-10-02T00:00:00+00:00",
+        )
+
+        blocked, exhausted = self._attempts()
+
+        self.assertIn(232, blocked)
+        self.assertEqual(exhausted[232]["last_reason"], "Review blocked the merge")
+
+    def test_the_conflict_helper_matches_both_texts_only_for_stopped_adoptions(self):
+        helper = nexus_initiative._is_integration_conflict
+        self.assertTrue(helper("failed", "Integrationskonflikt: a.py"))
+        self.assertTrue(helper("needs_review", "Integrationskonflikt beim Cherry-Pick."))
+        self.assertFalse(helper("adopted", "Integrationskonflikt: a.py"))
+        self.assertFalse(helper("failed", "merge conflict"))
+        self.assertFalse(helper("failed", None))
 
 
 class PipelineCrashAttemptsTests(unittest.TestCase):
