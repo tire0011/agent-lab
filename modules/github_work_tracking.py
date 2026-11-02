@@ -651,53 +651,53 @@ class GitHubWorkTrackingService:
         ).stdout
         changed_paths = self._status_paths(status)
         publishable = [path for path in changed_paths if self._publishable_path(path)]
-        if not publishable:
+
+        remote_sha = self._remote_branch_sha(ref.branch_name)
+        worktree_head = self._git(["rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
+        # A resume that merged main (#486) leaves its work committed on top
+        # of the Issue branch; that HEAD is what must be published.
+        head_ahead = worktree_head != remote_sha and self._git(
+            ["merge-base", "--is-ancestor", remote_sha, worktree_head],
+            cwd=worktree_path,
+            check=False,
+        ).returncode == 0
+        if not publishable and not head_ahead:
             excluded = sorted(set(changed_paths) - set(publishable))
             detail = f"; excluded runtime paths: {', '.join(excluded[:10])}" if excluded else ""
             raise GitHubWorkTrackingError(
                 "implementation produced no publishable source/test/documentation changes" + detail
             )
 
-        remote_sha = self._remote_branch_sha(ref.branch_name)
-        worktree_head = self._git(["rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
-        checkpoint_base = remote_sha
-        if ref.checkpoint_sha != remote_sha:
+        checkpoint_base = worktree_head if head_ahead else remote_sha
+        if not head_ahead and ref.checkpoint_sha != remote_sha:
             remote_descends_from_worktree = self._git(
                 ["merge-base", "--is-ancestor", worktree_head, remote_sha],
                 cwd=worktree_path,
                 check=False,
             )
             if remote_descends_from_worktree.returncode != 0:
-                worktree_descends_from_remote = self._git(
-                    ["merge-base", "--is-ancestor", remote_sha, worktree_head],
-                    cwd=worktree_path,
-                    check=False,
+                raise GitHubWorkTrackingError(
+                    "Issue branch no longer descends from the experiment worktree; manual reconciliation required"
                 )
-                if worktree_descends_from_remote.returncode == 0:
-                    checkpoint_base = worktree_head
-                else:
-                    raise GitHubWorkTrackingError(
-                        "Issue branch no longer descends from the experiment worktree; manual reconciliation required"
-                    )
 
-            if checkpoint_base == remote_sha:
-                upstream_paths = set(
-                    self._git(
-                        ["diff", "--name-only", f"{worktree_head}..{remote_sha}"],
-                        cwd=worktree_path,
-                    ).stdout.splitlines()
+            upstream_paths = set(
+                self._git(
+                    ["diff", "--name-only", f"{worktree_head}..{remote_sha}"],
+                    cwd=worktree_path,
+                ).stdout.splitlines()
+            )
+            overlap = sorted(upstream_paths.intersection(publishable))
+            if overlap:
+                raise GitHubWorkTrackingError(
+                    "Issue branch changed the same files as the worktree: " + ", ".join(overlap[:20])
                 )
-                overlap = sorted(upstream_paths.intersection(publishable))
-                if overlap:
-                    raise GitHubWorkTrackingError(
-                        "Issue branch changed the same files as the worktree: " + ", ".join(overlap[:20])
-                    )
 
         with tempfile.TemporaryDirectory(prefix="nexus-checkpoint-index-") as temp_dir:
             env = dict(os.environ)
             env["GIT_INDEX_FILE"] = str(Path(temp_dir) / "index")
             self._git(["read-tree", checkpoint_base], cwd=worktree_path, env=env)
-            self._git(["add", "-A", "--", *publishable], cwd=worktree_path, env=env)
+            if publishable:
+                self._git(["add", "-A", "--", *publishable], cwd=worktree_path, env=env)
             tree_sha = self._git(["write-tree"], cwd=worktree_path, env=env).stdout.strip()
         base_tree = self._git(
             ["rev-parse", f"{checkpoint_base}^{{tree}}"], cwd=worktree_path
@@ -722,6 +722,7 @@ class GitHubWorkTrackingService:
                 ],
                 cwd=worktree_path,
             ).stdout.strip()
+        if checkpoint_sha != remote_sha:
             self._git(
                 ["push", "origin", f"{checkpoint_sha}:refs/heads/{ref.branch_name}"],
                 cwd=worktree_path,
