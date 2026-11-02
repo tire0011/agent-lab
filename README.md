@@ -1,9 +1,54 @@
-# agent-lab
+# agent-lab: Nexus
 
-Experimental project for distributed self-improving LLM agents under strict budget constraints.
+**Nexus** is a self-developing agent. It runs on a small Azure VM, picks its own
+work from the GitHub issues of this repository, changes its own code through
+coding agents (Claude Code and Codex), checks every change, and merges it
+itself. The owner steers through issues and by releasing Nexus's own proposals.
+The project goal: find out how far such a system can improve itself safely,
+measurably and within a tight budget.
 
-Repository development and verification conventions are documented in
-[`CODING_GUIDELINES.md`](CODING_GUIDELINES.md).
+Identity and attribution rules are in [`NEXUS.md`](NEXUS.md); development and
+verification conventions are in [`CODING_GUIDELINES.md`](CODING_GUIDELINES.md).
+
+## How Nexus works
+
+Every 15 minutes the initiative tick (`nexus_tick.py`, `nexus-tick.timer`) runs
+one step:
+
+1. **Plan.** A read-only planner (Claude with the Nexus MCP read tools, Azure as
+   fallback) picks the next open issue. It also suggests one new issue of its
+   own, opened with the `proposal` label. It sees its recent experiments, its
+   open proposals and the owner's decisions on closed ones.
+2. **Implement.** An experiment runs in an isolated git worktree on the issue's
+   branch. A retry first merges the current `main`. The coding agent rotates
+   between Claude and Codex; when one is overloaded, the other takes over.
+3. **Check.** Tests, a deterministic quality gate, GitHub Actions on the
+   experiment commit, and a review that rotates between Claude, Codex and
+   Azure. Before the merge, CI must also pass on exactly the tree that goes to
+   `main`.
+4. **Merge.** Nexus squash-merges its own pull request (`Fixes #N` closes the
+   issue). If `main` turns red after a Nexus merge, the next tick reverts it and
+   reopens the issue.
+5. **Report.** Failures, reverts and new proposals are posted as comments on
+   `tire0011/agent-lab-mailbox#6`.
+
+Limits: one piece of work at a time; a daily budget of self-started
+experiments (`--daily-budget` in `deploy/nexus-tick.service`); at most two
+failed attempts per issue. A provider overload or a crash of Nexus's own
+pipeline does not use up an attempt, and a retry after a blocking review runs
+at once and outside the budget.
+
+## Working with Nexus
+
+- **Give work:** open a GitHub issue with a concrete Problem / Change / Test.
+  Nexus treats only paths in the Change section as files it must create.
+- **Review its ideas:** proposals carry the `proposal` label and are not worked
+  on. Remove the label to release one; close it with a comment to reject it.
+  The closing comment is shown to the planner as the owner's decision.
+- **Watch it:** comments on `tire0011/agent-lab-mailbox#6`, the open `WIP:`
+  pull requests, and `GET /diagnostics/public`.
+- **Deploy changes:** after a merge by hand, run `scripts/nexus-refresh.ps1` on
+  the VM (or via a mailbox command); Nexus restarts stale services itself.
 
 ## Mailbox
 
@@ -69,12 +114,9 @@ python mailbox_processor.py [--dry-run] [--db-path PATH] [--code-repo-path PATH]
 
 The VM normally sets `AGENT_CODE_REPO_PATH=/agent` and `AGENT_MAILBOX_REPO_PATH` to the separate mailbox checkout.
 
-## Current status
+## API overview
 
-- V0 (`agent.py`) works locally and on Azure VM.
-- V0 supports Azure OpenAI calls and logs run artifacts under `state/runs/`.
-- V1 (MCP-based) is in progress.
-- API service (`api.py`) provides:
+The API service (`api.py`) provides:
 	- public `GET /health`
 	- public `GET /activity/public` and `GET /experiments/{id}/public` with
 	  strict allowlisted observability fields (no prompts, diffs, raw logs, or paths)
@@ -87,16 +129,6 @@ The VM normally sets `AGENT_CODE_REPO_PATH=/agent` and `AGENT_MAILBOX_REPO_PATH`
 	  `GET /codex/tasks`, `GET /codex/tasks/{id}`,
 	  `POST /codex/tasks/{id}/run`) — synchronous, `read-only` sandbox,
 	  `working_dir` fixed to `/agent`; see "Coding task API" below
-
-## Current direction
-
-The project is not run from a fixed roadmap. Open, unprioritized ideas
-for future work live in `IDEAS.md` and may be added to by humans or
-agents at any time; see that file for current candidate ideas (V1 MCP
-completion, benchmarking, provider abstraction, cheaper models,
-evaluation gating, controlled self-improvement, and more) and their
-lightweight states (`new`, `exploring`, `selected`, `tested`, `adopted`,
-`rejected`).
 
 ## Local quick start
 
