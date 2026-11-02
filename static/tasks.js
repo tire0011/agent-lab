@@ -1,13 +1,13 @@
 "use strict";
 
 // ---------------------------------------------------------------------------
-// Aufträge: mailbox task approvals + experiment detail
+// Aufträge: mailbox tasks + experiment detail
 // ---------------------------------------------------------------------------
 
 const taskElements = {
   loadButton: document.querySelector("#task-load-button"),
-  content: document.querySelector("#task-approvals-content"),
-  count: document.querySelector("#task-approvals-count"),
+  content: document.querySelector("#mailbox-tasks-content"),
+  count: document.querySelector("#mailbox-tasks-count"),
   detailSection: document.querySelector("#task-detail-section"),
   detailContent: document.querySelector("#task-detail-content"),
   detailClose: document.querySelector("#task-detail-close"),
@@ -35,7 +35,7 @@ function startAdoptionPolling(experimentId) {
     try {
       const adoption = await requestJson(`/experiments/${encodeURIComponent(experimentId)}/adoption`, { headers: authHeaders() });
       updateAdoptionUi(adoption);
-      if (["adopted", "needs_review", "failed", "interrupted"].includes(adoption.status)) {
+      if (["adopted", "needs_review", "ready_for_review", "failed", "interrupted"].includes(adoption.status)) {
         stopAdoptionPolling();
       }
     } catch {
@@ -98,7 +98,7 @@ Jetzt übernehmen?`
   }
 }
 
-async function loadTaskApprovals() {
+async function loadMailboxTasks() {
   if (!state.apiKey) {
     taskElements.content.textContent = "Bitte oben den API-Key eingeben, um Aufträge zu sehen.";
     taskElements.count.textContent = "–";
@@ -108,7 +108,7 @@ async function loadTaskApprovals() {
   try {
     const data = await requestJson("/mailbox/tasks?limit=20", { headers: authHeaders() });
     taskElements.count.textContent = String(data.count);
-    await renderTaskApprovals(data.tasks);
+    await renderMailboxTasks(data.tasks);
   } catch (error) {
     taskElements.count.textContent = "!";
     showError(taskElements.content, error.message);
@@ -124,7 +124,18 @@ async function fetchExperimentSummary(experimentId) {
   }
 }
 
-async function renderTaskApprovals(tasks) {
+// States left by the removed approval step (#264); old records stay readable.
+const LEGACY_TASK_STATUS_LABELS = {
+  pending_approval: "pending_approval (alt, nicht ausgeführt)",
+  approved: "approved (alt)",
+  rejected: "rejected (alt)",
+};
+
+function taskStatusLabel(status) {
+  return LEGACY_TASK_STATUS_LABELS[status] || status;
+}
+
+async function renderMailboxTasks(tasks) {
   if (!tasks.length) {
     taskElements.content.textContent = "Keine Mailbox-Aufträge vorhanden.";
     return;
@@ -137,7 +148,7 @@ async function renderTaskApprovals(tasks) {
   renderCardList(taskElements.content, tasks, "Keine Mailbox-Aufträge vorhanden.", (li, task, index) => {
     const preview = (task.task_body || "").slice(0, 160);
     const truncated = preview.length < (task.task_body || "").length;
-    addTitle(li, `[${task.status}] ${task.sender} — ${preview}${truncated ? "…" : ""}`);
+    addTitle(li, `[${taskStatusLabel(task.status)}] ${task.sender} — ${preview}${truncated ? "…" : ""}`);
 
     const metaParts = [`Empfangen: ${task.received_at}`];
     if (task.result_summary) metaParts.push(task.result_summary);
@@ -159,56 +170,6 @@ async function renderTaskApprovals(tasks) {
       const actions = document.createElement("div");
       actions.className = "card-actions";
       actions.append(openBtn);
-      li.append(actions);
-    }
-
-    if (task.status === "pending_approval") {
-      const actions = document.createElement("div");
-      actions.className = "card-actions";
-
-      const approveBtn = document.createElement("button");
-      approveBtn.textContent = "Genehmigen";
-      approveBtn.type = "button";
-      approveBtn.addEventListener("click", async () => {
-        approveBtn.disabled = true;
-        approveBtn.textContent = "…";
-        try {
-          await requestJson(`/mailbox/tasks/${task.id}/approve`, {
-            method: "POST",
-            headers: authHeaders(),
-          });
-          await loadTaskApprovals();
-        } catch (err) {
-          approveBtn.textContent = "Fehler";
-          approveBtn.disabled = false;
-          window.alert(err.message);
-        }
-      });
-
-      const rejectBtn = document.createElement("button");
-      rejectBtn.textContent = "Ablehnen";
-      rejectBtn.type = "button";
-      rejectBtn.className = "secondary";
-      rejectBtn.addEventListener("click", async () => {
-        const reason = window.prompt("Ablehnungsgrund (1–500 Zeichen):");
-        if (!reason || !reason.trim()) return;
-        rejectBtn.disabled = true;
-        rejectBtn.textContent = "…";
-        try {
-          await requestJson(`/mailbox/tasks/${task.id}/reject`, {
-            method: "POST",
-            headers: authHeaders(),
-            body: JSON.stringify({ reason: reason.trim() }),
-          });
-          await loadTaskApprovals();
-        } catch (err) {
-          rejectBtn.textContent = "Fehler";
-          rejectBtn.disabled = false;
-          window.alert(err.message);
-        }
-      });
-
-      actions.append(approveBtn, rejectBtn);
       li.append(actions);
     }
   });
@@ -321,7 +282,7 @@ async function showExperimentDetail(experimentId) {
   }
 }
 
-taskElements.loadButton.addEventListener("click", loadTaskApprovals);
+taskElements.loadButton.addEventListener("click", loadMailboxTasks);
 taskElements.detailClose.addEventListener("click", () => {
   stopAdoptionPolling();
   taskState.currentExperimentId = null;

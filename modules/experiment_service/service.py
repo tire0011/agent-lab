@@ -18,12 +18,16 @@ from typing import Any, Callable
 
 from modules.coding_provider import (
     build_random_worker,
+    build_worker,
+    is_provider_overload,
+    other_provider,
     provider_of,
     random_worker_factory,
 )
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
+from modules.github_work_tracking import failing_test_names
 from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
 from modules.redaction import sanitized_reason
 from modules.run_store import (
@@ -47,6 +51,7 @@ from .models import (
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
     ExperimentNotCancellableError,
+    PIPELINE_CRASH_ERROR_PREFIX,
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
@@ -84,6 +89,7 @@ _WARNING_STATUSES = frozenset(
 _ERROR_STATUSES = frozenset({"failed", "timed_out"})
 
 _DEFAULT_MAX_TEST_OUTPUT_BYTES = 32 * 1024
+_MAX_ERROR_TEST_NAMES = 3
 _DEFAULT_MAX_DIFF_BYTES = 64 * 1024
 _DEFAULT_MAX_RAW_MESSAGE_BYTES = 16 * 1024
 _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES = 64 * 1024
@@ -224,6 +230,8 @@ class ExperimentService:
         test_safety_cap_seconds: float | None = None,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
         rng: Any | None = None,
+        base_ref: str = "HEAD",
+        test_command: list[str] | None = None,
     ) -> None:
         """
         Parameters
@@ -293,6 +301,14 @@ class ExperimentService:
             All three are passed through as written when set explicitly, and
             clamped to safe floors when they come from the environment - see
             ``WatchdogConfig.resolve``.
+        base_ref:
+            Commit an experiment's worktree starts from, unless the GitHub
+            lifecycle supplies one. The benchmark (#343) pins this; everything
+            else keeps ``HEAD``.
+        test_command:
+            Verification argv template replacing the built-in suite run;
+            ``{python}`` becomes ``test_python_executable``. For trusted callers
+            only: it must never be built from plan or model output.
         """
         self.selection_worker = (
             selection_worker
@@ -316,6 +332,8 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
+        self.base_ref = base_ref
+        self.test_command = test_command
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
         # cleanliness is asserted directly, so the log directory must never
@@ -563,6 +581,20 @@ class ExperimentService:
             rows = self._conn.execute(
                 "SELECT * FROM experiments ORDER BY created_at DESC, id DESC LIMIT ?",
                 (limit,),
+            ).fetchall()
+        return [_row_to_experiment(row) for row in rows]
+
+    def list_gate_recheck_candidates(self) -> list[Experiment]:
+        """Return only terminal runs eligible for a read-only gate recheck."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM experiments
+                WHERE status = ?
+                   OR (status = ? AND error LIKE 'quality evaluation:%')
+                ORDER BY created_at DESC, id DESC
+                """,
+                (STATUS_REJECTED, STATUS_NEEDS_REVIEW),
             ).fetchall()
         return [_row_to_experiment(row) for row in rows]
 
@@ -856,7 +888,7 @@ class ExperimentService:
                 experiment_id,
                 STATUS_FAILED,
                 ended_at=_utcnow_iso(),
-                error=f"unhandled exception in experiment pipeline: {exc}",
+                error=f"{PIPELINE_CRASH_ERROR_PREFIX}{exc}",
             )
             return self.get_experiment(experiment_id)
 
@@ -905,7 +937,7 @@ class ExperimentService:
         # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
-        base_ref = "HEAD"
+        base_ref = self.base_ref
         if github_work_tracking is not None:
             base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
@@ -961,6 +993,8 @@ class ExperimentService:
             "Starting implementation (single coding-agent call: analyse, plan, implement)",
         )
         implementation_prompt = _build_direct_implementation_prompt(experiment.goal)
+        if github_work_tracking is not None:
+            implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
         implementation_task_id = uuid.uuid4().hex
         worker = self.worker_factory(worktree_path)
         # Which coding agent got this experiment is recorded before the call,
@@ -988,6 +1022,38 @@ class ExperimentService:
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
         )
+
+        fallback = other_provider(implementation_provider) if implementation_provider else None
+        if (
+            implementation_result.error
+            and not implementation_result.timed_out
+            and is_provider_overload(implementation_result.error)
+            and fallback is not None
+            and self.get_experiment(experiment_id).status != STATUS_CANCELLED
+        ):
+            # The provider was overloaded, not the work wrong: let the other
+            # coding agent do it instead of failing the experiment.
+            elog.warning(
+                "implementation", "implementation_provider_fallback",
+                f"{implementation_provider} is overloaded; implementation runs on {fallback}",
+                provider=fallback,
+            )
+            worker = build_worker(fallback, db_path=self.db_path)
+            implementation_provider = fallback
+            self._force_status(
+                experiment_id, STATUS_IMPLEMENTING,
+                implementation_provider=implementation_provider,
+            )
+            implementation_result = worker.run(
+                task=implementation_prompt,
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=max_seconds,
+                stall_seconds=stall_seconds,
+                experiment_logger=elog,
+                phase="implementation",
+                on_process=lambda process: self._track_process(experiment_id, process),
+            )
 
         if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
             return self.get_experiment(experiment_id)
@@ -1049,6 +1115,44 @@ class ExperimentService:
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
+        )
+
+    def _merge_current_main(self, worktree_path: str, elog: ExperimentLogger) -> str:
+        """Bring today's main into a retry's issue branch (#478).
+
+        A retry continues the issue branch, which can lag far behind main;
+        its change then conflicts at adoption every time. Merging main first
+        lets the coding agent resolve a conflict once, in the experiment,
+        where tests and review still check it. Returns a note for the prompt
+        when conflict markers are left to resolve, else "".
+        """
+        def git(*args: str) -> subprocess.CompletedProcess:
+            return _run_git(
+                ["-c", "user.name=Nexus", "-c", "user.email=nexus@agent-lab.local", *args],
+                cwd=worktree_path, timeout=120, elog=elog, phase="implementation",
+            )
+
+        if git("fetch", "--no-tags", "origin", "main").returncode != 0:
+            return ""
+        if git("merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD").returncode == 0:
+            return ""
+        if git("merge", "--no-edit", "FETCH_HEAD").returncode == 0:
+            elog.info("implementation", "base_merged_clean", "Merged current main into the issue branch")
+            return ""
+        conflicted = git("diff", "--name-only", "--diff-filter=U").stdout.split()
+        if not conflicted:
+            git("merge", "--abort")
+            return ""
+        git("add", "-A")
+        git("commit", "--no-verify", "-m", "Merge main; conflicts left for the coding agent")
+        elog.warning(
+            "implementation", "base_merge_conflict",
+            f"Merging current main left conflicts in: {', '.join(conflicted[:20])}",
+        )
+        return (
+            "FIRST: merging the current main into this branch left conflict markers "
+            "(<<<<<<<, =======, >>>>>>>) in: " + ", ".join(conflicted[:20]) + ". Resolve "
+            "them, keeping what both sides intended, then do the task below.\n\n"
         )
 
     def _record_verification_run(
@@ -1312,7 +1416,7 @@ class ExperimentService:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
-        test_command_template = _TEST_COMMANDS.get(test_command_key)
+        test_command_template = self.test_command or _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
             if test_command_template is not None
@@ -1336,6 +1440,7 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         test_timed_out = False
+        ci_failure_detail = None
         if not use_local_tests:
             test_command = ["GitHub Actions", "tests.yml", ci_verification.commit_sha]
             test_exit_code = 0 if ci_verification.status == "passed" else 1
@@ -1345,6 +1450,10 @@ class ExperimentService:
                 f"{ci_verification.conclusion or 'unknown'}."
                 + (f" {ci_verification.url}" if ci_verification.url else "")
             )
+            # The first line stays as it is: ci_evidence_backfill parses it.
+            ci_failure_detail = getattr(ci_verification, "failure_detail", None)
+            if ci_failure_detail:
+                test_output = f"{test_output}\n{ci_failure_detail}"
         else:
             watchdog = self._get_test_watchdog_config()
             expected_total = self._get_expected_test_total()
@@ -1467,6 +1576,9 @@ class ExperimentService:
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"
+            failing_tests = failing_test_names(ci_failure_detail, limit=_MAX_ERROR_TEST_NAMES)
+            if failing_tests:
+                error = f"{error}: {', '.join(failing_tests)}"
             elog.error(
                 "verifying",
                 "tests_failed" if repair_iteration == 0 else "tests_failed_repair",

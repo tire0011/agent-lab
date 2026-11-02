@@ -128,8 +128,8 @@ class EarlierAttemptsTests(unittest.TestCase):
         from modules.experiment_evaluation import extract_explicit_goal_artifacts
         from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING
 
-        goal = f"Add modules/x.py\n\n{EARLIER_ATTEMPTS_HEADING}\n- erforderliches Artefakt git/hooks/a.sample fehlt"
-        self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/x.py"])
+        goal = f"Add modules/web_research.py\n\n{EARLIER_ATTEMPTS_HEADING}\n- erforderliches Artefakt git/hooks/a.sample fehlt"
+        self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/web_research.py"])
 
 
 if __name__ == "__main__":

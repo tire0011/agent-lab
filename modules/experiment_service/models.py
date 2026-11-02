@@ -9,6 +9,10 @@ from typing import Any
 # Status constants — small deterministic state machine.
 # ---------------------------------------------------------------------------
 
+# Start of the error of a run the pipeline itself crashed in. Nexus reads it to
+# tell such a run from a judged attempt (#467).
+PIPELINE_CRASH_ERROR_PREFIX = "unhandled exception in experiment pipeline: "
+
 STATUS_QUEUED = "queued"
 STATUS_SELECTING = "selecting"
 STATUS_REJECTED = "rejected"

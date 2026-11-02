@@ -45,6 +45,7 @@ class GitHubLifecycleTransport:
         self.origin = origin
         self.workspace = workspace
         self.merge_should_fail = merge_should_fail
+        self.ci_conclusion = "success"
         self.issues: dict[int, dict[str, object]] = {}
         self.next_issue = 42
         self.refs = {"main": "main-sha"}
@@ -54,6 +55,15 @@ class GitHubLifecycleTransport:
     def __call__(self, method, path, payload):
         self.calls.append((method, path, payload))
 
+        if method == "GET" and "/actions/workflows/" in path:
+            # CI for the integrated tree before the merge (#455).
+            import urllib.parse as _url
+
+            sha = _url.parse_qs(_url.urlparse(path).query).get("head_sha", [""])[0]
+            return {"workflow_runs": [{
+                "id": 9001, "head_sha": sha, "event": "push", "status": "completed",
+                "conclusion": self.ci_conclusion, "run_attempt": 1,
+            }]}
         if method == "GET" and path.startswith("/search/issues?"):
             query = parse_qs(urlsplit(path).query).get("q", [""])[0]
             wanted = ""
@@ -497,6 +507,44 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
             self.fx.adoption_service.start_adoption(experiment_id)
         self.assertEqual(self.fx.adoption_service.get(experiment_id).status, STATUS_NEEDS_REVIEW)
 
+    def test_retry_adopts_the_earlier_attempts_commits_too(self):
+        # #455: a retry builds on the earlier attempt's commit; adopting only
+        # the retry's own commit lost that work (the reverted #410).
+        experiment_id = "e7" * 16
+        self.fx.create_experiment(
+            experiment_id=experiment_id,
+            changed_files=["app.py"],
+            mutate={"app.py": "VALUE = 'retry'\n"},
+        )
+        worktree = self.fx.worktrees / f"exp-{experiment_id[:8]}"
+        git(worktree, "stash")
+        (worktree / "first_attempt.py").write_text("FIRST = True\n", encoding="utf-8")
+        git(worktree, "add", "first_attempt.py")
+        git(worktree, "commit", "-m", "earlier attempt")
+        git(worktree, "stash", "pop")
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_ADOPTED, adoption.reason)
+        self.assertIn("FIRST = True", git(self.fx.repo, "show", "origin/main:first_attempt.py").stdout)
+        self.assertIn("retry", git(self.fx.repo, "show", "origin/main:app.py").stdout)
+
+    def test_red_ci_on_the_integrated_tree_stops_the_merge(self):
+        # #455: what merges is the change on today's main; it must pass CI itself.
+        experiment_id = "e8" * 16
+        self.fx.create_experiment(experiment_id=experiment_id, changed_files=["app.py"])
+        self.fx.github_api.ci_conclusion = "failure"
+        before = git(self.fx.repo, "rev-parse", "origin/main").stdout.strip()
+
+        self.fx.adoption_service.start_adoption(experiment_id)
+        adoption = self.fx.wait_terminal(experiment_id)
+
+        self.assertEqual(adoption.status, STATUS_FAILED)
+        self.assertIn("CI on the integrated tree", adoption.reason)
+        git(self.fx.repo, "fetch", "origin")
+        self.assertEqual(before, git(self.fx.repo, "rev-parse", "origin/main").stdout.strip())
+
     def test_cherry_pick_conflict_keeps_diagnostic_worktree_and_skips_push(self):
         experiment_id = "b1" * 16
         self.fx.create_experiment(
@@ -511,7 +559,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
         self.fx.adoption_service.start_adoption(experiment_id)
         adoption = self.fx.wait_terminal(experiment_id)
         self.assertEqual(adoption.status, STATUS_NEEDS_REVIEW)
-        self.assertIn("Cherry-Pick", adoption.reason)
+        self.assertIn("Integrationskonflikt: app.py", adoption.reason)
         self.assertTrue(Path(adoption.diagnostic_worktree_path).exists())
 
     def test_integration_test_failure_prevents_push(self):

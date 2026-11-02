@@ -336,7 +336,7 @@ class TestMailboxDevelopment(unittest.TestCase):
         self.assertIn("**Exit code:** 1", body)
         self.assertIn("restart recovery: failed", body)
 
-    def test_task_is_approved_without_human_step(self):
+    def test_task_goes_straight_to_nexus(self):
         install(mailbox)
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "state.db")
@@ -368,9 +368,11 @@ class TestMailboxDevelopment(unittest.TestCase):
                 (db_msg_id,),
             ).fetchone()
             conn.close()
-        self.assertEqual(row[0], "approved")
-        self.assertIsNotNone(row[1])
-        self.assertIn("approved automatically", result)
+        # #264: no approval state, the worker hands a queued task to Nexus.
+        self.assertEqual(row[0], "queued")
+        self.assertIsNone(row[1])
+        self.assertIn("handed to Nexus", result)
+        self.assertNotIn("approv", result)
 
 
 if __name__ == "__main__":
