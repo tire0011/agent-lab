@@ -16,7 +16,6 @@ import logging
 import re
 import sqlite3
 import threading
-import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,13 +29,13 @@ from modules.experiment_wait import resume_with_new_orchestrator, run_then_resum
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
+from .task_ingest import insert_task_approval
 from modules.outbox_publisher import (
     OutboxMessage,
     PUBLISH_PENDING_WRITE,
     TaskApprovalOutboxPublisher,
 )
 from modules.run_store import DEFAULT_DB_PATH, init_db
-from modules.run_store.schema import record_merge_constraint
 # ``modules.task_orchestrator`` is imported lazily, not here. It imports
 # ``modules.mailbox.development``, which runs this package's ``__init__`` and
 # comes straight back to this module - so importing the orchestrator *first*
@@ -100,6 +99,7 @@ class MailboxTaskApproval:
         "received_at", "status", "approved_at", "rejected_at",
         "rejection_reason", "experiment_id", "outbox_file",
         "publish_status", "publish_commit_sha", "result_summary", "error",
+        "idempotency_key",
         "merge_forbidden", "merge_constraint_reason",
         "created_at", "updated_at",
     )
@@ -373,42 +373,37 @@ class MailboxTaskService:
         sender: str,
         file_path: str,
         received_at: str,
+        idempotency_key: str | None = None,
     ) -> MailboxTaskApproval:
+        """Record a task once per idempotency key (#378).
+
+        The key defaults to one derived from *mailbox_msg_id*; API callers
+        may pass their own. A repeated delivery returns the original task
+        unchanged, so it is approved and dispatched at most once.
+        """
         with self._lock:
-            existing = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
-                (mailbox_msg_id,),
-            ).fetchone()
-            if existing is not None:
-                return _row_to_approval(existing)
-            approval_id = uuid.uuid4().hex
-            now = _now_iso()
-            self._conn.execute(
-                """INSERT INTO mailbox_task_approvals
-                   (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-                    status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    approval_id,
-                    mailbox_msg_id,
-                    task_body or "",
-                    sender,
-                    file_path,
-                    received_at,
-                    _STATUS_QUEUED,
-                    now,
-                    now,
-                ),
+            approval_id, created = insert_task_approval(
+                self._conn,
+                mailbox_msg_id=mailbox_msg_id,
+                task_body=task_body,
+                sender=sender,
+                file_path=file_path,
+                received_at=received_at,
+                idempotency_key=idempotency_key,
             )
-            record_merge_constraint(self._conn, approval_id, task_body)
-            self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
-        self._task_logger(approval_id).info(
-            "mailbox", "task_received",
-            "mailbox task received, handed to Nexus",
-        )
+        if created:
+            self._task_logger(approval_id).info(
+                "mailbox", "task_received",
+                "mailbox task received, handed to Nexus",
+            )
+        else:
+            self._task_logger(approval_id).info(
+                "mailbox", "task_duplicate_delivery",
+                "mailbox task delivered again, returning the original task",
+            )
         return _row_to_approval(row)
 
     def get(self, approval_id: str) -> MailboxTaskApproval:
