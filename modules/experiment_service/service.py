@@ -47,6 +47,7 @@ from modules.verification_runner import (
 from .git_utils import _run_git
 from .models import (
     Experiment,
+    ExperimentAlreadyActiveError,
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
     ExperimentNotCancellableError,
@@ -70,6 +71,8 @@ from .prompts import _build_direct_implementation_prompt, _build_repair_implemen
 from .text_utils import _truncate_text, _utcnow_iso
 
 logger = logging.getLogger("modules.experiment_service")
+
+_GITHUB_ISSUE_GOAL_RE = re.compile(r"^GitHub Issue #(\d+):")
 
 # Statuses that represent a problem worth surfacing at WARNING level in the
 # journal (as opposed to ordinary forward progress, logged at INFO). Kept
@@ -462,32 +465,69 @@ class ExperimentService:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
+        normalized_goal = goal.strip()
+        issue_match = _GITHUB_ISSUE_GOAL_RE.match(normalized_goal)
+        issue_number = int(issue_match.group(1)) if issue_match is not None else None
         experiment_id = uuid.uuid4().hex
         created_at = _utcnow_iso()
 
-        with self._lock, self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO experiments (id, goal, status, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (experiment_id, goal.strip(), STATUS_QUEUED, created_at),
-            )
-            insert_activity(
-                self._conn,
-                timestamp=created_at,
-                entity_type="experiment",
-                entity_id=experiment_id,
-                event="created",
-                to_status=STATUS_QUEUED,
-                message=goal.strip(),
-            )
+        with self._lock:
+            # A connection context starts SQLite's default deferred transaction
+            # only when the INSERT runs.  That is too late for this guard: two
+            # service instances can both complete the SELECT before either one
+            # owns the write lock.  BEGIN IMMEDIATE reserves the writer before
+            # the lookup, making the check-and-insert atomic across connections
+            # and processes as well as within this service instance.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if issue_number is not None:
+                    placeholders = ", ".join("?" for _ in _TERMINAL_STATUSES)
+                    active_rows = self._conn.execute(
+                        f"""
+                        SELECT id, status, goal FROM experiments
+                        WHERE status NOT IN ({placeholders})
+                        ORDER BY created_at ASC
+                        """,
+                        _TERMINAL_STATUSES,
+                    ).fetchall()
+                    active = next(
+                        (
+                            row
+                            for row in active_rows
+                            if (match := _GITHUB_ISSUE_GOAL_RE.match(row["goal"]))
+                            and int(match.group(1)) == issue_number
+                        ),
+                        None,
+                    )
+                    if active is not None:
+                        raise ExperimentAlreadyActiveError(active["id"], active["status"])
+                self._conn.execute(
+                    """
+                    INSERT INTO experiments (id, goal, status, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at),
+                )
+                insert_activity(
+                    self._conn,
+                    timestamp=created_at,
+                    entity_type="experiment",
+                    entity_id=experiment_id,
+                    event="created",
+                    to_status=STATUS_QUEUED,
+                    message=normalized_goal,
+                )
+            except BaseException:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
 
         self._implementation_timeout_seconds = timeout_seconds
         logger.info("experiment %s created (status=%s)", experiment_id, STATUS_QUEUED)
         self.get_experiment_logger(experiment_id).info(
             STATUS_QUEUED, "experiment_created",
-            f"Experiment created: {goal.strip()}",
+            f"Experiment created: {normalized_goal}",
             timeout_seconds=timeout_seconds,
         )
         return self.get_experiment(experiment_id)

@@ -60,6 +60,7 @@ from .models import (
     STATUS_TIMED_OUT,
     STATUS_VERIFYING,
     Experiment,
+    ExperimentAlreadyActiveError,
     ExperimentNotFoundError,
     ExperimentNotCancellableError,
     ExperimentNotRunnableError,
