@@ -467,6 +467,7 @@ class ExperimentService:
 
         normalized_goal = goal.strip()
         issue_match = _GITHUB_ISSUE_GOAL_RE.match(normalized_goal)
+        issue_number = int(issue_match.group(1)) if issue_match is not None else None
         experiment_id = uuid.uuid4().hex
         created_at = _utcnow_iso()
 
@@ -479,18 +480,25 @@ class ExperimentService:
             # and processes as well as within this service instance.
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                if issue_match is not None:
-                    issue_prefix = f"GitHub Issue #{issue_match.group(1)}:%"
+                if issue_number is not None:
                     placeholders = ", ".join("?" for _ in _TERMINAL_STATUSES)
-                    active = self._conn.execute(
+                    active_rows = self._conn.execute(
                         f"""
-                        SELECT id, status FROM experiments
-                        WHERE goal LIKE ? AND status NOT IN ({placeholders})
+                        SELECT id, status, goal FROM experiments
+                        WHERE status NOT IN ({placeholders})
                         ORDER BY created_at ASC
-                        LIMIT 1
                         """,
-                        (issue_prefix, *_TERMINAL_STATUSES),
-                    ).fetchone()
+                        _TERMINAL_STATUSES,
+                    ).fetchall()
+                    active = next(
+                        (
+                            row
+                            for row in active_rows
+                            if (match := _GITHUB_ISSUE_GOAL_RE.match(row["goal"]))
+                            and int(match.group(1)) == issue_number
+                        ),
+                        None,
+                    )
                     if active is not None:
                         raise ExperimentAlreadyActiveError(active["id"], active["status"])
                 self._conn.execute(

@@ -41,7 +41,7 @@ class ExperimentIssueDedupTests(unittest.TestCase):
         first = self.service.create_experiment("GitHub Issue #7: first attempt")
 
         with self.assertRaises(ExperimentAlreadyActiveError) as raised:
-            self.service.create_experiment("GitHub Issue #7: duplicate attempt")
+            self.service.create_experiment("GitHub Issue #007: duplicate attempt")
 
         self.assertEqual(raised.exception.experiment_id, first.id)
         self.assertEqual(raised.exception.status, "queued")
