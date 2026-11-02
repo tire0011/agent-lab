@@ -1338,7 +1338,26 @@ class NexusTaskOrchestrator:
             experiment_id = decision.get("experiment_id")
             if action == ACTION_RESUME_EXPERIMENT:
                 if not experiment_id:
-                    raise TaskOrchestratorError("resume_experiment requires experiment_id")
+                    # The controller sometimes leaves the id out. Tell it, and let
+                    # it decide again, instead of failing the whole task.
+                    rejection = {
+                        "event": "terminal_decision_rejected",
+                        "terminal_action": ACTION_RESUME_EXPERIMENT,
+                        "reason": (
+                            "resume_experiment needs experiment_id. Name the experiment "
+                            "this task started, or choose new_experiment."
+                        ),
+                        "retryable": True,
+                    }
+                    rejection["event_id"] = self.task_store.append_event(
+                        session.id,
+                        role="system",
+                        kind="terminal_decision_rejected",
+                        content=json.dumps(rejection, separators=(",", ":")),
+                        metadata={"controller_action": action},
+                    )
+                    observations.append(rejection)
+                    continue
                 try:
                     experiment_id = self.experiment_service.resolve_experiment(str(experiment_id)).id
                 except Exception as exc:
