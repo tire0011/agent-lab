@@ -140,11 +140,6 @@ def _process_task(
                     "_process_task: msg %s is a duplicate delivery of task %s",
                     db_msg_id, approval_id,
                 )
-            else:
-                from modules.run_store.schema import record_merge_constraint
-
-                record_merge_constraint(conn, approval_id, msg.body)
-                conn.commit()
     except Exception:
         logger.warning("_process_task: failed to create task record for msg %s", db_msg_id, exc_info=True)
 

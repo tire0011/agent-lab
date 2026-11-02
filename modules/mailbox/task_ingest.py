@@ -62,20 +62,32 @@ def insert_task_approval(
     one statement, so concurrent deliveries - from other threads, connections
     or processes - cannot both create a task: the unique index lets exactly
     one insert through and every other caller reads that winner back.
+
+    The task's no-merge constraint (#185) is recorded in the same
+    transaction: a queued task is never visible to the worker without it,
+    and if recording it fails the task is rolled back with it.
     """
+    from modules.run_store.schema import record_merge_constraint
+
     key = resolve_idempotency_key(mailbox_msg_id, idempotency_key)
     approval_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    inserted = conn.execute(
-        """INSERT INTO mailbox_task_approvals
-           (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-            status, idempotency_key, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-           ON CONFLICT(idempotency_key) DO NOTHING""",
-        (approval_id, mailbox_msg_id, task_body or "", sender, file_path,
-         received_at, key, now, now),
-    ).rowcount
-    conn.commit()
+    try:
+        inserted = conn.execute(
+            """INSERT INTO mailbox_task_approvals
+               (id, mailbox_msg_id, task_body, sender, file_path, received_at,
+                status, idempotency_key, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+               ON CONFLICT(idempotency_key) DO NOTHING""",
+            (approval_id, mailbox_msg_id, task_body or "", sender, file_path,
+             received_at, key, now, now),
+        ).rowcount
+        if inserted:
+            record_merge_constraint(conn, approval_id, task_body)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     if inserted:
         return approval_id, True
     row = conn.execute(

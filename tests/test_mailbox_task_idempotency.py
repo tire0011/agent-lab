@@ -253,3 +253,60 @@ def test_migration_backfills_legacy_rows_once_per_message(tmp_path):
 
     assert keys == {"legacy-a": f"mailbox-msg:{msg_id}", "legacy-b": None}
     assert (approval_id, created) == ("legacy-a", False)
+
+
+_NO_MERGE_TASK = "Fix the bug. Do not merge the PR."
+
+
+def test_task_and_merge_constraint_commit_together(svc):
+    msg_id = _insert_msg(svc.db_path)
+    task = svc.create_task(msg_id, _NO_MERGE_TASK, "alice", "/f.md", _RECEIVED)
+
+    # Read through a separate connection: only committed state is visible.
+    conn = sqlite3.connect(svc.db_path)
+    try:
+        forbidden = conn.execute(
+            "SELECT merge_forbidden FROM mailbox_task_approvals WHERE id = ?", (task.id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert forbidden == 1
+
+
+def test_merge_constraint_failure_rolls_back_the_task(svc, monkeypatch):
+    """A queued task must never persist without its no-merge constraint."""
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("constraint write failed")
+
+    monkeypatch.setattr("modules.run_store.schema.record_merge_constraint", boom)
+    msg_id = _insert_msg(svc.db_path)
+
+    with pytest.raises(sqlite3.OperationalError):
+        svc.create_task(msg_id, _NO_MERGE_TASK, "alice", "/f.md", _RECEIVED)
+
+    assert _task_count(svc.db_path) == 0
+    _dispatch_all(svc)
+    svc.experiment_service.create_experiment.assert_not_called()
+
+    # The key was not burned: a redelivery after the fault creates the task.
+    monkeypatch.undo()
+    task = svc.create_task(msg_id, _NO_MERGE_TASK, "alice", "/f.md", _RECEIVED)
+    assert task.merge_forbidden == 1
+    assert _task_count(svc.db_path) == 1
+
+
+def test_inbox_merge_constraint_failure_leaves_no_task(tmp_path, monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("constraint write failed")
+
+    monkeypatch.setattr("modules.run_store.schema.record_merge_constraint", boom)
+    db_path = str(tmp_path / "inbox.db")
+    conn = init_db(db_path)
+    path = tmp_path / "a.md"
+    path.write_text(f"---\ntype: task\ncreated_by: alice\n---\n{_NO_MERGE_TASK}\n", encoding="utf-8")
+    msg = MailboxMessage.load(path, tmp_path)
+
+    _process_task(msg, tmp_path, conn, _insert_msg(db_path, str(msg.file_path)))
+    conn.close()
+
+    assert _task_count(db_path) == 0
