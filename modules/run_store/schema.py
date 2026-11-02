@@ -362,12 +362,9 @@ _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS = [
     ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("publish_last_error", "TEXT"),
     ("outbox_content", "TEXT"),
-<<<<<<< HEAD
     ("idempotency_key", "TEXT"),
-=======
     ("merge_forbidden", "INTEGER NOT NULL DEFAULT 0"),
     ("merge_constraint_reason", "TEXT"),
->>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
 ]
 
 
@@ -429,7 +426,6 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE mailbox_task_approvals ADD COLUMN {column_name} {column_type}"
             )
 
-<<<<<<< HEAD
     # Idempotency keys (#378): a redelivered message must map back to its
     # original task. Rows from before the key existed get the key their
     # message would derive today (``modules/mailbox/task_ingest.py``), so a
@@ -456,9 +452,6 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
         "ON mailbox_task_approvals(idempotency_key)"
     )
 
-    # Backfill: create pending_approval records for any task messages that
-    # don't already have one.
-=======
     # The approval step is gone (#264). An approved task was only waiting for
     # the worker, which now takes queued ones. Old pending_approval and
     # rejected rows stay as they are: readable, never run.
@@ -468,7 +461,6 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
 
     # Backfill: create task records for any task messages that don't already
     # have one. A task whose body was not stored is not handed to Nexus.
->>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
     import uuid
     from datetime import datetime, timezone
 
@@ -501,20 +493,12 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO mailbox_task_approvals
                 (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-<<<<<<< HEAD
-                 status, idempotency_key, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?)
+                 status, error, idempotency_key, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(idempotency_key) DO NOTHING
             """,
             (approval_id, msg_id, task_body, created_by or "", file_path or "",
-             received_at or now, f"mailbox-msg:{msg_id}", now, now),
-=======
-                 status, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (approval_id, msg_id, task_body, created_by or "", file_path or "",
-             received_at or now, status, error, now, now),
->>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
+             received_at or now, status, error, f"mailbox-msg:{msg_id}", now, now),
         )
 
     # Rows created before the structured constraint, and the orphans above,

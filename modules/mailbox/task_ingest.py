@@ -70,7 +70,7 @@ def insert_task_approval(
         """INSERT INTO mailbox_task_approvals
            (id, mailbox_msg_id, task_body, sender, file_path, received_at,
             status, idempotency_key, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
            ON CONFLICT(idempotency_key) DO NOTHING""",
         (approval_id, mailbox_msg_id, task_body or "", sender, file_path,
          received_at, key, now, now),

@@ -100,12 +100,9 @@ class MailboxTaskApproval:
         "received_at", "status", "approved_at", "rejected_at",
         "rejection_reason", "experiment_id", "outbox_file",
         "publish_status", "publish_commit_sha", "result_summary", "error",
-<<<<<<< HEAD
-        "idempotency_key", "created_at", "updated_at",
-=======
+        "idempotency_key",
         "merge_forbidden", "merge_constraint_reason",
         "created_at", "updated_at",
->>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
     )
 
     def __init__(self, **kwargs: Any) -> None:
@@ -386,7 +383,6 @@ class MailboxTaskService:
         unchanged, so it is approved and dispatched at most once.
         """
         with self._lock:
-<<<<<<< HEAD
             approval_id, created = insert_task_approval(
                 self._conn,
                 mailbox_msg_id=mailbox_msg_id,
@@ -396,55 +392,22 @@ class MailboxTaskService:
                 received_at=received_at,
                 idempotency_key=idempotency_key,
             )
+            if created:
+                record_merge_constraint(self._conn, approval_id, task_body)
+                self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
         if created:
             self._task_logger(approval_id).info(
                 "mailbox", "task_received",
-                "mailbox task received, pending approval",
+                "mailbox task received, handed to Nexus",
             )
         else:
             self._task_logger(approval_id).info(
                 "mailbox", "task_duplicate_delivery",
                 "mailbox task delivered again, returning the original task",
             )
-=======
-            existing = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
-                (mailbox_msg_id,),
-            ).fetchone()
-            if existing is not None:
-                return _row_to_approval(existing)
-            approval_id = uuid.uuid4().hex
-            now = _now_iso()
-            self._conn.execute(
-                """INSERT INTO mailbox_task_approvals
-                   (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-                    status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    approval_id,
-                    mailbox_msg_id,
-                    task_body or "",
-                    sender,
-                    file_path,
-                    received_at,
-                    _STATUS_QUEUED,
-                    now,
-                    now,
-                ),
-            )
-            record_merge_constraint(self._conn, approval_id, task_body)
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
-            ).fetchone()
-        self._task_logger(approval_id).info(
-            "mailbox", "task_received",
-            "mailbox task received, handed to Nexus",
-        )
->>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
         return _row_to_approval(row)
 
     def get(self, approval_id: str) -> MailboxTaskApproval:

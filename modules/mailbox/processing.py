@@ -101,15 +101,11 @@ def _process_task(
     conn: sqlite3.Connection,
     db_msg_id: int,
 ) -> tuple[str, None]:
-<<<<<<< HEAD
-    """Record task request and create pending approval."""
+    """Record the task request; the task worker hands it straight to Nexus (#264)."""
     explicit_key = msg.meta.get("idempotency_key") or None
     # A malformed key fails the message visibly instead of being swallowed
     # by the best-effort approval insert below.
     resolve_idempotency_key(db_msg_id, explicit_key)
-=======
-    """Record the task request; the task worker hands it straight to Nexus (#264)."""
->>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
     try:
         conn.execute(
             "UPDATE mailbox_messages SET task_body = ? WHERE id = ?",
@@ -127,7 +123,6 @@ def _process_task(
             (db_msg_id,),
         ).fetchone()
         if not existing:
-<<<<<<< HEAD
             # An optional front-matter ``idempotency_key`` lets a sender
             # redeliver the same task as a new file without a second task
             # (#378); otherwise the key is derived from this inbox row.
@@ -145,24 +140,11 @@ def _process_task(
                     "_process_task: msg %s is a duplicate delivery of task %s",
                     db_msg_id, approval_id,
                 )
-=======
-            import uuid as _uuid
-            from modules.run_store.schema import record_merge_constraint
+            else:
+                from modules.run_store.schema import record_merge_constraint
 
-            now = _now_iso()
-            approval_id = _uuid.uuid4().hex
-            conn.execute(
-                """
-                INSERT INTO mailbox_task_approvals
-                    (id, mailbox_msg_id, task_body, sender, file_path,
-                     received_at, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
-                """,
-                (approval_id, db_msg_id, msg.body, msg.created_by, str(msg.file_path), now, now, now),
-            )
-            record_merge_constraint(conn, approval_id, msg.body)
-            conn.commit()
->>>>>>> 00e9ed684f0055aa1385450bc4b4841559bfaac4
+                record_merge_constraint(conn, approval_id, msg.body)
+                conn.commit()
     except Exception:
         logger.warning("_process_task: failed to create task record for msg %s", db_msg_id, exc_info=True)
 

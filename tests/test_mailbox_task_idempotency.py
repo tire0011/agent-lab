@@ -51,11 +51,9 @@ def _task_count(db_path: str) -> int:
 
 
 def _dispatch_all(svc) -> None:
-    """Approve every pending task and drain the queue more often than needed."""
-    for approval in svc.list_pending(limit=200):
-        svc.approve(approval.id)
-    for _ in range(3):
-        svc.submit_approved()
+    """Drain the direct-to-Nexus queue more often than needed."""
+    for _ in range(10):
+        svc.submit_queued()
     svc._wait_for_failure_analyses(timeout=5)
 
 
@@ -72,8 +70,8 @@ def svc(tmp_path):
 def test_sequential_redelivery_returns_original_task_and_dispatches_once(svc):
     msg_id = _insert_msg(svc.db_path)
 
-    first = svc.create_approval(msg_id, "Do work", "alice", "/f.md", _RECEIVED)
-    again = [svc.create_approval(msg_id, "Do work", "alice", "/f.md", _RECEIVED) for _ in range(4)]
+    first = svc.create_task(msg_id, "Do work", "alice", "/f.md", _RECEIVED)
+    again = [svc.create_task(msg_id, "Do work", "alice", "/f.md", _RECEIVED) for _ in range(4)]
 
     assert {a.id for a in again} == {first.id}
     assert first.idempotency_key == f"mailbox-msg:{msg_id}"
@@ -81,7 +79,7 @@ def test_sequential_redelivery_returns_original_task_and_dispatches_once(svc):
 
     _dispatch_all(svc)
     # A delivery after dispatch still returns the original, now-submitted task.
-    late = svc.create_approval(msg_id, "Do work", "alice", "/f.md", _RECEIVED)
+    late = svc.create_task(msg_id, "Do work", "alice", "/f.md", _RECEIVED)
     _dispatch_all(svc)
 
     assert late.id == first.id
@@ -94,8 +92,8 @@ def test_explicit_key_deduplicates_across_source_messages(svc):
     msg_a = _insert_msg(svc.db_path, "/agent/inbox/a.md")
     msg_b = _insert_msg(svc.db_path, "/agent/inbox/b.md")
 
-    a = svc.create_approval(msg_a, "Do work", "alice", "/a.md", _RECEIVED, idempotency_key="req-1")
-    b = svc.create_approval(msg_b, "Do work", "alice", "/b.md", _RECEIVED, idempotency_key="req-1")
+    a = svc.create_task(msg_a, "Do work", "alice", "/a.md", _RECEIVED, idempotency_key="req-1")
+    b = svc.create_task(msg_b, "Do work", "alice", "/b.md", _RECEIVED, idempotency_key="req-1")
 
     assert a.id == b.id
     assert a.idempotency_key == "client:req-1"
@@ -113,7 +111,7 @@ def test_concurrent_deliveries_through_one_service_create_and_dispatch_once(svc)
         try:
             barrier.wait()
             results.append(
-                svc.create_approval(msg_id, "Do work", "alice", "/f.md", _RECEIVED).id
+                svc.create_task(msg_id, "Do work", "alice", "/f.md", _RECEIVED).id
             )
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
@@ -175,9 +173,9 @@ def test_distinct_keys_with_identical_text_create_separate_tasks(svc):
     msg_a = _insert_msg(svc.db_path, "/agent/inbox/a.md")
     msg_b = _insert_msg(svc.db_path, "/agent/inbox/b.md")
 
-    a = svc.create_approval(msg_a, "Same text", "alice", "/a.md", _RECEIVED)
-    b = svc.create_approval(msg_b, "Same text", "alice", "/b.md", _RECEIVED)
-    c = svc.create_approval(msg_b, "Same text", "alice", "/b.md", _RECEIVED, idempotency_key="other")
+    a = svc.create_task(msg_a, "Same text", "alice", "/a.md", _RECEIVED)
+    b = svc.create_task(msg_b, "Same text", "alice", "/b.md", _RECEIVED)
+    c = svc.create_task(msg_b, "Same text", "alice", "/b.md", _RECEIVED, idempotency_key="other")
 
     assert len({a.id, b.id, c.id}) == 3
     assert _task_count(svc.db_path) == 3
@@ -189,7 +187,7 @@ def test_distinct_keys_with_identical_text_create_separate_tasks(svc):
 def test_malformed_explicit_key_is_rejected(svc, bad_key):
     msg_id = _insert_msg(svc.db_path)
     with pytest.raises(ValueError):
-        svc.create_approval(msg_id, "Do work", "alice", "/f.md", _RECEIVED, idempotency_key=bad_key)
+        svc.create_task(msg_id, "Do work", "alice", "/f.md", _RECEIVED, idempotency_key=bad_key)
     assert _task_count(svc.db_path) == 0
 
 
