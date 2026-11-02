@@ -26,6 +26,33 @@ from modules.task_orchestrator import (
 # the initiative tick must wait for them before it exits (#358).
 EXPERIMENT_THREAD_PREFIX = "nexus-controller-exp-"
 
+GOAL_CHAR_CAP = 24000
+GOAL_TITLE_CAP = 200
+GOAL_TRUNCATION_MARKER = "\n\n[... earlier text truncated ...]\n\n"
+
+
+def _normalise_input(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _drop_repeated_inputs(inputs: list[str]) -> list[str]:
+    """Drop inputs whose normalised text a later input equals or starts with."""
+    normalised = [_normalise_input(item) for item in inputs]
+    return [
+        item
+        for index, item in enumerate(inputs)
+        if not any(
+            later.startswith(normalised[index]) for later in normalised[index + 1:]
+        )
+    ]
+
+
+def _keep_title_and_tail(goal: str, first_input: str) -> str:
+    """Cut an over-long goal from the front: the newest text is at the end."""
+    title = first_input.splitlines()[0][:GOAL_TITLE_CAP]
+    head = title + GOAL_TRUNCATION_MARKER
+    return head + goal[-(GOAL_CHAR_CAP - len(head)):]
+
 
 class NexusControllerService:
     """Feed heterogeneous work into one persistent local-LLM controller.
@@ -179,19 +206,26 @@ class NexusControllerService:
         user_inputs = [item for item in user_inputs if item]
         if not user_inputs:
             return fallback
-        goal = "\n\nUser follow-up:\n".join(user_inputs)
-        if len(goal) <= 24000:
+        # #495: a retried issue stores the whole body again, so an input that a
+        # later input repeats (or starts with) adds nothing but tokens.
+        kept = _drop_repeated_inputs(user_inputs)
+        dropped = len(user_inputs) - len(kept)
+        goal = "\n\nUser follow-up:\n".join(kept)
+        if len(goal) <= GOAL_CHAR_CAP:
             return goal
         try:
             self.orchestrator.task_store.append_event(
                 session_id,
                 role="tool",
                 kind="goal_truncated",
-                content=f"Execution goal truncated from {len(goal)} to 24000 characters.",
+                content=(
+                    f"Execution goal truncated from {len(goal)} to {GOAL_CHAR_CAP} "
+                    f"characters; {dropped} duplicate input(s) dropped."
+                ),
             )
         except Exception:
             pass
-        return goal[:24000]
+        return _keep_title_and_tail(goal, kept[0])
 
     def _execute(
         self,
