@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -219,9 +220,50 @@ def _read_command(argv: list[str], *, as_json: bool = False) -> Any:
 
 
 def _validate_limit(limit: int, *, minimum: int, maximum: int) -> int:
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        raise ValueError(f"invalid limit: must be an integer between {minimum} and {maximum}")
     if limit < minimum or limit > maximum:
         raise ValueError(f"invalid limit: must be between {minimum} and {maximum}")
     return limit
+
+
+def _github_issue(number: int) -> dict[str, Any]:
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        raise ValueError("invalid issue number: must be a positive integer")
+    return _read_command(
+        [
+            "gh", "issue", "view", str(number), "--json",
+            "number,title,state,labels,body,closedAt,comments",
+        ],
+        as_json=True,
+    )
+
+
+def _github_issues(state: str = "open", limit: int = 50, body_chars: int = 300) -> dict[str, Any]:
+    if state not in ("open", "closed", "all"):
+        raise ValueError("invalid state: must be open, closed or all")
+    limit = _validate_limit(limit, minimum=1, maximum=200)
+    body_chars = _validate_limit(body_chars, minimum=0, maximum=5000)
+    raw_issues = _read_command(
+        [
+            "gh", "issue", "list", "--state", state, "--limit", str(limit),
+            "--json", "number,title,state,labels,body,closedAt",
+        ],
+        as_json=True,
+    )
+    issues = []
+    for raw_issue in raw_issues:
+        issue = dict(raw_issue)
+        body = issue.get("body") or ""
+        if body_chars == 0:
+            issue.pop("body", None)
+            if body:
+                issue["body_truncated"] = True
+        elif len(body) > body_chars:
+            issue["body"] = body[:body_chars]
+            issue["body_truncated"] = True
+        issues.append(issue)
+    return {"issues": issues}
 
 
 @dataclass
@@ -270,8 +312,9 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         return _call_api(_api().status)
 
     @mcp.tool(description="GET /problems", structured_output=True)
-    def problems() -> dict[str, Any]:
-        return _call_api(_api().problems)
+    def problems(limit: int = 20, since: str | None = None) -> dict[str, Any]:
+        parsed_since = datetime.fromisoformat(since.replace("Z", "+00:00")) if since else None
+        return _call_api(_api().problems, limit=limit, since=parsed_since)
 
     @mcp.tool(description="GET /ideas", structured_output=True)
     def ideas() -> dict[str, Any]:
@@ -347,6 +390,15 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             limit=limit,
             service=nexus_api._resolve_experiment_service(),
         )
+
+    @mcp.tool(
+        description="Re-check rejected and quality-review experiments against current gates (read-only).",
+        structured_output=True,
+    )
+    def experiments_gate_recheck() -> dict[str, Any]:
+        from modules.experiment_service.gate_recheck import gate_recheck
+
+        return {"experiments": gate_recheck(_api()._resolve_experiment_service())}
 
     @mcp.tool(description="GET /experiments/{experiment_id}", structured_output=True)
     def experiment_get(experiment_id: str) -> dict[str, Any]:
@@ -489,20 +541,20 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
 
     @mcp.tool(
         description=(
-            "GitHub issues of the Nexus repository: number, title, state, labels, body. "
-            "state is 'open', 'closed' or 'all'; limit 1-200."
+            "GitHub issues of the Nexus repository with body previews. state is 'open', "
+            "'closed' or 'all'; limit 1-200; body_chars 0-5000 (0 omits bodies)."
         ),
         structured_output=True,
     )
-    def github_issues(state: str = "open", limit: int = 50) -> dict[str, Any]:
-        if state not in ("open", "closed", "all"):
-            raise ValueError("invalid state: must be open, closed or all")
-        limit = _validate_limit(limit, minimum=1, maximum=200)
-        return {"issues": _read_command(
-            ["gh", "issue", "list", "--state", state, "--limit", str(limit),
-             "--json", "number,title,state,labels,body,closedAt"],
-            as_json=True,
-        )}
+    def github_issues(state: str = "open", limit: int = 50, body_chars: int = 300) -> dict[str, Any]:
+        return _github_issues(state=state, limit=limit, body_chars=body_chars)
+
+    @mcp.tool(
+        description="One GitHub issue of the Nexus repository, including its full body and comments.",
+        structured_output=True,
+    )
+    def github_issue(number: int) -> dict[str, Any]:
+        return _github_issue(number)
 
     @mcp.tool(description="Recent commits of the Nexus repository (git log); limit 1-200.", structured_output=True)
     def git_log(limit: int = 30) -> dict[str, Any]:

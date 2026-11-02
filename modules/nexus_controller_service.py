@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from modules.experiment_handover import with_handover
+from modules.experiment_service import ExperimentAlreadyActiveError
 from modules.experiment_wait import resume_after_experiment, run_then_resume
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
@@ -61,15 +62,15 @@ class NexusControllerService:
     def repo_root(self) -> Path:
         return Path(getattr(self.orchestrator.operations_registry, "repo_root", "/agent"))
 
-    def handle_source(self, source: NexusSource) -> TaskDecision:
+    def handle_source(self, source: NexusSource) -> TaskDecision | dict[str, str]:
         decision = self.orchestrator.run(
             source.content,
             source_type=source.source_type,
             source_id=source.source_id,
             title=source.title,
         )
-        self._execute(decision, source.content, source=source)
-        return decision
+        execution_result = self._execute(decision, source.content, source=source)
+        return execution_result or decision
 
     def handle_task(
         self,
@@ -77,10 +78,10 @@ class NexusControllerService:
         *,
         source_id: str | None = None,
         title: str | None = None,
-    ) -> TaskDecision:
+    ) -> TaskDecision | dict[str, str]:
         return self.handle_source(task_source(content, source_id=source_id, title=title))
 
-    def handle_idea(self, idea_id: str) -> TaskDecision:
+    def handle_idea(self, idea_id: str) -> TaskDecision | dict[str, str]:
         return self.handle_source(idea_source(idea_id))
 
     def handle_issue(
@@ -91,7 +92,7 @@ class NexusControllerService:
         body: str,
         state: str | None = None,
         url: str | None = None,
-    ) -> TaskDecision:
+    ) -> TaskDecision | dict[str, str]:
         return self.handle_source(
             issue_source(
                 issue_number,
@@ -102,10 +103,12 @@ class NexusControllerService:
             )
         )
 
-    def reply(self, session_id: str, message: str) -> TaskDecision:
+    def reply(self, session_id: str, message: str) -> TaskDecision | dict[str, str]:
         decision = self.orchestrator.continue_session(session_id, message)
-        self._execute(decision, self._execution_goal(session_id, message))
-        return decision
+        execution_result = self._execute(
+            decision, self._execution_goal(session_id, message)
+        )
+        return execution_result or decision
 
     def resume_available_capabilities(self, *, limit: int = 1) -> list[TaskDecision]:
         """Continue blocked sessions when their required capability is now present."""
@@ -166,22 +169,29 @@ class NexusControllerService:
         history/memory but are not copied verbatim into an implementation goal.
         """
         try:
-            history = self.orchestrator.task_store.history(
-                session_id,
-                limit=50,
-                max_chars=20000,
-            )
+            stored_inputs = self.orchestrator.task_store.user_inputs(session_id)
         except Exception:
             return fallback
         user_inputs = [
-            str(event.get("content", "")).strip()
-            for event in history
-            if event.get("role") == "user" and event.get("kind") == "input"
+            str(content).strip()
+            for content in stored_inputs
         ]
         user_inputs = [item for item in user_inputs if item]
         if not user_inputs:
             return fallback
-        return "\n\nUser follow-up:\n".join(user_inputs)[:24000]
+        goal = "\n\nUser follow-up:\n".join(user_inputs)
+        if len(goal) <= 24000:
+            return goal
+        try:
+            self.orchestrator.task_store.append_event(
+                session_id,
+                role="tool",
+                kind="goal_truncated",
+                content=f"Execution goal truncated from {len(goal)} to 24000 characters.",
+            )
+        except Exception:
+            pass
+        return goal[:24000]
 
     def _execute(
         self,
@@ -189,7 +199,7 @@ class NexusControllerService:
         source_content: str,
         *,
         source: NexusSource | None = None,
-    ) -> None:
+    ) -> dict[str, str] | None:
         if decision.action == ACTION_NEW_EXPERIMENT:
             lifecycle_source = source or task_source(
                 source_content,
@@ -204,9 +214,21 @@ class NexusControllerService:
                 )
                 raise
 
-            experiment = self.experiment_service.create_experiment(
-                with_handover(source_content, decision.experiment_handover)
-            )
+            try:
+                experiment = self.experiment_service.create_experiment(
+                    with_handover(source_content, decision.experiment_handover)
+                )
+            except ExperimentAlreadyActiveError as exc:
+                self._record_execution(
+                    decision,
+                    "already_active",
+                    f"experiment_id={exc.experiment_id} status={exc.status}",
+                )
+                return {
+                    "status": "already_active",
+                    "experiment_id": exc.experiment_id,
+                    "experiment_status": exc.status,
+                }
             work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
             self._record_execution(
                 decision,

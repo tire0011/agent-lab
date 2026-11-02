@@ -3,8 +3,8 @@
 No new persistent storage is introduced here. Problems and ideas are derived
 from files that already exist in the repository/runtime state:
 
-- Problems: error entries already logged by agent.py under state/runs/*.json
-  (any run whose "response" starts with "ERROR:").
+- Problems: failed/rejected experiments in the SQLite experiment store plus
+  legacy error entries logged by agent.py under state/runs/*.json.
 - Ideas: entries under "## Ideas" in IDEAS.md, each an open-ended thought
   rather than a task; an optional trailing `` `state` `` marker (one of
   new/exploring/selected/tested/adopted/rejected) is parsed if present and
@@ -26,14 +26,18 @@ import fcntl
 import json
 import os
 import re
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from models import Idea, Problem
+from modules.run_store import DEFAULT_DB_PATH
 
 REPO_ROOT = Path(__file__).resolve().parent
 
 RUNS_DIR = Path(os.environ.get("AGENT_RUNS_DIR", str(REPO_ROOT / "state" / "runs")))
 IDEAS_PATH = Path(os.environ.get("AGENT_IDEAS_PATH", str(REPO_ROOT / "IDEAS.md")))
+EXPERIMENT_DB_PATH = Path(DEFAULT_DB_PATH)
 
 _IDEA_ITEM_RE = re.compile(
     r"^-\s+(?P<text>.+?)(?:\s+`(?P<state>new|exploring|selected|tested|adopted|rejected)`)?$",
@@ -56,22 +60,111 @@ class InvalidIdeaTextError(ValueError):
     """Raised when submitted idea text fails validation/sanitization."""
 
 
-def list_problems() -> list[Problem]:
-    """Return currently known problems derived from failed run logs.
+_PROBLEM_EXPERIMENT_STATUSES = frozenset(
+    {"failed", "timed_out", "rejected", "needs_review"}
+)
+_ISSUE_GOAL_RE = re.compile(r"^GitHub Issue #(\d+):")
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip() or value == "unknown":
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _experiment_problems(db_path: Path) -> list[Problem]:
+    """Read problem experiments without creating or migrating the store."""
+    if not db_path.is_file():
+        return []
+    try:
+        uri = f"file:{db_path.resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(experiments)").fetchall()
+            }
+            required = {"id", "goal", "status", "created_at", "ended_at", "error"}
+            if not required.issubset(columns):
+                return []
+            optional = [name for name in ("failure_phase", "failure_type") if name in columns]
+            selected = [*sorted(required), *optional]
+            rows = conn.execute(
+                f"SELECT {', '.join(selected)} FROM experiments "
+                "ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+
+    later_success_by_issue: set[int] = set()
+    problems: list[Problem] = []
+    for row in rows:
+        match = _ISSUE_GOAL_RE.match(row["goal"] or "")
+        issue_number = int(match.group(1)) if match else None
+        if row["status"] == "succeeded":
+            if issue_number is not None:
+                later_success_by_issue.add(issue_number)
+            continue
+        if row["status"] not in _PROBLEM_EXPERIMENT_STATUSES:
+            continue
+        if issue_number is not None and issue_number in later_success_by_issue:
+            continue
+        detail = (row["error"] or "").strip()
+        timestamp = row["ended_at"] or row["created_at"] or "unknown"
+        problems.append(
+            Problem(
+                id=row["id"],
+                source="experiment",
+                issue_number=issue_number,
+                summary=detail[:200] if detail else "Unknown error",
+                detail=detail,
+                timestamp=timestamp,
+                failure_phase=row["failure_phase"] if "failure_phase" in row.keys() else None,
+                failure_type=row["failure_type"] if "failure_type" in row.keys() else None,
+            )
+        )
+    return problems
+
+
+def list_problems(
+    limit: int = 20,
+    since: str | datetime | None = None,
+    *,
+    experiment_db_path: str | Path | None = None,
+) -> list[Problem]:
+    """Return recent experiment and legacy run-log problems, newest first.
 
     Read errors (missing directory, unreadable/corrupt files) are treated as
     "no problems found" rather than raised, since this is a best-effort,
     read-only view over operational logs.
     """
-    problems: list[Problem] = []
+    if limit <= 0:
+        return []
+    since_timestamp = _parse_timestamp(
+        since.isoformat() if isinstance(since, datetime) else since
+    )
+    if since is not None and since_timestamp is None:
+        raise ValueError("since must be an ISO timestamp")
+
+    db_path = (
+        Path(experiment_db_path)
+        if experiment_db_path is not None
+        else EXPERIMENT_DB_PATH
+    )
+    problems: list[Problem] = _experiment_problems(db_path)
 
     if not RUNS_DIR.exists() or not RUNS_DIR.is_dir():
-        return problems
-
-    try:
-        run_files = sorted(RUNS_DIR.glob("*.json"))
-    except OSError:
-        return problems
+        run_files: list[Path] = []
+    else:
+        try:
+            run_files = list(RUNS_DIR.glob("*.json"))
+        except OSError:
+            run_files = []
 
     for run_file in run_files:
         try:
@@ -97,7 +190,19 @@ def list_problems() -> list[Problem]:
             )
         )
 
-    return problems
+    problems.sort(
+        key=lambda problem: _parse_timestamp(problem.timestamp)
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    if since_timestamp is not None:
+        problems = [
+            problem
+            for problem in problems
+            if (timestamp := _parse_timestamp(problem.timestamp)) is not None
+            and timestamp >= since_timestamp
+        ]
+    return problems[:limit]
 
 
 def list_ideas() -> list[Idea]:

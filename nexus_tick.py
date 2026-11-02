@@ -21,7 +21,8 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime, timedelta, timezone
 
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
@@ -41,6 +42,48 @@ _PLANNER_STALL_SECONDS = 300
 _events: list[str] = []
 # How often the stall sweep (#400) runs while the tick waits for its experiment.
 _STALL_SWEEP_INTERVAL_SECONDS = 5 * 60
+
+
+def _service_diagnostics() -> dict:
+    url = os.environ.get(
+        "NEXUS_DIAGNOSTICS_URL", "http://127.0.0.1:8000/diagnostics/public"
+    )
+    with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - fixed/operator URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _restart_stale_service() -> None:
+    from modules.task_finalization import TaskFinalizationCoordinator
+
+    TaskFinalizationCoordinator._restart_services(
+        TaskFinalizationCoordinator._restart_service_names()
+    )
+
+
+def _checkout_revision(repo_root: str) -> str:
+    """Read the revision of the checkout executing this initiative tick."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _main_commit_date(repo_root: str) -> str:
+    """Read the date of the newest commit on the local ``origin/main`` ref."""
+    proc = subprocess.run(
+        ["git", "log", "-1", "--format=%cI", "origin/main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
@@ -114,6 +157,41 @@ def _count_open_proposals(repo_root: str) -> int:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
     return len(json.loads(proc.stdout or "[]"))
+
+
+def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[dict[str, str]]:
+    """Proposals the owner closed lately, with the closing comment as the reason.
+
+    A rejected proposal keeps its label; its last comment says why. The
+    planner sees these so it does not suggest the same thing again.
+    """
+    from modules.nexus_planner import PROPOSAL_LABEL
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    proc = subprocess.run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/issues?state=closed&labels={PROPOSAL_LABEL}"
+         f"&since={since}&per_page={limit}"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+    decisions = []
+    for issue in json.loads(proc.stdout or "[]")[:limit]:
+        if issue.get("state_reason") == "completed":
+            decisions.append({"title": str(issue.get("title") or ""), "reason": "implemented"})
+            continue
+        comments = subprocess.run(
+            ["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{issue['number']}/comments?per_page=100"],
+            cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+        )
+        bodies = json.loads(comments.stdout or "[]") if comments.returncode == 0 else []
+        reason = str(bodies[-1].get("body") or "") if bodies else ""
+        reason = reason.split("\n---\n", 1)[0]
+        decisions.append({
+            "title": str(issue.get("title") or ""),
+            "reason": " ".join(reason.split())[:400] or f"closed ({issue.get('state_reason') or 'no reason'})",
+        })
+    return decisions
 
 
 def _explore_with_claude(repo_root: str, prompt: str) -> str:
@@ -207,6 +285,11 @@ def _build_service(args) -> NexusInitiativeService:
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
+        decision_lister=lambda: _owner_decisions(args.repo_root),
+        diagnostics_client=_service_diagnostics,
+        checkout_revision=lambda: _checkout_revision(args.repo_root),
+        main_commit_date=lambda: _main_commit_date(args.repo_root),
+        restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
 
@@ -378,6 +461,12 @@ def main(argv: list[str] | None = None) -> int:
     # included.
     if not args.dry_run:
         _reconcile_stale_claims(args.db_path)
+        from modules.main_guard import guard_main
+
+        reverted = guard_main(args.repo_root)
+        if reverted:
+            logger.warning("main guard: %s", reverted)
+            _events.append(reverted)
 
     service = _build_service(args)
     if not args.dry_run:
@@ -407,7 +496,7 @@ def main(argv: list[str] | None = None) -> int:
             if busy:
                 logger.info("would do nothing: %s", busy)
                 return 0
-            candidates = service.candidates()
+            candidates = service.candidates(record_skips=False)
             if not candidates:
                 logger.info("would do nothing: no actionable work")
                 return 0

@@ -125,12 +125,15 @@ PROGRESS_SOURCE_LOG = "log_entry"
 PROGRESS_SOURCE_ROW = "updated_at"
 
 _TASK_LIFECYCLE: dict[str, str] = {
+    "queued": LIFECYCLE_QUEUED,
+    # Legacy states of the removed approval step (#264), kept readable.
     "pending_approval": LIFECYCLE_WAITING,
     "approved": LIFECYCLE_QUEUED,
     "submitted": LIFECYCLE_QUEUED,
     "running": LIFECYCLE_RUNNING,
     "nexus_deciding": LIFECYCLE_RUNNING,
     "needs_review": LIFECYCLE_NEEDS_REVIEW,
+    "ready_for_review": LIFECYCLE_NEEDS_REVIEW,
     "succeeded": LIFECYCLE_SUCCEEDED,
     "failed": LIFECYCLE_FAILED,
     "rejected": LIFECYCLE_REJECTED,
@@ -154,6 +157,7 @@ _ADOPTION_LIFECYCLE: dict[str, str] = {
     "adopting": LIFECYCLE_RUNNING,
     "adopted": LIFECYCLE_MERGED,
     "needs_review": LIFECYCLE_NEEDS_REVIEW,
+    "ready_for_review": LIFECYCLE_NEEDS_REVIEW,
     "failed": LIFECYCLE_FAILED,
     "interrupted": LIFECYCLE_ABANDONED,
 }

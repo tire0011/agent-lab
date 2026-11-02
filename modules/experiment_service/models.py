@@ -9,6 +9,10 @@ from typing import Any
 # Status constants — small deterministic state machine.
 # ---------------------------------------------------------------------------
 
+# Start of the error of a run the pipeline itself crashed in. Nexus reads it to
+# tell such a run from a judged attempt (#467).
+PIPELINE_CRASH_ERROR_PREFIX = "unhandled exception in experiment pipeline: "
+
 STATUS_QUEUED = "queued"
 STATUS_SELECTING = "selecting"
 STATUS_REJECTED = "rejected"
@@ -59,6 +63,17 @@ _STATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
 
 class ExperimentNotFoundError(LookupError):
     """Raised when an experiment id does not exist in the store."""
+
+
+class ExperimentAlreadyActiveError(RuntimeError):
+    """Raised when an issue already has a non-terminal experiment."""
+
+    def __init__(self, experiment_id: str, status: str) -> None:
+        self.experiment_id = experiment_id
+        self.status = status
+        super().__init__(
+            f"experiment {experiment_id!r} is already active (status={status!r})"
+        )
 
 
 class ExperimentNotRunnableError(RuntimeError):

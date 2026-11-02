@@ -120,6 +120,9 @@ class CodexWorker:
     db_path:
         Optional path to the SQLite run store for audit entries.
         Pass ``None`` to skip audit logging.
+    model:
+        Optional model override. When unset, the CLI's own configured model
+        is used.
     """
 
     #: Provider name recorded on every result this worker produces.
@@ -130,10 +133,12 @@ class CodexWorker:
         codex_bin: str = _DEFAULT_CODEX_BIN,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
         db_path: str | None = None,
+        model: str | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.max_output_bytes = max_output_bytes
         self._db_path = db_path
+        self.model = model
 
     # ------------------------------------------------------------------
     # Public API
@@ -326,6 +331,8 @@ class CodexWorker:
             "--json",
             "-C", working_dir,
         ]
+        if self.model:
+            cmd += ["--model", self.model]
         if skip_git_repo_check:
             cmd.append("--skip-git-repo-check")
         # --approve-for-me is only compatible with workspace-write, and the

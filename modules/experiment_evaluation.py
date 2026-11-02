@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -196,6 +197,28 @@ def parse_git_status_short(git_status_text: str | None) -> ChangedFiles:
 _GOAL_PATH_RE = re.compile(r"\b[\w][\w-]*(?:/[\w.-]+)+\.[A-Za-z0-9]{1,8}\b")
 
 
+# A section heading at the start of a line: "Change:", "**Change**", "## Change".
+_SECTION_HEADING_RE = re.compile(
+    r"^[ \t]*(?:#+[ \t]*|\*\*)?(problem|change|changes|test|tests|why|context|background|notes?)\b"
+    r"(?:\*\*|[ \t]*:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _change_section(task: str) -> str:
+    """The Change section of an issue that has sections, else the whole text.
+
+    Problem and Test sections name files that already exist or test fixtures
+    (#416: example paths made #403 and #416 fail their own gate).
+    """
+    headings = list(_SECTION_HEADING_RE.finditer(task))
+    for index, heading in enumerate(headings):
+        if heading.group(1).lower() in ("change", "changes"):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(task)
+            return task[heading.start():end]
+    return task
+
+
 def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     # Only the task itself names files to create. The handover appended to it
     # (#263) quotes whatever Nexus looked at - file listings, command output -
@@ -203,14 +226,33 @@ def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
 
     task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+    task = _change_section(task)
     found: list[str] = []
     for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
-        if is_test_path(path) or is_ignored_support_path(path):
+        if match.start() > 0 and task[match.start() - 1] == ".":
+            # "\b" starts the match after a leading dot: ".git/hooks/x" would
+            # become "git/hooks/x". Dot paths are never artifacts (#403).
+            continue
+        if path.startswith("git/"):
+            # The same paths quoted from gate output, already without the dot;
+            # the repository has no git/ directory (#403).
+            continue
+        if is_test_path(path) or is_ignored_support_path(path) or _is_placeholder_path(path):
             continue
         if path not in found:
             found.append(path)
     return found[:10]
+
+
+# Example names in an issue ("modules/a.py", "new_thing.py") are not files
+# the change must create (#433, #455).
+_PLACEHOLDER_STEMS = frozenset({"foo", "bar", "baz", "example", "new_thing", "some_file", "my_module"})
+
+
+def _is_placeholder_path(path: str) -> bool:
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    return len(stem) == 1 or stem in _PLACEHOLDER_STEMS
 
 
 # ---------------------------------------------------------------------------
@@ -536,3 +578,62 @@ def evaluate_implementation(
         changed_files=all_changed,
         missing_artifacts=missing_artifacts,
     )
+
+
+# ---------------------------------------------------------------------------
+# Compact history view of a stored evaluation error (#444)
+# ---------------------------------------------------------------------------
+
+_ERROR_PREFIX = "quality evaluation: "
+_MISSING_ARTIFACT_RE = re.compile(r"erforderliches Artefakt (.+) fehlt")
+_MAX_EXAMPLE_PATHS = 3
+_MAX_PATH_GROUPS = 3
+
+
+def _cut_at_word(text: str, limit: int) -> str:
+    """``text`` within ``limit`` characters, cut at a word boundary if it must be."""
+    if len(text) <= limit:
+        return text
+    head, space, _ = text[:limit].rpartition(" ")
+    # A single word longer than the limit has no boundary to land on.
+    return (head.rstrip(" ;,") if space else text[: limit - 1]) + "…"
+
+
+def summarize_error(error: str, limit: int = 200) -> str:
+    """``error`` in one line of at most ``limit`` characters.
+
+    The quality evaluation repeats "erforderliches Artefakt <path> fehlt" for
+    every path, so a plain cut hides how many artifacts failed and which kinds.
+    Those items become a total, a count per repeated top-level directory and a
+    few examples, each from a different directory first: one real gap must stay
+    visible beside dozens of ``git/`` false positives. Its other reasons are
+    separate failures and are kept. An error that fits needs no summary.
+    """
+    text = " ".join(str(error or "").split())
+    if len(text) <= limit:
+        return text
+
+    items = [item.strip() for item in text.removeprefix(_ERROR_PREFIX).split(";")]
+    matches = [_MISSING_ARTIFACT_RE.fullmatch(item) for item in items]
+    paths = list(dict.fromkeys(match.group(1) for match in matches if match))
+    if len(paths) < 2:
+        return _cut_at_word(text, limit)
+
+    first_in_dir: dict[str, str] = {}
+    for path in paths:
+        first_in_dir.setdefault(path.split("/", 1)[0], path)
+    examples = list(dict.fromkeys([*first_in_dir.values(), *paths]))
+
+    dirs = Counter(path.split("/", 1)[0] for path in paths if "/" in path)
+    groups = ", ".join(f"{name}/: {n}" for name, n in dirs.most_common(_MAX_PATH_GROUPS) if n > 1)
+    head = f"{_ERROR_PREFIX}{len(paths)} required artifacts missing" + (f" ({groups})" if groups else "")
+    others = "".join(f"; {item}" for item, match in zip(items, matches) if item and not match)
+
+    # Long paths give way before the counts and the other reasons do.
+    for shown in range(min(_MAX_EXAMPLE_PATHS, len(paths)), 0, -1):
+        rest = len(paths) - shown
+        more = f" (+{rest} more)" if rest else ""
+        summary = f"{head}, e.g. {', '.join(examples[:shown])}{more}{others}"
+        if len(summary) <= limit:
+            return summary
+    return _cut_at_word(f"{head}{others}", limit)

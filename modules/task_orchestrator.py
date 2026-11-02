@@ -27,6 +27,7 @@ from modules.local_llm_jobs import (
     LocalLlmJobError,
     LocalLlmJobService,
     acquire_local_llm_job_service,
+    local_llm_watchdog_seconds,
     release_local_llm_job_service,
 )
 from modules.escalation_probes import (
@@ -415,9 +416,7 @@ class NexusTaskOrchestrator:
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
-        job_watchdog = float(os.environ.get("NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS", "3600"))
-        job_watchdog = max(300.0, min(job_watchdog, 7200.0))
-        self.llama = llama_client or LlamaCppClient(timeout=job_watchdog)
+        self.llama = llama_client or LlamaCppClient(timeout=local_llm_watchdog_seconds())
         self.max_steps = max(1, min(max_steps, 10))
         db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
         self.loop_guard = PersistentToolLoopGuard(
@@ -1339,7 +1338,26 @@ class NexusTaskOrchestrator:
             experiment_id = decision.get("experiment_id")
             if action == ACTION_RESUME_EXPERIMENT:
                 if not experiment_id:
-                    raise TaskOrchestratorError("resume_experiment requires experiment_id")
+                    # The controller sometimes leaves the id out. Tell it, and let
+                    # it decide again, instead of failing the whole task.
+                    rejection = {
+                        "event": "terminal_decision_rejected",
+                        "terminal_action": ACTION_RESUME_EXPERIMENT,
+                        "reason": (
+                            "resume_experiment needs experiment_id. Name the experiment "
+                            "this task started, or choose new_experiment."
+                        ),
+                        "retryable": True,
+                    }
+                    rejection["event_id"] = self.task_store.append_event(
+                        session.id,
+                        role="system",
+                        kind="terminal_decision_rejected",
+                        content=json.dumps(rejection, separators=(",", ":")),
+                        metadata={"controller_action": action},
+                    )
+                    observations.append(rejection)
+                    continue
                 try:
                     experiment_id = self.experiment_service.resolve_experiment(str(experiment_id)).id
                 except Exception as exc:
@@ -1654,9 +1672,12 @@ class NexusTaskOrchestrator:
         except LocalLlmJobError as exc:
             failure = str(exc)[:1000]
             logger.error(
-                "%s_local_inference_failed session_id=%s error=%s; attempting external fallback",
+                "%s_local_inference_failed session_id=%s error_kind=%s job_id=%s error=%s; "
+                "attempting external fallback",
                 role,
                 session_id,
+                exc.kind,
+                job_id,
                 failure,
             )
             if task_logger is not None:
@@ -1665,6 +1686,8 @@ class NexusTaskOrchestrator:
                     f"{role}_local_inference_failed",
                     failure,
                     session_id=session_id,
+                    error_kind=exc.kind,
+                    job_id=job_id,
                 )
             if budget_plan is None:
                 raise TaskOrchestratorError(f"local LLM job failed: {failure}") from exc
@@ -3313,9 +3336,8 @@ Decide the next step now. Return JSON only.
             action=ACTION_MISSING_CAPABILITY,
             reason=reason,
             message=(
-                "Nexus could not take this controller turn: local inference "
-                "failed and no external provider is available. This needs "
-                "human review before retrying."
+                f"Nexus could not take this controller turn: {reason}. "
+                "This needs human review before retrying."
             ),
             observations=observations,
             session_id=session_id,
@@ -3650,7 +3672,12 @@ Decide the next step now. Return JSON only.
         context: str = "",
         reason: str = "",
     ) -> dict[str, Any]:
-        available = {item["provider"] for item in self.delegation.catalog()}
+        catalog = [item["provider"] for item in self.delegation.catalog()]
+        available = set(catalog)
+        if not provider and catalog:
+            # The controller sometimes leaves the provider out: take the local
+            # worker (it routes judgement to a stronger model) or the first one.
+            provider = "local_worker" if "local_worker" in available else catalog[0]
         if provider not in available:
             raise TaskOrchestratorError(f"delegation provider {provider!r} is not available")
 
