@@ -91,9 +91,9 @@ planned repository file — never an empty list.
 
 "change_kind" must be exactly one of: "implementation" (default for any
 ordinary feature/fix/refactoring change), "tests_only" (ONLY if the goal
-above explicitly and exclusively asks for a tests-only change with no
-production-code modification — never choose this for a refactoring or
-feature request), "documentation", or "analysis". "required_artifacts"
+above explicitly and exclusively asks for a tests-only change, or names
+only test-file paths, with no production-code modification — never choose
+this for a refactoring or feature request), "documentation", or "analysis". "required_artifacts"
 must be a list of the concrete new or modified non-test file paths that
 must exist once the change is implemented (may be empty only for
 "analysis"). "acceptance_criteria" must be a non-empty list of short,
@@ -204,7 +204,8 @@ which must be a non-empty list of strings naming at least one existing or
 planned repository file — never an empty list.
 
 "change_kind" must be exactly one of: "implementation", "tests_only" (ONLY
-if the goal explicitly and exclusively asks for a tests-only change),
+if the goal explicitly and exclusively asks for a tests-only change or
+names only test-file paths, with no production-code modification),
 "documentation", or "analysis". "required_artifacts" must list the
 concrete new or modified non-test file paths that must exist once
 implemented. "acceptance_criteria" must be a non-empty list of short,
