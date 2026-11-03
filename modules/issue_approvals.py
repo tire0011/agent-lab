@@ -7,11 +7,13 @@ persistent authorization state; Nexus = autonomous planning and execution of
 approved issues only.**
 
 An issue is executable only when this registry holds an ``approved`` row for
-its ``(repository, issue_number)`` whose ``content_hash`` matches the issue's
-current title+body. Anything else - no row (pending), ``revoked``,
-``rejected``, a repository/issue mismatch, a corrupted row, or edited issue
-content - fails closed. Approvals are recorded exclusively through structured
-``issue_approval`` mailbox messages from the trusted private mailbox (see
+its ``(repository, issue_number)``. For issues whose author is not a trusted
+account the ``content_hash`` must also match the issue's current title+body
+(a stranger could edit their own issue after approval). Anything else - no
+row (pending), ``revoked``, ``rejected``, a repository/issue mismatch, a
+corrupted row, or (for untrusted authors) edited issue content - fails closed.
+Approvals are recorded exclusively through structured ``issue_approval``
+mailbox messages from the trusted private mailbox (see
 ``modules/mailbox/processing.py``); issue text, comments, labels and PRs can
 never create or modify an approval.
 """
@@ -229,13 +231,18 @@ def check_execution(
     issue_number: Any,
     title: Any,
     body: Any,
+    skip_content_hash: bool = False,
 ) -> ExecutionVerdict:
     """May Nexus start new work on this issue right now?
 
     Fails closed on every anomaly: no row (pending), revoked/rejected,
-    unknown repository or issue number, corrupted status or hash, or a
-    content hash that no longer matches the approved one (the issue was
-    edited and needs renewed approval).
+    unknown repository or issue number, corrupted status or hash, or -
+    unless ``skip_content_hash`` is set - a content hash that no longer
+    matches the approved one (the issue was edited and needs renewed
+    approval). The hash check is skipped only for issues whose author is a
+    trusted actor: a stranger could edit their own issue after approval,
+    while a trusted author's edit (e.g. a typo fix) must not invalidate it.
+    The approval itself is required in every case.
     """
     repo = normalize_repository(repository)
     try:
@@ -266,13 +273,14 @@ def check_execution(
         return ExecutionVerdict(
             False, f"corrupted approval record for {repo}#{number} (bad content hash)", approval
         )
-    current_hash = issue_content_hash(title, body)
-    if current_hash != approval.content_hash:
-        return ExecutionVerdict(
-            False,
-            f"issue {repo}#{number} content changed since approval "
-            f"(approved {approval.content_hash[:12]}, now {current_hash[:12]}); "
-            "renewed approval required",
-            approval,
-        )
+    if not skip_content_hash:
+        current_hash = issue_content_hash(title, body)
+        if current_hash != approval.content_hash:
+            return ExecutionVerdict(
+                False,
+                f"issue {repo}#{number} content changed since approval "
+                f"(approved {approval.content_hash[:12]}, now {current_hash[:12]}); "
+                "renewed approval required",
+                approval,
+            )
     return ExecutionVerdict(True, f"issue {repo}#{number} approved at {approval.decided_at}", approval)

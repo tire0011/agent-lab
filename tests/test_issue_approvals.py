@@ -48,8 +48,11 @@ from tests.test_nexus_initiative import TEST_REPOSITORY, InitiativeFixture
 REPO = TEST_REPOSITORY  # "tire0011/agent-lab"
 
 
-def _issue(number: int, title: str = "work", body: str = "") -> dict:
-    return {"number": number, "title": title, "body": body, "labels": []}
+def _issue(number: int, title: str = "work", body: str = "", author: str | None = None) -> dict:
+    issue = {"number": number, "title": title, "body": body, "labels": []}
+    if author is not None:
+        issue["author"] = {"login": author}
+    return issue
 
 
 def _approve(conn, number: int, title: str, body: str, *, repository: str = REPO,
@@ -564,6 +567,64 @@ class InitiativeApprovalGateTests(unittest.TestCase):
                             experiment_service=SimpleNamespace(cancel_experiment=cancel))
         self.assertEqual(svc.enforce_issue_approvals(), [])
         cancel.assert_not_called()
+
+    def test_trusted_author_edited_after_approval_still_runs(self):
+        # A trusted author fixing a typo must not invalidate the approval:
+        # the content-hash check does not apply to trusted authors.
+        issue = _issue(550, "Title", "original body", author=OWNER)
+        self._approve(issue)
+        edited = _issue(550, "Title", "original body (typo fixed)", author=OWNER)
+        svc = self._service([edited])
+        decision = svc.tick()
+        self.assertTrue(decision.acted)
+        self.assertEqual(self.controller.issues, [550])
+
+    def test_untrusted_author_edited_after_approval_is_blocked(self):
+        issue = _issue(551, "Title", "original body", author=ATTACKER)
+        self._approve(issue)
+        edited = _issue(551, "Title", "edited by the stranger", author=ATTACKER)
+        svc = self._service([edited])
+        self.assertEqual(svc.candidates(), [])
+        decision = svc.tick()
+        self.assertFalse(decision.acted)
+        self.assertEqual(self.controller.issues, [])
+        skips = [e for e in svc.history() if e["decision"] == DECISION_SKIPPED_UNAPPROVED_ISSUE]
+        self.assertIn("changed", skips[0]["detail"])
+
+    def test_missing_author_edited_after_approval_is_blocked(self):
+        # No API-verified author -> fail closed: hash check stays active.
+        issue = _issue(552, "Title", "original body")
+        self._approve(issue)
+        edited = _issue(552, "Title", "edited, author unknown")
+        svc = self._service([edited])
+        self.assertEqual(svc.candidates(), [])
+        svc.tick()
+        self.assertEqual(self.controller.issues, [])
+
+    def test_trusted_author_without_approval_is_blocked(self):
+        # The approval itself is always required; only the hash check is
+        # skipped for trusted authors.
+        issue = _issue(553, "Title", "body", author=OWNER)
+        svc = self._service([issue])
+        self.assertEqual(svc.candidates(), [])
+        svc.tick()
+        self.assertEqual(self.controller.issues, [])
+        skips = [e for e in svc.history() if e["decision"] == DECISION_SKIPPED_UNAPPROVED_ISSUE]
+        self.assertIn("pending", skips[0]["detail"])
+
+    def test_trusted_author_revoked_is_blocked(self):
+        issue = _issue(554, "Title", "body", author=OWNER)
+        self._approve(issue)
+        conn = sqlite3.connect(self.fx.db_path)
+        with conn:
+            issue_approvals.record_decision(
+                conn, repository=REPO, issue_number=554, status="revoked"
+            )
+        conn.close()
+        svc = self._service([issue])
+        self.assertEqual(svc.candidates(), [])
+        svc.tick()
+        self.assertEqual(self.controller.issues, [])
 
     def test_forged_approval_claims_in_issue_text_do_not_help(self):
         issue = _issue(

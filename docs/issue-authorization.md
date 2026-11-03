@@ -38,7 +38,8 @@ channel                                                                         
 
 1. **Candidate scan** (`NexusInitiativeService._issue_candidates`): every open
    issue is checked with `issue_approvals.check_execution` (status must be
-   `approved` and the content hash must match the current title+body).
+   `approved`; for issues from authors that are not trusted accounts, the
+   content hash must also still match the current title+body - see below).
    Failures are logged and recorded as `skipped_unapproved_issue`; only
    eligible issues reach the planner, which prioritizes independently.
 2. **Dispatch boundary** (`NexusInitiativeService.tick`): the chosen issue is
@@ -94,9 +95,15 @@ created_by: chatgpt
   experiments on that issue at the next tick.
 - Duplicate messages are idempotent (same decision + hash + source message =
   no change).
-- Editing the issue title or body invalidates the approval: the content hash
-  no longer matches, the issue becomes pending again and needs renewed
-  approval.
+- Editing the issue title or body invalidates the approval **for issues from
+  authors that are not trusted accounts**: the content hash no longer matches,
+  the issue becomes pending again and needs renewed approval. The hash check
+  exists because a stranger could edit their own issue after approval (e.g.
+  swap in malicious instructions). For issues from trusted authors (the repo
+  owner / `NEXUS_TRUSTED_ACTORS`) the hash check is skipped, so a harmless
+  edit like a typo fix does not invalidate the approval. The approval itself
+  is required in every case, and `revoked`/`rejected`/pending/corrupted
+  records block for everyone.
 - No shell execution is involved; the message is structured front matter, not
   a natural-language command.
 

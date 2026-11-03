@@ -45,9 +45,10 @@ at once and outside the budget.
   Nexus treats only paths in the Change section as files it must create.
   The public repo is discovery and discussion only: Nexus lists all open
   issues, but **only issues explicitly approved through the private mailbox**
-  are eligible for autonomous execution (approval is bound to the issue's
-  title+body hash; editing an issue requires renewed approval). Approve or
-  revoke with a structured `issue_approval` mailbox message - see
+  are eligible for autonomous execution (for issues from untrusted authors the
+  approval is additionally bound to the issue's title+body hash, so editing
+  such an issue requires renewed approval). Approve or revoke with a
+  structured `issue_approval` mailbox message - see
   `docs/issue-authorization.md`. Unapproved issues are recorded as
   `skipped_unapproved_issue` and never start experiments.
 - **Review its ideas:** proposals carry the `proposal` label and are not worked

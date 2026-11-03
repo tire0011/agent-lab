@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modules import github_authorization
 from modules import issue_approvals
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
@@ -501,12 +502,19 @@ class NexusInitiativeService:
                 continue
             raw_title = str(issue.get("title") or f"Issue #{number}")
             raw_body = str(issue.get("body") or "")
+            # A trusted author may edit their issue after approval (typo
+            # fixes must not invalidate it), so the content-hash check only
+            # applies to everyone else. Missing author -> fail closed (hash
+            # check stays active).
+            author_login = github_authorization.api_actor_login(issue.get("author"))
+            author_trusted = github_authorization.is_trusted_actor(author_login)
             verdict = issue_approvals.check_execution(
                 self._conn,
                 repository=self._repository,
                 issue_number=int(number),
                 title=raw_title,
                 body=raw_body,
+                skip_content_hash=author_trusted,
             )
             if not verdict.allowed:
                 if record_skips and str(number) not in unapproved_skips:
@@ -536,6 +544,7 @@ class NexusInitiativeService:
                     "body": raw_body[:16000],
                     "raw_title": raw_title,
                     "raw_body": raw_body,
+                    "author_trusted": author_trusted,
                 },
             )
             if self._fails_goal_policy(candidate, skipped, policy_hash, record=record_skips):
@@ -568,6 +577,7 @@ class NexusInitiativeService:
             issue_number=int(candidate.ref),
             title=str(candidate.payload.get("raw_title") or candidate.title),
             body=str(candidate.payload.get("raw_body") or candidate.payload.get("body") or ""),
+            skip_content_hash=bool(candidate.payload.get("author_trusted")),
         )
 
     def enforce_issue_approvals(self) -> list[str]:

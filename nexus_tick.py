@@ -103,7 +103,9 @@ def _list_open_issues(repo_root: str) -> list[dict]:
                 "gh", "issue", "list",
                 "--state", "open",
                 "--limit", str(_ISSUE_LIMIT),
-                "--json", "number,title,body,labels",
+                # ``author`` decides whether the content-hash check applies
+                # (trusted authors may edit their issue after approval).
+                "--json", "number,title,body,labels,author",
             ],
             cwd=repo_root,
             capture_output=True,
