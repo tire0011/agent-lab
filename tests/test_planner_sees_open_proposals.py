@@ -9,14 +9,14 @@ from tests.test_nexus_initiative import InitiativeFixture
 class PlannerSeesOpenProposalsTest(unittest.TestCase):
     def test_prompt_lists_open_proposals(self):
         prompt = planning_prompt(
-            [{"number": 1, "title": "Something", "body": ""}],
+            [{"number": 1, "author": {"login": "tire0011"}, "title": "Something", "body": ""}],
             proposals=["Retry merges current main into the issue branch"],
         )
         self.assertIn("YOUR OPEN PROPOSALS", prompt)
         self.assertIn("Retry merges current main into the issue branch", prompt)
 
     def test_no_section_without_proposals(self):
-        self.assertNotIn("YOUR OPEN PROPOSALS", planning_prompt([{"number": 1, "title": "x", "body": ""}]))
+        self.assertNotIn("YOUR OPEN PROPOSALS", planning_prompt([{"number": 1, "author": {"login": "tire0011"}, "title": "x", "body": ""}]))
 
     def test_initiative_passes_proposal_titles_to_the_planner(self):
         seen = {}
@@ -28,8 +28,8 @@ class PlannerSeesOpenProposalsTest(unittest.TestCase):
 
         fx = InitiativeFixture()
         issues = [
-            {"number": 1, "title": "Work", "body": ""},
-            {"number": 2, "title": "My idea", "body": "", "labels": [{"name": "proposal"}]},
+            {"number": 1, "author": {"login": "tire0011"}, "title": "Work", "body": ""},
+            {"number": 2, "author": {"login": "tire0011"}, "title": "My idea", "body": "", "labels": [{"name": "proposal"}]},
         ]
         svc = fx.service(issue_lister=lambda: issues, planner=Planner())
         self.addCleanup(svc.close)

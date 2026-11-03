@@ -33,7 +33,7 @@ def _make_repo(tmp: Path) -> Path:
     """Create a minimal git repo at *tmp*."""
     subprocess.run(["git", "init", str(tmp)], check=True, capture_output=True)
     subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
+        ["git", "config", "user.email", "49699333+tire0011@users.noreply.github.com"],
         cwd=str(tmp),
         check=True,
         capture_output=True,
@@ -81,6 +81,11 @@ def _make_repo_with_remote(tmp: Path) -> tuple[Path, Path]:
 def _make_inbox_file(inbox: Path, name: str, content: str) -> Path:
     f = inbox / name
     f.write_text(content, encoding="utf-8")
+    # Inbox files arrive as commits (the webhook only fires for pushes); the
+    # authorization gate checks the commit author, so commit as the owner.
+    repo = inbox.parent
+    subprocess.run(["git", "add", f"inbox/{name}"], cwd=str(repo), check=False, capture_output=True)
+    subprocess.run(["git", "commit", "-m", f"add inbox {name}"], cwd=str(repo), check=False, capture_output=True)
     return f
 
 

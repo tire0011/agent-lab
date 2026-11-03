@@ -24,6 +24,7 @@ import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from modules import github_authorization
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
 from modules.nexus_task_store import NexusTaskStore
@@ -102,7 +103,9 @@ def _list_open_issues(repo_root: str) -> list[dict]:
                 "gh", "issue", "list",
                 "--state", "open",
                 "--limit", str(_ISSUE_LIMIT),
-                "--json", "number,title,body,labels",
+                # ``author`` decides whether the content-hash check applies
+                # (trusted authors may edit their issue after approval).
+                "--json", "number,title,body,labels,author",
             ],
             cwd=repo_root,
             capture_output=True,
@@ -185,7 +188,13 @@ def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[di
             cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
         )
         bodies = json.loads(comments.stdout or "[]") if comments.returncode == 0 else []
-        reason = str(bodies[-1].get("body") or "") if bodies else ""
+        # Only comments whose API-verified author is a trusted actor count as
+        # the owner's decision; comment text itself is never trusted.
+        trusted_bodies = [
+            c for c in bodies
+            if isinstance(c, dict) and github_authorization.classify_comment(c).trusted
+        ]
+        reason = str(trusted_bodies[-1].get("body") or "") if trusted_bodies else ""
         reason = reason.split("\n---\n", 1)[0]
         decisions.append({
             "title": str(issue.get("title") or ""),

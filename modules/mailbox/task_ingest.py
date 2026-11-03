@@ -23,6 +23,11 @@ from datetime import datetime, timezone
 
 # Must match the backfill in ``modules/run_store/schema.py``.
 DERIVED_KEY_PREFIX = "mailbox-msg:"
+# A task from a verified trusted sender goes straight to Nexus; anything else
+# waits for owner approval and is never run by the worker.
+_STATUS_QUEUED = "queued"
+_STATUS_PENDING_APPROVAL = "pending_approval"
+_ALLOWED_STATUSES = frozenset({_STATUS_QUEUED, _STATUS_PENDING_APPROVAL})
 EXPLICIT_KEY_PREFIX = "client:"
 MAX_EXPLICIT_KEY_LENGTH = 200
 _EXPLICIT_KEY_RE = re.compile(r"^[\x21-\x7e]+$")
@@ -55,6 +60,7 @@ def insert_task_approval(
     file_path: str,
     received_at: str,
     idempotency_key: str | None = None,
+    status: str = _STATUS_QUEUED,
 ) -> tuple[str, bool]:
     """Create the pending task for a message, or find the one it already created.
 
@@ -63,12 +69,16 @@ def insert_task_approval(
     or processes - cannot both create a task: the unique index lets exactly
     one insert through and every other caller reads that winner back.
 
-    The task's no-merge constraint (#185) is recorded in the same
+    ``status`` is ``queued`` only for senders the authorization gate verified as
+    trusted; untrusted senders get ``pending_approval``, which the worker never
+    runs. The task's no-merge constraint (#185) is recorded in the same
     transaction: a queued task is never visible to the worker without it,
     and if recording it fails the task is rolled back with it.
     """
     from modules.run_store.schema import record_merge_constraint
 
+    if status not in _ALLOWED_STATUSES:
+        raise ValueError(f"unknown task approval status {status!r}")
     key = resolve_idempotency_key(mailbox_msg_id, idempotency_key)
     approval_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -77,10 +87,10 @@ def insert_task_approval(
             """INSERT INTO mailbox_task_approvals
                (id, mailbox_msg_id, task_body, sender, file_path, received_at,
                 status, idempotency_key, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(idempotency_key) DO NOTHING""",
             (approval_id, mailbox_msg_id, task_body or "", sender, file_path,
-             received_at, key, now, now),
+             received_at, status, key, now, now),
         ).rowcount
         if inserted:
             record_merge_constraint(conn, approval_id, task_body)
