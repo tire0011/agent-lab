@@ -255,6 +255,8 @@ class NexusInitiativeService:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._ensure_schema()
+        # The owner sets the budget by mailbox; the command line is the default.
+        self.daily_budget = max(0, self._budget_setting(self.daily_budget))
 
     def close(self) -> None:
         self._conn.close()
@@ -352,6 +354,16 @@ class NexusInitiativeService:
             if abandoned:
                 found.append({"table": table, "count": abandoned})
         return found
+
+    def _budget_setting(self, default: int) -> int:
+        """The daily budget set through a mailbox `setting` message, else *default*."""
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM service_settings WHERE key = 'nexus.daily_budget'"
+            ).fetchone()
+            return int(row[0]) if row else default
+        except (sqlite3.Error, ValueError, TypeError):
+            return default
 
     def _spent_today(self) -> int:
         since = (_utcnow() - timedelta(days=1)).isoformat()
