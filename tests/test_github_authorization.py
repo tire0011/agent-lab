@@ -125,11 +125,13 @@ def _make_mailbox_repo(root: Path, email: str = OWNER_EMAIL) -> Path:
     repo = root / "mailbox"
     repo.mkdir()
     _git(repo, "init")
-    _git(repo, "config", "user.email", email=email)
-    _git(repo, "config", "user.name", email=email)
+    # Local identity (positional value!) so commits work on CI runners that
+    # have no global git config; per-commit authors still use the -c override.
+    _git(repo, "config", "user.email", email)
+    _git(repo, "config", "user.name", "Test")
     (repo / "README.md").write_text("# mailbox\n")
     _git(repo, "add", "README.md")
-    _git(repo, "commit", "-m", "init")
+    _git(repo, "commit", "-m", "init", email=email)
     (repo / "inbox").mkdir()
     (repo / "outbox").mkdir()
     return repo
