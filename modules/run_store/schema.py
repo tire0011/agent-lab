@@ -267,6 +267,21 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS issue_approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repository TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
+            source_mailbox_msg_id INTEGER,
+            decided_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(repository, issue_number)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_issue_approvals_lookup
+            ON issue_approvals(repository, issue_number);
         """
     )
     _migrate_experiments_columns(conn)

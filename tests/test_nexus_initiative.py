@@ -49,6 +49,31 @@ class RecordingController:
         self.ideas.append(idea_id)
 
 
+TEST_REPOSITORY = "tire0011/agent-lab"
+
+
+def approve_issue(
+    db_path: str, issue: dict, *, repository: str = TEST_REPOSITORY, status: str = "approved"
+) -> None:
+    """Seed the approval registry for one issue dict (title/body hash bound)."""
+    from modules import issue_approvals
+
+    conn = sqlite3.connect(db_path)
+    try:
+        issue_approvals.ensure_issue_approvals_table(conn)
+        issue_approvals.record_decision(
+            conn,
+            repository=repository,
+            issue_number=int(issue["number"]),
+            status=status,
+            content_hash=issue_approvals.issue_content_hash(
+                str(issue.get("title") or ""), str(issue.get("body") or "")
+            ),
+        )
+    finally:
+        conn.close()
+
+
 class InitiativeFixture:
     def __init__(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="nexus-initiative-")
@@ -106,6 +131,19 @@ class InitiativeFixture:
 
     def service(self, **kwargs) -> NexusInitiativeService:
         kwargs.setdefault("idea_lister", lambda: [])
+        kwargs.setdefault("repository", TEST_REPOSITORY)
+        lister = kwargs.get("issue_lister")
+        if lister is not None:
+            # Simulate approved issues: seed the approval registry (bound to
+            # each issue's content hash) the first time the lister runs.
+            def seeded_lister():
+                issues = lister() or []
+                for issue in issues:
+                    if issue.get("number") is not None:
+                        approve_issue(self.db_path, issue)
+                return issues
+
+            kwargs["issue_lister"] = seeded_lister
         return NexusInitiativeService(
             db_path=self.db_path,
             experiment_service=SimpleNamespace(),
@@ -756,6 +794,7 @@ class PipelineCrashAttemptsTests(unittest.TestCase):
         self._attempt("c2", error=self.CRASH)
 
     def _service(self, main_commit_date):
+        approve_issue(self.db_path, dict(self.ISSUE))
         svc = NexusInitiativeService(
             db_path=self.db_path,
             experiment_service=SimpleNamespace(),
@@ -765,6 +804,7 @@ class PipelineCrashAttemptsTests(unittest.TestCase):
             issue_commenter=lambda number, text: self.comments.append((number, text)),
             main_commit_date=main_commit_date,
             daily_budget=5,
+            repository=TEST_REPOSITORY,
         )
         self.addCleanup(svc.close)
         return svc

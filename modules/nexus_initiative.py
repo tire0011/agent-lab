@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from modules import github_authorization
+from modules import issue_approvals
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
@@ -89,11 +89,10 @@ DECISION_SKIPPED_ATTEMPTS_EXHAUSTED = "skipped_attempts_exhausted"
 # An issue the goal policy rejects is not sent (#408): the experiment would be
 # rejected before any work, at the cost of a tick and a budget slot.
 DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
-# An issue whose API-verified author is not a trusted actor is never dispatched
-# on its own text: it needs an explicit owner approval (a verified label event).
-DECISION_SKIPPED_UNTRUSTED_AUTHOR = "skipped_untrusted_author"
-# Bound the approval lookups (one GitHub call each) per candidate scan.
-_MAX_APPROVAL_CHECKS_PER_SCAN = 10
+# An issue without a valid approval in the registry (modules.issue_approvals)
+# is never dispatched: pending, revoked, content-changed and corrupted records
+# all land here. Approvals come only from the trusted private mailbox.
+DECISION_SKIPPED_UNAPPROVED_ISSUE = "skipped_unapproved_issue"
 # Reasons only _check_goal_policy produces. A rejection with one of them is
 # known in advance from the goal text, so retrying the same text is pointless.
 _GOAL_POLICY_REASON_PREFIXES = tuple(
@@ -222,8 +221,7 @@ class NexusInitiativeService:
         checkout_revision: Callable[[], str] | None = None,
         restart_hook: Callable[[], None] | None = None,
         main_commit_date: Callable[[], str] | None = None,
-        trusted_actors: frozenset[str] | None = None,
-        issue_approver: Callable[[int], bool] | None = None,
+        repository: str | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -241,14 +239,13 @@ class NexusInitiativeService:
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
-        # External-content authorization: only these actors' GitHub items may
-        # trigger execution without an explicit approval (see
-        # modules.github_authorization).
-        self._trusted_actors = (
-            trusted_actors if trusted_actors is not None else github_authorization.trusted_actors()
+        # Issue execution authorization: the repository whose issues this
+        # service may execute, checked against the persistent approval
+        # registry (modules.issue_approvals) at candidate scan and again at
+        # the dispatch boundary.
+        self._repository = issue_approvals.normalize_repository(
+            repository if repository is not None else os.environ.get("GITHUB_REPOSITORY")
         )
-        self._issue_approver = issue_approver
-        self._approval_checks = 0
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues: list[dict[str, Any]] = []
@@ -271,6 +268,7 @@ class NexusInitiativeService:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._ensure_schema()
+        issue_approvals.ensure_issue_approvals_table(self._conn)
         # The owner sets the budget by mailbox; the command line is the default.
         self.daily_budget = max(0, self._budget_setting(self.daily_budget))
 
@@ -485,8 +483,7 @@ class NexusInitiativeService:
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues = []
-        self._approval_checks = 0
-        untrusted_skips = self._untrusted_author_skips()
+        unapproved_skips = self._unapproved_issue_skips()
         for issue in issues:
             number = issue.get("number")
             labels = {
@@ -498,99 +495,130 @@ class NexusInitiativeService:
                 self._open_proposals += 1
                 self._open_proposal_titles.append(str(issue.get("title") or ""))
                 continue
-            if number is not None and not self._authorized_to_run(
-                issue, int(number), record=record_skips, already_recorded=str(number) in untrusted_skips
-            ):
-                continue
             if number is None or int(number) in linked:
                 if number is not None and int(number) in exhausted:
                     self._note_exhausted(issue, exhausted[int(number)], reported, record=record_skips)
                 continue
+            raw_title = str(issue.get("title") or f"Issue #{number}")
+            raw_body = str(issue.get("body") or "")
+            verdict = issue_approvals.check_execution(
+                self._conn,
+                repository=self._repository,
+                issue_number=int(number),
+                title=raw_title,
+                body=raw_body,
+            )
+            if not verdict.allowed:
+                if record_skips and str(number) not in unapproved_skips:
+                    self._record(
+                        InitiativeDecision(
+                            DECISION_SKIPPED_UNAPPROVED_ISSUE,
+                            candidate=Candidate(KIND_ISSUE, str(number), raw_title[:200], verdict.reason),
+                            detail=verdict.reason,
+                            tick_id=uuid.uuid4().hex,
+                        )
+                    )
+                logger.info("initiative: issue #%s not eligible: %s", number, verdict.reason)
+                continue
             candidate = Candidate(
                 kind=KIND_ISSUE,
                 ref=str(number),
-                title=str(issue.get("title") or f"Issue #{number}")[:200],
+                title=raw_title[:200],
                 reason=(
                     REVIEW_RETRY_REASON if int(number) in review_blocked
-                    else "open issue with no experiment working on it"
+                    else "approved open issue with no experiment working on it"
                 ),
-                payload={"body": str(issue.get("body") or "")[:16000]},
+                # The raw title/body are the validated snapshot: the dispatch
+                # boundary re-checks them and the worker receives exactly this
+                # content, so an edit between validation and execution cannot
+                # change what runs.
+                payload={
+                    "body": raw_body[:16000],
+                    "raw_title": raw_title,
+                    "raw_body": raw_body,
+                },
             )
             if self._fails_goal_policy(candidate, skipped, policy_hash, record=record_skips):
                 continue
             candidates.append(candidate)
         return candidates
 
-    def _untrusted_author_skips(self) -> set[str]:
-        """Issue refs already recorded as skipped for an untrusted author."""
+    def _unapproved_issue_skips(self) -> set[str]:
+        """Issue refs already recorded as skipped for missing/invalid approval."""
         try:
             rows = self._conn.execute(
                 "SELECT source_ref FROM nexus_initiative_log WHERE decision = ?",
-                (DECISION_SKIPPED_UNTRUSTED_AUTHOR,),
+                (DECISION_SKIPPED_UNAPPROVED_ISSUE,),
             ).fetchall()
         except sqlite3.OperationalError:
             return set()
         return {str(row["source_ref"]) for row in rows}
 
-    def _authorized_to_run(
-        self,
-        issue: dict[str, Any],
-        number: int,
-        *,
-        record: bool,
-        already_recorded: bool,
-    ) -> bool:
-        """The external-authorization gate for one issue.
+    def _execution_allowed(self, candidate: Candidate) -> issue_approvals.ExecutionVerdict:
+        """The centralized execution boundary check for one issue candidate.
 
-        The verdict comes from the API ``author.login`` field only; issue text
-        (title, body, embedded "approved by ..." claims) is never consulted.
-        An untrusted issue may still run when the owner explicitly approved it
-        through ``issue_approver`` (a verified label event).
+        Re-runs the registry check against the validated snapshot (raw
+        title/body captured when the issue was listed this tick), so a
+        revocation or content change between candidate scan and dispatch
+        cannot slip through.
         """
-        verdict = github_authorization.classify_issue(issue, trusted=self._trusted_actors)
-        if verdict.trusted:
-            return True
-        if self._owner_approved(number):
-            logger.info(
-                "initiative: issue #%s by untrusted author %s runs with owner approval",
-                number, verdict.actor,
-            )
-            return True
-        logger.info(
-            "initiative: issue #%s skipped: author %s is not trusted and no owner approval exists",
-            number, verdict.actor,
+        return issue_approvals.check_execution(
+            self._conn,
+            repository=self._repository,
+            issue_number=int(candidate.ref),
+            title=str(candidate.payload.get("raw_title") or candidate.title),
+            body=str(candidate.payload.get("raw_body") or candidate.payload.get("body") or ""),
         )
-        if record and not already_recorded:
-            self._record(
-                InitiativeDecision(
-                    DECISION_SKIPPED_UNTRUSTED_AUTHOR,
-                    candidate=Candidate(
-                        KIND_ISSUE, str(number),
-                        str(issue.get("title") or f"Issue #{number}")[:200],
-                        "issue author is not a trusted actor",
-                    ),
-                    detail=json.dumps({"actor": verdict.actor, "detail": verdict.detail}),
-                    tick_id=uuid.uuid4().hex,
-                )
-            )
-        return False
 
-    def _owner_approved(self, number: int) -> bool:
-        """Ask the configured approver whether the owner approved this issue.
+    def enforce_issue_approvals(self) -> list[str]:
+        """Cancel running experiments whose issue approval was revoked/rejected.
 
-        Bounded per scan so a backlog of untrusted issues cannot turn into one
-        GitHub call per issue per tick; a lookup failure fails closed.
+        Safe cancellation: only an explicit ``revoked``/``rejected`` record
+        stops running work. A missing record (pending) never does, so legacy
+        in-flight experiments and retries keep working; a content change only
+        blocks new starts. Returns the cancelled experiment ids.
         """
-        if self._issue_approver is None:
-            return False
-        if self._approval_checks >= _MAX_APPROVAL_CHECKS_PER_SCAN:
-            return False
-        self._approval_checks += 1
+        if not self._repository:
+            return []
         try:
-            return bool(self._issue_approver(number))
-        except Exception as exc:  # noqa: BLE001 - fail closed, keep scanning
-            logger.warning("initiative: approval lookup for issue #%s failed: %s", number, exc)
-            return False
+            rows = self._conn.execute(
+                """
+                SELECT l.experiment_id AS experiment_id, l.issue_number AS issue_number
+                FROM github_experiment_links l
+                JOIN experiments e ON e.id = l.experiment_id
+                WHERE e.status NOT IN ('rejected', 'succeeded', 'failed', 'timed_out',
+                                       'needs_review', 'cancelled', 'interrupted')
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        cancel = getattr(self.experiment_service, "cancel_experiment", None)
+        cancelled: list[str] = []
+        for row in rows:
+            try:
+                number = int(row["issue_number"])
+            except (TypeError, ValueError):
+                continue
+            approval = issue_approvals.get_approval(self._conn, self._repository, number)
+            if approval is None or approval.status not in (
+                issue_approvals.STATUS_REVOKED, issue_approvals.STATUS_REJECTED
+            ):
+                continue
+            experiment_id = str(row["experiment_id"])
+            logger.warning(
+                "initiative: issue #%s approval is %s; cancelling experiment %s",
+                number, approval.status, experiment_id,
+            )
+            if callable(cancel):
+                try:
+                    cancel(experiment_id, f"issue_approval_{approval.status}")
+                    cancelled.append(experiment_id)
+                except Exception as exc:  # noqa: BLE001 - one failure must not stop the sweep
+                    logger.warning(
+                        "initiative: could not cancel experiment %s for revoked issue #%s: %s",
+                        experiment_id, number, exc,
+                    )
+        return cancelled
 
     def _review_blocked_issues(self) -> set[int]:
         """Issues whose latest attempt was stopped by the reviewer (#396)."""
@@ -1119,6 +1147,7 @@ class NexusInitiativeService:
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
         self._sweep_stalled_experiments()
+        self.enforce_issue_approvals()
         busy = self.busy_reason()
         if busy is not None:
             return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
@@ -1158,6 +1187,25 @@ class NexusInitiativeService:
             )
 
         chosen = found[0]
+        # Centralized execution boundary: even though candidates were checked
+        # when listed, re-verify at dispatch time so nothing unapproved is
+        # ever handed to the controller.
+        if chosen.kind == KIND_ISSUE:
+            verdict = self._execution_allowed(chosen)
+            if not verdict.allowed:
+                logger.info(
+                    "initiative: dispatch of issue #%s blocked at the boundary: %s",
+                    chosen.ref, verdict.reason,
+                )
+                return self._record(
+                    InitiativeDecision(
+                        DECISION_SKIPPED_UNAPPROVED_ISSUE,
+                        candidate=chosen,
+                        considered=found[:10],
+                        detail=verdict.reason,
+                        tick_id=tick_id,
+                    )
+                )
         decision = InitiativeDecision(
             "dispatched", candidate=chosen, considered=found[:10], tick_id=tick_id
         )
