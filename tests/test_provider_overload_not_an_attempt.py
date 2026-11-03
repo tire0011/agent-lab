@@ -31,6 +31,8 @@ class ProviderOverloadTests(unittest.TestCase):
     def test_detects_overload_errors(self):
         self.assertTrue(is_provider_overload(OVERLOAD))
         self.assertTrue(is_provider_overload("HTTP 429 rate limit exceeded"))
+        self.assertTrue(is_provider_overload("Claude AI usage limit reached|1762300800"))
+        self.assertTrue(is_provider_overload("You've hit your weekly limit. Limit reached, resets Monday"))
         self.assertFalse(is_provider_overload("tests failed"))
 
     def test_a_failing_test_named_after_an_overload_is_no_overload(self):
