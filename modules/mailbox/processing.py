@@ -9,6 +9,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from modules import github_authorization
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from .refresh import process_refresh as _process_refresh
 from .task_ingest import insert_task_approval, resolve_idempotency_key
@@ -56,8 +57,29 @@ def _process_idea(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, str | None]:
-    """Append idea to IDEAS.md. Returns (result_body, idea_id)."""
+    """Append idea to IDEAS.md. Returns (result_body, idea_id).
+
+    An untrusted sender's idea is stored for review only: it must never enter
+    IDEAS.md in state ``new``, because the initiative tick would pick it up as
+    executable work.
+    """
+    if not sender_trusted:
+        conn.execute(
+            """
+            INSERT INTO knowledge (timestamp, run_id, category, key, value, confidence, source)
+            VALUES (?, NULL, 'mailbox_context', ?, ?, NULL, 'mailbox')
+            """,
+            (_now_iso(), msg.file_path.name, msg.body.strip()),
+        )
+        conn.commit()
+        return (
+            "Your submission has been stored for review. It is not added to IDEAS.md "
+            "and will not be worked on unless the repository owner approves it.",
+            None,
+        )
     ideas_path = repo_path / "IDEAS.md"
     content = ideas_path.read_text(encoding="utf-8")
 
@@ -100,8 +122,16 @@ def _process_task(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
-    """Record the task request; the task worker hands it straight to Nexus (#264)."""
+    """Record the task request; the task worker hands it straight to Nexus (#264).
+
+    Only a sender the authorization gate verified (via the git commit that
+    added the inbox file, never the file's own ``created_by`` text) gets a
+    ``queued`` task; everyone else gets ``pending_approval``, which the worker
+    never runs.
+    """
     explicit_key = msg.meta.get("idempotency_key") or None
     # A malformed key fails the message visibly instead of being swallowed
     # by the best-effort approval insert below.
@@ -134,6 +164,7 @@ def _process_task(
                 file_path=str(msg.file_path),
                 received_at=_now_iso(),
                 idempotency_key=explicit_key,
+                status="queued" if sender_trusted else "pending_approval",
             )
             if not created:
                 logger.info(
@@ -143,10 +174,17 @@ def _process_task(
     except Exception:
         logger.warning("_process_task: failed to create task record for msg %s", db_msg_id, exc_info=True)
 
-    result_body = (
-        "Your task request has been recorded and handed to Nexus. "
-        "The result will appear in the outbox."
-    )
+    if sender_trusted:
+        result_body = (
+            "Your task request has been recorded and handed to Nexus. "
+            "The result will appear in the outbox."
+        )
+    else:
+        result_body = (
+            "Your task request has been recorded and waits for approval by the "
+            "repository owner. Nothing will run until then. "
+            "The result will appear in the outbox."
+        )
     return result_body, None
 
 
@@ -155,8 +193,11 @@ def _process_question(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
     """Acknowledge question."""
+    del sender_trusted
     result_body = (
         "Your question has been received and will be reviewed by a Nexus operator.\n\n"
         "Questions submitted via the mailbox are logged and reviewed periodically. "
@@ -170,8 +211,11 @@ def _process_context(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
     """Store context in knowledge table."""
+    del sender_trusted
     now = _now_iso()
     conn.execute(
         """
@@ -201,8 +245,16 @@ def _process_setting(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
-    """Change one allowlisted setting from the front matter (``key``, ``value``)."""
+    """Change one allowlisted setting from the front matter (``key``, ``value``).
+
+    Settings change Nexus's own guardrails, so only a verified trusted sender
+    may change them.
+    """
+    if not sender_trusted:
+        return "Setting changes require a sender the repository owner trusts. Refused.", None
     key = str(msg.meta.get("key") or "").strip()
     if key not in SETTINGS:
         return f"Unknown setting {key!r}. Allowed: {', '.join(sorted(SETTINGS))}.", None
@@ -273,10 +325,24 @@ def _process_operation_chain(
     conn: sqlite3.Connection,
     db_msg_id: int,
     operation_chain_service: Any = None,
+    *,
+    sender_trusted: bool = True,
 ) -> Any:
-    """Parse, validate, and start an operation_chain message."""
+    """Parse, validate, and start an operation_chain message.
+
+    An operation chain executes operations, so an untrusted sender never gets
+    one started, no matter what the message text claims.
+    """
     import hashlib as _hashlib
 
+    if not sender_trusted:
+        logger.warning(
+            "operation_chain rejected for untrusted sender: %s", msg.file_path.name
+        )
+        return _ChainError(
+            "Operation chain rejected: the sender is not a trusted actor. "
+            "It needs approval by the repository owner before anything runs."
+        )
     data, parse_error = _parse_operation_chain_body(msg.body)
     if parse_error:
         logger.warning("operation_chain parse error for %s: %s", msg.file_path.name, parse_error)
@@ -644,6 +710,26 @@ class MailboxProcessor:
         commit_sha = git_current_commit(self._mailbox_repo_path)
         now = _now_iso()
 
+        # The authorization gate for this message: the verdict comes from the
+        # git commit that added the inbox file, never from the file's own
+        # ``created_by`` front matter (which is attacker-controlled text).
+        sender_verdict = github_authorization.classify_mailbox_message(
+            msg.created_by, self._mailbox_repo_path, file_path
+        )
+        sender_trusted = sender_verdict.trusted
+        if not sender_trusted:
+            logger.warning(
+                "mailbox message from unverified sender: file=%s actor=%s (%s)",
+                file_path.name, sender_verdict.actor, sender_verdict.detail,
+            )
+            task_log.warning(
+                "mailbox",
+                "untrusted_sender",
+                "message will not trigger execution without owner approval",
+                source_file=file_path.name,
+                actor=sender_verdict.actor,
+            )
+
         if existing:
             if existing["status"] == STATUS_DEFERRED:
                 self.conn.execute(
@@ -676,6 +762,7 @@ class MailboxProcessor:
                     self.conn,
                     db_msg_id,
                     operation_chain_service=self.operation_chain_service,
+                    sender_trusted=sender_trusted,
                 )
                 return self._handle_chain_outcome(
                     chain_outcome,
@@ -685,7 +772,9 @@ class MailboxProcessor:
                     db_msg_id,
                 )
             processor = _PROCESSORS[msg.msg_type]
-            processor_result = processor(msg, self._code_repo_path, self.conn, db_msg_id)
+            processor_result = processor(
+                msg, self._code_repo_path, self.conn, db_msg_id, sender_trusted=sender_trusted
+            )
             if processor_result is _DEFERRED_PROCESSING:
                 self.conn.execute(
                     "UPDATE mailbox_messages SET status=? WHERE id=?",

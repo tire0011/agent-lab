@@ -24,7 +24,13 @@ from modules.codex_task_service import (
     TaskNotRunnableError,
 )
 from modules.mailbox.config import MailboxConfig
-from modules.mailbox.github_webhook import has_inbox_changes, is_ping_event, verify_signature
+from modules.mailbox.github_webhook import (
+    expected_repository,
+    has_inbox_changes,
+    is_ping_event,
+    repository_matches,
+    verify_signature,
+)
 from modules.mailbox.poll_runner import run_mailbox_poll_once
 from modules.mailbox.task_service import (
     ApprovalNotFoundError,
@@ -930,6 +936,10 @@ async def mailbox_github_webhook(
     if not isinstance(payload, dict) or not has_inbox_changes(payload):
         _logger.info("mailbox_webhook ignored reason=no_inbox_changes")
         return JSONResponse(status_code=200, content={"status": "ignored"})
+
+    if not repository_matches(payload, expected_repository()):
+        _logger.warning("mailbox_webhook ignored reason=unexpected_repository")
+        return JSONResponse(status_code=202, content={"status": "ignored"})
 
     _start_mailbox_webhook_poll()
     _logger.info("mailbox_webhook accepted reason=inbox_change")

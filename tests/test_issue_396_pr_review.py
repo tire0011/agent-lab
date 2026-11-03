@@ -101,7 +101,7 @@ class RetryAfterBlockedReviewTests(unittest.TestCase):
         fx.add_experiment("e1", "succeeded", adoption="failed")
         with sqlite3.connect(fx.db_path) as conn:
             conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e1', 9)")
-        svc = fx.service(issue_lister=lambda: [{"number": 9, "title": "x", "body": ""}])
+        svc = fx.service(issue_lister=lambda: [{"number": 9, "author": {"login": "tire0011"}, "title": "x", "body": ""}])
         self.addCleanup(svc.close)
         svc.tick()
         self.assertEqual(fx.controller.issues, [9])
@@ -117,7 +117,7 @@ class EarlierAttemptsTests(unittest.TestCase):
             conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e1', 9)")
         bodies = []
         fx.controller.handle_issue = lambda number, *, title, body: bodies.append(body)
-        svc = fx.service(issue_lister=lambda: [{"number": 9, "title": "x", "body": "Do it."}])
+        svc = fx.service(issue_lister=lambda: [{"number": 9, "author": {"login": "tire0011"}, "title": "x", "body": "Do it."}])
         self.addCleanup(svc.close)
         svc.tick()
         self.assertTrue(bodies[0].startswith("Do it."))

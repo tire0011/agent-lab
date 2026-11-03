@@ -24,6 +24,7 @@ import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from modules import github_authorization
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
 from modules.nexus_task_store import NexusTaskStore
@@ -102,7 +103,9 @@ def _list_open_issues(repo_root: str) -> list[dict]:
                 "gh", "issue", "list",
                 "--state", "open",
                 "--limit", str(_ISSUE_LIMIT),
-                "--json", "number,title,body,labels",
+                # ``author`` is the API-verified actor the authorization gate
+                # checks; issue text is never used for that decision.
+                "--json", "number,title,body,labels,author",
             ],
             cwd=repo_root,
             capture_output=True,
@@ -185,13 +188,47 @@ def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[di
             cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
         )
         bodies = json.loads(comments.stdout or "[]") if comments.returncode == 0 else []
-        reason = str(bodies[-1].get("body") or "") if bodies else ""
+        # Only comments whose API-verified author is a trusted actor count as
+        # the owner's decision; comment text itself is never trusted.
+        trusted_bodies = [
+            c for c in bodies
+            if isinstance(c, dict) and github_authorization.classify_comment(c).trusted
+        ]
+        reason = str(trusted_bodies[-1].get("body") or "") if trusted_bodies else ""
         reason = reason.split("\n---\n", 1)[0]
         decisions.append({
             "title": str(issue.get("title") or ""),
             "reason": " ".join(reason.split())[:400] or f"closed ({issue.get('state_reason') or 'no reason'})",
         })
     return decisions
+
+
+def _issue_approved_by_owner(repo_root: str, number: int) -> bool:
+    """True if a trusted actor applied the approval label to the issue.
+
+    The label in an issue-list response carries no actor, so the timeline is
+    read and the ``labeled`` event's ``actor.login`` is what is checked. Any
+    failure fails closed.
+    """
+    label = github_authorization.approval_label()
+    proc = subprocess.run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{number}/timeline?per_page=100"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        logger.warning(
+            "approval lookup failed for issue #%s: %s", number, proc.stderr.strip()[:200]
+        )
+        return False
+    try:
+        events = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        logger.warning("approval lookup for issue #%s returned unparsable JSON", number)
+        return False
+    for event in events:
+        if github_authorization.classify_label_event(event, label=label).trusted:
+            return True
+    return False
 
 
 def _explore_with_claude(repo_root: str, prompt: str) -> str:
@@ -275,12 +312,20 @@ def _build_service(args) -> NexusInitiativeService:
                 experiment_service=experiment_service,
             )
         )
+    trusted = github_authorization.trusted_actors()
+    # Nexus's own token identity (the account that authors its proposals) is
+    # under the owner's control, so it counts as trusted too.
+    authenticated = github_authorization.authenticated_actor_login()
+    if authenticated:
+        trusted = trusted | {authenticated}
     return NexusInitiativeService(
         db_path=args.db_path,
         experiment_service=experiment_service,
         adoption_service=adoption_service,
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
+        trusted_actors=trusted,
+        issue_approver=(lambda number: _issue_approved_by_owner(args.repo_root, number)) if controller else None,
         planner=_planner(args.repo_root) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),

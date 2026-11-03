@@ -10,7 +10,7 @@ from modules.coding_provider import is_provider_overload
 from tests.test_nexus_initiative import InitiativeFixture
 
 OVERLOAD = "API Error: 529 Overloaded. This is a server-side issue, usually temporary"
-ISSUE = [{"number": 232, "title": "Staged controller view", "body": ""}]
+ISSUE = [{"number": 232, "author": {"login": "tire0011"}, "title": "Staged controller view", "body": ""}]
 
 
 class ProviderOverloadTests(unittest.TestCase):

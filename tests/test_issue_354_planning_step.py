@@ -13,9 +13,9 @@ from modules.nexus_planner import IssuePlanner, parse_choice, planning_prompt
 from tests.test_nexus_initiative import InitiativeFixture
 
 ISSUES = [
-    {"number": 158, "title": "Architecture: inverted model roles", "body": "big", "labels": []},
-    {"number": 351, "title": "Multi-line idea input in the Web UI", "body": "small", "labels": []},
-    {"number": 360, "title": "Suggested by Nexus", "body": "x", "labels": [{"name": "proposal"}]},
+    {"number": 158, "author": {"login": "tire0011"}, "title": "Architecture: inverted model roles", "body": "big", "labels": []},
+    {"number": 351, "author": {"login": "tire0011"}, "title": "Multi-line idea input in the Web UI", "body": "small", "labels": []},
+    {"number": 360, "author": {"login": "tire0011"}, "title": "Suggested by Nexus", "body": "x", "labels": [{"name": "proposal"}]},
 ]
 
 
@@ -85,7 +85,7 @@ class PlanningStepTests(unittest.TestCase):
 
     def test_no_new_proposal_while_three_are_open(self):
         waiting = [
-            {"number": 400 + i, "title": f"P{i}", "body": "", "labels": [{"name": "proposal"}]} for i in range(3)
+            {"number": 400 + i, "author": {"login": "tire0011"}, "title": f"P{i}", "body": "", "labels": [{"name": "proposal"}]} for i in range(3)
         ]
         svc, _ = self._service(
             _answer(351, proposal={"title": "Add X", "body": "Change Y"}), issues=ISSUES[:2] + waiting

@@ -43,9 +43,16 @@ at once and outside the budget.
 
 - **Give work:** open a GitHub issue with a concrete Problem / Change / Test.
   Nexus treats only paths in the Change section as files it must create.
+  Issues are only worked on automatically when their GitHub author is a
+  trusted actor (the repository owner, plus `NEXUS_TRUSTED_ACTORS` if set) or
+  when the owner applied the `nexus-approved` label (`NEXUS_APPROVAL_LABEL`).
+  Author identity is taken from the API `author.login` field only - never from
+  issue or comment text. Other users' issues are recorded as
+  `skipped_untrusted_author` and may be analyzed, but never trigger execution.
 - **Review its ideas:** proposals carry the `proposal` label and are not worked
   on. Remove the label to release one; close it with a comment to reject it.
-  The closing comment is shown to the planner as the owner's decision.
+  The closing comment is shown to the planner as the owner's decision, but
+  only when the comment's API-verified author is a trusted actor.
 - **Watch it:** comments on `tire0011/agent-lab-mailbox#6`, the open `WIP:`
   pull requests, and `GET /diagnostics/public`.
 - **Deploy changes:** after a merge by hand, run `scripts/nexus-refresh.ps1` on
@@ -181,6 +188,14 @@ CLI runner):
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
 - Optional for GitHub mailbox webhook: `AGENT_GITHUB_WEBHOOK_SECRET=<value>`
+  and `AGENT_MAILBOX_REPO=owner/mailbox-repo` (payloads from any other
+  repository are ignored even with a valid signature).
+- Optional external-content authorization: `NEXUS_TRUSTED_ACTORS=<comma-separated
+  logins>` (default: the repository owner) and `NEXUS_APPROVAL_LABEL=<label>`
+  (default: `nexus-approved`). See `modules/github_authorization.py`.
+  Mailbox inbox files are authorized by the git author of the commit that
+  added the file - the `created_by` front matter is display-only and never
+  trusted; untrusted senders get `pending_approval` tasks that never run.
 - Required for Nexus implementation tasks: `GITHUB_REPOSITORY=owner/repository`
   and `GITHUB_TOKEN=<fine-grained token with Issues, Contents and Pull requests write access plus Actions read access>`.
   Without them the API remains available for read-only work, but implementation

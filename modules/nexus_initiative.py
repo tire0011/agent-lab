@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modules import github_authorization
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
@@ -88,6 +89,11 @@ DECISION_SKIPPED_ATTEMPTS_EXHAUSTED = "skipped_attempts_exhausted"
 # An issue the goal policy rejects is not sent (#408): the experiment would be
 # rejected before any work, at the cost of a tick and a budget slot.
 DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
+# An issue whose API-verified author is not a trusted actor is never dispatched
+# on its own text: it needs an explicit owner approval (a verified label event).
+DECISION_SKIPPED_UNTRUSTED_AUTHOR = "skipped_untrusted_author"
+# Bound the approval lookups (one GitHub call each) per candidate scan.
+_MAX_APPROVAL_CHECKS_PER_SCAN = 10
 # Reasons only _check_goal_policy produces. A rejection with one of them is
 # known in advance from the goal text, so retrying the same text is pointless.
 _GOAL_POLICY_REASON_PREFIXES = tuple(
@@ -216,6 +222,8 @@ class NexusInitiativeService:
         checkout_revision: Callable[[], str] | None = None,
         restart_hook: Callable[[], None] | None = None,
         main_commit_date: Callable[[], str] | None = None,
+        trusted_actors: frozenset[str] | None = None,
+        issue_approver: Callable[[int], bool] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -233,6 +241,14 @@ class NexusInitiativeService:
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
+        # External-content authorization: only these actors' GitHub items may
+        # trigger execution without an explicit approval (see
+        # modules.github_authorization).
+        self._trusted_actors = (
+            trusted_actors if trusted_actors is not None else github_authorization.trusted_actors()
+        )
+        self._issue_approver = issue_approver
+        self._approval_checks = 0
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues: list[dict[str, Any]] = []
@@ -469,6 +485,8 @@ class NexusInitiativeService:
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues = []
+        self._approval_checks = 0
+        untrusted_skips = self._untrusted_author_skips()
         for issue in issues:
             number = issue.get("number")
             labels = {
@@ -479,6 +497,10 @@ class NexusInitiativeService:
                 # Waits for a human to review it and remove the label (#354).
                 self._open_proposals += 1
                 self._open_proposal_titles.append(str(issue.get("title") or ""))
+                continue
+            if number is not None and not self._authorized_to_run(
+                issue, int(number), record=record_skips, already_recorded=str(number) in untrusted_skips
+            ):
                 continue
             if number is None or int(number) in linked:
                 if number is not None and int(number) in exhausted:
@@ -498,6 +520,77 @@ class NexusInitiativeService:
                 continue
             candidates.append(candidate)
         return candidates
+
+    def _untrusted_author_skips(self) -> set[str]:
+        """Issue refs already recorded as skipped for an untrusted author."""
+        try:
+            rows = self._conn.execute(
+                "SELECT source_ref FROM nexus_initiative_log WHERE decision = ?",
+                (DECISION_SKIPPED_UNTRUSTED_AUTHOR,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        return {str(row["source_ref"]) for row in rows}
+
+    def _authorized_to_run(
+        self,
+        issue: dict[str, Any],
+        number: int,
+        *,
+        record: bool,
+        already_recorded: bool,
+    ) -> bool:
+        """The external-authorization gate for one issue.
+
+        The verdict comes from the API ``author.login`` field only; issue text
+        (title, body, embedded "approved by ..." claims) is never consulted.
+        An untrusted issue may still run when the owner explicitly approved it
+        through ``issue_approver`` (a verified label event).
+        """
+        verdict = github_authorization.classify_issue(issue, trusted=self._trusted_actors)
+        if verdict.trusted:
+            return True
+        if self._owner_approved(number):
+            logger.info(
+                "initiative: issue #%s by untrusted author %s runs with owner approval",
+                number, verdict.actor,
+            )
+            return True
+        logger.info(
+            "initiative: issue #%s skipped: author %s is not trusted and no owner approval exists",
+            number, verdict.actor,
+        )
+        if record and not already_recorded:
+            self._record(
+                InitiativeDecision(
+                    DECISION_SKIPPED_UNTRUSTED_AUTHOR,
+                    candidate=Candidate(
+                        KIND_ISSUE, str(number),
+                        str(issue.get("title") or f"Issue #{number}")[:200],
+                        "issue author is not a trusted actor",
+                    ),
+                    detail=json.dumps({"actor": verdict.actor, "detail": verdict.detail}),
+                    tick_id=uuid.uuid4().hex,
+                )
+            )
+        return False
+
+    def _owner_approved(self, number: int) -> bool:
+        """Ask the configured approver whether the owner approved this issue.
+
+        Bounded per scan so a backlog of untrusted issues cannot turn into one
+        GitHub call per issue per tick; a lookup failure fails closed.
+        """
+        if self._issue_approver is None:
+            return False
+        if self._approval_checks >= _MAX_APPROVAL_CHECKS_PER_SCAN:
+            return False
+        self._approval_checks += 1
+        try:
+            return bool(self._issue_approver(number))
+        except Exception as exc:  # noqa: BLE001 - fail closed, keep scanning
+            logger.warning("initiative: approval lookup for issue #%s failed: %s", number, exc)
+            return False
 
     def _review_blocked_issues(self) -> set[int]:
         """Issues whose latest attempt was stopped by the reviewer (#396)."""

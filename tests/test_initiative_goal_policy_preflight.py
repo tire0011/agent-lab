@@ -29,8 +29,8 @@ class GoalPolicyPreflightTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = InitiativeFixture()
         self.issues = [
-            {"number": 11, "title": "Cache cleanup", "body": HARMFUL_BODY},
-            {"number": 12, "title": "Cost monitor tests", "body": HARMLESS_BODY},
+            {"number": 11, "author": {"login": "tire0011"}, "title": "Cache cleanup", "body": HARMFUL_BODY},
+            {"number": 12, "author": {"login": "tire0011"}, "title": "Cost monitor tests", "body": HARMLESS_BODY},
         ]
         self.svc = self.fx.service(issue_lister=lambda: [dict(i) for i in self.issues])
         self.svc.experiment_service = RecordingExperimentService()
@@ -88,7 +88,7 @@ class GoalPolicyPreflightTests(unittest.TestCase):
 
     def test_changed_body_is_considered_again(self):
         self.svc.tick()
-        self.issues = [{"number": 11, "title": "Cache cleanup", "body": "Expire cache entries after a day."}]
+        self.issues = [{"number": 11, "author": {"login": "tire0011"}, "title": "Cache cleanup", "body": "Expire cache entries after a day."}]
 
         decision = self.svc.tick()
 
@@ -106,7 +106,7 @@ class GoalPolicyPreflightTests(unittest.TestCase):
         self.assertEqual(len(self._skips()), 2)
 
     def test_other_rejection_is_still_retried(self):
-        self.issues = [{"number": 12, "title": "Cost monitor tests", "body": HARMLESS_BODY}]
+        self.issues = [{"number": 12, "author": {"login": "tire0011"}, "title": "Cost monitor tests", "body": HARMLESS_BODY}]
         self._link("e1", 12, "rejected", "plan touches too many files (6); must be one small")
 
         decision = self.svc.tick()
