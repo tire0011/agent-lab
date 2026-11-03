@@ -189,6 +189,41 @@ def _process_context(
     return result_body, None
 
 
+# Owner-tunable settings a `setting` message may change, with their valid
+# range. Anything else is refused: the message carries no shell.
+SETTINGS: dict[str, tuple[str, int, int]] = {
+    "daily_budget": ("nexus.daily_budget", 0, 50),
+}
+
+
+def _process_setting(
+    msg: MailboxMessage,
+    repo_path: Path,
+    conn: sqlite3.Connection,
+    db_msg_id: int,
+) -> tuple[str, None]:
+    """Change one allowlisted setting from the front matter (``key``, ``value``)."""
+    key = str(msg.meta.get("key") or "").strip()
+    if key not in SETTINGS:
+        return f"Unknown setting {key!r}. Allowed: {', '.join(sorted(SETTINGS))}.", None
+    db_key, low, high = SETTINGS[key]
+    try:
+        value = int(str(msg.meta.get("value") or "").strip())
+    except ValueError:
+        return f"Setting {key} needs an integer value.", None
+    if not low <= value <= high:
+        return f"Setting {key} must be between {low} and {high}.", None
+    conn.execute(
+        """
+        INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (db_key, str(value), _now_iso()),
+    )
+    conn.commit()
+    return f"Setting {key} is now {value}.", None
+
+
 def _parse_operation_chain_body(body: str) -> tuple[dict, str | None]:
     """Parse and validate JSON body of an operation_chain message."""
     stripped = body.strip()
@@ -322,6 +357,8 @@ _PROCESSORS = {
     "context": _process_context,
     # Moving the deployment to a branch, with no shell in the message (#228).
     "refresh": _process_refresh,
+    # Owner-tunable settings such as the daily budget, no shell.
+    "setting": _process_setting,
 }
 
 

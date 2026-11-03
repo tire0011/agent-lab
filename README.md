@@ -33,7 +33,8 @@ one step:
    `tire0011/agent-lab-mailbox#6`.
 
 Limits: one piece of work at a time; a daily budget of self-started
-experiments (`--daily-budget` in `deploy/nexus-tick.service`); at most two
+experiments (set by a mailbox `setting` message; `--daily-budget` in
+`deploy/nexus-tick.service` is the default); at most two
 failed attempts per issue. A provider overload or a crash of Nexus's own
 pipeline does not use up an attempt, and a retry after a blocking review runs
 at once and outside the budget.
@@ -56,7 +57,7 @@ Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed m
 
 **Inbox** (`<AGENT_MAILBOX_REPO_PATH>/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus. This root-level directory is the only supported inbox; the code repository's former `communication/inbox/` path is not scanned.
 
-Supported message types: `idea`, `task`, `question`, `context`, `refresh`.
+Supported message types: `idea`, `task`, `question`, `context`, `refresh`, `setting`.
 
 Example: `agent-lab-mailbox/examples/idea-template.md`.
 
@@ -88,6 +89,20 @@ them.
   type: refresh
   created_by: rene
   branch: main
+  ---
+  ```
+
+- `setting` — changes one allowlisted owner setting from the front matter;
+  no shell. Today only `daily_budget` (0–50), the daily budget of
+  self-started experiments. It overrides `--daily-budget` from
+  `deploy/nexus-tick.service` from the next tick on.
+
+  ```markdown
+  ---
+  type: setting
+  created_by: rene
+  key: daily_budget
+  value: 5
   ---
   ```
 
