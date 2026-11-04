@@ -8,7 +8,9 @@ param(
   [string]$ChatPath
 )
 
-$env:AGENT_API_BASE_URL = "https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com"
+if (-not $env:AGENT_API_BASE_URL) {
+  throw "Set AGENT_API_BASE_URL to the Nexus host, e.g. https://<vm-host>"
+}
 
 $clientArgs = @($Command)
 

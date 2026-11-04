@@ -17,13 +17,16 @@ class StdioBridgeTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 BridgeConfig.from_env()
 
-    def test_config_uses_deployed_default_and_normalizes_url(self):
+    def test_config_requires_mcp_url(self):
         with patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}, clear=True):
+            with self.assertRaises(ValueError):
+                BridgeConfig.from_env()
+
+    def test_config_reads_url_and_defaults(self):
+        env = {"AGENT_API_KEY": "test-key", "NEXUS_MCP_URL": "https://vm.example/mcp/"}
+        with patch.dict(os.environ, env, clear=True):
             config = BridgeConfig.from_env()
-        self.assertEqual(
-            config.nexus_mcp_url,
-            "https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com/mcp/",
-        )
+        self.assertEqual(config.nexus_mcp_url, "https://vm.example/mcp/")
         self.assertEqual(config.transport, "stdio")
         self.assertEqual(config.http_host, "127.0.0.1")
         self.assertEqual(config.http_port, 8001)
