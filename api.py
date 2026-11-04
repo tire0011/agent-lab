@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 import chat as chat_module
 from data_sources import InvalidIdeaTextError, add_idea, list_ideas, list_problems
@@ -613,9 +612,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.mount("/mcp", _MCP_MOUNT)
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 _OUTBOX_DIR = MailboxConfig.from_env().outbox_dir
 
 API_KEY = os.environ["AGENT_API_KEY"]
@@ -663,11 +659,6 @@ def _start_mailbox_webhook_poll() -> None:
         daemon=True,
         name=thread_name,
     ).start()
-
-
-@app.get("/", include_in_schema=False)
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
 
 
 def authorize(x_api_key: str | None):
