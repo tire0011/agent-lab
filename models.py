@@ -164,6 +164,7 @@ class MailboxTaskApproval(BaseModel):
     outbox_file: str | None = None
     result_summary: str | None = None
     error: str | None = None
+    idempotency_key: str | None = None
     created_at: str
     updated_at: str
 

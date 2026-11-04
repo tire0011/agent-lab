@@ -97,9 +97,24 @@ def process_refresh(
     *,
     refresher: Callable[[str, Path], Any] | None = None,
     repo_root: Path | str | None = None,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
-    """Refresh the deployment checkout to the branch the message names."""
+    """Refresh the deployment checkout to the branch the message names.
+
+    A refresh moves the live deployment and restarts services, so only a
+    sender the authorization gate verified as trusted may request one.
+    """
     del conn, db_msg_id
+
+    if not sender_trusted:
+        logger.warning("refresh rejected: sender is not a trusted actor")
+        return (
+            "## Refresh rejected\n\n"
+            "**Reason:** the sender is not a trusted actor. "
+            "A refresh needs approval by the repository owner.\n\n"
+            "No refresh was attempted; the checkout is unchanged.",
+            None,
+        )
 
     try:
         branch = validate_branch((msg.meta or {}).get("branch", "main"))

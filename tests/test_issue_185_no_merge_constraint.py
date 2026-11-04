@@ -399,7 +399,7 @@ class InitiativeTests(unittest.TestCase):
             conn.execute(
                 "INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e1', 180)"
             )
-        service = fx.service(issue_lister=lambda: [{"number": 180, "title": "Issue 180", "body": ""}])
+        service = fx.service(issue_lister=lambda: [{"number": 180, "author": {"login": "tire0011"}, "title": "Issue 180", "body": ""}])
         self.addCleanup(service.close)
 
         service.tick()

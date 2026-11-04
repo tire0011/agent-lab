@@ -10,7 +10,7 @@ from modules.coding_provider import is_provider_overload
 from tests.test_nexus_initiative import InitiativeFixture
 
 OVERLOAD = "API Error: 529 Overloaded. This is a server-side issue, usually temporary"
-ISSUE = [{"number": 232, "title": "Staged controller view", "body": ""}]
+ISSUE = [{"number": 232, "author": {"login": "tire0011"}, "title": "Staged controller view", "body": ""}]
 
 
 class ProviderOverloadTests(unittest.TestCase):
@@ -31,6 +31,8 @@ class ProviderOverloadTests(unittest.TestCase):
     def test_detects_overload_errors(self):
         self.assertTrue(is_provider_overload(OVERLOAD))
         self.assertTrue(is_provider_overload("HTTP 429 rate limit exceeded"))
+        self.assertTrue(is_provider_overload("Claude AI usage limit reached|1762300800"))
+        self.assertTrue(is_provider_overload("You've hit your weekly limit. Limit reached, resets Monday"))
         self.assertFalse(is_provider_overload("tests failed"))
 
     def test_a_failing_test_named_after_an_overload_is_no_overload(self):

@@ -134,7 +134,17 @@ def process_command(
     repo_path: Path,
     conn: Any,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
+    if not sender_trusted:
+        # A shell command from an unverified sender must never run (#506).
+        logger.warning("command rejected: sender is not a trusted actor")
+        return (
+            "**Status:** rejected\n\n"
+            "**Reason:** the sender is not a trusted actor; the command was not run.",
+            None,
+        )
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")

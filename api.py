@@ -24,7 +24,13 @@ from modules.codex_task_service import (
     TaskNotRunnableError,
 )
 from modules.mailbox.config import MailboxConfig
-from modules.mailbox.github_webhook import has_inbox_changes, is_ping_event, verify_signature
+from modules.mailbox.github_webhook import (
+    expected_repository,
+    has_inbox_changes,
+    is_ping_event,
+    repository_matches,
+    verify_signature,
+)
 from modules.mailbox.poll_runner import run_mailbox_poll_once
 from modules.mailbox.task_service import (
     ApprovalNotFoundError,
@@ -359,6 +365,38 @@ def _resolve_nexus_chat_job_service() -> NexusChatJobService:
     return get_nexus_chat_job_service()
 
 
+# How often the API process sweeps for stalled experiments (#400). Startup
+# reconciliation only helps on a restart; a worker that hangs silently in this
+# process kept experiment deac59fb `implementing` for 11 hours.
+_STALL_SWEEP_INTERVAL_SECONDS = 5 * 60
+
+
+def _sweep_stalled_experiments_once() -> None:
+    try:
+        stalled = _resolve_experiment_service().sweep_stalled_experiments()
+    except Exception as exc:  # noqa: BLE001 - the sweep must never stop the API
+        _logger.error("could not sweep stalled experiments: %s", _sanitized_reason(str(exc)))
+        return
+    if isinstance(stalled, list) and stalled:
+        _logger.warning(
+            "marked %d stalled experiment(s) failed: %s",
+            len(stalled),
+            ", ".join(stalled[:10]),
+        )
+
+
+def _start_stall_sweeper(stop: threading.Event) -> threading.Thread:
+    """Sweep for stalled experiments every few minutes until *stop* is set."""
+
+    def run() -> None:
+        while not stop.wait(_STALL_SWEEP_INTERVAL_SECONDS):
+            _sweep_stalled_experiments_once()
+
+    thread = threading.Thread(target=run, daemon=True, name="experiment-stall-sweeper")
+    thread.start()
+    return thread
+
+
 def _resume_blocked_capabilities_after_startup() -> None:
     """Resume one eligible capability blocker behind normal initiative gates."""
     store = None
@@ -563,9 +601,12 @@ async def lifespan(app: FastAPI):
 
         worker = MailboxTaskWorker(mts)
         worker.start()
+        stall_sweep_stop = threading.Event()
+        _start_stall_sweeper(stall_sweep_stop)
         try:
             yield
         finally:
+            stall_sweep_stop.set()
             worker.stop()
 
 
@@ -895,6 +936,10 @@ async def mailbox_github_webhook(
     if not isinstance(payload, dict) or not has_inbox_changes(payload):
         _logger.info("mailbox_webhook ignored reason=no_inbox_changes")
         return JSONResponse(status_code=200, content={"status": "ignored"})
+
+    if not repository_matches(payload, expected_repository()):
+        _logger.warning("mailbox_webhook ignored reason=unexpected_repository")
+        return JSONResponse(status_code=202, content={"status": "ignored"})
 
     _start_mailbox_webhook_poll()
     _logger.info("mailbox_webhook accepted reason=inbox_change")

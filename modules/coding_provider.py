@@ -192,7 +192,12 @@ def choose_provider(
         conn.close()
 
 
-_OVERLOAD_RE = re.compile(r"\b(?:529|429)\b|overloaded|rate[ _-]?limit", re.IGNORECASE)
+# A provider's usage limit (Claude's weekly limit) is handled like an overload:
+# the other agent takes over and the attempt does not count.
+_OVERLOAD_RE = re.compile(
+    r"\b(?:529|429)\b|overloaded|rate[ _-]?limit|usage[ _-]?limit|limit (?:reached|exceeded)",
+    re.IGNORECASE,
+)
 
 
 def is_provider_overload(error: Any) -> bool:

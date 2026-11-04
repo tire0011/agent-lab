@@ -258,12 +258,10 @@ def _is_placeholder_path(path: str) -> bool:
 # ---------------------------------------------------------------------------
 # "tests_only" goal justification: a plan may only declare
 # change_kind="tests_only" when the *original* task explicitly and
-# narrowly asked for a tests-only change. This intentionally does not try
-# to classify arbitrary free text by keyword scanning; it only recognizes
-# a small, explicit set of "tests-only" phrasings, and separately rejects
-# outright whenever the goal names a concrete non-test file path (a
-# concrete file path is a much stronger, structural signal that real
-# implementation work was actually requested than any keyword could be).
+# narrowly asked for a tests-only change, or structurally names only test
+# paths. This intentionally does not classify arbitrary free text by broad
+# keyword scanning. A concrete non-test file path remains a stronger signal
+# that real implementation work was requested than either form of evidence.
 # ---------------------------------------------------------------------------
 
 _TESTS_ONLY_GOAL_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -284,6 +282,20 @@ def goal_is_explicit_tests_only(goal: str) -> bool:
         if not is_test_path(path) and not is_ignored_support_path(path):
             return False
     return any(pattern.search(text) for pattern in _TESTS_ONLY_GOAL_PATTERNS)
+
+
+def goal_names_only_test_paths(goal: str) -> bool:
+    """True when every path named by *goal* is test/support-only.
+
+    At least one named path must be an actual test path; a goal that names
+    no paths (or only ignored runtime/support paths) is not enough evidence
+    to relax the implementation gate.
+    """
+    paths = [match.group(0) for match in _GOAL_PATH_RE.finditer(goal or "")]
+    return (
+        any(is_test_path(path) for path in paths)
+        and all(is_test_path(path) or is_ignored_support_path(path) for path in paths)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -369,10 +381,10 @@ def validate_plan(plan: Any, goal: str) -> str | None:
                 "plan declares change_kind='tests_only' but affected_files names "
                 f"non-test file(s): {non_test_affected!r}"
             )
-        if not goal_is_explicit_tests_only(goal):
+        if not (goal_is_explicit_tests_only(goal) or goal_names_only_test_paths(goal)):
             return (
                 "plan declares change_kind='tests_only' but the original task did "
-                "not explicitly and exclusively request a tests-only change"
+                "not explicitly request a tests-only change or name only test paths"
             )
         return None
 
@@ -480,10 +492,21 @@ def evaluate_implementation(
     exception raised here as ``needs_review`` (never as ``succeeded``).
     """
     p = PlanLike.from_any(plan)
-    # When no structured plan exists (single-call pipeline) and the original
-    # goal is exclusively tests-only, promote change_kind accordingly so the
-    # evaluator does not incorrectly require non-test file evidence.
-    if plan is None and p.change_kind == DEFAULT_CHANGE_KIND and goal_is_explicit_tests_only(goal):
+    # A plan-less run, or an implementation plan that itself names only test
+    # files, may be promoted when the goal structurally or explicitly asks
+    # for tests only. Any affected non-test file keeps a plan classified as
+    # implementation, preserving the stricter non-test-evidence gate.
+    affected_files_are_tests_only = (
+        bool(p.affected_files) and all(is_test_path(path) for path in p.affected_files)
+    )
+    goal_allows_tests_only = (
+        goal_is_explicit_tests_only(goal) or goal_names_only_test_paths(goal)
+    )
+    if (
+        p.change_kind == DEFAULT_CHANGE_KIND
+        and (plan is None or affected_files_are_tests_only)
+        and goal_allows_tests_only
+    ):
         p.change_kind = "tests_only"
     all_changed = changed.all_paths()
     test_changed, non_test_changed = split_test_and_non_test(all_changed)

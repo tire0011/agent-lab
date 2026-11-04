@@ -169,6 +169,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             ended_at TEXT NULL,
             cancelled_at TEXT NULL,
             cancelled_by TEXT NULL,
+            worker_pgid INTEGER NULL,
             plan_json TEXT NULL,
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
@@ -266,6 +267,21 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS issue_approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repository TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
+            source_mailbox_msg_id INTEGER,
+            decided_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(repository, issue_number)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_issue_approvals_lookup
+            ON issue_approvals(repository, issue_number);
         """
     )
     _migrate_experiments_columns(conn)
@@ -307,6 +323,9 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("implementation_provider", "TEXT"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
+    # Process group of the live worker, so the stall sweep (#400) can stop it
+    # from another process; NULL while no worker runs.
+    ("worker_pgid", "INTEGER"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
@@ -358,6 +377,7 @@ _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS = [
     ("publish_retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ("publish_last_error", "TEXT"),
     ("outbox_content", "TEXT"),
+    ("idempotency_key", "TEXT"),
     ("merge_forbidden", "INTEGER NOT NULL DEFAULT 0"),
     ("merge_constraint_reason", "TEXT"),
 ]
@@ -421,6 +441,32 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE mailbox_task_approvals ADD COLUMN {column_name} {column_type}"
             )
 
+    # Idempotency keys (#378): a redelivered message must map back to its
+    # original task. Rows from before the key existed get the key their
+    # message would derive today (``modules/mailbox/task_ingest.py``), so a
+    # redelivery after the upgrade is still recognised. Only the oldest row
+    # per message gets it: legacy duplicates would violate the unique index.
+    conn.execute(
+        """
+        UPDATE mailbox_task_approvals
+        SET idempotency_key = 'mailbox-msg:' || mailbox_msg_id
+        WHERE idempotency_key IS NULL
+          AND rowid IN (
+              SELECT MIN(rowid) FROM mailbox_task_approvals
+              WHERE idempotency_key IS NULL
+              GROUP BY mailbox_msg_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM mailbox_task_approvals b
+              WHERE b.idempotency_key = 'mailbox-msg:' || mailbox_task_approvals.mailbox_msg_id
+          )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mta_idempotency_key "
+        "ON mailbox_task_approvals(idempotency_key)"
+    )
+
     # The approval step is gone (#264). An approved task was only waiting for
     # the worker, which now takes queued ones. Old pending_approval and
     # rejected rows stay as they are: readable, never run.
@@ -462,11 +508,12 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO mailbox_task_approvals
                 (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-                 status, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status, error, idempotency_key, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(idempotency_key) DO NOTHING
             """,
             (approval_id, msg_id, task_body, created_by or "", file_path or "",
-             received_at or now, status, error, now, now),
+             received_at or now, status, error, f"mailbox-msg:{msg_id}", now, now),
         )
 
     # Rows created before the structured constraint, and the orphans above,

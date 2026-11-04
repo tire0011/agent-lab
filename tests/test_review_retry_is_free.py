@@ -9,8 +9,8 @@ from modules.nexus_initiative import REVIEW_RETRY_REASON
 from tests.test_nexus_initiative import InitiativeFixture
 
 ISSUES = [
-    {"number": 7, "title": "Something new", "body": ""},
-    {"number": 418, "title": "Refuse a second experiment", "body": ""},
+    {"number": 7, "author": {"login": "tire0011"}, "title": "Something new", "body": ""},
+    {"number": 418, "author": {"login": "tire0011"}, "title": "Refuse a second experiment", "body": ""},
 ]
 
 

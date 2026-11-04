@@ -7,7 +7,7 @@ import unittest
 
 from tests.test_nexus_initiative import InitiativeFixture
 
-ISSUE = [{"number": 455, "title": "Adoption of a retry", "body": ""}]
+ISSUE = [{"number": 455, "author": {"login": "tire0011"}, "title": "Adoption of a retry", "body": ""}]
 
 
 class UnboundWorkLinkTests(unittest.TestCase):

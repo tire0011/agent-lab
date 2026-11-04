@@ -56,7 +56,7 @@ from models import OperationChainRequest, OperationChainStep
 
 def _make_repo(tmp: Path) -> Path:
     subprocess.run(["git", "init", str(tmp)], check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "49699333+tire0011@users.noreply.github.com"], cwd=str(tmp), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp), check=True, capture_output=True)
     readme = tmp / "README.md"
     readme.write_text("# test\n")
@@ -136,6 +136,10 @@ class _ChainProcessorBase(unittest.TestCase):
     def _write(self, name: str, content: str) -> Path:
         f = self.repo / "inbox" / name
         f.write_text(content, encoding="utf-8")
+        # Inbox files arrive as commits; the authorization gate checks the
+        # commit author, so commit as the owner.
+        subprocess.run(["git", "add", f"inbox/{name}"], cwd=str(self.repo), check=False, capture_output=True)
+        subprocess.run(["git", "commit", "-m", f"add inbox {name}"], cwd=str(self.repo), check=False, capture_output=True)
         return f
 
 

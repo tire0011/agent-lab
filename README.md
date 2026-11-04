@@ -33,7 +33,8 @@ one step:
    `tire0011/agent-lab-mailbox#6`.
 
 Limits: one piece of work at a time; a daily budget of self-started
-experiments (`--daily-budget` in `deploy/nexus-tick.service`); at most two
+experiments (set by a mailbox `setting` message; `--daily-budget` in
+`deploy/nexus-tick.service` is the default); at most two
 failed attempts per issue. A provider overload or a crash of Nexus's own
 pipeline does not use up an attempt, and a retry after a blocking review runs
 at once and outside the budget.
@@ -42,9 +43,19 @@ at once and outside the budget.
 
 - **Give work:** open a GitHub issue with a concrete Problem / Change / Test.
   Nexus treats only paths in the Change section as files it must create.
+  The public repo is discovery and discussion only: Nexus lists all open
+  issues, but **only issues written by a trusted actor (the owner) or
+  explicitly approved through the private mailbox** are eligible for
+  autonomous execution (for issues from untrusted authors the
+  approval is additionally bound to the issue's title+body hash, so editing
+  such an issue requires renewed approval). Approve or revoke with a
+  structured `issue_approval` mailbox message - see
+  `docs/issue-authorization.md`. Unapproved issues are recorded as
+  `skipped_unapproved_issue` and never start experiments.
 - **Review its ideas:** proposals carry the `proposal` label and are not worked
   on. Remove the label to release one; close it with a comment to reject it.
-  The closing comment is shown to the planner as the owner's decision.
+  The closing comment is shown to the planner as the owner's decision, but
+  only when the comment's API-verified author is a trusted actor.
 - **Watch it:** comments on `tire0011/agent-lab-mailbox#6`, the open `WIP:`
   pull requests, and `GET /diagnostics/public`.
 - **Deploy changes:** after a merge by hand, run `scripts/nexus-refresh.ps1` on
@@ -56,7 +67,7 @@ Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed m
 
 **Inbox** (`<AGENT_MAILBOX_REPO_PATH>/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus. This root-level directory is the only supported inbox; the code repository's former `communication/inbox/` path is not scanned.
 
-Supported message types: `idea`, `task`, `question`, `context`, `refresh`.
+Supported message types: `idea`, `task`, `question`, `context`, `refresh`, `setting`, `issue_approval` (approve/revoke an issue for autonomous execution - see `docs/issue-authorization.md`).
 
 Example: `agent-lab-mailbox/examples/idea-template.md`.
 
@@ -88,6 +99,20 @@ them.
   type: refresh
   created_by: rene
   branch: main
+  ---
+  ```
+
+- `setting` — changes one allowlisted owner setting from the front matter;
+  no shell. Today only `daily_budget` (0–50), the daily budget of
+  self-started experiments. It overrides `--daily-budget` from
+  `deploy/nexus-tick.service` from the next tick on.
+
+  ```markdown
+  ---
+  type: setting
+  created_by: rene
+  key: daily_budget
+  value: 5
   ---
   ```
 
@@ -166,6 +191,19 @@ CLI runner):
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
 - Optional for GitHub mailbox webhook: `AGENT_GITHUB_WEBHOOK_SECRET=<value>`
+  and `AGENT_MAILBOX_REPO=owner/mailbox-repo` (payloads from any other
+  repository are ignored even with a valid signature).
+- Optional trusted-actor configuration: `NEXUS_TRUSTED_ACTORS=<comma-separated
+  logins>` (default: the repository owner, from `NEXUS_REPO_OWNER` or
+  `GITHUB_REPOSITORY`). See `modules/github_authorization.py` and
+  `docs/issue-authorization.md`. Mailbox inbox files are authorized by the
+  git author of the commit that added the file (a trusted actor's GitHub
+  noreply address, or an address in `NEXUS_TRUSTED_MAILBOX_EMAILS`, default:
+  the owner's, Claude's, Vibe's and Codex/GPT's `@openai.com`) - the `created_by` front
+  matter is display-only and never trusted; untrusted senders get
+  `pending_approval` tasks that never run. Issue execution authorization
+  itself lives in the local SQLite `issue_approvals` table, fed only by
+  `issue_approval` mailbox messages from trusted senders.
 - Required for Nexus implementation tasks: `GITHUB_REPOSITORY=owner/repository`
   and `GITHUB_TOKEN=<fine-grained token with Issues, Contents and Pull requests write access plus Actions read access>`.
   Without them the API remains available for read-only work, but implementation

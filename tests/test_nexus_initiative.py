@@ -49,6 +49,31 @@ class RecordingController:
         self.ideas.append(idea_id)
 
 
+TEST_REPOSITORY = "tire0011/agent-lab"
+
+
+def approve_issue(
+    db_path: str, issue: dict, *, repository: str = TEST_REPOSITORY, status: str = "approved"
+) -> None:
+    """Seed the approval registry for one issue dict (title/body hash bound)."""
+    from modules import issue_approvals
+
+    conn = sqlite3.connect(db_path)
+    try:
+        issue_approvals.ensure_issue_approvals_table(conn)
+        issue_approvals.record_decision(
+            conn,
+            repository=repository,
+            issue_number=int(issue["number"]),
+            status=status,
+            content_hash=issue_approvals.issue_content_hash(
+                str(issue.get("title") or ""), str(issue.get("body") or "")
+            ),
+        )
+    finally:
+        conn.close()
+
+
 class InitiativeFixture:
     def __init__(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="nexus-initiative-")
@@ -106,6 +131,19 @@ class InitiativeFixture:
 
     def service(self, **kwargs) -> NexusInitiativeService:
         kwargs.setdefault("idea_lister", lambda: [])
+        kwargs.setdefault("repository", TEST_REPOSITORY)
+        lister = kwargs.get("issue_lister")
+        if lister is not None:
+            # Simulate approved issues: seed the approval registry (bound to
+            # each issue's content hash) the first time the lister runs.
+            def seeded_lister():
+                issues = lister() or []
+                for issue in issues:
+                    if issue.get("number") is not None:
+                        approve_issue(self.db_path, issue)
+                return issues
+
+            kwargs["issue_lister"] = seeded_lister
         return NexusInitiativeService(
             db_path=self.db_path,
             experiment_service=SimpleNamespace(),
@@ -132,7 +170,7 @@ class NexusInitiativeTests(unittest.TestCase):
 
     def test_stale_service_is_recorded_restarted_and_no_work_is_submitted(self):
         restart = MagicMock()
-        issue_lister = MagicMock(return_value=[{"number": 441, "title": "work", "body": ""}])
+        issue_lister = MagicMock(return_value=[{"number": 441, "author": {"login": "tire0011"}, "title": "work", "body": ""}])
         svc = self.fx.service(
             diagnostics_client=lambda: {"service": {
                 "status": "ok",
@@ -164,7 +202,7 @@ class NexusInitiativeTests(unittest.TestCase):
             }},
             checkout_revision=lambda: "aaaa111ddddddddddddddddddddddddddddddddd",
             restart_hook=restart,
-            issue_lister=lambda: [{"number": 441, "title": "work", "body": ""}],
+            issue_lister=lambda: [{"number": 441, "author": {"login": "tire0011"}, "title": "work", "body": ""}],
         )
         self.addCleanup(svc.close)
 
@@ -180,7 +218,7 @@ class NexusInitiativeTests(unittest.TestCase):
             diagnostics_client=lambda: {"service": {"status": "ok"}},
             checkout_revision=lambda: "bbbb222",
             restart_hook=restart,
-            issue_lister=lambda: [{"number": 448, "title": "work", "body": ""}],
+            issue_lister=lambda: [{"number": 448, "author": {"login": "tire0011"}, "title": "work", "body": ""}],
         )
         self.addCleanup(svc.close)
 
@@ -197,7 +235,7 @@ class NexusInitiativeTests(unittest.TestCase):
             diagnostics_client=lambda: {"service": {"git_revision": "aaaa111"}},
             checkout_revision=fail_lookup,
             restart_hook=restart,
-            issue_lister=lambda: [{"number": 448, "title": "work", "body": ""}],
+            issue_lister=lambda: [{"number": 448, "author": {"login": "tire0011"}, "title": "work", "body": ""}],
         )
         self.addCleanup(svc.close)
 
@@ -298,7 +336,7 @@ class NexusInitiativeTests(unittest.TestCase):
         # --integration-only builds no controller. Ideas and issues are then
         # unstartable, so they must not appear in the backlog at all.
         svc = self.fx.service(
-            issue_lister=lambda: [{"number": 7, "title": "Nope", "body": ""}],
+            issue_lister=lambda: [{"number": 7, "author": {"login": "tire0011"}, "title": "Nope", "body": ""}],
             idea_lister=lambda: [SimpleNamespace(id="idea-1", text="Nope", state="new")],
         )
         svc.controller = None
@@ -319,7 +357,7 @@ class NexusInitiativeTests(unittest.TestCase):
         # The real 3946adc3 shape: succeeded, stuck at needs_review.
         self.fx.add_experiment("stuck", "succeeded", adoption="needs_review")
         svc = self.fx.service(
-            issue_lister=lambda: [{"number": 7, "title": "Something new", "body": "..."}],
+            issue_lister=lambda: [{"number": 7, "author": {"login": "tire0011"}, "title": "Something new", "body": "..."}],
             idea_lister=lambda: [SimpleNamespace(id="idea-1", text="An idea", state="new")],
         )
         self.addCleanup(svc.close)
@@ -342,7 +380,7 @@ class NexusInitiativeTests(unittest.TestCase):
 
     def test_open_issue_is_picked_when_nothing_is_stuck(self):
         svc = self.fx.service(
-            issue_lister=lambda: [{"number": 7, "title": "Something new", "body": "do it"}]
+            issue_lister=lambda: [{"number": 7, "author": {"login": "tire0011"}, "title": "Something new", "body": "do it"}]
         )
         self.addCleanup(svc.close)
 
@@ -360,7 +398,7 @@ class NexusInitiativeTests(unittest.TestCase):
         conn.commit()
         conn.close()
         svc = self.fx.service(
-            issue_lister=lambda: [{"number": 7, "title": "Already taken", "body": ""}]
+            issue_lister=lambda: [{"number": 7, "author": {"login": "tire0011"}, "title": "Already taken", "body": ""}]
         )
         self.addCleanup(svc.close)
 
@@ -394,7 +432,7 @@ class NexusInitiativeTests(unittest.TestCase):
     def test_default_daily_budget_is_five(self):
         svc = self.fx.service(
             issue_lister=lambda: [
-                {"number": number, "title": f"Issue {number}", "body": ""}
+                {"number": number, "author": {"login": "tire0011"}, "title": f"Issue {number}", "body": ""}
                 for number in range(1, 7)
             ]
         )
@@ -455,8 +493,8 @@ class IssuesOutOfAttemptsTests(unittest.TestCase):
     """#457: an issue that used up its attempts is reported, not dropped silently."""
 
     ISSUES = [
-        {"number": 232, "title": "Stuck issue", "body": ""},
-        {"number": 7, "title": "Free issue", "body": ""},
+        {"number": 232, "author": {"login": "tire0011"}, "title": "Stuck issue", "body": ""},
+        {"number": 7, "author": {"login": "tire0011"}, "title": "Free issue", "body": ""},
     ]
 
     def setUp(self) -> None:
@@ -723,7 +761,7 @@ class PipelineCrashAttemptsTests(unittest.TestCase):
     LAST_CRASH = "2026-10-02T12:00:00+00:00"
     BEFORE = "2026-10-02T11:00:00+00:00"
     AFTER = "2026-10-02T13:00:00+00:00"
-    ISSUE = {"number": 386, "title": "Crashed issue", "body": "Add unit tests."}
+    ISSUE = {"number": 386, "author": {"login": "tire0011"}, "title": "Crashed issue", "body": "Add unit tests."}
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="nexus-crash-")
@@ -756,6 +794,7 @@ class PipelineCrashAttemptsTests(unittest.TestCase):
         self._attempt("c2", error=self.CRASH)
 
     def _service(self, main_commit_date):
+        approve_issue(self.db_path, dict(self.ISSUE))
         svc = NexusInitiativeService(
             db_path=self.db_path,
             experiment_service=SimpleNamespace(),
@@ -765,6 +804,7 @@ class PipelineCrashAttemptsTests(unittest.TestCase):
             issue_commenter=lambda number, text: self.comments.append((number, text)),
             main_commit_date=main_commit_date,
             daily_budget=5,
+            repository=TEST_REPOSITORY,
         )
         self.addCleanup(svc.close)
         return svc

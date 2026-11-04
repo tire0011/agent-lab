@@ -38,7 +38,12 @@ STATUS_DONE = "done"
 STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
 STATUS_DEFERRED = "deferred"
 _DEFERRED_PROCESSING = object()
-SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain", "refresh"}
+SUPPORTED_TYPES = {
+    "idea", "task", "question", "context", "operation_chain", "refresh", "setting",
+    # Structured issue authorization from the trusted mailbox; see
+    # modules.issue_approvals and _process_issue_approval.
+    "issue_approval",
+}
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
     re.compile(r"AZURE_[A-Z_]+\s*=\s*\S"),

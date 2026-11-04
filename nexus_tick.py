@@ -24,6 +24,7 @@ import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from modules import github_authorization
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
 from modules.nexus_task_store import NexusTaskStore
@@ -40,6 +41,8 @@ _PLANNER_STALL_SECONDS = 300
 
 # Things worth telling Claude about, collected during one tick (#365).
 _events: list[str] = []
+# How often the stall sweep (#400) runs while the tick waits for its experiment.
+_STALL_SWEEP_INTERVAL_SECONDS = 5 * 60
 
 
 def _service_diagnostics() -> dict:
@@ -100,7 +103,9 @@ def _list_open_issues(repo_root: str) -> list[dict]:
                 "gh", "issue", "list",
                 "--state", "open",
                 "--limit", str(_ISSUE_LIMIT),
-                "--json", "number,title,body,labels",
+                # ``author`` decides whether the content-hash check applies
+                # (trusted authors may edit their issue after approval).
+                "--json", "number,title,body,labels,author",
             ],
             cwd=repo_root,
             capture_output=True,
@@ -183,7 +188,13 @@ def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[di
             cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
         )
         bodies = json.loads(comments.stdout or "[]") if comments.returncode == 0 else []
-        reason = str(bodies[-1].get("body") or "") if bodies else ""
+        # Only comments whose API-verified author is a trusted actor count as
+        # the owner's decision; comment text itself is never trusted.
+        trusted_bodies = [
+            c for c in bodies
+            if isinstance(c, dict) and github_authorization.classify_comment(c).trusted
+        ]
+        reason = str(trusted_bodies[-1].get("body") or "") if trusted_bodies else ""
         reason = reason.split("\n---\n", 1)[0]
         decisions.append({
             "title": str(issue.get("title") or ""),
@@ -339,7 +350,26 @@ def _cleanup_expired_worktrees(service) -> None:
         logger.warning("could not clean up expired experiment worktrees: %s", exc)
 
 
-def _wait_for_experiments() -> None:
+def _sweep_stalled_experiments(service) -> None:
+    """Fail experiments that logged nothing past their phase limit (#400).
+
+    A hung worker otherwise holds the issue, the daily budget and this tick's
+    wait until a restart. Never fails the tick.
+    """
+    experiment_service = getattr(service, "experiment_service", None)
+    if experiment_service is None:
+        return
+    try:
+        stalled = experiment_service.sweep_stalled_experiments()
+    except Exception as exc:  # noqa: BLE001 - the sweep must not break a tick
+        logger.warning("could not sweep stalled experiments: %s", exc)
+        return
+    # The notification picks them up through _finished_badly.
+    for experiment_id in stalled:
+        logger.warning("experiment %s stalled and was marked failed", experiment_id)
+
+
+def _wait_for_experiments(service=None) -> None:
     """Keep the process alive until the work it started has ended (#358).
 
     The controller runs an experiment, and the adoption service an
@@ -361,7 +391,12 @@ def _wait_for_experiments() -> None:
             return
         for thread in pending:
             logger.info("waiting for %s to finish", thread.name)
-            thread.join()
+            # Wake up now and then: the experiment this tick waits for may be
+            # the one whose worker hangs (#400).
+            while thread.is_alive():
+                thread.join(timeout=_STALL_SWEEP_INTERVAL_SECONDS)
+                if thread.is_alive() and service is not None:
+                    _sweep_stalled_experiments(service)
 
 
 def _finished_badly(db_path: str, since: str) -> list[str]:
@@ -443,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
             _events.append(reverted)
 
     service = _build_service(args)
+    if not args.dry_run:
+        # Before the busy check, so a hung experiment does not block this tick.
+        _sweep_stalled_experiments(service)
     try:
         if not args.dry_run and service.controller is not None:
             resume = service.resume_blocked_capability()
@@ -488,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("no work started (%s): %s", decision.decision, decision.detail)
         return 0 if decision.decision != "error" else 1
     finally:
-        _wait_for_experiments()
+        _wait_for_experiments(None if args.dry_run else service)
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
         service.close()
