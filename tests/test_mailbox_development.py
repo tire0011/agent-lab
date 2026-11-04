@@ -377,3 +377,20 @@ class TestMailboxDevelopment(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommandSenderTrustTests(unittest.TestCase):
+    """The poll passes ``sender_trusted`` to every processor (#506)."""
+
+    def test_trusted_sender_keyword_is_accepted(self):
+        msg = SimpleNamespace(body="printf hello", meta={})
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = process_command(msg, Path(tmp), None, 0, sender_trusted=True)
+        self.assertIn("hello", body)
+
+    def test_untrusted_sender_never_runs_a_shell(self):
+        msg = SimpleNamespace(body="printf ran > ran.txt", meta={})
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = process_command(msg, Path(tmp), None, 0, sender_trusted=False)
+            self.assertFalse((Path(tmp) / "ran.txt").exists())
+        self.assertIn("not a trusted", body)
