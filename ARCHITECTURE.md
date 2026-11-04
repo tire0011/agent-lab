@@ -93,7 +93,7 @@
     for it (section 13), and the response says which one in `provider`; no worker
     logic duplicated in `api.py`. `working_dir` (`/agent`) and `sandbox`
     (`read-only`) are fixed server-side; `timeout_seconds` is capped at
-    120s. Synchronous only — no queue, no parallel execution, no chat/Web UI
+    120s. Synchronous only — no queue, no parallel execution, no chat
     wiring yet. `mark_interrupted_tasks_failed()` runs once via FastAPI's
     lifespan startup hook to mark orphaned `running` tasks as `failed`
     without restarting them.
