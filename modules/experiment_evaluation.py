@@ -492,24 +492,25 @@ def evaluate_implementation(
     exception raised here as ``needs_review`` (never as ``succeeded``).
     """
     p = PlanLike.from_any(plan)
+    all_changed = changed.all_paths()
+    test_changed, non_test_changed = split_test_and_non_test(all_changed)
     # A plan-less run, or an implementation plan that itself names only test
     # files, may be promoted when the goal structurally or explicitly asks
     # for tests only. Any affected non-test file keeps a plan classified as
-    # implementation, preserving the stricter non-test-evidence gate.
+    # implementation, preserving the stricter non-test-evidence gate - unless
+    # the task explicitly asked for tests only and only tests changed: the
+    # planner may list non-test files it only had to read (#493).
     affected_files_are_tests_only = (
         bool(p.affected_files) and all(is_test_path(path) for path in p.affected_files)
     )
-    goal_allows_tests_only = (
-        goal_is_explicit_tests_only(goal) or goal_names_only_test_paths(goal)
-    )
-    if (
-        p.change_kind == DEFAULT_CHANGE_KIND
-        and (plan is None or affected_files_are_tests_only)
-        and goal_allows_tests_only
+    explicit_tests_only = goal_is_explicit_tests_only(goal)
+    goal_allows_tests_only = explicit_tests_only or goal_names_only_test_paths(goal)
+    only_tests_changed = bool(test_changed) and not non_test_changed
+    if p.change_kind == DEFAULT_CHANGE_KIND and (
+        ((plan is None or affected_files_are_tests_only) and goal_allows_tests_only)
+        or (explicit_tests_only and only_tests_changed)
     ):
         p.change_kind = "tests_only"
-    all_changed = changed.all_paths()
-    test_changed, non_test_changed = split_test_and_non_test(all_changed)
 
     checks: list[EvaluationCheck] = []
     reasons: list[str] = []

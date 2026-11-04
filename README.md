@@ -493,7 +493,7 @@ command output. The website's Diagnostics card and
 - VM: `agent-lab-vm` (`Standard_B1s`, Ubuntu 22.04)
 - Azure OpenAI resource: `openAI-tire0011`
 - Deployment: `gpt-4o` (`2024-05-13`, GlobalStandard)
-- Public HTTPS host: `agent-lab-tire0011.germanywestcentral.cloudapp.azure.com`
+- Public HTTPS host: `<vm-host>`
 
 ## Additional documentation
 
@@ -582,7 +582,7 @@ Integration tests are intentionally separated from unit tests and only run when
 
 Example:
 
-- `AGENT_API_URL=https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com python -m unittest discover -s tests/integration -v`
+- `AGENT_API_URL=https://<vm-host> python -m unittest discover -s tests/integration -v`
 
 Covered checks:
 

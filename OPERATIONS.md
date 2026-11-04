@@ -15,7 +15,7 @@ Operational runbook for running and maintaining `agent-lab` on local machine and
 - Host: `agent-lab-vm` (Ubuntu 22.04, `Standard_B1s`)
 - Resource group: `agent-lab-rg`
 - Region: `germanywestcentral`
-- Public HTTPS host: `agent-lab-tire0011.germanywestcentral.cloudapp.azure.com`
+- Public HTTPS host: `<vm-host>`
 - Web stack: FastAPI + nginx + Let's Encrypt TLS
 
 ## Required environment variables
@@ -658,7 +658,7 @@ Any non-empty unit name is accepted; only an absent name is refused.
 
 ```bash
 # Launch test run
-curl -s -X POST https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com/maintenance/execute \
+curl -s -X POST https://<vm-host>/maintenance/execute \
   -H "X-Api-Key: $AGENT_API_KEY" \
   -H "X-Maintenance-Token: $MAINTENANCE_TOKEN" \
   -H "Content-Type: application/json" \
