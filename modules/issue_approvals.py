@@ -232,6 +232,7 @@ def check_execution(
     title: Any,
     body: Any,
     skip_content_hash: bool = False,
+    trusted_author: bool = False,
 ) -> ExecutionVerdict:
     """May Nexus start new work on this issue right now?
 
@@ -242,7 +243,9 @@ def check_execution(
     approval). The hash check is skipped only for issues whose author is a
     trusted actor: a stranger could edit their own issue after approval,
     while a trusted author's edit (e.g. a typo fix) must not invalidate it.
-    The approval itself is required in every case.
+    An issue a trusted actor wrote needs no approval record: the owner's
+    own issues (and released proposals) are approved by being written. An
+    explicit revoked/rejected record still blocks it.
     """
     repo = normalize_repository(repository)
     try:
@@ -258,6 +261,8 @@ def check_execution(
     except sqlite3.Error as exc:
         return ExecutionVerdict(False, f"approval registry unreadable: {exc}")
     if approval is None:
+        if trusted_author:
+            return ExecutionVerdict(True, f"issue {repo}#{number} was written by a trusted actor")
         return ExecutionVerdict(False, f"issue {repo}#{number} has no approval record (pending)")
     if approval.status not in KNOWN_STATUSES:
         return ExecutionVerdict(

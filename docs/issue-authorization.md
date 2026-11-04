@@ -21,7 +21,8 @@ channel                                                                         
   that can trigger execution.
 - **Private mailbox = trusted approval commands.** Structured
   `issue_approval` messages, accepted only when the git commit that added the
-  inbox file belongs to a trusted actor (`modules/github_authorization.py`;
+  inbox file belongs to a trusted actor or a trusted author email
+  (`NEXUS_TRUSTED_MAILBOX_EMAILS`) (`modules/github_authorization.py`;
   the `created_by` front matter is display-only and never proof of identity).
 - **Local SQLite = persistent authorization state.** The `issue_approvals`
   table (`modules/issue_approvals.py`) holds one row per
@@ -101,9 +102,11 @@ created_by: chatgpt
   exists because a stranger could edit their own issue after approval (e.g.
   swap in malicious instructions). For issues from trusted authors (the repo
   owner / `NEXUS_TRUSTED_ACTORS`) the hash check is skipped, so a harmless
-  edit like a typo fix does not invalidate the approval. The approval itself
-  is required in every case, and `revoked`/`rejected`/pending/corrupted
-  records block for everyone.
+  edit like a typo fix does not invalidate the approval. An issue from a
+  trusted author needs no approval record at all (writing it is the
+  approval; a released `proposal` counts the same). An explicit
+  `revoked`/`rejected` record, or a corrupted one, still blocks it; for
+  everyone else a missing record (pending) blocks too.
 - No shell execution is involved; the message is structured front matter, not
   a natural-language command.
 

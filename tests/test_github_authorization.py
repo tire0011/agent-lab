@@ -187,6 +187,24 @@ class MailboxCommitAttributionTests(unittest.TestCase):
         self.assertFalse(ga.classify_mailbox_message(OWNER, repo, f).trusted)
 
 
+    def test_owner_and_agent_author_emails_are_trusted(self):
+        # The owner's and the coding agents' (Claude, Vibe, Codex/GPT) commits
+        # reach the mailbox with these addresses, not a GitHub noreply one.
+        repo = _make_mailbox_repo(self.root)
+        for i, email in enumerate(
+            ["tire0011@gmx.net", "noreply@anthropic.com", "vibe@mistral.ai", "codex@openai.com"]
+        ):
+            f = _commit_inbox_file(repo, f"e{i}.md", "x", email=email)
+            with patch.dict(os.environ, {"NEXUS_TRUSTED_MAILBOX_EMAILS": ""}):
+                self.assertTrue(ga.classify_mailbox_message(OWNER, repo, f).trusted, email)
+
+    def test_trusted_email_list_is_configurable(self):
+        repo = _make_mailbox_repo(self.root)
+        f = _commit_inbox_file(repo, "g.md", "x", email="noreply@anthropic.com")
+        with patch.dict(os.environ, {"NEXUS_TRUSTED_MAILBOX_EMAILS": "me@example.org"}):
+            self.assertFalse(ga.classify_mailbox_message(OWNER, repo, f).trusted)
+
+
 # ---------------------------------------------------------------------------
 # nexus_tick: owner decisions only from verified comment authors
 # ---------------------------------------------------------------------------

@@ -515,6 +515,7 @@ class NexusInitiativeService:
                 title=raw_title,
                 body=raw_body,
                 skip_content_hash=author_trusted,
+                trusted_author=author_trusted,
             )
             if not verdict.allowed:
                 if record_skips and str(number) not in unapproved_skips:
@@ -578,6 +579,7 @@ class NexusInitiativeService:
             title=str(candidate.payload.get("raw_title") or candidate.title),
             body=str(candidate.payload.get("raw_body") or candidate.payload.get("body") or ""),
             skip_content_hash=bool(candidate.payload.get("author_trusted")),
+            trusted_author=bool(candidate.payload.get("author_trusted")),
         )
 
     def enforce_issue_approvals(self) -> list[str]:
