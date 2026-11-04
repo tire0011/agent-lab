@@ -492,20 +492,21 @@ def evaluate_implementation(
     exception raised here as ``needs_review`` (never as ``succeeded``).
     """
     p = PlanLike.from_any(plan)
-    # A plan-less run, or an implementation plan that itself names only test
-    # files, may be promoted when the goal structurally or explicitly asks
-    # for tests only. Any affected non-test file keeps a plan classified as
-    # implementation, preserving the stricter non-test-evidence gate.
+    # An explicit tests-only request takes precedence over an implementation
+    # plan that names non-test files the planner merely expected to inspect.
+    # The structural fallback (a goal that only names test paths) remains
+    # stricter: a mixed plan is not enough evidence to promote it.
     affected_files_are_tests_only = (
         bool(p.affected_files) and all(is_test_path(path) for path in p.affected_files)
     )
-    goal_allows_tests_only = (
-        goal_is_explicit_tests_only(goal) or goal_names_only_test_paths(goal)
-    )
+    explicit_tests_only_goal = goal_is_explicit_tests_only(goal)
+    goal_names_tests_only = goal_names_only_test_paths(goal)
     if (
         p.change_kind == DEFAULT_CHANGE_KIND
-        and (plan is None or affected_files_are_tests_only)
-        and goal_allows_tests_only
+        and (
+            explicit_tests_only_goal
+            or ((plan is None or affected_files_are_tests_only) and goal_names_tests_only)
+        )
     ):
         p.change_kind = "tests_only"
     all_changed = changed.all_paths()

@@ -435,6 +435,19 @@ class EvaluateImplementationTestCase(unittest.TestCase):
         )
         self.assertEqual(result.outcome, "pass")
 
+    def test_explicit_tests_only_goal_promotes_mixed_implementation_plan(self):
+        plan = self._plan(
+            affected_files=["tests/conftest.py", "modules/llama_cpp_client.py"]
+        )
+        changed = ChangedFiles(tracked_modified=["tests/conftest.py"], untracked_new=[])
+        result = evaluate_implementation(
+            plan,
+            "This is a tests-only change; do not change production code.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "pass")
+
     def test_mixed_implementation_plan_is_not_promoted(self):
         plan = self._plan(
             affected_files=["tests/conftest.py", "modules/llama_cpp_client.py"]
