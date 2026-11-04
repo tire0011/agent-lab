@@ -58,7 +58,7 @@ Primary objective: learn how far the system can improve itself safely and measur
 - Repo: `tire0011/agent-lab`
 - Azure OpenAI resource: `openAI-tire0011`
 - Deployment: `gpt-4o` (`2024-05-13`, GlobalStandard)
-- Public hostname: `agent-lab-tire0011.germanywestcentral.cloudapp.azure.com`
+- Public hostname: `<vm-host>`
 
 ## Execution Order (do not skip)
 
