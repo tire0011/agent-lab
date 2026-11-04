@@ -601,10 +601,17 @@ class InitiativeApprovalGateTests(unittest.TestCase):
         svc.tick()
         self.assertEqual(self.controller.issues, [])
 
-    def test_trusted_author_without_approval_is_blocked(self):
-        # The approval itself is always required; only the hash check is
-        # skipped for trusted authors.
+    def test_trusted_author_without_approval_is_eligible(self):
+        # The owner's own issues (and released proposals) need no mailbox
+        # approval: writing the issue is the approval.
         issue = _issue(553, "Title", "body", author=OWNER)
+        svc = self._service([issue])
+        self.assertEqual([c.ref for c in svc.candidates()], ["553"])
+        svc.tick()
+        self.assertEqual(len(self.controller.issues), 1)
+
+    def test_untrusted_author_without_approval_is_blocked(self):
+        issue = _issue(555, "Title", "body", author="stranger")
         svc = self._service([issue])
         self.assertEqual(svc.candidates(), [])
         svc.tick()

@@ -44,8 +44,9 @@ at once and outside the budget.
 - **Give work:** open a GitHub issue with a concrete Problem / Change / Test.
   Nexus treats only paths in the Change section as files it must create.
   The public repo is discovery and discussion only: Nexus lists all open
-  issues, but **only issues explicitly approved through the private mailbox**
-  are eligible for autonomous execution (for issues from untrusted authors the
+  issues, but **only issues written by a trusted actor (the owner) or
+  explicitly approved through the private mailbox** are eligible for
+  autonomous execution (for issues from untrusted authors the
   approval is additionally bound to the issue's title+body hash, so editing
   such an issue requires renewed approval). Approve or revoke with a
   structured `issue_approval` mailbox message - see
@@ -196,7 +197,9 @@ CLI runner):
   logins>` (default: the repository owner, from `NEXUS_REPO_OWNER` or
   `GITHUB_REPOSITORY`). See `modules/github_authorization.py` and
   `docs/issue-authorization.md`. Mailbox inbox files are authorized by the
-  git author of the commit that added the file - the `created_by` front
+  git author of the commit that added the file (a trusted actor's GitHub
+  noreply address, or an address in `NEXUS_TRUSTED_MAILBOX_EMAILS`, default:
+  the owner's, Claude's, Vibe's and Codex/GPT's `@openai.com`) - the `created_by` front
   matter is display-only and never trusted; untrusted senders get
   `pending_approval` tasks that never run. Issue execution authorization
   itself lives in the local SQLite `issue_approvals` table, fed only by

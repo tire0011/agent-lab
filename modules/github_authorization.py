@@ -15,6 +15,9 @@ Configuration (all optional):
   login; defaults to ``tire0011``.
 - ``NEXUS_TRUSTED_ACTORS`` - comma-separated logins trusted in addition to /
   instead of the owner (e.g. accounts allowed to push to the private mailbox).
+- ``NEXUS_TRUSTED_MAILBOX_EMAILS`` - comma-separated git author emails (or
+  ``@domain``) whose mailbox commits are trusted; replaces the default list of
+  the owner's and the coding agents' addresses.
 """
 
 from __future__ import annotations
@@ -33,6 +36,9 @@ __all__ = [
     "classify_comment",
     "classify_mailbox_message",
     "file_adding_commit_actor_login",
+    "file_adding_commit_email",
+    "is_trusted_mailbox_email",
+    "trusted_mailbox_emails",
     "is_trusted_actor",
     "login_from_noreply_email",
     "owner_login",
@@ -48,6 +54,19 @@ _REPO_OWNER_ENV = "NEXUS_REPO_OWNER"
 _NOREPLY_EMAIL_RE = re.compile(
     r"^(?:\d+\+)?([A-Za-z0-9][A-Za-z0-9-]*)@users\.noreply\.github\.com$",
     re.IGNORECASE,
+)
+
+
+_TRUSTED_MAILBOX_EMAILS_ENV = "NEXUS_TRUSTED_MAILBOX_EMAILS"
+
+# Git author addresses the owner and their coding agents (Claude, Vibe, Codex /
+# GPT) commit to the private mailbox with. Only accounts with push access can
+# commit there at all; this list decides which of those commits may execute.
+DEFAULT_TRUSTED_MAILBOX_EMAILS = (
+    "tire0011@gmx.net",
+    "noreply@anthropic.com",
+    "vibe@mistral.ai",
+    "@openai.com",
 )
 
 
@@ -140,15 +159,37 @@ def _git(repo_path: Path | str, args: list[str]) -> str | None:
     return proc.stdout.strip() or None
 
 
-def file_adding_commit_actor_login(repo_path: Path | str, file_path: Path | str) -> str | None:
-    """GitHub login of the commit that added *file_path* to the repository."""
+def trusted_mailbox_emails() -> tuple[str, ...]:
+    """Lowercased author emails / ``@domain`` suffixes trusted in the mailbox."""
+    raw = os.environ.get(_TRUSTED_MAILBOX_EMAILS_ENV, "").strip()
+    if raw:
+        return tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+    return DEFAULT_TRUSTED_MAILBOX_EMAILS
+
+
+def is_trusted_mailbox_email(email: Any) -> bool:
+    if not isinstance(email, str) or "@" not in email:
+        return False
+    email = email.strip().lower()
+    return any(
+        email.endswith(entry) if entry.startswith("@") else email == entry
+        for entry in trusted_mailbox_emails()
+    )
+
+
+def file_adding_commit_email(repo_path: Path | str, file_path: Path | str) -> str | None:
+    """Author email of the commit that added *file_path* to the repository."""
     repo = Path(repo_path)
     try:
         rel = str(Path(file_path).relative_to(repo))
     except ValueError:
         rel = str(file_path)
-    email = _git(repo, ["log", "--diff-filter=A", "-1", "--format=%ae", "--", rel])
-    return login_from_noreply_email(email)
+    return _git(repo, ["log", "--diff-filter=A", "-1", "--format=%ae", "--", rel])
+
+
+def file_adding_commit_actor_login(repo_path: Path | str, file_path: Path | str) -> str | None:
+    """GitHub login of the commit that added *file_path* to the repository."""
+    return login_from_noreply_email(file_adding_commit_email(repo_path, file_path))
 
 
 def classify_mailbox_message(
@@ -164,7 +205,10 @@ def classify_mailbox_message(
     pusher controls - so it is never used for the decision. The commit author
     is the only signal that cannot be forged from within the file.
     """
-    login = file_adding_commit_actor_login(repo_path, file_path)
+    email = file_adding_commit_email(repo_path, file_path)
+    if is_trusted_mailbox_email(email):
+        return ActorDecision(True, email, "inbox file was committed with a trusted author email")
+    login = login_from_noreply_email(email)
     if login is None:
         return ActorDecision(
             False,
