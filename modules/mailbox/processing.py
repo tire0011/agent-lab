@@ -643,8 +643,12 @@ class MailboxProcessor:
         if not plan or self.dry_run:
             return plan
 
+        notices: list[Path] = []
         for path in plan.inbox:
             self._log_terminal_inbox_message(path)
+            notice = self._write_discard_notice(path)
+            if notice is not None:
+                notices.append(notice)
 
         removed: list[Path] = []
         for path in plan.paths:
@@ -661,7 +665,7 @@ class MailboxProcessor:
 
         commit_msg = f"mailbox: prune {plan.summary()} older than {days}d"
         if not git_add_and_commit(
-            self._mailbox_repo_path, removed, commit_msg, self._mailbox_commit_prefixes
+            self._mailbox_repo_path, removed + notices, commit_msg, self._mailbox_commit_prefixes
         ):
             logger.warning("mailbox prune could not be committed")
         else:
@@ -670,6 +674,37 @@ class MailboxProcessor:
                 plan.summary(), plan.protected, plan.truncated,
             )
         return plan
+
+    def _write_discard_notice(self, path: Path) -> Path | None:
+        """An outbox answer for a message dropped after its retries (#521).
+
+        Without it a failed message just vanished from the inbox and its
+        sender never learned why (a crashing command went unnoticed).
+        """
+        row = self.conn.execute(
+            "SELECT retry_count, last_error, msg_type FROM mailbox_messages WHERE file_path = ?",
+            (str(path),),
+        ).fetchone()
+        notice = self.outbox / f"failed-{path.stem}.md"
+        body = (
+            "---\n"
+            "type: result\n"
+            "status: failed\n"
+            f"source: inbox/{path.name}\n"
+            "---\n\n"
+            f"# Failed: {path.name}\n\n"
+            f"The message was not processed and was removed from the inbox after "
+            f"{int(row[0]) if row and row[0] is not None else MAX_RETRY} attempts.\n\n"
+            f"**Type:** {str(row[2]) if row and row[2] else 'unknown'}\n\n"
+            f"**Last error:**\n\n```text\n{(str(row[1]) if row and row[1] else 'unknown')[:2000]}\n```\n"
+        )
+        try:
+            self.outbox.mkdir(parents=True, exist_ok=True)
+            notice.write_text(body, encoding="utf-8")
+        except OSError:
+            logger.warning("could not write the discard notice for %s", path.name)
+            return None
+        return notice
 
     def _log_terminal_inbox_message(self, path: Path) -> None:
         """Record why an inbox message is being dropped, before it is gone.
