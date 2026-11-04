@@ -449,6 +449,26 @@ class EvaluateImplementationTestCase(unittest.TestCase):
         self.assertEqual(result.outcome, "needs_review")
         self.assertIn("nur Tests geändert", result.reason)
 
+    def test_explicit_tests_only_goal_promotes_mixed_plan_when_only_tests_changed(self):
+        # #493: the issue says "tests-only change" but the planner listed the
+        # modules it had to read; a pure test diff is what was asked for.
+        plan = self._plan(
+            affected_files=["tests/conftest.py", "modules/llama_cpp_client.py"]
+        )
+        changed = ChangedFiles(
+            tracked_modified=["tests/conftest.py"],
+            untracked_new=["tests/test_conftest_local_model_isolation.py"],
+        )
+        result = evaluate_implementation(
+            plan,
+            "This is a tests-only change: only files under `tests/` change. "
+            "Point LOCAL_MODEL_URL in tests/conftest.py at an unreachable address.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertNotIn("nur Tests geändert", result.reason)
+        self.assertEqual(result.outcome, "pass")
+
     def test_no_plan_ordinary_goal_with_only_test_files_is_needs_review(self):
         """Single-call pipeline: plan=None + ordinary goal => needs_review when only tests changed."""
         changed = ChangedFiles(
