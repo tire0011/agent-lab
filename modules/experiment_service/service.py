@@ -1851,7 +1851,22 @@ class ExperimentService:
                     worktree_path,
                 )
                 quality_evaluation = eval_result.to_dict()
-                if eval_result.outcome != "pass":
+                # Only the artifact-evidence checks failed and the tests are
+                # green: the reviewer decides at adoption (#519). Only a
+                # GitHub-tracked run reaches adoption and its reviewer, so
+                # every other run keeps the hard stop.
+                review_findings = (
+                    eval_result.soft_findings() if github_work_tracking is not None else None
+                )
+                if review_findings is not None:
+                    quality_evaluation["outcome"] = "pass"
+                    quality_evaluation["review_findings"] = review_findings
+                    elog.warning(
+                        "verifying", "quality_evaluation_to_reviewer",
+                        f"Quality gate findings go to the reviewer: {review_findings}",
+                        evaluation_json=json.dumps(quality_evaluation),
+                    )
+                elif eval_result.outcome != "pass":
                     final_status = STATUS_NEEDS_REVIEW
                     error = f"quality evaluation: {eval_result.reason}"
                     elog.warning(
