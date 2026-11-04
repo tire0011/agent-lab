@@ -368,6 +368,8 @@ def _process_context(
 # range. Anything else is refused: the message carries no shell.
 SETTINGS: dict[str, tuple[str, int, int]] = {
     "daily_budget": ("nexus.daily_budget", 0, 50),
+    # Starts on top of the daily budget for the next 24 hours (#523).
+    "extra_budget": ("nexus.extra_budget", 0, 20),
 }
 
 
@@ -404,6 +406,8 @@ def _process_setting(
         (db_key, str(value), _now_iso()),
     )
     conn.commit()
+    if key == "extra_budget":
+        return f"Setting {key} is now {value} for the next 24 hours.", None
     return f"Setting {key} is now {value}.", None
 
 

@@ -103,9 +103,11 @@ them.
   ```
 
 - `setting` — changes one allowlisted owner setting from the front matter;
-  no shell. Today only `daily_budget` (0–50), the daily budget of
-  self-started experiments. It overrides `--daily-budget` from
-  `deploy/nexus-tick.service` from the next tick on.
+  no shell. `daily_budget` (0–50) is the daily budget of self-started
+  experiments; it overrides `--daily-budget` from
+  `deploy/nexus-tick.service` from the next tick on. `extra_budget` (0–20)
+  adds that many starts on top of it for the next 24 hours, then expires on
+  its own.
 
   ```markdown
   ---
