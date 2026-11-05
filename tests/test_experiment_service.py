@@ -797,6 +797,9 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
     def test_token_budget_shadow_logs_and_continues(self):
         self.implementation_worker.run.side_effect = self._budget_stream_worker()
+        # This test reaches verification in shadow mode. Use the interpreter
+        # running the suite rather than assuming the CI checkout has a .venv.
+        self.service.test_python_executable = sys.executable
         with patch.dict(os.environ, {
             "NEXUS_EXPERIMENT_TOKEN_BUDGET": "100",
             "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE": "shadow",
