@@ -1907,7 +1907,16 @@ class ExperimentAdoptionService:
                 integrated_changed,
                 str(integration_path),
             )
-            if eval_result.outcome != "pass":
+            # Soft gate findings (#519) go to the reviewer; without one they
+            # stay a hard stop here, before anything is pushed.
+            integrated_soft = eval_result.soft_findings() if self.reviewer is not None else None
+            review_findings = [
+                f for f in (
+                    (experiment.quality_evaluation or {}).get("review_findings"),
+                    integrated_soft,
+                ) if f
+            ]
+            if eval_result.outcome != "pass" and integrated_soft is None:
                 keep_integration = True
                 return self._finish_review(
                     experiment_id,
@@ -2042,7 +2051,10 @@ class ExperimentAdoptionService:
                     draft=False,
                 )
                 self.github_work_tracking.mark_pull_request_ready(work_ref)
-                blocked = self._review_blocks(experiment_id, experiment.goal, work_ref, integration_path, elog)
+                blocked = self._review_blocks(
+                    experiment_id, experiment.goal, work_ref, integration_path, elog,
+                    gate_findings="; ".join(dict.fromkeys(review_findings)),
+                )
                 if blocked is not None:
                     return self._finish_failure(
                         experiment_id,
@@ -2157,24 +2169,33 @@ class ExperimentAdoptionService:
             logger.warning("could not classify GitHub lifecycle readiness", exc_info=True)
             return None
 
-    def _review_blocks(self, experiment_id, goal, work_ref, integration_path, elog) -> str | None:
+    def _review_blocks(
+        self, experiment_id, goal, work_ref, integration_path, elog, *, gate_findings: str = "",
+    ) -> str | None:
         """Review the change before the merge (#396); the reason if it is blocked.
 
         The review result goes on the pull request either way. A review that
         cannot run does not block: tests and the quality gate already passed.
+        With quality-gate findings (#519) only a real verdict may merge: the
+        reviewer was asked to judge them, so no verdict means no merge.
         """
+        no_verdict = (
+            f"Qualitäts-Gate-Befund ohne Reviewer-Urteil: {gate_findings}" if gate_findings else None
+        )
         if self.reviewer is None:
-            return None
+            return no_verdict
+        kwargs = {"gate_findings": gate_findings} if gate_findings else {}
         try:
             result = self.reviewer.review(
                 experiment_id=experiment_id,
                 goal=str(goal or ""),
                 worktree_path=str(integration_path),
                 base_sha=self._integration_base_sha(),
+                **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - a broken review must not block
             logger.warning("adoption review failed for %s: %s", experiment_id, exc)
-            return None
+            return no_verdict
         from modules.nexus_reviewer import review_comment
 
         if elog is not None:
@@ -2185,6 +2206,8 @@ class ExperimentAdoptionService:
             logger.warning("could not post the review on PR #%s: %s", work_ref.pr_number, exc)
         if result.blocks:
             return f"Review by {result.reviewer} blocked the merge: {result.summary}"
+        if gate_findings and result.verdict != "approve":
+            return no_verdict
         return None
 
     def _finish_failure(

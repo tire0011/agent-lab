@@ -422,6 +422,11 @@ class EvaluationCheck:
         }
 
 
+# Checks whose failure, with green tests, goes to the reviewer instead of
+# stopping the run (#519).
+SOFT_CHECKS = frozenset({"required_artifacts_present", "non_test_evidence", "plan_diff_evidence"})
+
+
 @dataclass
 class EvaluationResult:
     outcome: str  # "pass" or "needs_review"
@@ -430,6 +435,21 @@ class EvaluationResult:
     expected_files: list[str] = field(default_factory=list)
     changed_files: list[str] = field(default_factory=list)
     missing_artifacts: list[str] = field(default_factory=list)
+
+    def soft_findings(self) -> str | None:
+        """The reason, when only artifact-evidence checks failed; else ``None``.
+
+        These checks read file paths out of free task text and have raised
+        many false alarms (#461, #499, #513). With green tests they no longer
+        stop the run: the reviewer gets them and decides (#519). Any other
+        failed check, or an empty diff, stays a hard stop.
+        """
+        failed = [c for c in self.checks if not c.passed]
+        if self.outcome == "pass" or not failed or not self.changed_files:
+            return None
+        if any(c.name not in SOFT_CHECKS for c in failed):
+            return None
+        return self.reason
 
     def to_dict(self) -> dict[str, Any]:
         return {

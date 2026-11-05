@@ -103,9 +103,11 @@ them.
   ```
 
 - `setting` — changes one allowlisted owner setting from the front matter;
-  no shell. Today only `daily_budget` (0–50), the daily budget of
-  self-started experiments. It overrides `--daily-budget` from
-  `deploy/nexus-tick.service` from the next tick on.
+  no shell. `daily_budget` (0–50) is the daily budget of self-started
+  experiments; it overrides `--daily-budget` from
+  `deploy/nexus-tick.service` from the next tick on. `extra_budget` (0–20)
+  adds that many starts on top of it for the next 24 hours, then expires on
+  its own.
 
   ```markdown
   ---
@@ -282,15 +284,13 @@ which includes the Copilot CLI setup.
   `### Inbox` subsection at the end of the `## Ideas` section.
 - Writes are guarded by an exclusive file lock (`fcntl.flock`) so
   concurrent requests append one at a time instead of racing.
-- The Web UI's "Idee hinzufügen" field/button on `/` calls this endpoint
-  and refreshes the ideas list on success.
 
 ## Coding task API
 
 Small, authenticated FastAPI wrapper around `modules.codex_task_service.CodexTaskService`,
 which itself reuses the coding-agent workers — `modules.codex_worker.CodexWorker`
 (`codex exec`) and `modules.claude_worker.ClaudeWorker` (`claude --print`),
-never `shell=True`. Currently synchronous only, no chat/Web UI integration, no
+never `shell=True`. Currently synchronous only, no chat integration, no
 background queue, no parallel execution.
 
 Which agent runs a task is selected by a persistent round-robin when the task is created and
@@ -349,8 +349,7 @@ State machine: `queued → submitted → running → succeeded / failed / needs_
 A background `MailboxTaskWorker` daemon (10 s poll interval) calls
 `submit_queued()` + `poll_running()` on each tick. Experiments run
 serially (one VM, one budget). Results reach the outbox as
-`task-approval-result-<id>.md` (file name kept for compatibility). The Web UI
-"Mailbox-Aufträge" card lists the records.
+`task-approval-result-<id>.md` (file name kept for compatibility).
 
 Records from before #264 stay readable: `approved` rows became `queued` on
 migration; `pending_approval` and `rejected` rows keep their status and are
@@ -391,9 +390,7 @@ curl -s "$BASE/logs/trace/verification%20succeeded"
 ```
 
 An unresolvable reference returns `found: false` with an empty timeline rather
-than a 404. The Logs tab exposes both: a free-text search box over the full
-history, and an "Auftrag verfolgen" field (plus a per-entry button) that renders
-the same trace with its summary.
+than a 404.
 
 ## Nexus diagnostic commands
 
@@ -439,7 +436,7 @@ so its diagnosis and your `nexus logs` see the same facts.
 
 `GET /activity/public` returns the latest 100 sanitized lifecycle events without
 authentication. `GET /experiments/{id}/public` returns the corresponding public
-experiment summary. The website displays this feed and refreshes it every 10 seconds.
+experiment summary.
 Public experiment lookups accept either the full ID or a unique lowercase hexadecimal
 prefix of at least eight characters.
 
@@ -478,8 +475,7 @@ activity events stored in the database are already safe to return.
 **Never returned:** API keys, tokens, credentials, or headers; prompts or
 user-provided task bodies; environment variables; source code, diffs, or
 file contents; stack traces with internal paths; or unrestricted/raw
-command output. The website's Diagnostics card and
-`./scripts/nexus-logs.ps1` both display this same model.
+command output. `./scripts/nexus-logs.ps1` displays this same model.
 
 ## Security
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,6 +53,44 @@ class BudgetSettingTests(unittest.TestCase):
         self.addCleanup(svc.close)
         self.assertEqual(svc.daily_budget, 15)
 
+
+
+class ExtraBudgetTests(unittest.TestCase):
+    """``extra_budget`` adds starts on top of the daily budget for 24 hours (#523)."""
+
+    def _service(self, value: str | None, set_at: str, daily_budget: int = 5):
+        fx = InitiativeFixture()
+        with sqlite3.connect(fx.db_path) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS service_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+            if value is not None:
+                conn.execute("INSERT INTO service_settings VALUES ('nexus.extra_budget', ?, ?)", (value, set_at))
+        svc = fx.service(daily_budget=daily_budget)
+        self.addCleanup(svc.close)
+        return svc
+
+    def test_message_stores_the_bonus(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = init_db(str(Path(tmp.name) / "agent.db"))
+        self.addCleanup(conn.close)
+        reply, _ = _process_setting(_msg(key="extra_budget", value="5"), Path("."), conn, 1)
+        self.assertIn("next 24 hours", reply)
+        self.assertIn("between", _process_setting(_msg(key="extra_budget", value="21"), Path("."), conn, 1)[0])
+
+    def test_a_fresh_bonus_adds_to_the_daily_budget(self):
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(self._service("5", now).daily_budget, 10)
+
+    def test_an_old_bonus_has_expired(self):
+        old = (datetime.now(timezone.utc) - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(self._service("5", old).daily_budget, 5)
+
+    def test_unlimited_stays_unlimited(self):
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(self._service("5", now, daily_budget=0).daily_budget, 0)
+
+    def test_without_a_bonus_nothing_changes(self):
+        self.assertEqual(self._service(None, "").daily_budget, 5)
 
 if __name__ == "__main__":
     unittest.main()

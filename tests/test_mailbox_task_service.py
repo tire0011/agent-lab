@@ -491,15 +491,6 @@ class TestApprovalEndpointsRemoved(unittest.TestCase):
         self.assertIn("/mailbox/tasks/{approval_id}", paths)
         self.assertFalse([p for p in paths if p.endswith(("/approve", "/reject")) and "mailbox" in p])
 
-    def test_ui_has_no_approval_controls(self):
-        static = Path(__file__).resolve().parents[1] / "static"
-        javascript = (static / "tasks.js").read_text(encoding="utf-8")
-        html = (static / "index.html").read_text(encoding="utf-8")
-        self.assertNotIn("/approve", javascript)
-        self.assertNotIn("/reject", javascript)
-        self.assertNotIn("Genehmigen", javascript)
-        self.assertNotIn("task-approvals", html)
-
 
 class TestTaskLogging(unittest.TestCase):
     """Gap 1: mailbox intake and queueing/experiment

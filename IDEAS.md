@@ -11,8 +11,8 @@ For a record of what has actually been *built and verified*, see
 
 ## New ideas
 
-Propose a new idea as a GitHub issue. Ideas submitted through the Web UI
-(`POST /ideas`) or a mailbox `idea` message are still appended to a
+Propose a new idea as a GitHub issue. Ideas submitted via `POST /ideas`
+or a mailbox `idea` message are still appended to a
 `## Ideas` / `### Inbox` section in this file, one line each; turn them
 into issues and remove them from here.
 

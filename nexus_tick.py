@@ -428,6 +428,70 @@ def _finished_badly(db_path: str, since: str) -> list[str]:
     return found
 
 
+# Nexus stood still for 17 hours after #506 and every tick only said "idle"
+# (#521). After this long without starting work, the owner hears about it,
+# at most once a day.
+_STALL_ALARM_HOURS = 6
+_STALL_ALARM_REPEAT_HOURS = 24
+_STALL_ALARM = "stall_alarm"
+# Decisions that explain a quiet stretch on their own.
+_EXPECTED_QUIET = ("busy", "budget_exhausted")
+
+
+def _stall_alarm(db_path: str, now: datetime | None = None) -> str | None:
+    """A message when Nexus has started no work for a long time, else ``None``.
+
+    Records the alarm in the initiative log so it is sent once a day.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        db = sqlite3.connect(db_path, timeout=30)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = db.execute(
+            "SELECT created_at, decision, detail FROM nexus_initiative_log ORDER BY created_at"
+        ).fetchall()
+        if not rows:
+            return None
+        dispatched = [r[0] for r in rows if r[1] == "dispatched"]
+        since = dispatched[-1] if dispatched else rows[0][0]
+        window = [r for r in rows if r[0] > since and r[1] != _STALL_ALARM]
+        quiet_for = now - datetime.fromisoformat(since)
+        if quiet_for < timedelta(hours=_STALL_ALARM_HOURS):
+            return None
+        if window and window[-1][1] in _EXPECTED_QUIET:
+            return None
+        alarms = [r[0] for r in rows if r[1] == _STALL_ALARM and r[0] > since]
+        if alarms and now - datetime.fromisoformat(alarms[-1]) < timedelta(hours=_STALL_ALARM_REPEAT_HOURS):
+            return None
+        counts: dict[str, int] = {}
+        for _created, decision, _detail in window:
+            counts[decision] = counts.get(decision, 0) + 1
+        seen = ", ".join(f"{d} x{n}" for d, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+        examples = list(dict.fromkeys(
+            str(detail)[:150] for _c, decision, detail in reversed(window)
+            if detail and decision != "idle"
+        ))[:3]
+        message = (
+            f"Nexus has started no work for {int(quiet_for.total_seconds() // 3600)}h "
+            f"(decisions since: {seen or 'none'})"
+            + (f"; e.g. {' | '.join(examples)}" if examples else "")
+        )
+        with db:
+            db.execute(
+                "INSERT INTO nexus_initiative_log (tick_id, created_at, decision, detail) "
+                "VALUES (?, ?, ?, ?)",
+                (f"stall-{now.isoformat()}", now.isoformat(), _STALL_ALARM, message[:1000]),
+            )
+        return message
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        logger.warning("stall alarm: %s", exc)
+        return None
+    finally:
+        db.close()
+
+
 def _notify(repo_root: str, messages: list[str]) -> None:
     """Comment on the watched notification PR so Claude wakes up (#365).
 
@@ -533,7 +597,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.dry_run:
             if decision is not None and decision.decision == "error":
                 _events.append(f"Tick error: {str(decision.detail or '')[:300]}")
-            _notify(args.repo_root, _events + _finished_badly(args.db_path, started_at))
+            stalled = _stall_alarm(args.db_path)
+            _notify(
+                args.repo_root,
+                _events + _finished_badly(args.db_path, started_at) + ([stalled] if stalled else []),
+            )
 
 
 if __name__ == "__main__":
