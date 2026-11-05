@@ -15,6 +15,15 @@ from modules.mailbox.task_ingest import insert_task_approval
 from modules.run_store import init_db
 from tests.test_mailbox_task_service import _make_exp, _make_service
 
+def _wait_for_failure_analyses(svc, timeout=None):
+    from concurrent.futures import wait as _fut_wait
+    with svc._failure_analysis_futures_lock:
+        pending = tuple(svc._failure_analysis_futures)
+    if not pending:
+        return True
+    _done, not_done = _fut_wait(pending, timeout=timeout)
+    return not not_done
+
 _RECEIVED = "2026-01-01T00:00:00Z"
 
 
@@ -54,7 +63,7 @@ def _dispatch_all(svc) -> None:
     """Drain the direct-to-Nexus queue more often than needed."""
     for _ in range(10):
         svc.submit_queued()
-    svc._wait_for_failure_analyses(timeout=5)
+    _wait_for_failure_analyses(svc, timeout=5)
 
 
 @pytest.fixture

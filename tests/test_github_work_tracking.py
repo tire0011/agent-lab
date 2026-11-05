@@ -359,6 +359,27 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertIn(ref.branch_name, self.fake.refs)
         self.assertTrue(any(call[0:2] == ("POST", "/repos/tire0011/agent-lab/issues") for call in self.fake.calls))
 
+    def test_controller_task_reuses_issue_from_goal_header(self):
+        self.fake.issues[220] = {
+            "number": 220,
+            "title": "Mailbox: accept all commands",
+            "state": "open",
+        }
+        source = SimpleNamespace(
+            source_type="task",
+            source_id="controller-220",
+            title="Nexus controller task",
+            content="GitHub Issue #220: Mailbox: accept all commands\n\nDetails.",
+        )
+
+        with patch.object(self.service, "_reuse_issue", wraps=self.service._reuse_issue) as reuse, \
+             patch.object(self.service, "_create_issue", wraps=self.service._create_issue) as create:
+            ref = self.service.ensure_for_source(source)
+
+        self.assertEqual(ref.issue_number, 220)
+        reuse.assert_called_once_with(220)
+        create.assert_not_called()
+
     def test_pr_merge_closes_issue_and_keeps_experiment_link(self):
         source = SimpleNamespace(
             source_type="issue",

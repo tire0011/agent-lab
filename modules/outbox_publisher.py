@@ -214,14 +214,6 @@ class OutboxPublisher:
     # Public helpers: state transitions used by producers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def status_pending_write() -> str:
-        return PUBLISH_PENDING_WRITE
-
-    @staticmethod
-    def status_written() -> str:
-        return PUBLISH_WRITTEN
-
     # ------------------------------------------------------------------
     # Core publish API
     # ------------------------------------------------------------------

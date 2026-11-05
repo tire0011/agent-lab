@@ -97,14 +97,6 @@ class TestMailboxConfigDefaults(unittest.TestCase):
                 else:
                     os.environ.pop(k, None)
 
-    def test_repos_are_separate_property(self):
-        cfg = MailboxConfig(
-            code_repo_path=Path("/code"),
-            mailbox_repo_path=Path("/mailbox"),
-            inbox_dir=Path("/mailbox/inbox"),
-            outbox_dir=Path("/mailbox/outbox"),
-        )
-        self.assertTrue(cfg.repos_are_separate)
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +139,6 @@ class TestMailboxConfigExternal(unittest.TestCase):
             str(self.cfg.inbox_dir).startswith(str(self.mailbox_repo))
         )
 
-    def test_repos_are_separate(self):
-        self.assertTrue(self.cfg.repos_are_separate)
 
     def test_mailbox_task_service_uses_config(self):
         svc = MailboxTaskService(db_path=self.db_path, mailbox_config=self.cfg)
@@ -564,7 +554,6 @@ class TestEnvVarDirectExternalPaths(unittest.TestCase):
             cfg = MailboxConfig.from_env()
             self.assertEqual(cfg.inbox_dir, Path("/var/lib/nexus/mailbox-repo/inbox"))
             self.assertEqual(cfg.outbox_dir, Path("/var/lib/nexus/mailbox-repo/outbox"))
-            self.assertTrue(cfg.repos_are_separate)
         finally:
             self._restore_env()
 
@@ -575,7 +564,6 @@ class TestEnvVarDirectExternalPaths(unittest.TestCase):
             cfg = MailboxConfig.from_env()
             self.assertEqual(cfg.inbox_dir, Path("/agent/inbox"))
             self.assertEqual(cfg.outbox_dir, Path("/agent/outbox"))
-            self.assertFalse(cfg.repos_are_separate)
         finally:
             self._restore_env()
 
@@ -583,13 +571,11 @@ class TestEnvVarDirectExternalPaths(unittest.TestCase):
         cfg = MailboxConfig.from_paths(Path("/code"), Path("/mailbox"))
         self.assertEqual(cfg.inbox_dir, Path("/mailbox/inbox"))
         self.assertEqual(cfg.outbox_dir, Path("/mailbox/outbox"))
-        self.assertTrue(cfg.repos_are_separate)
 
     def test_from_paths_same_gives_root_layout(self):
         cfg = MailboxConfig.from_paths(Path("/agent"), Path("/agent"))
         self.assertEqual(cfg.inbox_dir, Path("/agent/inbox"))
         self.assertEqual(cfg.outbox_dir, Path("/agent/outbox"))
-        self.assertFalse(cfg.repos_are_separate)
 
 
 class TestCLIPathResolution(unittest.TestCase):
@@ -730,7 +716,6 @@ class TestTwoRepoEndToEndCommit(unittest.TestCase):
         cfg = MailboxConfig.from_paths(self.code_repo, self.code_repo)
         self.assertEqual(cfg.inbox_dir, self.code_repo / "inbox")
         self.assertEqual(cfg.outbox_dir, self.code_repo / "outbox")
-        self.assertFalse(cfg.repos_are_separate)
 
 
 class TestTwoRepoEndToEndProcessInbox(unittest.TestCase):

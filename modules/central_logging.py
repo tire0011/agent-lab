@@ -280,11 +280,6 @@ class ExperimentLogger:
     def path(self) -> Path:
         return self._path
 
-    def bind_mailbox_task_id(self, mailbox_task_id: str | None) -> None:
-        """Attach a mailbox task id discovered after this logger was created."""
-        if mailbox_task_id:
-            self.mailbox_task_id = mailbox_task_id
-
     def bind_session_id(self, session_id: str | None) -> None:
         if session_id:
             self.session_id = redaction.redact(session_id)

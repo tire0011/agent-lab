@@ -16,7 +16,7 @@ import logging
 import re
 import sqlite3
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,10 +86,6 @@ _MAX_EXPERIMENTS_PER_TASK = 2
 
 
 class ApprovalNotFoundError(LookupError):
-    pass
-
-
-class ApprovalStateError(RuntimeError):
     pass
 
 
@@ -241,15 +237,6 @@ class MailboxTaskService:
             future.result()
         except Exception:
             logger.exception("mailbox_task: background failure analysis crashed")
-
-    def _wait_for_failure_analyses(self, timeout: float | None = None) -> bool:
-        """Wait for already queued diagnoses; used by shutdown and tests."""
-        with self._failure_analysis_futures_lock:
-            pending = tuple(self._failure_analysis_futures)
-        if not pending:
-            return True
-        _done, not_done = wait(pending, timeout=timeout)
-        return not not_done
 
     def _failure_analysis(self, *, context: str | None = None) -> Any | None:
         """Lazily-built :class:`FailureAnalysisService`, or ``None`` if unavailable (#145).
@@ -449,44 +436,6 @@ class MailboxTaskService:
             return
         approval = _row_to_approval(row)
         self._orchestrate_approval(approval, approval.task_body)
-
-    def continue_discussion(self, approval_id: str, user_message: str) -> MailboxTaskApproval:
-        """Continue the SAME persistent Nexus task after a clarification/review reply.
-
-        This is an internal primitive for API/MCP/UI adapters. It deliberately
-        reuses the approval id as the controller source id, so the durable
-        Nexus task session and memory/history are recovered automatically.
-        """
-        message = (user_message or "").strip()
-        if not message:
-            raise ValueError("user_message must not be empty")
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id=?", (approval_id,)
-            ).fetchone()
-            if row is None:
-                raise ApprovalNotFoundError(f"no approval with id {approval_id!r}")
-            approval = _row_to_approval(row)
-            if approval.status != _STATUS_NEEDS_REVIEW or approval.experiment_id:
-                raise ApprovalStateError(
-                    "discussion can only continue for a non-experiment task awaiting review"
-                )
-            combined = (
-                f"{approval.task_body.rstrip()}\n\n"
-                f"User follow-up:\n{message}"
-            )[:32000]
-            updated = self._conn.execute(
-                """UPDATE mailbox_task_approvals
-                   SET status=?, task_body=?, result_summary=NULL, error=NULL, updated_at=?
-                   WHERE id=? AND status=? AND experiment_id IS NULL""",
-                (_STATUS_QUEUED, combined, _now_iso(), approval.id, _STATUS_NEEDS_REVIEW),
-            ).rowcount
-            self._conn.commit()
-        if not updated:
-            raise ApprovalStateError("task discussion state changed concurrently")
-        refreshed = self.get(approval_id)
-        self._orchestrate_approval(refreshed, message)
-        return self.get(approval_id)
 
     def _orchestrate_approval(
         self,
@@ -1226,16 +1175,6 @@ class MailboxTaskService:
         except Exception:
             logger.exception("mailbox_task: failed to write outbox for %s", approval.id)
             return None
-
-    # Backward-compatible name used by existing tests/helpers.
-    def _write_outbox(
-        self,
-        approval: MailboxTaskApproval,
-        status: str,
-        exp: Any,
-        summary: str,
-    ) -> str | None:
-        return self._write_result_outbox(approval, status, summary, exp)
 
     def _write_problem(
         self,

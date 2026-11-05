@@ -30,6 +30,11 @@ from modules.experiment_service import ExperimentService
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 
 
+def _wait_for_thread(service, experiment_id, timeout=None):
+    thread = service._threads.get(experiment_id)
+    if thread is not None:
+        thread.join(timeout)
+
 def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
@@ -354,7 +359,7 @@ class AdoptionRepoFixture:
     def wait_terminal(self, experiment_id: str, timeout: float = 10.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            self.adoption_service.wait_for_thread(experiment_id, timeout=0.1)
+            _wait_for_thread(self.adoption_service, experiment_id, timeout=0.1)
             adoption = self.adoption_service.get(experiment_id)
             if adoption.status not in {STATUS_QUEUED, STATUS_ADOPTING}:
                 return adoption
@@ -676,7 +681,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
     def _wait_terminal_on(self, service, experiment_id: str, timeout: float = 20.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            service.wait_for_thread(experiment_id, timeout=0.1)
+            _wait_for_thread(service, experiment_id, timeout=0.1)
             adoption = service.get(experiment_id)
             if adoption.status not in {STATUS_QUEUED, STATUS_ADOPTING}:
                 return adoption

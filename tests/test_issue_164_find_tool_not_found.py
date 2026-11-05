@@ -144,7 +144,7 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator = self._orchestrator(tmp, service=service)
             try:
-                metadata = orchestrator._find_tool_not_found_metadata(
+                metadata = orchestrator.tool_router.find_tool_not_found_metadata(
                     f"Inspect experiment {experiment_id}",
                     "inspect repository lifecycle state",
                     ["git_status"],
@@ -198,7 +198,7 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator = self._orchestrator(tmp, service=service)
             try:
-                metadata = orchestrator._find_tool_not_found_metadata(
+                metadata = orchestrator.tool_router.find_tool_not_found_metadata(
                     "Continue the release notes for 20260913",
                     "inspect repository lifecycle state",
                     [],
@@ -226,7 +226,7 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
                     kind="input",
                     content=f"Resume experiment {experiment_id}",
                 )
-                metadata = orchestrator._find_tool_not_found_metadata(
+                metadata = orchestrator.tool_router.find_tool_not_found_metadata(
                     "Summarise yesterday's mailbox traffic",
                     "inspect mailbox state",
                     [],
@@ -314,7 +314,10 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
                     source_type="task",
                     source_id="issue-164-telemetry",
                 )
-                stats = orchestrator.task_store.controller_turn_stats()
+                turn_rows = orchestrator.task_store._conn.execute(
+                    "SELECT outcome, COUNT(*) AS n FROM nexus_controller_turns WHERE session_id=? GROUP BY outcome",
+                    (result.session_id,),
+                ).fetchall()
                 events = orchestrator.task_store.recent_events(
                     result.session_id, kind="find_tool_redirected"
                 )
@@ -324,7 +327,7 @@ class Issue164FindToolNotFoundTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_RESUME_EXPERIMENT)
         # The controller chose find_tool twice; the turn record must say so
         # rather than claiming a decision the controller never made.
-        self.assertEqual(stats["by_outcome"], {"find_tool": 2})
+        self.assertEqual({row["outcome"]: row["n"] for row in turn_rows}, {"find_tool": 2})
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["metadata"]["controller_action"], "find_tool")
         self.assertEqual(events[0]["metadata"]["experiment_id"], experiment_id)

@@ -318,11 +318,6 @@ class ExperimentAdoptionService:
             ).fetchone()
         return _row_to_adoption(row, experiment_id)
 
-    def wait_for_thread(self, experiment_id: str, timeout: float | None = None) -> None:
-        thread = self._threads.get(experiment_id)
-        if thread is not None:
-            thread.join(timeout)
-
     def recover_after_restart(self) -> list[str]:
         """Resume adoptions that a process restart interrupted mid-flight.
 

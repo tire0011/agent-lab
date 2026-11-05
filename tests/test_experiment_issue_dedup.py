@@ -14,6 +14,7 @@ from modules.experiment_service import (
 )
 from modules.nexus_controller_service import NexusControllerService
 from modules.task_orchestrator import ACTION_NEW_EXPERIMENT, TaskDecision
+from modules.nexus_sources import task_source
 
 
 class ExperimentIssueDedupTests(unittest.TestCase):
@@ -134,7 +135,7 @@ class ControllerAlreadyActiveTests(unittest.TestCase):
         orchestrator.run.return_value = decision
 
         with patch.object(controller, "_start_experiment_thread") as start:
-            result = controller.handle_task("GitHub Issue #7: duplicate")
+            result = controller.handle_source(task_source("GitHub Issue #7: duplicate"))
 
         self.assertEqual(
             result,

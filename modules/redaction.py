@@ -154,6 +154,74 @@ def redact_credentials(text: str) -> str:
     return _SECRET_PATTERN.sub(_redacted_assignment, text)
 
 
+#: Mask for credentials in mailbox command results (#220).
+OUTBOUND_PLACEHOLDER = "****"
+# A variable whose *name* marks it as a credential. Its value is scrubbed
+# from outbound text even when the name is not in ``_SECRET_ENV_VARS``: a
+# mailbox command can print the whole environment (``env``), and every
+# credential on the VM - not just the four this module knows by name -
+# must stay on the VM.
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?i)(token|key|secret|password|passwd|credential|authorization|cookie|azure_openai)"
+)
+
+
+def sensitive_environment_values(environ: dict[str, str] | None = None) -> list[str]:
+    """Literal values of every credential configured in *environ*.
+
+    Longest first, so a secret that contains another one is masked whole
+    instead of leaving its remainder readable.
+    """
+    source = os.environ if environ is None else environ
+    values = {
+        value.strip()
+        for name, value in source.items()
+        if name in _SECRET_ENV_VARS or _SENSITIVE_ENV_NAME.search(name)
+    }
+    return sorted(
+        (value for value in values if len(value) >= _MIN_SECRET_VALUE_CHARS),
+        key=len,
+        reverse=True,
+    )
+
+
+def redact_outbound(text: str | None, *, environ: dict[str, str] | None = None) -> str:
+    """Mask every credential in text that is about to leave the VM (#220).
+
+    The single redaction step for mailbox command results: run on stdout,
+    stderr, errors and the finished outbox document before anything is
+    written to the mailbox repository. It removes the literal value of every
+    configured credential wherever it appears - inside a header, a URL, a
+    longer token, any number of times - and then every generic credential
+    shape this module recognizes. Each is replaced by ``****``.
+
+    Unlike :func:`redact`, paths and plain URLs stay readable: a diagnostic
+    command's output is the payload, and only its credentials are secret.
+    """
+    if not text:
+        return ""
+    for value in sensitive_environment_values(environ):
+        text = text.replace(value, OUTBOUND_PLACEHOLDER)
+    mask = OUTBOUND_PLACEHOLDER
+    text = _URL_USERINFO_PATTERN.sub(rf"\1{mask}@", text)
+    text = _BEARER_PATTERN.sub(f"Bearer {mask}", text)
+    text = _SK_KEY_PATTERN.sub(mask, text)
+    text = _GITHUB_TOKEN_PATTERN.sub(mask, text)
+
+    def _masked_assignment(match: re.Match[str]) -> str:
+        keyword, separator, value = match.group(1), match.group(2), match.group(3)
+        if value in (mask, _PLACEHOLDER) or (
+            separator.rstrip().endswith(":") and value.lower() == "bearer"
+        ):
+            # Already masked, or "Authorization: Bearer ****" - whose
+            # credential the bearer pattern above has masked already.
+            return match.group(0)
+        quote = value[:1] if value[:1] in {'"', "'"} else ""
+        return f"{keyword}{separator}{quote}{mask}{quote}"
+
+    return _SECRET_PATTERN.sub(_masked_assignment, text)
+
+
 def redact(text: str) -> str:
     """Scrub secret-shaped substrings and absolute filesystem paths."""
     return _PATH_PATTERN.sub("[PATH]", redact_secrets(text))

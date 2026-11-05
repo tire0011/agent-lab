@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from modules.redaction import redact
+from modules.redaction import redact_outbound
 
 from .command_recovery import (
     evaluate_interrupted_command,
@@ -37,7 +37,6 @@ _COMMAND_META_KEYS = {
     "timeout",
     "recovery_services",
 }
-_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ACTIVE_COMMANDS: dict[int, subprocess.Popen] = {}
 _SENSITIVE_ENV_MARKERS = (
     "TOKEN",
@@ -47,9 +46,6 @@ _SENSITIVE_ENV_MARKERS = (
     "CREDENTIAL",
     "AZURE_OPENAI",
 )
-
-def development_mode_enabled() -> bool:
-    return os.environ.get("NEXUS_DEVELOPMENT_MODE", "").strip().lower() in _TRUE_VALUES
 
 
 def _command_environment() -> dict[str, str]:
@@ -61,7 +57,11 @@ def _command_environment() -> dict[str, str]:
 
 
 def _bounded_redacted(text: str | None) -> str:
-    clean = redact(text or "")
+    # Credentials only (#220): every configured credential value and every
+    # generic credential shape becomes ``****``. The rest of the output - paths,
+    # URLs, ordinary text - is the diagnostic payload and stays as printed.
+    # Masked before truncation, so a cut can never split a value in two.
+    clean = redact_outbound(text)
     if len(clean) <= MAX_OUTPUT_CHARS:
         return clean
     omitted = len(clean) - MAX_OUTPUT_CHARS

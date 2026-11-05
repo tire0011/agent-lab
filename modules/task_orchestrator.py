@@ -70,11 +70,8 @@ from modules.nexus_tool_router import (
     ToolResolverUnavailableError,
     ToolRouterError,
     controller_native_capabilities,
-    invalid_find_tool_goal,
     operation_already_resolved,
     related_operation_lookup_goal,
-    resolver_prompt,
-    selection_correctness,
     terminal_not_found_guidance,
     terminal_not_found_observation,
     tokens as tool_search_tokens,
@@ -1740,47 +1737,6 @@ class NexusTaskOrchestrator:
     def _read_only_operation_specs(self) -> list[Any]:
         return self.tool_router.operation_specs()
 
-    def _candidate_operations(self, goal: str) -> list[Any]:
-        return self.tool_router.candidate_operations(goal)
-
-    def _latest_operation_grant(self, session_id: str, operation: str) -> dict[str, Any] | None:
-        return self.tool_router.grant_ledger.latest_grant(session_id, operation)
-
-    @staticmethod
-    def _invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
-        return invalid_find_tool_goal(goal)
-
-    def _resolver_prompt(self, goal: str, candidates: list[Any]) -> str:
-        return resolver_prompt(goal, candidates)
-
-    @staticmethod
-    def _selection_correctness(
-        *,
-        status: str,
-        selected_operation: str | None,
-        expected_operation: str | None,
-        expected_status: str | None,
-    ) -> str:
-        return selection_correctness(
-            status=status,
-            selected_operation=selected_operation,
-            expected_operation=expected_operation,
-            expected_status=expected_status,
-        )
-
-    def _resolvable_experiment_ids(self, text: str) -> list[str]:
-        return self.tool_router.resolvable_experiment_ids(text)
-
-    def _find_tool_not_found_metadata(
-        self,
-        task_text: str,
-        goal: str,
-        related_operations: list[str],
-    ) -> dict[str, Any]:
-        return self.tool_router.find_tool_not_found_metadata(
-            task_text, goal, related_operations
-        )
-
     @staticmethod
     def _terminal_not_found_observation(
         goal: str,
@@ -2104,20 +2060,6 @@ Return exactly one JSON object matching the schema."""
                 "and choose a different next step"
             ),
         }
-
-    @staticmethod
-    def _knowledge_collector_max_rounds() -> int:
-        """Bound research turns; the final synthesis turn is separate."""
-        raw = os.environ.get("NEXUS_KNOWLEDGE_COLLECTOR_MAX_ROUNDS", "").strip()
-        try:
-            configured = int(raw) if raw else 3
-        except ValueError:
-            logger.warning(
-                "invalid NEXUS_KNOWLEDGE_COLLECTOR_MAX_ROUNDS=%r; falling back to 3",
-                raw[:100],
-            )
-            configured = 3
-        return max(1, min(configured, 5))
 
     @staticmethod
     def _knowledge_collector_unavailable_briefing(exc: BaseException) -> dict[str, Any]:

@@ -41,6 +41,10 @@ _ISSUE_TARGET_RE = re.compile(
     rf"\b{_TARGET_VERBS}\b[^.\n]{{0,40}}?{_ISSUE_REF}", re.IGNORECASE
 )
 _ISSUE_MENTION_RE = re.compile(_ISSUE_REF, re.IGNORECASE)
+_ISSUE_HEADER_RE = re.compile(
+    r"\A(?:[ \t]*(?:\r?\n|\r))*[ \t]*GitHub Issue #(\d{1,7})[ \t]*:",
+    re.IGNORECASE,
+)
 
 _NEGATION = r"(?:do\s+not|do\s*n[o']t|don'?t|dont|never|no)"
 _CREATE = r"(?:create|creating|open|opening|file|filing|raise|raising|make|making)"
@@ -108,6 +112,7 @@ class WorkDirectives:
     """What a task instruction explicitly demands of GitHub work tracking."""
 
     issue_number: int | None = None
+    header_issue_number: int | None = None
     mentioned_issue_numbers: tuple[int, ...] = ()
     forbid_new_issue: bool = False
     branch_name: str | None = None
@@ -115,9 +120,6 @@ class WorkDirectives:
     forbid_merge: bool = False
     merge_constraint_reason: str | None = None
 
-    @property
-    def requires_issue_reuse(self) -> bool:
-        return self.forbid_new_issue or self.issue_number is not None
 
 
 def parse_work_directives(text: str | None) -> WorkDirectives:
@@ -129,8 +131,19 @@ def parse_work_directives(text: str | None) -> WorkDirectives:
     targets = _unique_numbers(_ISSUE_TARGET_RE.findall(source))
     mentions = _unique_numbers(_ISSUE_MENTION_RE.findall(source))
     forbid_new_issue = any(pattern.search(source) for pattern in _NO_NEW_ISSUE_RES)
+    header_match = _ISSUE_HEADER_RE.match(source)
+    header_issue_number = int(header_match.group(1)) if header_match else None
 
-    if len(targets) == 1:
+    if header_issue_number is not None and all(
+        target == header_issue_number for target in targets
+    ):
+        issue_number: int | None = header_issue_number
+    elif header_issue_number is not None:
+        # A verb-led target is more explicit than the standard goal heading,
+        # but conflicting numbers remain ambiguous rather than silently
+        # choosing either Issue.
+        issue_number = None
+    elif len(targets) == 1:
         issue_number: int | None = targets[0]
     elif not targets and forbid_new_issue and len(mentions) == 1:
         # "Do not create another issue" plus exactly one Issue in the task
@@ -144,6 +157,7 @@ def parse_work_directives(text: str | None) -> WorkDirectives:
     merge_match = _NO_MERGE_RE.search(source)
     return WorkDirectives(
         issue_number=issue_number,
+        header_issue_number=header_issue_number,
         mentioned_issue_numbers=mentions,
         forbid_new_issue=forbid_new_issue,
         branch_name=_find_branch(source),

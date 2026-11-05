@@ -40,7 +40,7 @@ class WorkDirectiveParsingTests(unittest.TestCase):
         self.assertTrue(directives.forbid_new_issue)
         self.assertTrue(directives.forbid_new_branch)
         self.assertEqual(directives.branch_name, "fix/180-outbox-message-object")
-        self.assertTrue(directives.requires_issue_reuse)
+        self.assertTrue(directives.forbid_new_issue or directives.issue_number is not None)
 
     def test_plain_task_carries_no_directives(self):
         directives = parse_work_directives("Add a retry to the mailbox poller.")
@@ -49,7 +49,7 @@ class WorkDirectiveParsingTests(unittest.TestCase):
         self.assertFalse(directives.forbid_new_issue)
         self.assertFalse(directives.forbid_new_branch)
         self.assertIsNone(directives.branch_name)
-        self.assertFalse(directives.requires_issue_reuse)
+        self.assertFalse(directives.forbid_new_issue or directives.issue_number is not None)
 
     def test_background_mention_is_not_a_work_target(self):
         directives = parse_work_directives(
@@ -71,7 +71,7 @@ class WorkDirectiveParsingTests(unittest.TestCase):
 
         self.assertIsNone(directives.issue_number)
         self.assertTrue(directives.forbid_new_issue)
-        self.assertTrue(directives.requires_issue_reuse)
+        self.assertTrue(directives.forbid_new_issue or directives.issue_number is not None)
 
     def test_reuse_phrasings_and_issue_urls_are_recognised(self):
         self.assertEqual(parse_work_directives("Reuse issue #180.").issue_number, 180)

@@ -683,19 +683,6 @@ class NexusToolRouter:
     # Catalog / candidate selection
     # ------------------------------------------------------------------
 
-    def read_only_operation_specs(self) -> list[Any]:
-        """The capabilities a read-only role may discover and call.
-
-        The whole surface of that role: ``find_tool`` resolves against this
-        list and ``call_tool`` refuses anything outside it, so an operation
-        that has not declared itself read-only is neither discoverable nor
-        executable here.
-        """
-        return [
-            spec for spec in self.operations_registry.catalog()
-            if is_read_only(spec)
-        ]
-
     def operation_specs(self) -> list[Any]:
         """What this caller may find and call: the read-only operations, plus
         the few marked ``controller_allowed`` when the caller is the controller."""

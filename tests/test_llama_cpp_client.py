@@ -19,7 +19,9 @@ def make_client(base_url: str = "http://localhost:8080/v1") -> LlamaCppClient:
 
 # ── Default configuration ─────────────────────────────────────────────────────
 
-def test_default_base_url():
+def test_default_base_url(monkeypatch):
+    monkeypatch.delenv("LOCAL_MODEL_URL")
+    monkeypatch.delenv("LLAMA_CPP_BASE_URL")
     client = LlamaCppClient()
     assert client.base_url == _DEFAULT_BASE_URL.rstrip("/")
 
@@ -241,4 +243,3 @@ async def test_is_available_false_on_connection_error():
 
         client = make_client()
         assert await client.is_available() is False
-

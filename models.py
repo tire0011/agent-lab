@@ -61,15 +61,6 @@ class ChatRequest(BaseModel):
     session_id: str | None = Field(default=None, max_length=120)
 
 
-class ChatResponse(BaseModel):
-    reply: str
-    intent: str
-    session_id: str
-    action: str
-    experiment_id: str | None = None
-    status: str
-
-
 class ChatJobResponse(BaseModel):
     job_id: str
     status: str
@@ -366,11 +357,6 @@ class ActivityEntry(BaseModel):
     message: str | None = None
 
 
-class ActivityResponse(BaseModel):
-    count: int
-    activity: list[ActivityEntry]
-
-
 class DiagnosticActivityEntry(ActivityEntry):
     mailbox_task_id: str | None = None
     phase: str | None = None
@@ -574,28 +560,6 @@ class UnifiedLogsResponse(BaseModel):
     truncated: bool = False
 
 
-class PublicLogEntry(BaseModel):
-    """One structured log line, safe for the unauthenticated Logs tab.
-
-    A strict subset of ``ExperimentLogEntry``'s allowlist: never includes
-    command/cwd/stdout/stderr/exception/stacktrace/job_id/session_id, since
-    those may carry internal detail not meant for an unauthenticated
-    caller. ``message`` is still the write- and read-path redacted text
-    (see ``modules.redaction``), matching what ``/diagnostics/public``
-    already exposes via ``diagnostic_messages``/``failure_summary``.
-    """
-
-    timestamp: str
-    level: str
-    phase: str
-    event: str
-    message: str | None = None
-    experiment_id: str | None = None
-    mailbox_task_id: str | None = None
-    truncated: bool | None = None
-    source: str = "experiment"
-
-
 class LogTraceResponse(BaseModel):
     """Everything Nexus did for one order, reconstructed from its logs.
 
@@ -615,19 +579,6 @@ class LogTraceResponse(BaseModel):
     truncated: bool = False
 
 
-class PublicUnifiedLogsResponse(BaseModel):
-    """Public, unauthenticated equivalent of ``UnifiedLogsResponse``.
-
-    Backs the Logs tab's default view when no API key has been entered,
-    so the fallback is the same central multi-source feed (experiments,
-    mailbox tasks, system) rather than only per-experiment diagnostics.
-    """
-
-    count: int
-    entries: list[PublicLogEntry] = Field(default_factory=list)
-    next_cursor: str | None = None
-
-
 # ---------------------------------------------------------------------------
 # Operation Chain models
 # ---------------------------------------------------------------------------
@@ -643,13 +594,6 @@ class OperationChainRequest(BaseModel):
     steps: list[OperationChainStep] = Field(..., min_items=1, max_items=10)
     stop_on_error: bool = False
     request_id: str | None = None
-
-    @staticmethod
-    def validate_unique_ids(v: list[OperationChainStep]) -> list[OperationChainStep]:
-        ids = [s.id for s in v]
-        if len(ids) != len(set(ids)):
-            raise ValueError("duplicate step IDs")
-        return v
 
 
 class OperationChainStepResult(BaseModel):

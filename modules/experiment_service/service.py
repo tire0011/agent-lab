@@ -582,7 +582,6 @@ class ExperimentService:
             else:
                 self._conn.commit()
 
-        self._implementation_timeout_seconds = timeout_seconds
         logger.info("experiment %s created (status=%s)", experiment_id, STATUS_QUEUED)
         self.get_experiment_logger(experiment_id).info(
             STATUS_QUEUED, "experiment_created",
@@ -684,34 +683,6 @@ class ExperimentService:
                 entity_type="experiment",
                 entity_id=experiment_id,
             )
-
-    def list_verification_runs(self, experiment_id: str) -> list[dict[str, Any]]:
-        """Return every persisted verification attempt for an experiment."""
-        with self._lock:
-            rows = self._conn.execute(
-                """SELECT iteration, started_at, ended_at, status, commit_sha,
-                          command_json, exit_code, output, error,
-                          failure_fingerprint
-                   FROM verification_runs
-                   WHERE experiment_id = ?
-                   ORDER BY iteration""",
-                (experiment_id,),
-            ).fetchall()
-        return [
-            {
-                "iteration": row[0],
-                "started_at": row[1],
-                "ended_at": row[2],
-                "status": row[3],
-                "commit_sha": row[4],
-                "command": json.loads(row[5]) if row[5] else None,
-                "exit_code": row[6],
-                "output": row[7],
-                "error": row[8],
-                "failure_fingerprint": row[9],
-            }
-            for row in rows
-        ]
 
     def mailbox_task_id_for_experiment(self, experiment_id: str) -> str | None:
         """Return the approval id linked to an experiment, if any."""

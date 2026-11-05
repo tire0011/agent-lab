@@ -46,18 +46,22 @@ from modules.experiment_service import (
     ExperimentNotRunnableError,
     ExperimentService,
     _build_direct_implementation_prompt,
-    _build_implementation_prompt,
-    _build_plan_prompt,
-    _build_policy_replan_prompt,
-    _build_reformat_retry_prompt,
-    _build_research_prompt,
     _check_goal_policy,
     _goal_secret_warning,
-    _extract_diagnostic_log,
     extract_single_json_object,
     parse_plan,
     plan_violates_policy,
 )
+
+def _verification_runs(service, experiment_id: str) -> list[dict]:
+    with service._lock:
+        rows = service._conn.execute(
+            "SELECT status, output, failure_fingerprint FROM verification_runs "
+            "WHERE experiment_id = ? ORDER BY iteration",
+            (experiment_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
 
 
 # Sanitized, real Codex raw response captured while reproducing the
@@ -487,7 +491,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.service.max_repair_iterations = len(details) - 1
         experiment = self.service.create_experiment(goal="Change it.")
         result = self.service.run_experiment(experiment.id, github_work_tracking=github)
-        return result, self.service.list_verification_runs(experiment.id)
+        return result, _verification_runs(self.service, experiment.id)
 
     def _ci_detail(self, *tests: str) -> str:
         return "Failed job: unittest\nFailed step: Run tests\nFailing tests:\n" + "\n".join(
@@ -619,7 +623,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
         self.assertEqual(result.status, STATUS_SUCCEEDED)
         self.assertEqual(calls, 2)
-        runs = self.service.list_verification_runs(experiment.id)
+        runs = _verification_runs(self.service, experiment.id)
         self.assertEqual([run["status"] for run in runs], [STATUS_FAILED, STATUS_SUCCEEDED])
         self.assertEqual(
             self.implementation_worker.run.call_args_list[1].kwargs["phase"],
@@ -1725,28 +1729,7 @@ class ReformatRetryTestCase(unittest.TestCase):
         self.service.run_experiment(experiment.id)
         self.implementation_worker.run.assert_not_called()
 
-    def test_plan_phase_uses_plan_schema(self):
-        from modules.experiment_service import PLAN_JSON_SCHEMA
 
-        self.plan_worker.run.return_value = _make_result(final_message=VALID_PLAN_JSON)
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        call_kwargs = self.plan_worker.run.call_args.kwargs
-        self.assertEqual(call_kwargs.get("output_schema"), PLAN_JSON_SCHEMA)
-
-    def test_retry_uses_same_plan_schema(self):
-        from modules.experiment_service import PLAN_JSON_SCHEMA
-
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        retry_call_kwargs = self.plan_worker.run.call_args_list[1].kwargs
-        self.assertEqual(retry_call_kwargs.get("output_schema"), PLAN_JSON_SCHEMA)
 
     def test_native_schema_output_still_validated_against_policy(self):
         # Even if the worker "natively" honors the schema, a policy
@@ -2023,201 +2006,10 @@ class PolicyReplanTestCase(unittest.TestCase):
         self.assertNotIn("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890123456789", result.policy_replan_raw_message)
         self.assertLessEqual(len(result.policy_replan_raw_message.encode("utf-8")), 5000)
 
-    def test_build_policy_replan_prompt_helper(self):
-        prompt = _build_policy_replan_prompt(
-            goal="goal-x",
-            research_summary="summary-y",
-            rejected_plan_json='{"title": "bad"}',
-            rejection_reason="reason-z",
-        )
-        self.assertIn("goal-x", prompt)
-        self.assertIn("summary-y", prompt)
-        self.assertIn('{"title": "bad"}', prompt)
-        self.assertIn("reason-z", prompt)
-        self.assertIn("code, test, or", prompt)
 
 
-class ExtractDiagnosticLogTestCase(unittest.TestCase):
-    """Unit tests for the standalone _extract_diagnostic_log() filter."""
-
-    def test_returns_none_for_empty_stdout(self):
-        self.assertIsNone(_extract_diagnostic_log("", 1024))
-        self.assertIsNone(_extract_diagnostic_log(None, 1024))
-
-    def test_keeps_lifecycle_and_agent_message_events(self):
-        stdout = "\n".join([
-            json.dumps({"type": "thread.started", "thread_id": "tid-1"}),
-            json.dumps({"type": "turn.started"}),
-            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "hello"}}),
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5}}),
-        ])
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertIn("thread.started", log)
-        self.assertIn("turn.started", log)
-        self.assertIn("agent_message", log)
-        self.assertIn("hello", log)
-        self.assertIn("turn.completed", log)
-
-    def test_drops_reasoning_items(self):
-        stdout = "\n".join([
-            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "secret chain of thought"}}),
-            json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "final"}}),
-        ])
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertNotIn("reasoning", log)
-        self.assertNotIn("secret chain of thought", log)
-        self.assertIn("final", log)
-
-    def test_command_execution_kept_metadata_only_not_full_output(self):
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {
-                "id": "i0",
-                "type": "command_execution",
-                "command": "ls -la",
-                "aggregated_output": "this is a huge dump of file contents that must not be stored",
-                "exit_code": 0,
-                "status": "completed",
-            },
-        })
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertIn("command_execution", log)
-        self.assertIn("ls -la", log)
-        self.assertIn("exit_code", log)
-        self.assertNotIn("huge dump of file contents", log)
-
-    def test_ignores_malformed_json_lines(self):
-        stdout = "\n".join([
-            "not json at all",
-            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "ok"}}),
-        ])
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertIn("ok", log)
-
-    def test_secrets_are_redacted(self):
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {
-                "id": "i0",
-                "type": "agent_message",
-                "text": "here is my api_key=sk-ABCDEFGHIJ1234567890 for reference",
-            },
-        })
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertNotIn("sk-ABCDEFGHIJ1234567890", log)
-        self.assertIn("REDACTED", log)
-
-    def test_bearer_token_is_redacted(self):
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "agent_message", "text": "Authorization: Bearer abcdef0123456789"},
-        })
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertNotIn("abcdef0123456789", log)
-
-    def test_size_limit_and_truncation_marker_with_original_size(self):
-        big_text = "y" * 5000
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "agent_message", "text": big_text},
-        })
-        log = _extract_diagnostic_log(stdout, 200)
-        self.assertLessEqual(len(log.encode("utf-8")), 200 + 100)
-        self.assertIn("truncated", log)
-        self.assertIn("original size", log)
-
-    def test_no_diagnostic_events_yields_none(self):
-        # Only a reasoning item and nothing else safe to keep.
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "reasoning", "text": "thinking..."},
-        })
-        self.assertIsNone(_extract_diagnostic_log(stdout, 1024))
 
 
-class DiagnosticLogPipelineTestCase(unittest.TestCase):
-    """Verifies selection_diagnostic_log / reformat_diagnostic_log are
-    stored (separately) by the actual experiment pipeline."""
-
-    UNPARSEABLE_TEXT = "I looked around but I will just describe it in prose."
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.repo_root = Path(self.tmp.name) / "repo"
-        self.repo_root.mkdir()
-        _init_git_repo(self.repo_root)
-
-        self.worktrees_root = Path(self.tmp.name) / "worktrees"
-        self.db_path = str(Path(self.tmp.name) / "agent.db")
-
-        self.selection_worker = MagicMock()
-        self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: looked at IDEAS.md and repo layout."
-        )
-        self.plan_worker = MagicMock()
-
-        def plan_factory(scratch_dir: str):
-            return self.plan_worker
-
-        self.implementation_worker = MagicMock()
-        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
-
-        def factory(worktree_path: str):
-            return self.implementation_worker
-
-        self.service = ExperimentService(
-            selection_worker=self.selection_worker,
-            plan_worker_factory=plan_factory,
-            worker_factory=factory,
-            db_path=self.db_path,
-            repo_root=str(self.repo_root),
-            worktrees_root=str(self.worktrees_root),
-        )
-        self.addCleanup(self.service.close)
-
-    def _stdout_for(self, message: str) -> str:
-        return json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "agent_message", "text": message},
-        })
-
-    @unittest.skip("selection phase removed")
-    def test_selection_diagnostic_log_stored_on_rejection(self):
-        self.plan_worker.run.return_value = _make_result(
-            final_message=self.UNPARSEABLE_TEXT,
-            stdout=self._stdout_for(self.UNPARSEABLE_TEXT),
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertIsNotNone(result.selection_diagnostic_log)
-        self.assertIn(self.UNPARSEABLE_TEXT, result.selection_diagnostic_log)
-
-    @unittest.skip("reformat-retry phase removed")
-    def test_reformat_diagnostic_log_stored_separately(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT, stdout=self._stdout_for(self.UNPARSEABLE_TEXT)),
-            _make_result(final_message=VALID_PLAN_JSON, stdout=self._stdout_for(VALID_PLAN_JSON)),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertIn(self.UNPARSEABLE_TEXT, result.selection_diagnostic_log)
-        self.assertIn("title", result.reformat_diagnostic_log)
-        self.assertNotEqual(result.selection_diagnostic_log, result.reformat_diagnostic_log)
-
-    def test_no_secrets_in_stored_diagnostic_logs(self):
-        leaky_message = "plan info AZURE_OPENAI_API_KEY=sk-verysecretvalue1234"
-        self.plan_worker.run.return_value = _make_result(
-            final_message=leaky_message,
-            stdout=self._stdout_for(leaky_message),
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertNotIn("sk-verysecretvalue1234", result.selection_diagnostic_log or "")
 
 
 class NexusIdentityPromptTestCase(unittest.TestCase):
@@ -2225,7 +2017,6 @@ class NexusIdentityPromptTestCase(unittest.TestCase):
         plan = parse_plan(VALID_PLAN_JSON)
         prompts = [
             _build_direct_implementation_prompt("some goal"),
-            _build_implementation_prompt(plan),
         ]
         # Old prompts still exist as helpers but are no longer called in the
         # live pipeline; verify the new direct-implementation prompt and the
@@ -2237,55 +2028,8 @@ class NexusIdentityPromptTestCase(unittest.TestCase):
                 self.assertIn('not as "the user"', prompt)
                 self.assertIn("not independently Nexus", prompt)
 
-class ResearchPromptRequirementsTestCase(unittest.TestCase):
-    """The research prompt must instruct Codex to investigate read-only and
-    produce a free-form (non-JSON) summary, without forcing a final plan."""
-
-    def test_research_prompt_is_read_only_and_investigative(self):
-        prompt = " ".join(_build_research_prompt("some goal").split())
-        self.assertIn("READ-ONLY", prompt)
-        self.assertIn("Do not modify any files", prompt)
-        self.assertIn("IDEAS.md", prompt)
-
-    def test_research_prompt_forbids_final_json_or_plan(self):
-        prompt = " ".join(_build_research_prompt("some goal").split())
-        self.assertIn("Do NOT emit a final structured plan or any JSON object", prompt)
-        self.assertIn("prose, not JSON", prompt)
 
 
-@unittest.skip("plan phase removed")
-class PlanPromptRequirementsTestCase(unittest.TestCase):
-    """The plan prompt must instruct Codex it has no tools, embed the
-    research summary, forbid placeholder/intention-only answers, and
-    require at least one affected file. The reformat retry prompt must
-    remain reformat-only (no new research)."""
-
-    def test_plan_prompt_declares_no_tools(self):
-        prompt = " ".join(_build_plan_prompt("some goal", "some research").split())
-        self.assertIn("You have NO tools available", prompt)
-        self.assertIn("cannot run any command or", prompt)
-
-    def test_plan_prompt_embeds_research_summary(self):
-        prompt = _build_plan_prompt("some goal", "UNIQUE_RESEARCH_MARKER_XYZ")
-        self.assertIn("UNIQUE_RESEARCH_MARKER_XYZ", prompt)
-
-    def test_plan_prompt_requires_concrete_feature_and_nonempty_affected_files(self):
-        prompt = " ".join(_build_plan_prompt("some goal", "research").split())
-        self.assertIn("one concrete", prompt)
-        self.assertIn("affected_files", prompt)
-        self.assertIn("must contain at least one existing or planned repository file", prompt)
-
-    def test_plan_prompt_forbids_progress_or_placeholder_content(self):
-        prompt = " ".join(_build_plan_prompt("some goal", "research").split())
-        self.assertIn("Do not return progress, placeholder, or intention-only content", prompt)
-
-    def test_reformat_retry_prompt_still_forbids_new_selection(self):
-        prompt = _build_reformat_retry_prompt("some previous output")
-        self.assertIn("Do not select or modify the feature", prompt)
-        self.assertIn("Output JSON only", prompt)
-        # The retry prompt must not itself instruct further investigation;
-        # it must only ask for reformatting of the already-produced text.
-        self.assertNotIn("Investigate the repository", prompt)
 
 
 class PlaceholderPlanPolicyTestCase(unittest.TestCase):

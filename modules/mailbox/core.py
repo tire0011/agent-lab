@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from modules.redaction import redact_outbound
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
@@ -44,6 +46,8 @@ SUPPORTED_TYPES = {
     # modules.issue_approvals and _process_issue_approval.
     "issue_approval",
 }
+#: Trusted shell command message, registered by ``development.install``.
+COMMAND_TYPE = "command"
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
     re.compile(r"AZURE_[A-Z_]+\s*=\s*\S"),
@@ -176,10 +180,22 @@ class MailboxMessage:
 
         text = raw.decode("utf-8", errors="replace")
 
-        if _has_secret(text):
-            raise ValueError("Potential secret detected in message content")
+        try:
+            meta, body = parse_front_matter(text)
+            parse_error: ValueError | None = None
+        except ValueError as exc:
+            meta, body, parse_error = {}, "", exc
 
-        meta, body = parse_front_matter(text)
+        # A command may name a credential - `curl -H "x-api-key: $AGENT_API_KEY"`
+        # is how a diagnostic reaches the local API - so its input is not
+        # screened (#220). What protects the credential is the outbound side:
+        # every command result is redacted before it reaches the outbox (see
+        # ``redact_outbound``). Every other message type is still rejected,
+        # because its text is stored or forwarded as it is.
+        if meta.get("type", "").strip() != COMMAND_TYPE and _has_secret(text):
+            raise ValueError("Potential secret detected in message content")
+        if parse_error is not None:
+            raise parse_error
 
         msg_type = meta.get("type", "").strip()
         created_by = meta.get("created_by", "").strip()
@@ -395,7 +411,13 @@ def _build_outbox_content(
     if idea_id:
         lines.append(f"idea_id: {idea_id}")
     lines += ["---", "", "## Result", "", result_body]
-    return "\n".join(lines) + "\n"
+    content = "\n".join(lines) + "\n"
+    if msg.msg_type == COMMAND_TYPE:
+        # Last stop before the outbox file is written and committed: the
+        # whole document, not only the stdout/stderr the processor already
+        # masked, so no field a command produced can carry a credential (#220).
+        content = redact_outbound(content)
+    return content
 
 
 class MailboxLock:
