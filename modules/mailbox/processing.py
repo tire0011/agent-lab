@@ -14,10 +14,12 @@ from typing import Any
 from modules import github_authorization
 from modules import issue_approvals
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
+from modules.redaction import redact_outbound
 from .refresh import process_refresh as _process_refresh
 from .task_ingest import insert_task_approval, resolve_idempotency_key
 
 from .core import (
+    COMMAND_TYPE,
     MAX_RETRY,
     STATUS_DEFERRED,
     STATUS_DONE,
@@ -690,6 +692,10 @@ class MailboxProcessor:
             (str(path),),
         ).fetchone()
         notice = self.outbox / f"failed-{path.stem}.md"
+        # The last error is exception text - for a command it can quote the
+        # command's own output - and the notice is committed to the mailbox
+        # repository, so it is masked like every other outbound result (#220).
+        last_error = redact_outbound(str(row[1]) if row and row[1] else "") or "unknown"
         body = (
             "---\n"
             "type: result\n"
@@ -700,7 +706,7 @@ class MailboxProcessor:
             f"The message was not processed and was removed from the inbox after "
             f"{int(row[0]) if row and row[0] is not None else MAX_RETRY} attempts.\n\n"
             f"**Type:** {str(row[2]) if row and row[2] else 'unknown'}\n\n"
-            f"**Last error:**\n\n```text\n{(str(row[1]) if row and row[1] else 'unknown')[:2000]}\n```\n"
+            f"**Last error:**\n\n```text\n{last_error[:2000]}\n```\n"
         )
         try:
             self.outbox.mkdir(parents=True, exist_ok=True)
@@ -968,16 +974,28 @@ class MailboxProcessor:
                 return {"file": rel, "status": "pending", "type": msg.msg_type}
             result_body, idea_id = processor_result
         except Exception as exc:
-            logger.exception("Error processing %s", file_path)
-            self._record_failure(file_path, str(exc), {"id": db_msg_id})
+            error = str(exc)
+            if msg.msg_type == COMMAND_TYPE:
+                # Exception text from a command run is user-visible (status,
+                # API, discard notice) and may quote the command's output.
+                error = redact_outbound(error)
+                logger.error("Error processing %s: %s", file_path, error)
+            else:
+                logger.exception("Error processing %s", file_path)
+            self._record_failure(file_path, error, {"id": db_msg_id})
             task_log.error(
                 "mailbox",
                 "message_processing_failed",
                 "mailbox message processing failed",
-                exc=exc,
+                # A stack trace would repeat the unmasked exception text.
+                **(
+                    {"exception_type": type(exc).__name__, "exception_message": error}
+                    if msg.msg_type == COMMAND_TYPE
+                    else {"exc": exc}
+                ),
                 source_file=file_path.name,
             )
-            return {"file": rel, "status": "failed", "error": str(exc)}
+            return {"file": rel, "status": "failed", "error": error}
 
         processed_at = _now_iso()
         outbox_name = _outbox_filename(msg, processed_at)
