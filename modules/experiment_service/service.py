@@ -80,18 +80,14 @@ logger = logging.getLogger("modules.experiment_service")
 
 _GITHUB_ISSUE_GOAL_RE = re.compile(r"^GitHub Issue #(\d+):")
 
-# Statuses that represent a problem worth surfacing at WARNING level in the
-# journal (as opposed to ordinary forward progress, logged at INFO). Kept
-# as a small fixed set here so lifecycle logging in ``_transition``/
-# ``_force_status`` stays centralized and consistent.
+# Statuses worth journalling at WARNING (vs INFO); kept as a small fixed set here
+# so lifecycle logging in ``_transition``/``_force_status`` stays centralized.
 _WARNING_STATUSES = frozenset(
     {"rejected", "failed", "timed_out", "needs_review", "cancelled", "interrupted"}
 )
 
-# Subset of the above that represents an actual failure (as opposed to a
-# policy rejection or a review handoff) — logged at ERROR in the
-# structured per-experiment JSONL log (journald keeps the coarser
-# WARNING/INFO split above for backward compatibility).
+# Subset of the above that is an actual failure (vs a policy rejection or review
+# handoff), logged at ERROR in the per-experiment JSONL log.
 _ERROR_STATUSES = frozenset({"failed", "timed_out"})
 
 _DEFAULT_MAX_TEST_OUTPUT_BYTES = 32 * 1024
@@ -102,33 +98,27 @@ _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES = 64 * 1024
 _DEFAULT_RESEARCH_TIMEOUT_SECONDS = 120
 _DEFAULT_PLAN_TIMEOUT_SECONDS = 90
 _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
-# Absolute cap only (#327): the coding agent is progress-watched and stopped
-# when it stalls; see modules.coding_worker.agent_watchdog_limits.
+# Absolute cap only (#327): the coding agent is progress-watched and stopped when
+# it stalls; see modules.coding_worker.agent_watchdog_limits.
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
 
-# Worktree retention (#376). Every experiment keeps its worktree after it ends
-# so it can be inspected, retried or adopted - but a full checkout per run on a
-# 1 GB VM silently exhausts the disk. Terminal experiments whose ``ended_at``
-# is older than this many hours have their worktree directory removed; the
-# experiment row, its log and its branch are kept. ``0`` disables cleanup, and
-# so does anything unparsable or negative: a typo must not start deleting.
+# Worktree retention (#376): worktrees are kept after an experiment ends for
+# inspection/retry/adoption, but a full checkout per run exhausts a 1 GB VM's disk,
+# so terminal runs older than this many hours lose the directory (row, log and branch
+# are kept). ``0`` or anything unparsable disables cleanup - a typo must not start deleting.
 WORKTREE_RETENTION_ENV_VAR = "NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS"
 DEFAULT_WORKTREE_RETENTION_HOURS = 7 * 24
 
 # Adoption statuses that still need the experiment's worktree, whatever its age.
 _ADOPTION_TERMINAL_STATUSES = ("adopted", "needs_review", "failed", "interrupted")
 
-# Stall sweep (#400). Experiment deac59fb logged ``codex_call_start`` and then
-# nothing for 11 hours; neither the absolute cap nor the progress watchdog left
-# a trace, and only a service restart ended it. The sweep runs periodically and
-# fails an active experiment whose newest log or activity event is older than
-# its phase's hard limit plus this grace. A live worker logs
-# ``coding_agent_progress`` every 10 minutes, so a healthy run never gets near
-# the limit.
+# Stall sweep (#400): fail an active experiment whose newest log or activity event
+# is older than its phase's hard limit plus this grace. A live worker logs
+# ``coding_agent_progress`` every 10 minutes, so a healthy run never nears the limit.
 STALL_GRACE_ENV_VAR = "NEXUS_EXPERIMENT_STALL_GRACE_SECONDS"
 DEFAULT_STALL_GRACE_SECONDS = 15 * 60
 _STALLED_ERROR_PREFIX = "stalled: "
@@ -190,67 +180,34 @@ class WorktreeCleanupResult:
     removed: list[str] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
 
-# Progress-aware local verification (#209). The verification subprocess is no
-# longer bounded by a fixed wall-clock timeout, adaptive or not: a wall-clock
-# limit cannot tell a healthy-but-slow suite from a stuck test, which is how
-# experiment df97d67bc08e45b4bc5c573db0c84d85 came to be reported as
-# ``timed_out`` with no exit code and nothing to diagnose. Instead the run is
-# watched for *progress* (see ``modules.verification_runner``): it continues
-# for as long as tests keep starting and finishing, and is aborted when they
-# stop. The absolute cap below survives only as a final guard against a
-# permanently orphaned process, deliberately far too large to be the normal
-# mechanism for deciding whether a run is failing.
-#
-# The total test count the suite last reported is persisted in
-# ``service_settings`` (see ``modules.run_store``), so a run in progress can
-# report "842 / 1873" rather than a bare count from its very first minute.
-# The watchdog's own numbers (and their environment variables and floors)
-# live with the watchdog in ``modules.verification_runner``; leaving these
-# unset here is what lets an operator tune a deployment through the
-# environment without editing code.
+# Progress-aware local verification (#209): the run is watched for *progress* (tests
+# starting/finishing), not bounded by a wall-clock limit, which cannot tell a slow
+# suite from a stuck test; the absolute cap below is only a final guard against a
+# permanently orphaned process. The last reported test total is persisted in
+# ``service_settings`` so a run can report "842 / 1873"; watchdog numbers stay
+# tunable through the environment without editing code.
 _TEST_TOTAL_SETTING_KEY = "verification_test_total"
 
-# Built-in default test command, keyed by a fixed identifier. The plan/LLM output
-# never supplies a raw shell string; the service only ever chooses one of
-# these fixed argv templates. "{python}" is substituted with the
-# configured test interpreter (see ExperimentService.test_python_executable)
-# so that worktrees without their own virtualenv can still run tests using
-# the main repository's already-installed interpreter/site-packages,
-# without copying a .venv or installing any package into the worktree.
-# ``-v`` rather than ``-q``: the verbose stream is the only in-band signal
-# that says which test is running right now, and the progress watchdog is
-# built on it. It does not make the persisted test output any larger - the
-# runner strips the per-test "... ok" lines back out again (see
-# ``modules.test_progress.UnittestStreamParser``), so what reaches
-# ``test_output`` (and its head-first truncation, and the failure tail the UI
-# shows) stays what ``-q`` produced, plus a one-liner per failing test.
+# Built-in default test commands, keyed by a fixed identifier: plan/LLM output never
+# supplies a raw shell string. "{python}" becomes the configured interpreter so
+# worktrees without their own venv can run the suite. ``-v`` because the verbose
+# stream is the in-band progress signal the watchdog is built on (the runner strips
+# the per-test "... ok" lines back out again).
 _TEST_COMMANDS: dict[str, list[str]] = {
     "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-v"],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
 
-# Default interpreter used to run tests inside an experiment worktree.
-# Using the main repository's own virtualenv interpreter lets a fresh git
-# worktree (which has no virtualenv of its own) run the existing test
-# suite without copying any files or installing any packages — the
-# worktree only needs to be used as the *working directory* (``cwd``) for
-# ``python -m unittest``, since Python resolves ``tests/`` relative to cwd
-# while the interpreter and its installed packages come from the venv path.
+# Default test interpreter inside a worktree: the main repo's venv python, so no files
+# are copied and no package installed - the worktree is only the command's cwd.
 _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
 
 class ExperimentService:
-    """Orchestrates one bounded self-development experiment at a time.
-
-    Reuses the external coding-agent workers (``CodexWorker`` /
-    ``ClaudeWorker``) for both the read-only selection phase and the isolated
-    workspace-write implementation phase; no worker/subprocess logic is
-    duplicated here beyond git worktree management and the fixed verification
-    commands.
-
-    Which agent runs an experiment is selected by a persistent rotation (see
-    ``modules.coding_provider``) unless the caller injects its own worker or
-    factory. The selected provider is recorded on the experiment as
-    ``implementation_provider``.
+    """Orchestrates one bounded self-development experiment at a time, using the
+    external coding-agent workers (``CodexWorker``/``ClaudeWorker``) for the read-only
+    selection phase and the isolated implementation phase. The provider is chosen by
+    a persistent rotation (``modules.coding_provider``) unless a worker/factory is
+    injected, and recorded on the experiment as ``implementation_provider``.
     """
 
     def __init__(
@@ -279,87 +236,41 @@ class ExperimentService:
         Parameters
         ----------
         rng:
-            Deprecated compatibility argument. Provider selection is now a
-            deterministic, persistent rotation. Ignored when factories are injected.
+            Deprecated compatibility argument; ignored when factories are injected.
         selection_worker:
-            ``CodexWorker`` used for the read-only *research* phase (the
-            only phase that ever investigates the live repository).
-            Defaults to a real worker allowed only inside ``repo_root``.
+            Worker for the read-only research phase; defaults to one allowed only inside ``repo_root``.
         worker_factory:
-            Callable ``(worktree_path) -> CodexWorker`` used to build the
-            implementation-phase worker, scoped (legacy worker root configuration) to that
-            single worktree path only. Defaults to a factory that selects the
-            next coding agent once per worktree
-            (``modules.coding_provider.random_worker_factory``).
+            ``(worktree_path) -> worker`` for the implementation phase, scoped to that worktree only.
         plan_worker_factory:
-            Callable ``(scratch_dir) -> CodexWorker`` used to build the
-            *plan*-phase worker (and its one reformat retry), scoped
-            (legacy worker root configuration) to a fresh, empty scratch directory created
-            fresh for each experiment and removed afterwards. This worker
-            never sees ``repo_root`` and is given only the goal plus the
-            research summary as input — it cannot perform any further
-            repository research even if it tried to run a shell command,
-            since its working directory is empty. Defaults to a factory that
-            selects the next coding agent once per scratch directory.
+            ``(scratch_dir) -> worker`` for the plan phase, scoped to a fresh empty scratch dir that never sees ``repo_root``.
         repo_root:
-            Root of the main repository (default ``/agent``). Never
-            modified by this service.
+            Main repository root (default ``/agent``); never modified by this service.
         worktrees_root:
-            Parent directory under which per-experiment worktrees (and
-            plan-phase scratch directories) are created. Defaults to
-            ``~/agent-worktrees`` since ``/`` itself is typically not
-            writable by the agent user.
+            Parent dir for per-experiment worktrees and scratch dirs (default ``~/agent-worktrees``).
         test_python_executable:
-            Path to the Python interpreter used to run the verification
-            test command inside an experiment worktree. Defaults to the
-            main repository's own virtualenv interpreter
-            (``/agent/.venv/bin/python``) so a fresh git worktree — which
-            has no virtualenv of its own — can still run the existing test
-            suite: the worktree is used only as the test command's
-            *working directory*, never as the source of the interpreter
-            or its installed packages. No package is installed and no
-            ``.venv`` is copied into the worktree.
+            Interpreter for verification inside a worktree; defaults to the main repo's venv
+            python so no package is installed or copied into the worktree.
         experiment_log_dir:
-            Directory holding one durable, append-only JSONL log per
-            experiment (``<experiment_log_dir>/<experiment_id>.jsonl``),
-            written via ``modules.central_logging.ExperimentLogger``.
-            Defaults to ``<repo_root>/state/experiment-logs``.
-        test_stall_timeout_seconds:
-            How long a local verification run may go without a single test
-            starting or finishing before the watchdog calls it stalled and
-            aborts it. This - not total runtime - is what decides whether a
-            run is failing. ``None`` (the default) resolves it from
-            ``NEXUS_TEST_STALL_SECONDS``, or the watchdog's own default.
-        test_watchdog_interval_seconds:
-            How often the watchdog checks progress, and therefore how often
-            the test heartbeat reaches this experiment's log. ``None``
-            resolves it from ``NEXUS_TEST_WATCHDOG_INTERVAL_SECONDS``.
-        test_safety_cap_seconds:
-            Absolute ceiling on one local verification run, as a final guard
-            against a permanently orphaned process. Deliberately large; it
-            must never be the mechanism that ends a healthy run. ``None``
-            resolves it from ``NEXUS_TEST_SAFETY_CAP_SECONDS``.
-
-            All three are passed through as written when set explicitly, and
-            clamped to safe floors when they come from the environment - see
-            ``WatchdogConfig.resolve``.
+            Directory for the per-experiment append-only JSONL log; defaults to
+            ``<repo_root>/state/experiment-logs``.
+        test_stall_timeout_seconds / test_watchdog_interval_seconds / test_safety_cap_seconds:
+            Watchdog rules for local verification; ``None`` resolves from the environment
+            (clamped, see ``WatchdogConfig.resolve``). The safety cap is only a final guard
+            against an orphaned process, never the normal stop mechanism.
         base_ref:
-            Commit an experiment's worktree starts from, unless the GitHub
-            lifecycle supplies one. The benchmark (#343) pins this; everything
-            else keeps ``HEAD``.
+            Commit an experiment's worktree starts from unless the GitHub lifecycle supplies one.
         test_command:
-            Verification argv template replacing the built-in suite run;
-            ``{python}`` becomes ``test_python_executable``. For trusted callers
-            only: it must never be built from plan or model output.
+            Verification argv template replacing the built-in suite; ``{python}`` becomes
+            ``test_python_executable``. Trusted callers only - never build it from plan or
+            model output.
         """
         self.selection_worker = (
             selection_worker
             if selection_worker is not None
             else build_random_worker(db_path=db_path)[1]
         )
-        # One selection per worktree/scratch directory, i.e. one agent per
-        # experiment: the implementation call and any repair iteration run on
-        # the same provider, while the next experiment rotates again.
+        # One provider per worktree/scratch dir, i.e. one agent per experiment: the
+        # implementation call and any repair iteration share it, the next experiment rotates.
         self.worker_factory = worker_factory or random_worker_factory(db_path=db_path, rng=rng)
         self.plan_worker_factory = plan_worker_factory or random_worker_factory(db_path=db_path, rng=rng)
         self.db_path = db_path
@@ -376,13 +287,9 @@ class ExperimentService:
         self.max_repair_iterations = max(0, max_repair_iterations)
         self.base_ref = base_ref
         self.test_command = test_command
-        # Deliberately *not* derived from ``repo_root``: tests (and some
-        # deployments) point ``repo_root`` at a throwaway git checkout whose
-        # cleanliness is asserted directly, so the log directory must never
-        # live inside it (matching ``modules.run_log``'s plain
-        # ``state/runs`` default, which is likewise independent of any
-        # injected repo path). In production this resolves relative to the
-        # service's working directory (``/agent``).
+        # Deliberately *not* derived from ``repo_root``: tests point ``repo_root`` at a
+        # throwaway checkout whose cleanliness is asserted directly, so the log directory
+        # must never live inside it.
         self.experiment_log_dir = experiment_log_dir or DEFAULT_LOG_DIR
 
         conn = init_db(db_path)
@@ -401,24 +308,23 @@ class ExperimentService:
                 self._active_processes.pop(experiment_id, None)
             else:
                 self._active_processes[experiment_id] = process
-        # Workers run in their own process group (start_new_session). The id is
-        # persisted so a stall sweep in another process can stop it (#400).
+        # Workers run in their own process group (start_new_session); the id is persisted so
+        # a stall sweep in another process can stop it (#400).
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE experiments SET worker_pgid = ? WHERE id = ?",
                 (process.pid if process is not None else None, experiment_id),
             )
-        # Close the narrow race where cancellation (or the stall sweep)
-        # commits after the caller starts a phase but before that phase
-        # publishes its Popen handle.
+        # Close the race where cancellation (or the stall sweep) commits after a phase starts
+        # but before it publishes its Popen handle.
         if process is not None and self._ended_from_outside(experiment_id):
             self._terminate_process(process)
 
     def _ended_from_outside(self, experiment_id: str) -> bool:
         """Cancelled by an operator or failed by the stall sweep while running.
 
-        The pipeline thread checks this after every blocking step and stops
-        instead of overwriting the outcome.
+        The pipeline thread checks this after every blocking step and stops instead of
+        overwriting the outcome.
         """
         experiment = self.get_experiment(experiment_id)
         return experiment.status == STATUS_CANCELLED or _is_stalled(experiment.status, experiment.error)
@@ -466,16 +372,12 @@ class ExperimentService:
             self._terminate_process(process)
         return self.get_experiment(experiment.id)
 
-    # ------------------------------------------------------------------
-    # verification test watchdog (#209)
-    # ------------------------------------------------------------------
 
     def _get_test_watchdog_config(self) -> WatchdogConfig:
         """Progress rules for the next local verification run.
 
-        Whatever this service was constructed with wins; anything left unset
-        falls through to the environment (clamped) and then to the watchdog's
-        defaults.
+        Constructor values win; anything unset falls through to the (clamped) environment
+        and then to the watchdog's defaults.
         """
         return WatchdogConfig.resolve(
             stall_timeout_seconds=self.test_stall_timeout_seconds,
@@ -486,9 +388,7 @@ class ExperimentService:
     def _get_expected_test_total(self) -> int | None:
         """How many tests the suite reported last time, if it ever finished.
 
-        Only used to make progress readable ("842 / 1873"); a wrong or
-        missing value costs nothing, so every failure here is simply "we do
-        not know the total yet".
+        Only for readable progress ("842 / 1873") - a wrong or missing value costs nothing.
         """
         with self._lock:
             raw = get_setting(self._conn, _TEST_TOTAL_SETTING_KEY)
@@ -510,9 +410,6 @@ class ExperimentService:
                 updated_at=_utcnow_iso(),
             )
 
-    # ------------------------------------------------------------------
-    # create_experiment
-    # ------------------------------------------------------------------
 
     def create_experiment(
         self,
@@ -531,12 +428,9 @@ class ExperimentService:
         created_at = _utcnow_iso()
 
         with self._lock:
-            # A connection context starts SQLite's default deferred transaction
-            # only when the INSERT runs.  That is too late for this guard: two
-            # service instances can both complete the SELECT before either one
-            # owns the write lock.  BEGIN IMMEDIATE reserves the writer before
-            # the lookup, making the check-and-insert atomic across connections
-            # and processes as well as within this service instance.
+            # BEGIN IMMEDIATE reserves the writer before the SELECT: a deferred transaction would
+            # start only at the INSERT, letting two instances both pass the check before either
+            # owns the write lock.
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if issue_number is not None:
@@ -590,9 +484,6 @@ class ExperimentService:
         )
         return self.get_experiment(experiment_id)
 
-    # ------------------------------------------------------------------
-    # get_experiment
-    # ------------------------------------------------------------------
 
     def get_experiment(self, experiment_id: str) -> Experiment:
         with self._lock:
@@ -606,9 +497,8 @@ class ExperimentService:
     def _resolve_by_prefix(self, experiment_id: str) -> Experiment:
         """Resolve an exact id or an unambiguous >=8 hex-char id prefix.
 
-        Shared by both the public and the authenticated single-experiment
-        lookups so an operator can use the same short id (e.g. copied from
-        ``/activity/public`` or a log line) against either endpoint.
+        Shared by the public and authenticated single-experiment lookups so the same
+        short id works against either endpoint.
         """
         if re.fullmatch(r"[0-9a-f]{8,64}", experiment_id) is None:
             raise ExperimentNotFoundError("invalid experiment id")
@@ -628,13 +518,8 @@ class ExperimentService:
     def resolve_experiment(self, experiment_id: str) -> Experiment:
         """Authenticated equivalent of ``resolve_public_experiment``.
 
-        Accepts either a full experiment id or an unambiguous >=8 hex-char
-        prefix, exactly like the public endpoint, so an operator holding
-        only a short id (e.g. from ``/activity/public``) can still look up
-        full authenticated detail without first resolving it elsewhere.
-        Falls back to an exact-id lookup for ids that don't look like a
-        valid hex prefix (e.g. legacy/non-hex ids), preserving the previous
-        ``get_experiment`` behavior for exact matches.
+        Accepts an exact id or an unambiguous >=8 hex-char prefix like the public endpoint;
+        ids that are not valid hex prefixes fall back to an exact-id lookup.
         """
         if re.fullmatch(r"[0-9a-f]{8,64}", experiment_id) is not None:
             return self._resolve_by_prefix(experiment_id)
@@ -664,17 +549,14 @@ class ExperimentService:
             ).fetchall()
         return [_row_to_experiment(row) for row in rows]
 
-    # ------------------------------------------------------------------
-    # list_activity — persistent activity log (experiment lifecycle events)
-    # ------------------------------------------------------------------
 
     def list_activity(
         self, limit: int = 50, experiment_id: str | None = None
     ) -> list[dict[str, Any]]:
         """Return recent persisted activity log entries, newest first.
 
-        Reuses ``modules.run_store.list_activity`` against the same
-        connection/lock used for all other experiment reads/writes.
+        Reuses ``modules.run_store.list_activity`` on the same connection/lock as all
+        other experiment reads/writes.
         """
         with self._lock:
             return list_activity(
@@ -698,11 +580,8 @@ class ExperimentService:
     ) -> ExperimentLogger:
         """Build the (cheap, stateless) structured JSONL logger for one experiment.
 
-        Every caller anywhere in the pipeline — this service, the mailbox
-        approval bridge, or a test — goes through this single factory so
-        every log entry for a given experiment lands in exactly one file
-        (``<experiment_log_dir>/<experiment_id>.jsonl``), regardless of
-        which thread is writing.
+        Every pipeline caller goes through this single factory, so all log entries for an
+        experiment land in exactly one file regardless of which thread writes.
         """
         if mailbox_task_id is None:
             mailbox_task_id = self.mailbox_task_id_for_experiment(experiment_id)
@@ -716,16 +595,12 @@ class ExperimentService:
         """Path to an experiment's JSONL log file (may not exist yet)."""
         return Path(self.experiment_log_dir) / f"{experiment_id}.jsonl"
 
-    # ------------------------------------------------------------------
-    # Internal: status transition helper
-    # ------------------------------------------------------------------
 
     def _transition(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:
         """Atomically move ``from_status`` -> ``to_status`` iff still ``from_status``.
 
-        Returns True if the transition happened. Extra ``fields`` are set in
-        the same UPDATE. Unknown/disallowed transitions are refused by the
-        caller (checked via ``_STATE_TRANSITIONS`` before calling this).
+        Returns True if the transition happened; extra ``fields`` are set in the same
+        UPDATE. Disallowed transitions are refused by the caller via ``_STATE_TRANSITIONS``.
         """
         set_clauses = ["status = ?"]
         values: list[Any] = [to_status]
@@ -793,8 +668,8 @@ class ExperimentService:
             ).fetchone()
             if current is not None and current[0] == STATUS_CANCELLED and status != STATUS_CANCELLED:
                 return
-            # The pipeline thread of a stalled experiment may still wake up
-            # once its worker is stopped; the stall verdict stands (#400).
+            # The pipeline thread of a stalled experiment may still wake up once its worker is
+            # stopped; the stall verdict stands (#400).
             if current is not None and _is_stalled(current[0], current[1]):
                 return
             self._conn.execute(
@@ -832,31 +707,18 @@ class ExperimentService:
             reason=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
         )
 
-    # ------------------------------------------------------------------
-    # mark_interrupted_experiments_failed — startup recovery (#281, #371)
-    # ------------------------------------------------------------------
 
     def mark_interrupted_experiments_failed(self) -> list[str]:
-        """Reconcile experiments orphaned by a service restart.
+        """Reconcile experiments orphaned by a service restart (#281).
 
-        An experiment runs in a daemon thread of the ``agent-api`` process, so
-        a restart kills it mid-flight and leaves its row in ``implementing`` or
-        ``verifying`` forever (#281). Intended to be called once at process
-        startup, before any new experiment is run: at that moment no thread in
-        this process can still own an active experiment.
+        An experiment runs in a daemon thread of the ``agent-api`` process, so a restart
+        kills it mid-flight and leaves its row active forever. Called once at process
+        startup, before any new experiment runs. Never resumes the work: moving to a
+        terminal status is what lets the waiting Nexus session resume and decide.
+        Implementation/verification become ``interrupted`` (legacy ``selecting`` becomes
+        ``failed``); worktrees are deliberately retained for inspection or retry.
 
-        Never resumes the work. Moving the experiment to a terminal status is
-        what lets the waiting Nexus session resume (see
-        ``MailboxTaskService.resume_finished_experiments``) and decide whether
-        the task continues or ends.
-
-        Implementation and verification runs become the distinct terminal
-        ``interrupted`` state. The legacy ``selecting`` phase still becomes
-        ``failed`` so old persisted rows retain their previous recovery
-        behaviour. Worktrees and their database references are deliberately
-        retained for inspection or retry.
-
-        Returns the list of experiment ids that were reconciled.
+        Returns the list of reconciled experiment ids.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -874,28 +736,22 @@ class ExperimentService:
                 ended_at=_utcnow_iso(),
                 error=_INTERRUPTED_BY_RESTART_ERROR,
             ):
-                # A newly constructed service has no live handles, but clearing
-                # the registry here also makes explicit/in-process startup
-                # reconciliation safe and prevents stale cancellation targets.
+                # Clearing the registry also makes in-process startup reconciliation safe and prevents
+                # stale cancellation targets.
                 with self._process_lock:
                     self._active_processes.pop(row["id"], None)
                 marked.append(row["id"])
         return marked
 
-    # ------------------------------------------------------------------
-    # sweep_stalled_experiments — periodic stall detection (#400)
-    # ------------------------------------------------------------------
 
     def _phase_hard_limit_seconds(self, status: str) -> float:
         """Longest a phase may legitimately go without a single log entry.
 
-        Verification runs the test suite under its own safety cap and may then
-        start a repair agent, so it gets the larger of both.
+        Verification runs the test suite under its own safety cap and may then start a
+        repair agent, so it gets the larger of both.
         """
-        # The implementation timeout is the phase's upper bound, not a floor.
-        # A deliberately shorter coding-agent cap must make a silent phase
-        # eligible for sweeping sooner, while an absent or oversized setting
-        # retains the three-hour implementation maximum.
+        # The implementation timeout is the phase's upper bound, not a floor: a shorter
+        # coding-agent cap must make a silent phase sweep-eligible sooner.
         agent_cap = min(agent_watchdog_limits()[1], float(_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS))
         if status == STATUS_VERIFYING:
             return max(agent_cap, float(self._get_test_watchdog_config().safety_cap_seconds))
@@ -905,8 +761,8 @@ class ExperimentService:
         """Timestamp and event of the newest entry in the experiment's JSONL log."""
         newest: datetime | None = None
         event = ""
-        # A rotation leaves the active file briefly empty; the previous one
-        # then holds the newest entry.
+        # A rotation leaves the active file briefly empty; the previous one then holds the
+        # newest entry.
         for name in (f"{experiment_id}.jsonl", f"{experiment_id}-1.jsonl"):
             path = Path(self.experiment_log_dir) / name
             try:
@@ -964,7 +820,7 @@ class ExperimentService:
         if not pgid:
             return "no worker recorded"
         pgid = int(pgid)
-        # Never signal this process's own group, init or anything below it.
+        # Never signal this process's own group, init, or anything below it.
         if pgid <= 1 or pgid == os.getpgrp():
             return "refused to signal own process group"
         try:
@@ -989,15 +845,13 @@ class ExperimentService:
     def sweep_stalled_experiments(self, now: datetime | None = None) -> list[str]:
         """Fail active experiments that logged nothing past their phase limit.
 
-        Startup reconciliation (#371) only helps when the process restarts; a
-        worker that hangs silently in a live process kept its experiment
-        ``implementing`` for 11 hours (#400), blocking the issue, the daily
-        budget and the retry logic. An experiment whose newest experiment log
-        entry or activity event is older than the phase's hard limit plus the
-        grace (``NEXUS_EXPERIMENT_STALL_GRACE_SECONDS``) is moved to
-        ``failed`` with a ``stalled:`` error, and its worker's process group,
-        if still alive, is stopped. Anything that logged within the limit is
-        never touched. Idempotent: a swept experiment is terminal.
+        Startup reconciliation (#371) only helps on a restart; a worker that hangs silently
+        in a live process kept its experiment ``implementing`` for 11 hours (#400), blocking
+        the issue, the budget and retries. An experiment whose newest log entry or activity
+        event is older than the phase hard limit plus the grace
+        (``NEXUS_EXPERIMENT_STALL_GRACE_SECONDS``) moves to ``failed`` with a ``stalled:``
+        error and its worker's process group is stopped if still alive; anything that
+        logged within the limit is never touched. Idempotent: a swept experiment is terminal.
 
         Returns the ids of the experiments marked stalled.
         """
@@ -1022,9 +876,8 @@ class ExperimentService:
             if silent <= limit + grace:
                 continue
             error = f"{_STALLED_ERROR_PREFIX}no progress for {int(silent)}s in phase {phase}"
-            # Claim the row first, conditionally: an experiment that moved on
-            # in between is left alone, and once it is failed the pipeline
-            # thread woken by the stopped worker cannot overwrite the verdict.
+            # Claim the row first, conditionally: an experiment that moved on in between is left
+            # alone, and once failed the woken pipeline thread cannot overwrite the verdict.
             if not self._transition(
                 experiment_id, phase, STATUS_FAILED,
                 ended_at=now.isoformat(), error=error, worker_pgid=None,
@@ -1050,9 +903,6 @@ class ExperimentService:
             stalled.append(experiment_id)
         return stalled
 
-    # ------------------------------------------------------------------
-    # run_experiment — the whole pipeline, single entry point
-    # ------------------------------------------------------------------
 
     def run_experiment(self, experiment_id: str, github_work_tracking: Any | None = None) -> Experiment:
         experiment = self.get_experiment(experiment_id)  # raises if missing
@@ -1105,24 +955,18 @@ class ExperimentService:
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
         """Single-call implementation pipeline.
 
-        Phases (in order):
-          1. Goal security check (deterministic, no LLM call).
-          2. Isolated git worktree creation.
-          3. One coding-agent call (Codex or Claude, selected per experiment) —
-             the worker analyses the repo, plans, and implements the goal
-             directly inside the worktree.
-          4. Verification — git diff + tests + deterministic quality gate.
+        Phases: 1. goal security check (deterministic, no LLM call), 2. isolated git
+        worktree creation, 3. one coding-agent call inside the worktree, 4. verification
+        (git diff + tests + deterministic quality gate).
 
-        The injected GitHub lifecycle publishes a checkpoint through a
-        temporary index before verification; it never changes this worktree's
-        HEAD/index and never merges or deploys from this service.
-        Reuses the external coding-agent workers (no duplicated
-        subprocess/worker logic) and the existing SQLite store.
+        The injected GitHub lifecycle publishes a checkpoint through a temporary index
+        before verification; it never changes this worktree's HEAD/index and never
+        merges or deploys from this service.
         """
         experiment = self.get_experiment(experiment_id)
         elog = self.get_experiment_logger(experiment_id)
 
-        # ---- Security check: apply safety denylist to the raw goal --------
+        # Security check: apply the safety denylist to the raw goal.
         rejection_reason = _check_goal_policy(experiment.goal)
         if rejection_reason is not None:
             elog.warning(
@@ -1144,7 +988,6 @@ class ExperimentService:
                 f"Goal may describe a secret action; continuing, the reviewer checks the change: {secret_warning}",
             )
 
-        # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
         base_ref = self.base_ref
@@ -1197,7 +1040,6 @@ class ExperimentService:
             branch_name=branch_name,
         )
 
-        # ---- Single Codex implementation call -----------------------------
         elog.info(
             "implementation", "implementation_started",
             "Starting implementation (single coding-agent call: analyse, plan, implement)",
@@ -1207,8 +1049,8 @@ class ExperimentService:
             implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
         implementation_task_id = uuid.uuid4().hex
         worker = self.worker_factory(worktree_path)
-        # Which coding agent got this experiment is recorded before the call,
-        # so a timeout or a crash still leaves the run attributable.
+        # Record which coding agent got this experiment before the call, so a timeout or
+        # crash still leaves the run attributable.
         implementation_provider = provider_of(worker)
         self._force_status(
             experiment_id, STATUS_IMPLEMENTING,
@@ -1241,8 +1083,8 @@ class ExperimentService:
             and fallback is not None
             and self.get_experiment(experiment_id).status != STATUS_CANCELLED
         ):
-            # The provider was overloaded, not the work wrong: let the other
-            # coding agent do it instead of failing the experiment.
+            # Provider overloaded, not the work wrong: let the other coding agent try instead
+            # of failing the experiment.
             elog.warning(
                 "implementation", "implementation_provider_fallback",
                 f"{implementation_provider} is overloaded; implementation runs on {fallback}",
@@ -1314,7 +1156,6 @@ class ExperimentService:
         if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
 
-        # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
         result = self._verify(
             experiment_id,
@@ -1330,11 +1171,10 @@ class ExperimentService:
     def _merge_current_main(self, worktree_path: str, elog: ExperimentLogger) -> str:
         """Bring today's main into a retry's issue branch (#478).
 
-        A retry continues the issue branch, which can lag far behind main;
-        its change then conflicts at adoption every time. Merging main first
-        lets the coding agent resolve a conflict once, in the experiment,
-        where tests and review still check it. Returns a note for the prompt
-        when conflict markers are left to resolve, else "".
+        A retry continues the issue branch, which can lag far behind main and conflict at
+        adoption every time; merging main first lets the coding agent resolve a conflict
+        once, in the experiment, where tests and review still check it. Returns a note for
+        the prompt when conflict markers are left to resolve, else "".
         """
         def git(*args: str) -> subprocess.CompletedProcess:
             return _run_git(
@@ -1689,10 +1529,8 @@ class ExperimentService:
                 run_id=experiment_id,
                 config=watchdog,
                 expected_total=expected_total,
-                # Publishing the test heartbeat into this experiment's own log
-                # is what keeps the global Nexus heartbeat alive while a long
-                # suite runs; the per-test entries stay in the dedicated test
-                # log rather than flooding this one.
+                # Publishing the test heartbeat into this experiment's log keeps the global Nexus
+                # heartbeat alive during a long suite; per-test entries stay in the dedicated test log.
                 on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
@@ -1754,13 +1592,9 @@ class ExperimentService:
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
             elog.warning("verifying", "diff_check_issue", f"git diff --check reported issues: {diff_check_issue}")
         elif test_timed_out:
-            # An aborted test run is not a normal test failure: the tests
-            # never finished (exit_code=None is expected and must not be
-            # mistaken for a real failing exit status). Keep this branch
-            # ahead of the exit-code check below so it can never be folded
-            # into "tests failed". The distinct "test_stalled" /
-            # "test_safety_cap_exceeded" event was already logged above,
-            # with the diagnostics naming the test progress stopped on.
+            # An aborted test run is not a test failure (exit_code=None is expected): keep this
+            # branch ahead of the exit-code check so it can never fold into "tests failed". The
+            # distinct "test_stalled"/"test_safety_cap_exceeded" event was already logged above.
             final_status = STATUS_TIMED_OUT
             if use_local_tests and test_run.stalled:
                 error = (
@@ -1777,8 +1611,8 @@ class ExperimentService:
             if use_local_tests and test_run.stall_diagnostics:
                 error = f"{error}\n{test_run.stall_diagnostics}"
         elif use_local_tests and test_run.process_died:
-            # Killed by a signal (OOM, an operator, the host): the suite never
-            # reached a verdict, so it must not be filed as a test failure.
+            # Killed by a signal (OOM, an operator, the host): no verdict was reached, so it must
+            # not be filed as a test failure.
             final_status = STATUS_NEEDS_REVIEW
             error = "test process died before finishing (killed by a signal, no exit code)"
             if test_run.stall_diagnostics:
@@ -1799,17 +1633,9 @@ class ExperimentService:
         else:
             elog.info("verifying", "tests_passed", "Verification tests passed")
 
-            # ---- Deterministic quality evaluation (no LLM call) --------
-            # Tests passing is necessary but never sufficient: this checks
-            # that the *actual* diff matches what the plan (and the
-            # original task) required — e.g. a plan for an implementation
-            # change that only touched test files must never become
-            # "succeeded" just because those tests happen to pass. A
-            # failure anywhere in this block (a bug in the evaluator
-            # itself, an unreadable plan, ...) must never be able to turn
-            # into a silent "succeeded" — it always downgrades to
-            # needs_review instead, with the worktree preserved for
-            # manual review.
+            # Deterministic quality evaluation (no LLM call): tests passing is necessary but never
+            # sufficient - the diff must match what plan and task required. Any failure in this
+            # block downgrades to needs_review with the worktree preserved, never a silent "succeeded".
             try:
                 experiment_for_eval = self.get_experiment(experiment_id)
                 changed = parse_git_status_short(git_status)
@@ -1822,10 +1648,8 @@ class ExperimentService:
                     worktree_path,
                 )
                 quality_evaluation = eval_result.to_dict()
-                # Only the artifact-evidence checks failed and the tests are
-                # green: the reviewer decides at adoption (#519). Only a
-                # GitHub-tracked run reaches adoption and its reviewer, so
-                # every other run keeps the hard stop.
+                # Only artifact-evidence checks failed and tests are green: the reviewer decides at
+                # adoption (#519); every non-GitHub-tracked run keeps the hard stop.
                 review_findings = (
                     eval_result.soft_findings() if github_work_tracking is not None else None
                 )
@@ -1914,16 +1738,12 @@ class ExperimentService:
                 )
         return self.get_experiment(experiment_id)
 
-    # ------------------------------------------------------------------
-    # Cleanup — explicit removal of worktree and branch
-    # ------------------------------------------------------------------
 
     def cleanup_worktree(self, experiment_id: str) -> None:
         """Explicitly remove an experiment's git worktree and branch.
 
-        Never called automatically by ``run_experiment``; the worktree is
-        kept after an experiment finishes so a human can inspect it. Safe to
-        call multiple times.
+        Never called automatically by ``run_experiment`` - the worktree is kept after an
+        experiment finishes so a human can inspect it. Safe to call multiple times.
         """
         elog = self.get_experiment_logger(experiment_id)
         experiment = self.get_experiment(experiment_id)
@@ -1939,9 +1759,6 @@ class ExperimentService:
             _run_git(["branch", "-D", experiment.branch_name], cwd=self.repo_root, elog=elog, phase="cleanup")
         elog.info("cleanup", "worktree_cleanup_done", "Experiment worktree and branch cleanup finished")
 
-    # ------------------------------------------------------------------
-    # Worktree retention (#376) — startup and periodic, terminal runs only
-    # ------------------------------------------------------------------
 
     def cleanup_expired_worktrees(
         self, retention_hours: float | None = None, *, now: datetime | None = None
@@ -1949,17 +1766,14 @@ class ExperimentService:
         """Remove worktrees of terminal experiments that ended over ``retention_hours`` ago.
 
         ``retention_hours`` defaults to ``NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS``
-        (see ``worktree_retention_hours``); ``0`` disables the pass. Only the
-        worktree directory goes: the experiment row (including its
-        ``worktree_path``), its JSONL log and its branch are kept, so the
-        record stays complete and committed work stays recoverable.
+        (see ``worktree_retention_hours``); ``0`` disables the pass. Only the worktree
+        directory goes - the experiment row, its JSONL log and its branch are kept, so
+        the record stays complete and committed work stays recoverable.
 
-        A worktree is never removed while its experiment is non-terminal, has
-        no ``ended_at``, ended within the retention window, or has an adoption
-        that has not finished, nor when its path lies outside
-        ``worktrees_root``. Already-missing directories are skipped silently,
-        so repeated passes are no-ops. A failure on one worktree is recorded
-        (activity log, experiment log) and does not stop the others.
+        Never removed while the experiment is non-terminal, has no ``ended_at``, ended
+        within the window, has an unfinished adoption, or has a path outside
+        ``worktrees_root``. Already-missing directories are skipped silently so repeated
+        passes are no-ops; a failure on one worktree is recorded and does not stop the others.
         """
         hours = worktree_retention_hours() if retention_hours is None else max(0.0, float(retention_hours))
         result = WorktreeCleanupResult(retention_hours=hours)
@@ -1995,8 +1809,8 @@ class ExperimentService:
         terminal = ", ".join("?" * len(_TERMINAL_STATUSES))
         finished = ", ".join("?" * len(_ADOPTION_TERMINAL_STATUSES))
         with self._lock:
-            # Re-checked right before deleting: an adoption may have been
-            # queued since the candidates were listed.
+            # Re-checked right before deleting: an adoption may have been queued since the
+            # candidates were listed.
             still_expired = self._conn.execute(
                 f"SELECT 1 FROM experiments e WHERE e.id = ? AND e.status IN ({terminal}) "
                 "AND NOT EXISTS (SELECT 1 FROM experiment_adoptions a "
@@ -2012,8 +1826,8 @@ class ExperimentService:
 
         elog = self.get_experiment_logger(experiment_id)
         try:
-            # Unregisters the worktree from the main repository; the rmtree
-            # below is what actually guarantees the directory is gone.
+            # Unregister the worktree from the main repository; the rmtree below is what actually
+            # guarantees the directory is gone.
             _run_git(
                 ["worktree", "remove", "--force", str(path)],
                 cwd=self.repo_root, elog=elog, phase="cleanup",

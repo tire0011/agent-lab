@@ -143,37 +143,30 @@ def _read_git_revision() -> str | None:
 
 
 _PROCESS_START_TIME = time.time()
-# Capture this while the module's code is being loaded.  Reading HEAD lazily
-# would describe a later checkout, not the revision this process is executing.
+# Capture at module load: reading HEAD lazily would describe a later checkout,
+# not the revision this process is executing.
 _STARTUP_REVISION = _read_git_revision()
 configure_logging()
 _logger = logging.getLogger(__name__)
 _MCP_MOUNT = create_mcp_mount()
 
-# How long a controller session may sit untouched mid-turn before it is called
-# abandoned. Liveness has to be inferred from `updated_at` because there is no
-# heartbeat (#158), so this sits well clear of a slow but healthy turn: local
-# inference plus tool calls can legitimately take many minutes, and calling a
-# live session dead is worse than noticing a dead one late.
+# How long a session may sit untouched mid-turn before it is called abandoned.
+# Inferred from `updated_at` (no heartbeat, #158), so it sits well clear of a slow
+# but healthy turn: calling a live session dead is worse than noticing a dead one late.
 _STALE_SESSION_SECONDS = int(os.environ.get("NEXUS_STALE_SESSION_SECONDS", 6 * 60 * 60))
 
-# The heartbeat path (#162) replaces that inference for work that claims itself:
-# a worker says explicitly that it is alive, so silence means something and the
-# timeout can be minutes instead of hours. ``resolve_stale_timeout`` clamps a
-# zero/negative/unparsable setting to a safe floor rather than reaping live work.
+# With the heartbeat (#162) a worker says it is alive explicitly, so silence means
+# something and the timeout can be minutes, not hours. ``resolve_stale_timeout``
+# clamps a zero/negative/unparsable setting to a safe floor rather than reaping live work.
 _STALE_HEARTBEAT_SECONDS = resolve_stale_timeout(
     os.environ.get("NEXUS_STALE_HEARTBEAT_SECONDS")
 )
 
 
 
-# ---------------------------------------------------------------------------
-# Codex task API: fixed server-side execution boundaries.
-#
-# Clients never choose the working directory or sandbox mode; both are
-# hard-coded here so Codex tasks started through this API stay read-only
-# and confined to the repository root, regardless of request payload.
-# ---------------------------------------------------------------------------
+# Codex task API: clients never choose the working directory or sandbox mode -
+# both are hard-coded so tasks stay read-only and confined to the repository root,
+# regardless of the request payload.
 CODEX_WORKING_DIR = "/agent"
 CODEX_SANDBOX = "read-only"
 CODEX_DEFAULT_TIMEOUT_SECONDS = 120
@@ -207,12 +200,8 @@ def get_codex_service() -> CodexTaskService:
 
 @lru_cache(maxsize=1)
 def get_experiment_service() -> ExperimentService:
-    """Singleton ExperimentService for the process.
-
-    Shared with ``MailboxTaskService`` so both the mailbox task bridge
-    and the read-only ``/experiments`` and ``/activity`` endpoints observe
-    the same in-process state (single SQLite connection/lock), rather than
-    each opening its own separate connection to the same database file.
+    """Singleton ExperimentService for the process, shared with MailboxTaskService
+    so both observe the same in-process state (one SQLite connection/lock).
 
     Overridable in tests via ``app.dependency_overrides[get_experiment_service]``.
     """
@@ -243,10 +232,8 @@ def get_experiment_adoption_service() -> ExperimentAdoptionService:
 
 @lru_cache(maxsize=1)
 def get_failure_analysis_service() -> FailureAnalysisService:
-    """Singleton failure-analysis service for the process (#145).
-
-    Given the process's own operations registry so diagnosis reaches the same
-    read-only capability catalog the persistent controller does (#172).
+    """Singleton failure-analysis service for the process (#145), wired to the same
+    read-only capability catalog as the persistent controller (#172).
 
     Overridable in tests via ``app.dependency_overrides[get_failure_analysis_service]``.
     """
@@ -285,11 +272,8 @@ def get_operation_chain_service() -> OperationChainService:
 
 
 def get_nexus_task_store() -> Iterator[NexusTaskStore]:
-    """Controller session store for liveness inspection.
-
-    Opened and closed per request rather than cached: this serves occasional
-    diagnostic reads, and a process-lifetime connection for them would be one
-    more shared handle for no benefit.
+    """Controller session store for liveness inspection, opened and closed per
+    request - occasional diagnostic reads do not need a process-lifetime handle.
 
     Overridable in tests via ``app.dependency_overrides[get_nexus_task_store]``.
     """
@@ -314,11 +298,8 @@ def _resolve_experiment_service() -> ExperimentService:
 
 
 def _resolve_codex_service() -> CodexTaskService:
-    """Look up the (possibly test-overridden) Codex service for startup use.
-
-    Direct calls to ``get_codex_service()`` would bypass FastAPI's
-    ``dependency_overrides`` used by tests, so lifespan startup goes through
-    this helper instead.
+    """Look up the (possibly test-overridden) Codex service for startup use:
+    direct calls to ``get_codex_service()`` would bypass ``dependency_overrides``.
     """
     override = app.dependency_overrides.get(get_codex_service)
     if override is not None:
@@ -361,9 +342,8 @@ def _resolve_nexus_chat_job_service() -> NexusChatJobService:
     return get_nexus_chat_job_service()
 
 
-# How often the API process sweeps for stalled experiments (#400). Startup
-# reconciliation only helps on a restart; a worker that hangs silently in this
-# process kept experiment deac59fb `implementing` for 11 hours.
+# How often the API process sweeps for stalled experiments (#400); startup
+# reconciliation only helps on a restart.
 _STALL_SWEEP_INTERVAL_SECONDS = 5 * 60
 
 
@@ -468,12 +448,11 @@ def get_operations_executor() -> OperationsExecutor:
 
 @lru_cache(maxsize=1)
 def get_log_reader() -> LogReader:
-    """Singleton LogReader for the process.
+    """Singleton LogReader for the process, reading the merged
+    agent-api/nexus-mailbox/llama-server systemd journals.
 
-    Reads the ``agent-api``/``nexus-mailbox``/``llama-server`` systemd
-    journals merged into ``GET /logs``. Overridable in tests via
-    ``app.dependency_overrides[get_log_reader]`` so a test never shells
-    out to the real ``journalctl`` binary.
+    Overridable in tests via ``app.dependency_overrides[get_log_reader]`` so a test
+    never shells out to the real ``journalctl`` binary.
     """
     return LogReader()
 
@@ -481,12 +460,11 @@ def get_log_reader() -> LogReader:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with _MCP_MOUNT.lifespan():
-        # Mark orphaned 'running' Codex tasks as failed exactly once at startup.
-        # Never restarts execution and never starts a Codex process.
+        # Mark orphaned running Codex tasks failed exactly once at startup; never
+        # restarts execution and never starts a Codex process.
         _resolve_codex_service().mark_interrupted_tasks_failed()
-        # Experiment threads die with this process too (#281, #371). Reconciling them
-        # before the mailbox recovery below lets the waiting Nexus session
-        # resume and decide whether the task continues or ends.
+        # Experiment threads die with this process too (#281, #371); reconcile them
+        # before the mailbox recovery so the waiting Nexus session can resume.
         try:
             _interrupted = _resolve_experiment_service().mark_interrupted_experiments_failed()
             if isinstance(_interrupted, list) and _interrupted:
@@ -497,10 +475,9 @@ async def lifespan(app: FastAPI):
                 )
         except Exception as _exc:  # noqa: BLE001 - recovery must not block startup
             _logger.error("could not mark interrupted experiments: %s", _exc)
-        # Terminal experiments keep their worktree for inspection; past the
-        # retention window it is removed so finished runs cannot fill the
-        # disk (#376). Runs after the reconciliation above, which stamps
-        # just-interrupted runs with a fresh ended_at, so they are kept.
+        # Terminal experiments keep their worktree for inspection; past the retention
+        # window it is removed so finished runs cannot fill the disk (#376). Runs after
+        # the reconciliation above, which stamps just-interrupted runs with a fresh ended_at.
         try:
             _gc = _resolve_experiment_service().cleanup_expired_worktrees()
             if getattr(_gc, "removed", None):
@@ -518,13 +495,9 @@ async def lifespan(app: FastAPI):
         _resolve_operation_chain_service().recover_after_restart()
         _resume_blocked_capabilities_after_startup()
 
-        # Controller sessions only reach a terminal status through the final
-        # decision path, so a turn that dies mid-flight leaves its row `active`
-        # forever. 17 of the 41 sessions ever started were in that state,
-        # untouched for 8 to 19 days, with nothing reaping or reporting them
-        # (#158). Marking them is deliberate and does not resume anything:
-        # re-running a turn costs a model call and may repeat whatever killed
-        # it. Never aborts startup.
+        # Sessions only reach a terminal status through the final decision path, so a turn
+        # dying mid-flight leaves its row `active` forever (#158). Marking is deliberate and
+        # resumes nothing - re-running a turn may repeat whatever killed it. Never aborts startup.
         try:
             _abandoned = NexusTaskStore().abandon_stale_sessions(
                 _STALE_SESSION_SECONDS
@@ -538,11 +511,9 @@ async def lifespan(app: FastAPI):
         except Exception as _exc:  # noqa: BLE001 - recovery must not block startup
             _logger.error("could not reap stale controller sessions: %s", _exc)
 
-        # Claims whose worker stopped heartbeating (#162). A restart is the
-        # clearest case: every worker this process inherited is gone by
-        # definition, so their claims are reconciled to an explicit terminal
-        # reason instead of waiting out the six-hour `updated_at` threshold.
-        # Idempotent, and never resumes the work.
+        # Claims whose worker stopped heartbeating (#162): on restart every inherited
+        # worker is gone, so reconcile their claims to an explicit terminal reason instead
+        # of waiting out the updated_at threshold. Idempotent, never resumes work.
         _claim_store = None
         try:
             _claim_store = NexusTaskStore()
@@ -565,12 +536,10 @@ async def lifespan(app: FastAPI):
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Best-effort outbox recovery: publish any un-pushed outbox records from
-        # a previous crash.  Both publishers share the same MailboxConfig / DB.
-        # Each publisher is fully wrapped so that a constructor *or* close failure
-        # never skips the next publisher and never aborts the API startup.
-        # exc_info is intentionally omitted: raw tracebacks can expose paths /
-        # tokens; the redacted message is sufficient for diagnosis.
+        # Best-effort outbox recovery: publish un-pushed outbox records from a previous
+        # crash. Each publisher is fully wrapped so a constructor or close failure never
+        # skips the next one and never aborts startup. exc_info is omitted on purpose:
+        # raw tracebacks can expose paths/tokens.
         _mc = MailboxConfig.from_env()
         for _pub_cls in (OperationChainOutboxPublisher, TaskApprovalOutboxPublisher):
             _cls_name = getattr(_pub_cls, "__name__", repr(_pub_cls))
@@ -628,8 +597,8 @@ def _run_mailbox_poll_once_for_webhook() -> None:
         dry_run=False,
     )
     if result.status == "busy":
-        # The active processor rescans the inbox before releasing the lock, so
-        # the message this webhook announced is still picked up.
+        # The active processor rescans the inbox before releasing the lock, so the
+        # announced message is still picked up.
         _logger.info("mailbox_webhook busy: another processor is already running")
         return
     if result.status == "processed":
@@ -754,9 +723,6 @@ def get_chat_job(
         error=job.error if job.status == STATUS_FAILED else None,
     )
 
-# ---------------------------------------------------------------------------
-# Codex task endpoints (authenticated, synchronous, read-only sandbox only)
-# ---------------------------------------------------------------------------
 
 
 @app.post("/codex/tasks", response_model=CodexTaskResponse, status_code=201)
@@ -843,16 +809,12 @@ def run_codex_task(
     except TaskNotRunnableError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception:
-        # Worker-level failures are already captured as a stored task status
-        # by CodexTaskService.run_task. Anything reaching here is an
-        # unexpected internal error; never leak tracebacks/secrets.
+        # Worker-level failures are already captured as a stored task status; anything
+        # reaching here is unexpected - never leak tracebacks/secrets.
         raise HTTPException(status_code=500, detail="internal error running codex task")
     return CodexTaskResponse(**task.to_dict())
 
 
-# ---------------------------------------------------------------------------
-# Mailbox task endpoints (authenticated, read-only)
-# ---------------------------------------------------------------------------
 
 
 def _approval_to_response(approval) -> MailboxTaskApproval:
@@ -934,14 +896,8 @@ async def mailbox_github_webhook(
     return JSONResponse(status_code=202, content={"status": "accepted"})
 
 
-# ---------------------------------------------------------------------------
-# Mailbox inbox/outbox listing (public, sanitized, read-only)
-#
-# Separate from the "Aufträge" task-approval bridge above: this surfaces the
-# general communication mailbox (idea/task/question/context messages and
-# their outbox responses) so the web UI can show what came in and what went
-# out, without ever exposing full prompts, file paths, or secrets.
-# ---------------------------------------------------------------------------
+# Public, sanitized inbox/outbox listing: shows what came in and went out without
+# ever exposing full prompts, file paths, or secrets.
 
 MAILBOX_MESSAGES_DEFAULT_LIMIT = 20
 MAILBOX_MESSAGES_MAX_LIMIT = 100
@@ -975,8 +931,8 @@ def _safe_mailbox_sender(raw: str | None) -> str | None:
 def _mailbox_preview(text: str | None) -> str | None:
     if not text:
         return None
-    # Drop markdown headings (e.g. "## Result") so the preview starts with
-    # actual content, then redact and bound it like every other diagnostic.
+    # Drop markdown headings so the preview starts with actual content, then redact
+    # and bound it like every other diagnostic.
     stripped = "\n".join(
         line for line in text.splitlines() if not line.strip().startswith("#")
     ).strip()
@@ -1037,12 +993,8 @@ def list_mailbox_messages(
     )
 
 
-# ---------------------------------------------------------------------------
-# Experiment and activity log endpoints (public allowlisted + authenticated)
-#
-# Thin routes over the existing ExperimentService/run_store persistence;
-# no experiment orchestration or new SQLite access is added here.
-# ---------------------------------------------------------------------------
+# Experiment and activity log endpoints: thin routes over the existing
+# ExperimentService/run_store persistence; no new orchestration or SQLite access here.
 
 
 @app.get("/experiments", response_model=ExperimentsResponse)
@@ -1099,19 +1051,13 @@ def cancel_experiment(
 
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 
-# Coarse groupings of a structured JSONL entry's ``phase`` into the
-# ``source`` shown by the unified Logs timeline, independent of the
-# systemd journal sources (``agent-api``/``nexus-mailbox``/``llama-server``)
-# merged in by ``GET /logs``. Experiment id / mailbox task id / job id
-# remain available as optional detail/filter fields on every entry;
-# ``source`` is only the primary at-a-glance grouping.
+# Coarse grouping of a structured entry's ``phase`` into the timeline's ``source``;
+# experiment/mailbox task/job ids remain available as detail/filter fields on every entry.
 _MAILBOX_SOURCE_PHASES = {
     "mailbox",
     "queued",
-    # Entries written before the phase for mailbox loggers was corrected
-    # (see modules/logging_config._phase_for_logger) carry the logger's
-    # module name as their phase. Recognizing those here reclassifies the
-    # existing history as `mailbox` on read, with no migration.
+    # Entries written before the mailbox phase fix carry the logger's module name as
+    # their phase; recognizing those reclassifies the existing history on read, no migration.
     "mailbox_processor",
     "poll_runner",
     "processing",
@@ -1150,11 +1096,9 @@ def get_experiment_logs(
     limit: int = Query(default=EXPERIMENT_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENT_LOGS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentLogsResponse:
-    """Single, chronological, structured view of one experiment's complete
-    task/experiment run - mailbox approval through research, selection,
-    implementation, verification, and cleanup - reusing the same durable
-    JSONL log written by ``modules.central_logging``, merged with its
-    correlated mailbox task's pre-experiment-id log entries if any.
+    """Single, chronological view of one experiment's complete run - mailbox
+    approval through research, implementation, verification, cleanup - from the
+    durable JSONL log, merged with its mailbox task's pre-experiment entries.
     """
     authorize(x_api_key)
     try:
@@ -1167,8 +1111,7 @@ def get_experiment_logs(
 
     mailbox_task_id = _mailbox_task_id(service, experiment.id)
     try:
-        # Fetch one extra entry to detect whether an older page remains,
-        # without re-scanning already-returned entries on the next call.
+        # Fetch one extra entry to detect whether an older page remains.
         raw_entries = central_logging_module.read_experiment_logs(
             service.experiment_log_dir, experiment.id,
             mailbox_task_id=mailbox_task_id, level=level, phase=phase,
@@ -1193,15 +1136,10 @@ def get_experiment_logs(
     )
 
 
-# Per-service line count merged from each journalctl unit into every
-# unfiltered-by-id page of GET /logs; bounded so one manual refresh (or
-# "load older" call) cannot turn into an unbounded read across three
-# services. ``modules.log_reader.LogReader.tail_journal_entries`` also
-# normalizes each journal entry's timestamp into the same string shape
-# structured entries use and attaches the same ``_source``/``_rseq`` tie
-# -break keys, so ``modules.central_logging.entry_sort_key``/
-# ``encode_log_cursor``/``decode_log_cursor`` can order and paginate
-# both kinds of entries together with no journal-specific logic here.
+# Per-service journalctl line count merged into every unfiltered-by-id page of
+# GET /logs; bounded so one refresh cannot become an unbounded read across three
+# services. LogReader normalizes each journal entry's timestamp and attaches the same
+# sort/cursor keys, so both entry kinds order and paginate together.
 _UNIFIED_LOGS_JOURNAL_LINES = 100
 
 
@@ -1223,30 +1161,11 @@ async def get_unified_logs(
 ) -> UnifiedLogsResponse:
     """One complete, chronological Nexus log timeline.
 
-    Unlike ``/activity`` (lifecycle/status summaries only), this returns
-    the real structured JSONL entries written by ``modules.central_logging``
-    - mailbox intake, queueing, research/selection (``controller``),
-    implementation, verification, GitHub lifecycle, adoption, chat jobs,
-    and failures/timeouts - merged in chronological order from every
-    ``<experiment_log_dir>/*.jsonl`` file, including ``task-<mailbox_task_id>``
-    files that hold events recorded before an experiment id existed. On
-    every unfiltered-by-id page (with or without a cursor), this is
-    additionally merged with the ``agent-api``/``nexus-mailbox``/
-    ``llama-server`` systemd journals so the whole runtime is visible in
-    one list without picking an experiment or a log section first, and
-    "load older" walks back into each journal's real history (via
-    ``--until``) rather than only ever re-reading the same fixed newest
-    window. Every entry carries a coarse ``source`` (``mailbox``/
-    ``controller``/``experiment``/``chat``/``system``, or the journal's
-    service name) usable as an optional filter. A running/new experiment
-    is included as soon as it has written any log line, with no
-    dependency on the public diagnostics list or a terminal status.
-    Bounded reads and one cursor-based pagination scheme spanning both
-    structured and journal entries (see *cursor*/*next_cursor*) keep one
-    manual refresh - and "load older" - from re-scanning unbounded
-    historical data while never re-showing (or permanently skipping) an
-    entry across pages; if a journal source cannot be read, its failure
-    is reported in ``source_errors`` rather than emptying the whole feed.
+    Merges every ``<experiment_log_dir>/*.jsonl`` entry (including pre-experiment
+    ``task-<mailbox_task_id>`` files) with the systemd journals on unfiltered pages;
+    every entry carries a coarse ``source`` usable as a filter. Bounded reads and
+    one cursor scheme paginate both kinds without re-showing entries across pages;
+    an unreadable journal source is reported in ``source_errors``, not silently dropped.
     """
     if level is not None and level.upper() not in _LOG_LEVELS:
         raise HTTPException(status_code=400, detail="invalid level filter")
@@ -1260,18 +1179,14 @@ async def get_unified_logs(
 
     resolved_mailbox_task_id = mailbox_task_id
     if resolved_experiment_id and not resolved_mailbox_task_id:
-        # Correlate the experiment with its mailbox task log automatically,
-        # same as the single-experiment endpoint, so filtering the unified
-        # feed down to one experiment shows the same complete task path.
+        # Correlate the experiment with its mailbox task log automatically, same as the
+        # single-experiment endpoint.
         resolved_mailbox_task_id = _mailbox_task_id(service, resolved_experiment_id)
 
     try:
-        # Fetch one extra entry to detect whether an older page remains,
-        # without re-scanning already-returned entries on the next call.
-        # This is already a correct upper bound even after merging in
-        # journal entries below: the final page can never need more than
-        # `limit + 1` structured entries regardless of how many extra
-        # journal candidates are merged in alongside them.
+        # Fetch one extra entry to detect an older page; still a correct upper bound after
+        # merging journal entries - the final page never needs more than `limit + 1`
+        # structured entries.
         scan = central_logging_module.scan_log_entries(
             service.experiment_log_dir,
             experiment_id=resolved_experiment_id,
@@ -1291,12 +1206,8 @@ async def get_unified_logs(
     raw_entries = scan.entries
     _apply_log_source(raw_entries)
 
-    # The journal is only merged into the unfiltered-by-id feed, so
-    # filtering down to one experiment/task/job never mixes in unrelated
-    # systemd noise it cannot be correlated to. Unlike the structured
-    # feed, it is merged on *every* such page (a cursor no longer opts
-    # it out) - otherwise a page beyond the first could never surface
-    # any journal entry at all, no matter how recent.
+    # The journal is merged only into the unfiltered-by-id feed, on *every* such page -
+    # a cursor must not opt it out, or later pages could never surface any journal entry.
     source_errors: dict[str, str] | None = None
     merged_entries = raw_entries
     is_default_page = (
@@ -1306,24 +1217,17 @@ async def get_unified_logs(
     if include_journal and is_default_page:
         decoded_cursor = central_logging_module.decode_log_cursor(cursor) if cursor else None
         journal_before: str | None = decoded_cursor[0] if decoded_cursor else None
-        # Reuses the cursor's own timestamp component as the journal
-        # page boundary; an unrecognized/legacy cursor simply omits
-        # `--until` (falls back to each service's newest window)
-        # rather than risking an incorrectly-scoped, possibly
-        # duplicate-producing query.
+        # Reuse the cursor's timestamp as the journal page boundary; an unrecognized/legacy
+        # cursor omits ``--until`` (falls back to each service's newest window) rather than
+        # risk an incorrectly-scoped, duplicate-producing query.
         journal_entries, errors = await log_reader.read_all_journal_entries(
             lines=_UNIFIED_LOGS_JOURNAL_LINES, before=journal_before, search=search,
         )
         if decoded_cursor is not None:
-            # `journalctl --until` only has second precision and is
-            # inclusive, so it can legitimately return an entry again
-            # that was already on the previous page (e.g. two journal
-            # lines within the same second straddling the cursor
-            # boundary). Re-apply the exact same strict, sub-second
-            # cursor comparison the structured feed already uses
-            # (`_entry_sort_key(e) < cursor_key` in
-            # ``central_logging.read_log_entries``) so correctness never
-            # depends on journalctl's coarser boundary semantics.
+            # ``journalctl --until`` has only second precision and is inclusive, so it can return
+            # an entry already on the previous page; re-apply the exact sub-second cursor
+            # comparison the structured feed uses, so correctness never depends on journalctl's
+            # coarser boundary semantics.
             journal_entries = [
                 e for e in journal_entries
                 if central_logging_module.entry_sort_key(e) < decoded_cursor
@@ -1339,17 +1243,13 @@ async def get_unified_logs(
     if source:
         wanted = source.strip().lower()
         merged_entries = [e for e in merged_entries if str(e.get("source", "")).lower() == wanted]
-    # `search` is deliberately *not* re-applied here: it is pushed down
-    # into both readers (the JSONL scan and `journalctl --grep`), so it
-    # searches the whole retained history. Filtering here as well would
-    # re-introduce the original bug's blind spot - matches would again be
-    # limited to whatever one page happened to contain.
+    # `search` is deliberately *not* re-applied here: it is pushed down into both readers
+    # (JSONL scan and `journalctl --grep`), so it searches the whole retained history,
+    # not just whatever one page contained.
 
-    # One shared sort + cursor scheme (see `_UNIFIED_LOGS_JOURNAL_LINES`
-    # above) spans structured and journal entries alike, so the
-    # `next_cursor` returned below reflects the true oldest entry of the
-    # *merged* page - never just the structured feed's own boundary -
-    # and no entry is ever shown twice or skipped across pages.
+    # One shared sort + cursor scheme spans structured and journal entries, so `next_cursor`
+    # reflects the true oldest entry of the *merged* page - never just the structured feed's
+    # boundary - and no entry is shown twice or skipped across pages.
     merged_entries.sort(key=central_logging_module.entry_sort_key)
     merged_entries, next_cursor = _paginate_log_entries(merged_entries, limit)
 
@@ -1374,19 +1274,12 @@ def get_log_trace(
 ) -> LogTraceResponse:
     """Everything Nexus did for one order, from any reference to it.
 
-    ``GET /logs`` answers "what happened recently"; this answers "Nexus
-    was given this - what did it actually do?". *reference* can be an
-    experiment id, a mailbox task id, a controller session or chat job
-    id, an inbox message filename, or any distinctive fragment (part of
-    an error, part of a command): the resolver finds whatever entries
-    that identifies, reads the correlation ids off them, and pulls in
-    everything sharing those ids, so the whole chain - mailbox intake,
-    approval, controller decisions, implementation, verification, result
-    - comes back from any single point in it.
+    *reference* may be an experiment/mailbox task/session/chat job id, an inbox
+    message filename, or a distinctive fragment; everything sharing the resolved
+    correlation ids comes back.
 
-    An unresolvable reference returns ``found: false`` with an empty
-    timeline rather than a 404: "I looked and found nothing" is a useful
-    answer here, and is not the same as a broken route.
+    An unresolvable reference returns ``found: false`` with an empty timeline rather
+    than a 404: "I looked and found nothing" is a useful answer here.
     """
     try:
         trace = log_trace_module.resolve_trace(
@@ -1534,18 +1427,12 @@ def _mailbox_task_id(service: ExperimentService, experiment_id: str) -> str | No
 def _paginate_log_entries(
     raw_entries: list[dict[str, Any]], limit: int
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Split a *raw_entries* list fetched with ``limit + 1`` into exactly
-    ``limit`` entries to return plus the ``next_cursor`` for the
-    following (older) page, if any.
+    """Split a *raw_entries* list fetched with ``limit + 1`` into ``limit`` entries
+    plus the ``next_cursor`` for the following (older) page, if any.
 
-    ``raw_entries`` must be chronological (oldest first), which is what
-    every ``read_*`` function in ``modules.central_logging`` returns.
-    The page boundary is anchored to the oldest entry actually *returned*
-    on this page - not the extra look-ahead entry used only to detect
-    whether more data remains - and encoded as an opaque cursor (see
-    ``encode_log_cursor``) rather than a bare timestamp, so that entries
-    sharing an identical timestamp at a page boundary are never skipped
-    or duplicated across successive manual "load older" calls.
+    The cursor anchors to the oldest entry actually returned - not the look-ahead
+    entry - and is opaque, so entries sharing a timestamp at a page boundary are
+    never skipped or duplicated across "load older" calls.
     """
     if len(raw_entries) <= limit:
         return raw_entries, None
@@ -1686,16 +1573,11 @@ def list_activity(
     return DiagnosticActivityResponse(count=len(diagnostics), activity=diagnostics)
 
 
-# ---------------------------------------------------------------------------
-# GET /diagnostics/public — single public, strictly allowlisted endpoint for
-# remote diagnosis. Built exclusively from the explicit allowlist below;
-# never derived from a generic to_dict()/model_dump() of internal records.
-#
-# Excluded by construction (never touched by this handler): API keys,
-# tokens, credentials, headers, prompts/task bodies, environment variables,
-# source code/diffs/file contents, stack traces with internal paths, and
+# GET /diagnostics/public: built exclusively from the explicit allowlist below, never
+# derived from to_dict()/model_dump() of internal records.
+# Excluded by construction: API keys, tokens, credentials, headers, prompts/task bodies,
+# env vars, source code/diffs/file contents, stack traces with internal paths, and
 # unrestricted/raw command output.
-# ---------------------------------------------------------------------------
 
 DIAGNOSTICS_DEFAULT_LIMIT = 10
 DIAGNOSTICS_MAX_LIMIT = 100
@@ -1828,9 +1710,7 @@ def _diagnostic_mailbox_task(approval) -> PublicDiagnosticMailboxTask:
     )
 
 
-# ---------------------------------------------------------------------------
-# Operation Chain endpoints (authenticated, sequential operation execution)
-# ---------------------------------------------------------------------------
+# Operation Chain endpoints (authenticated, sequential operation execution).
 
 
 @app.post("/operations/chains", response_model=OperationChainResult, status_code=202)
@@ -1906,13 +1786,9 @@ def get_public_diagnostics(
 
 
 
-# ---------------------------------------------------------------------------
-# Failure analysis (#145) — manual/debug inspection of stored diagnoses,
-# and an endpoint to trigger one on demand. The automatic integrations live
-# in modules/mailbox/task_service.py and
-# modules/mailbox/finalizing_task_service.py; this surface is for humans
-# (or scripts) inspecting/requesting an analysis directly.
-# ---------------------------------------------------------------------------
+# Failure analysis (#145): manual inspection of stored diagnoses and on-demand
+# triggers; the automatic integrations live in modules/mailbox/, this surface is
+# for humans and scripts.
 
 FAILURE_ANALYSES_DEFAULT_LIMIT = 20
 FAILURE_ANALYSES_MAX_LIMIT = 100
@@ -1926,10 +1802,9 @@ def get_nexus_liveness(
 ) -> NexusLivenessResponse:
     """Who owns which controller work, and when it last reported itself alive.
 
-    Read-only: it reports staleness but never reaps, so an operator can look at
-    a suspect session without changing its state. ``stale_after_seconds`` only
-    reframes the question - the store clamps it to the same safe floor the
-    reaper uses, so no query can make live work look dead (#162).
+    Read-only: reports staleness but never reaps, so an operator can inspect a
+    suspect session without changing its state. ``stale_after_seconds`` is clamped
+    to the reaper's safe floor, so no query can make live work look dead (#162).
     """
     authorize(x_api_key)
     snapshot = store.liveness(
@@ -1940,25 +1815,18 @@ def get_nexus_liveness(
     )
 
 
-# ---------------------------------------------------------------------------
-# Nexus diagnostics (#188) — first-class, read-only answers to "what happened
-# to this work?", so diagnosing a failure never again means composing ad-hoc
-# shell commands through the mailbox. Every route here resolves a reference
-# through the one shared backend (modules/nexus_diagnostics.py), which the
-# operations catalog and the failure-analysis routine also use.
-# ---------------------------------------------------------------------------
+# Nexus diagnostics (#188): first-class read-only answers to "what happened to this
+# work?", resolved through the one shared backend (modules/nexus_diagnostics.py).
 
 DIAGNOSTIC_LOG_DEFAULT_LINES = nexus_diagnostics_module.DEFAULT_LOG_LINES
 DIAGNOSTIC_LOG_MAX_LINES = nexus_diagnostics_module.MAX_LOG_LINES
 
 
 def get_nexus_diagnostics() -> Iterator[nexus_diagnostics_module.NexusDiagnostics]:
-    """Read-only diagnostic backend, opened and closed per request.
+    """Read-only diagnostic backend, opened and closed per request like
+    ``get_nexus_task_store``.
 
-    Per-request like ``get_nexus_task_store``, and for the same reason: this
-    serves occasional diagnostic reads, and a process-lifetime handle for them
-    would buy nothing. Overridable in tests via
-    ``app.dependency_overrides[get_nexus_diagnostics]``.
+    Overridable in tests via ``app.dependency_overrides[get_nexus_diagnostics]``.
     """
     try:
         diagnostics = nexus_diagnostics_module.NexusDiagnostics(
@@ -1966,9 +1834,8 @@ def get_nexus_diagnostics() -> Iterator[nexus_diagnostics_module.NexusDiagnostic
             stale_after_seconds=_STALE_HEARTBEAT_SECONDS,
         )
     except nexus_diagnostics_module.DiagnosticsError as exc:
-        # The backend opens the database read-only and never creates it, so a
-        # deployment that has not written one yet has nothing to diagnose.
-        # That is a service condition with a plain cause, not a 500.
+        # The backend opens the database read-only and never creates it, so a deployment
+        # without one has nothing to diagnose - a service condition with a plain cause, not a 500.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
         yield diagnostics
@@ -1997,9 +1864,9 @@ async def get_diagnostic_service_logs(
 ) -> DiagnosticServiceLogsResponse:
     """Recent logs for one Nexus service, without constructing ``journalctl``.
 
-    *service* may be a friendly name (``api``, ``mailbox``, ``llm``) or a unit
-    name; anything unrecognized is validated as a unit name before it is used,
-    so no caller can smuggle a shell fragment through this route.
+    *service* may be a friendly name (``api``, ``mailbox``, ``llm``) or a unit name;
+    anything unrecognized is validated as a unit name before use, so no caller can
+    smuggle a shell fragment through this route.
     """
     authorize(x_api_key)
     diagnostics.log_reader = log_reader
@@ -2027,9 +1894,8 @@ def get_diagnostic_last_failure(
 ) -> DiagnosticReportResponse:
     """The most recent failed *or stalled* work, with its error context.
 
-    Stalled counts: a process that died mid-run never wrote a ``failed`` row,
-    so a search for explicit failures alone would miss exactly the case this
-    endpoint exists for (#186/#187).
+    Stalled counts: a process that died mid-run never wrote a ``failed`` row, so
+    searching explicit failures alone would miss exactly this case (#186/#187).
     """
     authorize(x_api_key)
     try:
@@ -2047,8 +1913,7 @@ def get_diagnostic_llm_job(
 ) -> str:
     """``nexus debug llm-job <id> [--result|--prompt]`` (#259), read-only.
 
-    Plain ``key: value`` lines, the same the ``nexus_llm_job`` operation
-    returns, so the output reads directly in a terminal.
+    Plain ``key: value`` lines, the same the ``nexus_llm_job`` operation returns.
     """
     authorize(x_api_key)
     try:
@@ -2066,9 +1931,9 @@ def get_diagnostic_status(
 ) -> DiagnosticReportResponse:
     """Lifecycle state for one piece of work, with no log bodies.
 
-    *reference* may be a mailbox task id, an experiment id, a controller
-    session id, an issue or PR number (``188``, ``#188``, ``PR #195``), an
-    inbox message filename, or a unique prefix of any id.
+    *reference* may be a mailbox task id, experiment id, controller session id,
+    issue or PR number (``188``, ``#188``, ``PR #195``), inbox filename, or a
+    unique prefix of any id.
     """
     authorize(x_api_key)
     try:
@@ -2089,8 +1954,8 @@ def get_diagnostic_logs(
     """Lifecycle state *and* the bounded logs that explain it, for one reference.
 
     Registered after the fixed ``/diagnostics/logs/service/...`` and
-    ``/diagnostics/logs/last-failure`` routes on purpose: a ``:path``
-    parameter would otherwise swallow both.
+    ``/diagnostics/logs/last-failure`` routes on purpose: a ``:path`` parameter
+    would otherwise swallow both.
     """
     authorize(x_api_key)
     try:
@@ -2163,14 +2028,11 @@ async def get_public_unified_logs(
     service: ExperimentService = Depends(get_experiment_service),
     log_reader: LogReader = Depends(get_log_reader),
 ) -> UnifiedLogsResponse:
-    """Backwards-compatible alias of ``GET /logs``.
+    """Backwards-compatible alias of ``GET /logs`` - both return the identical,
+    complete timeline, and reading logs needs no API key (DECISIONS.md D-012).
 
-    Both routes now return the identical, complete timeline: reading logs
-    needs neither an API key nor a reduced allowlist (see DECISIONS.md
-    D-012 - this is a single-operator experiment VM, and analysis is the
-    point of the log surface). Kept as a separate path only so existing
-    clients and bookmarks continue to work; it delegates rather than
-    maintaining a second read implementation that could drift.
+    Kept as a separate path only so existing clients keep working; it delegates
+    rather than maintaining a second read implementation that could drift.
     """
     return await get_unified_logs(
         level=level,
@@ -2189,16 +2051,10 @@ async def get_public_unified_logs(
     )
 
 
-# ── Maintenance API ───────────────────────────────────────────────────────────
-#
-# All /maintenance/* endpoints require:
-#   - The normal X-Api-Key header (AGENT_API_KEY)
-#   - A second X-Maintenance-Token header (MAINTENANCE_TOKEN)
-#   - MAINTENANCE_ENABLED=true (env var)
-#   - The current UTC time must be before MAINTENANCE_EXPIRY (if set)
-#
-# These endpoints are intended as a temporary remote-maintenance bridge for
-# PR #21 deployment and must be disabled again after use (unset MAINTENANCE_ENABLED).
+# All /maintenance/* endpoints require the normal X-Api-Key, a second
+# X-Maintenance-Token header, MAINTENANCE_ENABLED=true, and UTC time before
+# MAINTENANCE_EXPIRY (if set). Temporary remote-maintenance bridge - disable it
+# again after use (unset MAINTENANCE_ENABLED).
 
 
 @app.get("/maintenance/status", response_model=MaintenanceStatusResponse)
@@ -2225,9 +2081,9 @@ def maintenance_execute(
 ) -> MaintenanceExecuteResponse:
     """Execute a named maintenance operation.
 
-    Returns the operation result as a JSON object.  Background operations
-    (``run_router_test``, ``run_tests``) return a ``task_id`` that can be
-    polled via ``router_task_status`` / ``test_task_status``.
+    Returns the result as a JSON object; background operations (``run_router_test``,
+    ``run_tests``) return a ``task_id`` pollable via ``router_task_status`` /
+    ``test_task_status``.
     """
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -2261,9 +2117,6 @@ def get_maintenance_audit(
     )
 
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
 
 def _op_response(result, operation: str) -> OperationResponse:
     from modules.operations_executor import OperationResult
@@ -2278,9 +2131,6 @@ def _op_response(result, operation: str) -> OperationResponse:
     )
 
 
-# ---------------------------------------------------------------------------
-# Git Operations  (/operations/git/*)
-# ---------------------------------------------------------------------------
 
 @app.post("/operations/git/pull", response_model=OperationResponse)
 async def operations_git_pull(
@@ -2316,9 +2166,6 @@ async def operations_git_commit_push(
     return _op_response(result, "git/commit-and-push")
 
 
-# ---------------------------------------------------------------------------
-# Service Management  (/operations/services/*)
-# ---------------------------------------------------------------------------
 
 @app.post("/operations/services/restart", response_model=OperationResponse)
 async def operations_services_restart(
@@ -2351,9 +2198,6 @@ async def operations_llama_reload_model(
     return _op_response(result, "services/llama/reload-model")
 
 
-# ---------------------------------------------------------------------------
-# Logging  (/operations/logs/*)
-# ---------------------------------------------------------------------------
 
 @app.get("/operations/logs/tail", response_model=OperationResponse)
 async def operations_logs_tail(
@@ -2381,9 +2225,6 @@ async def operations_logs_errors(
     return _op_response(result, "logs/errors")
 
 
-# ---------------------------------------------------------------------------
-# Self-Healing  (/operations/healing/*)
-# ---------------------------------------------------------------------------
 
 @app.post("/operations/healing/fix-locks", response_model=OperationResponse)
 async def operations_healing_fix_locks(
@@ -2415,9 +2256,6 @@ async def operations_healing_diagnose(
     return _op_response(result, "healing/diagnose")
 
 
-# ---------------------------------------------------------------------------
-# Model Management  (/operations/models/*)
-# ---------------------------------------------------------------------------
 
 @app.get("/operations/models/status", response_model=OperationResponse)
 async def operations_models_status(
@@ -2442,9 +2280,6 @@ async def operations_models_test(
     return _op_response(result, "models/test")
 
 
-# ---------------------------------------------------------------------------
-# Context / Config  (/operations/context/*)
-# ---------------------------------------------------------------------------
 
 @app.get("/operations/context/env", response_model=OperationResponse)
 async def operations_context_env(
