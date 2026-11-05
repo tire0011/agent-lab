@@ -37,7 +37,6 @@ _COMMAND_META_KEYS = {
     "timeout",
     "recovery_services",
 }
-_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ACTIVE_COMMANDS: dict[int, subprocess.Popen] = {}
 _SENSITIVE_ENV_MARKERS = (
     "TOKEN",
@@ -47,9 +46,6 @@ _SENSITIVE_ENV_MARKERS = (
     "CREDENTIAL",
     "AZURE_OPENAI",
 )
-
-def development_mode_enabled() -> bool:
-    return os.environ.get("NEXUS_DEVELOPMENT_MODE", "").strip().lower() in _TRUE_VALUES
 
 
 def _command_environment() -> dict[str, str]:

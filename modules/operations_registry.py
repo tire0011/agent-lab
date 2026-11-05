@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-import mailbox_processor
 from modules import central_logging as central_logging_module
 from modules.mailbox import MailboxLock, MailboxProcessor
 from modules.redaction import bounded_lines, changed_file_names, redact, sanitized_reason, test_command_name, test_failure_tail as _test_failure_tail

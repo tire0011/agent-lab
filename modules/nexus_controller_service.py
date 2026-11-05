@@ -99,15 +99,6 @@ class NexusControllerService:
         execution_result = self._execute(decision, source.content, source=source)
         return execution_result or decision
 
-    def handle_task(
-        self,
-        content: str,
-        *,
-        source_id: str | None = None,
-        title: str | None = None,
-    ) -> TaskDecision | dict[str, str]:
-        return self.handle_source(task_source(content, source_id=source_id, title=title))
-
     def handle_idea(self, idea_id: str) -> TaskDecision | dict[str, str]:
         return self.handle_source(idea_source(idea_id))
 

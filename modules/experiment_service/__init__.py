@@ -47,7 +47,6 @@ annotations = __future__.annotations
 from .git_utils import _run_git
 from .gate_recheck import gate_recheck
 from .models import (
-    EXPERIMENT_STATUSES,
     STATUS_FAILED,
     STATUS_CANCELLED,
     STATUS_IMPLEMENTING,
@@ -70,7 +69,6 @@ from .models import (
     _row_to_experiment,
 )
 from .parsing import (
-    PLAN_JSON_SCHEMA,
     _PLAN_FIELD_PATTERNS,
     _find_balanced_json_objects,
     extract_single_json_object,
@@ -111,19 +109,9 @@ from .policy import (
 )
 from .prompts import (
     _DIRECT_IMPLEMENTATION_PROMPT_TEMPLATE,
-    _IMPLEMENTATION_PROMPT_TEMPLATE,
     _NEXUS_IDENTITY_PROMPT,
-    _PLAN_PROMPT_TEMPLATE,
-    _POLICY_REPLAN_PROMPT_TEMPLATE,
-    _REFORMAT_RETRY_PROMPT_TEMPLATE,
-    _RESEARCH_PROMPT_TEMPLATE,
     _build_direct_implementation_prompt,
     _build_repair_implementation_prompt,
-    _build_implementation_prompt,
-    _build_plan_prompt,
-    _build_policy_replan_prompt,
-    _build_reformat_retry_prompt,
-    _build_research_prompt,
     _with_nexus_identity,
 )
 from .service import (
@@ -153,12 +141,6 @@ from .service import (
     worktree_retention_hours,
 )
 from .text_utils import (
-    _DIAGNOSTIC_EVENT_TYPES,
-    _DIAGNOSTIC_ITEM_TYPES,
-    _DIAGNOSTIC_TOOL_ITEM_TYPES,
-    _SECRET_PATTERNS,
-    _extract_diagnostic_log,
-    _redact_secrets,
     _truncate_text,
     _utcnow_iso,
 )

@@ -41,6 +41,11 @@ from tests.test_experiment_adoption_service import AdoptionRepoFixture
 # The historical row from the issue: no exit code, output that only says
 # the command never returned, and the German reason adoption writes when
 # the tests could not be *completed* (as opposed to having failed).
+def _wait_for_thread(service, experiment_id, timeout=None):
+    thread = service._threads.get(experiment_id)
+    if thread is not None:
+        thread.join(timeout)
+
 _TIMEOUT_REASON = "Die Integrationstests konnten nicht erfolgreich abgeschlossen werden."
 _VERDICT_REASON = "Die Integrationstests sind fehlgeschlagen."
 
@@ -237,7 +242,7 @@ class StaleFailureAssessmentTests(unittest.TestCase):
                     test_output="[test command timed out]",
                 )
                 self.fx.adoption_service.start_adoption(self.experiment_id)
-                self.fx.adoption_service.wait_for_thread(self.experiment_id, timeout=5)
+                _wait_for_thread(self.fx.adoption_service, self.experiment_id, timeout=5)
 
         self.assertEqual(
             self.fx.adoption_service.get(self.experiment_id).stale_retry_attempts, 0
@@ -286,7 +291,7 @@ class StaleFailureAssessmentTests(unittest.TestCase):
             self.fx.adoption_service.start_adoption(
                 self.experiment_id, superseded=refusal
             )
-            self.fx.adoption_service.wait_for_thread(self.experiment_id, timeout=5)
+            _wait_for_thread(self.fx.adoption_service, self.experiment_id, timeout=5)
 
         self.assertEqual(
             self.fx.adoption_service.get(self.experiment_id).stale_retry_attempts, 0
@@ -356,7 +361,7 @@ class StaleFailureAssessmentTests(unittest.TestCase):
             self.fx.adoption_service, "_run_adoption_pipeline", side_effect=_capture
         ):
             self.fx.adoption_service.start_adoption(self.experiment_id, superseded=granted)
-            self.fx.adoption_service.wait_for_thread(self.experiment_id, timeout=5)
+            _wait_for_thread(self.fx.adoption_service, self.experiment_id, timeout=5)
 
         status, attempts, reason = observed["row"]
         self.assertEqual(status, "queued")

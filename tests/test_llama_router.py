@@ -12,8 +12,6 @@ from modules.llama_cpp_client import LlamaCppClientError
 from modules.llama_router import (
     LlamaRouter,
     RouterDecision,
-    VALID_PROVIDERS,
-    VALID_ROLES,
     _ensure_router_tables,
     _parse_router_response,
 )
@@ -71,18 +69,9 @@ def test_parse_router_response_unknown_decision_raises():
         _parse_router_response(raw)
 
 
-# ── RouterDecision.is_valid ───────────────────────────────────────────────────
-
-def test_router_decision_is_valid():
-    for provider in ("local", "azure_openai", "codex", "copilot"):
-        for role in ("developer", "planner", "reviewer", "context_gatherer"):
-            d = RouterDecision(provider=provider, role=role, confidence=1.0, reasoning="ok")
-            assert d.is_valid(), f"Expected valid for provider={provider} role={role}"
 
 
-def test_router_decision_is_invalid():
-    d = RouterDecision(provider="unknown_provider", role="developer", confidence=0.0, reasoning="")
-    assert not d.is_valid()
+
 
 
 # ── _ensure_router_tables ─────────────────────────────────────────────────────

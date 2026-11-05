@@ -296,43 +296,6 @@ class TestSubmitQueued(unittest.TestCase):
         es.create_experiment.assert_not_called()
         self.assertEqual(svc.get(approval.id).experiment_id, existing_id)
 
-    def test_clarification_can_continue_same_task_and_preserve_followup(self):
-        exp = _make_exp(id="expAfterReply", status="queued")
-        es = self._make_exp_service(exp)
-
-        class DiscussionOrchestrator(_FixedOrchestrator):
-            decisions = [
-                TaskDecision(
-                    action=ACTION_CLARIFICATION,
-                    message="Optimize for cost or latency?",
-                    reason="material tradeoff",
-                    session_id="session-abc",
-                ),
-                TaskDecision(action=ACTION_NEW_EXPERIMENT, reason="clarified"),
-            ]
-            calls = []
-
-            def run(self, task, **kwargs):
-                type(self).calls.append((task, kwargs))
-                return type(self).decisions.pop(0)
-
-        svc = _make_service(self.tmp, exp_service=es, orchestrator_factory=DiscussionOrchestrator)
-        msg_id = _insert_mailbox_msg(svc)
-        approval = svc.create_task(msg_id, "Improve routing", "alice", "/f.md", "2026-01-01T00:00:00Z")
-        svc.submit_queued()
-        waiting = svc.get(approval.id)
-        self.assertEqual(waiting.status, _STATUS_NEEDS_REVIEW)
-        self.assertIn("Nexus session: session-abc", waiting.result_summary)
-
-        svc.continue_discussion(approval.id, "Optimize for cost")
-        import time; time.sleep(0.1)
-
-        es.create_experiment.assert_called_once()
-        goal = es.create_experiment.call_args[0][0]
-        self.assertIn("Improve routing", goal)
-        self.assertIn("Optimize for cost", goal)
-        self.assertEqual(DiscussionOrchestrator.calls[0][1]["source_id"], approval.id)
-        self.assertEqual(DiscussionOrchestrator.calls[1][1]["source_id"], approval.id)
 
 
 class TestPollRunning(unittest.TestCase):

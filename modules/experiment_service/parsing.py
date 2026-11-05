@@ -7,49 +7,6 @@ from typing import Any
 from .models import ExperimentPlan
 
 
-# JSON Schema for the structured plan, passed to Codex via
-# ``CodexWorker.run(output_schema=...)`` for both the selection phase and
-# the reformat retry. Codex's own ``--output-schema`` support constrains
-# the *shape* of the model's final response; the result is still fully
-# re-validated with parse_plan()/plan_violates_policy()/validate_plan()
-# below (no semantic values are trusted or guessed just because the shape
-# matched).
-PLAN_JSON_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "title": {"type": "string"},
-        "motivation": {"type": "string"},
-        "affected_files": {"type": "array", "items": {"type": "string"}},
-        "expected_changes": {"type": "string"},
-        "success_criteria": {"type": "string"},
-        "planned_tests": {"type": "string"},
-        "risks": {"type": "string"},
-        "estimated_scope": {"type": "string"},
-        "change_kind": {
-            "type": "string",
-            "enum": ["implementation", "tests_only", "documentation", "analysis"],
-        },
-        "required_artifacts": {"type": "array", "items": {"type": "string"}},
-        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": [
-        "title",
-        "motivation",
-        "affected_files",
-        "expected_changes",
-        "success_criteria",
-        "planned_tests",
-        "risks",
-        "estimated_scope",
-        "change_kind",
-        "required_artifacts",
-        "acceptance_criteria",
-    ],
-    "additionalProperties": False,
-}
-
-
-
 # ---------------------------------------------------------------------------
 
 _PLAN_FIELD_PATTERNS: dict[str, str] = {

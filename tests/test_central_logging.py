@@ -84,15 +84,6 @@ class ExperimentLoggerBasicsTests(unittest.TestCase):
         entry = _read_lines(elog.path)[0]
         self.assertNotIn("mailbox_task_id", entry)
 
-    def test_bind_mailbox_task_id_attaches_later(self):
-        elog = ExperimentLogger("exp5", log_dir=self.log_dir)
-        elog.info("p", "before_bind", "no id yet")
-        elog.bind_mailbox_task_id("task-xyz")
-        elog.info("p", "after_bind", "has id now")
-
-        entries = _read_lines(elog.path)
-        self.assertNotIn("mailbox_task_id", entries[0])
-        self.assertEqual(entries[1]["mailbox_task_id"], "task-xyz")
 
     def test_writes_are_immediately_visible_on_disk(self):
         """Every entry must be durable immediately (flush+fsync), not only

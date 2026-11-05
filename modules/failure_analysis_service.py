@@ -1889,11 +1889,6 @@ class FailureAnalysisService:
         rows = self._conn.execute(query, params).fetchall()
         return [_json_loads(row["analysis_json"]) for row in rows]
 
-    def latest_for_subject(self, subject_type: str, subject_id: str) -> dict[str, Any] | None:
-        results = self.list_recent(limit=1, subject_type=subject_type, subject_id=subject_id)
-        return results[0] if results else None
-
-
 def _json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
