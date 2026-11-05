@@ -174,6 +174,10 @@ Environment variables:
 	- `AGENT_FS_ROOT` (default: `/agent`)
 	- `MCP_FILESYSTEM_SERVER_COMMAND` (default: `npx`)
 	- `MCP_FILESYSTEM_SERVER_ARGS` (default uses `@modelcontextprotocol/server-filesystem`)
+	- `NEXUS_EXPERIMENT_TOKEN_BUDGET` sets the live coding-agent token limit for
+	  each experiment. `NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE` is `shadow` by
+	  default (log and continue); set it to `enforce` to stop at the limit and
+	  end the experiment in `needs_review`.
 
 Run V0:
 

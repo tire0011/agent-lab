@@ -163,6 +163,9 @@ class Experiment:
     reformat_retry_usage: dict[str, Any] | None = None
     policy_replan_usage: dict[str, Any] | None = None
     implementation_usage: dict[str, Any] | None = None
+    token_budget: int | None = None
+    token_budget_consumed: int | None = None
+    token_budget_stop_reason: str | None = None
     selection_raw_message: str | None = None
     reformat_raw_message: str | None = None
     policy_replan_raw_message: str | None = None
@@ -215,6 +218,9 @@ class Experiment:
             "reformat_retry_usage": self.reformat_retry_usage,
             "policy_replan_usage": self.policy_replan_usage,
             "implementation_usage": self.implementation_usage,
+            "token_budget": self.token_budget,
+            "token_budget_consumed": self.token_budget_consumed,
+            "token_budget_stop_reason": self.token_budget_stop_reason,
             "selection_raw_message": self.selection_raw_message,
             "reformat_raw_message": self.reformat_raw_message,
             "policy_replan_raw_message": self.policy_replan_raw_message,
@@ -276,6 +282,9 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         reformat_retry_usage=_json_or_none(row["reformat_retry_usage_json"]),
         policy_replan_usage=_json_or_none(row["policy_replan_usage_json"]),
         implementation_usage=_json_or_none(row["implementation_usage_json"]),
+        token_budget=row["token_budget"],
+        token_budget_consumed=row["token_budget_consumed"],
+        token_budget_stop_reason=row["token_budget_stop_reason"],
         selection_raw_message=row["selection_raw_message"],
         reformat_raw_message=row["reformat_raw_message"],
         policy_replan_raw_message=row["policy_replan_raw_message"],

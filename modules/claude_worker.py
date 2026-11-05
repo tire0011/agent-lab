@@ -147,6 +147,21 @@ def _usage_from_result(result: dict[str, Any]) -> dict[str, int] | None:
     return usage or None
 
 
+def _usage_from_event_line(line: str) -> dict[str, int] | None:
+    """Return live cumulative usage from a Claude stream-json event."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    usage = _usage_from_result(event)
+    if usage is not None:
+        return usage
+    message = event.get("message")
+    return _usage_from_result(message) if isinstance(message, dict) else None
+
+
 def _model_from_result(result: dict[str, Any]) -> str:
     """Best-effort model name for the audit entry."""
     model_usage = result.get("modelUsage")
@@ -219,6 +234,7 @@ class ClaudeWorker:
         phase: str = "claude",
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        on_usage: Any | None = None,
         extra_args: list[str] | None = None,
     ) -> WorkerResult:
         """Execute *task* non-interactively via the ``claude`` CLI.
@@ -289,7 +305,7 @@ class ClaudeWorker:
             )
 
         result = self._execute(
-            cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process,
+            cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process, on_usage,
             on_heartbeat=progress_heartbeat(experiment_logger, phase, "Claude"),
         )
 
@@ -420,6 +436,7 @@ class ClaudeWorker:
         sandbox: str,
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        on_usage: Any | None = None,
         on_heartbeat: Any | None = None,
     ) -> WorkerResult:
         timed_out = False
@@ -436,6 +453,8 @@ class ClaudeWorker:
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
                     on_process=on_process,
                     on_heartbeat=on_heartbeat,
+                    on_stdout_line=(lambda line: bool(on_usage(usage)) if (usage := _usage_from_event_line(line)) else False)
+                    if on_usage is not None else None,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:

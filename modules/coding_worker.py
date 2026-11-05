@@ -175,6 +175,7 @@ MIN_AGENT_MAX_SECONDS = 30 * 60
 
 STOP_STALLED = "stalled"
 STOP_MAX_RUNTIME = "max_runtime"
+STOP_TOKEN_BUDGET = "token_budget"
 
 # Output kept while the agent runs (review on #328): the start (Codex names its
 # thread there) and the end (result and usage events), never all of it.
@@ -272,6 +273,7 @@ def run_watched(
     on_process: Callable[[subprocess.Popen | None], None] | None = None,
     on_heartbeat: Callable[[float, float], None] | None = None,
     heartbeat_seconds: float = PROGRESS_HEARTBEAT_SECONDS,
+    on_stdout_line: Callable[[str], bool] | None = None,
 ) -> WatchedRun:
     """Run *cmd* and stop it only when it stalls or reaches the absolute cap.
 
@@ -299,14 +301,22 @@ def run_watched(
     stdout_capture = _BoundedCapture()
     stderr_capture = _BoundedCapture()
 
-    def pump(stream: Any, sink: _BoundedCapture) -> None:
+    requested_stop = threading.Event()
+
+    def pump(stream: Any, sink: _BoundedCapture, line_callback: Callable[[str], bool] | None = None) -> None:
         for line in iter(stream.readline, ""):
             sink.add(line)
             last_output[0] = time.monotonic()
+            if line_callback is not None:
+                try:
+                    if line_callback(line):
+                        requested_stop.set()
+                except Exception:  # noqa: BLE001 - observers must not break the worker
+                    pass
         stream.close()
 
     readers = [
-        threading.Thread(target=pump, args=(proc.stdout, stdout_capture), daemon=True),
+        threading.Thread(target=pump, args=(proc.stdout, stdout_capture, on_stdout_line), daemon=True),
         threading.Thread(target=pump, args=(proc.stderr, stderr_capture), daemon=True),
     ]
     for reader in readers:
@@ -323,12 +333,16 @@ def run_watched(
     stop_reason: str | None = None
     while proc.poll() is None:
         now = time.monotonic()
+        if requested_stop.is_set():
+            stop_reason = STOP_TOKEN_BUDGET
         if on_heartbeat is not None and now - last_heartbeat >= heartbeat_seconds:
             last_heartbeat = now
             try:
                 on_heartbeat(now - started, now - last_output[0])
             except Exception:  # noqa: BLE001 - logging must not stop the watchdog
                 pass
+        if stop_reason:
+            break
         if now - last_output[0] > stall_seconds:
             stop_reason = STOP_STALLED
         elif now - started > max_seconds:
@@ -375,4 +389,6 @@ def progress_heartbeat(
 def watchdog_error(agent: str, run: WatchedRun, stall_seconds: float, max_seconds: float) -> str:
     if run.stop_reason == STOP_STALLED:
         return f"{agent} stalled: no output for {int(stall_seconds)}s"
+    if run.stop_reason == STOP_TOKEN_BUDGET:
+        return f"{agent} stopped by token budget"
     return f"{agent} reached the absolute cap of {int(max_seconds)}s"

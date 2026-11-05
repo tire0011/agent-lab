@@ -119,6 +119,35 @@ _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
 WORKTREE_RETENTION_ENV_VAR = "NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS"
 DEFAULT_WORKTREE_RETENTION_HOURS = 7 * 24
 
+TOKEN_BUDGET_ENV_VAR = "NEXUS_EXPERIMENT_TOKEN_BUDGET"
+TOKEN_BUDGET_MODE_ENV_VAR = "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE"
+TOKEN_BUDGET_STOP_REASON = "coding agent token budget exceeded"
+
+
+def experiment_token_budget(raw: str | None = None) -> int | None:
+    """Configured implementation token budget; unset/invalid disables it."""
+    value = raw if raw is not None else os.environ.get(TOKEN_BUDGET_ENV_VAR)
+    try:
+        budget = int(str(value).strip())
+    except (TypeError, ValueError):
+        if value not in (None, ""):
+            logger.warning("ignoring invalid %s value", TOKEN_BUDGET_ENV_VAR)
+        return None
+    return budget if budget > 0 else None
+
+
+def _usage_tokens(usage: dict[str, Any]) -> int:
+    """Turn a provider usage snapshot into non-overlapping consumed tokens."""
+    total = usage.get("total_tokens")
+    if isinstance(total, (int, float)) and not isinstance(total, bool):
+        return max(0, int(total))
+    consumed = sum(
+        int(usage.get(key, 0))
+        for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+        if isinstance(usage.get(key, 0), (int, float)) and not isinstance(usage.get(key, 0), bool)
+    )
+    return max(0, consumed)
+
 # Adoption statuses that still need the experiment's worktree, whatever its age.
 _ADOPTION_TERMINAL_STATUSES = ("adopted", "needs_review", "failed", "interrupted")
 
@@ -1251,6 +1280,33 @@ class ExperimentService:
 
         stall_seconds, max_seconds = agent_watchdog_limits()
 
+        token_budget = experiment_token_budget()
+        token_budget_mode = os.environ.get(TOKEN_BUDGET_MODE_ENV_VAR, "shadow").strip().lower()
+        if token_budget_mode not in {"shadow", "enforce"}:
+            logger.warning("ignoring invalid %s value; using shadow", TOKEN_BUDGET_MODE_ENV_VAR)
+            token_budget_mode = "shadow"
+        budget_state = {"consumed": 0, "crossed": False}
+
+        def observe_usage(usage: dict[str, Any]) -> bool:
+            consumed = _usage_tokens(usage)
+            budget_state["consumed"] = max(budget_state["consumed"], consumed)
+            if token_budget is None or consumed <= token_budget:
+                return False
+            if not budget_state["crossed"]:
+                budget_state["crossed"] = True
+                elog.warning(
+                    "implementation", "token_budget_exceeded",
+                    f"Coding agent consumed {consumed} tokens, exceeding budget {token_budget} ({token_budget_mode})",
+                    token_budget=token_budget, consumed_tokens=consumed, mode=token_budget_mode,
+                )
+                self._force_status(
+                    experiment_id, self.get_experiment(experiment_id).status,
+                    token_budget=token_budget,
+                    token_budget_consumed=consumed,
+                    token_budget_stop_reason=TOKEN_BUDGET_STOP_REASON if token_budget_mode == "enforce" else None,
+                )
+            return token_budget_mode == "enforce"
+
         implementation_result: CodexResult = worker.run(
             task=implementation_prompt,
             working_dir=worktree_path,
@@ -1260,6 +1316,7 @@ class ExperimentService:
             experiment_logger=elog,
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
+            on_usage=observe_usage,
         )
 
         fallback = other_provider(implementation_provider) if implementation_provider else None
@@ -1292,9 +1349,28 @@ class ExperimentService:
                 experiment_logger=elog,
                 phase="implementation",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_usage=observe_usage,
             )
 
         if self._ended_from_outside(experiment_id):
+            return self.get_experiment(experiment_id)
+
+        if budget_state["crossed"] and token_budget_mode == "enforce":
+            checkpoint_error = self._checkpoint_interrupted_work(
+                experiment_id, worktree_path, github_work_tracking, elog
+            )
+            consumed = budget_state["consumed"]
+            self._force_status(
+                experiment_id, STATUS_NEEDS_REVIEW,
+                ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
+                implementation_task_id=implementation_task_id,
+                implementation_runtime_ms=implementation_result.runtime_ms,
+                implementation_usage_json=json.dumps(implementation_result.usage)
+                if implementation_result.usage else None,
+                token_budget=token_budget, token_budget_consumed=consumed,
+                token_budget_stop_reason=TOKEN_BUDGET_STOP_REASON,
+                error=f"{TOKEN_BUDGET_STOP_REASON}: budget {token_budget}, consumed {consumed}" + checkpoint_error,
+            )
             return self.get_experiment(experiment_id)
 
         if implementation_result.timed_out:
@@ -1354,6 +1430,10 @@ class ExperimentService:
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
+            on_usage=observe_usage,
+            budget_state=budget_state,
+            token_budget=token_budget,
+            token_budget_mode=token_budget_mode,
         )
 
     def _merge_current_main(self, worktree_path: str, elog: ExperimentLogger) -> str:
@@ -1420,6 +1500,10 @@ class ExperimentService:
     def _repair_failed_verification(
         self, experiment_id: str, worktree_path: str, elog: ExperimentLogger,
         result: Experiment, *, github_work_tracking: Any | None = None,
+        on_usage: Callable[[dict[str, Any]], bool] | None = None,
+        budget_state: dict[str, Any] | None = None,
+        token_budget: int | None = None,
+        token_budget_mode: str = "shadow",
     ) -> Experiment:
         """Give actionable test failures a small number of focused repair attempts."""
         if result.status != STATUS_FAILED or result.test_exit_code is None:
@@ -1475,8 +1559,19 @@ class ExperimentService:
                 experiment_logger=elog,
                 phase="implementation_repair",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_usage=on_usage,
             )
             if self._ended_from_outside(experiment_id):
+                return self.get_experiment(experiment_id)
+            if budget_state and budget_state.get("crossed") and token_budget_mode == "enforce":
+                consumed = int(budget_state.get("consumed", 0))
+                self._force_status(
+                    experiment_id, STATUS_NEEDS_REVIEW,
+                    ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
+                    token_budget=token_budget, token_budget_consumed=consumed,
+                    token_budget_stop_reason=TOKEN_BUDGET_STOP_REASON,
+                    error=f"{TOKEN_BUDGET_STOP_REASON}: budget {token_budget}, consumed {consumed}",
+                )
                 return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:
                 self._force_status(

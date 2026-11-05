@@ -191,6 +191,9 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             implementation_runtime_ms INTEGER NULL,
             selection_usage_json TEXT NULL,
             implementation_usage_json TEXT NULL,
+            token_budget INTEGER NULL,
+            token_budget_consumed INTEGER NULL,
+            token_budget_stop_reason TEXT NULL,
             test_command_json TEXT NULL,
             test_exit_code INTEGER NULL,
             test_output TEXT NULL,
@@ -326,6 +329,9 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # Process group of the live worker, so the stall sweep (#400) can stop it
     # from another process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),
+    ("token_budget", "INTEGER"),
+    ("token_budget_consumed", "INTEGER"),
+    ("token_budget_stop_reason", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

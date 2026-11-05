@@ -778,6 +778,56 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertIsNone(result.selection_usage)
         self.assertIsNone(result.research_usage)
 
+    def _budget_stream_worker(self, *, write_changes: bool = True):
+        implementation = _write_affected_files_side_effect()
+
+        def run(*args, **kwargs):
+            stop = kwargs["on_usage"]({"input_tokens": 70, "output_tokens": 20})
+            self.assertFalse(stop)
+            stop = kwargs["on_usage"]({"input_tokens": 100, "output_tokens": 30})
+            if write_changes:
+                implementation(*args, **kwargs)
+            return _make_result(
+                success=not stop,
+                error="stopped by token budget" if stop else None,
+                usage={"input_tokens": 100, "output_tokens": 30},
+            )
+
+        return run
+
+    def test_token_budget_shadow_logs_and_continues(self):
+        self.implementation_worker.run.side_effect = self._budget_stream_worker()
+        with patch.dict(os.environ, {
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET": "100",
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE": "shadow",
+        }):
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_SUCCEEDED)
+        self.assertEqual(result.token_budget, 100)
+        self.assertEqual(result.token_budget_consumed, 130)
+        self.assertIsNone(result.token_budget_stop_reason)
+        entries = [json.loads(line) for line in self.service.experiment_log_path(experiment.id).read_text().splitlines()]
+        crossing = [entry for entry in entries if entry.get("event") == "token_budget_exceeded"]
+        self.assertEqual(len(crossing), 1)
+        self.assertEqual(crossing[0]["mode"], "shadow")
+
+    def test_token_budget_enforce_stops_and_records_reason(self):
+        self.implementation_worker.run.side_effect = self._budget_stream_worker(write_changes=False)
+        with patch.dict(os.environ, {
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET": "100",
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE": "enforce",
+        }):
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertEqual(result.token_budget, 100)
+        self.assertEqual(result.token_budget_consumed, 130)
+        self.assertEqual(result.token_budget_stop_reason, "coding agent token budget exceeded")
+        self.assertIn("budget 100, consumed 130", result.error)
+
     # ------------------------------------------------------------------
     # Rejection handling
     # ------------------------------------------------------------------

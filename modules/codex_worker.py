@@ -106,6 +106,19 @@ def _parse_jsonl(stdout: str) -> tuple[str | None, str | None, dict[str, int] | 
     return thread_id, final_message, usage
 
 
+def _usage_from_event_line(line: str) -> dict[str, int] | None:
+    """Return a live cumulative usage snapshot from a Codex JSON event."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    raw = event.get("usage") if event.get("type") == "turn.completed" else None
+    if not isinstance(raw, dict):
+        return None
+    usage = {k: int(v) for k, v in raw.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return usage or None
+
+
 class CodexWorker:
     """Runs a coding task non-interactively via ``codex exec``.
 
@@ -156,6 +169,7 @@ class CodexWorker:
         phase: str = "codex",
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        on_usage: Any | None = None,
     ) -> CodexResult:
         """Execute *task* non-interactively via ``codex exec``.
 
@@ -250,7 +264,7 @@ class CodexWorker:
                 )
 
             result = self._execute(
-                cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process,
+                cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process, on_usage,
                 on_heartbeat=progress_heartbeat(experiment_logger, phase, "Codex"),
             )
         finally:
@@ -367,6 +381,7 @@ class CodexWorker:
         sandbox: str,
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        on_usage: Any | None = None,
         on_heartbeat: Any | None = None,
     ) -> CodexResult:
         timed_out = False
@@ -383,6 +398,8 @@ class CodexWorker:
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
                     on_process=on_process,
                     on_heartbeat=on_heartbeat,
+                    on_stdout_line=(lambda line: bool(on_usage(usage)) if (usage := _usage_from_event_line(line)) else False)
+                    if on_usage is not None else None,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:
