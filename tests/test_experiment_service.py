@@ -849,7 +849,11 @@ class ExperimentServiceTestCase(unittest.TestCase):
         def worker(*args, **kwargs):
             nonlocal calls
             calls += 1
-            stop = kwargs["on_usage"]({"input_tokens": 70, "output_tokens": 20})
+            # Live reports and the result are cumulative within each call.
+            # The second live report contributes only its 50-token delta, and
+            # the identical final result must not contribute anything again.
+            self.assertFalse(kwargs["on_usage"]({"total_tokens": 40}))
+            stop = kwargs["on_usage"]({"total_tokens": 90})
             worktree = Path(kwargs["working_dir"])
             (worktree / "implementation.py").write_text('"""implemented."""\n')
             if calls == 2 and not stop:
@@ -862,7 +866,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
             return _make_result(
                 success=not stop,
                 error="stopped by token budget" if stop else None,
-                usage={"input_tokens": 70, "output_tokens": 20},
+                usage={"total_tokens": 90},
                 sandbox="workspace-write",
             )
 
@@ -870,7 +874,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.service.max_repair_iterations = 1
         self.service.test_python_executable = sys.executable
         with patch.dict(os.environ, {
-            "NEXUS_EXPERIMENT_TOKEN_BUDGET": "100",
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET": "150",
             "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE": mode,
         }):
             experiment = self.service.create_experiment(goal="Fix the failing test.")
@@ -891,10 +895,10 @@ class ExperimentServiceTestCase(unittest.TestCase):
         result = self._run_two_call_budget_experiment("enforce")
 
         self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
-        self.assertEqual(result.token_budget, 100)
+        self.assertEqual(result.token_budget, 150)
         self.assertEqual(result.token_budget_consumed, 180)
         self.assertEqual(result.token_budget_stop_reason, "coding agent token budget exceeded")
-        self.assertIn("budget 100, consumed 180", result.error)
+        self.assertIn("budget 150, consumed 180", result.error)
 
     # ------------------------------------------------------------------
     # Rejection handling
