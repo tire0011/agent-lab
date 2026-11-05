@@ -1287,28 +1287,28 @@ class ExperimentService:
             token_budget_mode = "shadow"
         # Provider snapshots are cumulative within one CLI invocation, but an
         # experiment can invoke several workers (overload fallback and repair
-        # attempts). Convert each invocation's snapshots to deltas before
-        # adding them to the experiment total. Thus repeated/final snapshots
-        # are not counted twice, while two separate 90-token calls count as
-        # 180 rather than as a global maximum of 90.
-        budget_state = {"consumed": 0, "crossed": False}
+        # attempts).  Keep completed invocations separate from the current
+        # invocation's high-water mark so two 90-token calls count as 180,
+        # rather than as a global maximum of 90.
+        budget_state = {"completed": 0, "current": 0, "consumed": 0, "crossed": False}
 
         def start_usage_invocation() -> tuple[
             Callable[[dict[str, Any]], bool], Callable[[dict[str, Any] | None], None]
         ]:
-            invocation_consumed = 0
+            budget_state["current"] = 0
 
             def observe_usage(usage: dict[str, Any]) -> bool:
-                nonlocal invocation_consumed
-                reported = _usage_tokens(usage)
-                delta = max(0, reported - invocation_consumed)
-                invocation_consumed += delta
-                budget_state["consumed"] += delta
-                return record_usage(budget_state["consumed"])
+                budget_state["current"] = max(budget_state["current"], _usage_tokens(usage))
+                consumed = budget_state["completed"] + budget_state["current"]
+                budget_state["consumed"] = consumed
+                return record_usage(consumed)
 
             def finish_usage(usage: dict[str, Any] | None) -> None:
                 if usage:
                     observe_usage(usage)
+                budget_state["completed"] += budget_state["current"]
+                budget_state["current"] = 0
+                budget_state["consumed"] = budget_state["completed"]
 
             return observe_usage, finish_usage
 
