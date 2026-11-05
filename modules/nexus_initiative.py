@@ -272,6 +272,9 @@ class NexusInitiativeService:
         issue_approvals.ensure_issue_approvals_table(self._conn)
         # The owner sets the budget by mailbox; the command line is the default.
         self.daily_budget = max(0, self._budget_setting(self.daily_budget))
+        # 0 means no limit; a bonus must not turn that into one.
+        if self.daily_budget:
+            self.daily_budget += self._extra_budget()
 
     def close(self) -> None:
         self._conn.close()
@@ -379,6 +382,23 @@ class NexusInitiativeService:
             return int(row[0]) if row else default
         except (sqlite3.Error, ValueError, TypeError):
             return default
+
+    def _extra_budget(self) -> int:
+        """Extra starts set by mailbox (``extra_budget``), valid 24 hours (#523)."""
+        try:
+            row = self._conn.execute(
+                "SELECT value, updated_at FROM service_settings WHERE key = 'nexus.extra_budget'"
+            ).fetchone()
+            if not row:
+                return 0
+            set_at = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+            if set_at.tzinfo is None:
+                set_at = set_at.replace(tzinfo=timezone.utc)
+            if _utcnow() - set_at > timedelta(days=1):
+                return 0
+            return max(0, int(row[0]))
+        except (sqlite3.Error, ValueError, TypeError):
+            return 0
 
     def _spent_today(self) -> int:
         since = (_utcnow() - timedelta(days=1)).isoformat()
