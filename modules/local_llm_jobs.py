@@ -978,12 +978,3 @@ def _forget_shared_service(service: LocalLlmJobService) -> None:
             if shared is service:
                 del _SHARED_SERVICES[key]
                 return
-
-
-def reset_local_llm_job_services() -> None:
-    """Close and forget every shared service (shutdown paths and tests)."""
-    with _SHARED_LOCK:
-        services = [service for service, _ in _SHARED_SERVICES.values()]
-        _SHARED_SERVICES.clear()
-    for service in services:
-        service.close()

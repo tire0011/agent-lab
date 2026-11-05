@@ -13,6 +13,7 @@ Covers the acceptance criteria of the issue:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -58,6 +59,26 @@ from modules.verification_runner import (
 )
 
 # A watchdog that reacts in well under a second, so the suite stays fast.
+def _record_all(tracker, events):
+    for event in events:
+        tracker.record(event)
+
+
+def _read_entries(log):
+    entries = []
+    for line in log.path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            entries.append(json.loads(line))
+    return entries
+
+
+def _read_heartbeat(log):
+    try:
+        return json.loads(log._heartbeat_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
 FAST = WatchdogConfig(
     stall_timeout_seconds=1.5,
     check_interval_seconds=0.05,
@@ -157,7 +178,7 @@ class TestProgressTrackerTests(unittest.TestCase):
     def test_progress_age_follows_test_events_once_any_are_seen(self):
         parser = UnittestStreamParser()
         tracker = ProgressTracker(expected_total=10)
-        tracker.record_all(parser.feed("test_a (tests.m.C.test_a) ... ok\n"))
+        _record_all(tracker, parser.feed("test_a (tests.m.C.test_a) ... ok\n"))
         snapshot = tracker.snapshot(process_alive=True)
         self.assertEqual(snapshot["tests_completed"], 1)
         self.assertEqual(snapshot["tests_total"], 10)
@@ -173,7 +194,7 @@ class TestProgressTrackerTests(unittest.TestCase):
     def test_diagnostics_name_the_test_and_the_gap(self):
         parser = UnittestStreamParser()
         tracker = ProgressTracker(expected_total=1873)
-        tracker.record_all(parser.feed("test_foo (tests.test_xyz.SomeTest.test_foo) ... "))
+        _record_all(tracker, parser.feed("test_foo (tests.test_xyz.SomeTest.test_foo) ... "))
         report = format_stall_diagnostics(tracker.snapshot(process_alive=True, pid=4242))
         self.assertIn("Test run stalled", report)
         self.assertIn("current_test: tests.test_xyz.SomeTest.test_foo", report)
@@ -202,11 +223,11 @@ class TestRunLogTests(unittest.TestCase):
         )
         log.write_heartbeat({"current_test": "tests.m.C.test_b", "tests_completed": 1})
 
-        entries = log.read_entries()
+        entries = _read_entries(log)
         self.assertEqual([e["event"] for e in entries], ["test_started", "test_finished"])
         self.assertEqual(entries[1]["duration_ms"], 1000)
         self.assertEqual(entries[1]["result"], RESULT_PASSED)
-        heartbeat = log.read_heartbeat()
+        heartbeat = _read_heartbeat(log)
         self.assertEqual(heartbeat["current_test"], "tests.m.C.test_b")
         self.assertEqual(heartbeat["run_id"], "run-1")
 
@@ -231,7 +252,7 @@ class TestRunLogTests(unittest.TestCase):
         (self.dir / "file-in-the-way").write_text("not a directory", encoding="utf-8")
         log.log_test_start("tests.m.C.test_a")  # must not raise
         log.write_heartbeat({"current_test": None})
-        self.assertIsNone(log.read_heartbeat())
+        self.assertIsNone(_read_heartbeat(log))
 
     def test_pruning_keeps_only_the_newest_runs(self):
         for index in range(4):
@@ -372,7 +393,7 @@ class MonitoredRunTests(unittest.TestCase):
             """
         )
         result, _ = self._run(root)
-        entries = list(VerificationTestLog("run-under-test", log_dir=self.log_dir).read_entries())
+        entries = list(_read_entries(VerificationTestLog("run-under-test", log_dir=self.log_dir)))
         events = [e["event"] for e in entries]
         self.assertIn("test_run_started", events)
         self.assertIn("stalled", events)
@@ -451,7 +472,7 @@ class MonitoredRunTests(unittest.TestCase):
         result, _ = self._run(root)
         self.assertEqual(result.exit_code, 1)
 
-        entries = [e for e in VerificationTestLog("run-under-test", log_dir=self.log_dir).read_entries()
+        entries = [e for e in _read_entries(VerificationTestLog("run-under-test", log_dir=self.log_dir))
                    if e["kind"] == "test"]
         finished = {e["test"]: e for e in entries if e["event"] == "test_finished"}
         started = {e["test"] for e in entries if e["event"] == "test_started"}
@@ -496,7 +517,7 @@ class MonitoredRunTests(unittest.TestCase):
             on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
         )
 
-        test_entries = VerificationTestLog("isolated", log_dir=self.log_dir).read_entries()
+        test_entries = _read_entries(VerificationTestLog("isolated", log_dir=self.log_dir))
         self.assertTrue([e for e in test_entries if e["event"] == "test_finished"])
 
         global_entries = read_log_entries(elog.path)

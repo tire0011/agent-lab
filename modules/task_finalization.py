@@ -167,10 +167,6 @@ class TaskFinalizationCoordinator:
                 """
             )
 
-    def get_phase(self, approval_id: str) -> str | None:
-        state = self._get(approval_id)
-        return state.phase if state is not None else None
-
     def advance(self, approval: Any, experiment: Any) -> FinalizationResult:
         state = self._get_or_create(str(approval.id), str(experiment.id))
         adoption = self.adoption_service.get(str(experiment.id))

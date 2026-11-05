@@ -36,6 +36,15 @@ from modules.task_finalization import (
 from modules.experiment_adoption_service import STATUS_NOT_STARTED
 
 
+def _wait_for_failure_analyses(svc, timeout=None):
+    from concurrent.futures import wait as _fut_wait
+    with svc._failure_analysis_futures_lock:
+        pending = tuple(svc._failure_analysis_futures)
+    if not pending:
+        return True
+    _done, not_done = _fut_wait(pending, timeout=timeout)
+    return not not_done
+
 def _make_exp(id="exp1", status="queued", test_exit_code=None, diff_stat=None, error=None):
     exp = MagicMock()
     exp.id = id
@@ -110,7 +119,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp1")
 
         svc.poll_running()
-        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_FAILED)
         analyzer.analyze_from_logs.assert_called_once()
@@ -129,7 +138,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp2")
 
         svc.poll_running()
-        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_NEEDS_REVIEW)
         analyzer.analyze_from_logs.assert_called_once()
@@ -144,7 +153,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp3")
 
         svc.poll_running()
-        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_SUCCEEDED)
         analyzer.analyze_from_logs.assert_not_called()
@@ -160,7 +169,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         approval_id = _submit(svc, "exp4")
 
         svc.poll_running()  # must not raise
-        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(svc.get(approval_id).status, _STATUS_FAILED)
         analyzer.analyze_from_logs.assert_called_once()
@@ -197,7 +206,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
             self.assertTrue(started.wait(1))
         finally:
             release.set()
-            self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+            self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(analyzer.analyze_from_logs.call_count, 2)
 
@@ -221,7 +230,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         fa_module.FailureAnalysisService = _boom
         try:
             svc.poll_running()
-            self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+            self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
         finally:
             fa_module.FailureAnalysisService = original
 
@@ -258,7 +267,7 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
         fa_module.FailureAnalysisService = _Capturing
         try:
             svc.poll_running()
-            self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+            self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
         finally:
             fa_module.FailureAnalysisService = original
 
@@ -308,7 +317,7 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
         self.addCleanup(svc.close)
 
         svc.poll_running()
-        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(svc.get(approval.id).status, _STATUS_NEEDS_REVIEW)
         analyzer.analyze_from_logs.assert_called_once()
@@ -327,7 +336,7 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
         self.addCleanup(svc.close)
 
         svc.poll_running()
-        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(svc.get(approval.id).status, _STATUS_SUCCEEDED)
         analyzer.analyze_from_logs.assert_not_called()
@@ -342,7 +351,7 @@ class FinalizationFailureIntegrationTests(unittest.TestCase):
         self.addCleanup(svc.close)
 
         svc.poll_running()  # must not raise
-        self.assertTrue(svc._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(svc.get(approval.id).status, _STATUS_NEEDS_REVIEW)
         self.assertTrue(list((self.tmp / "outbox").glob("*.md")))
@@ -443,7 +452,7 @@ class FinalizationResumedRecoveryIntegrationTests(unittest.TestCase):
             )
 
         svc_1.poll_running()  # first attempt: adoption fails, retry budget not yet exhausted
-        self.assertTrue(svc_1._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc_1, timeout=2))
 
         self.assertEqual(svc_1.get(approval.id).status, "running")
         coordinator_1.close()
@@ -460,7 +469,7 @@ class FinalizationResumedRecoveryIntegrationTests(unittest.TestCase):
         self.addCleanup(svc_2.close)
 
         svc_2.poll_running()  # second attempt: retry budget now exhausted -> needs_review
-        self.assertTrue(svc_2._wait_for_failure_analyses(timeout=2))
+        self.assertTrue(_wait_for_failure_analyses(svc_2, timeout=2))
 
         self.assertEqual(svc_2.get(approval.id).status, _STATUS_NEEDS_REVIEW)
         analyzer.analyze_from_logs.assert_called_once()

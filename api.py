@@ -55,7 +55,6 @@ from modules.run_store import DEFAULT_DB_PATH, calculate_estimated_cost, get_app
 from models import (
     DiagnosticActivityResponse,
     ChatRequest,
-    ChatResponse,
     ChatJobResponse,
     CodexTaskCreateRequest,
     CodexTaskListResponse,
@@ -105,8 +104,6 @@ from models import (
     ProblemsResponse,
     PublicActivityResponse,
     PublicExperimentSummary,
-    PublicLogEntry,
-    PublicUnifiedLogsResponse,
     ServiceRestartRequest,
     SetConfigRequest,
     StatusResponse,
@@ -1702,9 +1699,6 @@ def list_activity(
 
 DIAGNOSTICS_DEFAULT_LIMIT = 10
 DIAGNOSTICS_MAX_LIMIT = 100
-
-PUBLIC_LOGS_DEFAULT_LIMIT = 100
-PUBLIC_LOGS_MAX_LIMIT = 500
 
 
 def _revisions_differ(startup: str | None, checkout: str | None) -> bool:

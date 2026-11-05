@@ -34,7 +34,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from modules.central_logging import resolve_log_dir
 
@@ -111,10 +111,6 @@ class VerificationTestLog:
     def path(self) -> Path:
         return self._path
 
-    @property
-    def heartbeat_path(self) -> Path:
-        return self._heartbeat_path
-
     # ------------------------------------------------------------------
     # writing
     # ------------------------------------------------------------------
@@ -172,18 +168,6 @@ class VerificationTestLog:
             except OSError:  # pragma: no cover - best effort cleanup
                 pass
 
-    def read_heartbeat(self) -> dict[str, Any] | None:
-        try:
-            with self._heartbeat_path.open("r", encoding="utf-8") as handle:
-                loaded = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            return None
-        return loaded if isinstance(loaded, dict) else None
-
-    def read_entries(self) -> list[dict[str, Any]]:
-        """Every well-formed entry in this run's test log, in order."""
-        return list(read_test_log_entries(self._path))
-
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
@@ -218,24 +202,6 @@ class VerificationTestLog:
         except OSError:
             # Instrumentation must never be the reason a test run fails.
             logger.exception("test_run_log: failed to append to %s", self._path)
-
-
-def read_test_log_entries(path: str | Path) -> Iterator[dict[str, Any]]:
-    """Yield well-formed JSON objects from a test log, skipping bad lines."""
-    try:
-        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(entry, dict):
-                    yield entry
-    except OSError:
-        return
 
 
 def prune_test_logs(

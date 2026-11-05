@@ -120,9 +120,6 @@ class WorkDirectives:
     forbid_merge: bool = False
     merge_constraint_reason: str | None = None
 
-    @property
-    def requires_issue_reuse(self) -> bool:
-        return self.forbid_new_issue or self.issue_number is not None
 
 
 def parse_work_directives(text: str | None) -> WorkDirectives:

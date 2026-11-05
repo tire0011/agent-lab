@@ -16,6 +16,11 @@ from modules.github_work_tracking import GitHubCIVerification, GitHubWorkTrackin
 from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 
+def _wait_for_thread(service, experiment_id, timeout=None):
+    thread = service._threads.get(experiment_id)
+    if thread is not None:
+        thread.join(timeout)
+
 class LegacyCIEvidenceBackfillTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = AdoptionRepoFixture()
@@ -186,7 +191,7 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
 
         with patch.object(adoption, "_run_adoption_pipeline"):
             adoption.start_adoption(self.experiment_id, superseded=assessment)
-            adoption.wait_for_thread(self.experiment_id, timeout=5)
+            _wait_for_thread(adoption, self.experiment_id, timeout=5)
         self.assertEqual(adoption.get(self.experiment_id).stale_retry_attempts, 1)
         history = adoption.failure_history(self.experiment_id)
         self.assertEqual(len(history), 1)

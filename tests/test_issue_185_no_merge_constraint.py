@@ -40,6 +40,15 @@ ISSUE_180_TASK = (
 )
 
 
+def _phase_of(coordinator, approval_id):
+    state = coordinator._get(approval_id)
+    return state.phase if state is not None else None
+
+def _wait_for_thread(service, experiment_id, timeout=None):
+    thread = service._threads.get(experiment_id)
+    if thread is not None:
+        thread.join(timeout)
+
 def _insert_approval(db_path: str, *, body: str, experiment_id: str | None, approval_id: str = "a182") -> None:
     """A task row as an older release stored it: the constraint not parsed yet."""
     with sqlite3.connect(db_path) as conn:
@@ -259,7 +268,7 @@ class AdoptionScenarioTests(unittest.TestCase):
 
     def _adopt(self):
         self.fx.adoption_service.start_adoption(self.experiment_id)
-        self.fx.adoption_service.wait_for_thread(self.experiment_id, timeout=30)
+        _wait_for_thread(self.fx.adoption_service, self.experiment_id, timeout=30)
         return self.fx.wait_terminal(self.experiment_id, timeout=30)
 
     def _merge_calls(self) -> list[tuple]:
@@ -309,7 +318,7 @@ class AdoptionScenarioTests(unittest.TestCase):
 
         restarted.recover_after_restart()
 
-        restarted.wait_for_thread(self.experiment_id, timeout=30)
+        _wait_for_thread(restarted, self.experiment_id, timeout=30)
         self.assertEqual(restarted.get(self.experiment_id).status, STATUS_READY_FOR_REVIEW)
         self.assertEqual(self._merge_calls(), [])
 
@@ -334,7 +343,7 @@ class FinalizationTests(unittest.TestCase):
         result = coordinator.advance(SimpleNamespace(id="a182"), SimpleNamespace(id="exp-182"))
 
         self.assertEqual(result.status, "ready_for_review")
-        self.assertEqual(coordinator.get_phase("a182"), PHASE_READY_FOR_REVIEW)
+        self.assertEqual(_phase_of(coordinator, "a182"), PHASE_READY_FOR_REVIEW)
         self.assertIn("not merged", result.summary)
         adoption_service.start_adoption.assert_not_called()
 

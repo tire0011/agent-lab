@@ -803,13 +803,6 @@ class MailboxProcessor:
         files.sort(key=lambda f: (f.stat().st_mtime, f.name))
         return files
 
-    def _is_already_processed(self, file_path: Path) -> bool:
-        row = self.conn.execute(
-            "SELECT status FROM mailbox_messages WHERE file_path = ? AND status IN ('done', 'processing')",
-            (str(file_path),),
-        ).fetchone()
-        return row is not None
-
     def _get_existing_record(self, file_path: Path) -> dict | None:
         row = self.conn.execute(
             """

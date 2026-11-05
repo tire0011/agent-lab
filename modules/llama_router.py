@@ -84,9 +84,6 @@ class RouterDecision:
         if not self.decision:
             self.decision = _PROVIDER_TO_DECISION.get(self.provider, "SELF")
 
-    def is_valid(self) -> bool:
-        return self.provider in VALID_PROVIDERS and self.role in VALID_ROLES
-
 
 def _parse_router_response(raw: str) -> RouterDecision:
     """Extract a :class:`RouterDecision` from the model's raw text output.

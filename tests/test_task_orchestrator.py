@@ -1561,8 +1561,11 @@ class TaskOrchestratorTests(unittest.TestCase):
             # The row already stored in the events table must be complete...
             self.assertGreater(len(row["content"]), 15000)
             self.assertIn(huge_line, row["content"])
-            # ...and get_event() must return that same complete raw content.
-            full = orchestrator.task_store.get_event(row["id"])
+            # ...and the journal read path must return that same complete raw content.
+            full = next(
+                event for event in orchestrator.task_store.recent_events(result.session_id, limit=100)
+                if event["id"] == row["id"]
+            )
             self.assertEqual(full["content"], row["content"])
             self.assertIn(huge_line, full["content"])
         finally:

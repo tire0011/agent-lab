@@ -32,6 +32,15 @@ from modules.operations_registry import OperationsRegistry
 from modules.run_store import init_db
 
 
+def _wait_for_chain(service, request_id, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        chain = service.get_chain(request_id)
+        if chain is None or chain.overall_status not in (STATUS_QUEUED, STATUS_RUNNING):
+            return True
+        time.sleep(0.02)
+    return False
+
 @pytest.fixture
 def temp_db():
     """Create a temporary database."""
@@ -131,7 +140,7 @@ class TestOperationChainService:
         request = OperationChainRequest(steps=[OperationChainStep(id="step1", action="local_model_status")])
         result = service.start_chain(request)
         assert result.overall_status == STATUS_QUEUED
-        assert service.wait_for_chain(result.request_id)
+        assert _wait_for_chain(service, result.request_id)
         current = service.get_chain(result.request_id)
         assert current is not None
         assert current.overall_status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS)
@@ -283,7 +292,7 @@ class TestOperationChainService:
         )
         
         result = service.start_chain(request)
-        assert service.wait_for_chain(result.request_id)
+        assert _wait_for_chain(service, result.request_id)
 
         result = service.get_chain(result.request_id)
         # Step 3 must be there and must be skipped. `if step3:` used to guard
@@ -304,7 +313,7 @@ class TestOperationChainService:
         result = service.start_chain(request)
         request_id = result.request_id
 
-        assert service.wait_for_chain(request_id)
+        assert _wait_for_chain(service, request_id)
 
         final = service.get_chain(request_id)
         assert final is not None
@@ -324,7 +333,7 @@ class TestOperationChainService:
         )
         
         result = service.start_chain(request)
-        assert service.wait_for_chain(result.request_id)
+        assert _wait_for_chain(service, result.request_id)
 
         final = service.get_chain(result.request_id)
         # Should complete with error despite timeout. STATUS_RUNNING is no
@@ -347,7 +356,7 @@ class TestOperationChainService:
         )
         
         result = service.start_chain(request)
-        assert service.wait_for_chain(result.request_id)
+        assert _wait_for_chain(service, result.request_id)
 
         final = service.get_chain(result.request_id)
         # `if final.steps:` used to guard this, so a chain that had not
@@ -501,7 +510,7 @@ class TestOperationChainServiceRealRegistryIntegration:
                 request = OperationChainRequest(steps=steps)
                 result = service.start_chain(request)
 
-                assert service.wait_for_chain(result.request_id, timeout=15)
+                assert _wait_for_chain(service, result.request_id, timeout=15)
                 final = service.get_chain(result.request_id)
                 return final
             finally:

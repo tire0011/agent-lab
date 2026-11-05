@@ -33,6 +33,10 @@ from modules.operations_registry import OperationResult, OperationSpec, Operatio
 from modules.task_orchestrator import NexusTaskOrchestrator
 
 
+def _read_only_specs(router):
+    from modules.nexus_tool_router import is_read_only
+    return [spec for spec in router.operations_registry.catalog() if is_read_only(spec)]
+
 SECRET = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
 
 _STALE_FAILURE = (
@@ -235,8 +239,8 @@ class SharedToolPathTests(unittest.TestCase):
         self.assertIsInstance(orchestrator.tool_router, NexusToolRouter)
         self.assertIsInstance(service._tool_router, NexusToolRouter)
         self.assertEqual(
-            [spec.name for spec in orchestrator.tool_router.read_only_operation_specs()],
-            [spec.name for spec in service._tool_router.read_only_operation_specs()],
+            [spec.name for spec in _read_only_specs(orchestrator.tool_router)],
+            [spec.name for spec in _read_only_specs(service._tool_router)],
         )
 
     def test_current_evidence_outranks_the_persisted_error(self):
@@ -387,7 +391,7 @@ class MissingCapabilityTests(unittest.TestCase):
             caller="failure analysis",
         )
         self.assertNotIn(
-            "inbox_refresh", [spec.name for spec in router.read_only_operation_specs()]
+            "inbox_refresh", [spec.name for spec in _read_only_specs(router)]
         )
         with self.assertRaises(ToolRouterError):
             router.execute_operation(
@@ -456,7 +460,7 @@ class ReadOnlyBoundaryDurabilityTests(unittest.TestCase):
         # ...and absent from the surface a read-only role can see.
         self.assertNotIn(
             "merge_pull_request",
-            [spec.name for spec in router.read_only_operation_specs()],
+            [spec.name for spec in _read_only_specs(router)],
         )
         # find_tool cannot even offer it as a candidate, so the resolver is
         # never given the chance to pick it.
@@ -501,7 +505,7 @@ class ReadOnlyBoundaryDurabilityTests(unittest.TestCase):
 
         self.assertNotIn(
             "future_operation",
-            [spec.name for spec in router.read_only_operation_specs()],
+            [spec.name for spec in _read_only_specs(router)],
         )
         with self.assertRaises(ToolRouterError):
             router.execute_operation(
