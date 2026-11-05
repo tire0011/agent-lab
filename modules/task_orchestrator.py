@@ -1390,6 +1390,22 @@ class NexusTaskOrchestrator:
                 experiment_id = None
 
             if action == ACTION_NEW_EXPERIMENT:
+                verified = self._succeeded_issue_experiment(session.id)
+                if verified is not None:
+                    # Verified work for this issue already waits for adoption
+                    # and its review; a second experiment raced it (#530).
+                    result = TaskDecision(
+                        action=ACTION_ANSWER,
+                        reason="second experiment refused (#530)",
+                        message=(
+                            f"Experiment {verified} already succeeded for this issue. "
+                            "Adoption and its review decide what happens next."
+                        ),
+                        observations=observations,
+                        session_id=session.id,
+                    )
+                    self._persist_final(session.id, task, result)
+                    return result
                 logger.info(
                     "llm_provider selected provider=codex role=developer session_id=%s reason=%s",
                     session.id,
@@ -3018,6 +3034,23 @@ Decide the next step now. Return JSON only.
             for item in observations
         )
         return not has_failed_attempt
+
+    def _succeeded_issue_experiment(self, session_id: str) -> str | None:
+        """A succeeded experiment of this session, if the session works on an issue.
+
+        Chat sessions may ask for follow-up work, so only issue sessions count.
+        """
+        inputs = self.task_store.recent_events(session_id, role="user", kind="input", limit=100)
+        if not any((e.get("metadata") or {}).get("source_type") == "issue" for e in inputs):
+            return None
+        for experiment_id in sorted(self._session_experiment_ids(session_id)):
+            try:
+                status = self.experiment_service.get_experiment(experiment_id).status
+            except Exception:  # noqa: BLE001 - an unknown experiment refuses nothing
+                continue
+            if status == "succeeded":
+                return experiment_id
+        return None
 
     def _session_experiment_ids(self, session_id: str) -> set[str]:
         """Experiments this session started (#330).
