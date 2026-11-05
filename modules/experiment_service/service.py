@@ -1285,11 +1285,34 @@ class ExperimentService:
         if token_budget_mode not in {"shadow", "enforce"}:
             logger.warning("ignoring invalid %s value; using shadow", TOKEN_BUDGET_MODE_ENV_VAR)
             token_budget_mode = "shadow"
-        budget_state = {"consumed": 0, "crossed": False}
+        # Provider snapshots are cumulative within one CLI invocation, but an
+        # experiment can invoke several workers (overload fallback and repair
+        # attempts).  Keep completed invocations separate from the current
+        # invocation's high-water mark so two 90-token calls count as 180,
+        # rather than as a global maximum of 90.
+        budget_state = {"completed": 0, "current": 0, "consumed": 0, "crossed": False}
 
-        def observe_usage(usage: dict[str, Any]) -> bool:
-            consumed = _usage_tokens(usage)
-            budget_state["consumed"] = max(budget_state["consumed"], consumed)
+        def start_usage_invocation() -> tuple[
+            Callable[[dict[str, Any]], bool], Callable[[dict[str, Any] | None], None]
+        ]:
+            budget_state["current"] = 0
+
+            def observe_usage(usage: dict[str, Any]) -> bool:
+                budget_state["current"] = max(budget_state["current"], _usage_tokens(usage))
+                consumed = budget_state["completed"] + budget_state["current"]
+                budget_state["consumed"] = consumed
+                return record_usage(consumed)
+
+            def finish_usage(usage: dict[str, Any] | None) -> None:
+                if usage:
+                    observe_usage(usage)
+                budget_state["completed"] += budget_state["current"]
+                budget_state["current"] = 0
+                budget_state["consumed"] = budget_state["completed"]
+
+            return observe_usage, finish_usage
+
+        def record_usage(consumed: int) -> bool:
             if token_budget is None or consumed <= token_budget:
                 return False
             if not budget_state["crossed"]:
@@ -1299,14 +1322,18 @@ class ExperimentService:
                     f"Coding agent consumed {consumed} tokens, exceeding budget {token_budget} ({token_budget_mode})",
                     token_budget=token_budget, consumed_tokens=consumed, mode=token_budget_mode,
                 )
-                self._force_status(
-                    experiment_id, self.get_experiment(experiment_id).status,
-                    token_budget=token_budget,
-                    token_budget_consumed=consumed,
-                    token_budget_stop_reason=TOKEN_BUDGET_STOP_REASON if token_budget_mode == "enforce" else None,
-                )
+            # Persist every later high-water mark too.  In shadow mode the
+            # experiment continues through repairs, and the final record must
+            # contain all tokens consumed, not merely the first crossing.
+            self._force_status(
+                experiment_id, self.get_experiment(experiment_id).status,
+                token_budget=token_budget,
+                token_budget_consumed=consumed,
+                token_budget_stop_reason=TOKEN_BUDGET_STOP_REASON if token_budget_mode == "enforce" else None,
+            )
             return token_budget_mode == "enforce"
 
+        observe_usage, finish_usage = start_usage_invocation()
         implementation_result: CodexResult = worker.run(
             task=implementation_prompt,
             working_dir=worktree_path,
@@ -1318,6 +1345,7 @@ class ExperimentService:
             on_process=lambda process: self._track_process(experiment_id, process),
             on_usage=observe_usage,
         )
+        finish_usage(implementation_result.usage)
 
         fallback = other_provider(implementation_provider) if implementation_provider else None
         if (
@@ -1340,6 +1368,7 @@ class ExperimentService:
                 experiment_id, STATUS_IMPLEMENTING,
                 implementation_provider=implementation_provider,
             )
+            observe_usage, finish_usage = start_usage_invocation()
             implementation_result = worker.run(
                 task=implementation_prompt,
                 working_dir=worktree_path,
@@ -1351,6 +1380,7 @@ class ExperimentService:
                 on_process=lambda process: self._track_process(experiment_id, process),
                 on_usage=observe_usage,
             )
+            finish_usage(implementation_result.usage)
 
         if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
@@ -1430,7 +1460,7 @@ class ExperimentService:
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
-            on_usage=observe_usage,
+            start_usage_invocation=start_usage_invocation,
             budget_state=budget_state,
             token_budget=token_budget,
             token_budget_mode=token_budget_mode,
@@ -1500,7 +1530,9 @@ class ExperimentService:
     def _repair_failed_verification(
         self, experiment_id: str, worktree_path: str, elog: ExperimentLogger,
         result: Experiment, *, github_work_tracking: Any | None = None,
-        on_usage: Callable[[dict[str, Any]], bool] | None = None,
+        start_usage_invocation: Callable[[], tuple[
+            Callable[[dict[str, Any]], bool], Callable[[dict[str, Any] | None], None]
+        ]] | None = None,
         budget_state: dict[str, Any] | None = None,
         token_budget: int | None = None,
         token_budget_mode: str = "shadow",
@@ -1550,6 +1582,9 @@ class ExperimentService:
                 iteration=repair_iteration,
                 provider=provider_of(worker) or "",
             )
+            observe_usage, finish_usage = (
+                start_usage_invocation() if start_usage_invocation is not None else (None, lambda usage: None)
+            )
             repair_result = worker.run(
                 task=_build_repair_implementation_prompt(result.goal, feedback),
                 working_dir=worktree_path,
@@ -1559,8 +1594,9 @@ class ExperimentService:
                 experiment_logger=elog,
                 phase="implementation_repair",
                 on_process=lambda process: self._track_process(experiment_id, process),
-                on_usage=on_usage,
+                on_usage=observe_usage,
             )
+            finish_usage(repair_result.usage)
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if budget_state and budget_state.get("crossed") and token_budget_mode == "enforce":

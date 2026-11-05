@@ -831,6 +831,71 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(result.token_budget_stop_reason, "coding agent token budget exceeded")
         self.assertIn("budget 100, consumed 130", result.error)
 
+    def _run_two_call_budget_experiment(self, mode: str):
+        """Implementation and repair each stay below budget, but total 180."""
+        (self.repo_root / "tests" / "test_placeholder.py").write_text(
+            "import unittest\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_fail(self):\n"
+            "        self.assertTrue(False)\n"
+        )
+        subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo_root), "commit", "-q", "-m", "failing test"],
+            check=True,
+        )
+        calls = 0
+
+        def worker(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            stop = kwargs["on_usage"]({"input_tokens": 70, "output_tokens": 20})
+            worktree = Path(kwargs["working_dir"])
+            (worktree / "implementation.py").write_text('"""implemented."""\n')
+            if calls == 2 and not stop:
+                (worktree / "tests" / "test_placeholder.py").write_text(
+                    "import unittest\n\n"
+                    "class T(unittest.TestCase):\n"
+                    "    def test_fixed(self):\n"
+                    "        self.assertTrue(True)\n"
+                )
+            return _make_result(
+                success=not stop,
+                error="stopped by token budget" if stop else None,
+                usage={"input_tokens": 70, "output_tokens": 20},
+                sandbox="workspace-write",
+            )
+
+        self.implementation_worker.run.side_effect = worker
+        self.service.max_repair_iterations = 1
+        self.service.test_python_executable = sys.executable
+        with patch.dict(os.environ, {
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET": "100",
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE": mode,
+        }):
+            experiment = self.service.create_experiment(goal="Fix the failing test.")
+            result = self.service.run_experiment(experiment.id)
+        self.assertEqual(calls, 2)
+        return result
+
+    def test_token_budget_counts_multiple_worker_invocations_in_shadow_mode(self):
+        result = self._run_two_call_budget_experiment("shadow")
+
+        # Shadow mode does not turn the ordinary verification outcome into a
+        # budget stop (the helper also asserts that both workers ran).
+        self.assertNotEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertEqual(result.token_budget_consumed, 180)
+        self.assertIsNone(result.token_budget_stop_reason)
+
+    def test_token_budget_counts_multiple_worker_invocations_in_enforce_mode(self):
+        result = self._run_two_call_budget_experiment("enforce")
+
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertEqual(result.token_budget, 100)
+        self.assertEqual(result.token_budget_consumed, 180)
+        self.assertEqual(result.token_budget_stop_reason, "coding agent token budget exceeded")
+        self.assertIn("budget 100, consumed 180", result.error)
+
     # ------------------------------------------------------------------
     # Rejection handling
     # ------------------------------------------------------------------
@@ -1098,6 +1163,40 @@ class ExperimentServiceTestCase(unittest.TestCase):
         fallback.run.assert_called_once()
         self.assertEqual(result.status, STATUS_FAILED)
         self.assertIn("real failure", result.error)
+
+    def test_token_budget_accumulates_across_provider_fallback(self):
+        self.implementation_worker.provider = "claude"
+
+        def overloaded(*args, **kwargs):
+            self.assertFalse(kwargs["on_usage"]({"total_tokens": 90}))
+            return _make_result(
+                success=False, sandbox="workspace-write", usage={"total_tokens": 90},
+                error="API Error: 529 Overloaded. This is a server-side issue",
+            )
+
+        self.implementation_worker.run.side_effect = overloaded
+        fallback = MagicMock()
+
+        def fallback_run(*args, **kwargs):
+            stop = kwargs["on_usage"]({"total_tokens": 90})
+            return _make_result(
+                success=not stop, sandbox="workspace-write", usage={"total_tokens": 90},
+                error="stopped by token budget" if stop else None,
+            )
+
+        fallback.run.side_effect = fallback_run
+        with patch.dict(os.environ, {
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET": "100",
+            "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE": "enforce",
+        }), patch(
+            "modules.experiment_service.service.other_provider", return_value="codex"
+        ), patch("modules.experiment_service.service.build_worker", return_value=fallback):
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertEqual(result.token_budget_consumed, 180)
+        self.assertEqual(result.token_budget_stop_reason, "coding agent token budget exceeded")
 
     def test_other_errors_do_not_fall_back(self):
         self.implementation_worker.provider = "claude"
