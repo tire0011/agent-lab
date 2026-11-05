@@ -419,7 +419,10 @@ class GitHubWorkTrackingService:
         title = (getattr(source, "title", None) or "").strip()
         content = (getattr(source, "content", None) or "").strip()
 
-        directives = parse_work_directives(f"{title}\n{content}")
+        # The body is the goal; put it first so its standard ``GitHub Issue
+        # #N:`` heading remains the first non-empty line even when the source
+        # has a generic title such as "Nexus controller task".
+        directives = parse_work_directives(f"{content}\n{title}")
 
         persisted = self._find_by_source(source_type, source_id) if source_id else None
         if persisted is not None:
@@ -436,6 +439,11 @@ class GitHubWorkTrackingService:
             # Issue #184: the task names the Issue to work on, so that Issue
             # *is* the work-tracking record. Opening a second one here is how
             # #181 was created alongside #180.
+            if directives.header_issue_number == directives.issue_number:
+                logger.info(
+                    "reusing GitHub issue #%s from goal header",
+                    directives.issue_number,
+                )
             issue = self._reuse_requested_issue(directives.issue_number)
         elif directives.forbid_new_issue:
             # Explicitly told not to create one, and no single Issue to reuse:
