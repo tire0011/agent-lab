@@ -123,6 +123,9 @@ class Experiment:
     # Coding agent that ran the implementation (codex | claude); None for
     # experiments from before the second agent existed.
     implementation_provider: str | None = None
+    complexity: str | None = None
+    source_type: str | None = None
+    source_id: str | None = None
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
@@ -177,6 +180,9 @@ class Experiment:
             "selection_started_at": self.selection_started_at,
             "selection_ended_at": self.selection_ended_at,
             "implementation_provider": self.implementation_provider,
+            "complexity": self.complexity,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
             "implementation_started_at": self.implementation_started_at,
             "implementation_ended_at": self.implementation_ended_at,
             "ended_at": self.ended_at,
@@ -240,6 +246,9 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
             if "implementation_provider" in row.keys()
             else None
         ),
+        complexity=row["complexity"] if "complexity" in row.keys() else None,
+        source_type=row["source_type"] if "source_type" in row.keys() else None,
+        source_id=row["source_id"] if "source_id" in row.keys() else None,
         implementation_started_at=row["implementation_started_at"],
         implementation_ended_at=row["implementation_ended_at"],
         ended_at=row["ended_at"],
