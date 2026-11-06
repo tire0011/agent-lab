@@ -576,7 +576,8 @@ class MailboxTaskService:
                     with_handover(
                         current_approval.task_body,
                         decision.experiment_handover if decision is not None else None,
-                    )
+                    ),
+                    complexity=decision.complexity if decision is not None else "large",
                 )
             except ExperimentAlreadyActiveError as exc:
                 task_log.info(

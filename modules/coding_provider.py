@@ -40,11 +40,14 @@ from modules.claude_worker import PROVIDER as PROVIDER_CLAUDE
 from modules.claude_worker import _default_claude_bin
 from modules.codex_worker import _DEFAULT_CODEX_BIN, CodexWorker
 from modules.codex_worker import PROVIDER as PROVIDER_CODEX
+from modules.local_coding_worker import LocalCodingWorker
+from modules.local_coding_worker import PROVIDER as PROVIDER_LOCAL
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger("modules.coding_provider")
 
 KNOWN_PROVIDERS: tuple[str, ...] = (PROVIDER_CODEX, PROVIDER_CLAUDE)
+RESULT_PROVIDERS: tuple[str, ...] = (*KNOWN_PROVIDERS, PROVIDER_LOCAL)
 
 ENV_PROVIDER_PIN = "AGENT_CODING_PROVIDER"
 ENV_PROVIDER_ALLOW_LIST = "AGENT_CODING_PROVIDERS"
@@ -221,7 +224,7 @@ def provider_of(worker: Any, default: str | None = None) -> str | None:
     *default* rather than a value that would be stored or bound to SQL.
     """
     provider = getattr(worker, "provider", None)
-    if isinstance(provider, str) and provider in KNOWN_PROVIDERS:
+    if isinstance(provider, str) and provider in RESULT_PROVIDERS:
         return provider
     return default
 
@@ -237,6 +240,8 @@ def build_worker(provider: str, *, db_path: str | None = None, **kwargs: Any) ->
         return CodexWorker(db_path=db_path, **kwargs)
     if provider == PROVIDER_CLAUDE:
         return ClaudeWorker(db_path=db_path, **kwargs)
+    if provider == PROVIDER_LOCAL:
+        return LocalCodingWorker(**kwargs)
     raise UnknownProviderError(
         f"unknown coding provider {provider!r}; known: {KNOWN_PROVIDERS}"
     )

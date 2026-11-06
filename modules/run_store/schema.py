@@ -164,6 +164,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             research_raw_summary TEXT NULL,
             research_diagnostic_log TEXT NULL,
             implementation_provider TEXT NULL,
+            complexity TEXT NOT NULL DEFAULT 'large',
             implementation_started_at TEXT NULL,
             implementation_ended_at TEXT NULL,
             ended_at TEXT NULL,
@@ -321,6 +322,7 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("quality_evaluation_json", "TEXT"),
     # Which coding agent ran the implementation phase (codex | claude).
     ("implementation_provider", "TEXT"),
+    ("complexity", "TEXT NOT NULL DEFAULT 'large'"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
     # Process group of the live worker, so the stall sweep (#400) can stop it
@@ -340,8 +342,9 @@ def _migrate_experiments_columns(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(experiments)")}
     for column_name, column_type in _EXPERIMENTS_ADDITIVE_COLUMNS:
         if column_name not in existing:
+            nullable_suffix = "" if column_name == "complexity" else " NULL"
             conn.execute(
-                f"ALTER TABLE experiments ADD COLUMN {column_name} {column_type} NULL"
+                f"ALTER TABLE experiments ADD COLUMN {column_name} {column_type}{nullable_suffix}"
             )
 
 

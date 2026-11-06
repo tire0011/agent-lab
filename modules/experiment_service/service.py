@@ -25,6 +25,7 @@ from modules.coding_provider import (
     provider_of,
     random_worker_factory,
 )
+from modules.local_coding_worker import LocalCodingWorker, PROVIDER as PROVIDER_LOCAL
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
@@ -456,6 +457,7 @@ class ExperimentService:
         self,
         goal: str,
         timeout_seconds: int = _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
+        complexity: str | None = None,
     ) -> Experiment:
         if not goal or not goal.strip():
             raise ValueError("goal must not be empty")
@@ -463,6 +465,7 @@ class ExperimentService:
             raise ValueError("timeout_seconds must be positive")
 
         normalized_goal = goal.strip()
+        normalized_complexity = "small" if complexity == "small" else "large"
         issue_match = _GITHUB_ISSUE_GOAL_RE.match(normalized_goal)
         issue_number = int(issue_match.group(1)) if issue_match is not None else None
         experiment_id = uuid.uuid4().hex
@@ -497,10 +500,10 @@ class ExperimentService:
                         raise ExperimentAlreadyActiveError(active["id"], active["status"])
                 self._conn.execute(
                     """
-                    INSERT INTO experiments (id, goal, status, created_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO experiments (id, goal, status, created_at, complexity)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at),
+                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at, normalized_complexity),
                 )
                 insert_activity(
                     self._conn,
@@ -534,6 +537,31 @@ class ExperimentService:
         if row is None:
             raise ExperimentNotFoundError(f"no experiment with id {experiment_id!r}")
         return _row_to_experiment(row)
+
+    def _failed_local_attempt(self, experiment: Experiment) -> bool:
+        """Whether this task already spent its one local-model attempt."""
+        issue = _GITHUB_ISSUE_GOAL_RE.match(experiment.goal)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT goal FROM experiments
+                WHERE id != ? AND status = ? AND implementation_provider = ?
+                """,
+                (experiment.id, STATUS_FAILED, PROVIDER_LOCAL),
+            ).fetchall()
+        if issue is not None:
+            issue_number = int(issue.group(1))
+            return any(
+                (match := _GITHUB_ISSUE_GOAL_RE.match(row["goal"])) is not None
+                and int(match.group(1)) == issue_number
+                for row in rows
+            )
+        return any(row["goal"] == experiment.goal for row in rows)
+
+    def _implementation_worker(self, experiment: Experiment, worktree_path: str) -> Any:
+        if experiment.complexity == "small" and not self._failed_local_attempt(experiment):
+            return LocalCodingWorker()
+        return self.worker_factory(worktree_path)
 
     def _resolve_by_prefix(self, experiment_id: str) -> Experiment:
         """Resolve an exact id or an unambiguous >=8 hex-char id prefix.
@@ -1158,7 +1186,7 @@ class ExperimentService:
         if github_work_tracking is not None:
             implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
         implementation_task_id = uuid.uuid4().hex
-        worker = self.worker_factory(worktree_path)
+        worker = self._implementation_worker(experiment, worktree_path)
         # Record which coding agent got this experiment before the call, so a timeout or
         # crash still leaves the run attributable.
         implementation_provider = provider_of(worker)
@@ -1276,6 +1304,10 @@ class ExperimentService:
             elog,
             github_work_tracking=github_work_tracking,
         )
+        # The local provider is deliberately one-shot: a failed patch becomes a
+        # failed experiment, and the task-level retry is routed externally.
+        if implementation_provider == PROVIDER_LOCAL:
+            return result
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,

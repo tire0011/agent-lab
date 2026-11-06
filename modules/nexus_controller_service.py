@@ -241,7 +241,8 @@ class NexusControllerService:
 
             try:
                 experiment = self.experiment_service.create_experiment(
-                    with_handover(source_content, decision.experiment_handover)
+                    with_handover(source_content, decision.experiment_handover),
+                    complexity=decision.complexity,
                 )
             except ExperimentAlreadyActiveError as exc:
                 self._record_execution(

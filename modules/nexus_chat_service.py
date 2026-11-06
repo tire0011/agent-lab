@@ -224,7 +224,9 @@ class NexusChatService:
                     )
                 )
                 try:
-                    experiment = self.experiment_service.create_experiment(goal)
+                    experiment = self.experiment_service.create_experiment(
+                        goal, complexity=decision.complexity
+                    )
                 except ExperimentAlreadyActiveError as exc:
                     return NexusChatResult(
                         reply=(

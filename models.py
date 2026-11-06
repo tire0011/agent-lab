@@ -275,6 +275,7 @@ class ExperimentSummary(BaseModel):
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
     implementation_provider: str | None = None
+    complexity: str = "large"
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
@@ -295,6 +296,7 @@ class ExperimentDetail(BaseModel):
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
     implementation_provider: str | None = None
+    complexity: str = "large"
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None

@@ -182,6 +182,7 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
                 ],
             },
             "goal": {"type": "string"},
+            "complexity": {"type": "string", "enum": ["small", "large"]},
             "tool": {"type": "string"},
             "arguments": {"type": "object", "additionalProperties": True},
             "query": {"type": "string"},
@@ -311,6 +312,7 @@ class TaskDecision:
     # What Nexus already learned, handed to a new_experiment with the task so
     # the coding agent does not begin from the bare task text (#263).
     experiment_handover: str | None = None
+    complexity: str = "large"
 
 
 class TaskOrchestratorError(RuntimeError):
@@ -1350,6 +1352,7 @@ class NexusTaskOrchestrator:
                     if action == ACTION_NEW_EXPERIMENT
                     else None
                 ),
+                complexity="small" if decision.get("complexity") == "small" else "large",
             )
             if task_logger is not None:
                 task_logger.info(
@@ -1788,7 +1791,10 @@ class NexusTaskOrchestrator:
                     "included: start a new isolated implementation experiment. What you "
                     "already found in this run is handed over with your goal."
                 ),
-                "arguments": {"goal": "the concrete change to make and why"},
+                "arguments": {
+                    "goal": "the concrete change to make and why",
+                    "complexity": "small for a clear one-or-two-file fix; otherwise large",
+                },
             },
             {"name": ACTION_RESUME_EXPERIMENT, "description": "Resume an existing persisted experiment/worktree without allocating another experiment. Only for an experiment this task started or the user explicitly asked to resume."},
             {"name": ACTION_ANSWER, "description": "Finish directly when Nexus itself or its tool/delegate observations have solved the request."},
@@ -3793,6 +3799,7 @@ Decide the next step now. Return JSON only.
                 "reason": decision.reason,
                 "experiment_id": decision.experiment_id,
                 "experiment_handover": decision.experiment_handover,
+                "complexity": decision.complexity,
                 "has_command": bool(decision.command),
                 "capability": decision.capability,
                 "required_inputs": decision.required_inputs,
