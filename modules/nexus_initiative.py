@@ -62,6 +62,8 @@ _DEFAULT_STALE_AFTER_SECONDS = 6 * 60 * 60
 
 KIND_CAPABILITY_RESUME = "capability_resume"
 KIND_INTEGRATION = "integration_backlog"
+# The reason of an integration candidate that was never adopted (#538).
+_FRESH_ADOPTION = "adoption is not_started"
 # An issue whose last attempt the reviewer blocked: retried at once and free of
 # the daily budget, so review findings go straight back to the coder.
 REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findings"
@@ -411,10 +413,32 @@ class NexusInitiativeService:
             (since, REVIEW_RETRY_REASON),
         ).fetchone()
         spent = int(row["n"]) if row else 0
+        # The first adoption of fresh verified work is not new work (#538).
+        # Any repeat counts: the budget is what stops a re-adoption loop.
+        spent -= len(self._fresh_adoptions_since(since))
         # Crashes stay in the budget, unlike overloads (#467): an overload was
         # refused before any work, a crash can come after a paid coding run, and
         # this budget is the only limit across issues on a broken pipeline.
         return max(0, spent - self._overloaded_since(since))
+
+    def _fresh_adoptions_since(self, since: str) -> set[str]:
+        """Experiments whose first adoption dispatch since *since* was fresh."""
+        rows = self._conn.execute(
+            """
+            SELECT source_ref, COUNT(*) AS n, MIN(created_at) AS first FROM nexus_initiative_log
+            WHERE decision = 'dispatched' AND source_kind = ? AND COALESCE(reason, '') LIKE ?
+            GROUP BY source_ref
+            """,
+            (KIND_INTEGRATION, f"%{_FRESH_ADOPTION}%"),
+        ).fetchall()
+        return {str(r["source_ref"]) for r in rows if r["n"] == 1 and str(r["first"]) >= since}
+
+    def _adoption_dispatched_before(self, ref: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM nexus_initiative_log WHERE decision = 'dispatched' AND source_kind = ? AND source_ref = ?",
+            (KIND_INTEGRATION, ref),
+        ).fetchone()
+        return row is not None
 
     def _overloaded_since(self, since: str) -> int:
         """Experiments since *since* that failed only because the provider was overloaded."""
@@ -1202,7 +1226,14 @@ class NexusInitiativeService:
             return decision
 
         if self.daily_budget and self._spent_today() >= self.daily_budget:
-            found = [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON] if self.controller else []
+            # Verified work is still adopted, and review findings still go back
+            # to the coder, when the budget for new work is used up (#538).
+            found = [
+                c for c in (self._integration_candidates() if self.adoption_service is not None else [])
+                if _FRESH_ADOPTION in c.reason and not self._adoption_dispatched_before(c.ref)
+            ]
+            if self.controller:
+                found += [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON]
             if not found:
                 return self._record(
                     InitiativeDecision(
