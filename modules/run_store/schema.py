@@ -212,6 +212,21 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_experiments_created_at ON experiments(created_at);
         CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
 
+        CREATE TABLE IF NOT EXISTS experiment_reflections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            model TEXT NULL,
+            summary_json TEXT NOT NULL,
+            suggestions_json TEXT NOT NULL,
+            raw_response TEXT NULL,
+            error TEXT NULL,
+            FOREIGN KEY (experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_experiment_reflections_created_at
+            ON experiment_reflections(created_at);
+
         CREATE TABLE IF NOT EXISTS mailbox_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_path TEXT NOT NULL,

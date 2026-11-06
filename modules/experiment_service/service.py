@@ -309,6 +309,7 @@ class ExperimentService:
         test_watchdog_interval_seconds: float | None = None,
         test_safety_cap_seconds: float | None = None,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
+        reflection_service: Any | None = None,
         rng: Any | None = None,
         base_ref: str = "HEAD",
         test_command: list[str] | None = None,
@@ -366,14 +367,19 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
+        self.reflection_service = reflection_service
         self.experiment_token_budget = _experiment_token_budget(
             os.environ.get(EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
         )
         self.base_ref = base_ref
         self.test_command = test_command
-        # Deliberately *not* derived from ``repo_root``: tests point ``repo_root`` at a
-        # throwaway checkout whose cleanliness is asserted directly, so the log directory
-        # must never live inside it.
+        # Deliberately *not* derived from ``repo_root``: tests (and some
+        # deployments) point ``repo_root`` at a throwaway git checkout whose
+        # cleanliness is asserted directly, so the log directory must never
+        # live inside it (matching ``modules.run_log``'s plain
+        # ``state/runs`` default, which is likewise independent of any
+        # injected repo path). In production this resolves relative to the
+        # service's working directory (``/agent``).
         self.experiment_log_dir = experiment_log_dir or DEFAULT_LOG_DIR
 
         conn = init_db(db_path)
@@ -630,7 +636,18 @@ class ExperimentService:
             process = self._active_processes.get(experiment.id)
         if process is not None:
             self._terminate_process(process)
-        return self.get_experiment(experiment.id)
+        result = self.get_experiment(experiment.id)
+        self._reflect_terminal(result)
+        return result
+
+    def _reflect_terminal(self, experiment: Experiment) -> None:
+        """Run advisory reflection without ever changing lifecycle state."""
+        if experiment.status not in _TERMINAL_STATUSES or self.reflection_service is None:
+            return
+        try:
+            self.reflection_service.reflect_sync(experiment)
+        except Exception:
+            logger.exception("experiment %s: terminal reflection failed", experiment.id)
 
 
     def _get_test_watchdog_config(self) -> WatchdogConfig:
@@ -1070,6 +1087,7 @@ class ExperimentService:
                 with self._process_lock:
                     self._active_processes.pop(row["id"], None)
                 marked.append(row["id"])
+                self._reflect_terminal(self.get_experiment(row["id"]))
         return marked
 
 
@@ -1229,6 +1247,7 @@ class ExperimentService:
                 "experiment %s stalled in phase %s: no progress for %ds (last event %s at %s); worker: %s",
                 experiment_id, phase, int(silent), last_event, last_at.isoformat(), worker,
             )
+            self._reflect_terminal(self.get_experiment(experiment_id))
             stalled.append(experiment_id)
         return stalled
 
@@ -1266,7 +1285,7 @@ class ExperimentService:
             )
 
         try:
-            return self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
+            result = self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
             elog.error(
                 "pipeline", "unhandled_exception",
@@ -1279,7 +1298,9 @@ class ExperimentService:
                 ended_at=_utcnow_iso(),
                 error=f"{PIPELINE_CRASH_ERROR_PREFIX}{exc}",
             )
-            return self.get_experiment(experiment_id)
+            result = self.get_experiment(experiment_id)
+        self._reflect_terminal(result)
+        return result
 
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
         """Single-call implementation pipeline.
