@@ -354,6 +354,31 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
     return None
 
 
+_HANDOVER_SECTION_RE = re.compile(
+    r"\n\n(?:Knowledge briefing:|Delegate findings \(unverified\):|Earlier attempts in this run:)"
+)
+
+
+def _policy_text(goal: str) -> str:
+    """The part of a goal the keyword denylist judges (#544).
+
+    The task and Nexus' own goal for it. Not the rest of the handover or the
+    earlier attempts: those quote tool output and old failure reasons (a grep
+    hit in a docstring that says "never shell=True", or the rejection reason
+    itself), which describe what Nexus saw, not what it is asked to do.
+    """
+    from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
+
+    task = goal.split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+    _, found, handover = goal.partition(HANDOVER_HEADING)
+    if not found:
+        return task
+    _, has_goal, nexus_goal = handover.partition("Nexus goal:\n")
+    if not has_goal:
+        return task
+    return task + "\n" + _HANDOVER_SECTION_RE.split(nexus_goal, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+
+
 def _check_goal_policy(goal: str) -> str | None:
     """Apply the safety denylist directly to the raw goal text.
 
@@ -362,7 +387,7 @@ def _check_goal_policy(goal: str) -> str | None:
     "commit"/"push"/"merge" are handled by the word-boundary, negation-aware
     _GIT_ACTION_REGEXES, so safe goals like "do not commit or push" are not rejected.
     """
-    haystack = (goal or "").lower()
+    haystack = _policy_text(goal or "").lower()
     # Git commit/push/merge are normal experiment-branch workflow actions; main/merge/# deployment governance is enforced by the lifecycle layer.
     for keyword in _REJECT_KEYWORDS:
         if keyword in haystack:
