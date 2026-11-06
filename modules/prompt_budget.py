@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from modules.observation_summary import summarize_observation
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEMINFO_PATH = "/proc/meminfo"
@@ -322,10 +324,12 @@ def compact_observations(
 ) -> tuple[list[dict[str, Any]], list[int]]:
     """Bound observations sent to the model to a total character budget.
 
-    The most recent ``keep_recent_full`` observations are kept closest to
-    full fidelity (still individually capped); older observations are
-    replaced by a small stub referencing their stable event id so the raw
-    result stays retrievable from the database without resending it inline.
+    An observation that fits its share is passed through unchanged. One that
+    does not is replaced by a semantic summary (``observation_summary``) when
+    that fits; the most recent ``keep_recent_full`` may otherwise still be
+    truncated in place; everything else becomes a small stub referencing its
+    stable event id, so the raw result stays retrievable from the database
+    without resending it inline.
     Returns ``(compacted_observations, omitted_indices)`` where
     ``omitted_indices`` are 0-based positions in the *input* list that were
     reduced to a stub.
@@ -350,6 +354,13 @@ def compact_observations(
         if len(serialized) <= fair_share:
             result[index] = obs
             remaining = max(0, remaining - len(serialized))
+            continue
+        # Middle step (#561): the fields the next decision needs, before
+        # either a blind cut or the bare stub. Not counted as omitted.
+        summary = summarize_observation(obs, fair_share)
+        if summary is not None:
+            result[index] = summary
+            remaining = max(0, remaining - len(json.dumps(summary, separators=(",", ":"))))
             continue
         if is_recent and remaining > 500:
             # Not counted as omitted: this still carries real content.
