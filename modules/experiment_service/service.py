@@ -295,6 +295,7 @@ class ExperimentService:
         self,
         selection_worker: CodexWorker | None = None,
         worker_factory: Callable[[str], CodexWorker] | None = None,
+        local_worker_factory: Callable[[str], Any] | None = None,
         plan_worker_factory: Callable[[str], CodexWorker] | None = None,
         db_path: str = DEFAULT_DB_PATH,
         repo_root: str = "/agent",
@@ -353,6 +354,9 @@ class ExperimentService:
         # One provider per worktree/scratch dir, i.e. one agent per experiment: the
         # implementation call and any repair iteration share it, the next experiment rotates.
         self.worker_factory = worker_factory or random_worker_factory(db_path=db_path, rng=rng)
+        self.local_worker_factory = local_worker_factory or (
+            lambda _working_dir: build_worker("local", db_path=db_path)
+        )
         self.plan_worker_factory = plan_worker_factory or random_worker_factory(db_path=db_path, rng=rng)
         self.db_path = db_path
         self.repo_root = repo_root
@@ -675,6 +679,9 @@ class ExperimentService:
         self,
         goal: str,
         timeout_seconds: int = _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
+        complexity: str | None = None,
+        source_type: str | None = None,
+        source_id: str | None = None,
     ) -> Experiment:
         if not goal or not goal.strip():
             raise ValueError("goal must not be empty")
@@ -684,6 +691,11 @@ class ExperimentService:
         normalized_goal = goal.strip()
         issue_match = _GITHUB_ISSUE_GOAL_RE.match(normalized_goal)
         issue_number = int(issue_match.group(1)) if issue_match is not None else None
+        normalized_complexity = "small" if complexity == "small" else "large"
+        if source_type is None and issue_number is not None:
+            source_type, source_id = "issue", str(issue_number)
+        normalized_source_type = str(source_type).strip()[:64] if source_type else None
+        normalized_source_id = str(source_id).strip()[:256] if source_id else None
         experiment_id = uuid.uuid4().hex
         created_at = _utcnow_iso()
 
@@ -716,10 +728,12 @@ class ExperimentService:
                         raise ExperimentAlreadyActiveError(active["id"], active["status"])
                 self._conn.execute(
                     """
-                    INSERT INTO experiments (id, goal, status, created_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO experiments
+                        (id, goal, status, created_at, complexity, source_type, source_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at),
+                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at,
+                     normalized_complexity, normalized_source_type, normalized_source_id),
                 )
                 insert_activity(
                     self._conn,
@@ -743,6 +757,22 @@ class ExperimentService:
             timeout_seconds=timeout_seconds,
         )
         return self.get_experiment(experiment_id)
+
+    def _must_use_external_provider(self, experiment: Experiment) -> bool:
+        """Whether a prior local attempt for this stable task identity did not succeed."""
+        if not experiment.source_type or not experiment.source_id:
+            return False
+        failed_terminal = tuple(status for status in _TERMINAL_STATUSES if status != STATUS_SUCCEEDED)
+        placeholders = ", ".join("?" for _ in failed_terminal)
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT 1 FROM experiments
+                   WHERE source_type = ? AND source_id = ? AND id != ?
+                     AND implementation_provider = 'local' AND status IN ({placeholders})
+                   LIMIT 1""",
+                (experiment.source_type, experiment.source_id, experiment.id, *failed_terminal),
+            ).fetchone()
+        return row is not None
 
 
     def get_experiment(self, experiment_id: str) -> Experiment:
@@ -1383,7 +1413,11 @@ class ExperimentService:
         if github_work_tracking is not None:
             implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
         implementation_task_id = uuid.uuid4().hex
-        worker = self.worker_factory(worktree_path)
+        use_local = (
+            experiment.complexity == "small"
+            and not self._must_use_external_provider(experiment)
+        )
+        worker = self.local_worker_factory(worktree_path) if use_local else self.worker_factory(worktree_path)
         # Record which coding agent got this experiment before the call, so a timeout or
         # crash still leaves the run attributable.
         implementation_provider = provider_of(worker)
@@ -1413,7 +1447,11 @@ class ExperimentService:
             experiment_id, implementation_result.usage, elog
         )
 
-        fallback = other_provider(implementation_provider) if implementation_provider else None
+        fallback = (
+            other_provider(implementation_provider)
+            if implementation_provider and implementation_provider != "local"
+            else None
+        )
         if (
             implementation_result.error
             and not implementation_result.timed_out
@@ -1572,6 +1610,10 @@ class ExperimentService:
     ) -> Experiment:
         """Give actionable test failures a small number of focused repair attempts."""
         if result.status != STATUS_FAILED or result.test_exit_code is None:
+            return result
+        # A local experiment is deliberately one model patch. A failed verification
+        # is terminal and also activates the stable-task external fallback.
+        if result.implementation_provider == "local":
             return result
 
         for repair_iteration in range(1, self.max_repair_iterations + 1):

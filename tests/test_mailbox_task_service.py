@@ -232,7 +232,12 @@ class TestSubmitQueued(unittest.TestCase):
         approval = svc.create_task(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.submit_queued()
         import time; time.sleep(0.1)
-        es.create_experiment.assert_called_once_with("Do work")
+        es.create_experiment.assert_called_once_with(
+            "Do work",
+            complexity=None,
+            source_type="task",
+            source_id=approval.id,
+        )
         updated = svc.get(approval.id)
         self.assertIn(updated.status, (_STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_SUCCEEDED, _STATUS_FAILED))
         _, kwargs = _FixedOrchestrator.calls[-1]
