@@ -449,8 +449,8 @@
   declares itself read-only - no denylist to keep in step with the catalog.
   A spec that declares nothing is treated as mutating.
 - Inference and grant storage are injected, because they are genuinely
-  per-role: the controller resolves through a memory budget with an external
-  fallback and reads its grants back from persistent session events; failure
+  per-role: the controller resolves local-first (memory pressure is only
+  logged, see D-027) with an external fallback after a real local failure and reads its grants back from persistent session events; failure
   analysis queues a job under section 11 and keeps grants for the one
   analysis they belong to.
 - Diagnosis runs a bounded evidence-gathering phase *before* it diagnoses:

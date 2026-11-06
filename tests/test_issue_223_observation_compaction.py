@@ -402,20 +402,23 @@ class VmBudgetTests(unittest.TestCase):
 
 
 class StubbedUnderARealSqueezeTests(unittest.TestCase):
-    """The stub path still matters where memory really is exhausted.
+    """The stub path still matters when observations outgrow their room.
 
-    A host with a few hundred MB free is genuinely in trouble, and there the
-    budget still collapses. A stub naming the operation without saying which
-    issue cannot stop a controller asking for #196 again, so the identity
-    fields stay.
+    Host memory no longer collapses the budget (#230) - it is a signal, not a
+    shrink - but many or large observations can still exceed the context
+    window's share. A stub naming the operation without saying which issue
+    cannot stop a controller asking for #196 again, so the identity fields stay.
     """
 
     SQUEEZED = 150
 
-    def test_a_starved_host_still_collapses_the_budget(self):
+    def test_a_starved_host_is_flagged_but_keeps_its_budget(self):
+        """This test used to assert the collapse; that was the #230 bug."""
+        roomy = compute_budget(mem_available_kb=None)
         plan = compute_budget(mem_available_kb=100_000, swap_free_kb=0, swap_total_kb=8_388_604)
         self.assertTrue(plan.low_memory)
-        self.assertLess(plan.observation_chars, 300)
+        self.assertEqual(plan.observation_chars, roomy.observation_chars)
+        self.assertGreater(plan.observation_chars, 3000)
 
     def test_a_stubbed_success_still_names_the_operation_its_args_and_outcome(self):
         views = controller_observation_view([_github_issue_success()])

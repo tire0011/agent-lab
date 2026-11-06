@@ -563,6 +563,69 @@ class TaskOrchestratorTests(unittest.TestCase):
         delegation.delegate.assert_not_called()
 
     @patch.dict(os.environ, {"NEXUS_CONTROLLER_PROVIDER": "local"})  # local-first controller (#337)
+    def test_measured_memory_pressure_still_sends_a_full_prompt_to_the_local_model(self):
+        """#230: low memory is a signal, never a gate or a shrink.
+
+        Unlike the test above this does not patch the plan: the host reports
+        1 MB free, the real `compute_budget` flags it, and the controller still
+        sends its whole, budget-bounded prompt to llama-server first.
+        """
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"done locally","reason":"local inference succeeded"}',
+        ])
+        delegation = MagicMock()
+        delegation.catalog.return_value = [
+            {"provider": "azure_openai", "description": "external", "writes_repo": False, "cost": "paid"}
+        ]
+        orchestrator = self._orchestrator(client, delegation=delegation)
+        plans = []
+        try:
+            from modules.prompt_budget import compute_budget as real_compute_budget
+
+            def _recording(**kwargs):
+                plans.append(real_compute_budget(**kwargs))
+                return plans[-1]
+
+            with patch("modules.task_orchestrator.read_mem_available_kb", return_value=1024), patch(
+                "modules.task_orchestrator.compute_budget", side_effect=_recording
+            ):
+                result = orchestrator.run("Answer despite measured memory pressure")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertEqual(result.message, "done locally")
+        self.assertEqual(len(client.prompts), 1)
+        delegation.delegate.assert_not_called()
+        plan = plans[0]
+        self.assertTrue(plan.low_memory)
+        self.assertEqual(plan.effective_budget_chars, plan.context_budget_chars)
+        prompt = client.prompts[0]
+        self.assertLessEqual(len(prompt), plan.effective_budget_chars)
+        self.assertIn("Answer despite measured memory pressure", prompt)
+        self.assertIn("AVAILABLE CAPABILITIES:", prompt)
+
+    @patch.dict(
+        os.environ,
+        {"NEXUS_CONTROLLER_PROVIDER": "local", "NEXUS_LOCAL_MODEL_CONTEXT_TOKENS": "1200"},
+    )
+    def test_a_window_the_fixed_sections_exhaust_fails_loudly_instead_of_running_blind(self):
+        client = _Client([
+            '{"type":"action","action":"answer","experiment_id":null,'
+            '"message":"should not be asked","reason":"blind"}',
+        ])
+        orchestrator = self._orchestrator(client)
+        try:
+            result = orchestrator.run("Answer with a window too small for the rules")
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(result.action, ACTION_MISSING_CAPABILITY)
+        self.assertIn("prompt budget exhausted", result.reason)
+        self.assertEqual(client.prompts, [])
+
+    @patch.dict(os.environ, {"NEXUS_CONTROLLER_PROVIDER": "local"})  # local-first controller (#337)
     def test_local_inference_failure_uses_external_fallback(self):
         client = _FailingClient([])
         delegation = MagicMock()

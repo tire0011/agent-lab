@@ -76,10 +76,12 @@ from modules.controller_observations import _args_signature, controller_observat
 from modules.experiment_handover import experiment_handover
 from modules.prompt_budget import (
     CHARS_PER_TOKEN,
+    PromptBudgetExhaustedError,
     PromptBudgetPlan,
     compact_observations,
     compute_budget,
     dedupe_nested_results,
+    fit_history,
     prompt_json,
     read_mem_available_kb,
     read_swap_free_kb,
@@ -125,6 +127,8 @@ _GITHUB_WRITE_COMMAND = re.compile(
 # External fallback prompts are cut to this length; size the prompt below it
 # first (#297).
 _EXTERNAL_PROMPT_CHARS = 16000
+# Opens the controller prompt's history section; its length counts against the budget.
+_HISTORY_HEADER = "\nPERSISTENT TASK/DISCUSSION HISTORY:\n"
 # Room for the role preamble that _external_fallback_completion puts in front.
 _EXTERNAL_PREAMBLE_CHARS = 300
 
@@ -818,21 +822,38 @@ class NexusTaskOrchestrator:
                     task_logger,
                 )
             budget_plan = compute_budget(
+                fixed_chars=self._controller_fixed_chars(session),
                 mem_available_kb=read_mem_available_kb(),
                 swap_free_kb=read_swap_free_kb(),
                 swap_total_kb=read_swap_total_kb(),
             )
+            # Fetched up to the whole variable room; `_build_prompt` trims it to what
+            # the observations leave, since history is the re-readable section.
             history = self.task_store.history(
                 session.id,
                 limit=18,
-                max_chars=budget_plan.history_chars,
+                max_chars=budget_plan.variable_chars,
                 max_event_id=run_start_event_id,
             )
-            prompt, prompt_meta = self._build_prompt(session, task, history, observations, budget_plan)
+            try:
+                prompt, prompt_meta = self._build_prompt(
+                    session, task, history, observations, budget_plan
+                )
+            except PromptBudgetExhaustedError as exc:
+                logger.error(
+                    "controller_prompt_budget_exhausted session_id=%s %s error=%s",
+                    session.id,
+                    budget_plan.as_log_fields(),
+                    exc,
+                )
+                return self._budget_exceeded_result(
+                    session.id, task, observations, str(exc), task_logger
+                )
             # Log the plan once, and again only when the budget really shifts - compared on
             # what was decided, not measured (`mem_available_kb` moves every read).
             budget_shape = (
                 budget_plan.effective_budget_chars,
+                budget_plan.fixed_chars,
                 budget_plan.observation_chars,
                 budget_plan.history_chars,
                 budget_plan.low_memory,
@@ -845,13 +866,14 @@ class NexusTaskOrchestrator:
                 )
                 last_budget_shape = budget_shape
             logger.info(
-                "controller_prompt session_id=%s prompt_chars=%s estimated_tokens=%s "
-                "history_events=%s observation_count=%s omitted_observations=%s "
-                "superseded_observations=%s",
+                "controller_prompt session_id=%s prompt_chars=%s budget_chars=%s "
+                "estimated_tokens=%s history_events=%s observation_count=%s "
+                "omitted_observations=%s superseded_observations=%s",
                 session.id,
                 len(prompt),
+                budget_plan.effective_budget_chars,
                 len(prompt) // CHARS_PER_TOKEN,
-                len(history),
+                prompt_meta.get("history_events", len(history)),
                 len(observations),
                 prompt_meta["omitted_observation_indices"],
                 prompt_meta["superseded_observation_count"],
@@ -1697,8 +1719,8 @@ class NexusTaskOrchestrator:
         """The controller inference path, as the tool router expects it.
 
         The router owns the resolver prompt and schema; the controller side keeps the
-        memory budget and external fallback and maps their failures to the router's
-        single "resolver unavailable" signal.
+        advisory memory signal and external fallback and maps their failures to the
+        router's single "resolver unavailable" signal.
         """
         budget_plan = compute_budget(
             mem_available_kb=read_mem_available_kb(),
@@ -2369,11 +2391,18 @@ Return exactly one JSON object matching the schema."""
         observations: list[dict[str, Any]],
         budget_plan: PromptBudgetPlan,
     ) -> tuple[str, dict[str, Any]]:
-        """Compact observations/current input to fit ``budget_plan`` and render.
+        """Compact input, observations and history so the whole prompt fits the budget.
 
-        Prevents nested duplication and bounds any individually oversized observation
-        before the next model call.
+        The rendered prompt - fixed sections included - never exceeds
+        ``budget_plan.effective_budget_chars`` (#230). Priority when room is short:
+        the current input (capped), then the observations, then the persisted history,
+        which is re-readable and so gives way first. Raises
+        ``PromptBudgetExhaustedError`` rather than sending a prompt in which the
+        controller cannot see its own tool results.
         """
+        budget_plan.require_usable()
+        budget = budget_plan.effective_budget_chars
+        capabilities_json = prompt_json(self._capabilities())
         truncated_input, input_truncated = truncate_text(current_input, budget_plan.current_input_chars)
         seen: set[str] = set()
         for event in history:
@@ -2383,13 +2412,50 @@ Return exactly one JSON object matching the schema."""
         deduped_observations = dedupe_nested_results(observations, already_seen=seen)
         # Prepare semantic content before applying the size budget.
         viewed_observations = controller_observation_view(deduped_observations)
-        compacted_observations, omitted_indices = compact_observations(
-            viewed_observations,
-            budget_chars=budget_plan.observation_chars,
-            keep_recent_full=2,
+        # Input room the task did not use goes to the observations, not to history.
+        observation_budget = budget_plan.observation_chars + max(
+            0, budget_plan.current_input_chars - len(truncated_input)
         )
-        prompt = self._prompt(session, truncated_input, history, compacted_observations)
+        # Compaction bounds the serialised observations; per-result headers and stub
+        # minimums can still overshoot, so the rendered length is what is checked.
+        for _ in range(4):
+            compacted_observations, omitted_indices = compact_observations(
+                viewed_observations,
+                budget_chars=observation_budget,
+                keep_recent_full=2,
+            )
+            without_history = self._prompt(
+                session, truncated_input, [], compacted_observations,
+                capabilities_json=capabilities_json,
+            )
+            overflow = len(without_history) - budget
+            if overflow <= 0:
+                break
+            observation_budget = max(0, observation_budget - overflow - 200)
+        else:
+            raise PromptBudgetExhaustedError(
+                f"prompt budget exhausted: {len(without_history)} characters without any "
+                f"history exceed the {budget}-character budget even with observations "
+                "compacted to stubs"
+            )
+        earlier = [
+            event for event in history
+            if str(event.get("content", "")).strip() != truncated_input.strip()
+        ]
+        history_room = budget - len(without_history) - len(_HISTORY_HEADER) - 1
+        fitted_history = fit_history(earlier, history_room) if history_room > 0 else []
+        prompt = self._prompt(
+            session, truncated_input, fitted_history, compacted_observations,
+            capabilities_json=capabilities_json,
+        )
+        if len(prompt) > budget:
+            # Not expected - fit_history measures the same serialisation - but the
+            # bound is a correctness requirement, so history yields entirely.
+            fitted_history = []
+            prompt = without_history
         meta = {
+            "history_events": len(fitted_history),
+            "history_events_dropped": len(earlier) - len(fitted_history),
             "input_truncated": input_truncated,
             # Positions in the *viewed* list, which is what was budgeted - not in
             # ``observations``; `superseded_observation_count` says how far they diverged.
@@ -2401,13 +2467,31 @@ Return exactly one JSON object matching the schema."""
         }
         return prompt, meta
 
-    def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
+    def _controller_fixed_chars(self, session: Any) -> int:
+        """Measured cost of the controller prompt sections that are never compacted.
+
+        The rules block, the capability catalog and the framing, rendered with an
+        empty input, no history and no observations - ``len()``, not a share (#230).
+        """
+        return len(self._prompt(session, "", [], []))
+
+    def _prompt(
+        self,
+        session: Any,
+        current_input: str,
+        history: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        *,
+        capabilities_json: str | None = None,
+    ) -> str:
         """Render one controller prompt, stable parts first.
 
         llama-server reuses the KV cache only up to the first changed byte, so the
         observations - the only part that changes between turns - go last, and the
         closing instruction stays last on purpose (#218).
         """
+        if capabilities_json is None:
+            capabilities_json = prompt_json(self._capabilities())
         tool_results = "\n\n".join(
             f"{str(observation.get('tool') or observation.get('event') or 'tool')} result:\n"
             f"{prompt_json(observation)}"
@@ -2421,7 +2505,7 @@ Return exactly one JSON object matching the schema."""
             if str(event.get("content", "")).strip() != current_input.strip()
         ]
         history_block = (
-            f"\nPERSISTENT TASK/DISCUSSION HISTORY:\n{json.dumps(earlier, separators=(',', ':'))}\n"
+            f"{_HISTORY_HEADER}{json.dumps(earlier, separators=(',', ':'))}\n"
             if earlier
             else ""
         )
@@ -2445,7 +2529,7 @@ RULES:
 - Return exactly one next action.
 
 AVAILABLE CAPABILITIES:
-{prompt_json(self._capabilities())}
+{capabilities_json}
 
 OBSERVATIONS FROM TOOLS USED IN THIS RUN:
 {tool_results or "none"}

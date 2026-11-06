@@ -632,6 +632,30 @@ Decision log for architecture and operating choices.
 - Revisit if: an external client needs a mutating operation; that needs its own
   authorization rule, not the controller flag.
 
+### D-027: The prompt budget is the context window; host memory is a signal
+
+- Status: Accepted (#230)
+- Decision: `compute_budget` bounds the whole rendered prompt by the context
+  window minus reserved output. The never-compacted sections (rules, capability
+  catalog, framing) are measured with `len()` of the rendered empty prompt and
+  subtracted as-is; the remainder goes to the current input (capped at 20 %),
+  observations, and history (10 % floor plus whatever observations leave).
+  `_build_prompt` checks the rendered length and trims observations, then
+  history, until it fits. If the fixed sections leave under 2000 characters,
+  the turn fails with `prompt budget exhausted` instead of running blind.
+  `low_memory`, `safe_local_budget_chars` and `memory_budget_chars` are
+  logged and never shrink a section or gate a local call.
+- Why: the old fixed shares (instructions 12 %, tool schema 18 %, ...) covered
+  sections that were never compacted. A 500-char "budget" sat next to a
+  9946-char prompt, and the only real effect was 150 characters for
+  observations. On the VM a full-context prompt costs ~109 MB RSS more than a
+  tiny one, once, bounded by `n_ctx`. That is not worth blinding the controller.
+- Evidence: `tests/test_issue_230_prompt_budget.py`, `tests/test_prompt_budget.py`,
+  `tests/test_task_orchestrator.py`
+  (`test_measured_memory_pressure_still_sends_a_full_prompt_to_the_local_model`).
+- Revisit if: a host shows real OOM kills from prompt size (not model load), or
+  `CHARS_PER_TOKEN = 4` proves too optimistic for the prompt's JSON.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns
