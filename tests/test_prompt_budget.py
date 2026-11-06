@@ -291,8 +291,16 @@ class CompactObservationsTests(unittest.TestCase):
             {"tool": "command", "event_id": 2, "result": "new" * 2000},
         ]
         compacted, omitted = compact_observations(observations, budget_chars=2000, keep_recent_full=1)
-        self.assertIn(0, omitted)
         self.assertNotIn(1, omitted)
+        # The older one is reduced - to a summary (#561) or a stub - and keeps
+        # its event reference; it is never passed through at full size.
+        older = compacted[0]
+        self.assertTrue(older.get("summarized") or older.get("truncated"))
+        self.assertEqual(older["event_id"], 1)
+        self.assertLessEqual(
+            len(json.dumps(older, separators=(",", ":"))),
+            len(json.dumps(compacted[1], separators=(",", ":"))),
+        )
 
 
 class FitHistoryTests(unittest.TestCase):
