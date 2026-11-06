@@ -5,10 +5,8 @@ The models live in ``config/models.json`` (or the file named by
 Every provider is reached through the same ``/chat/completions`` call.
 A model is available when its API key is set in the environment; keys are
 read from the environment only and never logged. An optional per-entry
-``headers`` object adds provider-required headers (GitHub Models answers
-its non-API paths with 200 text/plain "OK", so it needs
-``Accept: application/vnd.github+json``). A 2xx answer that is not JSON is
-reported as ``non_json_response``, not as a success.
+``headers`` object adds provider-required headers. A 2xx answer that is not
+JSON is reported as ``non_json_response``, not as a success.
 """
 
 from __future__ import annotations
