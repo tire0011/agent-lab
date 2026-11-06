@@ -102,6 +102,7 @@ _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 # it stalls; see modules.coding_worker.agent_watchdog_limits.
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
+EXPERIMENT_TOKEN_BUDGET_ENV_VAR = "NEXUS_EXPERIMENT_TOKEN_BUDGET"
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
@@ -160,6 +161,43 @@ def worktree_retention_hours(raw: str | None = None) -> float:
         logger.warning("ignoring invalid %s value; worktree cleanup disabled", WORKTREE_RETENTION_ENV_VAR)
         return 0.0
     return hours if hours > 0 and hours != float("inf") else 0.0
+
+
+def _experiment_token_budget(raw: str | None) -> int | None:
+    """Parse the optional shadow-mode budget; invalid values disable it safely."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        budget = int(raw)
+    except ValueError:
+        logger.warning("ignoring invalid %s value", EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        return None
+    if budget < 0:
+        logger.warning("ignoring negative %s value", EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        return None
+    return budget
+
+
+def worker_run_token_total(usage: dict[str, Any] | None) -> int:
+    """Return provider-independent tokens for one completed worker run.
+
+    Both workers flatten their final usage event.  Input and output tokens are
+    counted along with every reported cache-token counter; unrelated counters
+    (for example reasoning tokens) are deliberately excluded.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    keys = {"input_tokens", "output_tokens"}
+    keys.update(
+        key for key in usage
+        if isinstance(key, str) and "cache" in key.lower() and "token" in key.lower()
+    )
+    return sum(
+        max(0, int(usage.get(key, 0)))
+        for key in keys
+        if isinstance(usage.get(key, 0), (int, float))
+        and not isinstance(usage.get(key, 0), bool)
+    )
 
 
 def _parse_utc(timestamp: str | None) -> datetime | None:
@@ -285,6 +323,9 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
+        self.experiment_token_budget = _experiment_token_budget(
+            os.environ.get(EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        )
         self.base_ref = base_ref
         self.test_command = test_command
         # Deliberately *not* derived from ``repo_root``: tests point ``repo_root`` at a
@@ -594,6 +635,75 @@ class ExperimentService:
     def experiment_log_path(self, experiment_id: str) -> Path:
         """Path to an experiment's JSONL log file (may not exist yet)."""
         return Path(self.experiment_log_dir) / f"{experiment_id}.jsonl"
+
+    def _record_worker_run_usage(
+        self,
+        experiment_id: str,
+        usage: dict[str, Any] | None,
+        elog: ExperimentLogger,
+    ) -> str | None:
+        """Accumulate one finished implementation/fallback/repair run.
+
+        When shadow mode is disabled this returns the historical raw usage JSON
+        without changing the database.  With a configured budget, the update and
+        warning-deduplication flag are committed atomically.
+        """
+        if self.experiment_token_budget is None:
+            return json.dumps(usage) if usage else None
+
+        run_tokens = worker_run_token_total(usage)
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT implementation_usage_json FROM experiments WHERE id = ?",
+                (experiment_id,),
+            ).fetchone()
+            previous: dict[str, Any] = {}
+            if row is not None and row[0]:
+                try:
+                    decoded = json.loads(row[0])
+                    if isinstance(decoded, dict):
+                        previous = decoded
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            total = int(previous.get("tokens_consumed", 0)) + run_tokens
+            run_count = int(previous.get("token_run_count", 0)) + 1
+            already_warned = bool(previous.get("token_budget_warning_logged", False))
+            crossed = total > self.experiment_token_budget and not already_warned
+            persisted = dict(usage) if isinstance(usage, dict) else {}
+            persisted.update(
+                token_budget=self.experiment_token_budget,
+                tokens_consumed=total,
+                token_run_count=run_count,
+                token_budget_warning_logged=already_warned or crossed,
+            )
+            encoded = json.dumps(persisted)
+            self._conn.execute(
+                "UPDATE experiments SET implementation_usage_json = ? WHERE id = ?",
+                (encoded, experiment_id),
+            )
+
+        if crossed:
+            elog.warning(
+                "implementation",
+                "token_budget_exceeded",
+                "Experiment token budget exceeded (shadow mode; execution continues)",
+                budget=self.experiment_token_budget,
+                total=total,
+                run_count=run_count,
+            )
+        else:
+            # ``nexus logs`` reads this same structured stream, so the current
+            # shadow total is visible even before crossing (and after the one
+            # deduplicated warning has already been emitted).
+            elog.info(
+                "implementation",
+                "token_budget_updated",
+                "Experiment token usage updated (shadow mode)",
+                budget=self.experiment_token_budget,
+                total=total,
+                run_count=run_count,
+            )
+        return encoded
 
 
     def _transition(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:
@@ -1074,6 +1184,9 @@ class ExperimentService:
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
         )
+        implementation_usage_json = self._record_worker_run_usage(
+            experiment_id, implementation_result.usage, elog
+        )
 
         fallback = other_provider(implementation_provider) if implementation_provider else None
         if (
@@ -1106,6 +1219,9 @@ class ExperimentService:
                 phase="implementation",
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
+            implementation_usage_json = self._record_worker_run_usage(
+                experiment_id, implementation_result.usage, elog
+            )
 
         if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
@@ -1120,8 +1236,7 @@ class ExperimentService:
                 implementation_ended_at=_utcnow_iso(),
                 implementation_task_id=implementation_task_id,
                 implementation_runtime_ms=implementation_result.runtime_ms,
-                implementation_usage_json=json.dumps(implementation_result.usage)
-                if implementation_result.usage else None,
+                implementation_usage_json=implementation_usage_json,
                 error="implementation phase timed out"
                 + (f" ({implementation_result.error})" if implementation_result.error else "")
                 + checkpoint_error,
@@ -1138,8 +1253,7 @@ class ExperimentService:
                 implementation_ended_at=_utcnow_iso(),
                 implementation_task_id=implementation_task_id,
                 implementation_runtime_ms=implementation_result.runtime_ms,
-                implementation_usage_json=json.dumps(implementation_result.usage)
-                if implementation_result.usage else None,
+                implementation_usage_json=implementation_usage_json,
                 error=implementation_result.error + checkpoint_error,
             )
             return self.get_experiment(experiment_id)
@@ -1149,8 +1263,7 @@ class ExperimentService:
             implementation_ended_at=_utcnow_iso(),
             implementation_task_id=implementation_task_id,
             implementation_runtime_ms=implementation_result.runtime_ms,
-            implementation_usage_json=json.dumps(implementation_result.usage)
-            if implementation_result.usage else None,
+            implementation_usage_json=implementation_usage_json,
         )
 
         if self._ended_from_outside(experiment_id):
@@ -1287,6 +1400,7 @@ class ExperimentService:
                 phase="implementation_repair",
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
+            self._record_worker_run_usage(experiment_id, repair_result.usage, elog)
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:
