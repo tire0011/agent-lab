@@ -103,12 +103,9 @@ _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
 # it stalls; see modules.coding_worker.agent_watchdog_limits.
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
-<<<<<<< HEAD
 BASELINE_RECHECK_ENV_VAR = "NEXUS_BASELINE_RECHECK_SECONDS"
 DEFAULT_BASELINE_RECHECK_SECONDS = 120.0
-=======
 EXPERIMENT_TOKEN_BUDGET_ENV_VAR = "NEXUS_EXPERIMENT_TOKEN_BUDGET"
->>>>>>> e952d64c2675dbf9563599af916e6bf037e35613
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
@@ -242,7 +239,6 @@ _TEST_COMMANDS: dict[str, list[str]] = {
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
 
-<<<<<<< HEAD
 
 def _is_real_test_id(test_id: str) -> bool:
     """Whether *test_id* names a collected test rather than a loader error."""
@@ -283,17 +279,8 @@ def _baseline_verdict(test_id: str, result: VerificationRunResult) -> str:
     return "regression"
 
 
-# Default interpreter used to run tests inside an experiment worktree.
-# Using the main repository's own virtualenv interpreter lets a fresh git
-# worktree (which has no virtualenv of its own) run the existing test
-# suite without copying any files or installing any packages — the
-# worktree only needs to be used as the *working directory* (``cwd``) for
-# ``python -m unittest``, since Python resolves ``tests/`` relative to cwd
-# while the interpreter and its installed packages come from the venv path.
-=======
 # Default test interpreter inside a worktree: the main repo's venv python, so no files
 # are copied and no package installed - the worktree is only the command's cwd.
->>>>>>> e952d64c2675dbf9563599af916e6bf037e35613
 _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
 
 class ExperimentService:
@@ -1842,11 +1829,8 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         test_timed_out = False
-<<<<<<< HEAD
         baseline_classifications: dict[str, str] | None = None
-=======
         ci_failure_detail = None
->>>>>>> e952d64c2675dbf9563599af916e6bf037e35613
         if not use_local_tests:
             test_command = ["GitHub Actions", "tests.yml", ci_verification.commit_sha]
             test_exit_code = 0 if ci_verification.status == "passed" else 1

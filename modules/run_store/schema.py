@@ -326,13 +326,10 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("implementation_provider", "TEXT"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
-<<<<<<< HEAD
     ("base_commit_sha", "TEXT"),
-=======
     # Process group of the live worker, so the stall sweep (#400) can stop it
     # from another process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),
->>>>>>> e952d64c2675dbf9563599af916e6bf037e35613
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

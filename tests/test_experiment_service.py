@@ -627,7 +627,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
             result.baseline_test_classifications,
             {"test_placeholder.T.test_fail": "pre_existing"},
         )
-        runs = self.service.list_verification_runs(experiment.id)
+        runs = _verification_runs(self.service, experiment.id)
         self.assertEqual([run["status"] for run in runs], [STATUS_NEEDS_REVIEW])
 
     def test_failed_verification_gets_bounded_repair_in_same_worktree(self):
