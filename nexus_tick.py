@@ -250,6 +250,12 @@ def _planner(repo_root: str):
     from modules.nexus_planner import IssuePlanner
 
     def complete(prompt: str) -> str:
+        # Free registry models first (#552), Azure only when none answers.
+        from modules import model_registry
+
+        free = model_registry.chat_first(prompt, role="planning", max_cost="free", max_tokens=2000)
+        if free.success:
+            return free.content
         service = NexusDelegationService()
         try:
             result = asyncio.run(service.azure_chat(prompt, max_tokens=2000)).to_dict()

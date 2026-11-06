@@ -1344,6 +1344,10 @@ class NexusInitiativeService:
                 event = json.loads(content or "{}")
             except (TypeError, ValueError):
                 return True
+            result = event.get("result") if isinstance(event.get("result"), dict) else {}
+            cost = str((result.get("metadata") or {}).get("cost") or "")
+            if cost in {"local", "free"}:
+                continue  # a free registry model (#552)
             used = {str(event.get(k) or "") for k in ("provider", "provider_used")} - {""}
             if not used or used - {"local_worker"}:
                 return True
