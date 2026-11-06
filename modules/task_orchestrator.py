@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
@@ -2830,9 +2831,27 @@ Decide the next step now. Return JSON only.
                 status = self.experiment_service.get_experiment(experiment_id).status
             except Exception:  # noqa: BLE001 - an unknown experiment refuses nothing
                 continue
-            if status == "succeeded":
+            if status == "succeeded" and not self._adoption_decided(experiment_id):
                 return experiment_id
         return None
+
+    def _adoption_decided(self, experiment_id: str) -> bool:
+        """Whether adoption already judged *experiment_id* (#546).
+
+        A review that blocked the merge sends the issue back for another
+        attempt in the same session; only work still waiting for adoption
+        refuses a second experiment.
+        """
+        conn = getattr(self.experiment_service, "_conn", None)
+        if not isinstance(conn, sqlite3.Connection):
+            return False
+        try:
+            row = conn.execute(
+                "SELECT status FROM experiment_adoptions WHERE experiment_id = ?", (experiment_id,)
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return bool(row) and str(row[0]) in {"failed", "needs_review", "adopted"}
 
     def _session_experiment_ids(self, session_id: str) -> set[str]:
         """Experiments this session started (#330).

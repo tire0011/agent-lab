@@ -55,5 +55,29 @@ class NoSecondExperimentTests(unittest.TestCase):
         self.assertEqual(self._first_experiment("chat", "succeeded").action, ACTION_NEW_EXPERIMENT)
 
 
+    def test_a_review_block_allows_the_retry_in_the_same_session(self):
+        # #546: the guard refused the review retry, so #276 was dispatched
+        # every tick without a new experiment.
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE experiment_adoptions (experiment_id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute("INSERT INTO experiment_adoptions VALUES ('2aeeca59', 'failed')")
+        service = MagicMock()
+        service.get_experiment.return_value = SimpleNamespace(status="succeeded")
+        service._conn = conn
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=self.registry,
+            experiment_service=service,
+            llama_client=_Client([NEW_EXPERIMENT, NEW_EXPERIMENT]),
+        )
+        first = orchestrator.run("Issue #348", source_type="issue", source_id="348")
+        orchestrator.task_store.append_event(
+            first.session_id, role="tool", kind=ACTION_NEW_EXPERIMENT,
+            content="{}", metadata={"experiment_id": "2aeeca59"},
+        )
+        second = orchestrator.run("Review blocked; retry", source_type="issue", source_id="348",
+                                  session_id=first.session_id)
+        self.assertEqual(second.action, ACTION_NEW_EXPERIMENT)
+
 if __name__ == "__main__":
     unittest.main()

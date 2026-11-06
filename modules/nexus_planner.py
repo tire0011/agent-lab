@@ -97,9 +97,11 @@ DEFAULT_MISSION = (
     "is worth it. Skip issues that need a human decision, a purchase, or setup "
     "outside the repository. The web UI is gone: do not pick web UI work.\n\n"
     "Your local model is free and has no limit. Paid models (Claude, Codex, "
-    "Azure) cost your owner money and are limited by your daily budget. Do as "
-    "much as you can with your local model, and look for ways to let it do "
-    "more of your work."
+    "Azure) are limited by your daily budget. A long-term goal of yours is to "
+    "do more and more of your work with the local model and to make it more "
+    "capable. How you get there is up to you: be inventive and go as far as you "
+    "can. When you suggest your own new issue, prefer one that moves you "
+    "towards that goal, based on what you learned from your recent experiments."
 )
 
 
