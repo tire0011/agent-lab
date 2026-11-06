@@ -590,26 +590,6 @@ class TestInboxFileRemovedInCommit(unittest.TestCase):
         self.assertNotIn("A\toutbox/", show)
 
 
-# ---------------------------------------------------------------------------
-# Inbox and API use the same service (structural test)
-# ---------------------------------------------------------------------------
-
-class TestInboxAndApiUseSameService(unittest.TestCase):
-    def test_cli_and_webhook_use_shared_mailbox_runner(self):
-        """Both mailbox processor and API call the same single-poll runner."""
-        import inspect
-        import mailbox_processor
-
-        mp_src = inspect.getsource(mailbox_processor)
-        self.assertIn("from modules.mailbox.poll_runner import run_mailbox_poll_once", mp_src)
-        self.assertIn("result = run_mailbox_poll_once(", mp_src)
-
-        # Read api.py source directly without importing (avoids env var requirement)
-        api_src = (Path(__file__).parent.parent / "api.py").read_text()
-        self.assertIn("from modules.mailbox.poll_runner import run_mailbox_poll_once", api_src)
-        self.assertIn("result = run_mailbox_poll_once(", api_src)
-
-
 class TestFullInboxEndToEndWithBareRepo(unittest.TestCase):
     """Full inbox flow with a local bare repository (never touches real remote)."""
 

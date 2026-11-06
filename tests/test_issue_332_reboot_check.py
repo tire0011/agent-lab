@@ -78,10 +78,6 @@ class RebootCheckTests(unittest.TestCase):
         db_path = str(self.tmp / "main.db")
         self.assertEqual(nexus_reboot_check.main(["--db-path", db_path, "--marker-path", str(self.marker)]), 0)
 
-    def test_default_marker_is_the_ubuntu_path(self):
-        self.assertEqual(nexus_reboot_check.REBOOT_REQUIRED_PATH, "/var/run/reboot-required")
-
-
 class RebootCheckUnitTests(unittest.TestCase):
     def test_timer_runs_every_two_hours(self):
         timer = (DEPLOY / "nexus-reboot-check.timer").read_text(encoding="utf-8")

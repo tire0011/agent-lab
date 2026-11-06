@@ -74,7 +74,10 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.service.handle_source(task_source("Implement the requested feature", source_id="task-1"))
 
         self.orchestrator.experiment_service.create_experiment.assert_called_once_with(
-            "Implement the requested feature"
+            "Implement the requested feature",
+            complexity=None,
+            source_type="task",
+            source_id="task-1",
         )
         self.github.ensure_for_source.assert_called_once()
         self.github.bind_experiment.assert_called_once()
