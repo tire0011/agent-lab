@@ -401,7 +401,7 @@ class _Planner:
     def __init__(self, raw: str):
         self._planner = IssuePlanner(lambda prompt: raw)
 
-    def choose(self, issues, recent=None, exhausted=None, proposals=None, decisions=None):
+    def choose(self, issues, recent=None, exhausted=None, proposals=None, decisions=None, **_):
         return self._planner.choose(issues, recent, exhausted)
 
 

@@ -64,6 +64,8 @@ KIND_CAPABILITY_RESUME = "capability_resume"
 KIND_INTEGRATION = "integration_backlog"
 # The reason of an integration candidate that was never adopted (#538).
 _FRESH_ADOPTION = "adoption is not_started"
+# Marks a dispatch that used only the local model; it is not in the budget (#541).
+_LOCAL_ONLY = "local_only"
 # An issue whose last attempt the reviewer blocked: retried at once and free of
 # the daily budget, so review findings go straight back to the coder.
 REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findings"
@@ -252,6 +254,7 @@ class NexusInitiativeService:
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues: list[dict[str, Any]] = []
+        self._planner_called = False
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
             try:
@@ -385,6 +388,14 @@ class NexusInitiativeService:
         except (sqlite3.Error, ValueError, TypeError):
             return default
 
+    def _text_setting(self, key: str) -> str | None:
+        """A text setting the owner stored by mailbox, else ``None``."""
+        try:
+            row = self._conn.execute("SELECT value FROM service_settings WHERE key = ?", (key,)).fetchone()
+        except sqlite3.Error:
+            return None
+        return str(row[0]) if row and str(row[0]).strip() else None
+
     def _extra_budget(self) -> int:
         """Extra starts set by mailbox (``extra_budget``), valid 24 hours (#523)."""
         try:
@@ -416,6 +427,12 @@ class NexusInitiativeService:
         # The first adoption of fresh verified work is not new work (#538).
         # Any repeat counts: the budget is what stops a re-adoption loop.
         spent -= len(self._fresh_adoptions_since(since))
+        # Work done only by the local model is free (#541).
+        local = self._conn.execute(
+            "SELECT COUNT(*) FROM nexus_initiative_log WHERE decision = ? AND created_at >= ?",
+            (_LOCAL_ONLY, since),
+        ).fetchone()
+        spent -= int(local[0]) if local else 0
         # Crashes stay in the budget, unlike overloads (#467): an overload was
         # refused before any work, a crash can come after a paid coding run, and
         # this budget is the only limit across issues on a broken pipeline.
@@ -1136,12 +1153,15 @@ class NexusInitiativeService:
         """
         if not issues:
             return []
+        self._planner_called = True
         choice = self._planner.choose(
             [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues],
             recent=self._recent_experiments(),
             exhausted=self._exhausted_issues,
             proposals=self._open_proposal_titles,
             decisions=self._owner_decisions(),
+            mission=self._text_setting("nexus.planner_mission"),
+            budget_left=(self.daily_budget - self._spent_today()) if self.daily_budget else None,
         )
         if choice is None:
             return []
@@ -1202,6 +1222,7 @@ class NexusInitiativeService:
 
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
+        self._planner_called = False
         self._sweep_stalled_experiments()
         self.enforce_issue_approvals()
         busy = self.busy_reason()
@@ -1275,6 +1296,7 @@ class NexusInitiativeService:
         # Persist the intent *before* acting, so a crash mid-dispatch leaves a
         # record of what Nexus was trying to do rather than a silent gap.
         self._record(decision)
+        dispatched_at = _utcnow().isoformat()
         try:
             self._dispatch(chosen)
         except Exception as exc:  # noqa: BLE001 - a failed dispatch is data, not a crash
@@ -1282,7 +1304,50 @@ class NexusInitiativeService:
             decision.decision = "error"
             decision.detail = f"{type(exc).__name__}: {exc}"[:1000]
             self._record(decision, update=True)
+            return decision
+        # An adoption runs the paid reviewer; it has its own budget rule.
+        if chosen.kind != KIND_INTEGRATION and not self._dispatch_was_paid(dispatched_at):
+            self._record(InitiativeDecision(
+                _LOCAL_ONLY, detail=f"dispatch {tick_id} used only the local model", tick_id=f"local-{tick_id}",
+            ))
         return decision
+
+    def _dispatch_was_paid(self, since: str) -> bool:
+        """Whether this tick used a paid model (#541); unknown counts as paid.
+
+        Paid: the planner (Claude/Azure), an Azure-driven controller, a
+        delegation to anything but the local worker, or a coding experiment.
+        """
+        if self._planner_called:
+            return True
+        orchestrator = getattr(self.controller, "orchestrator", None)
+        azure = getattr(orchestrator, "_azure_drives_controller", None)
+        if not callable(azure):
+            return True
+        try:
+            if azure():
+                return True
+            if self._conn.execute("SELECT 1 FROM experiments WHERE created_at >= ?", (since,)).fetchone():
+                return True
+        except Exception:  # noqa: BLE001 - unknown is paid
+            return True
+        try:
+            delegations = self._conn.execute(
+                "SELECT content FROM nexus_task_events WHERE kind = 'delegate' AND created_at >= ?", (since,)
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                return True
+            delegations = []
+        for (content,) in delegations:
+            try:
+                event = json.loads(content or "{}")
+            except (TypeError, ValueError):
+                return True
+            used = {str(event.get(k) or "") for k in ("provider", "provider_used")} - {""}
+            if not used or used - {"local_worker"}:
+                return True
+        return False
 
     def _stale_service_revisions(self) -> tuple[str, str] | None:
         """Return the two revisions when live diagnostics prove the API is stale."""
