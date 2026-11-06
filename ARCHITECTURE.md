@@ -33,6 +33,38 @@
   diverge. Exposed read-only via `GET /activity`.
 - JSON artifacts under `state/runs/` are kept for lightweight audit/debug parity.
 
+#### Event journal vs. curated memory (#248)
+
+Nexus keeps two things apart that used to share one table:
+
+- **Event journal (EventStore):** `nexus_task_sessions` / `nexus_task_events`,
+  written by `NexusTaskStore`. It is the complete history of what Nexus did:
+  inputs, controller decisions, `find_tool` / `find_tool_redirected`,
+  `memory_search` observations, redundant tool requests, rejected terminal
+  decisions, knowledge collection, tool executions and status transitions.
+  It is used for audit, debugging, session replay and failure analysis.
+  Nothing is filtered out when writing.
+- **Curated memory (MemoryStore):** what `memory_search` returns as knowledge
+  for future work. Today it is read by `NexusMemory.search()`
+  (`modules/nexus_memory.py`) from three sources: `knowledge` rows, project
+  documents (`PROJECT_HISTORY.md`, `DECISIONS.md`, `ARCHITECTURE.md`,
+  `IDEAS.md`), and the journal events that `is_memory_eligible_event()`
+  accepts (task intent, answers, changes, verified findings).
+
+Orchestration bookkeeping (`ORCHESTRATION_EVENT_KINDS`: `memory_search`,
+`controller_decision`, `find_tool`, `find_tool_redirected`,
+`redundant_tool_request`, `terminal_decision_rejected`,
+`knowledge_collection`, `preflight_plan`) stays in the journal but is never
+returned as memory. Without this, a stored `memory_search` result was indexed
+by the next search, and results nested earlier searches recursively (#238).
+
+Planned, not built: a separate MemoryStore that is filled by deliberate,
+inspectable promotion (confirmed controller findings, verified test results,
+explicit design decisions, approved task summaries, manual entries) instead
+of a deny-list over the journal. `is_memory_eligible_event()` is the single
+place that would change; the `memory_search` tool and `NexusMemory.search()`
+signature stay the same.
+
 ### 3) API surface
 
 - File: `api.py`, models in `models.py`, read-only data adapters in `data_sources.py`, rule-based chat in `chat.py`
@@ -527,6 +559,8 @@
 ## Known gaps
 
 - No persistent relational metrics store yet.
+- Curated memory is still a deny-list over the event journal; there is no
+  separate MemoryStore with explicit knowledge promotion yet (#248).
 - The experiment benchmark (`benchmarks/`, #343) has no stored baseline yet.
 - No finalized policy/eval framework for autonomous self-modification yet.
 - External ChatGPT-to-endpoint integration is not yet dependable.

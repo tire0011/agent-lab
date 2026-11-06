@@ -656,6 +656,25 @@ Decision log for architecture and operating choices.
 - Revisit if: a host shows real OOM kills from prompt size (not model load), or
   `CHARS_PER_TOKEN = 4` proves too optimistic for the prompt's JSON.
 
+### D-028: The event journal is not memory
+
+- Status: Accepted
+- Decision: `nexus_task_events` stays the complete event journal; every event
+  is still written. `memory_search` returns only knowledge: `knowledge` rows,
+  project documents, and journal events accepted by
+  `is_memory_eligible_event()` in `modules/nexus_memory.py`. Orchestration
+  bookkeeping (`ORCHESTRATION_EVENT_KINDS`, including `memory_search` itself)
+  is never returned as memory.
+- Why: one table served as both audit log and knowledge source. A stored
+  `memory_search` result was indexed by the next search, so results nested
+  earlier searches and pulled in unrelated issues (#238, #248).
+- Evidence: `tests/test_nexus_memory.py`
+  (`test_later_search_cannot_return_an_earlier_stored_search_result`,
+  `test_journal_keeps_bookkeeping_events_that_memory_skips`).
+- Revisit if: a dedicated MemoryStore with explicit knowledge promotion is
+  built. It replaces `is_memory_eligible_event()`; the `memory_search` tool
+  surface stays the same.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns

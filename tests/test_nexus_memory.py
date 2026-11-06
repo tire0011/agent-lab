@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from modules.nexus_memory import NexusMemory
+from modules.nexus_memory import (
+    ORCHESTRATION_EVENT_KINDS,
+    NexusMemory,
+    is_memory_eligible_event,
+)
 from modules.nexus_task_store import NexusTaskStore
 from modules.run_store import init_db
 
@@ -226,6 +232,105 @@ class NexusMemoryTests(unittest.TestCase):
             finally:
                 memory.close()
                 store.close()
+
+    def test_later_search_cannot_return_an_earlier_stored_search_result(self):
+        """End to end (#248): search, store the result the way the orchestrator
+        does (kind = tool name, content = serialized observation), search again.
+        The second search must not return the first one, at any depth."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / "state.db")
+            store = NexusTaskStore(db_path=db_path)
+            session = store.get_or_create(
+                source_type="issue", source_id="248", title="Event journal vs memory"
+            )
+            store.append_event(
+                session.id,
+                role="assistant",
+                kind="answer",
+                content="Issue #248 decision: the event journal is not curated memory.",
+            )
+            memory = NexusMemory(db_path=db_path, repo_root=str(root), task_store=store)
+            try:
+                query = "issue #248 event journal memory"
+                first = memory.search(query, limit=10)
+                self.assertEqual(len(first), 1)
+                for _ in range(3):
+                    observation = {
+                        "tool": "memory_search",
+                        "query": query,
+                        "results": memory.search(query, limit=10),
+                    }
+                    store.append_event(
+                        session.id,
+                        role="tool",
+                        kind=observation["tool"],
+                        content=json.dumps(observation, separators=(",", ":")),
+                    )
+                later = memory.search(query, limit=10)
+                self.assertEqual(later, first)
+                for item in later:
+                    self.assertNotEqual(item.get("kind"), "memory_search")
+                    self.assertNotIn('"tool":"memory_search"', item.get("content", ""))
+            finally:
+                memory.close()
+                store.close()
+
+    def test_journal_keeps_bookkeeping_events_that_memory_skips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / "state.db")
+            store = NexusTaskStore(db_path=db_path)
+            session = store.get_or_create(
+                source_type="task", source_id="journal", title="Journal completeness"
+            )
+            for kind in ORCHESTRATION_EVENT_KINDS:
+                store.append_event(
+                    session.id,
+                    role="system",
+                    kind=kind,
+                    content=f"bookkeeping {kind} mentions the term cobaltblue",
+                )
+            store.append_event(
+                session.id,
+                role="assistant",
+                kind="answer",
+                content="Confirmed finding about cobaltblue.",
+            )
+            memory = NexusMemory(db_path=db_path, repo_root=str(root), task_store=store)
+            try:
+                results = memory.search("cobaltblue", limit=10)
+                self.assertEqual([item["kind"] for item in results], ["answer"])
+            finally:
+                memory.close()
+
+            conn = sqlite3.connect(db_path)
+            try:
+                stored = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT kind FROM nexus_task_events WHERE session_id=? ORDER BY id",
+                        (session.id,),
+                    )
+                ]
+            finally:
+                conn.close()
+                store.close()
+            self.assertEqual(stored, [*ORCHESTRATION_EVENT_KINDS, "answer"])
+
+    def test_memory_eligibility_policy_covers_required_bookkeeping_kinds(self):
+        for kind in (
+            "memory_search",
+            "controller_decision",
+            "find_tool",
+            "find_tool_redirected",
+            "redundant_tool_request",
+            "terminal_decision_rejected",
+            "knowledge_collection",
+        ):
+            self.assertFalse(is_memory_eligible_event(kind), kind)
+        for kind in ("input", "answer", "change", "verify"):
+            self.assertTrue(is_memory_eligible_event(kind), kind)
 
 
 if __name__ == "__main__":
