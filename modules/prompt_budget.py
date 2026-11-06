@@ -1,9 +1,17 @@
-"""Configurable prompt/token budget for the persistent Nexus controller.
+"""Prompt budget for the persistent Nexus controller, bounded by the context window.
 
 The controller resends its observations every turn, so an unbounded prompt
-grows until llama-server is killed by the OOM killer. This computes a
-character budget from the model's context window, its reserved output and
-host memory, then compacts observations deterministically to fit it.
+would outgrow the model's context window. The window is the one hard limit:
+llama-server allocates its KV cache for ``n_ctx`` up front, and on the VM a
+full-context prompt costs ~109 MB more RSS than a tiny one, once (#230). Host
+memory is therefore reported as a signal (``low_memory``,
+``safe_local_budget_chars``) and never shrinks the budget or gates a local
+call.
+
+The sections that are not compacted - the rules and the capability catalog -
+are passed in as their measured length (``fixed_chars``), not guessed as a
+share. What remains goes to the current input, the observations and, last,
+the persisted (and re-readable) history.
 
 Kept dependency-free so it stays unit testable.
 """
@@ -23,6 +31,20 @@ DEFAULT_MEMINFO_PATH = "/proc/meminfo"
 # Conservative estimate for English/code text; used only for logging and
 # coarse budgeting, never for exact tokenizer-accurate truncation.
 CHARS_PER_TOKEN = 4
+
+# Shares of the *variable* room (budget minus the measured fixed sections).
+# The current input is capped, history keeps a small reserved floor, and the
+# observations get everything else - they carry the answer to the current
+# task, while history is persisted and can be re-read.
+INPUT_SHARE = 0.20
+HISTORY_FLOOR_SHARE = 0.10
+# Below this much variable room a controller cannot see its own tool results
+# and would loop; it fails loudly instead of running blind (#230).
+MIN_VARIABLE_CHARS = 2000
+
+
+class PromptBudgetExhaustedError(RuntimeError):
+    """The fixed prompt sections leave no usable room for the task's content."""
 
 
 def _env_int(name: str, default: int) -> int:
@@ -79,7 +101,19 @@ def _read_meminfo_field(meminfo_path: str, field: str) -> int | None:
 
 @dataclass(slots=True)
 class PromptBudgetPlan:
-    """One budget computation, used both for prompt sizing and for logging."""
+    """One budget computation, used both for prompt sizing and for logging.
+
+    ``effective_budget_chars`` is the whole rendered prompt, bounded by the
+    context window minus the reserved output. It splits into
+    ``fixed_chars`` (measured, never compacted) and ``variable_chars``,
+    which in turn splits into ``current_input_chars`` (a cap),
+    ``observation_chars`` and ``history_chars`` (a reserved floor; history
+    also gets whatever the observations leave unused). For a plan that is
+    not ``starved`` the four sections sum to ``effective_budget_chars``.
+
+    The memory fields are advisory signals only: they are logged and
+    reported, and never shrink a section or gate a local call (#230).
+    """
 
     model_context_tokens: int
     reserved_output_tokens: int
@@ -93,8 +127,9 @@ class PromptBudgetPlan:
     effective_budget_chars: int
     safe_local_budget_chars: int
     low_memory: bool
-    instructions_chars: int
-    tool_schema_chars: int
+    fixed_chars: int
+    variable_chars: int
+    starved: bool
     current_input_chars: int
     history_chars: int
     observation_chars: int
@@ -113,13 +148,30 @@ class PromptBudgetPlan:
             "effective_budget_chars": self.effective_budget_chars,
             "safe_local_budget_chars": self.safe_local_budget_chars,
             "low_memory": self.low_memory,
+            "fixed_chars": self.fixed_chars,
+            "variable_chars": self.variable_chars,
+            "starved": self.starved,
+            "current_input_chars": self.current_input_chars,
+            "observation_chars": self.observation_chars,
+            "history_chars": self.history_chars,
         }
+
+    def require_usable(self) -> None:
+        """Raise instead of letting a blind controller loop on stubs (#230)."""
+        if self.starved:
+            raise PromptBudgetExhaustedError(
+                f"prompt budget exhausted: the fixed prompt sections take {self.fixed_chars} "
+                f"of {self.effective_budget_chars} characters, leaving {self.variable_chars} "
+                f"for the task, its tool results and history (minimum {MIN_VARIABLE_CHARS}); "
+                "the controller could not see its own tool results"
+            )
 
 
 def compute_budget(
     *,
     model_context_tokens: int | None = None,
     reserved_output_tokens: int = 700,
+    fixed_chars: int = 0,
     mem_available_kb: int | None = None,
     swap_free_kb: int | None = None,
     swap_total_kb: int | None = None,
@@ -128,11 +180,17 @@ def compute_budget(
     kb_per_input_token: int | None = None,
     chars_per_token: int = CHARS_PER_TOKEN,
 ) -> PromptBudgetPlan:
-    """Compute a conservative effective prompt budget.
+    """Compute the prompt budget from the context window.
 
-    Model context capacity and host-memory safety are treated as two
-    independent limits; the smaller one always wins, so the effective budget
-    never claims more than either.
+    ``fixed_chars`` is the measured length of every prompt section that is
+    rendered in full (rules, capability catalog, framing). It is subtracted
+    as-is; only the remainder is shared between input, observations and
+    history.
+
+    Host memory is read only to report pressure. It does not change any
+    section: a resident model's KV cache is already sized for the whole
+    context window, so a larger prompt costs a bounded ~100 MB, and an
+    attempt can succeed where a prediction said it would not.
     """
     model_context_tokens = model_context_tokens if model_context_tokens is not None else _env_int(
         "NEXUS_LOCAL_MODEL_CONTEXT_TOKENS", 8192
@@ -152,23 +210,16 @@ def compute_budget(
     context_tokens_available = max(256, model_context_tokens - max(0, reserved_output_tokens))
     context_budget_chars = context_tokens_available * chars_per_token
 
+    # --- Advisory memory signal: reported, never applied. ---
     low_memory = False
     memory_budget_chars: int | None = None
     if mem_available_kb is not None:
-        # The model is already resident: its bytes are in `used`, not in
-        # `MemAvailable`, and its KV cache is sized up front from the
-        # configured context, not per request. Adding `mem_limit_kb` here
-        # asked the host for room to load the model a second time, which
-        # collapsed the budget to its floor on every host where it was
-        # running (#223). A prompt costs its own tokens and nothing else.
-        required_kb = inference_headroom_kb
-        surplus_kb = mem_available_kb - required_kb
+        surplus_kb = mem_available_kb - inference_headroom_kb
         if surplus_kb <= 0:
             low_memory = True
             memory_budget_chars = 0
         else:
-            memory_tokens_available = surplus_kb // kb_per_input_token
-            memory_budget_chars = int(memory_tokens_available) * chars_per_token
+            memory_budget_chars = int(surplus_kb // kb_per_input_token) * chars_per_token
         # A host with no swap reports ``SwapFree: 0`` forever, so exhausted
         # swap is only pressure when swap exists and RAM is thin too.
         swap_configured = swap_total_kb is not None and swap_total_kb > 0
@@ -177,25 +228,19 @@ def compute_budget(
             low_memory = True
             memory_budget_chars = 0
 
-
-    if memory_budget_chars is None:
-        effective_budget_chars = context_budget_chars
-    else:
-        effective_budget_chars = min(context_budget_chars, memory_budget_chars)
-    effective_budget_chars = max(500, effective_budget_chars)
-
+    # The context window is the bound; there is no floor that would let the
+    # budget claim room the window does not have.
+    effective_budget_chars = context_budget_chars
     # Advisory only. A resident model can still serve a request under
-    # pressure, so this must never become a hard routing gate.
+    # pressure, so this must never become a routing gate.
     safe_local_budget_chars = 0 if low_memory else effective_budget_chars
 
-    instructions_chars = int(effective_budget_chars * 0.12)
-    tool_schema_chars = int(effective_budget_chars * 0.18)
-    current_input_chars = int(effective_budget_chars * 0.15)
-    history_chars = int(effective_budget_chars * 0.25)
-    observation_chars = max(
-        0,
-        effective_budget_chars - instructions_chars - tool_schema_chars - current_input_chars - history_chars,
-    )
+    fixed_chars = max(0, int(fixed_chars))
+    variable_chars = max(0, effective_budget_chars - fixed_chars)
+    starved = variable_chars < MIN_VARIABLE_CHARS
+    current_input_chars = int(variable_chars * INPUT_SHARE)
+    history_chars = int(variable_chars * HISTORY_FLOOR_SHARE)
+    observation_chars = max(0, variable_chars - current_input_chars - history_chars)
 
     return PromptBudgetPlan(
         model_context_tokens=model_context_tokens,
@@ -210,12 +255,28 @@ def compute_budget(
         effective_budget_chars=effective_budget_chars,
         safe_local_budget_chars=safe_local_budget_chars,
         low_memory=low_memory,
-        instructions_chars=instructions_chars,
-        tool_schema_chars=tool_schema_chars,
+        fixed_chars=fixed_chars,
+        variable_chars=variable_chars,
+        starved=starved,
         current_input_chars=current_input_chars,
         history_chars=history_chars,
         observation_chars=observation_chars,
     )
+
+
+def fit_history(history: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
+    """Keep the newest history events whose serialised list fits ``max_chars``.
+
+    History is persisted and re-readable, so it is the section that gives way
+    when the observations need the room. Order is preserved.
+    """
+    kept: list[dict[str, Any]] = []
+    for event in reversed(history):
+        candidate = [event, *kept]
+        if len(json.dumps(candidate, separators=(",", ":"))) > max_chars:
+            break
+        kept = candidate
+    return kept
 
 
 def truncate_text(text: str, max_chars: int, *, note: str = "truncated") -> tuple[str, bool]:

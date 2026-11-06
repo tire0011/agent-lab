@@ -4,10 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import json
+
 from modules.prompt_budget import (
+    PromptBudgetExhaustedError,
     compact_observations,
     compute_budget,
     dedupe_nested_results,
+    fit_history,
     read_mem_available_kb,
     read_swap_free_kb,
     read_swap_total_kb,
@@ -21,26 +25,43 @@ class ComputeBudgetTests(unittest.TestCase):
         self.assertLessEqual(plan.effective_budget_chars, plan.context_budget_chars)
         self.assertEqual(plan.context_budget_chars, (2048 - 500) * 4)
 
-    def test_low_memory_shrinks_effective_budget_below_context_window(self):
+    def test_low_memory_is_a_signal_and_never_shrinks_the_budget(self):
+        """#230: a full-context prompt costs ~109 MB once, bounded by n_ctx.
+
+        This test used to assert the opposite - that low memory shrinks the
+        effective budget - which is how the controller was blinded to its own
+        tool results on a host with the model resident.
+        """
         generous = compute_budget(
             model_context_tokens=8192,
             reserved_output_tokens=700,
+            fixed_chars=9500,
             mem_available_kb=8_000_000,
             mem_limit_mb=2048,
         )
         starved = compute_budget(
             model_context_tokens=8192,
             reserved_output_tokens=700,
+            fixed_chars=9500,
             mem_available_kb=1024,  # ~1MB free, far below the 2048MB limit
             mem_limit_mb=2048,
         )
         self.assertFalse(generous.low_memory)
         self.assertTrue(starved.low_memory)
-        self.assertLess(starved.effective_budget_chars, generous.effective_budget_chars)
-        self.assertLessEqual(starved.safe_local_budget_chars, starved.effective_budget_chars)
-        # The low-memory branch must actually shrink the safe local budget,
-        # not just re-apply the value effective_budget_chars already used.
+        # Reported...
         self.assertEqual(starved.safe_local_budget_chars, 0)
+        self.assertEqual(starved.memory_budget_chars, 0)
+        # ...and not applied: every section is what the context window gives.
+        for field in (
+            "effective_budget_chars",
+            "variable_chars",
+            "current_input_chars",
+            "observation_chars",
+            "history_chars",
+        ):
+            self.assertEqual(getattr(starved, field), getattr(generous, field), field)
+        self.assertFalse(starved.starved)
+        starved.require_usable()  # does not raise
 
     def test_realistic_low_memory_range_is_flagged_but_never_blocks_local_calls(self):
         # The name matters: nothing here blocks anything. `low_memory` and
@@ -142,15 +163,44 @@ class ComputeBudgetTests(unittest.TestCase):
         self.assertGreater(plan.observation_chars, 3005)
 
     def test_sections_sum_to_effective_budget(self):
-        plan = compute_budget(model_context_tokens=8192, reserved_output_tokens=700, mem_available_kb=None)
+        plan = compute_budget(
+            model_context_tokens=8192, reserved_output_tokens=700, fixed_chars=9946, mem_available_kb=None
+        )
         total = (
-            plan.instructions_chars
-            + plan.tool_schema_chars
+            plan.fixed_chars
             + plan.current_input_chars
             + plan.history_chars
             + plan.observation_chars
         )
         self.assertEqual(total, plan.effective_budget_chars)
+
+    def test_fixed_sections_are_subtracted_as_measured_not_as_a_share(self):
+        plan = compute_budget(
+            model_context_tokens=8192, reserved_output_tokens=700, fixed_chars=9946, mem_available_kb=None
+        )
+        self.assertEqual(plan.fixed_chars, 9946)
+        self.assertEqual(plan.variable_chars, plan.effective_budget_chars - 9946)
+        self.assertFalse(hasattr(plan, "instructions_chars"))
+        self.assertFalse(hasattr(plan, "tool_schema_chars"))
+
+    def test_observations_get_more_room_than_history(self):
+        plan = compute_budget(fixed_chars=9946, mem_available_kb=None)
+        self.assertGreater(plan.observation_chars, plan.history_chars)
+        self.assertGreater(plan.observation_chars, plan.current_input_chars)
+
+    def test_there_is_no_floor_above_the_context_window(self):
+        """The old 500-char floor let the budget claim room the window lacked."""
+        plan = compute_budget(model_context_tokens=300, reserved_output_tokens=200, mem_available_kb=None)
+        self.assertEqual(plan.effective_budget_chars, plan.context_budget_chars)
+
+    def test_fixed_sections_that_leave_no_room_fail_loudly(self):
+        plan = compute_budget(
+            model_context_tokens=2048, reserved_output_tokens=700, fixed_chars=5000, mem_available_kb=None
+        )
+        self.assertTrue(plan.starved)
+        with self.assertRaises(PromptBudgetExhaustedError) as caught:
+            plan.require_usable()
+        self.assertIn("could not see its own tool results", str(caught.exception))
 
     def test_budget_is_configurable_via_explicit_arguments(self):
         small = compute_budget(model_context_tokens=1024, reserved_output_tokens=200, mem_available_kb=None)
@@ -243,6 +293,18 @@ class CompactObservationsTests(unittest.TestCase):
         compacted, omitted = compact_observations(observations, budget_chars=2000, keep_recent_full=1)
         self.assertIn(0, omitted)
         self.assertNotIn(1, omitted)
+
+
+class FitHistoryTests(unittest.TestCase):
+    def test_keeps_the_newest_events_that_fit_in_order(self):
+        history = [{"content": f"event {i} " + "x" * 100} for i in range(10)]
+        fitted = fit_history(history, 400)
+        self.assertLessEqual(len(json.dumps(fitted, separators=(",", ":"))), 400)
+        self.assertTrue(fitted)
+        self.assertEqual(fitted, history[-len(fitted):])
+
+    def test_no_room_keeps_nothing(self):
+        self.assertEqual(fit_history([{"content": "x" * 50}], 10), [])
 
 
 class DedupeNestedResultsTests(unittest.TestCase):
