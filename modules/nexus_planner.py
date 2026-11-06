@@ -87,6 +87,28 @@ def _exhausted_section(exhausted: list[dict[str, Any]] | None) -> str:
     )
 
 
+# The owner can replace this with a mailbox setting `planner_mission` (#541).
+DEFAULT_MISSION = (
+    "You are Nexus, an independent agent that develops itself. Your own code "
+    "lives in this repository, and you pick and do your own work. Below are "
+    "your open GitHub issues and how your most recent experiments ended.\n\n"
+    "Pick the ONE issue that is the most useful for you to work on next. Prefer "
+    "issues that unblock or simplify later work. A larger issue is fine when it "
+    "is worth it. Skip issues that need a human decision, a purchase, or setup "
+    "outside the repository. The web UI is gone: do not pick web UI work.\n\n"
+    "Your local model is free and has no limit. Paid models (Claude, Codex, "
+    "Azure) cost your owner money and are limited by your daily budget. Do as "
+    "much as you can with your local model, and look for ways to let it do "
+    "more of your work."
+)
+
+
+def _budget_line(budget_left: int | None) -> str:
+    if budget_left is None:
+        return ""
+    return f"Paid starts left in your daily budget: {max(0, budget_left)}.\n\n"
+
+
 def planning_prompt(
     issues: list[dict[str, Any]],
     recent: list[dict[str, str]] | None = None,
@@ -95,6 +117,8 @@ def planning_prompt(
     exhausted: list[dict[str, Any]] | None = None,
     proposals: list[str] | None = None,
     decisions: list[dict[str, str]] | None = None,
+    mission: str | None = None,
+    budget_left: int | None = None,
 ) -> str:
     lines = []
     for issue in issues:
@@ -102,15 +126,9 @@ def planning_prompt(
         lines.append(f"#{issue['number']} {issue['title']}\n{body}")
     history = [_history_line(r) for r in recent or []]
     return (
-        "You are Nexus, an independent agent that develops itself. Your own code "
-        "lives in this repository, and you pick and do your own work. Below are "
-        "your open GitHub issues and how your most recent experiments ended.\n\n"
+        (mission.strip() if mission and mission.strip() else DEFAULT_MISSION) + "\n\n"
+        + _budget_line(budget_left)
         + (_EXPLORE if explore else "") +
-        "Pick the ONE issue that is the most useful for you to work on next. Prefer "
-        "issues that are concrete and small enough for one change with tests, and "
-        "that unblock or simplify later work. Skip issues that need a human "
-        "decision, a purchase, or setup outside the repository. The web UI is not "
-        "a priority: do not pick web UI work.\n\n"
         "Also suggest exactly ONE new issue of your own: a concrete, testable "
         "improvement that no listed issue covers and that makes you work more "
         "reliably or more autonomously. Base it on your own experience: what went "
@@ -206,15 +224,21 @@ class IssuePlanner:
         exhausted: list[dict[str, Any]] | None = None,
         proposals: list[str] | None = None,
         decisions: list[dict[str, str]] | None = None,
+        mission: str | None = None,
+        budget_left: int | None = None,
     ) -> PlanChoice | None:
         if not issues:
             return None
         allowed = {int(issue["number"]) for issue in issues}
+        context = dict(
+            exhausted=exhausted, proposals=proposals, decisions=decisions,
+            mission=mission, budget_left=budget_left,
+        )
         choice = None
         if self._explore is not None:
-            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, exhausted=exhausted, proposals=proposals, decisions=decisions), allowed)
+            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, **context), allowed)
         if choice is None:
-            choice = self._ask(self._complete, planning_prompt(issues, recent, exhausted=exhausted, proposals=proposals, decisions=decisions), allowed)
+            choice = self._ask(self._complete, planning_prompt(issues, recent, **context), allowed)
         return choice
 
     @staticmethod

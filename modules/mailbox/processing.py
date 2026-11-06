@@ -375,6 +375,13 @@ SETTINGS: dict[str, tuple[str, int, int]] = {
 }
 
 
+# Text settings take their value from the message body; "default" or an
+# empty body restores the built-in text (#541).
+TEXT_SETTINGS: dict[str, tuple[str, int]] = {
+    "planner_mission": ("nexus.planner_mission", 4000),
+}
+
+
 def _process_setting(
     msg: MailboxMessage,
     repo_path: Path,
@@ -391,8 +398,27 @@ def _process_setting(
     if not sender_trusted:
         return "Setting changes require a sender the repository owner trusts. Refused.", None
     key = str(msg.meta.get("key") or "").strip()
+    if key in TEXT_SETTINGS:
+        db_key, limit = TEXT_SETTINGS[key]
+        text = str(msg.body or "").strip()
+        if not text or text.lower() == "default":
+            conn.execute("DELETE FROM service_settings WHERE key = ?", (db_key,))
+            conn.commit()
+            return f"Setting {key} is back to the default.", None
+        if len(text) > limit:
+            return f"Setting {key} must be at most {limit} characters.", None
+        conn.execute(
+            """
+            INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (db_key, text, _now_iso()),
+        )
+        conn.commit()
+        return f"Setting {key} is now set ({len(text)} characters).", None
     if key not in SETTINGS:
-        return f"Unknown setting {key!r}. Allowed: {', '.join(sorted(SETTINGS))}.", None
+        allowed = sorted([*SETTINGS, *TEXT_SETTINGS])
+        return f"Unknown setting {key!r}. Allowed: {', '.join(allowed)}.", None
     db_key, low, high = SETTINGS[key]
     try:
         value = int(str(msg.meta.get("value") or "").strip())

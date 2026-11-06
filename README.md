@@ -107,7 +107,10 @@ them.
   experiments; it overrides `--daily-budget` from
   `deploy/nexus-tick.service` from the next tick on. `extra_budget` (0–20)
   adds that many starts on top of it for the next 24 hours, then expires on
-  its own.
+  its own. Only paid work counts: a start that used only the local model
+  (no planner, no Azure, no paid delegation, no coding experiment) is free.
+  `planner_mission` replaces the planner's mission text with the message
+  body (up to 4000 characters); a body of `default` restores the built-in one.
 
   ```markdown
   ---
