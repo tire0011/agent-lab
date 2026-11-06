@@ -60,6 +60,20 @@ class LocalModelIsFreeTests(unittest.TestCase):
         self.assertTrue(svc.tick().acted)
         self.assertEqual(svc.tick().decision, "budget_exhausted")
 
+    def test_a_free_registry_delegation_is_free_but_a_paid_one_is_not(self):
+        import json
+        fx, svc = self._service(azure=False)
+        since = "2026-01-01T00:00:00"
+        with sqlite3.connect(fx.db_path) as conn:
+            conn.execute("CREATE TABLE nexus_task_events (kind TEXT, content TEXT, created_at TEXT)")
+            free = {"tool": "delegate", "provider_used": "free_tier", "result": {"metadata": {"cost": "free"}}}
+            conn.execute("INSERT INTO nexus_task_events VALUES ('delegate', ?, '2026-06-01')", (json.dumps(free),))
+        self.assertFalse(svc._dispatch_was_paid(since))
+        with sqlite3.connect(fx.db_path) as conn:
+            paid = {"tool": "delegate", "provider_used": "azure_openai", "result": {"metadata": {}}}
+            conn.execute("INSERT INTO nexus_task_events VALUES ('delegate', ?, '2026-06-01')", (json.dumps(paid),))
+        self.assertTrue(svc._dispatch_was_paid(since))
+
     def test_a_controller_of_unknown_kind_is_paid(self):
         fx = InitiativeFixture()
         svc = fx.service(daily_budget=1, issue_lister=lambda: ISSUES)

@@ -1,0 +1,23 @@
+{
+  "_comment": "Chat models Nexus can call through modules.model_registry (#552). Add an entry to add a model; no code change. cost: free models are tried before paid ones and do not count in the daily budget. A model whose api_key_env is unset is off. The local llama-server is reached through the local_worker delegate, not from here.",
+  "models": [
+    {
+      "id": "github-gpt-4.1-mini",
+      "base_url": "https://models.github.ai/inference",
+      "model": "openai/gpt-4.1-mini",
+      "api_key_env": "GITHUB_MODELS_TOKEN",
+      "cost": "free",
+      "roles": ["analysis", "planning", "review", "controller"],
+      "description": "GitHub Models free tier (rate-limited): general reasoning and analysis."
+    },
+    {
+      "id": "github-gpt-4.1",
+      "base_url": "https://models.github.ai/inference",
+      "model": "openai/gpt-4.1",
+      "api_key_env": "GITHUB_MODELS_TOKEN",
+      "cost": "free",
+      "roles": ["analysis", "planning", "review", "controller"],
+      "description": "GitHub Models free tier (tighter rate limit): stronger reasoning for harder questions."
+    }
+  ]
+}

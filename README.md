@@ -121,6 +121,13 @@ them.
   ---
   ```
 
+- Chat models: `config/models.json` lists the external chat models Nexus can
+  call through one OpenAI-compatible interface (`modules/model_registry.py`).
+  Adding a provider is a new entry (base URL, model, `api_key_env`, `cost`,
+  `roles`); a model whose key is not set in `/etc/agent-lab/agent.env` is off.
+  Free models are tried before paid ones (delegate `free_tier`, controller
+  fallback, planner) and do not count in the daily budget.
+
 **Safety:**
 
 - Files over 64 KB, binary files, symlinks, path traversals, unknown types, and files containing secrets (e.g. `sk-`, `API_KEY=`) are rejected.

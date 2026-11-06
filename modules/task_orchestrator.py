@@ -105,9 +105,9 @@ ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
 ACTION_KNOWLEDGE_COLLECTOR = "knowledge_collector"
 
-# Fallback delegates after a local inference failure. ``local_worker`` is
-# excluded - same llama-server, no recovery.
-_EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
+# Fallback delegates after a local inference failure: free registry models
+# first (#552), then paid. ``local_worker`` is excluded - same llama-server.
+_EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("free_tier", "azure_openai", "codex_readonly")
 
 # Who drives the controller (#337): Azure takes the turns when configured;
 # the local model only covers an Azure failure.
@@ -161,6 +161,7 @@ _DECISION_FIELDS = (
 )
 
 _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "free_tier": ("free_tier", "azure_openai", "local_worker", "codex_readonly"),
     "local_worker": ("local_worker", "azure_openai", "codex_readonly"),
     "azure_openai": ("azure_openai", "local_worker", "codex_readonly"),
     "codex_readonly": ("codex_readonly", "azure_openai", "local_worker"),
@@ -3588,8 +3589,12 @@ Decide the next step now. Return JSON only.
         # Judgement goes to a strong model (#337): the local worker is the same small
         # model and answers confidently when wrong.
         routed = provider
-        if provider == "local_worker" and "azure_openai" in available and not self._controller_forced_local():
-            routed = "azure_openai"
+        if provider == "local_worker" and not self._controller_forced_local():
+            # A free registry model before a paid one (#552).
+            if "free_tier" in available:
+                routed = "free_tier"
+            elif "azure_openai" in available:
+                routed = "azure_openai"
         order = [p for p in _PROVIDER_FALLBACKS.get(routed, (routed,)) if p in available]
         attempts: list[dict[str, Any]] = []
         previous_error = ""
