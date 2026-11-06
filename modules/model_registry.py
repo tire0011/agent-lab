@@ -4,7 +4,11 @@ The models live in ``config/models.json`` (or the file named by
 ``NEXUS_MODELS_FILE``): adding a provider is a new entry, not new code.
 Every provider is reached through the same ``/chat/completions`` call.
 A model is available when its API key is set in the environment; keys are
-read from the environment only and never logged.
+read from the environment only and never logged. An optional per-entry
+``headers`` object adds provider-required headers (GitHub Models answers
+its non-API paths with 200 text/plain "OK", so it needs
+``Accept: application/vnd.github+json``). A 2xx answer that is not JSON is
+reported as ``non_json_response``, not as a success.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ class ModelSpec:
     api_key_env: str = ""
     roles: tuple[str, ...] = ()
     description: str = ""
+    headers: tuple[tuple[str, str], ...] = ()
 
     @property
     def available(self) -> bool:
@@ -71,6 +76,11 @@ def load_models(path: str | Path | None = None) -> list[ModelSpec]:
                 api_key_env=str(raw.get("api_key_env") or "").strip(),
                 roles=tuple(str(r).strip().lower() for r in raw.get("roles") or ()),
                 description=str(raw.get("description") or ""),
+                headers=tuple(
+                    (str(k).strip(), str(v))
+                    for k, v in (raw.get("headers") or {}).items()
+                    if str(k).strip()
+                ),
             ))
         except (KeyError, TypeError, AttributeError):
             logger.warning("model registry: skipping a malformed entry")
@@ -96,7 +106,8 @@ def _post(url: str, headers: dict[str, str], body: dict[str, Any]) -> httpx.Resp
 
 def chat(spec: ModelSpec, prompt: str, *, max_tokens: int = 1500, transport: Transport | None = None) -> ChatResult:
     """One chat completion against *spec*."""
-    headers = {"Content-Type": "application/json"}
+    headers = dict(spec.headers)
+    headers["Content-Type"] = "application/json"
     if spec.api_key_env:
         headers["Authorization"] = f"Bearer {os.environ.get(spec.api_key_env, '').strip()}"
     body = {"model": spec.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens}
@@ -110,8 +121,15 @@ def chat(spec: ModelSpec, prompt: str, *, max_tokens: int = 1500, transport: Tra
         return ChatResult(spec.id, spec.cost, False, error=f"http_{response.status_code}")
     try:
         data = response.json()
+    except ValueError:
+        logger.warning(
+            "model registry: %s answered %s with a non-JSON body (content-type %s)",
+            spec.id, response.status_code, response.headers.get("content-type", "unknown"),
+        )
+        return ChatResult(spec.id, spec.cost, False, error="non_json_response")
+    try:
         content = str(data["choices"][0]["message"]["content"] or "")
-    except (ValueError, KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError):
         return ChatResult(spec.id, spec.cost, False, error="bad_response")
     return ChatResult(spec.id, spec.cost, bool(content.strip()), content=content,
                       error="" if content.strip() else "empty", usage=dict(data.get("usage") or {}))
