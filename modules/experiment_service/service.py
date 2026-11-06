@@ -367,8 +367,12 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
-<<<<<<< HEAD
         self.reflection_service = reflection_service
+        self.experiment_token_budget = _experiment_token_budget(
+            os.environ.get(EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        )
+        self.base_ref = base_ref
+        self.test_command = test_command
         # Deliberately *not* derived from ``repo_root``: tests (and some
         # deployments) point ``repo_root`` at a throwaway git checkout whose
         # cleanliness is asserted directly, so the log directory must never
@@ -376,16 +380,6 @@ class ExperimentService:
         # ``state/runs`` default, which is likewise independent of any
         # injected repo path). In production this resolves relative to the
         # service's working directory (``/agent``).
-=======
-        self.experiment_token_budget = _experiment_token_budget(
-            os.environ.get(EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
-        )
-        self.base_ref = base_ref
-        self.test_command = test_command
-        # Deliberately *not* derived from ``repo_root``: tests point ``repo_root`` at a
-        # throwaway checkout whose cleanliness is asserted directly, so the log directory
-        # must never live inside it.
->>>>>>> d72d235b9bf71cc8033d6369e238c7dd7490de6e
         self.experiment_log_dir = experiment_log_dir or DEFAULT_LOG_DIR
 
         conn = init_db(db_path)
@@ -1253,6 +1247,7 @@ class ExperimentService:
                 "experiment %s stalled in phase %s: no progress for %ds (last event %s at %s); worker: %s",
                 experiment_id, phase, int(silent), last_event, last_at.isoformat(), worker,
             )
+            self._reflect_terminal(self.get_experiment(experiment_id))
             stalled.append(experiment_id)
         return stalled
 

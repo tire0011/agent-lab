@@ -14,6 +14,8 @@ from modules.run_store import DEFAULT_DB_PATH, init_db
 
 MAX_REFLECTION_TOKENS = 384
 MAX_SUGGESTIONS = 3
+MAX_PLAN_CHARS = 3000
+MAX_SUGGESTION_FIELD_CHARS = 1000
 
 _SYSTEM = """You review a completed software experiment to improve future experiments.
 Return JSON only. Suggest zero to three concrete improvements. Do not propose or perform
@@ -78,9 +80,14 @@ def compact_experiment_summary(experiment: Any) -> dict[str, Any]:
         "policy_replan_ms": experiment.policy_replan_runtime_ms,
         "implementation_ms": experiment.implementation_runtime_ms,
     }
+    plan = json.dumps(experiment.plan, separators=(",", ":"), default=str)
+    if len(plan) > MAX_PLAN_CHARS:
+        plan = plan[:MAX_PLAN_CHARS] + "..."
     return {
         "goal": experiment.goal[:2000],
-        "plan": experiment.plan,
+        # The plan can contain arbitrary model text. Keep its serialized form bounded
+        # so a malformed or legacy row cannot turn this cheap call into a large one.
+        "plan": plan,
         "changed_files": changed_files,
         "phase_timings": phases,
         "token_usage": _usage_total(
@@ -148,7 +155,7 @@ class ExperimentReflectionService:
                     break
                 if not isinstance(candidate, dict):
                     continue
-                item = {key: str(candidate.get(key) or "").strip() for key in
+                item = {key: str(candidate.get(key) or "").strip()[:MAX_SUGGESTION_FIELD_CHARS] for key in
                         ("title", "expected_benefit", "cost", "risk", "measurement")}
                 if not all(item.values()) or _title_key(item["title"]) in open_titles:
                     continue

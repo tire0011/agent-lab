@@ -7,8 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from modules.experiment_reflection_service import (
+    MAX_PLAN_CHARS,
     MAX_REFLECTION_TOKENS,
     ExperimentReflectionService,
+    compact_experiment_summary,
 )
 from modules.experiment_service import ExperimentService
 
@@ -110,6 +112,15 @@ class ExperimentReflectionServiceTests(unittest.IsolatedAsyncioTestCase):
             open_issue_titles=lambda: ["  IMPROVEMENT-0  "],
         )
         self.assertEqual([item["title"] for item in result], ["Improvement 1"])
+
+    async def test_summary_bounds_model_generated_plan(self):
+        experiment = _experiment()
+        experiment.plan = {"detail": "x" * (MAX_PLAN_CHARS * 2)}
+
+        summary = compact_experiment_summary(experiment)
+
+        self.assertLessEqual(len(summary["plan"]), MAX_PLAN_CHARS + 3)
+        self.assertTrue(summary["plan"].endswith("..."))
 
     async def test_failure_is_recorded_and_never_changes_experiment_status(self):
         experiment = _experiment(status="failed")
