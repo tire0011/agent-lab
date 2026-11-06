@@ -73,3 +73,13 @@ os.environ["AGENT_CODEX_BIN"] = str(Path(_LOG_DIR) / "no-codex-binary-in-tests")
 # finds nothing installed and falls back to codex, which keeps the suite
 # deterministic as well.
 os.environ["AGENT_CLAUDE_BIN"] = str(Path(_LOG_DIR) / "no-claude-binary-in-tests")
+
+# Same isolation for the local model server: llama-server runs on the VM, so
+# an accidentally default-constructed client can otherwise make a real request
+# and wait for its 300-second timeout. Assigned, not setdefault, because the
+# production URL is present in the VM environment. Tests that need a model URL
+# set it through monkeypatch after this file runs.
+_UNREACHABLE_LOCAL_MODEL_URL = "http://127.0.0.1:9"
+os.environ["LOCAL_MODEL_URL"] = _UNREACHABLE_LOCAL_MODEL_URL
+os.environ["LLAMA_CPP_BASE_URL"] = _UNREACHABLE_LOCAL_MODEL_URL
+os.environ["LLAMA_API_URL"] = _UNREACHABLE_LOCAL_MODEL_URL

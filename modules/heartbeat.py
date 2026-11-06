@@ -59,10 +59,6 @@ _worker_id_lock = threading.Lock()
 _worker_id: str | None = None
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _coerce_int(value: object) -> int | None:
     """Return ``value`` as an int, or ``None`` when it is not usable at all.
 
@@ -185,7 +181,6 @@ class Heartbeat:
         self._name = name
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self.lost_claim = False
 
     def start(self) -> "Heartbeat":
         if self._thread is not None:
@@ -208,8 +203,6 @@ class Heartbeat:
         except Exception:  # noqa: BLE001 - a heartbeat must not break the work
             logger.exception("heartbeat refresh failed for %s", self._name)
             return True
-        if not alive:
-            self.lost_claim = True
         return alive
 
     def _loop(self) -> None:

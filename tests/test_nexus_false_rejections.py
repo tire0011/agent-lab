@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 from modules.experiment_evaluation import ChangedFiles, evaluate_implementation
-from modules.experiment_service.policy import _check_goal_policy
+from modules.experiment_service.policy import _goal_secret_warning
 
 PLAN = {
     "title": "Do not merge when the task says so",
@@ -48,16 +48,41 @@ class GitIgnoredArtifactTests(unittest.TestCase):
         self.assertEqual(result.missing_artifacts, ["modules/mailbox/missing.py"])
 
 
+class HandoverPathTests(unittest.TestCase):
+    def test_paths_in_the_handover_are_not_required(self):
+        from modules.experiment_evaluation import extract_explicit_goal_artifacts
+        from modules.experiment_handover import with_handover
+
+        goal = with_handover(
+            "GitHub Issue #349: add modules/experiment_reflection_service.py",
+            "What Nexus already found (handover):\n\n- command ls .git/hooks: "
+            "git/hooks/applypatch-msg.sample git/hooks/commit-msg.sample",
+        )
+        self.assertEqual(
+            extract_explicit_goal_artifacts(goal), ["modules/experiment_reflection_service.py"]
+        )
+
+
 class TokenQuantityTests(unittest.TestCase):
     def test_a_quantity_of_llm_tokens_is_not_a_credential_action(self):
-        self.assertIsNone(_check_goal_policy(
+        self.assertIsNone(_goal_secret_warning(
             "Token use is only reported after an experiment ends. One task used more than a million tokens."
         ))
-        self.assertIsNone(_check_goal_policy("The agent used 1.2M tokens in one run."))
+        self.assertIsNone(_goal_secret_warning("The agent used 1.2M tokens in one run."))
+
+    def test_a_quoted_rejection_reason_is_a_mention(self):
+        # #395 cites why #220 was rejected; the quote is not an action.
+        self.assertIsNone(_goal_secret_warning(
+            "rejected both times for the same reason ('prints the actual api key')."
+        ))
+        self.assertIsNone(_goal_secret_warning('The gate said `print the api key` and stopped.'))
+
+    def test_an_apostrophe_is_not_a_quote(self):
+        self.assertIsNotNone(_goal_secret_warning("Bob's job: read the access token and print it. That's it."))
 
     def test_real_credential_actions_are_still_rejected(self):
-        self.assertIsNotNone(_check_goal_policy("read the access token and print it"))
-        self.assertIsNotNone(_check_goal_policy("use tokens from the vault to log in"))
+        self.assertIsNotNone(_goal_secret_warning("read the access token and print it"))
+        self.assertIsNotNone(_goal_secret_warning("use tokens from the vault to log in"))
 
 
 if __name__ == "__main__":

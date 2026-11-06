@@ -72,6 +72,14 @@ _TEST_ID_RE = re.compile(r"^(?P<method>[A-Za-z_]\w*) \((?P<target>[\w.]+)\)$")
 # ``unittest``'s final summary line, the only place a total is stated.
 _RAN_TESTS_RE = re.compile(r"^Ran (?P<count>\d+) tests? in ", re.MULTILINE)
 
+# Header of one entry in unittest's closing failure report. The description may
+# carry a subtest suffix, and a dotted "method" is how a failed import of a
+# nested test module is named.
+_FAILURE_HEADER_RE = re.compile(
+    r"^(?:FAIL|ERROR|UNEXPECTED SUCCESS): (?P<method>[\w.]+) \((?P<target>[\w.]+)\)",
+    re.MULTILINE,
+)
+
 # How much trailing text is held back while waiting for a start marker. A
 # description is short; this only has to exceed ``len(_START_MARKER)`` so a
 # marker can never be split across a drain boundary.
@@ -115,6 +123,20 @@ def parse_total_tests(output: str | None) -> int | None:
         return int(matches[-1])
     except (TypeError, ValueError):  # pragma: no cover - regex guarantees digits
         return None
+
+
+def parse_failed_test_ids(output: str | None) -> set[str]:
+    """Canonical IDs from unittest's closing failure report.
+
+    Stricter than the live stream in both directions: subtest failures appear
+    only here, and a passing test that logs a line starting with ``ERROR``
+    appears only there.
+    """
+    failed: set[str] = set()
+    for match in _FAILURE_HEADER_RE.finditer(output or ""):
+        method, target = match.group("method"), match.group("target")
+        failed.add(target if "." in method else canonical_test_id(f"{method} ({target})"))
+    return failed
 
 
 def canonical_test_id(description: str) -> str:
@@ -324,10 +346,6 @@ class ProgressTracker:
                 self._current_test_started_at = None
                 if event.result:
                     self._results[event.result] = self._results.get(event.result, 0) + 1
-
-    def record_all(self, events: Iterable[ProgressEvent]) -> None:
-        for event in events:
-            self.record(event)
 
     def set_total_tests(self, total: int | None) -> None:
         if total is not None and total >= 0:

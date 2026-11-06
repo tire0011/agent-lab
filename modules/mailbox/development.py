@@ -1,8 +1,7 @@
 """Development extensions for the Git-backed Nexus mailbox.
 
 The command channel is available for the trusted development mailbox.
-Mailbox tasks are immediately approved and handed to the existing task worker,
-so the controller can execute them without a manual approval step.
+Mailbox tasks need nothing here: they go straight to Nexus (#264).
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from modules.redaction import redact
+from modules.redaction import redact_outbound
 
 from .command_recovery import (
     evaluate_interrupted_command,
@@ -38,7 +37,6 @@ _COMMAND_META_KEYS = {
     "timeout",
     "recovery_services",
 }
-_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ACTIVE_COMMANDS: dict[int, subprocess.Popen] = {}
 _SENSITIVE_ENV_MARKERS = (
     "TOKEN",
@@ -48,9 +46,6 @@ _SENSITIVE_ENV_MARKERS = (
     "CREDENTIAL",
     "AZURE_OPENAI",
 )
-
-def development_mode_enabled() -> bool:
-    return os.environ.get("NEXUS_DEVELOPMENT_MODE", "").strip().lower() in _TRUE_VALUES
 
 
 def _command_environment() -> dict[str, str]:
@@ -62,7 +57,11 @@ def _command_environment() -> dict[str, str]:
 
 
 def _bounded_redacted(text: str | None) -> str:
-    clean = redact(text or "")
+    # Credentials only (#220): every configured credential value and every
+    # generic credential shape becomes ``****``. The rest of the output - paths,
+    # URLs, ordinary text - is the diagnostic payload and stays as printed.
+    # Masked before truncation, so a cut can never split a value in two.
+    clean = redact_outbound(text)
     if len(clean) <= MAX_OUTPUT_CHARS:
         return clean
     omitted = len(clean) - MAX_OUTPUT_CHARS
@@ -135,7 +134,17 @@ def process_command(
     repo_path: Path,
     conn: Any,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
+    if not sender_trusted:
+        # A shell command from an unverified sender must never run (#506).
+        logger.warning("command rejected: sender is not a trusted actor")
+        return (
+            "**Status:** rejected\n\n"
+            "**Reason:** the sender is not a trusted actor; the command was not run.",
+            None,
+        )
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")
@@ -369,39 +378,6 @@ def process_command(
 
 
 def install(mailbox_module: Any) -> None:
-    """Install trusted command execution and unconditional task auto-approval."""
+    """Install trusted command execution."""
     mailbox_module.SUPPORTED_TYPES.add("command")
     mailbox_module._PROCESSORS["command"] = process_command
-
-    if getattr(mailbox_module, "_development_adapter_installed", False):
-        return
-
-    original_task_processor = mailbox_module._PROCESSORS["task"]
-
-    def process_task_without_manual_approval(
-        msg: Any,
-        repo_path: Path,
-        conn: Any,
-        db_msg_id: int,
-    ) -> tuple[str, None]:
-        _result_body, idea_id = original_task_processor(
-            msg, repo_path, conn, db_msg_id
-        )
-        now = mailbox_module._now_iso()
-        conn.execute(
-            """
-            UPDATE mailbox_task_approvals
-            SET status='approved', approved_at=?, updated_at=?
-            WHERE mailbox_msg_id=? AND status='pending_approval'
-            """,
-            (now, now, db_msg_id),
-        )
-        conn.commit()
-        return (
-            "Your task request has been recorded and approved automatically. "
-            "The mailbox task worker will submit it for execution.",
-            idea_id,
-        )
-
-    mailbox_module._PROCESSORS["task"] = process_task_without_manual_approval
-    mailbox_module._development_adapter_installed = True

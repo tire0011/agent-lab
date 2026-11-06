@@ -94,8 +94,6 @@ class AnalyzeBasicsTests(unittest.TestCase):
         self.assertEqual(len(recent), 1)
         self.assertEqual(recent[0]["id"], analysis.id)
 
-        self.assertEqual(service.latest_for_subject("experiment", "exp-1")["id"], analysis.id)
-        self.assertIsNone(service.latest_for_subject("experiment", "no-such-id"))
 
     def test_missing_subject_falls_back_without_raising(self):
         client = _FakeClient(_diagnosis_json())
@@ -401,7 +399,7 @@ class Issue115Issue116RegressionFixtureTests(unittest.TestCase):
         stored = service.get(analysis.id)
         self.assertIsNotNone(stored)
         self.assertEqual(stored["category"], "lifecycle_logic")
-        self.assertEqual(service.latest_for_subject("task_finalization", self.experiment_id)["id"], analysis.id)
+        self.assertEqual(service.list_recent(limit=1, subject_type="task_finalization", subject_id=self.experiment_id)[0]["id"], analysis.id)
 
 
 class AsyncEntryPointTests(unittest.IsolatedAsyncioTestCase):

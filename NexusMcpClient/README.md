@@ -17,7 +17,7 @@ The HTTP endpoint is available at `/mcp`.
 
 Optional variables:
 
-- `NEXUS_MCP_URL` — defaults to `https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com/mcp/`
+- `NEXUS_MCP_URL` — required, e.g. `https://<vm-host>/mcp/`
 - `NEXUS_MCP_TIMEOUT_SECONDS` — defaults to `30`
 - `NEXUS_MCP_TRANSPORT` — `stdio` (default) or `streamable-http`
 - `NEXUS_MCP_HTTP_HOST` — HTTP bind host, defaults to `127.0.0.1`

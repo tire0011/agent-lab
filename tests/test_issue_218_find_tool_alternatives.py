@@ -181,7 +181,7 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
 
     def test_alternatives_are_descriptors_not_bare_names(self):
         orchestrator = self._orchestrator([])
-        metadata = orchestrator._find_tool_not_found_metadata(
+        metadata = orchestrator.tool_router.find_tool_not_found_metadata(
             TASK, INSPECT_GOAL, ["git_status", "git_log", "git_worktrees"]
         )
 
@@ -222,7 +222,7 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
         # request for shell execution is unresolvable however it is worded. The
         # controller owns `command` natively; saying so is what stops the search.
         orchestrator = self._orchestrator([])
-        metadata = orchestrator._find_tool_not_found_metadata(TASK, SHELL_GOAL, [])
+        metadata = orchestrator.tool_router.find_tool_not_found_metadata(TASK, SHELL_GOAL, [])
 
         self.assertEqual(metadata["direct_capabilities"], [ACTION_COMMAND])
         self.assertEqual(metadata["recommended_next_action"], ACTION_COMMAND)
@@ -234,7 +234,7 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
         # answered "resolve git_status" - and, on a repeat, executed. That is
         # right-looking evidence about the wrong subject.
         orchestrator = self._orchestrator([])
-        metadata = orchestrator._find_tool_not_found_metadata(
+        metadata = orchestrator.tool_router.find_tool_not_found_metadata(
             TASK,
             "run a shell command to execute the test suite in the repository",
             ["git_status", "git_log"],
@@ -261,7 +261,7 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
             "show the command line arguments of the running process",
         ):
             with self.subTest(goal=goal):
-                metadata = orchestrator._find_tool_not_found_metadata(TASK, goal, [])
+                metadata = orchestrator.tool_router.find_tool_not_found_metadata(TASK, goal, [])
                 self.assertEqual(metadata["direct_capabilities"], [])
                 self.assertEqual(
                     metadata["recommended_next_action"], ACTION_MISSING_CAPABILITY
@@ -271,7 +271,7 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
         # Describing an operation the registry does not have would invent both
         # the description and the argument schema.
         orchestrator = self._orchestrator([])
-        metadata = orchestrator._find_tool_not_found_metadata(
+        metadata = orchestrator.tool_router.find_tool_not_found_metadata(
             TASK, INSPECT_GOAL, ["git_status", "run_shell"]
         )
 
@@ -281,7 +281,7 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
 
     def test_nothing_to_offer_still_ends_at_missing_capability(self):
         orchestrator = self._orchestrator([])
-        metadata = orchestrator._find_tool_not_found_metadata(
+        metadata = orchestrator.tool_router.find_tool_not_found_metadata(
             TASK, "inspect GPU utilization", []
         )
 
@@ -499,7 +499,11 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
         redirects = orchestrator.task_store.recent_events(
             result.session_id, kind="find_tool_redirected"
         )
-        stats = orchestrator.task_store.controller_turn_stats()
+        turn_rows = orchestrator.task_store._conn.execute(
+            "SELECT outcome, COUNT(*) AS n FROM nexus_controller_turns WHERE session_id=? GROUP BY outcome",
+            (result.session_id,),
+        ).fetchall()
+        by_outcome = {row["outcome"]: row["n"] for row in turn_rows}
 
         self.assertEqual(len(redirects), 1)
         metadata = redirects[0]["metadata"]
@@ -510,7 +514,7 @@ class Issue218NotFoundAlternativesTests(unittest.TestCase):
         self.assertEqual(metadata["controller_reason"], SHELL_REASON)
         self.assertEqual(metadata["related_goal"], NARROWED_GOAL)
         # The turn record still says what the controller itself decided.
-        self.assertEqual(stats["by_outcome"][TOOL_FIND_TOOL], 2)
+        self.assertEqual(by_outcome[TOOL_FIND_TOOL], 2)
 
         not_found = result.observations[0]
         self.assertEqual(not_found["status"], "not_found")

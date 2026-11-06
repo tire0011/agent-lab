@@ -276,34 +276,6 @@ class NexusTaskStore:
             self._conn.commit()
             return int(cursor.lastrowid)
 
-    def get_event(self, event_id: int) -> dict[str, Any] | None:
-        """Fetch one full, raw event by its durable id.
-
-        Used to retrieve complete tool results that were compacted to a stub
-        reference in a prompt instead of being resent inline.
-        """
-        with self._lock:
-            row = self._conn.execute(
-                """SELECT id, session_id, role, kind, content, metadata_json, created_at
-                   FROM nexus_task_events WHERE id=?""",
-                (event_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            metadata = json.loads(row["metadata_json"] or "{}")
-        except json.JSONDecodeError:
-            metadata = {}
-        return {
-            "id": row["id"],
-            "session_id": row["session_id"],
-            "role": row["role"],
-            "kind": row["kind"],
-            "content": row["content"],
-            "metadata": metadata,
-            "created_at": row["created_at"],
-        }
-
     def recent_events(
         self,
         session_id: str,
@@ -350,6 +322,33 @@ class NexusTaskStore:
                 }
             )
         return events
+
+    def user_inputs(self, session_id: str) -> list[str]:
+        """Return complete user input events in their original order.
+
+        This is a durable-state read, not a prompt view: it deliberately has
+        no history limit or character budget. Knowledge-collector bookkeeping
+        remains auditable in the journal but is not user-authored task text.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT content, metadata_json
+                   FROM nexus_task_events
+                   WHERE session_id=? AND role='user' AND kind='input'
+                   ORDER BY id ASC""",
+                (session_id,),
+            ).fetchall()
+
+        inputs: list[str] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            if metadata.get("knowledge_collector_internal"):
+                continue
+            inputs.append(str(row["content"] or ""))
+        return inputs
 
     def history(
         self,
@@ -457,33 +456,6 @@ class NexusTaskStore:
                 self._conn.commit()
         except Exception:  # noqa: BLE001 - never break a turn to record it
             logger.exception("failed to record controller turn for %s", session_id)
-
-    def controller_turn_stats(self, since: str | None = None) -> dict[str, Any]:
-        """Aggregate the question this table exists to answer."""
-        where, params = ("WHERE created_at >= ?", (since,)) if since else ("", ())
-        with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT provider_used, escalated, outcome, COUNT(*) AS n
-                FROM nexus_controller_turns {where}
-                GROUP BY provider_used, escalated, outcome
-                """,
-                params,
-            ).fetchall()
-        total = sum(int(r["n"]) for r in rows)
-        escalated = sum(int(r["n"]) for r in rows if int(r["escalated"]))
-        by_outcome: dict[str, int] = {}
-        by_provider: dict[str, int] = {}
-        for r in rows:
-            by_outcome[str(r["outcome"])] = by_outcome.get(str(r["outcome"]), 0) + int(r["n"])
-            by_provider[str(r["provider_used"])] = by_provider.get(str(r["provider_used"]), 0) + int(r["n"])
-        return {
-            "total_turns": total,
-            "escalated_turns": escalated,
-            "escalation_rate": round(escalated / total, 4) if total else 0.0,
-            "by_provider": by_provider,
-            "by_outcome": by_outcome,
-        }
 
     def stale_sessions(self, older_than_seconds: int) -> list[NexusTaskSession]:
         """Sessions left mid-turn with nothing driving them.
@@ -606,38 +578,6 @@ class NexusTaskStore:
                    SET last_heartbeat_at=?
                    WHERE id=? AND worker_id=?""",
                 (_now(), session_id, str(worker_id)[:128]),
-            )
-            self._conn.commit()
-        return cursor.rowcount > 0
-
-    def release_claim(
-        self,
-        session_id: str,
-        *,
-        reason: str,
-        worker_id: str | None = None,
-    ) -> bool:
-        """End a claim with an explicit outcome instead of letting it go quiet.
-
-        The owner is kept for observability ("who ran this"); the heartbeat is
-        cleared so a finished session can never be mistaken for a live one, and
-        so reconciliation has nothing left to reap.
-
-        This is the bare primitive, for a caller that is releasing a claim and
-        nothing else. A turn that is ending uses ``finalize_turn`` instead, so
-        its journal entry, status and release cannot straddle a takeover.
-        """
-        params: list[Any] = [str(reason)[:200], _now(), session_id]
-        clause = ""
-        if worker_id is not None:
-            clause = " AND worker_id=?"
-            params.append(str(worker_id)[:128])
-        with self._lock:
-            cursor = self._conn.execute(
-                f"""UPDATE nexus_task_sessions
-                    SET last_heartbeat_at=NULL, terminal_reason=?, updated_at=?
-                    WHERE id=?{clause}""",
-                params,
             )
             self._conn.commit()
         return cursor.rowcount > 0

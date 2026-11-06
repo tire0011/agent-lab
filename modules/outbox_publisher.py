@@ -214,14 +214,6 @@ class OutboxPublisher:
     # Public helpers: state transitions used by producers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def status_pending_write() -> str:
-        return PUBLISH_PENDING_WRITE
-
-    @staticmethod
-    def status_written() -> str:
-        return PUBLISH_WRITTEN
-
     # ------------------------------------------------------------------
     # Core publish API
     # ------------------------------------------------------------------
@@ -806,7 +798,7 @@ class OperationChainOutboxPublisher(_TablePublisher):
 
 
 class TaskApprovalOutboxPublisher(_TablePublisher):
-    """Publishes task-approval outbox results."""
+    """Publishes mailbox task results (file name kept from the approval era, #264)."""
 
     _TABLE = "mailbox_task_approvals"
     _ID_COLUMN = "id"

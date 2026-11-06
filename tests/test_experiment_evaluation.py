@@ -29,6 +29,7 @@ from modules.experiment_evaluation import (
     evaluate_implementation,
     extract_explicit_goal_artifacts,
     goal_is_explicit_tests_only,
+    goal_names_only_test_paths,
     parse_git_status_short,
     validate_plan,
 )
@@ -209,6 +210,15 @@ class ValidatePlanTestCase(unittest.TestCase):
         reason = validate_plan(plan, goal=goal)
         self.assertIsNone(reason)
 
+    def test_tests_only_plan_is_accepted_when_goal_names_only_test_path(self):
+        plan = {
+            "title": "x",
+            "affected_files": ["tests/conftest.py"],
+            "change_kind": "tests_only",
+        }
+        goal = "Fix tests/conftest.py so LOCAL_MODEL_URL is configured."
+        self.assertIsNone(validate_plan(plan, goal=goal))
+
     def test_analysis_plan_needs_no_files(self):
         plan = {"title": "x", "affected_files": [], "change_kind": "analysis"}
         reason = validate_plan(plan, goal="Investigate why tests are flaky.")
@@ -253,6 +263,23 @@ class GoalHeuristicsTestCase(unittest.TestCase):
         self.assertTrue(
             goal_is_explicit_tests_only("Only add tests; do not change production code.")
         )
+
+    def test_goal_naming_only_test_path_is_accepted(self):
+        self.assertTrue(
+            goal_names_only_test_paths(
+                "Fix tests/conftest.py so LOCAL_MODEL_URL is configured for tests."
+            )
+        )
+
+    def test_goal_naming_test_and_implementation_paths_is_rejected(self):
+        self.assertFalse(
+            goal_names_only_test_paths(
+                "Update tests/conftest.py and modules/llama_cpp_client.py."
+            )
+        )
+
+    def test_goal_naming_no_paths_is_rejected(self):
+        self.assertFalse(goal_names_only_test_paths("Fix the test harness fixture."))
 
     def test_goal_extraction_finds_explicit_path(self):
         artifacts = extract_explicit_goal_artifacts(EB57900_GOAL)
@@ -363,6 +390,83 @@ class EvaluateImplementationTestCase(unittest.TestCase):
             changed,
             worktree_path=None,
         )
+        self.assertEqual(result.outcome, "pass")
+
+    def test_named_test_harness_goal_with_test_only_diff_passes(self):
+        changed = ChangedFiles(tracked_modified=["tests/conftest.py"], untracked_new=[])
+        result = evaluate_implementation(
+            None,
+            "Fix tests/conftest.py so LOCAL_MODEL_URL is available to local-model tests.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "pass")
+
+    def test_goal_naming_test_and_non_test_paths_with_test_only_diff_fails(self):
+        changed = ChangedFiles(tracked_modified=["tests/conftest.py"], untracked_new=[])
+        result = evaluate_implementation(
+            None,
+            "Update tests/conftest.py for modules/llama_cpp_client.py and LOCAL_MODEL_URL.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "needs_review")
+        self.assertIn("nur Tests geändert", result.reason)
+
+    def test_goal_naming_no_paths_with_test_only_diff_fails(self):
+        changed = ChangedFiles(tracked_modified=["tests/conftest.py"], untracked_new=[])
+        result = evaluate_implementation(
+            None,
+            "Fix the local-model test harness fixture.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "needs_review")
+        self.assertIn("nur Tests geändert", result.reason)
+
+    def test_test_only_implementation_plan_may_be_promoted(self):
+        plan = self._plan(affected_files=["tests/conftest.py"])
+        changed = ChangedFiles(tracked_modified=["tests/conftest.py"], untracked_new=[])
+        result = evaluate_implementation(
+            plan,
+            "Fix tests/conftest.py so LOCAL_MODEL_URL is configured.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "pass")
+
+    def test_mixed_implementation_plan_is_not_promoted(self):
+        plan = self._plan(
+            affected_files=["tests/conftest.py", "modules/llama_cpp_client.py"]
+        )
+        changed = ChangedFiles(tracked_modified=["tests/conftest.py"], untracked_new=[])
+        result = evaluate_implementation(
+            plan,
+            "Fix tests/conftest.py so LOCAL_MODEL_URL is configured.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertEqual(result.outcome, "needs_review")
+        self.assertIn("nur Tests geändert", result.reason)
+
+    def test_explicit_tests_only_goal_promotes_mixed_plan_when_only_tests_changed(self):
+        # #493: the issue says "tests-only change" but the planner listed the
+        # modules it had to read; a pure test diff is what was asked for.
+        plan = self._plan(
+            affected_files=["tests/conftest.py", "modules/llama_cpp_client.py"]
+        )
+        changed = ChangedFiles(
+            tracked_modified=["tests/conftest.py"],
+            untracked_new=["tests/test_conftest_local_model_isolation.py"],
+        )
+        result = evaluate_implementation(
+            plan,
+            "This is a tests-only change: only files under `tests/` change. "
+            "Point LOCAL_MODEL_URL in tests/conftest.py at an unreachable address.",
+            changed,
+            worktree_path=None,
+        )
+        self.assertNotIn("nur Tests geändert", result.reason)
         self.assertEqual(result.outcome, "pass")
 
     def test_no_plan_ordinary_goal_with_only_test_files_is_needs_review(self):

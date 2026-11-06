@@ -6,48 +6,30 @@ from pathlib import Path
 
 from .models import ExperimentPlan
 
-# unambiguous by themselves — the bare word already implies the disallowed
-# action (there is no legitimate "harmless mention" of e.g. "pip install"
-# or "drop table" inside a plan) — so any hit rejects the experiment
-# immediately, regardless of surrounding context. Matching is a simple
-# case-insensitive substring check against the lowercased haystack.
-# Secret/credential-related terms are intentionally NOT here: they are
-# handled by the action-based _SECRET_ACTION_REGEXES check below, since a
-# bare mention (e.g. "without secrets", "tests the redaction logic for
-# tokens") is a common, safe statement that must not reject a plan.
-#
-# NOTE: "commit", "push", and "merge" are kept here for the plan-level check
-# (plan_violates_policy) where the haystack is LLM-generated plan JSON and
-# any occurrence unambiguously means a planned git operation.  For the
-# goal-level check (_check_goal_policy) these three verbs are handled by the
-# word-boundary and negation-aware _GIT_ACTION_REGEXES instead — see the
-# _GIT_ACTION_KEYWORDS frozenset below.
+# Unambiguous reject keywords: any case-insensitive substring hit rejects
+# immediately. Secret/credential terms are deliberately NOT here - they are handled by
+# the action-based _SECRET_ACTION_REGEXES, since a bare mention ("without secrets",
+# "tests the redaction logic for tokens") must not reject. "commit"/"push"/"merge" stay
+# for the plan-level check (LLM plan JSON, any occurrence is a planned git op); the
+# goal-level check uses the negation-aware _GIT_ACTION_REGEXES instead.
 _REJECT_KEYWORDS: tuple[str, ...] = (
     "drop table", "delete from", "truncate table", "rm -rf",
     "shell=true",
-    # Paid/costly actions: only the action words themselves (never bare
-    # nouns like "budget" or "cost"), so mentioning cost considerations in
-    # a plan's risk assessment does not accidentally reject it.
+    # Paid/costly actions: only the action words themselves, never bare nouns like
+    # "budget" or "cost", so a plan's risk assessment mentioning cost does not reject.
     "purchas",  # stem: matches purchase/purchasing/purchased/purchases
     "enable billing", "paid tier", "spend money",
     "increase budget", "increase the budget", "credit card",
 )
 
-# The three git-action keywords that are treated specially in
-# _check_goal_policy (word/context-aware instead of plain substring).
+# Git-action keywords treated specially (word/context-aware) in _check_goal_policy.
 _GIT_ACTION_KEYWORDS: frozenset[str] = frozenset({"commit", "push", "merge"})
 
-# Action-based infrastructure/deployment check. Bare mentions of terms
-# such as "VM", "Azure", "deploy", or "infrastructure" must NOT alone
-# reject a plan (the agent needs to be able to read, discuss, and document
-# such topics — e.g. fixing a VM version number in README.md). A plan is
-# only rejected when one of these *action verbs* appears close to one of
-# these *target nouns*, i.e. the plan actually describes creating,
-# changing, deleting, or deploying real external infrastructure rather
-# than just mentioning it. Proximity is word-count based (not a fixed
-# character window) so an incidental mention of a noun in one sentence and
-# an unrelated verb several sentences later does not trigger a false
-# rejection.
+# Action-based infra/deployment check: bare mentions of "VM"/"Azure"/"deploy" must NOT
+# alone reject (the agent must be able to read, discuss and document such topics). Only
+# an action verb within a word-count window of a target noun counts as describing a real
+# change - proximity is word-count based, so an incidental noun in another sentence does
+# not false-positive.
 _INFRA_ACTION_VERBS: tuple[str, ...] = (
     "create", "creates", "creating", "created",
     "provision", "provisions", "provisioning", "provisioned",
@@ -75,11 +57,9 @@ _INFRA_TARGET_NOUNS: tuple[str, ...] = (
     "production", "prod", "environment", "website", "site",
 )
 
-# Maximum number of filler words allowed between the action verb and the
-# target noun for the pair to still count as describing the same action
-# (e.g. "delete the VM" -> 1 filler word; "resize the VM to Standard_B2s"
-# -> 1 filler word). A plan that merely mentions "VM" in one sentence and
-# an unrelated verb many words later is not considered a match.
+# Max filler words between verb and noun for the pair to count as one action
+# ("delete the VM" = 1, "resize the VM to Standard_B2s" = 1); more words apart means
+# not a match.
 _INFRA_ACTION_MAX_FILLER_WORDS = 6
 
 _INFRA_VERB_ALT = "|".join(re.escape(v) for v in _INFRA_ACTION_VERBS)
@@ -97,29 +77,12 @@ _INFRA_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
     ),
 )
 
-# Git-action detection for the goal-level policy check (_check_goal_policy).
-# The plan-level check (plan_violates_policy) keeps the simple substring
-# matches in _REJECT_KEYWORDS because the haystack there is LLM-generated
-# plan JSON and any occurrence of "commit" / "push" / "merge" is
-# unambiguously a planned git operation.
-#
-# Raw user goals are different: they routinely contain safe incidental
-# mentions that would be false-positively flagged by substring matching:
-#   "do not commit or push"           (safety constraint / negation)
-#   "improve merge-conflict handling" (incidental compound noun)
-#   "handle commit message parsing"   (domain noun, not a git command)
-#   "push-notification support"       (unrelated product domain)
-#
-# The word-boundary and negation-aware checks below are therefore used
-# instead for raw goal text:
-#   (a) Explicit git sub-command: "git commit / push / merge"  → always
-#       an imperative git action; reject unless a negation precedes it.
-#   (b) Git verb + git-object proximity: "commit the changes",
-#       "push the branch", "merge the PR"  → reject unless negated.
-#
-# Both patterns reuse _infra_action_match_is_false_positive so that
-# explicit negations ("do not commit", "without pushing", "won't merge")
-# and clause-level negations ("never ..., commit ...") are accepted.
+# Git-action detection for raw goal text: plain substring matching false-positives on
+# safe mentions ("do not commit or push", "improve merge-conflict handling",
+# "push-notification support"), so the goal check uses (a) explicit "git commit/push/merge"
+# and (b) git verb + git-object proximity, both negation-aware via
+# _infra_action_match_is_false_positive, so "do not commit", "without pushing",
+# "won't merge" are accepted.
 _GIT_OBJECT_NOUNS: tuple[str, ...] = (
     "change", "changes", "code", "branch", "branches",
     "result", "results", "implementation", "work",
@@ -129,10 +92,10 @@ _GIT_OBJECT_NOUNS: tuple[str, ...] = (
 _GIT_ACTION_MAX_FILLER = 4
 _GIT_NOUN_ALT = "|".join(re.escape(n) for n in _GIT_OBJECT_NOUNS)
 _GIT_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
-    # (a) Explicit git sub-command: "git commit", "git push", "git merge"
+    # (a) Explicit git sub-command: "git commit", "git push", "git merge".
     re.compile(r"\bgit\s+(?:commit|push|merge)\b", re.IGNORECASE),
-    # (b) Git verb within a few words of a recognisable git-object noun:
-    #     "commit the changes", "push the branch", "merge the PR"
+    # (b) Git verb within a few words of a git-object noun: "commit the changes",
+    #     "push the branch", "merge the PR".
     re.compile(
         rf"\b(?:commit|push|merge)\b(?:\s+\S+){{0,{_GIT_ACTION_MAX_FILLER}}}\s+"
         rf"\b(?:{_GIT_NOUN_ALT})\b",
@@ -140,23 +103,11 @@ _GIT_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
     ),
 )
 
-# Words whose presence between a matched verb and noun indicate the plan is
-# actually *disclaiming* the action ("does not touch infrastructure",
-# "will not deploy anything") rather than describing it. A raw proximity
-# match alone cannot tell "create a VM" apart from "will not create a VM",
-# so any negation word found inside the matched span turns off the
-# rejection for that specific match (the search continues past it).
-#
-# Also includes non-disclosure/absence state words ("absent", "missing",
-# "excluded") for the secret/credential check specifically: defensive
-# statements like "secrets are absent from public activity output" or
-# "credentials are excluded from the response" describe the *lack* of a
-# secret/credential rather than an action performed on one, and are easily
-# confused with a real action match only because of an unrelated, later
-# noun/verb-homograph word (e.g. "output") appearing further in the same
-# sentence. Treating these as negation-equivalent state words keeps the
-# fix narrowly scoped to negation/non-disclosure handling rather than
-# adding a broad secret-domain keyword exception.
+# Words between a matched verb and noun that mean the plan is *disclaiming* the action
+# ("does not touch infrastructure", "will not deploy anything"): any negation inside
+# the matched span turns off that specific match. Absence words ("absent", "missing",
+# "excluded") count as negation for the secret check only - "secrets are absent from
+# public activity output" describes a lack, not an action.
 _INFRA_ACTION_NEGATION_WORDS = frozenset(
     {
         "not", "no", "never", "without", "cannot", "avoid", "don't",
@@ -168,26 +119,20 @@ _INFRA_ACTION_NEGATION_WORDS = frozenset(
 
 
 def _infra_action_match_is_false_positive(matched_text: str, preceding_text: str = "") -> bool:
-    """True if *matched_text* (a verb/noun proximity match) should NOT be
-    treated as describing a real action — either because it crosses a
-    sentence boundary (a later, unrelated sentence merely repeats the
-    noun) or because it contains an explicit negation. ``preceding_text``
-    (a small window of text immediately before the match) is also checked
-    for a trailing negation word, so "without changing production" is
-    recognized as a disclaimer even though "without" falls just outside
-    the verb/noun match span itself."""
+    """True if *matched_text* should NOT count as describing a real action: it crosses
+    a sentence boundary, or it - or the small window of text just before it,
+    ``preceding_text`` - contains a negation. "without changing production" is a
+    disclaimer even though "without" falls outside the match span itself.
+    """
     if re.search(r"[.!?]\s", matched_text):
         return True
     words = re.findall(r"[a-z']+", matched_text.lower())
     if any(word in _INFRA_ACTION_NEGATION_WORDS or word.endswith("n't") for word in words):
         return True
     if preceding_text:
-        # Look for a negation anywhere since the start of the current
-        # sentence/clause, not just the immediately preceding word: prose
-        # like "without network access, secrets, or production changes"
-        # lists several nouns after a single leading negation, so a
-        # negation several comma-separated items earlier still applies to
-        # a later item in the same list.
+        # Look for a negation anywhere since the start of the current sentence/clause, not just
+        # the preceding word: "without network access, secrets, or production changes" lists
+        # several nouns after one leading negation, so it still applies to later items.
         sentence_start = 0
         for boundary in re.finditer(r"[.!?]\s|\b(?:but|however|although|though)\b", preceding_text):
             sentence_start = boundary.end()
@@ -201,19 +146,11 @@ def _infra_action_match_is_false_positive(matched_text: str, preceding_text: str
     return False
 
 
-# Action-based secret/credential check. Bare mentions of terms such as
-# "secret", "credential", "token", "api key", or "ssh key" must NOT alone
-# reject a plan — legitimate plans routinely discuss redaction logic,
-# assert they need no secrets, or test secret-scrubbing code (e.g. this
-# very module's own _redact_secrets tests). A plan is only rejected when
-# one of these *action verbs* appears close to one of these *target
-# nouns*, i.e. the plan actually describes reading, obtaining, using,
-# copying, exposing/logging, storing, transmitting, creating, changing, or
-# deleting a real secret/credential rather than just mentioning the
-# concept. Reuses the same word-count proximity, sentence-boundary, and
-# negation-guard logic as the infrastructure/deployment check above (see
-# ``_infra_action_match_is_false_positive``), so "without secrets",
-# "does not access credentials", and "no API key required" are accepted.
+# Action-based secret/credential check: bare mentions of "secret"/"credential"/"token"/"api key" must NOT alone reject - legitimate plans discuss redaction, assert they need
+# no secrets, or test secret-scrubbing. Only an action verb close to a target noun
+# (read/obtain/use/copy/expose/store/transmit/create/change/delete a real secret)
+# rejects. Same proximity, sentence-boundary and negation logic as the infra check, so
+# "without secrets", "does not access credentials", "no API key required" pass.
 _SECRET_ACTION_VERBS: tuple[str, ...] = (
     "read", "reads", "reading",
     "obtain", "obtains", "obtaining", "obtained",
@@ -265,10 +202,9 @@ _SECRET_ACTION_REGEXES: tuple[re.Pattern[str], ...] = (
     ),
 )
 
-# Generic "token" is overloaded: it can mean a credential or an LLM
-# accounting/tokenization unit.  Keep credential-qualified tokens strict,
-# and exempt only explicit metric/tokenization phrases in the immediate
-# context of a generic token match.
+# Generic "token" is overloaded (credential vs LLM accounting unit): keep
+# credential-qualified tokens strict, exempt only explicit metric/tokenization
+# phrases in the immediate context of a generic token match.
 _LLM_TOKEN_METRIC_REGEXES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:input|output|prompt|completion|context)\s+tokens?\b", re.IGNORECASE),
     re.compile(r"\btokens?\s+counts?\b", re.IGNORECASE),
@@ -277,14 +213,37 @@ _LLM_TOKEN_METRIC_REGEXES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\btokens?\s+budget\b", re.IGNORECASE),
     re.compile(r"\btokens?\s+per\s+second\b", re.IGNORECASE),
     re.compile(r"\btokens?\s+rate\b", re.IGNORECASE),
-    # A quantity of tokens is a measure, not a credential (#348: "used more
-    # than a million tokens").
+    # A quantity of tokens is a measure, not a credential (#348: "used more than a
+    # million tokens").
     re.compile(r"\b(?:\d[\d,.]*\s*[km]?|hundred|thousand|million|billion)\s+tokens\b", re.IGNORECASE),
 )
 _CREDENTIAL_QUALIFIED_TOKEN_REGEX = re.compile(
     r"\b(?:access|auth|authentication|api|bearer|credential|secret|session|oauth)\s+tokens?\b",
     re.IGNORECASE,
 )
+
+
+_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (("`", "`"), ('"', '"'), ("“", "”"), ("'", "'"))
+
+
+def _is_quoted(preceding_text: str, following_text: str) -> bool:
+    """True when the match sits inside quotes on its own line (goal text only).
+
+    Quoted text is a mention - typically a cited past rejection (#395) - not an action
+    the goal asks for. An apostrophe inside a word ("doesn't") is not an opening quote.
+    """
+    before = preceding_text.rsplit("\n", 1)[-1]
+    after = following_text.split("\n", 1)[0]
+    for opening, closing in _QUOTE_PAIRS:
+        start = before.rfind(opening)
+        if start < 0 or closing not in after:
+            continue
+        if opening == closing and before.count(opening) % 2 == 0:
+            continue
+        if opening == "'" and start > 0 and before[start - 1].isalnum():
+            continue
+        return True
+    return False
 
 
 def _secret_action_match_is_false_positive(
@@ -296,8 +255,8 @@ def _secret_action_match_is_false_positive(
     if _infra_action_match_is_false_positive(matched_text, preceding_text):
         return True
 
-    # Metric exemptions apply only to matches whose secret noun is the
-    # ambiguous generic token(s), never api keys/passwords/etc.
+    # Metric exemptions apply only when the secret noun is the ambiguous generic
+    # "token(s)", never api keys/passwords/etc.
     if not re.search(r"\btokens?\b", matched_text, re.IGNORECASE):
         return False
 
@@ -307,9 +266,8 @@ def _secret_action_match_is_false_positive(
     return any(regex.search(context) for regex in _LLM_TOKEN_METRIC_REGEXES)
 
 
-# Title phrases that indicate a placeholder/intention-only response rather
-# than a concrete, already-selected feature (e.g. the model announcing it
-# is about to start investigating instead of reporting what it decided).
+# Title phrases marking a placeholder/intention-only response rather than a concrete,
+# already-selected feature.
 _PLACEHOLDER_PHRASES: tuple[str, ...] = (
     "inspection started",
     "analysis only",
@@ -328,8 +286,8 @@ _PLACEHOLDER_PHRASES: tuple[str, ...] = (
     "documentation only",
 )
 
-# Documentation-only plans are not implementations. Instead of maintaining a
-# positive list of source extensions, classify only obvious documentation files.
+# Documentation-only plans are not implementations: classify only obvious documentation
+# files instead of maintaining a positive list of source extensions.
 _DOCUMENTATION_ONLY_SUFFIXES: tuple[str, ...] = (".md", ".rst", ".txt")
 
 
@@ -359,22 +317,17 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
                 f"{match.group(0)!r}"
             )
 
-    # Safety net against placeholder/intention-only plans that technically
-    # satisfy the JSON schema (non-empty affected_files, all fields
-    # present) but describe only the *intent* to investigate rather than a
-    # concrete, implementation-ready feature. This is an additional,
-    # conservative check — it never loosens any existing rule.
+    # Safety net against placeholder plans that satisfy the JSON schema but describe only
+    # the intent to investigate; an additional conservative check - it never loosens any
+    # existing rule.
     title_lower = plan.title.strip().lower()
     for phrase in _PLACEHOLDER_PHRASES:
         if phrase in title_lower:
             return f"plan title looks like a placeholder/intention-only statement: {plan.title!r}"
 
-    # A plan whose affected_files are all non-code/non-test documents (e.g.
-    # only IDEAS.md) describes an investigation or documentation note, not
-    # an implementable feature. This does not forbid legitimate
-    # documentation *features* in general — it only requires that at least
-    # one affected file be a concrete code or test file; a plan may still
-    # additionally touch README.md/IDEAS.md/etc. alongside a real code file.
+    # A plan whose affected_files are all documents (e.g. only IDEAS.md) is an investigation,
+    # not an implementable feature: at least one concrete code or test file is required
+    # (documentation alongside real code is still fine).
     if not any(_is_code_or_test_file(path) for path in plan.affected_files):
         return (
             "plan does not touch any concrete code or test file; "
@@ -384,9 +337,8 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
         )
 
     if len(plan.affected_files) > 1:
-        # Not an automatic hard rejection by count alone, but more than a
-        # small handful strongly suggests more than "one small connected
-        # feature" — conservative reject.
+        # More than a small handful of affected files suggests more than "one small connected
+        # feature" - conservative reject.
         if len(plan.affected_files) > 4:
             return (
                 f"plan touches too many files ({len(plan.affected_files)}); "
@@ -402,31 +354,63 @@ def plan_violates_policy(plan: ExperimentPlan, raw_text: str) -> str | None:
     return None
 
 
+_HANDOVER_SECTION_RE = re.compile(
+    r"\n\n(?:Knowledge briefing:|Delegate findings \(unverified\):|Earlier attempts in this run:)"
+)
+
+
+def _policy_text(goal: str) -> str:
+    """The part of a goal the keyword denylist judges (#544).
+
+    The task and Nexus' own goal for it. Not the rest of the handover or the
+    earlier attempts: those quote tool output and old failure reasons (a grep
+    hit in a docstring that says "never shell=True", or the rejection reason
+    itself), which describe what Nexus saw, not what it is asked to do.
+    """
+    from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
+
+    task = goal.split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+    _, found, handover = goal.partition(HANDOVER_HEADING)
+    if not found:
+        return task
+    _, has_goal, nexus_goal = handover.partition("Nexus goal:\n")
+    if not has_goal:
+        return task
+    return task + "\n" + _HANDOVER_SECTION_RE.split(nexus_goal, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+
+
 def _check_goal_policy(goal: str) -> str | None:
     """Apply the safety denylist directly to the raw goal text.
 
-    This is the pre-implementation security check for the single-call
-    pipeline (no LLM-generated plan to scan).  Returns a human-readable
-    rejection reason or ``None`` if the goal is acceptable.
-
-    Unlike the plan-level check (plan_violates_policy), the git-action
-    keywords "commit", "push", and "merge" are handled by the word-boundary
-    and negation-aware _GIT_ACTION_REGEXES rather than the plain substring
-    scan.  This avoids false-positive rejections of safe goals such as
-    "do not commit or push", "improve merge-conflict handling", or
-    "handle commit message parsing".
+    Pre-implementation security check for the single-call pipeline (no LLM plan to
+    scan). Returns a rejection reason or ``None``. Unlike the plan-level check,
+    "commit"/"push"/"merge" are handled by the word-boundary, negation-aware
+    _GIT_ACTION_REGEXES, so safe goals like "do not commit or push" are not rejected.
     """
-    haystack = (goal or "").lower()
-    # Git commit/push/merge are normal experiment-branch workflow actions.
-    # Main/merge/deployment governance is enforced by the lifecycle layer.
+    haystack = _policy_text(goal or "").lower()
+    # Git commit/push/merge are normal experiment-branch workflow actions; main/merge/# deployment governance is enforced by the lifecycle layer.
     for keyword in _REJECT_KEYWORDS:
         if keyword in haystack:
             return f"goal mentions disallowed keyword: {keyword!r}"
+    return None
+
+
+def _goal_secret_warning(goal: str) -> str | None:
+    """Flag a goal that reads like a secret/credential action.
+
+    Warning only, not a rejection: issues usually *describe* such actions (a leak to
+    fix, a quoted rejection), which the regexes cannot tell apart. The reviewer checks
+    the actual change before it is merged.
+    """
+    haystack = (goal or "").lower()
     for regex in _SECRET_ACTION_REGEXES:
         for match in regex.finditer(haystack):
             preceding = haystack[max(0, match.start() - 200):match.start()]
             following = haystack[match.end():min(len(haystack), match.end() + 120)]
             if _secret_action_match_is_false_positive(match.group(0), preceding, following):
+                continue
+            # Goal text only: a plan is checked as raw JSON, where every value is in quotes.
+            if _is_quoted(preceding, following):
                 continue
             return (
                 "goal describes an actual secret/credential action: "
@@ -435,14 +419,10 @@ def _check_goal_policy(goal: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Policy rule classification — turns a free-text rejection reason (produced
-# by plan_violates_policy() or by the surrounding pipeline) into a short,
-# stable rule identifier. This never carries any plan-derived free text
-# (which could echo something from the model's own output); it is only a
-# fixed vocabulary word matched against the *known, hard-coded* reason
-# prefixes above, so it is always safe to log and to expose over the API.
-# ---------------------------------------------------------------------------
+# Policy rule classification: map a free-text rejection reason to a short, fixed rule id.
+# Never carries plan-derived free text (which could echo model output) - only a fixed
+# vocabulary matched against the hard-coded reason prefixes, so it is always safe to
+# log and expose over the API.
 _POLICY_RULE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("plan output could not be reliably parsed", "unparseable_plan"),
     ("policy replan output could not be reliably parsed", "unparseable_plan"),
@@ -475,8 +455,8 @@ _POLICY_RULE_PREFIXES: tuple[tuple[str, str], ...] = (
 def _policy_rule_for_reason(reason: str | None) -> str | None:
     """Classify a rejection reason into a short, fixed policy-rule id.
 
-    Returns ``None`` when the reason does not match any known rule (e.g. an
-    upstream worker error message) rather than guessing.
+    Returns ``None`` when no known rule matches (e.g. an upstream worker error)
+    rather than guessing.
     """
     if not reason:
         return None

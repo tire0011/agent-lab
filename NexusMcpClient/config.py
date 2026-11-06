@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-DEFAULT_NEXUS_MCP_URL = "https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com/mcp/"
 DEFAULT_TRANSPORT = "stdio"
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8001
@@ -27,7 +26,9 @@ class BridgeConfig:
         api_key = os.environ.get("AGENT_API_KEY", "").strip()
         if not api_key:
             raise ValueError("AGENT_API_KEY is required")
-        url = os.environ.get("NEXUS_MCP_URL", DEFAULT_NEXUS_MCP_URL).strip()
+        url = os.environ.get("NEXUS_MCP_URL", "").strip()
+        if not url:
+            raise ValueError("NEXUS_MCP_URL is required (e.g. https://<vm-host>/mcp/)")
         if not url.startswith(("https://", "http://")):
             raise ValueError("NEXUS_MCP_URL must use http:// or https://")
         if not url.endswith("/"):

@@ -72,10 +72,6 @@ class MailboxConfig:
     # Convenience
     # ------------------------------------------------------------------
 
-    @property
-    def repos_are_separate(self) -> bool:
-        """True when code and mailbox paths point to different directories."""
-        return self.code_repo_path.resolve() != self.mailbox_repo_path.resolve()
 
 
 # ---------------------------------------------------------------------------

@@ -169,6 +169,22 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
             )
             return
 
+        if result.status == _base._STATUS_READY_FOR_REVIEW:
+            task_log.info(
+                "finalization",
+                "merge_refused",
+                result.summary,
+                experiment_id=exp.id,
+                finalization_phase=result.phase,
+            )
+            self._transition_finalization_terminal(
+                approval,
+                exp,
+                _base._STATUS_READY_FOR_REVIEW,
+                f"status=ready_for_review; not merged; {result.summary}",
+            )
+            return
+
         task_log.warning(
             "finalization",
             "finalization_needs_review",

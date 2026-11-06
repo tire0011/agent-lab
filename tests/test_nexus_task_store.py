@@ -22,20 +22,7 @@ class NexusTaskStoreEventIdTests(unittest.TestCase):
         self.assertIsInstance(event_id, int)
         self.assertGreater(event_id, 0)
 
-    def test_get_event_returns_full_raw_content_by_id(self):
-        session = self.store.get_or_create(source_type="task", source_id="t-2")
-        big_content = "x" * 15000
-        event_id = self.store.append_event(
-            session.id, role="tool", kind="command", content=big_content, metadata={"reason": "test"}
-        )
-        event = self.store.get_event(event_id)
-        self.assertIsNotNone(event)
-        self.assertEqual(event["id"], event_id)
-        self.assertEqual(event["content"], big_content)
-        self.assertEqual(event["metadata"], {"reason": "test"})
 
-    def test_get_event_returns_none_for_unknown_id(self):
-        self.assertIsNone(self.store.get_event(999999))
 
     def test_recent_events_filters_raw_journal_events_newest_first(self):
         session = self.store.get_or_create(source_type="task", source_id="t-recent")
@@ -98,6 +85,23 @@ class NexusTaskStoreEventIdTests(unittest.TestCase):
         unbounded = self.store.history(session.id)
         contents_unbounded = [event["content"] for event in unbounded]
         self.assertIn("later observation", contents_unbounded)
+
+    def test_user_inputs_are_full_ordered_and_skip_collector_internal_rows(self):
+        session = self.store.get_or_create(source_type="task", source_id="t-inputs")
+        original = "x" * 5000 + "\nUNIQUE-END-MARKER"
+        self.store.append_event(session.id, role="user", kind="input", content=original)
+        self.store.append_event(
+            session.id,
+            role="user",
+            kind="input",
+            content="internal lookup",
+            metadata={"knowledge_collector_internal": True},
+        )
+        self.store.append_event(session.id, role="assistant", kind="answer", content="reply")
+        self.store.append_event(session.id, role="user", kind="input", content="clarification")
+
+        self.assertEqual(self.store.user_inputs(session.id), [original, "clarification"])
+        self.assertEqual(len(self.store.history(session.id)[0]["content"]), 1800)
 
 
 if __name__ == "__main__":

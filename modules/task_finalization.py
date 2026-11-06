@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.nexus_reviewer import default_reviewer
 from modules.experiment_adoption_service import (
     _NullExperimentLogger,
     STATUS_ADOPTED,
@@ -20,6 +21,7 @@ from modules.experiment_adoption_service import (
     STATUS_FAILED,
     STATUS_INTERRUPTED,
     STATUS_NEEDS_REVIEW,
+    STATUS_READY_FOR_REVIEW,
     STATUS_NOT_STARTED,
     STATUS_QUEUED,
     ExperimentAdoptionError,
@@ -40,6 +42,7 @@ PHASE_RESTART_REQUESTED = "restart_requested"
 PHASE_VALIDATING_LIVE = "validating_live"
 PHASE_SUCCEEDED = "succeeded"
 PHASE_NEEDS_REVIEW = "needs_review"
+PHASE_READY_FOR_REVIEW = "ready_for_review"
 
 # Prefix of the error a finalization attempt records when adoption could
 # not even be started. It is a shared constant because the needs_review
@@ -56,7 +59,7 @@ _DEFAULT_RESTART_TIMEOUT_SECONDS = 600
 # one that works may stop this very process before it returns.
 _RESTART_FAILURE_WINDOW_SECONDS = 5
 _ACTIVE_APPROVAL_STATUSES = {
-    "pending_approval", "approved", "submitted", "running", "nexus_deciding",
+    "queued", "pending_approval", "approved", "submitted", "running", "nexus_deciding",
 }
 # Restarted after an adopted change. scripts/setup-nexus-permissions.sh grants
 # the service user exactly the transient-unit command assembled below.
@@ -131,6 +134,7 @@ class TaskFinalizationCoordinator:
             db_path=db_path,
             repo_root=str(self.repo_root),
             github_work_tracking=github_work_tracking,
+            reviewer=default_reviewer(db_path),
         )
         self._owns_adoption_service = adoption_service is None
         self._restart_runner = restart_runner or self._restart_services
@@ -163,13 +167,18 @@ class TaskFinalizationCoordinator:
                 """
             )
 
-    def get_phase(self, approval_id: str) -> str | None:
-        state = self._get(approval_id)
-        return state.phase if state is not None else None
-
     def advance(self, approval: Any, experiment: Any) -> FinalizationResult:
         state = self._get_or_create(str(approval.id), str(experiment.id))
         adoption = self.adoption_service.get(str(experiment.id))
+
+        if adoption.status == STATUS_READY_FOR_REVIEW:
+            state.phase = PHASE_READY_FOR_REVIEW
+            self._save(state)
+            return FinalizationResult(
+                PHASE_READY_FOR_REVIEW,
+                state.phase,
+                f"pull request open, not merged: {getattr(adoption, 'reason', None) or 'the task forbids the merge'}",
+            )
 
         superseded: Any | None = None
         review_retry: Any | None = None

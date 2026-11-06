@@ -93,7 +93,7 @@
     for it (section 13), and the response says which one in `provider`; no worker
     logic duplicated in `api.py`. `working_dir` (`/agent`) and `sandbox`
     (`read-only`) are fixed server-side; `timeout_seconds` is capped at
-    120s. Synchronous only — no queue, no parallel execution, no chat/Web UI
+    120s. Synchronous only — no queue, no parallel execution, no chat
     wiring yet. `mark_interrupted_tasks_failed()` runs once via FastAPI's
     lifespan startup hook to mark orphaned `running` tasks as `failed`
     without restarting them.
@@ -125,7 +125,7 @@
 - Mailbox repository: the checkout configured by `AGENT_MAILBOX_REPO_PATH`
 - Inbox: root-level `inbox/` — Markdown files with YAML front matter
 - Outbox: root-level `outbox/` — response files written per processed message
-- Message types: `idea` (appended to IDEAS.md), `task` (body stored, `pending_approval` record created in `mailbox_task_approvals`), `question` (acknowledged), `context` (stored in `knowledge` table)
+- Message types: `idea` (appended to IDEAS.md), `task` (body stored, `queued` record created in `mailbox_task_approvals` and handed to Nexus), `question` (acknowledged), `context` (stored in `knowledge` table)
 - Safety: max 64 KB, no binary/symlinks/path-traversal, secret pattern detection, max 3 retries
 - Git integration: commits outbox + IDEAS.md (idea type only), pushes to tracked branch
 - Lock: `state/mailbox.lock` via `fcntl.flock` prevents concurrent runs on the Ubuntu deployment; the implementation includes a Windows fallback for portable local checks
@@ -191,14 +191,15 @@
   is computed, so a further restart replays the same cached reply instead
   of re-deriving or duplicating it.
 
-### 7) Mailbox task approval bridge
+### 7) Mailbox task bridge
 
 - Module: `modules/mailbox/task_service.py`
-- Table: `mailbox_task_approvals` in SQLite
-- State machine: `pending_approval → approved → submitted → running → succeeded / failed / needs_review`
-- Human operators approve/reject via authenticated API (`POST /mailbox/tasks/{id}/approve`) or Web UI
-- On approval, `ExperimentService.create_experiment` + `run_experiment` run in a daemon thread
-- `MailboxTaskWorker` daemon polls every 10 s (`submit_approved` + `poll_running`)
+- Table: `mailbox_task_approvals` in SQLite (name kept from the removed approval step, #264)
+- State machine: `queued → submitted → running → succeeded / failed / needs_review`
+- No approval step: a queued task is handed to the local Nexus controller, which chooses the action
+- For `new_experiment`, `ExperimentService.create_experiment` + `run_experiment` run in a daemon thread
+- `MailboxTaskWorker` daemon polls every 10 s (`submit_queued` + `poll_running`)
+- Legacy `pending_approval`/`rejected` rows stay readable and are never run; `approved` rows were migrated to `queued`
 - Terminal states write outbox files; `failed`/`needs_review` also write a problem JSON to `state/runs/`
 
 ### 8) Adoption restart recovery
@@ -253,7 +254,12 @@
   reported through `abandoned_work()` and otherwise ignored — see D-017.
 - Audit: `nexus_initiative_log` records every tick (decision, chosen source,
   reason, what else was considered, failure detail), readable via
-  `NexusInitiativeService.history()`.
+  `NexusInitiativeService.history()`. An open issue out of attempts is logged
+  as `skipped_attempts_exhausted` once per set of experiments, gets one GitHub
+  comment and is listed in the planning prompt, but stays unselectable.
+  A pipeline crash is not an attempt (#467): after two crashes the issue is
+  reported the same way, but returns once the local `origin/main` ref has a
+  commit newer than the last crash. Crashes stay in the daily budget.
 
 ### 10) Work heartbeats (explicit liveness)
 
@@ -368,11 +374,13 @@
   `error_kind`, and the session they belong to. `role` is observability
   only - it never changes how a job runs - so one feature's local-model
   traffic can be read back without filtering another's.
-- No caller-side deadline. A waiter blocks for as long as the job legitimately
-  takes; the service's own watchdog
-  (`NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS`, default 1h, clamped 5m-2h) is the
-  HTTP read timeout, and a `running` job that outlives it by the grace window
-  is swept to `failed` with `error_kind=stuck`, which releases its waiter.
+- No caller-side deadline. A waiter blocks until its job is terminal; the
+  service's own watchdog (`NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS`, default 15m,
+  clamped 1m-2h) is one hard deadline per model call, for every role. A call
+  that reaches it is cancelled and fails with `error_kind=timeout` (#236),
+  and a `running` job that outlives it by the grace window (a wedged worker)
+  is swept to `failed` with `error_kind=stuck`. Either way the waiter is
+  released; the controller then uses its external-provider fallback.
 - Terminal writes are guarded by status *and* ownership: a job cancelled
   (`cancel()`), swept as stuck, or reclaimed from a lapsed lease while its
   request was still in flight stays terminal, and the late result is
@@ -389,6 +397,8 @@
   `modules/tool_loop_guard.py` (duplicate/non-progressing protection).
   Callers: `modules/task_orchestrator.py` (the persistent controller) and
   `modules/failure_analysis_service.py` (diagnosis, #172).
+  `modules/tool_router_mcp.py` exposes the same router to external MCP clients
+  over stdio, read-only (#118, `docs/issue-118-tool-router-mcp.md`).
 - `find_tool` resolves one plain-language capability request against the
   read-only catalog and returns that operation's schema; `call_tool` runs an
   operation only when a `find_tool` result in the same session already
@@ -501,7 +511,7 @@
 2. **Persistent storage**
    - Keep SQLite-backed structured run store and evolve reporting/migrations as needed.
 3. **Benchmark harness**
-   - Reproducible V0 vs V1 comparison pipeline.
+   - Reproducible V0 vs V1 comparison pipeline. For `new_experiment` this exists: see `benchmarks/README.md`.
 4. **Provider abstraction layer**
    - Decouple agent runtime from single provider/model.
 5. **Evaluation gate**
@@ -517,6 +527,6 @@
 ## Known gaps
 
 - No persistent relational metrics store yet.
-- No formal benchmark suite checked into repo yet.
+- The experiment benchmark (`benchmarks/`, #343) has no stored baseline yet.
 - No finalized policy/eval framework for autonomous self-modification yet.
 - External ChatGPT-to-endpoint integration is not yet dependable.
