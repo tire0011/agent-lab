@@ -25,6 +25,7 @@ from modules.coding_provider import (
     provider_of,
     random_worker_factory,
 )
+from modules.experiment_handover import HANDOVER_HEADING
 from modules.local_coding_worker import LocalCodingWorker, PROVIDER as PROVIDER_LOCAL
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
@@ -80,6 +81,20 @@ from .text_utils import _truncate_text, _utcnow_iso
 logger = logging.getLogger("modules.experiment_service")
 
 _GITHUB_ISSUE_GOAL_RE = re.compile(r"^GitHub Issue #(\d+):")
+
+
+def _derive_task_key(goal: str) -> str:
+    """Task identity for a goal when the caller names none (#276).
+
+    A ``GitHub Issue #N:`` goal belongs to issue N; any other goal is its task
+    text without the handover, which differs from one attempt to the next.
+    """
+    text = (goal or "").strip()
+    issue = _GITHUB_ISSUE_GOAL_RE.match(text)
+    if issue is not None:
+        return f"issue:{int(issue.group(1))}"
+    head, _sep, _rest = text.partition(HANDOVER_HEADING)
+    return "goal:" + head.strip()
 
 # Statuses worth journalling at WARNING (vs INFO); kept as a small fixed set here
 # so lifecycle logging in ``_transition``/``_force_status`` stays centralized.
@@ -458,6 +473,7 @@ class ExperimentService:
         goal: str,
         timeout_seconds: int = _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
         complexity: str | None = None,
+        task_key: str | None = None,
     ) -> Experiment:
         if not goal or not goal.strip():
             raise ValueError("goal must not be empty")
@@ -468,6 +484,7 @@ class ExperimentService:
         normalized_complexity = "small" if complexity == "small" else "large"
         issue_match = _GITHUB_ISSUE_GOAL_RE.match(normalized_goal)
         issue_number = int(issue_match.group(1)) if issue_match is not None else None
+        normalized_task_key = (task_key or "").strip() or _derive_task_key(normalized_goal)
         experiment_id = uuid.uuid4().hex
         created_at = _utcnow_iso()
 
@@ -500,10 +517,13 @@ class ExperimentService:
                         raise ExperimentAlreadyActiveError(active["id"], active["status"])
                 self._conn.execute(
                     """
-                    INSERT INTO experiments (id, goal, status, created_at, complexity)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO experiments (id, goal, status, created_at, complexity, task_key)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at, normalized_complexity),
+                    (
+                        experiment_id, normalized_goal, STATUS_QUEUED, created_at,
+                        normalized_complexity, normalized_task_key,
+                    ),
                 )
                 insert_activity(
                     self._conn,
@@ -539,24 +559,26 @@ class ExperimentService:
         return _row_to_experiment(row)
 
     def _failed_local_attempt(self, experiment: Experiment) -> bool:
-        """Whether this task already spent its one local-model attempt."""
-        issue = _GITHUB_ISSUE_GOAL_RE.match(experiment.goal)
+        """Whether this task already spent its one local-model attempt (#276).
+
+        Experiments of one task share a ``task_key``: the mailbox task id for
+        mailbox work, ``issue:N`` for GitHub-issue goals, otherwise the goal
+        without its handover. The handover changes between attempts, so the
+        full goal text is never the identity.
+        """
+        task_key = experiment.task_key or _derive_task_key(experiment.goal)
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT goal FROM experiments
+                SELECT goal, task_key FROM experiments
                 WHERE id != ? AND status = ? AND implementation_provider = ?
                 """,
                 (experiment.id, STATUS_FAILED, PROVIDER_LOCAL),
             ).fetchall()
-        if issue is not None:
-            issue_number = int(issue.group(1))
-            return any(
-                (match := _GITHUB_ISSUE_GOAL_RE.match(row["goal"])) is not None
-                and int(match.group(1)) == issue_number
-                for row in rows
-            )
-        return any(row["goal"] == experiment.goal for row in rows)
+        return any(
+            (row["task_key"] or _derive_task_key(row["goal"])) == task_key
+            for row in rows
+        )
 
     def _implementation_worker(self, experiment: Experiment, worktree_path: str) -> Any:
         if experiment.complexity == "small" and not self._failed_local_attempt(experiment):

@@ -124,6 +124,8 @@ class Experiment:
     # experiments from before the second agent existed.
     implementation_provider: str | None = None
     complexity: str = "large"
+    # Identity of the task this experiment works on (#276 fallback).
+    task_key: str | None = None
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
@@ -177,6 +179,7 @@ class Experiment:
             "selection_ended_at": self.selection_ended_at,
             "implementation_provider": self.implementation_provider,
             "complexity": self.complexity,
+            "task_key": self.task_key,
             "implementation_started_at": self.implementation_started_at,
             "implementation_ended_at": self.implementation_ended_at,
             "ended_at": self.ended_at,
@@ -239,6 +242,7 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
             else None
         ),
         complexity=(row["complexity"] if "complexity" in row.keys() else "large"),
+        task_key=(row["task_key"] if "task_key" in row.keys() else None),
         implementation_started_at=row["implementation_started_at"],
         implementation_ended_at=row["implementation_ended_at"],
         ended_at=row["ended_at"],

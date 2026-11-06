@@ -578,6 +578,10 @@ class MailboxTaskService:
                         decision.experiment_handover if decision is not None else None,
                     ),
                     complexity=decision.complexity if decision is not None else "large",
+                    # Every experiment of this mailbox task shares one identity,
+                    # so a failed local attempt hands the retry to an external
+                    # agent (#276) whatever the goal text says.
+                    task_key=f"mailbox:{approval.id}",
                 )
             except ExperimentAlreadyActiveError as exc:
                 task_log.info(

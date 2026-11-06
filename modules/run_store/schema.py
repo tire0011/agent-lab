@@ -165,6 +165,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             research_diagnostic_log TEXT NULL,
             implementation_provider TEXT NULL,
             complexity TEXT NOT NULL DEFAULT 'large',
+            task_key TEXT NULL,
             implementation_started_at TEXT NULL,
             implementation_ended_at TEXT NULL,
             ended_at TEXT NULL,
@@ -323,6 +324,9 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # Which coding agent ran the implementation phase (codex | claude).
     ("implementation_provider", "TEXT"),
     ("complexity", "TEXT NOT NULL DEFAULT 'large'"),
+    # Which task an experiment belongs to, so a failed local attempt sends the
+    # next experiment of the same task to an external agent (#276).
+    ("task_key", "TEXT"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
     # Process group of the live worker, so the stall sweep (#400) can stop it

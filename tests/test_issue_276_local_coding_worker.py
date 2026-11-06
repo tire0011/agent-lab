@@ -84,6 +84,69 @@ class ComplexityRoutingTests(unittest.TestCase):
         self.assertIs(worker, self.external)
         local_cls.assert_not_called()
 
+    @patch("modules.experiment_service.service.LocalCodingWorker")
+    def test_failed_local_attempt_forces_same_mailbox_task_to_external(self, local_cls):
+        # Mailbox goals carry a handover that changes between attempts and no
+        # "GitHub Issue #N:" prefix; the task identity must still match.
+        first = self.service.create_experiment(
+            "Fix the parser\n\nWhat Nexus already found (handover):\n\nfirst notes",
+            complexity="small",
+            task_key="mailbox:task-1",
+        )
+        self.service._force_status(
+            first.id, STATUS_FAILED, implementation_provider="local", error="bad patch"
+        )
+        retry = self.service.create_experiment(
+            "Fix the parser\n\nWhat Nexus already found (handover):\n\nlocal patch failed",
+            complexity="small",
+            task_key="mailbox:task-1",
+        )
+        self.assertEqual(retry.task_key, "mailbox:task-1")
+        self.assertIs(self.service._implementation_worker(retry, "/tmp/retry"), self.external)
+        local_cls.assert_not_called()
+
+    @patch("modules.experiment_service.service.LocalCodingWorker")
+    def test_failed_local_attempt_does_not_affect_other_mailbox_task(self, local_cls):
+        local = MagicMock()
+        local_cls.return_value = local
+        first = self.service.create_experiment(
+            "Fix the parser", complexity="small", task_key="mailbox:task-1"
+        )
+        self.service._force_status(
+            first.id, STATUS_FAILED, implementation_provider="local", error="bad patch"
+        )
+        other = self.service.create_experiment(
+            "Fix the parser", complexity="small", task_key="mailbox:task-2"
+        )
+        self.assertIs(self.service._implementation_worker(other, "/tmp/other"), local)
+
+    @patch("modules.experiment_service.service.LocalCodingWorker")
+    def test_failed_local_attempt_matches_goal_without_handover(self, local_cls):
+        first = self.service.create_experiment(
+            "Fix the parser\n\nWhat Nexus already found (handover):\n\nA",
+            complexity="small",
+        )
+        self.service._force_status(
+            first.id, STATUS_FAILED, implementation_provider="local", error="bad patch"
+        )
+        retry = self.service.create_experiment(
+            "Fix the parser\n\nWhat Nexus already found (handover):\n\nB",
+            complexity="small",
+        )
+        self.assertIs(self.service._implementation_worker(retry, "/tmp/retry"), self.external)
+        local_cls.assert_not_called()
+
+    @patch("modules.experiment_service.service.LocalCodingWorker")
+    def test_succeeded_or_external_failure_keeps_local_for_small(self, local_cls):
+        local = MagicMock()
+        local_cls.return_value = local
+        first = self.service.create_experiment("x", complexity="large", task_key="mailbox:t")
+        self.service._force_status(
+            first.id, STATUS_FAILED, implementation_provider="codex", error="boom"
+        )
+        retry = self.service.create_experiment("x", complexity="small", task_key="mailbox:t")
+        self.assertIs(self.service._implementation_worker(retry, "/tmp/r"), local)
+
 
 if __name__ == "__main__":
     unittest.main()
