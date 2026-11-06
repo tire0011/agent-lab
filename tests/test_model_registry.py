@@ -39,8 +39,6 @@ def _plain_ok_transport(calls: list):
 
 
 REPO_MODELS = {
-    "github-gpt-4.1-mini": ("https://models.github.ai/inference", "openai/gpt-4.1-mini", "GITHUB_MODELS_TOKEN"),
-    "github-gpt-4.1": ("https://models.github.ai/inference", "openai/gpt-4.1", "GITHUB_MODELS_TOKEN"),
     "mistral-small": ("https://api.mistral.ai/v1", "mistral-small-latest", "MISTRAL_API_KEY"),
     "codestral": ("https://codestral.mistral.ai/v1", "codestral-latest", "CODESTRAL_API_KEY"),
     "gemini-3.8-flash": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.8-flash", "GEMINI_API_KEY"),
@@ -64,7 +62,7 @@ class RegistryTests(unittest.TestCase):
 
     def test_each_new_entry_is_off_without_its_own_key(self):
         models = {m.id: m for m in mr.load_models()}
-        for model_id in ("github-gpt-4.1-mini", "mistral-small", "codestral", "gemini-3.8-flash", "gemini-3.5-flash-lite"):
+        for model_id in ("mistral-small", "codestral", "gemini-3.8-flash", "gemini-3.5-flash-lite"):
             with self.subTest(model=model_id):
                 spec = models[model_id]
                 with patch.dict(os.environ, {}, clear=True):
@@ -74,22 +72,22 @@ class RegistryTests(unittest.TestCase):
                     self.assertTrue(spec.available)
 
     def test_configured_headers_are_sent(self):
-        spec = next(m for m in mr.load_models() if m.id == "github-gpt-4.1-mini")
+        spec = mr.ModelSpec("x", "https://x.example/v1", "m", "free", api_key_env="KEY_X",
+                            headers=(("Accept", "application/json"), ("X-Test", "1")))
         calls: list = []
 
         def send(url, headers, body):
             calls.append((url, dict(headers)))
             return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
-        with patch.dict(os.environ, {"GITHUB_MODELS_TOKEN": "secret-gh"}, clear=True):
+        with patch.dict(os.environ, {"KEY_X": "secret-x"}, clear=True):
             result = mr.chat(spec, "hi", transport=send)
         self.assertTrue(result.success)
         url, sent = calls[0]
-        self.assertEqual(url, "https://models.github.ai/inference/chat/completions")
-        self.assertEqual(sent.get("Accept"), "application/vnd.github+json")
-        self.assertEqual(sent.get("X-GitHub-Api-Version"), "2022-11-28")
-        self.assertEqual(sent.get("Authorization"), "Bearer secret-gh")
-        self.assertNotIn("secret-gh", result.error + result.content)
+        self.assertEqual(url, "https://x.example/v1/chat/completions")
+        self.assertEqual(sent.get("X-Test"), "1")
+        self.assertEqual(sent.get("Authorization"), "Bearer secret-x")
+        self.assertNotIn("secret-x", result.error + result.content)
 
     def test_a_new_provider_is_only_a_config_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,12 +173,12 @@ class DelegationTests(unittest.TestCase):
     def test_free_tier_is_offered_and_answers_with_its_cost(self):
         from modules import nexus_delegation
 
-        with patch.dict(os.environ, {"GITHUB_MODELS_TOKEN": "t"}, clear=True):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "t"}, clear=True):
             providers = {p["provider"]: p["cost"] for p in nexus_delegation._registry_catalog()}
             self.assertEqual(providers.get("free_tier"), "free")
-            self.assertIn("model:github-gpt-4.1-mini", providers)
+            self.assertIn("model:gemini-3.8-flash", providers)
             service = nexus_delegation.NexusDelegationService.__new__(nexus_delegation.NexusDelegationService)
-            with patch.object(mr, "chat_first", return_value=mr.ChatResult("github-gpt-4.1-mini", "free", True, "ok")):
+            with patch.object(mr, "chat_first", return_value=mr.ChatResult("gemini-3.8-flash", "free", True, "ok")):
                 result = asyncio.run(service._registry("free_tier", "task", ""))
         self.assertTrue(result.success)
         self.assertEqual(result.metadata["cost"], "free")
