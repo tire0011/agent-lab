@@ -336,5 +336,37 @@ class PruneCommitTests(_MailboxRepoFixture, unittest.TestCase):
         self.assertIn("exit code 255", json.dumps(discarded[0]))
 
 
+    def test_a_discarded_inbox_message_leaves_an_answer_in_the_outbox(self):
+        # #521: the sender learns why the message never ran.
+        stuck = self.inbox / "202608291430-status-claude.md"
+        stuck.write_text("body\n", encoding="utf-8")
+        self.conn.execute(
+            """
+            INSERT INTO mailbox_messages
+                (file_path, source_commit_sha, msg_type, created_by, status,
+                 received_at, retry_count, last_error)
+            VALUES (?, 'sha', 'command', 'Claude', 'failed',
+                    '2026-08-29T14:30:00Z', ?, 'TypeError: unexpected keyword')
+            """,
+            (str(stuck), MAX_RETRY),
+        )
+        self.conn.commit()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-m", "add inbox")
+
+        with patch.dict(os.environ, {retention.ENV_RETENTION_DAYS: "5"}):
+            self._processor().prune_old_messages(now=NOW)
+
+        notice = self.outbox / "failed-202608291430-status-claude.md"
+        self.assertTrue(notice.exists())
+        text = notice.read_text(encoding="utf-8")
+        self.assertIn("TypeError: unexpected keyword", text)
+        self.assertIn("**Type:** command", text)
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", str(notice.relative_to(self.repo))],
+            cwd=str(self.repo), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertTrue(tracked, "the notice is committed with the prune")
+
 if __name__ == "__main__":
     unittest.main()

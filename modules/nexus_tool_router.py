@@ -1,39 +1,12 @@
 """One MCP-style tool mechanism, shared by every Nexus LLM role (#172).
 
-Tool discovery (``find_tool``) and read-only tool execution (``call_tool``)
-used to live inside :class:`~modules.task_orchestrator.NexusTaskOrchestrator`,
-which meant only the persistent controller could reach them. Every other
-Nexus role - failure analysis first among them - could describe evidence it
-had been handed but never go and *check* anything, so a stale persisted
-error string was indistinguishable from a current one.
-
-This module holds that mechanism instead, so the controller and the other
-roles drive the same code: the same ``OperationsRegistry`` catalog, the same
-declared read-only boundary, the same candidate scoring, the same resolver
-prompt and schema, the same "``call_tool`` needs a prior ``find_tool`` grant"
-rule, and the same registry-side validation, redaction and audit logging.
-Roles differ only in what they are *allowed* to do with it, not in how it
-works.
-
-What "read-only" means is declared by each capability (``mutates_state`` on
-its :class:`~modules.operations_registry.OperationSpec`) and never inferred
-from a list of known-mutating names. A denylist would make a capability
-added later read-only by default, so a role that may only read would gain
-privileges nobody granted it; declaring access per capability means a new
-mutating operation is invisible to that role with no central list to
-maintain.
-
-Two things are deliberately injected rather than owned here:
-
-* **Inference** (*schema_completion*). The controller routes its resolver
-  calls through a memory budget with an external-provider fallback; failure
-  analysis just queues a job on the shared local-LLM service. Both end up
-  calling the same resolver prompt with the same response schema.
-* **Grants** (*grant_ledger*). The controller's grants are persistent
-  session events; a one-shot diagnostic role only needs the grants issued
-  during its own bounded run (:class:`InMemoryToolGrantLedger`). The rule
-  itself - no ``call_tool`` without a matching ``find_tool`` result - is
-  enforced here for everyone.
+Tool discovery (``find_tool``) and read-only execution (``call_tool``) drive the same
+``OperationsRegistry`` catalog, resolver prompt/schema, grant rule (``call_tool`` needs
+a prior ``find_tool``), validation, redaction and audit for every role. "Read-only" is
+declared per capability (``mutates_state``), never inferred from a denylist - a new
+mutating operation is invisible to read-only roles by default. Inference
+(*schema_completion*) and grants (*grant_ledger*) are injected per role; the grant
+rule itself is enforced here for everyone.
 """
 
 from __future__ import annotations
@@ -51,9 +24,9 @@ from modules.llama_cpp_client import (
 )
 from modules.prompt_budget import prompt_json
 from modules.redaction import redact_secrets
-# From the leaf, never from `operations_registry` itself: that module imports
-# mailbox_processor, which reaches back here, so importing it from this side
-# closes the cycle and half-builds whichever module loaded first.
+# Import from the leaf, never from `operations_registry` itself: that module imports
+# mailbox_processor, which reaches back here, so importing it from this side closes the
+# cycle.
 from modules.operation_contract import OperationValidationError, normalize_integer_argument
 
 logger = logging.getLogger(__name__)
@@ -61,9 +34,8 @@ logger = logging.getLogger(__name__)
 TOOL_FIND_TOOL = "find_tool"
 ACTION_CALL_TOOL = "call_tool"
 
-# Action names the not-found metadata below can point a caller at. Defined
-# here rather than imported from the orchestrator so the dependency runs one
-# way only (orchestrator -> router); the orchestrator re-exports them.
+# Action names the not-found metadata can point at, defined here (not imported) so the
+# dependency runs one way only: orchestrator -> router.
 ACTION_RESUME_EXPERIMENT = "resume_experiment"
 ACTION_MISSING_CAPABILITY = "missing_capability"
 ACTION_COMMAND = "command"
@@ -72,32 +44,22 @@ ACTION_RESOLVE_RELATED_OPERATION = "resolve_related_operation"
 
 MAX_RESOLVER_CANDIDATES = 5
 
-# How many alternatives a terminal not_found carries, and how much of each
-# description it keeps. The caller is a small local model reading this inside
-# an already-budgeted prompt, so "everything we know" would push the rest of
-# the observations out; the best few, fully described, are what it can act on.
+# How many alternatives a terminal not_found carries and how much of each description: the
+# caller is a small model inside an already-budgeted prompt - the best few, fully
+# described, are what it can act on.
 MAX_RELATED_OPERATIONS = 3
 MAX_RESOLVER_RAW_CHARS = 600
 MAX_RELATED_DESCRIPTION_CHARS = 300
 MAX_WHY_RELEVANT_TERMS = 5
 
-# The example a caller is pointed at when its goal was unusable. It must name
-# a capability find_tool can actually resolve: the goal that produced #218
-# ("run a shell command in the repository") was copied verbatim out of this
-# guidance and out of the controller prompt's example, and shell execution is
-# a controller-native action that the read-only OperationsRegistry will never
-# contain - so the illustration itself guaranteed a not_found.
-# Shown only *after* a goal was rejected, as the corrective example. It has to
-# be a goal the resolver actually resolves: the previous one was rejected by
-# the resolver itself as "too generic", so the correction pointed at another
-# dead end. This wording is one of the standing evaluation cases and resolves
-# to git_status.
+# The corrective example shown after an unusable goal: it must name a capability find_tool
+# can actually resolve. The old example ("run a shell command in the repository") was copied
+# verbatim by the model and guaranteed a not_found, since shell execution is
+# controller-native and never in the read-only registry (#218).
 FIND_TOOL_GOAL_EXAMPLE = "inspect whether the Nexus repository has local changes"
-# What the controller prompt shows in its place. The small local model copies
-# the example goal verbatim - it did so with the old one, and it did so again
-# with this one, which the resolver then rejected as too generic after a
-# three-minute call. A placeholder that cannot be mistaken for a goal is caught
-# here instead, in microseconds, with guidance to describe the real capability.
+# The placeholder the controller prompt shows instead: the small model copies example goals
+# verbatim, and one that cannot be mistaken for a goal is caught here in microseconds
+# rather than after a three-minute resolver call.
 FIND_TOOL_GOAL_PLACEHOLDER = "<the concrete capability this task needs>"
 FIND_TOOL_GOAL_GUIDANCE = (
     f"Describe the operation you need, e.g. '{FIND_TOOL_GOAL_EXAMPLE}'."
@@ -110,17 +72,12 @@ NOT_FOUND_GUIDANCE = (
     "choose missing_capability when none of them can satisfy the need."
 )
 
-# A goal that asks to *run* something rather than to read a specific piece of
-# Nexus state. find_tool searches the read-only OperationsRegistry only, so it
-# can never resolve one of these - but the controller owns both natively, and
-# saying which one stops the caller searching for it a second time.
-#
-# Anchored on the verb, never on the noun. "inspect the python module versions
-# installed" and "show the command line arguments of the running process" are
-# read-only lookups that merely mention python and commands; answering either
-# with "execute this yourself" would turn a request to read state into a
-# request to run something, which is the one direction that must never be
-# guessed.
+# Goals that ask to *run* something, which find_tool can never resolve (read-only
+# registry only); the controller owns those natively, and naming the owning action stops a
+# second search. Anchored on the verb, never the noun: "inspect the python module versions"
+# is a read-only lookup that merely mentions python - answering it with "execute this
+# yourself" would turn a read request into a run request, the one direction that must
+# never be guessed.
 _EXECUTION_VERBS = r"(?:run|runs|running|execute|executes|executing|invoke|invokes|invoking)"
 _SHELL_GOAL_PATTERN = re.compile(
     rf"\b{_EXECUTION_VERBS}\b[^.]{{0,24}}\b(?:shell|bash|zsh|terminal|commands?|command[- ]line)\b",
@@ -185,9 +142,8 @@ TOOL_RESOLVER_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
     "tool_resolver", TOOL_RESOLVER_SCHEMA
 )
 
-# A bare hex run is only a *candidate* experiment id: commit shas and dates match
-# it too, so every candidate is resolved against the experiment service before it
-# is treated as one (#164 review).
+# A bare hex run is only a *candidate* experiment id: commit shas and dates match it too,
+# so every candidate is resolved against the experiment service first (#164 review).
 EXPERIMENT_ID_PATTERN = re.compile(r"\b[0-9a-f]{8,32}\b", re.IGNORECASE)
 MAX_EXPERIMENT_ID_CANDIDATES = 5
 RESUME_INTENT_PATTERN = re.compile(r"\b(resume|continue|continuing)\b", re.IGNORECASE)
@@ -200,9 +156,9 @@ class ToolRouterError(RuntimeError):
 class ToolResolverUnavailableError(RuntimeError):
     """Inference for the resolver could not be performed.
 
-    Carries the ``provider`` label and reason wording the caller wants in the
-    resulting ``unavailable`` observation, so the injected inference path -
-    not this module - decides how its own failure modes read.
+    Carries the ``provider`` label and reason wording for the resulting ``unavailable``
+    observation - the injected inference path, not this module, decides how its own
+    failure modes read.
     """
 
     def __init__(self, detail: str, *, provider: str = "local", reason: str | None = None) -> None:
@@ -223,12 +179,10 @@ class ToolGrantLedger(Protocol):
 
 
 class InMemoryToolGrantLedger:
-    """Grants that live exactly as long as one bounded run.
+    """Grants that live exactly as long as one bounded run (e.g. failure analysis).
 
-    Enough for a role that resolves and calls a tool inside a single
-    operation (failure analysis) and has no persistent session to attach the
-    grant to. The rule it serves is the shared one: ``call_tool`` only ever
-    runs an operation some ``find_tool`` result already returned a schema for.
+    Serves the shared rule: ``call_tool`` only ever runs an operation some ``find_tool``
+    result already returned a schema for.
     """
 
     def __init__(self) -> None:
@@ -254,16 +208,12 @@ class InMemoryToolGrantLedger:
 
 
 def is_read_only(spec: Any) -> bool:
-    """Whether *spec* has declared itself safe for a read-only role.
+    """Whether *spec* declared itself safe for a read-only role.
 
-    Read-only is a declared property of a capability, never one inferred from
-    a list of known-bad names. A denylist gets the default backwards: an
-    operation added later is read-only until somebody remembers to exclude
-    it, so the privilege of a role that may only read grows on its own. Here
-    a spec that does not declare ``mutates_state`` is treated as mutating -
-    the direction that needs a decision is the unsafe one - which is why a
-    new mutating operation is invisible to such a role without any central
-    list being edited.
+    Read-only is a declared property, never inferred from known-bad names: a denylist gets
+    the default backwards (a new operation is read-only until someone excludes it). A spec
+    without ``mutates_state`` is treated as mutating - the direction that needs a decision
+    is the unsafe one.
     """
     declared = getattr(spec, "mutates_state", None)
     if not isinstance(declared, bool):
@@ -317,14 +267,11 @@ def invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
 
 
 def controller_native_capabilities(goal: str) -> list[str]:
-    """Controller actions a goal is asking for that find_tool cannot resolve.
+    """Controller actions a goal asks for that find_tool cannot resolve.
 
-    ``find_tool`` only ever searches the read-only OperationsRegistry, so a
-    goal about *running* a shell command or a Python script is unresolvable by
-    construction however it is worded. Naming the action that does own it turns
-    a dead end into a next step - and it is exactly the step missing from #218,
-    where the controller asked for shell execution, was told "not found", and
-    asked again.
+    ``find_tool`` only searches the read-only registry, so a goal about *running* something
+    is unresolvable by construction however it is worded. Naming the action that owns it
+    turns a dead end into a next step (#218).
     """
     text = str(goal or "")
     native: list[str] = []
@@ -342,11 +289,8 @@ def controller_native_capabilities(goal: str) -> list[str]:
 
 
 def why_relevant(goal: str, spec: Any) -> str:
-    """Why this alternative was offered, in terms the caller can check.
-
-    Derived from the overlap the candidate scorer itself used, so the answer is
-    the real reason the operation is on the list rather than a rationalisation
-    written afterwards.
+    """Why this alternative was offered, derived from the overlap the candidate scorer
+    itself used - the real reason, not a post-hoc rationalisation.
     """
     spec_tags = " ".join(str(tag) for tag in getattr(spec, "tags", []) or [])
     haystack = f"{spec.name} {spec.description} {spec_tags}"
@@ -381,12 +325,9 @@ def terminal_not_found_observation(
 ) -> dict[str, Any] | None:
     """The unresolved answer this exact lookup already produced, if any.
 
-    ``not_found`` and ``unavailable`` both count. Only the first is settled,
-    but the caller reaches this function having asked the identical question a
-    second time with nothing about the state changed - which the loop guard
-    refuses either way. Recognising both is what lets that refusal carry the
-    alternatives instead of a bare verdict, and what lets the repeat be
-    redirected rather than spent.
+    ``not_found`` and ``unavailable`` both count. Recognising both is what lets the loop
+    guard's refusal of the identical repeat carry the alternatives instead of a bare
+    verdict, and the repeat be redirected rather than spent.
     """
     return next(
         (
@@ -407,9 +348,9 @@ def terminal_not_found_guidance(
 ) -> dict[str, Any]:
     """Turn a refused repeat into an answer the caller can act on.
 
-    The loop guard says "you already called this"; on its own that leaves
-    the caller to guess what else to do, which is how the loop in #164
-    kept going. This carries the terminal lookup's alternatives back.
+    The loop guard says "you already called this"; without the terminal lookup's
+    alternatives the caller just guesses what else to do - which is how the #164 loop
+    kept going.
     """
     guidance: dict[str, Any] = {
         "status": "not_found",
@@ -429,9 +370,8 @@ def terminal_not_found_guidance(
     if recommended_operation:
         guidance["recommended_operation"] = recommended_operation
     if resolved is not None:
-        # The alternative is not merely suggested any more - it was resolved,
-        # and in the ordinary path already executed. Saying so is the
-        # difference between "try this" and "you have already done this".
+        # The alternative was not merely suggested - it was already resolved (and run): "try this"
+        # vs "you have already done this".
         guidance["already_resolved_operation"] = str(resolved.get("resolved_tool", ""))
         guidance["already_resolved_event_id"] = resolved.get("event_id")
         guidance["reason"] = (
@@ -448,11 +388,9 @@ def operation_already_resolved(
 ) -> dict[str, Any] | None:
     """The lookup that already resolved *operation* in this run, if any.
 
-    A redirect exists to turn a dead question into an answerable one. Once the
-    operation it points at has been resolved - and, in the ordinary path, run -
-    pointing at it again asks a question this run has already answered, and the
-    loop guard refuses the repeat as a duplicate. That is the loop the redirect
-    was supposed to prevent, arriving one step later (#218).
+    Once the operation a redirect points at has been resolved (and run), pointing at it
+    again asks a question this run already answered, and the loop guard refuses the repeat
+    - the loop the redirect was supposed to prevent, one step later (#218).
     """
     if not operation:
         return None
@@ -469,20 +407,13 @@ def operation_already_resolved(
 
 
 def related_operation_lookup_goal(prior: dict[str, Any]) -> str:
-    """A concrete find_tool goal aimed at the alternative already offered.
+    """A concrete find_tool goal aimed at an alternative already offered.
 
-    The dead goal cannot be asked again, but the operation it was answered with
-    can be looked up on its own terms. Built from the descriptor the terminal
-    lookup already returned, so the redirected lookup can only ever target an
-    operation this session was actually offered.
-
-    When the operation takes arguments, the dead goal's own wording is carried
-    along. The resolver binds argument values only from the goal it is given,
-    so a redirect built from the descriptor alone dropped the concrete values
-    the controller had already named - ``#224`` in "read github issue #224" -
-    and ``github_issue`` resolved without an ``issue_number``, costing another
-    controller round to supply it (#224). An operation that takes no arguments
-    has nothing to bind, so its goal stays the bare descriptor.
+    Built from the descriptor the terminal lookup returned, so the redirect can only target
+    an operation this session was actually offered. The dead goal's wording is carried
+    along because the resolver binds argument values only from the goal it is given - a
+    descriptor-only redirect dropped the concrete values the caller had named ("read github
+    issue #224" resolved without an ``issue_number``, #224).
     """
     operation = str(prior.get("recommended_operation") or "").strip()
     if not operation:
@@ -500,22 +431,21 @@ def related_operation_lookup_goal(prior: dict[str, Any]) -> str:
     original_goal = str(prior.get("goal") or "").strip()
     if (descriptor or {}).get("arguments") and original_goal:
         if original_goal.startswith(f"{operation}:"):
-            # The dead goal already is a redirect to this operation. Wrapping
-            # it again would produce a new goal every round and let the
-            # redirect chase itself; returning it unchanged lets the caller
-            # see it is the same lookup and leave the repeat to the loop guard.
+            # The dead goal already is a redirect to this operation; wrapping it again would mint a new
+            # goal every round and let the redirect chase itself - return it unchanged and let the
+            # loop guard see the repeat.
             return original_goal[:1000]
-        # The request goes first: the goal is cut at 1000 characters, and the
-        # values the request names are what the binding needs to find.
+        # The request goes first: the goal is cut at 1000 characters, and the values the request
+        # names are what the binding needs to find.
         goal = f"{operation}: {original_goal} ({description})" if description else (
             f"{operation}: {original_goal}"
         )
     return goal[:1000]
 
 
-# A number the goal names must be consumed by some argument. If one is left
-# over while an integer argument stayed unbound, a value was missed - and the
-# unbound argument would silently fall back to its default.
+# A number the goal names must be consumed by some argument; a leftover number with an
+# unbound integer argument means a value was missed and the argument would silently fall
+# back to its default.
 _GOAL_NUMBER_PATTERN = re.compile(r"\d+")
 
 
@@ -542,11 +472,10 @@ def _coerce_argument(argument: Any, value: Any) -> tuple[Any, str]:
 def _evidenced_in_goal(value: Any, goal: str) -> bool:
     """Whether *value* was read out of *goal* rather than invented.
 
-    The schema can say a value is well-formed; only the goal can say it is the
-    value that was asked for. ``service="agent-api"`` validates perfectly while
-    the goal said ``llama-server``, so well-formedness alone is not a check.
-    Numbers must match as whole tokens - otherwise ``limit=5`` would find its
-    evidence inside the ``50`` of "the last 50 commits".
+    The schema can say a value is well-formed; only the goal can say it is the value asked
+    for (``service="agent-api"`` validates perfectly while the goal said ``llama-server``).
+    Numbers must match as whole tokens - otherwise ``limit=5`` would find its evidence
+    inside the ``50`` of "the last 50 commits".
     """
     if isinstance(value, int) and not isinstance(value, bool):
         return re.search(rf"(?<!\d){value}(?!\d)", goal) is not None
@@ -559,23 +488,13 @@ def bind_resolved_arguments(
 ) -> tuple[dict[str, Any] | None, str]:
     """Argument values a resolved operation may be executed with, or ``None``.
 
-    ``None`` means the values cannot be trusted to represent the goal, and the
-    caller must fall back to asking rather than run something plausible. Every
-    rule here exists because the alternative is evidence that looks right about
-    the wrong subject - which a diagnosis cannot detect (#177 review):
-
-    * an unknown argument name, or a value the declared schema rejects;
-    * a value that does not appear in the goal, i.e. one the resolver invented;
-    * a required argument left unbound;
-    * *nothing* bound for an operation that takes arguments. Binding nothing
-      would mean executing on defaults, and "the goal did not say" is not the
-      same claim as "the goal asked for the default": that is exactly how
-      ``service_status for llama-server`` would have read ``agent-api``;
-    * a number left over in the goal while an integer argument stayed unbound,
-      which says a value was named but not picked up.
-
-    An operation that declares no arguments binds ``{}`` and stays directly
-    executable, since there is nothing about it a goal could disagree with.
+    ``None`` means the values cannot be trusted to represent the goal - never run something
+    plausible the goal did not ask for (#177 review). Rejected: unknown argument names,
+    schema-invalid values, values absent from the goal (invented), unbound required
+    arguments, *nothing* bound for an operation that takes arguments (executing on defaults
+    is how ``llama-server`` would have read ``agent-api``), and a leftover number in the
+    goal while an integer argument stayed unbound. An operation with no declared arguments
+    binds ``{}`` and stays directly executable.
     """
     by_name = {
         getattr(argument, "name", ""): argument
@@ -679,22 +598,6 @@ class NexusToolRouter:
         self.caller = caller
         self.controller = controller
 
-    # ------------------------------------------------------------------
-    # Catalog / candidate selection
-    # ------------------------------------------------------------------
-
-    def read_only_operation_specs(self) -> list[Any]:
-        """The capabilities a read-only role may discover and call.
-
-        The whole surface of that role: ``find_tool`` resolves against this
-        list and ``call_tool`` refuses anything outside it, so an operation
-        that has not declared itself read-only is neither discoverable nor
-        executable here.
-        """
-        return [
-            spec for spec in self.operations_registry.catalog()
-            if is_read_only(spec)
-        ]
 
     def operation_specs(self) -> list[Any]:
         """What this caller may find and call: the read-only operations, plus
@@ -722,21 +625,14 @@ class NexusToolRouter:
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [spec for _, _, spec in scored[:MAX_RESOLVER_CANDIDATES]]
 
-    # ------------------------------------------------------------------
-    # not_found metadata
-    # ------------------------------------------------------------------
 
     def resolvable_experiment_ids(self, text: str) -> list[str]:
         """Hex-looking tokens in ``text`` that are actually experiments.
 
-        "Looks like hex" is not an identity. A commit sha matches the same
-        pattern, and so does a date like ``20260913``; handing one to
-        ``resume_experiment`` turns an ordinary task ("continue reviewing the
-        regression from commit 4f1b3f2a") into ``unknown experiment``. Only ids
-        the experiment service can actually resolve count as experiment ids.
-
-        Resolution is bounded: a pathological input full of hex tokens must not
-        turn one lookup into dozens of database queries.
+        "Looks like hex" is not an identity: a commit sha or a date like ``20260913`` matches
+        the same pattern, and only ids the experiment service can resolve count - handing a sha
+        to ``resume_experiment`` turns an ordinary task into ``unknown experiment``. Resolution
+        is bounded so a pathological input cannot turn one lookup into dozens of queries.
         """
         if self.experiment_service is None:
             return []
@@ -748,9 +644,8 @@ class NexusToolRouter:
             except Exception:  # noqa: BLE001 - unknown id, not an error here
                 continue
             experiment_id = str(getattr(experiment, "id", "") or "").strip()
-            # The resolved id has to look like one too: a service that answers
-            # every lookup (a stub, a stale cache) must not be able to turn a
-            # commit sha into an "experiment" by returning something arbitrary.
+            # The resolved id must look like one too: a service that answers every lookup (a stub, a
+            # stale cache) must not turn a commit sha into an "experiment".
             if not EXPERIMENT_ID_PATTERN.fullmatch(experiment_id):
                 continue
             if experiment_id not in resolved:
@@ -764,15 +659,10 @@ class NexusToolRouter:
     ) -> list[dict[str, Any]]:
         """The alternatives, described well enough to be chosen between.
 
-        A bare name is not an alternative: a small local model handed
-        ``["git_status", "git_log"]`` has nothing to compare against the goal
-        it just failed to resolve, which is why #218's controller asked the
-        same dead question again instead of picking one. The description,
-        the relevance and the argument schema all come from the registry's own
-        :class:`~modules.operations_registry.OperationSpec`, so they cannot
-        drift from what the operation actually does or actually takes - and a
-        name with no spec behind it is dropped rather than described from
-        guesswork.
+        A bare name list gives a small local model nothing to compare against the goal it just
+        failed to resolve (#218). Description, relevance and argument schema come from the
+        registry's own ``OperationSpec`` so they cannot drift from what the operation does; a
+        name with no spec behind it is dropped rather than described from guesswork.
         """
         specs = {spec.name: spec for spec in self.operation_specs()}
         descriptors: list[dict[str, Any]] = []
@@ -801,11 +691,10 @@ class NexusToolRouter:
     ) -> dict[str, Any]:
         """What the caller can do instead, for this task and this goal.
 
-        Deliberately scoped to the current task and lookup rather than to the
-        session's history: an experiment id and the word "resume" left over
-        from an earlier, unrelated request say nothing about what this task
-        needs, and offering a direct capability on that basis points the
-        caller at someone else's work.
+        Deliberately scoped to the current lookup, not the session history: an experiment id
+        and the word "resume" left over from an earlier, unrelated request say nothing about
+        what this task needs, and offering a capability on that basis points the caller at
+        someone else's work.
         """
         context_text = " ".join(part for part in (task_text or "", goal or "") if part)
         experiment_ids = self.resolvable_experiment_ids(context_text)
@@ -815,9 +704,8 @@ class NexusToolRouter:
             if len(experiment_ids) == 1 and resume_relevant
             else []
         )
-        # Read out of the goal alone. The task text describes the work, not the
-        # lookup, and "fix github issue #196" mentioning a command somewhere in
-        # its body says nothing about what this find_tool asked for.
+        # Read out of the goal alone: the task text describes the work, not this lookup ("fix github
+        # issue #196" mentioning a command in its body says nothing about what find_tool asked for).
         native_capabilities = [
             capability
             for capability in controller_native_capabilities(goal)
@@ -828,13 +716,9 @@ class NexusToolRouter:
         if ACTION_RESUME_EXPERIMENT in direct_capabilities:
             recommended_next_action = ACTION_RESUME_EXPERIMENT
         elif native_capabilities:
-            # Ahead of the related operations on purpose. When the goal asks to
-            # run something, the action that owns it is the answer; the scorer
-            # will still have produced candidates ("run a shell command to
-            # execute the test suite" scores every git_* operation), and
-            # recommending one of those would answer a request to run the tests
-            # with the output of `git status` - right-looking evidence about the
-            # wrong subject.
+            # Native capabilities go ahead of related operations on purpose: when the goal asks to run
+            # something, the owning action is the answer - recommending a git_* candidate for "run the
+            # test suite" would be right-looking evidence about the wrong subject.
             recommended_next_action = native_capabilities[0]
         elif descriptors:
             recommended_next_action = ACTION_RESOLVE_RELATED_OPERATION
@@ -848,23 +732,16 @@ class NexusToolRouter:
             "guidance": NOT_FOUND_GUIDANCE,
         }
         if recommended_next_action == ACTION_RESOLVE_RELATED_OPERATION:
-            # The single best alternative, named once. Whoever acts on
-            # ``resolve_related_operation`` must not have to re-rank the list
-            # and must not be able to pick a name that is not on it. Set only
-            # when resolving one of them really is the recommendation, so a
-            # goal answered with a native capability cannot be redirected into
-            # an operation nobody recommended.
+            # The single best alternative, named once: whoever acts on ``resolve_related_operation`` must
+            # not re-rank the list or pick a name not on it; set only when resolving one really is the
+            # recommendation.
             metadata["recommended_operation"] = descriptors[0]["operation"]
         if ACTION_RESUME_EXPERIMENT in direct_capabilities:
-            # The id the capability was offered for, already resolved. Whoever
-            # acts on it must not have to guess which token was meant, and must
-            # never re-derive it from different text.
+            # The id the capability was offered for, already resolved: the actor must not guess which
+            # token was meant nor re-derive it from different text.
             metadata["resume_experiment_id"] = experiment_ids[0]
         return metadata
 
-    # ------------------------------------------------------------------
-    # find_tool
-    # ------------------------------------------------------------------
 
     async def resolve_find_tool(
         self,
@@ -986,9 +863,8 @@ class NexusToolRouter:
                 "related_tools": [spec.name for spec in candidates[:3]],
             }
             resolver_unavailable = True
-        # Case-folded: a small local model that answers "Found" has given the
-        # same answer as one that answers "found", and throwing its correct
-        # selection away over the spelling is not a safety property.
+        # Case-folded: a model answering "Found" gave the same answer as "found"; discarding a
+        # correct selection over spelling is not a safety property.
         status = str(parsed.get("status", "")).strip().lower()
         operation = str(parsed.get("operation", "")).strip()
         reason = str(parsed.get("reason", "")).strip()[:1000] or "Tool resolver did not provide a reason."
@@ -1005,9 +881,8 @@ class NexusToolRouter:
                 "goal": clean_goal,
                 "resolved_tool": operation,
                 "arguments_schema": selected.get("arguments", []),
-                # The values this operation may run with, or None when they
-                # could not be tied back to the goal. A caller that executes
-                # without asking first must consult this, not the schema.
+                # The values this operation may run with, or None when they could not be tied back to the
+                # goal - a caller executing without asking must consult this, not the schema.
                 "resolved_arguments": resolved_arguments,
                 "arguments_binding_reason": binding_reason,
                 "operation": selected,
@@ -1054,20 +929,16 @@ class NexusToolRouter:
             if final_status == "not_found" or resolver_unavailable:
                 final_reason = reason
             elif operation and operation not in candidate_by_name:
-                # The one case the old wording described. Kept exact, because
-                # "it named something that does not exist" is a real and
-                # different failure from the one below.
+                # The one case the old wording described; kept exact because "named something that does not
+                # exist" is a different failure from an unusable status field.
                 final_reason = (
                     f"Resolver selected {operation!r}, which was not among the "
                     f"candidates it was offered."
                 )
             elif operation:
-                # What actually happened in #218's manual run: the resolver
-                # named a perfectly available operation, but its status field
-                # was not one this contract accepts. The old wording blamed the
-                # operation - "Resolver selected unavailable operation
-                # 'git_status'" - while git_status was right there in the
-                # candidate list, which sent the diagnosis after the wrong bug.
+                # What happened in #218's manual run: the resolver named an available operation whose
+                # status field the contract did not accept; the old wording blamed the operation and sent
+                # the diagnosis after the wrong bug.
                 final_reason = (
                     f"Resolver returned status {status!r}, which is not one of "
                     f"found/not_found/invalid_goal, while naming the available "
@@ -1088,13 +959,9 @@ class NexusToolRouter:
             "error": final_error,
             "guidance": final_guidance,
             "related_tools": related_tools,
-            # Both unresolved outcomes carry the alternatives. A caller handed
-            # "unavailable" with nothing but a bare name list has exactly the
-            # dead end #218 was about - it cannot tell what git_status does or
-            # what it takes - and the resolver having produced an unusable
-            # answer is no reason to withhold the candidates it was choosing
-            # between. `retryable` is what separates them: not_found is settled
-            # for this goal, unavailable may yet succeed on a fresh attempt.
+            # Both unresolved outcomes carry the alternatives: a caller handed "unavailable" with only
+            # a bare name list has exactly the #218 dead end. ``retryable`` separates them - not_found
+            # is settled for this goal, unavailable may yet succeed on a fresh attempt.
             **(
                 {
                     **self.find_tool_not_found_metadata(current_task, clean_goal, related_tools),
@@ -1103,9 +970,8 @@ class NexusToolRouter:
                 if final_status in {"not_found", "unavailable"}
                 else {}
             ),
-            # Bounded and redacted: when an answer could not be used, what the
-            # model actually said is the only thing that explains why, and
-            # reconstructing it from a reason string is guesswork.
+            # Bounded and redacted: when an answer could not be used, what the model actually said is the
+            # only thing that explains why - reconstructing it from a reason string is guesswork.
             **(
                 {"resolver_raw": redact_secrets(raw)[:MAX_RESOLVER_RAW_CHARS]}
                 if final_status != "found"
@@ -1133,9 +999,6 @@ class NexusToolRouter:
             },
         }
 
-    # ------------------------------------------------------------------
-    # call_tool
-    # ------------------------------------------------------------------
 
     def execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
         operation = str(decision.get("operation", "")).strip()
@@ -1171,14 +1034,10 @@ class NexusToolRouter:
                 **execute_kwargs,
             )
         except ValueError as exc:
-            # The registry answers a failing operation with a failed result and
-            # re-raises only argument validation, which is `OperationValidationError`
-            # - a ValueError. Caught by base class rather than by import, to keep
-            # the dependency running one way (registry is injected, never imported).
-            #
-            # "issue_number must be a positive integer" is a fact the caller can
-            # act on: call it again with a real number. Letting it escape ended a
-            # whole Nexus task with a traceback (#218).
+            # The registry re-raises only argument validation (``OperationValidationError``, a
+            # ValueError), caught by base class to keep the dependency one-way (registry injected,
+            # never imported). "issue_number must be a positive integer" is a fact the caller can act
+            # on - letting it escape ended a whole Nexus task with a traceback (#218).
             raise ToolRouterError(str(exc)) from exc
         payload = result.to_dict()
         payload["output_lines"] = [

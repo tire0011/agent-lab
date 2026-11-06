@@ -33,7 +33,7 @@ class MailboxFollowUpTests(unittest.TestCase):
         self.svc._start_thread = lambda *_args: None
         self.addCleanup(self.svc.close)
         msg_id = _insert_mailbox_msg(self.svc)
-        approval = self.svc.create_approval(
+        approval = self.svc.create_task(
             msg_id, "solve github issue #238", "tester", "/inbox/t.md", "2026-01-01T00:00:00Z"
         )
         self.approval_id = approval.id

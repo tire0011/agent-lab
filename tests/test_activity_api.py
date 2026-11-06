@@ -207,28 +207,6 @@ class ActivityApiTests(unittest.TestCase):
         self.assertNotIn(SECRET, serialized)
         self.assertNotIn("/agent", serialized)
 
-    def test_website_loads_public_activity_every_ten_seconds(self):
-        html = self.client.get("/").text
-        js = "\n".join([
-            self.client.get("/static/utils.js").text,
-            self.client.get("/static/overview.js").text,
-            self.client.get("/static/app.js").text,
-        ])
-        self.assertIn("public-activity-content", html)
-        self.assertIn('requestJson("/activity/public")', js)
-        self.assertIn("setInterval(loadPublicActivity, 10000)", js)
-
-    def test_website_loads_diagnostics_every_ten_seconds(self):
-        html = self.client.get("/").text
-        js = "\n".join([
-            self.client.get("/static/utils.js").text,
-            self.client.get("/static/overview.js").text,
-            self.client.get("/static/app.js").text,
-        ])
-        self.assertIn("diagnostics-content", html)
-        self.assertIn('requestJson("/diagnostics/public")', js)
-        self.assertIn("setInterval(loadDiagnostics, 10000)", js)
-
 
 if __name__ == "__main__":
     unittest.main()

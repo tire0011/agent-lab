@@ -347,10 +347,6 @@ class ProgressTracker:
                 if event.result:
                     self._results[event.result] = self._results.get(event.result, 0) + 1
 
-    def record_all(self, events: Iterable[ProgressEvent]) -> None:
-        for event in events:
-            self.record(event)
-
     def set_total_tests(self, total: int | None) -> None:
         if total is not None and total >= 0:
             with self._lock:

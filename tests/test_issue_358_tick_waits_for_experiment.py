@@ -40,6 +40,22 @@ class _Service:
         self.closed = True
 
 
+class _ChainingService(_Service):
+    """An experiment thread that starts a second one, as a resumed controller does."""
+
+    def tick(self):
+        def second():
+            time.sleep(0.3)
+            self.finished.set()
+
+        def first():
+            time.sleep(0.1)
+            threading.Thread(target=second, daemon=True, name=f"{EXPERIMENT_THREAD_PREFIX}second").start()
+
+        threading.Thread(target=first, daemon=True, name=f"{EXPERIMENT_THREAD_PREFIX}first").start()
+        return SimpleNamespace(acted=False, candidate=None, decision="dispatched", detail="")
+
+
 class TickWaitsTests(unittest.TestCase):
     def test_the_tick_returns_only_after_its_experiment_ended(self):
         service = _Service()
@@ -48,6 +64,15 @@ class TickWaitsTests(unittest.TestCase):
             self.assertEqual(nexus_tick.main(["--db-path", ":memory:"]), 0)
         self.assertTrue(service.finished.is_set())
         self.assertTrue(service.closed)
+
+    def test_the_tick_also_waits_for_an_experiment_started_by_another(self):
+        # #388: the resumed controller started deac59fb after fbe17810 was
+        # rejected; the tick exited and left it implementing for 11 hours.
+        service = _ChainingService()
+        with patch.object(nexus_tick, "_build_service", return_value=service), \
+                patch.object(nexus_tick, "_reconcile_stale_claims"):
+            nexus_tick.main(["--db-path", ":memory:"])
+        self.assertTrue(service.finished.is_set())
 
     def test_the_tick_returns_only_after_its_adoption_ended(self):
         # After #359 the next tick started an integration, exited, and left

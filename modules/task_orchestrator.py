@@ -1,9 +1,4 @@
-"""Agentic local-LLM controller for free-form Nexus work.
-
-The local model remains in control across tasks, issues, ideas and discussions.
-It can inspect Nexus state, search persistent memory, consult other LLMs and
-then decide what Nexus should do next. Existing pipelines remain tools.
-"""
+"""Agentic local-LLM controller for free-form Nexus work."""
 
 from __future__ import annotations
 
@@ -13,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
@@ -27,6 +23,7 @@ from modules.local_llm_jobs import (
     LocalLlmJobError,
     LocalLlmJobService,
     acquire_local_llm_job_service,
+    local_llm_watchdog_seconds,
     release_local_llm_job_service,
 )
 from modules.escalation_probes import (
@@ -69,11 +66,8 @@ from modules.nexus_tool_router import (
     ToolResolverUnavailableError,
     ToolRouterError,
     controller_native_capabilities,
-    invalid_find_tool_goal,
     operation_already_resolved,
     related_operation_lookup_goal,
-    resolver_prompt,
-    selection_correctness,
     terminal_not_found_guidance,
     terminal_not_found_observation,
     tokens as tool_search_tokens,
@@ -109,21 +103,18 @@ ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
 ACTION_KNOWLEDGE_COLLECTOR = "knowledge_collector"
 
-# Delegates the local controller may fall back to after a local inference
-# failure. ``local_worker`` is deliberately excluded because it uses the same
-# local llama-server and cannot recover from that failure.
+# Fallback delegates after a local inference failure. ``local_worker`` is
+# excluded - same llama-server, no recovery.
 _EXTERNAL_FALLBACK_ORDER: tuple[str, ...] = ("azure_openai", "codex_readonly")
 
-# Who drives the controller (#337). A small local model does not notice when a
-# turn is beyond it, so when Azure is configured it takes the controller's turns
-# and the local model only covers an Azure failure. "local" restores the old
-# behaviour.
+# Who drives the controller (#337): Azure takes the turns when configured;
+# the local model only covers an Azure failure.
 _CONTROLLER_PROVIDER_ENV = "NEXUS_CONTROLLER_PROVIDER"
 # Room for a routed reasoning model to think before it writes the JSON answer.
 _AZURE_CONTROLLER_MAX_TOKENS = 2000
 
-# Commands that write to GitHub (#337). They are reviewed through
-# new_experiment and a PR instead of running straight from the controller.
+# GitHub-write commands go through new_experiment + PR review, not straight
+# from the controller (#337).
 _GITHUB_WRITE_COMMAND = re.compile(
     r"\bgh\s+(?:issue|pr|label|release|repo)\s+"
     r"(?:close|comment|create|delete|edit|lock|merge|reopen|review|transfer|unlock)\b"
@@ -131,8 +122,8 @@ _GITHUB_WRITE_COMMAND = re.compile(
     r"|\s(?:-f|-F|--field|--raw-field|--input)\b)",
     re.IGNORECASE,
 )
-# External fallback prompts are cut to this length, so callers that cannot
-# lose their tail size the prompt below it first (#297).
+# External fallback prompts are cut to this length; size the prompt below it
+# first (#297).
 _EXTERNAL_PROMPT_CHARS = 16000
 # Room for the role preamble that _external_fallback_completion puts in front.
 _EXTERNAL_PREAMBLE_CHARS = 300
@@ -158,8 +149,8 @@ _ORCHESTRATOR_TOOLS = {
 
 logger = logging.getLogger(__name__)
 
-# Decision fields worth journalling. Not the whole decision: `message` can
-# be a page of prose and adds nothing to "why did it choose this".
+# Decision fields worth journalling; `message` can be a page of prose and
+# adds nothing to "why did it choose this".
 _DECISION_FIELDS = (
     "tool", "goal", "query", "request", "operation", "provider", "command",
     "script", "module", "experiment_id", "capability",
@@ -262,11 +253,9 @@ _KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_form
     "nexus_knowledge_collector", _KNOWLEDGE_COLLECTOR_SCHEMA
 )
 
-# The shared tool mechanism owns the resolver schema, the read-only
-# boundary, candidate scoring and the not-found metadata (#172). Re-exported
-# here under their historical names so existing importers keep working.
-# There is deliberately no read-only denylist to re-export any more: each
-# capability declares whether it mutates state (#174 review).
+# Re-exports from the shared tool mechanism (#172) under historical names.
+# No read-only denylist to re-export: each capability declares whether it
+# mutates state.
 _TOOL_RESOLVER_RESPONSE_FORMAT = TOOL_RESOLVER_RESPONSE_FORMAT
 _MAX_RESOLVER_CANDIDATES = MAX_RESOLVER_CANDIDATES
 _TOOL_ACCURACY_UNKNOWN = TOOL_ACCURACY_UNKNOWN
@@ -279,12 +268,7 @@ _SOLVE_ISSUE_RE = re.compile(r"^\s*solve github issue #\d+\s*$", re.IGNORECASE)
 
 
 def _issue_briefing_decision(task: str, observations: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """An issue to solve goes to an experiment once its briefing is there (#311).
-
-    Issue -> experiment -> PR is the fixed workflow. The local controller got
-    this step right in one live #301 run and wrong in the next (find_tool,
-    delegate, clarification), so it no longer decides it.
-    """
+    """An issue to solve goes to an experiment once its briefing is there (#311)."""
     if not _SOLVE_ISSUE_RE.match(task) or not observations:
         return None
     last = observations[-1]
@@ -336,10 +320,10 @@ class TaskOrchestratorError(RuntimeError):
 
 class ControllerBudgetExceededError(TaskOrchestratorError):
     """Raised when a compacted controller prompt still exceeds the safe local
-    budget and no external provider is available/succeeds.
+    budget and no external provider is available or succeeds.
 
-    Callers must translate this into a controlled, non-crashing decision
-    (``missing_capability``/needs_review) rather than invoking llama-server.
+    Callers must turn this into a controlled decision (``missing_capability``/needs_review),
+    not call llama-server.
     """
 
 
@@ -351,11 +335,8 @@ _RESUME_INTENT_PATTERN = RESUME_INTENT_PATTERN
 class _TaskStoreGrantLedger:
     """``find_tool`` grants as persistent controller-session events.
 
-    The controller's grants are already durable: every tool observation of a
-    turn is appended to the session's event log, so the ledger only has to
-    read them back. Recording is therefore a no-op here - writing a second
-    copy would create a grant record that could disagree with the session
-    history it is supposed to describe.
+    Recording is a no-op: grants are already durable in the session event log,
+    and a second copy could disagree with the history it describes.
     """
 
     def __init__(self, task_store: NexusTaskStore) -> None:
@@ -415,9 +396,7 @@ class NexusTaskOrchestrator:
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
-        job_watchdog = float(os.environ.get("NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS", "3600"))
-        job_watchdog = max(300.0, min(job_watchdog, 7200.0))
-        self.llama = llama_client or LlamaCppClient(timeout=job_watchdog)
+        self.llama = llama_client or LlamaCppClient(timeout=local_llm_watchdog_seconds())
         self.max_steps = max(1, min(max_steps, 10))
         db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
         self.loop_guard = PersistentToolLoopGuard(
@@ -426,26 +405,23 @@ class NexusTaskOrchestrator:
             max_identical_calls=max_identical_calls or int(os.environ.get("NEXUS_ORCHESTRATOR_MAX_IDENTICAL_CALLS", "3")),
             max_non_progressing_cycles=max_non_progressing_cycles or int(os.environ.get("NEXUS_ORCHESTRATOR_MAX_CYCLES", "2")),
         )
-        # The shared local-LLM execution path (#167): controller inference and
-        # every other local-model caller (failure analysis included) queue on
-        # one worker per database, so they serialize instead of racing
-        # llama-server with independent requests.
+        # Shared local-LLM execution path (#167): all local-model callers queue on one
+        # worker per database, so they serialize instead of racing llama-server.
         self.llm_jobs = llm_job_service or acquire_local_llm_job_service(
             db_path=db_path, llama_client=llama_client
         )
         self._owns_llm_jobs = llm_job_service is None
         if llama_client is None and llm_job_service is None:
-            # One client object for the whole process, owned by the shared
-            # job service - including its watchdog timeout.
+            # One client for the whole process, owned by the shared job service,
+            # watchdog timeout included.
             self.llama = self.llm_jobs.llama
         repo_root = str(getattr(operations_registry, "repo_root", "/agent"))
         self.task_store = task_store or NexusTaskStore(db_path=db_path)
         self._owns_task_store = task_store is None
         self.memory = memory or NexusMemory(db_path=db_path, repo_root=repo_root, task_store=self.task_store)
         self._owns_memory = memory is None
-        # Handed the orchestrator's own job service rather than just its
-        # client: local delegation is another role on the same queue (#167),
-        # so it can never open a second request path to llama-server.
+        # Delegation shares the orchestrator's job service, so it can never open a
+        # second request path to llama-server (#167).
         self.delegation = delegation_service or NexusDelegationService(
             llama_client=self.llama,
             db_path=db_path,
@@ -453,11 +429,8 @@ class NexusTaskOrchestrator:
             llm_job_service=self.llm_jobs,
         )
         self._owns_delegation = delegation_service is None
-        # The one shared tool mechanism (#172): capability discovery and
-        # read-only capability execution live in NexusToolRouter, so the
-        # controller and every other Nexus LLM role drive the same catalog,
-        # the same resolver, the same grant rule and the same registry-side
-        # validation/redaction/audit path.
+        # One shared tool mechanism (#172): the router owns catalog, resolver, grant
+        # rule and validation/redaction/audit.
         self.tool_router = NexusToolRouter(
             operations_registry=operations_registry,
             experiment_service=experiment_service,
@@ -466,11 +439,8 @@ class NexusTaskOrchestrator:
             caller="local task orchestrator",
             controller=True,
         )
-        # session_id -> the worker id this process currently holds the claim
-        # under. Every status write during a claimed turn is scoped to it, so a
-        # worker that was reaped or taken over stops being able to drive the
-        # session it no longer owns. One worker drives a session at a time, so
-        # a plain dict keyed by session is enough.
+        # session_id -> worker id of the current claim. Status writes during a claimed
+        # turn are scoped to it, so a reaped or taken-over worker cannot drive the session.
         self._claims: dict[str, str] = {}
 
     def _claim_owner(self, session_id: str) -> str | None:
@@ -481,9 +451,8 @@ class NexusTaskOrchestrator:
         """Set a status, but only while this process still owns the session."""
         owner = self._claim_owner(session_id)
         if owner is None:
-            # Unreachable from a claimed turn - ``run_async`` refuses to start
-            # one without a claim - so this is a bug guard, not a fallback. It
-            # fails closed: an unowned write is the thing being prevented.
+            # Bug guard, not a fallback: unreachable from a claimed turn. Fails closed -
+            # an unowned write is what is being prevented.
             logger.warning("refusing unowned status write for session %s", session_id)
             return
         self.task_store.set_status(session_id, status, worker_id=owner)
@@ -625,15 +594,9 @@ class NexusTaskOrchestrator:
     def _apply_completion_requirement(self, session: Any, task: str) -> None:
         """Record that *task* owes completion evidence, once this worker owns it.
 
-        Called only after the claim succeeds: writing the requirement first
-        would mutate a session another worker holds whenever the claim then
-        fails.
-
-        The key is refreshed on every new implementation request, so a
-        follow-up that is not itself a request ("yes, go ahead") keeps the
-        original requirement together with the evidence already gathered for
-        it, while a genuinely new request arriving in the same session starts
-        from no evidence.
+        Called only after the claim succeeds - writing first would mutate a session
+        another worker holds. The key is refreshed per implementation request, so a
+        follow-up keeps the evidence already gathered.
         """
         if not self._is_implementation_intent(task):
             return
@@ -664,19 +627,10 @@ class NexusTaskOrchestrator:
             title=title,
             session_id=session_id,
         )
-        # Claim the session and report this worker alive for as long as the
-        # turn runs (#162). A turn can legitimately spend minutes inside one
-        # local inference call without writing anything, so the heartbeat - not
-        # ``updated_at`` - is what says the work still has an owner. If this
-        # process dies mid-turn the beats simply stop and the session is
-        # reconciled explicitly instead of sitting `active` forever.
-        #
-        # The claim is a prerequisite, not bookkeeping around one: treating a
-        # failure here as survivable would be worse than never claiming, since
-        # every later write then falls back to "no owner" and the ownership
-        # rules switch themselves off exactly when persistence is already
-        # misbehaving. Refusing is the safe direction - the session keeps the
-        # state it has, and any worker that does own it keeps it.
+        # Claim the session and heartbeat for the whole turn (#162): a turn can spend
+        # minutes in one inference call, so the heartbeat - not ``updated_at`` - proves
+        # an owner. A failed claim must refuse: treating it as survivable would switch
+        # off the ownership rules exactly when persistence misbehaves.
         worker = heartbeat_worker_id()
         try:
             claimed = self.task_store.claim_session(session.id, worker_id=worker)
@@ -717,9 +671,8 @@ class NexusTaskOrchestrator:
     ) -> list[TaskDecision]:
         """Continue every session parked on *experiment_id* with its result (#263).
 
-        Called the moment the experiment ends, and by the polling safety net
-        after a restart lost that moment; the claim makes sure only one of
-        them continues a session.
+        Called when the experiment ends and by the polling safety net after a restart;
+        the claim ensures only one of them continues a session.
         """
         resumed: list[TaskDecision] = []
         for session in self.task_store.sessions_waiting_for_experiments(experiment_id):
@@ -777,12 +730,10 @@ class NexusTaskOrchestrator:
         )
 
     def _abort_turn(self, session_id: str, reason: str, detail: str) -> None:
-        """Record a turn that died in the open, instead of letting it go quiet.
+        """Record a turn that died in the open instead of letting it go quiet.
 
-        Without this the row would keep its last status and a frozen heartbeat
-        until the reaper found it, and an outcome we actually witnessed would
-        end up recorded as ``heartbeat_timeout`` - "nobody ever told us" - which
-        is a weaker and less true fact than "this turn raised".
+        Otherwise the row would end up as ``heartbeat_timeout`` - a weaker fact than
+        "this turn raised".
         """
         owner = self._claim_owner(session_id)
         if owner is None:
@@ -815,9 +766,8 @@ class NexusTaskOrchestrator:
         self._claimed_status(session.id, "active")
         if experiment_result is not None:
             if experiment_result.get("status") == "succeeded":
-                # The experiment changed the code and passed its verification;
-                # without this the controller's answer is rejected for lack of
-                # completion evidence, turn after turn (#263).
+                # The experiment changed code and passed verification; without this the answer
+                # is rejected for lack of completion evidence, turn after turn (#263).
                 experiment_result = dict(experiment_result)
                 experiment_result["completion_evidence"] = self._record_evidence(
                     session, kind="change", source=ACTION_NEW_EXPERIMENT
@@ -851,8 +801,7 @@ class NexusTaskOrchestrator:
         observations: list[dict[str, Any]] = (
             [dict(experiment_result)] if experiment_result is not None else []
         )
-        # Counted so a finished run says plainly whether the controller used
-        # the results it already had. See `_log_result_reuse`.
+        # Counted so a finished run says whether results were reused; see `_log_result_reuse`.
         redundant_requests = 0
         # The budget is logged when it changes, not every turn; see below.
         last_budget_shape: tuple[Any, ...] | None = None
@@ -880,13 +829,8 @@ class NexusTaskOrchestrator:
                 max_event_id=run_start_event_id,
             )
             prompt, prompt_meta = self._build_prompt(session, task, history, observations, budget_plan)
-            # The plan is a dozen numbers, and repeating them every turn buries
-            # the two that actually change. It goes out once, and again only
-            # when the budget really shifts.
-            #
-            # Compared on what was decided, not on what was measured:
-            # `mem_available_kb` moves every read, so comparing the whole plan
-            # would log on every turn again while looking like it does not.
+            # Log the plan once, and again only when the budget really shifts - compared on
+            # what was decided, not measured (`mem_available_kb` moves every read).
             budget_shape = (
                 budget_plan.effective_budget_chars,
                 budget_plan.observation_chars,
@@ -981,9 +925,8 @@ class NexusTaskOrchestrator:
                         f"retry also failed: {correction_error}"
                     ) from correction_error
             action = str(decision.get("action", "")).strip().lower()
-            # What the controller itself chose. A redirect below may change the
-            # action this turn executes, but the turn record has to keep saying
-            # which decision the model actually produced (#158).
+            # The controller's own choice: a redirect below may change the executed action,
+            # but the turn record keeps the model's actual decision (#158).
             controller_action = action
             self._journal_decision(session.id, decision)
             satisfied_by = self._already_satisfied(decision, observations)
@@ -1003,30 +946,24 @@ class NexusTaskOrchestrator:
             )
             related_goal = related_operation_lookup_goal(terminal_not_found or {})
             if related_goal == str(decision.get("goal", "")).strip():
-                # The dead lookup already *was* the narrowed one. Redirecting it
-                # to itself would only relabel the repeat, so it goes to the loop
-                # guard unchanged - which is the point at which there really is
-                # nothing left to offer.
+                # The dead lookup already was the narrowed one; redirecting it to itself would
+                # only relabel the repeat, so it goes to the loop guard unchanged.
                 related_goal = ""
             already_resolved = operation_already_resolved(
                 str((terminal_not_found or {}).get("recommended_operation") or ""),
                 observations,
             )
             if already_resolved is not None:
-                # The redirect has already done its job for this goal once. Doing
-                # it again re-asks a question this run answered, and the guard
-                # refuses that as a duplicate - the same loop, one step later.
-                # The refusal below says what was resolved instead.
+                # The redirect already did its job for this goal once; repeating it is the same
+                # duplicate the guard refuses, one step later.
                 related_goal = ""
             if (
                 terminal_not_found is not None
                 and resume_experiment_id
                 and self._may_resume_experiment(session.id, task, resume_experiment_id)
             ):
-                # The lookup is terminal and the resolver already established -
-                # against the experiment service, not against a regex - which
-                # experiment this task is about. Go there directly instead of
-                # letting the controller ask the same dead question again.
+                # Terminal lookup, and the resolver already established which experiment this
+                # task is about - go there directly instead of re-asking the dead question.
                 turn_detail = (
                     f"repeated terminal {TOOL_FIND_TOOL} lookup redirected to "
                     f"{ACTION_RESUME_EXPERIMENT} ({resume_experiment_id})"
@@ -1063,11 +1000,9 @@ class NexusTaskOrchestrator:
                 action = ACTION_RESUME_EXPERIMENT
                 terminal_not_found = None
             elif terminal_not_found is not None and related_goal:
-                # The lookup is dead but its answer was not empty: the terminal
-                # not_found already described an operation that fits. Asking for
-                # that operation by name is a different, answerable question, so
-                # the session moves on instead of spending its remaining turns
-                # re-asking the dead one until the loop guard ends it (#218).
+                # The dead lookup's answer was not empty: the terminal not_found already named a
+                # fitting operation, so ask for that by name instead of re-asking until the
+                # guard ends it (#218).
                 recommended_operation = str(
                     terminal_not_found.get("recommended_operation") or ""
                 )
@@ -1107,21 +1042,15 @@ class NexusTaskOrchestrator:
                         "it offered instead"
                     ),
                 }
-                # Still find_tool, so the redirected lookup goes through the
-                # loop guard like any other: a second redirect to the same
-                # related goal is a duplicate and is counted as one. What the
-                # guard would then refuse is the *redirect target*, so the
-                # guidance carried into its verdict has to be that goal's own
-                # terminal not_found, not the dead goal's. Nulling it instead
-                # would hand the controller the bare "duplicate_tool_call" that
-                # #164 exists to prevent.
+                # Still find_tool, so the redirected lookup goes through the loop guard: carry
+                # the redirect target's own terminal not_found in its verdict, not the dead
+                # goal's - else the guard hands out the bare duplicate_tool_call that #164
+                # exists to prevent.
                 terminal_not_found = self._terminal_not_found_observation(
                     related_goal, observations, state_token
                 )
-            # One durable row per turn (#158). Which model decided this turn was
-            # previously recoverable only from a log line, so the question "does
-            # the local controller produce usable decisions" could not be
-            # answered without grepping the journal.
+            # One durable row per turn (#158), so which model decided a turn is answerable
+            # without grepping the journal.
             self.task_store.record_controller_turn(
                 session.id,
                 provider_used=provider_used,
@@ -1155,17 +1084,12 @@ class NexusTaskOrchestrator:
                 if not check.allowed:
                     observation = check.observation or {"event": "duplicate_tool_call"}
                     if tool == "operation":
-                        # The guard identifies a call by hash, so its refusal
-                        # names no operation. The controller needs the name and
-                        # arguments to recognise which answer it already holds,
-                        # and the prompt view uses them to point at the event
-                        # that carries it (#223).
+                        # The guard refuses by hash and names no operation; the controller needs name +
+                        # arguments to recognise the answer it already holds (#223).
                         observation = {**observation, **arguments}
                     if terminal_not_found is not None:
-                        # The guard already refuses the repeat and counts it, so
-                        # pre-empting it would only hide the repeat from the
-                        # budget that is supposed to end this loop. Make its
-                        # verdict actionable instead (#164).
+                        # The guard already refuses and counts the repeat; pre-empting it would hide it
+                        # from the budget that ends the loop - make the verdict actionable instead (#164).
                         observation = {
                             **observation,
                             **self._terminal_not_found_guidance(
@@ -1210,11 +1134,8 @@ class NexusTaskOrchestrator:
                     # find_tool decides its not_found guidance from what this
                     # task is about, so it needs the task itself.
                     execution_decision["current_task"] = task
-                    # Completion evidence is measured, never accepted on the
-                    # controller's word: `effect` says what the call is meant
-                    # to do, and the snapshots either bear that out or do not.
-                    # Only executions can change anything, so only they are
-                    # measured.
+                    # Completion evidence is measured, never taken on the controller's word; only
+                    # executions can change anything, so only they are measured.
                     measured = tool in {ACTION_COMMAND, TOOL_PYTHON_RUN}
                     before = self._worktree_snapshot(
                         self._decision_cwd(execution_decision)
@@ -1228,12 +1149,9 @@ class NexusTaskOrchestrator:
                         after = self._worktree_snapshot(
                             self._decision_cwd(execution_decision)
                         )
-                        # An execution that changed the checkout is completion
-                        # evidence. One that succeeded without changing it -
-                        # or whose effect this process cannot see, such as a
-                        # restarted service or a remote call - is recorded as
-                        # a verification instead, which sends the completion
-                        # claim to the user rather than closing the task.
+                        # An execution that changed the checkout is completion evidence; one that
+                        # succeeded without a visible change (restarted service, remote call) is a
+                        # verification and goes to the user to confirm.
                         kind = (
                             "change"
                             if self._observed_state_change(before, after)
@@ -1273,15 +1191,9 @@ class NexusTaskOrchestrator:
                     task_logger=task_logger,
                 )
                 if executed is not None:
-                    # Say on the lookup itself that it already ran, and where
-                    # the result is. The controller follows "find_tool then
-                    # call_tool", and a lookup that reports `resolved_tool`
-                    # and nothing else reads as an invitation to make that
-                    # call - so it does, and the guard refuses a call that
-                    # was never needed. Measured in session
-                    # e33be32780f747de8c6a85f0ba6af00d: find_tool ran the
-                    # operation, the controller called it anyway, and only
-                    # after the refusal did it use the result it already had.
+                    # Say on the lookup that it already ran and where the result is: a lookup
+                    # reporting only `resolved_tool` reads as an invitation to call it, and the
+                    # guard then refuses a call that was never needed (#223).
                     observations[-1] = {
                         **observations[-1],
                         "already_executed": True,
@@ -1294,10 +1206,9 @@ class NexusTaskOrchestrator:
                     observations.append(executed)
                 reboot = executed or observation
                 if self._successful_machine_reboot(reboot):
-                    # Scheduling the reboot is itself the requested state
-                    # change. Do not queue another controller inference: the
-                    # host may go down during it and recovery would otherwise
-                    # repeat the reboot forever (#326).
+                    # Scheduling the reboot is itself the requested state change - do not queue
+                    # another inference, the host may go down during it and recovery would repeat
+                    # the reboot forever (#326).
                     reboot = dict(reboot)
                     reboot["completion_evidence"] = self._record_evidence(
                         session, kind="change", source="machine_reboot"
@@ -1339,15 +1250,33 @@ class NexusTaskOrchestrator:
             experiment_id = decision.get("experiment_id")
             if action == ACTION_RESUME_EXPERIMENT:
                 if not experiment_id:
-                    raise TaskOrchestratorError("resume_experiment requires experiment_id")
+                    # The controller sometimes leaves the id out. Tell it, and let
+                    # it decide again, instead of failing the whole task.
+                    rejection = {
+                        "event": "terminal_decision_rejected",
+                        "terminal_action": ACTION_RESUME_EXPERIMENT,
+                        "reason": (
+                            "resume_experiment needs experiment_id. Name the experiment "
+                            "this task started, or choose new_experiment."
+                        ),
+                        "retryable": True,
+                    }
+                    rejection["event_id"] = self.task_store.append_event(
+                        session.id,
+                        role="system",
+                        kind="terminal_decision_rejected",
+                        content=json.dumps(rejection, separators=(",", ":")),
+                        metadata={"controller_action": action},
+                    )
+                    observations.append(rejection)
+                    continue
                 try:
                     experiment_id = self.experiment_service.resolve_experiment(str(experiment_id)).id
                 except Exception as exc:
                     raise TaskOrchestratorError(f"unknown experiment {experiment_id!r}") from exc
                 if not self._may_resume_experiment(session.id, task, experiment_id):
-                    # An experiment named in a refusal is someone else's work.
-                    # Resuming it is what turned a refused machine_reboot into
-                    # an unrelated merged change (#330).
+                    # An experiment named in a refusal is someone else's work - resuming it turned
+                    # a refused reboot into an unrelated merged change (#330).
                     rejection = self._foreign_resume_rejection(experiment_id)
                     event_id = self.task_store.append_event(
                         session.id,
@@ -1372,6 +1301,22 @@ class NexusTaskOrchestrator:
                 experiment_id = None
 
             if action == ACTION_NEW_EXPERIMENT:
+                verified = self._succeeded_issue_experiment(session.id)
+                if verified is not None:
+                    # Verified work for this issue already waits for adoption and review; a second
+                    # experiment raced it (#530).
+                    result = TaskDecision(
+                        action=ACTION_ANSWER,
+                        reason="second experiment refused (#530)",
+                        message=(
+                            f"Experiment {verified} already succeeded for this issue. "
+                            "Adoption and its review decide what happens next."
+                        ),
+                        observations=observations,
+                        session_id=session.id,
+                    )
+                    self._persist_final(session.id, task, result)
+                    return result
                 logger.info(
                     "llm_provider selected provider=codex role=developer session_id=%s reason=%s",
                     session.id,
@@ -1450,10 +1395,8 @@ class NexusTaskOrchestrator:
     ) -> tuple[str, str]:
         """Run one controller completion.
 
-        Returns ``(raw_response, provider_used)``. The budget plan controls
-        prompt compaction and diagnostics, but does not preemptively block
-        llama-server. External providers are used only after a real local
-        inference failure.
+        Returns ``(raw_response, provider_used)``. External providers are used only
+        after a real local inference failure.
         """
         if self._azure_drives_controller():
             self._claimed_status(session_id, "waiting_for_llm")
@@ -1509,10 +1452,8 @@ class NexusTaskOrchestrator:
     ) -> tuple[str, str]:
         """Delegate externally after local inference has actually failed.
 
-        Never falls back to ``local_worker``: that delegate also calls the
-        same local llama-server and cannot recover from the local failure.
-        ``attempt_log`` receives one entry per provider tried, with its
-        answer or error, also when every provider fails (#301).
+        Never falls back to ``local_worker`` - same llama-server, no recovery.
+        ``attempt_log`` gets one entry per provider tried, answer or error (#301).
         """
         available = {item["provider"] for item in self.delegation.catalog()}
         candidates = [p for p in _EXTERNAL_FALLBACK_ORDER if p in available]
@@ -1551,8 +1492,8 @@ class NexusTaskOrchestrator:
             tried.append(attempt)
             if attempt_log is not None:
                 attempt_log.append(attempt)
-            # The answer or the provider error is what explains an escalation
-            # afterwards; success=False alone did not (#301).
+            # The answer or provider error is what explains an escalation afterwards;
+            # success=False alone did not (#301).
             outcome = (
                 f"answer={attempt.get('answer', '')[:500]!r}"
                 if attempt["success"]
@@ -1654,9 +1595,12 @@ class NexusTaskOrchestrator:
         except LocalLlmJobError as exc:
             failure = str(exc)[:1000]
             logger.error(
-                "%s_local_inference_failed session_id=%s error=%s; attempting external fallback",
+                "%s_local_inference_failed session_id=%s error_kind=%s job_id=%s error=%s; "
+                "attempting external fallback",
                 role,
                 session_id,
+                exc.kind,
+                job_id,
                 failure,
             )
             if task_logger is not None:
@@ -1665,6 +1609,8 @@ class NexusTaskOrchestrator:
                     f"{role}_local_inference_failed",
                     failure,
                     session_id=session_id,
+                    error_kind=exc.kind,
+                    job_id=job_id,
                 )
             if budget_plan is None:
                 raise TaskOrchestratorError(f"local LLM job failed: {failure}") from exc
@@ -1700,47 +1646,6 @@ class NexusTaskOrchestrator:
 
     def _read_only_operation_specs(self) -> list[Any]:
         return self.tool_router.operation_specs()
-
-    def _candidate_operations(self, goal: str) -> list[Any]:
-        return self.tool_router.candidate_operations(goal)
-
-    def _latest_operation_grant(self, session_id: str, operation: str) -> dict[str, Any] | None:
-        return self.tool_router.grant_ledger.latest_grant(session_id, operation)
-
-    @staticmethod
-    def _invalid_find_tool_goal(goal: str) -> tuple[bool, str | None, str | None]:
-        return invalid_find_tool_goal(goal)
-
-    def _resolver_prompt(self, goal: str, candidates: list[Any]) -> str:
-        return resolver_prompt(goal, candidates)
-
-    @staticmethod
-    def _selection_correctness(
-        *,
-        status: str,
-        selected_operation: str | None,
-        expected_operation: str | None,
-        expected_status: str | None,
-    ) -> str:
-        return selection_correctness(
-            status=status,
-            selected_operation=selected_operation,
-            expected_operation=expected_operation,
-            expected_status=expected_status,
-        )
-
-    def _resolvable_experiment_ids(self, text: str) -> list[str]:
-        return self.tool_router.resolvable_experiment_ids(text)
-
-    def _find_tool_not_found_metadata(
-        self,
-        task_text: str,
-        goal: str,
-        related_operations: list[str],
-    ) -> dict[str, Any]:
-        return self.tool_router.find_tool_not_found_metadata(
-            task_text, goal, related_operations
-        )
 
     @staticmethod
     def _terminal_not_found_observation(
@@ -1789,13 +1694,11 @@ class NexusTaskOrchestrator:
         role: str = "tool_resolver",
         task_logger: Any | None = None,
     ) -> tuple[str, str]:
-        """The controller's inference path, as the tool router expects it.
+        """The controller inference path, as the tool router expects it.
 
-        The router owns the resolver prompt and schema; this keeps the
-        controller-specific parts - a freshly computed memory budget and the
-        external-provider fallback - on the controller side, and translates
-        their failure modes into the router's one "resolver unavailable"
-        signal.
+        The router owns the resolver prompt and schema; the controller side keeps the
+        memory budget and external fallback and maps their failures to the router's
+        single "resolver unavailable" signal.
         """
         budget_plan = compute_budget(
             mem_available_kb=read_mem_available_kb(),
@@ -1902,10 +1805,8 @@ class NexusTaskOrchestrator:
                     "controller capabilities that own the goal instead; it never implements "
                     "missing tools and never resolves shell or Python execution."
                 ),
-                # A description, never a usable goal. The local model copies
-                # whatever concrete goal this prompt shows it - twice over, in
-                # two different runs, with two different examples - and this
-                # was the last place still offering one (#218).
+                # A description, never a usable goal: the local model copies whatever concrete
+                # goal the prompt shows (#218).
                 "arguments": {"goal": FIND_TOOL_GOAL_PLACEHOLDER},
                 "legacy_catalog_schema_chars": legacy_catalog_chars,
             },
@@ -2045,16 +1946,8 @@ Return exactly one JSON object matching the schema."""
     ) -> dict[str, Any]:
         """Say on a ``find_tool`` observation that its operation already ran.
 
-        The controller follows "find_tool then call_tool", and a lookup that
-        reports `resolved_tool` and nothing else reads as an invitation to
-        make that call - so it does, and the guard refuses a call that was
-        never needed. Measured in session
-        e33be32780f747de8c6a85f0ba6af00d: find_tool ran the operation, the
-        controller called it anyway, and only after the refusal did it use the
-        result it already had (#223).
-
-        Shared with the knowledge collector, which resolves and executes through
-        the same two calls and therefore hands the controller the same trap.
+        A lookup reporting only `resolved_tool` reads as an invitation to call it, and
+        the guard then refuses a call that was never needed (#223).
         """
         return {
             **lookup,
@@ -2065,20 +1958,6 @@ Return exactly one JSON object matching the schema."""
                 "and choose a different next step"
             ),
         }
-
-    @staticmethod
-    def _knowledge_collector_max_rounds() -> int:
-        """Bound research turns; the final synthesis turn is separate."""
-        raw = os.environ.get("NEXUS_KNOWLEDGE_COLLECTOR_MAX_ROUNDS", "").strip()
-        try:
-            configured = int(raw) if raw else 3
-        except ValueError:
-            logger.warning(
-                "invalid NEXUS_KNOWLEDGE_COLLECTOR_MAX_ROUNDS=%r; falling back to 3",
-                raw[:100],
-            )
-            configured = 3
-        return max(1, min(configured, 5))
 
     @staticmethod
     def _knowledge_collector_unavailable_briefing(exc: BaseException) -> dict[str, Any]:
@@ -2101,9 +1980,8 @@ Return exactly one JSON object matching the schema."""
             for line in result.get("output_lines") or []:
                 if not str(line).startswith("issue: "):
                     continue
-                # Read the fields one by one: redaction replaces the URL and
-                # everything after it on the line, so the line is no longer
-                # valid JSON (#292, seen on the VM).
+                # Read fields one by one: redaction replaces the URL and everything after it on
+                # the line, so it is no longer valid JSON (#292).
                 number = re.search(r'"number":\s*(\d+)', str(line))
                 title = re.search(r'"title":\s*"((?:[^"\\]|\\.)*)"', str(line))
                 if number and title:
@@ -2121,10 +1999,8 @@ Return exactly one JSON object matching the schema."""
     ) -> str:
         """The collector prompt sized for the external fallback (#297 review).
 
-        The external path cuts prompts from the end, which would drop the
-        current issue and the output instruction. Memory is shortened first:
-        it is the source that disagreed. If the prompt is still too long,
-        compaction shrinks the remaining sources, the current issue last.
+        The external path cuts prompts from the end, so memory is shortened first;
+        compaction then shrinks the remaining sources, the current issue last.
         """
         limit = _EXTERNAL_PROMPT_CHARS - _EXTERNAL_PREAMBLE_CHARS
         overflow = len(prompt) - limit
@@ -2180,13 +2056,8 @@ Return exactly one JSON object matching the schema."""
     ) -> ProbeResult | None:
         """Ask the local model whether memory describes the fetched issue (#297).
 
-        The answer's token probability is the signal: the model's plain
-        answer is "yes" even for outdated memory, but its p_yes drops. Each
-        distinct memory entry is asked about on its own, against the issue
-        title and body, and the lowest p_yes decides: joined entries and the
-        raw output lines hid an outdated entry in the live #288 run. None
-        when there is nothing to compare or a probe failed; the briefing
-        then runs locally as before.
+        The answer token's probability is the signal: each distinct memory entry is
+        checked on its own and the lowest p_yes decides.
         """
         issue = ""
         entries: list[str] = []
@@ -2208,9 +2079,8 @@ Return exactly one JSON object matching the schema."""
             return None
         results: list[ProbeResult] = []
         try:
-            # Every distinct entry the briefing will see is checked: one left
-            # out could carry the outdated text unnoticed (review on #299).
-            # memory.search returns at most 8 hits, each check is a short call.
+            # Every distinct entry the briefing will see is checked - one left out could
+            # carry outdated text unnoticed (#299).
             for entry in entries:
                 job_id = self.llm_jobs.submit(
                     same_requirement_logprob_prompt(issue, entry),
@@ -2316,10 +2186,8 @@ Return exactly one JSON object matching the schema."""
                     }
                 )
 
-            # Project history is a complementary source for an explicitly
-            # referenced issue. It is gathered by Nexus, not selected by the
-            # collector model, so a failed current GitHub read can still be
-            # complemented by prior task knowledge without another planning loop.
+            # Project history complements an explicitly referenced issue, gathered by Nexus
+            # so a failed GitHub read can still be complemented without another planning loop.
             memory_query = f"GitHub issue #{issue_number}"
             try:
                 memory_source = {
@@ -2330,9 +2198,8 @@ Return exactly one JSON object matching the schema."""
                     "deterministic_reference": True,
                 }
                 if self._fetched_issue_heading(sources):
-                    # Placed first and marked as history: earlier runs may have
-                    # recorded an older version of the issue, and the current
-                    # text must win and survive compaction as the newest source (#292).
+                    # Placed first and marked as history: the current issue text must win and survive
+                    # compaction as the newest source (#292).
                     memory_source["note"] = (
                         "Earlier project history. It may describe an older version of "
                         "this issue; the current GitHub issue wins on any conflict."
@@ -2351,9 +2218,8 @@ Return exactly one JSON object matching the schema."""
                 )
 
         if not sources:
-            # Generic tasks currently have no deterministic extractor. The
-            # collector must summarize only the request itself rather than
-            # inventing external facts.
+            # Generic tasks have no deterministic extractor; the collector must summarize
+            # only the request, not invent external facts.
             sources.append(
                 {
                     "tool": "knowledge_request",
@@ -2399,9 +2265,8 @@ Return exactly one JSON object matching the schema."""
                         memory_check=escalation,
                     )
             if memory_check is not None and memory_check.escalate:
-                # Memory and the current issue disagree: a stronger model
-                # writes the briefing, through the same external chain the
-                # controller uses when local inference fails (#297).
+                # Memory and the current issue disagree: a stronger model writes the briefing
+                # through the same external chain the controller uses on local failure (#297).
                 external_attempts: list[dict[str, Any]] = []
                 escalation["external_attempts"] = external_attempts
                 try:
@@ -2506,10 +2371,8 @@ Return exactly one JSON object matching the schema."""
     ) -> tuple[str, dict[str, Any]]:
         """Compact observations/current input to fit ``budget_plan`` and render.
 
-        Prevents nested duplication (e.g. a ``memory_search`` observation
-        surfacing content already present in persisted history or in an
-        earlier observation of this same run) and deterministically bounds
-        any individually oversized observation before the next model call.
+        Prevents nested duplication and bounds any individually oversized observation
+        before the next model call.
         """
         truncated_input, input_truncated = truncate_text(current_input, budget_plan.current_input_chars)
         seen: set[str] = set()
@@ -2528,10 +2391,8 @@ Return exactly one JSON object matching the schema."""
         prompt = self._prompt(session, truncated_input, history, compacted_observations)
         meta = {
             "input_truncated": input_truncated,
-            # Positions in the *viewed* list, which is what was budgeted. The
-            # view can drop a superseded failed attempt, so these are not
-            # positions in ``observations``; `superseded_observation_count`
-            # says how far the two have diverged.
+            # Positions in the *viewed* list, which is what was budgeted - not in
+            # ``observations``; `superseded_observation_count` says how far they diverged.
             "omitted_observation_indices": omitted_indices,
             "superseded_observation_count": len(deduped_observations) - len(viewed_observations),
             "deduped_observation_count": sum(
@@ -2543,21 +2404,9 @@ Return exactly one JSON object matching the schema."""
     def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
         """Render one controller prompt, stable parts first.
 
-        The order is a cost decision, not a style one. llama-server reuses the
-        KV cache for the longest prefix a request shares with the previous one,
-        and stops at the first difference - so everything *after* the first
-        changed byte is recomputed. Within a run, only the observations change
-        between turns; source, input, history and the capability catalog do
-        not. With the observations in the middle, every turn re-processed them
-        *and* the whole policy/rules block behind them: measured on the VM,
-        1222 tokens at 7.18 tokens/second, about 170 seconds of the ~190 a turn
-        took (#218).
-
-        With them at the end, the reusable prefix covers the rules too, and
-        only the observations and the closing line are new. The closing
-        instruction stays last on purpose: a small model handed a wall of JSON
-        as the final thing it reads is measurably worse at answering in the
-        requested shape, and those few tokens are cheap to recompute.
+        llama-server reuses the KV cache only up to the first changed byte, so the
+        observations - the only part that changes between turns - go last, and the
+        closing instruction stays last on purpose (#218).
         """
         tool_results = "\n\n".join(
             f"{str(observation.get('tool') or observation.get('event') or 'tool')} result:\n"
@@ -2565,8 +2414,8 @@ Return exactly one JSON object matching the schema."""
             for observation in observations
         )
 
-        # Without it a reply to a clarification arrives as the whole task and
-        # the original request is gone. The current input is already shown.
+        # Without it a reply to a clarification arrives as the whole task and the original
+        # request is lost.
         earlier = [
             event for event in history
             if str(event.get("content", "")).strip() != current_input.strip()
@@ -2607,9 +2456,8 @@ Decide the next step now. Return JSON only.
     def _action_to_tool_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
         """Translate the action-only controller protocol to internal tool dispatch.
 
-        The outer LLM never needs the legacy type/tool/operation envelope. Native
-        controller capabilities remain internal actions; OperationsRegistry calls
-        always use find_tool -> call_tool.
+        Native controller capabilities stay internal actions; registry calls always
+        use find_tool -> call_tool.
         """
         action = str(decision.get("action", "")).strip().lower()
         normalized = dict(decision)
@@ -2645,16 +2493,13 @@ Decide the next step now. Return JSON only.
                 "context": str(decision.get("context", "")),
             }
         if tool == ACTION_COMMAND:
-            # `effect` is the controller's claim about the call, not part of
-            # its identity: including it would let the same command run twice
-            # by relabelling it read -> change, which both defeats the #164
-            # loop guard and mints completion evidence from a read-only call.
+            # `effect` is the controller's claim, not part of the call's identity: including
+            # it would let the same command run twice by relabelling read -> change, defeating
+            # the #164 guard and minting evidence from a read-only call.
             return tool, {"command": str(decision.get("command", "")).strip()}
         if tool == TOOL_PYTHON_RUN:
-            # The working directory changes module/script resolution, so two
-            # otherwise identical python_run calls in different directories are
-            # materially different calls and must not collapse into one
-            # duplicate-tool-call signature.
+            # Different working directories make two python_run calls materially different;
+            # they must not collapse into one duplicate signature.
             try:
                 cwd = str(self._resolve_cwd(decision.get("cwd")))
             except TaskOrchestratorError:
@@ -2708,11 +2553,8 @@ Decide the next step now. Return JSON only.
         tool = str(observation.get("tool", "")).strip()
         if not tool:
             return False
-        # A plan is a statement of intent, never an attempt. The knowledge collector
-        # stub written when the planner is unavailable carries the reason it
-        # failed, and any truthy failure key below would otherwise let that
-        # stub stand in for a capability nobody tried - the exact bypass the
-        # #244 guard exists to prevent.
+        # A plan is intent, never an attempt: a truthy failure key in the planner stub
+        # would stand in for a capability nobody tried - the #244 bypass.
         if tool == TOOL_KNOWLEDGE_BRIEFING:
             return False
         if tool == TOOL_FIND_TOOL:
@@ -2732,8 +2574,8 @@ Decide the next step now. Return JSON only.
 
     @staticmethod
     def _supports_missing_capability(observation: dict[str, Any]) -> bool:
-        # See `_is_resolution_evidence`: a knowledge collector plan never evidences an
-        # attempted capability, however it ended.
+        # A knowledge collector plan never evidences an attempted capability; see
+        # `_is_resolution_evidence`.
         if observation.get("tool") == TOOL_KNOWLEDGE_BRIEFING:
             return False
         if observation.get("tool") == TOOL_FIND_TOOL:
@@ -2789,10 +2631,8 @@ Decide the next step now. Return JSON only.
         )
         return bool(gap_tokens & observation_tokens)
 
-    # A request for news about work is not a request to do it. These are
-    # matched anywhere in the text, unlike the start-anchored informational
-    # openers, because "... and please update me on #42" reads as a status
-    # request wherever it sits.
+    # Status-request phrases match anywhere in the text, unlike start-anchored openers:
+    # "... and please update me on #42" reads as a status request wherever it sits.
     _STATUS_REQUEST_RE = re.compile(
         r"\b(?:status\s+update|update\s+(?:me|us)\b|keep\s+(?:me|us)\s+posted)"
     )
@@ -2826,16 +2666,13 @@ Decide the next step now. Return JSON only.
     def _command_exit_code(output: Any) -> int | None:
         """Read the exit code out of a command result.
 
-        Delegates to the shared parser rather than matching a second format:
-        ``process_command`` renders ``**Exit code:** 0`` (Markdown, capitalised,
-        spaced), so a stricter pattern of this module's own would silently
-        never match and no evidence would ever be recorded.
+        Must match the shared parser's ``**Exit code:** 0`` rendering - a stricter
+        pattern of this module's own would never match.
         """
         return exit_code_of(str(output or ""))
 
-    # Paths inside the code checkout that this process and its loggers write
-    # on their own. A turn touches them whether or not it changed anything,
-    # so they can never stand as evidence of requested work.
+    # Paths this process writes on its own; a turn touches them regardless, so they
+    # are never evidence of requested work.
     _RUNTIME_OWNED_PREFIXES = ("state/", "logs/", ".git/")
 
     def _decision_cwd(self, decision: dict[str, Any]) -> Path | None:
@@ -2868,15 +2705,9 @@ Decide the next step now. Return JSON only.
     def _worktree_snapshot(self, cwd: Path | None = None) -> str | None:
         """Executor-side view of the code checkout, scoped to *cwd*.
 
-        Deliberately narrow. The comparison is only ever made across a single
-        command execution, over the subtree that command ran in, and with this
-        process's own artefacts excluded - a whole-repository fingerprint taken
-        around every tool call credits any concurrent writer's work to the call
-        in flight. The mailbox daemons write their own separate checkout
-        (`AGENT_MAILBOX_REPO_PATH`), so they are outside this view entirely.
-
-        Returns ``None`` when the state cannot be read, which is never treated
-        as evidence.
+        Narrow on purpose: comparisons span one command over its subtree, excluding
+        this process's own artifacts - a whole-repo fingerprint would credit a
+        concurrent writer. Returns ``None`` when unreadable, never treated as evidence.
         """
         root = self._repo_root()
         try:
@@ -2928,9 +2759,7 @@ Decide the next step now. Return JSON only.
     def _record_evidence(self, session: Any, *, kind: str, source: str) -> dict[str, Any]:
         """Persist evidence of *kind* for the session's current request.
 
-        Persisted only for a session that owes evidence; for any other session
-        the observation still carries the record, but there is no requirement
-        for it to answer.
+        Persisted only for a session that owes evidence.
         """
         intent_key = getattr(session, "completion_intent_key", None) or ""
         if intent_key:
@@ -2950,11 +2779,8 @@ Decide the next step now. Return JSON only.
     def _evidence_satisfies(session: Any, *, kind: str) -> bool:
         """Whether recorded evidence belongs to the request now in force.
 
-        Read from the session row rather than re-scanned out of the event log:
-        the log view is bounded, so evidence in a long session would age out
-        and leave it unable to ever finish. Comparing intent keys is also what
-        stops one task's evidence from completing a later, different one that
-        arrived through ``continue_session``.
+        Read from the session row, not the bounded log view; comparing intent keys
+        stops one task's evidence from completing a different later task.
         """
         required = getattr(session, "completion_intent_key", None) or ""
         column = (
@@ -2969,12 +2795,8 @@ Decide the next step now. Return JSON only.
     ) -> bool:
         """Whether the latest unresolved evidence gate is being called a capability gap.
 
-        The controller is free to paraphrase an observation, so matching its next
-        ``information_gap`` string cannot reliably preserve the distinction between
-        unfinished work and a missing capability.  Use the structured rejection that
-        Nexus itself emitted instead.  A failed tool attempt is independent evidence
-        for a real blocker; when one exists, normal missing-capability validation still
-        applies.
+        Match the structured rejection Nexus itself emitted, not a paraphrased
+        ``information_gap`` string; a failed tool attempt still counts as a real blocker.
         """
         latest_completion_rejection = -1
         for index, observation in enumerate(observations):
@@ -2996,12 +2818,45 @@ Decide the next step now. Return JSON only.
         )
         return not has_failed_attempt
 
+    def _succeeded_issue_experiment(self, session_id: str) -> str | None:
+        """A succeeded experiment of this session, if the session works on an issue.
+
+        Only issue sessions count - chat sessions may ask for follow-up work.
+        """
+        inputs = self.task_store.recent_events(session_id, role="user", kind="input", limit=100)
+        if not any((e.get("metadata") or {}).get("source_type") == "issue" for e in inputs):
+            return None
+        for experiment_id in sorted(self._session_experiment_ids(session_id)):
+            try:
+                status = self.experiment_service.get_experiment(experiment_id).status
+            except Exception:  # noqa: BLE001 - an unknown experiment refuses nothing
+                continue
+            if status == "succeeded" and not self._adoption_decided(experiment_id):
+                return experiment_id
+        return None
+
+    def _adoption_decided(self, experiment_id: str) -> bool:
+        """Whether adoption already judged *experiment_id* (#546).
+
+        A review that blocked the merge sends the issue back for another
+        attempt in the same session; only work still waiting for adoption
+        refuses a second experiment.
+        """
+        conn = getattr(self.experiment_service, "_conn", None)
+        if not isinstance(conn, sqlite3.Connection):
+            return False
+        try:
+            row = conn.execute(
+                "SELECT status FROM experiment_adoptions WHERE experiment_id = ?", (experiment_id,)
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return bool(row) and str(row[0]) in {"failed", "needs_review", "adopted"}
+
     def _session_experiment_ids(self, session_id: str) -> set[str]:
         """Experiments this session started (#330).
 
-        A session parks on the experiment its new_experiment created and,
-        once that ends, journals the result under the same id; between them
-        they cover the experiment's whole life.
+        Park and journal share the id, covering the experiment's whole life.
         """
         started: set[str] = set()
         session = self.task_store.get(session_id)
@@ -3019,9 +2874,8 @@ Decide the next step now. Return JSON only.
     def _may_resume_experiment(self, session_id: str, task: str, experiment_id: str) -> bool:
         """Whether resume_experiment may continue *experiment_id* here (#330).
 
-        Only the session's own experiments qualify, plus the one the user's
-        own request explicitly asks to resume. An id that merely turned up in
-        an observation - a refusal naming whatever blocks it, say - does not.
+        Only the session's own experiments, plus one the user explicitly asked to
+        resume - an id that merely turned up in an observation does not qualify.
         """
         experiment_id = str(experiment_id)
         if experiment_id in self._session_experiment_ids(session_id):
@@ -3069,14 +2923,9 @@ Decide the next step now. Return JSON only.
         if action == ACTION_ANSWER and requires_completion:
             if self._evidence_satisfies(session, kind="change"):
                 return None
-            # A run that succeeded without changing anything the executor can
-            # see is not completion: `true` does exactly that, and so does a
-            # genuine check of work that was already done. The two are
-            # indistinguishable from here, and an effect this process cannot
-            # observe - a restarted service, a remote call - looks the same
-            # again. All three go to the user to confirm, carrying the output,
-            # instead of the controller certifying its own claim or the turn
-            # burning its remaining steps.
+            # A run that succeeded without a visible change is not completion (`true` does
+            # exactly that): send it to the user to confirm rather than letting the controller
+            # certify its own claim or burn its remaining steps.
             if self._evidence_satisfies(session, kind="verify"):
                 return {
                     "event": "terminal_decision_rejected",
@@ -3206,11 +3055,9 @@ Decide the next step now. Return JSON only.
                 )
                 for item in terminal_evidence
             )
-            # An empty result from the authoritative read-only catalog only
-            # rules a capability out when the controller has no native path
-            # for the same gap. command/python_run deliberately do not live in
-            # OperationsRegistry, so treating an empty read-only catalog as
-            # proof of absence is the #244 failure.
+            # An empty read-only catalog only rules out a capability when there is no native
+            # path for the same gap - command/python_run deliberately live outside
+            # OperationsRegistry (#244).
             catalog_rules_out_capability = (
                 action == ACTION_MISSING_CAPABILITY
                 and not candidates
@@ -3297,12 +3144,11 @@ Decide the next step now. Return JSON only.
     ) -> TaskDecision:
         """Controlled, non-crashing outcome when no provider can take this turn.
 
-        The session and its full history/observations remain persisted so a
-        human can resolve capacity/configuration and resume; nothing required
-        to continue is silently discarded.
+        Session and history stay persisted so a human can resume; nothing needed to
+        continue is silently discarded.
         """
-        # Counted like any other turn: a statistic that only records the turns
-        # that succeeded would answer the wrong question.
+        # Counted like any other turn: a statistic of only successful turns answers the
+        # wrong question.
         self.task_store.record_controller_turn(
             session_id,
             provider_used="none",
@@ -3313,9 +3159,8 @@ Decide the next step now. Return JSON only.
             action=ACTION_MISSING_CAPABILITY,
             reason=reason,
             message=(
-                "Nexus could not take this controller turn: local inference "
-                "failed and no external provider is available. This needs "
-                "human review before retrying."
+                f"Nexus could not take this controller turn: {reason}. "
+                "This needs human review before retrying."
             ),
             observations=observations,
             session_id=session_id,
@@ -3341,8 +3186,8 @@ Decide the next step now. Return JSON only.
         if not isinstance(data, dict):
             raise TaskOrchestratorError("orchestrator response must be a JSON object")
 
-        # Temporary read compatibility for persisted tests/sessions created before
-        # issue #111. The controller schema and prompt no longer expose this shape.
+        # Temporary read compatibility for sessions persisted before #111; the controller
+        # schema no longer exposes this shape.
         response_type = str(data.get("type", "")).strip().lower()
         if response_type in {"tool", "action"}:
             legacy = dict(data)
@@ -3371,9 +3216,8 @@ Decide the next step now. Return JSON only.
         action = str(data.get("action", "")).strip().lower()
         if not action:
             raise TaskOrchestratorError("action response requires action")
-        # The capability list shows every action's fields under "arguments", and
-        # the local model answers in exactly that shape (#257). call_tool keeps
-        # its own "arguments" object for the resolved operation.
+        # The capability list shows each action's fields under "arguments", the shape the
+        # model answers in (#257).
         nested = data.get("arguments")
         if action != ACTION_CALL_TOOL and isinstance(nested, dict):
             data = {**nested, **data}
@@ -3583,9 +3427,7 @@ Decide the next step now. Return JSON only.
     def _rejected_python_run(decision: dict[str, Any], error: str) -> dict[str, Any]:
         """An invalid python_run request, returned to the controller to correct.
 
-        Raising here ended the whole task on one malformed call, and the
-        request itself was never recorded, so the failure could not be
-        diagnosed afterwards.
+        Raising ended the whole task on one malformed call without recording the request.
         """
         received = {
             key: decision.get(key)
@@ -3650,12 +3492,17 @@ Decide the next step now. Return JSON only.
         context: str = "",
         reason: str = "",
     ) -> dict[str, Any]:
-        available = {item["provider"] for item in self.delegation.catalog()}
+        catalog = [item["provider"] for item in self.delegation.catalog()]
+        available = set(catalog)
+        if not provider and catalog:
+            # The controller sometimes leaves the provider out: take the local worker or the
+            # first available.
+            provider = "local_worker" if "local_worker" in available else catalog[0]
         if provider not in available:
             raise TaskOrchestratorError(f"delegation provider {provider!r} is not available")
 
-        # Judgement goes to a strong model (#337): the local worker is the same
-        # small model as the controller and answers confidently when it is wrong.
+        # Judgement goes to a strong model (#337): the local worker is the same small
+        # model and answers confidently when wrong.
         routed = provider
         if provider == "local_worker" and "azure_openai" in available and not self._controller_forced_local():
             routed = "azure_openai"
@@ -3736,18 +3583,9 @@ Decide the next step now. Return JSON only.
     ) -> dict[str, Any] | None:
         """Run a read-only operation ``find_tool`` already resolved *and* bound.
 
-        The controller pays the same formality failure analysis did (#177):
-        after the resolver has returned one operation and read its arguments
-        straight out of the goal, asking the model to confirm "now call it"
-        buys nothing and costs a full decision on the local model.
-
-        Executed only when the router bound the arguments against that goal.
-        ``resolved_arguments`` is ``None`` whenever a value could not be tied
-        back to it, and that must never be read as "use the defaults" - it is
-        how a goal naming ``llama-server`` would be answered with
-        ``agent-api``. Everything else is the ordinary path: the same loop
-        guard, the same grant rule, the same read-only boundary in
-        ``execute_operation``, the same durable event.
+        Executed only when the router bound the arguments to the goal.
+        ``resolved_arguments`` is ``None`` when a value could not be tied back to it -
+        never read that as "use the defaults".
         """
         if observation.get("tool") != TOOL_FIND_TOOL or observation.get("status") != "found":
             return None
@@ -3756,14 +3594,9 @@ Decide the next step now. Return JSON only.
         if not operation or not isinstance(arguments, dict):
             return None
 
-        # The same identity `_tool_identity` gives a controller `call_tool`.
-        # The guard recognises a repeat by hashing (tool, arguments), so
-        # spelling this call `call_tool {"tool":..., "arguments":...}` while the
-        # controller's own spells it `operation {"operation":..., "args":...}`
-        # made one call hash two ways: the guard could not see that a
-        # subsequent call_tool was re-running what this already ran. Measured
-        # on the VM, git_status resolved here, ran, and the controller's next
-        # decision ran it again unrefused (#223).
+        # Same identity as a controller call_tool: the guard hashes (tool, arguments), and
+        # spelling the call two ways made one call hash differently, so a repeat went
+        # unrefused (#223).
         check = self.loop_guard.check(
             session_id,
             "operation",
@@ -3778,11 +3611,8 @@ Decide the next step now. Return JSON only.
                 {"operation": operation, "args": dict(arguments), "session_id": session_id}
             )
         except TaskOrchestratorError as exc:
-            # A refused execution is an observation about this turn, not a
-            # failure of it: the model still sees why and can choose again.
-            # Same shape as a refused call_tool, `recovery` included: the
-            # controller should not have to recognise two spellings of one
-            # answer depending on which path ran the operation.
+            # A refused execution is an observation about this turn, not a failure of it -
+            # same shape as a refused call_tool, so the controller sees one spelling.
             result = {
                 "tool": "operation",
                 "operation": operation,
@@ -3821,15 +3651,8 @@ Decide the next step now. Return JSON only.
     def _execute_operation(self, decision: dict[str, Any]) -> dict[str, Any]:
         """Run one resolved capability, reporting a refusal rather than raising.
 
-        A capability that rejects its arguments is answering the caller:
-        "issue_number must be a positive integer" is a fact the controller can
-        act on by calling again with a real number. Raising instead ended a
-        whole Nexus task with a traceback and lost every observation gathered
-        before it (#218).
-
-        Deliberately narrower than catching every tool error. ``python_run``
-        refusing a working directory outside the repository is a boundary being
-        tested, not an argument being corrected, and that still stops the run.
+        An argument rejection is an answer the controller can act on; a boundary
+        refusal (e.g. python_run outside the repository) still stops the run.
         """
         try:
             return self.tool_router.execute_operation(decision)
@@ -3855,10 +3678,7 @@ Decide the next step now. Return JSON only.
     ) -> dict[str, Any] | None:
         """The successful observation this decision asks to produce again.
 
-        Distinct from what the loop guard catches. The guard refuses any
-        repeat, including a retry of something that failed - a legitimate
-        move. This names the one case #223 is about: asking for a result that
-        is already in hand, which is never progress and never necessary.
+        Asking for a result already in hand is never progress - the case #223 is about.
         """
         if str(decision.get("action", "")).strip().lower() != ACTION_CALL_TOOL:
             return None
@@ -3920,9 +3740,7 @@ Decide the next step now. Return JSON only.
     ) -> None:
         """One line per run saying whether results were reused.
 
-        Green has to be observable, not only red. Without this a correct run
-        is silent and indistinguishable from one nobody looked at, so the only
-        way to know was to read the journal back with a script afterwards.
+        Green has to be observable too, not only red.
         """
         successes = sum(
             1
@@ -3945,14 +3763,7 @@ Decide the next step now. Return JSON only.
     def _journal_decision(self, session_id: str, decision: dict[str, Any]) -> None:
         """Record what the controller chose and the reason it gave.
 
-        `nexus_controller_turns` keeps the outcome of a turn; the model's own
-        stated reason was not kept anywhere. Reading a finished session back
-        therefore showed which tools ran and nothing about why - so a
-        controller that asked for a result it already had could be observed
-        doing it, and never asked what it thought it was doing.
-
-        Best-effort, like every other piece of instrumentation here: this must
-        never be the reason a turn fails.
+        Best-effort: instrumentation must never fail a turn.
         """
         try:
             metadata: dict[str, Any] = {"action": str(decision.get("action", ""))[:64]}
@@ -3983,10 +3794,8 @@ Decide the next step now. Return JSON only.
             status = "blocked_missing_capability"
         else:
             status = "action_selected"
-        # Journal, status and claim release in one ownership-scoped write. The
-        # turn ended on purpose, so the claim ends with a stated outcome rather
-        # than by going quiet - and if this worker was taken over meanwhile,
-        # none of it lands on the new owner's session (#162).
+        # Journal, status and claim release in one ownership-scoped write; if this worker
+        # was taken over, none of it lands on the new owner's session (#162).
         owner = self._claim_owner(session_id)
         if owner is None:
             logger.warning("refusing unowned final write for session %s", session_id)

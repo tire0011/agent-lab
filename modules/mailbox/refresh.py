@@ -97,9 +97,24 @@ def process_refresh(
     *,
     refresher: Callable[[str, Path], Any] | None = None,
     repo_root: Path | str | None = None,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
-    """Refresh the deployment checkout to the branch the message names."""
+    """Refresh the deployment checkout to the branch the message names.
+
+    A refresh moves the live deployment and restarts services, so only a
+    sender the authorization gate verified as trusted may request one.
+    """
     del conn, db_msg_id
+
+    if not sender_trusted:
+        logger.warning("refresh rejected: sender is not a trusted actor")
+        return (
+            "## Refresh rejected\n\n"
+            "**Reason:** the sender is not a trusted actor. "
+            "A refresh needs approval by the repository owner.\n\n"
+            "No refresh was attempted; the checkout is unchanged.",
+            None,
+        )
 
     try:
         branch = validate_branch((msg.meta or {}).get("branch", "main"))
@@ -147,13 +162,20 @@ def _format(branch: str, result: Any) -> str:
     # A restart this process handed to systemd and will not survive to see is
     # neither done nor failed. Calling it failed was the mirror of the bug it
     # replaced: the service does restart, we are simply not around to watch.
-    pending_services = sorted(
-        name for name, state in services.items() if str(state).startswith("restart ")
+    unknown_services = sorted(
+        name for name, state in services.items() if "outcome unknown" in str(state)
+    )
+    scheduled_services = sorted(
+        name
+        for name, state in services.items()
+        if str(state).startswith("restart ") and name not in unknown_services
     )
     failed_services = sorted(
         name
         for name, state in services.items()
-        if str(state) != "restarted" and name not in pending_services
+        if str(state) != "restarted"
+        and name not in scheduled_services
+        and name not in unknown_services
     )
     if not success:
         heading = "failed"
@@ -174,11 +196,17 @@ def _format(branch: str, result: Any) -> str:
         lines.append(
             f"**Not running the new code:** {', '.join(f'`{n}`' for n in failed_services)}"
         )
-    if pending_services:
+    if scheduled_services:
         lines.append(
-            "**Restarting shortly:** "
-            + ", ".join(f"`{n}`" for n in pending_services)
+            "**Restart scheduled:** "
+            + ", ".join(f"`{n}`" for n in scheduled_services)
             + " (handed to systemd; this process is being replaced)"
+        )
+    if unknown_services:
+        lines.append(
+            "**Restart outcome unknown:** "
+            + ", ".join(f"`{n}`" for n in unknown_services)
+            + " (fallback attempted; verify the service is running the new code)"
         )
     previous = getattr(result, "previous_head", None)
     new_head = getattr(result, "new_head", None)

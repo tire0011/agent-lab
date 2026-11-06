@@ -112,20 +112,3 @@ def render_prompt(role: str, variables: dict[str, Any], prompts_dir: Path | None
         body = body.replace("{{" + key + "}}", str(value))
 
     return body
-
-
-def get_prompt_metadata(role: str, prompts_dir: Path | None = None) -> dict[str, str]:
-    """Return the YAML front-matter metadata for *role* without the body."""
-    if role not in PROMPT_ROLES:
-        raise PromptLibraryError(
-            f"Unknown prompt role {role!r}. Available: {PROMPT_ROLES}"
-        )
-
-    base = prompts_dir or _PROMPTS_DIR
-    path = base / f"{role}_prompt.md"
-    if not path.exists():
-        raise PromptLibraryError(f"Prompt file not found: {path}")
-
-    raw = path.read_text(encoding="utf-8")
-    metadata, _ = _parse_front_matter(raw)
-    return metadata

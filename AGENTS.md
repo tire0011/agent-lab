@@ -34,12 +34,12 @@ Primary objective: learn how far the system can improve itself safely and measur
 - FastAPI app exists in `api.py` with:
   - public `GET /health`
   - authenticated `GET /secure-health` via `AGENT_API_KEY`
-  - authenticated `GET/POST /mailbox/tasks/{id}/approve|reject` — task approval bridge
-- Mailbox task approval bridge implemented: `modules/mailbox/task_service.py`
-  - `task` mailbox messages create `pending_approval` records; human approves/rejects via API/Web UI
-  - On approval, `ExperimentService` runs the task in a background daemon thread
-  - State machine: `pending_approval → approved → submitted → running → succeeded/failed/needs_review`
-  - Web UI Task Approvals card added to `static/index.html`
+  - authenticated `GET /mailbox/tasks` and `GET /mailbox/tasks/{id}` — mailbox task bridge (read-only)
+- Mailbox task bridge implemented: `modules/mailbox/task_service.py`
+  - `task` mailbox messages create `queued` records that go straight to Nexus (no approval step, #264)
+  - Nexus chooses the action; `new_experiment` runs in a background daemon thread
+  - State machine: `queued → submitted → running → succeeded/failed/needs_review`
+  - Legacy `pending_approval`/`rejected` records stay readable and are never run
 - FastAPI + nginx are running on VM with HTTPS and Let's Encrypt.
 - Azure OpenAI API connectivity has been tested successfully.
 
@@ -58,7 +58,7 @@ Primary objective: learn how far the system can improve itself safely and measur
 - Repo: `tire0011/agent-lab`
 - Azure OpenAI resource: `openAI-tire0011`
 - Deployment: `gpt-4o` (`2024-05-13`, GlobalStandard)
-- Public hostname: `agent-lab-tire0011.germanywestcentral.cloudapp.azure.com`
+- Public hostname: `<vm-host>`
 
 ## Execution Order (do not skip)
 

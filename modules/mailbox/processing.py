@@ -5,14 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
+from modules import github_authorization
+from modules import issue_approvals
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
+from modules.redaction import redact_outbound
 from .refresh import process_refresh as _process_refresh
+from .task_ingest import insert_task_approval, resolve_idempotency_key
 
 from .core import (
+    COMMAND_TYPE,
     MAX_RETRY,
     STATUS_DEFERRED,
     STATUS_DONE,
@@ -55,8 +62,29 @@ def _process_idea(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, str | None]:
-    """Append idea to IDEAS.md. Returns (result_body, idea_id)."""
+    """Append idea to IDEAS.md. Returns (result_body, idea_id).
+
+    An untrusted sender's idea is stored for review only: it must never enter
+    IDEAS.md in state ``new``, because the initiative tick would pick it up as
+    executable work.
+    """
+    if not sender_trusted:
+        conn.execute(
+            """
+            INSERT INTO knowledge (timestamp, run_id, category, key, value, confidence, source)
+            VALUES (?, NULL, 'mailbox_context', ?, ?, NULL, 'mailbox')
+            """,
+            (_now_iso(), msg.file_path.name, msg.body.strip()),
+        )
+        conn.commit()
+        return (
+            "Your submission has been stored for review. It is not added to IDEAS.md "
+            "and will not be worked on unless the repository owner approves it.",
+            None,
+        )
     ideas_path = repo_path / "IDEAS.md"
     content = ideas_path.read_text(encoding="utf-8")
 
@@ -99,8 +127,20 @@ def _process_task(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
-    """Record task request and create pending approval."""
+    """Record the task request; the task worker hands it straight to Nexus (#264).
+
+    Only a sender the authorization gate verified (via the git commit that
+    added the inbox file, never the file's own ``created_by`` text) gets a
+    ``queued`` task; everyone else gets ``pending_approval``, which the worker
+    never runs.
+    """
+    explicit_key = msg.meta.get("idempotency_key") or None
+    # A malformed key fails the message visibly instead of being swallowed
+    # by the best-effort approval insert below.
+    resolve_idempotency_key(db_msg_id, explicit_key)
     try:
         conn.execute(
             "UPDATE mailbox_messages SET task_body = ? WHERE id = ?",
@@ -111,33 +151,174 @@ def _process_task(
         logger.warning("_process_task: failed to store task_body for msg %s", db_msg_id)
 
     try:
+        # A retry of this same inbox row keeps the task it already created,
+        # even if the sender edited the file's key in between.
         existing = conn.execute(
             "SELECT id FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
             (db_msg_id,),
         ).fetchone()
         if not existing:
-            import uuid as _uuid
-            now = _now_iso()
-            approval_id = _uuid.uuid4().hex
-            conn.execute(
-                """
-                INSERT INTO mailbox_task_approvals
-                    (id, mailbox_msg_id, task_body, sender, file_path,
-                     received_at, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
-                """,
-                (approval_id, db_msg_id, msg.body, msg.created_by, str(msg.file_path), now, now, now),
+            # An optional front-matter ``idempotency_key`` lets a sender
+            # redeliver the same task as a new file without a second task
+            # (#378); otherwise the key is derived from this inbox row.
+            approval_id, created = insert_task_approval(
+                conn,
+                mailbox_msg_id=db_msg_id,
+                task_body=msg.body,
+                sender=msg.created_by,
+                file_path=str(msg.file_path),
+                received_at=_now_iso(),
+                idempotency_key=explicit_key,
+                status="queued" if sender_trusted else "pending_approval",
             )
-            conn.commit()
+            if not created:
+                logger.info(
+                    "_process_task: msg %s is a duplicate delivery of task %s",
+                    db_msg_id, approval_id,
+                )
     except Exception:
-        logger.warning("_process_task: failed to create approval for msg %s", db_msg_id, exc_info=True)
+        logger.warning("_process_task: failed to create task record for msg %s", db_msg_id, exc_info=True)
 
-    result_body = (
-        "Your task request has been recorded and is queued for human review.\n\n"
-        "Tasks submitted via the mailbox require human approval before execution. "
-        "A Nexus operator will evaluate the request and decide whether to run it."
-    )
+    if sender_trusted:
+        result_body = (
+            "Your task request has been recorded and handed to Nexus. "
+            "The result will appear in the outbox."
+        )
+    else:
+        result_body = (
+            "Your task request has been recorded and waits for approval by the "
+            "repository owner. Nothing will run until then. "
+            "The result will appear in the outbox."
+        )
     return result_body, None
+
+
+def _default_issue_fetcher(repository: str, issue_number: int) -> dict[str, Any]:
+    """Fetch the current title/body of one issue via the GitHub API.
+
+    Used to bind an approval to the issue's content hash at approval time.
+    """
+    proc = subprocess.run(
+        [
+            "gh", "api", f"repos/{repository}/issues/{issue_number}",
+            "--jq", "{title: .title, body: .body, pull_request: (has(\"pull_request\"))}",
+        ],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"GitHub issue lookup failed for {repository}#{issue_number}: "
+            f"{proc.stderr.strip()[:300]}"
+        )
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"GitHub issue lookup returned unparsable JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("GitHub issue lookup returned an unexpected payload")
+    if data.get("pull_request"):
+        raise RuntimeError(f"{repository}#{issue_number} is a pull request, not an issue")
+    return data
+
+
+def _process_issue_approval(
+    msg: MailboxMessage,
+    repo_path: Path,
+    conn: sqlite3.Connection,
+    db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
+    issue_fetcher: Any = None,
+) -> tuple[str, None]:
+    """Structured issue authorization command from the trusted mailbox.
+
+    Front matter (never free text): ``repository``, ``issue``, ``decision`` in
+    {approved, revoked, rejected}. Only a sender verified through the git
+    provenance of the adding commit (``sender_trusted``) may change the
+    approval registry; the file's own ``created_by`` is not proof of identity.
+    Approvals are bound to the issue's current content hash, recorded
+    transactionally and idempotently; the confirmation goes to the outbox.
+    No shell is involved.
+    """
+    if not sender_trusted:
+        logger.warning("issue_approval rejected: untrusted sender for %s", msg.file_path.name)
+        return (
+            "Issue approval rejected: the sender is not a trusted mailbox actor. "
+            "Nothing was changed.", None
+        )
+
+    repository_raw = str(
+        msg.meta.get("repository") or os.environ.get("GITHUB_REPOSITORY") or ""
+    ).strip()
+    issue_raw = str(msg.meta.get("issue") or "").strip()
+    decision = str(msg.meta.get("decision") or "").strip().lower()
+
+    repository = issue_approvals.normalize_repository(repository_raw)
+    if not repository:
+        return (
+            f"Issue approval rejected: invalid repository {repository_raw!r} "
+            "(expected 'owner/repo').", None
+        )
+    try:
+        issue_number = int(issue_raw)
+    except ValueError:
+        return f"Issue approval rejected: invalid issue number {issue_raw!r}.", None
+    if issue_raw != str(issue_number) or issue_number < 1:
+        return f"Issue approval rejected: invalid issue number {issue_raw!r}.", None
+    if decision not in issue_approvals.KNOWN_STATUSES:
+        return (
+            f"Issue approval rejected: unknown decision {decision!r} "
+            f"(allowed: {', '.join(sorted(issue_approvals.KNOWN_STATUSES))}).", None
+        )
+
+    content_hash = ""
+    if decision == issue_approvals.STATUS_APPROVED:
+        fetcher = issue_fetcher or _default_issue_fetcher
+        try:
+            issue = fetcher(repository, issue_number)
+        except Exception as exc:  # noqa: BLE001 - reported to the sender, nothing recorded
+            logger.warning("issue_approval: could not fetch %s#%s: %s", repository, issue_number, exc)
+            return (
+                f"Issue approval for {repository}#{issue_number} not recorded: "
+                f"the issue could not be fetched ({type(exc).__name__}).", None
+            )
+        if not isinstance(issue, dict) or issue.get("pull_request"):
+            return (
+                f"Issue approval rejected: {repository}#{issue_number} is a pull "
+                "request, not an issue.", None
+            )
+        content_hash = issue_approvals.issue_content_hash(
+            issue.get("title"), issue.get("body")
+        )
+
+    try:
+        approval, changed = issue_approvals.record_decision(
+            conn,
+            repository=repository,
+            issue_number=issue_number,
+            status=decision,
+            content_hash=content_hash,
+            source_mailbox_msg_id=db_msg_id,
+        )
+    except ValueError as exc:
+        return f"Issue approval rejected: {exc}.", None
+
+    if not changed:
+        return (
+            f"Issue {repository}#{issue_number} was already {decision} "
+            f"(content {approval.content_hash[:12]}); nothing changed.", None
+        )
+    if decision == issue_approvals.STATUS_APPROVED:
+        return (
+            f"Issue {repository}#{issue_number} is now **approved** for autonomous "
+            f"execution, bound to content hash `{approval.content_hash[:12]}…`. "
+            "If the issue is edited, the approval no longer applies and must be renewed.",
+            None,
+        )
+    return (
+        f"Issue {repository}#{issue_number} is now **{decision}**. Running experiments "
+        "on it are cancelled on the next tick; new work will not start.", None
+    )
 
 
 def _process_question(
@@ -145,8 +326,11 @@ def _process_question(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
     """Acknowledge question."""
+    del sender_trusted
     result_body = (
         "Your question has been received and will be reviewed by a Nexus operator.\n\n"
         "Questions submitted via the mailbox are logged and reviewed periodically. "
@@ -160,8 +344,11 @@ def _process_context(
     repo_path: Path,
     conn: sqlite3.Connection,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
     """Store context in knowledge table."""
+    del sender_trusted
     now = _now_iso()
     conn.execute(
         """
@@ -177,6 +364,79 @@ def _process_context(
         "under category `mailbox_context`."
     )
     return result_body, None
+
+
+# Owner-tunable settings a `setting` message may change, with their valid
+# range. Anything else is refused: the message carries no shell.
+SETTINGS: dict[str, tuple[str, int, int]] = {
+    "daily_budget": ("nexus.daily_budget", 0, 50),
+    # Starts on top of the daily budget for the next 24 hours (#523).
+    "extra_budget": ("nexus.extra_budget", 0, 20),
+}
+
+
+# Text settings take their value from the message body; "default" or an
+# empty body restores the built-in text (#541).
+TEXT_SETTINGS: dict[str, tuple[str, int]] = {
+    "planner_mission": ("nexus.planner_mission", 4000),
+}
+
+
+def _process_setting(
+    msg: MailboxMessage,
+    repo_path: Path,
+    conn: sqlite3.Connection,
+    db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
+) -> tuple[str, None]:
+    """Change one allowlisted setting from the front matter (``key``, ``value``).
+
+    Settings change Nexus's own guardrails, so only a verified trusted sender
+    may change them.
+    """
+    if not sender_trusted:
+        return "Setting changes require a sender the repository owner trusts. Refused.", None
+    key = str(msg.meta.get("key") or "").strip()
+    if key in TEXT_SETTINGS:
+        db_key, limit = TEXT_SETTINGS[key]
+        text = str(msg.body or "").strip()
+        if not text or text.lower() == "default":
+            conn.execute("DELETE FROM service_settings WHERE key = ?", (db_key,))
+            conn.commit()
+            return f"Setting {key} is back to the default.", None
+        if len(text) > limit:
+            return f"Setting {key} must be at most {limit} characters.", None
+        conn.execute(
+            """
+            INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (db_key, text, _now_iso()),
+        )
+        conn.commit()
+        return f"Setting {key} is now set ({len(text)} characters).", None
+    if key not in SETTINGS:
+        allowed = sorted([*SETTINGS, *TEXT_SETTINGS])
+        return f"Unknown setting {key!r}. Allowed: {', '.join(allowed)}.", None
+    db_key, low, high = SETTINGS[key]
+    try:
+        value = int(str(msg.meta.get("value") or "").strip())
+    except ValueError:
+        return f"Setting {key} needs an integer value.", None
+    if not low <= value <= high:
+        return f"Setting {key} must be between {low} and {high}.", None
+    conn.execute(
+        """
+        INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (db_key, str(value), _now_iso()),
+    )
+    conn.commit()
+    if key == "extra_budget":
+        return f"Setting {key} is now {value} for the next 24 hours.", None
+    return f"Setting {key} is now {value}.", None
 
 
 def _parse_operation_chain_body(body: str) -> tuple[dict, str | None]:
@@ -228,10 +488,24 @@ def _process_operation_chain(
     conn: sqlite3.Connection,
     db_msg_id: int,
     operation_chain_service: Any = None,
+    *,
+    sender_trusted: bool = True,
 ) -> Any:
-    """Parse, validate, and start an operation_chain message."""
+    """Parse, validate, and start an operation_chain message.
+
+    An operation chain executes operations, so an untrusted sender never gets
+    one started, no matter what the message text claims.
+    """
     import hashlib as _hashlib
 
+    if not sender_trusted:
+        logger.warning(
+            "operation_chain rejected for untrusted sender: %s", msg.file_path.name
+        )
+        return _ChainError(
+            "Operation chain rejected: the sender is not a trusted actor. "
+            "It needs approval by the repository owner before anything runs."
+        )
     data, parse_error = _parse_operation_chain_body(msg.body)
     if parse_error:
         logger.warning("operation_chain parse error for %s: %s", msg.file_path.name, parse_error)
@@ -312,6 +586,10 @@ _PROCESSORS = {
     "context": _process_context,
     # Moving the deployment to a branch, with no shell in the message (#228).
     "refresh": _process_refresh,
+    # Owner-tunable settings such as the daily budget, no shell.
+    "setting": _process_setting,
+    # Structured issue authorization; persisted in issue_approvals, no shell.
+    "issue_approval": _process_issue_approval,
 }
 
 
@@ -326,6 +604,7 @@ class MailboxProcessor:
         operation_chain_service: Any = None,
         mailbox_config: Any = None,
         task_log_dir: str | Path = DEFAULT_LOG_DIR,
+        issue_fetcher: Any = None,
     ) -> None:
         if mailbox_config is not None:
             self._mailbox_repo_path: Path = mailbox_config.mailbox_repo_path
@@ -346,6 +625,7 @@ class MailboxProcessor:
         self.db_path = db_path
         self.dry_run = dry_run
         self.operation_chain_service = operation_chain_service
+        self.issue_fetcher = issue_fetcher
         self.task_log_dir = Path(task_log_dir)
         self._conn: sqlite3.Connection | None = None
 
@@ -395,8 +675,12 @@ class MailboxProcessor:
         if not plan or self.dry_run:
             return plan
 
+        notices: list[Path] = []
         for path in plan.inbox:
             self._log_terminal_inbox_message(path)
+            notice = self._write_discard_notice(path)
+            if notice is not None:
+                notices.append(notice)
 
         removed: list[Path] = []
         for path in plan.paths:
@@ -413,7 +697,7 @@ class MailboxProcessor:
 
         commit_msg = f"mailbox: prune {plan.summary()} older than {days}d"
         if not git_add_and_commit(
-            self._mailbox_repo_path, removed, commit_msg, self._mailbox_commit_prefixes
+            self._mailbox_repo_path, removed + notices, commit_msg, self._mailbox_commit_prefixes
         ):
             logger.warning("mailbox prune could not be committed")
         else:
@@ -422,6 +706,41 @@ class MailboxProcessor:
                 plan.summary(), plan.protected, plan.truncated,
             )
         return plan
+
+    def _write_discard_notice(self, path: Path) -> Path | None:
+        """An outbox answer for a message dropped after its retries (#521).
+
+        Without it a failed message just vanished from the inbox and its
+        sender never learned why (a crashing command went unnoticed).
+        """
+        row = self.conn.execute(
+            "SELECT retry_count, last_error, msg_type FROM mailbox_messages WHERE file_path = ?",
+            (str(path),),
+        ).fetchone()
+        notice = self.outbox / f"failed-{path.stem}.md"
+        # The last error is exception text - for a command it can quote the
+        # command's own output - and the notice is committed to the mailbox
+        # repository, so it is masked like every other outbound result (#220).
+        last_error = redact_outbound(str(row[1]) if row and row[1] else "") or "unknown"
+        body = (
+            "---\n"
+            "type: result\n"
+            "status: failed\n"
+            f"source: inbox/{path.name}\n"
+            "---\n\n"
+            f"# Failed: {path.name}\n\n"
+            f"The message was not processed and was removed from the inbox after "
+            f"{int(row[0]) if row and row[0] is not None else MAX_RETRY} attempts.\n\n"
+            f"**Type:** {str(row[2]) if row and row[2] else 'unknown'}\n\n"
+            f"**Last error:**\n\n```text\n{last_error[:2000]}\n```\n"
+        )
+        try:
+            self.outbox.mkdir(parents=True, exist_ok=True)
+            notice.write_text(body, encoding="utf-8")
+        except OSError:
+            logger.warning("could not write the discard notice for %s", path.name)
+            return None
+        return notice
 
     def _log_terminal_inbox_message(self, path: Path) -> None:
         """Record why an inbox message is being dropped, before it is gone.
@@ -510,13 +829,6 @@ class MailboxProcessor:
         files.sort(key=lambda f: (f.stat().st_mtime, f.name))
         return files
 
-    def _is_already_processed(self, file_path: Path) -> bool:
-        row = self.conn.execute(
-            "SELECT status FROM mailbox_messages WHERE file_path = ? AND status IN ('done', 'processing')",
-            (str(file_path),),
-        ).fetchone()
-        return row is not None
-
     def _get_existing_record(self, file_path: Path) -> dict | None:
         row = self.conn.execute(
             """
@@ -597,6 +909,26 @@ class MailboxProcessor:
         commit_sha = git_current_commit(self._mailbox_repo_path)
         now = _now_iso()
 
+        # The authorization gate for this message: the verdict comes from the
+        # git commit that added the inbox file, never from the file's own
+        # ``created_by`` front matter (which is attacker-controlled text).
+        sender_verdict = github_authorization.classify_mailbox_message(
+            msg.created_by, self._mailbox_repo_path, file_path
+        )
+        sender_trusted = sender_verdict.trusted
+        if not sender_trusted:
+            logger.warning(
+                "mailbox message from unverified sender: file=%s actor=%s (%s)",
+                file_path.name, sender_verdict.actor, sender_verdict.detail,
+            )
+            task_log.warning(
+                "mailbox",
+                "untrusted_sender",
+                "message will not trigger execution without owner approval",
+                source_file=file_path.name,
+                actor=sender_verdict.actor,
+            )
+
         if existing:
             if existing["status"] == STATUS_DEFERRED:
                 self.conn.execute(
@@ -629,6 +961,7 @@ class MailboxProcessor:
                     self.conn,
                     db_msg_id,
                     operation_chain_service=self.operation_chain_service,
+                    sender_trusted=sender_trusted,
                 )
                 return self._handle_chain_outcome(
                     chain_outcome,
@@ -637,8 +970,20 @@ class MailboxProcessor:
                     msg,
                     db_msg_id,
                 )
-            processor = _PROCESSORS[msg.msg_type]
-            processor_result = processor(msg, self._code_repo_path, self.conn, db_msg_id)
+            if msg.msg_type == "issue_approval":
+                processor_result = _process_issue_approval(
+                    msg,
+                    self._code_repo_path,
+                    self.conn,
+                    db_msg_id,
+                    sender_trusted=sender_trusted,
+                    issue_fetcher=self.issue_fetcher,
+                )
+            else:
+                processor = _PROCESSORS[msg.msg_type]
+                processor_result = processor(
+                    msg, self._code_repo_path, self.conn, db_msg_id, sender_trusted=sender_trusted
+                )
             if processor_result is _DEFERRED_PROCESSING:
                 self.conn.execute(
                     "UPDATE mailbox_messages SET status=? WHERE id=?",
@@ -648,16 +993,28 @@ class MailboxProcessor:
                 return {"file": rel, "status": "pending", "type": msg.msg_type}
             result_body, idea_id = processor_result
         except Exception as exc:
-            logger.exception("Error processing %s", file_path)
-            self._record_failure(file_path, str(exc), {"id": db_msg_id})
+            error = str(exc)
+            if msg.msg_type == COMMAND_TYPE:
+                # Exception text from a command run is user-visible (status,
+                # API, discard notice) and may quote the command's output.
+                error = redact_outbound(error)
+                logger.error("Error processing %s: %s", file_path, error)
+            else:
+                logger.exception("Error processing %s", file_path)
+            self._record_failure(file_path, error, {"id": db_msg_id})
             task_log.error(
                 "mailbox",
                 "message_processing_failed",
                 "mailbox message processing failed",
-                exc=exc,
+                # A stack trace would repeat the unmasked exception text.
+                **(
+                    {"exception_type": type(exc).__name__, "exception_message": error}
+                    if msg.msg_type == COMMAND_TYPE
+                    else {"exc": exc}
+                ),
                 source_file=file_path.name,
             )
-            return {"file": rel, "status": "failed", "error": str(exc)}
+            return {"file": rel, "status": "failed", "error": error}
 
         processed_at = _now_iso()
         outbox_name = _outbox_filename(msg, processed_at)

@@ -10,7 +10,7 @@ import unittest
 
 from tests.test_nexus_initiative import InitiativeFixture
 
-ISSUE = [{"number": 235, "title": "Self-restart fallback", "body": ""}]
+ISSUE = [{"number": 235, "author": {"login": "tire0011"}, "title": "Self-restart fallback", "body": ""}]
 
 
 class IssueRetryTests(unittest.TestCase):

@@ -233,6 +233,19 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("status: verifying", client.prompts[-1])
         self.assertIsNotNone(result.session_id)
 
+    def test_resume_without_experiment_id_is_sent_back_to_the_controller(self):
+        client = _Client([
+            '{"type":"action","action":"resume_experiment","experiment_id":null,'
+            '"command":null,"message":"","reason":"continue"}',
+            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
+            '"message":"Nothing to resume.","reason":"no experiment named"}',
+        ])
+
+        result = self._orchestrator(client).run("Continue the work", source_id="tick-1")
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertIn("resume_experiment needs experiment_id", client.prompts[-1])
+
     def test_controller_inference_runs_through_persistent_job_service(self):
         client = _Client([
             '{"type":"action","action":"answer","experiment_id":null,"command":null,'
@@ -1178,6 +1191,22 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(delegation.calls[0][0], "codex_readonly")
         self.assertIn("timeout handling", client.prompts[1])
 
+    def test_delegate_without_provider_uses_the_local_worker(self):
+        delegation = _Delegation()
+        client = _Client([
+            '{"type":"tool","tool":"delegate","task":"Inspect the timeout",'
+            '"reason":"specialist analysis"}',
+            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
+            '"message":"Done.","reason":"enough evidence"}',
+        ])
+
+        result = self._orchestrator(client, delegation=delegation).run(
+            "Investigate the verification timeout", source_type="issue", source_id="46",
+        )
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertTrue(delegation.calls)
+
     def test_clarification_persists_and_same_session_can_continue(self):
         client = _Client([
             '{"type":"action","action":"clarification","experiment_id":null,'
@@ -1532,8 +1561,11 @@ class TaskOrchestratorTests(unittest.TestCase):
             # The row already stored in the events table must be complete...
             self.assertGreater(len(row["content"]), 15000)
             self.assertIn(huge_line, row["content"])
-            # ...and get_event() must return that same complete raw content.
-            full = orchestrator.task_store.get_event(row["id"])
+            # ...and the journal read path must return that same complete raw content.
+            full = next(
+                event for event in orchestrator.task_store.recent_events(result.session_id, limit=100)
+                if event["id"] == row["id"]
+            )
             self.assertEqual(full["content"], row["content"])
             self.assertIn(huge_line, full["content"])
         finally:

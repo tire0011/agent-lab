@@ -7,7 +7,6 @@ import pytest
 
 from modules.prompt_library import (
     PromptLibraryError,
-    get_prompt_metadata,
     load_prompt,
     render_prompt,
 )
@@ -99,14 +98,6 @@ def test_render_prompt_extra_variables_ignored(prompts_dir):
     assert "Hello" in rendered
 
 
-# ── get_prompt_metadata ───────────────────────────────────────────────────────
-
-def test_get_prompt_metadata_returns_front_matter(prompts_dir):
-    meta = get_prompt_metadata("router", prompts_dir=prompts_dir)
-    assert meta["version"] == "1.0"
-    assert meta["role"] == "router"
 
 
-def test_get_prompt_metadata_unknown_role_raises():
-    with pytest.raises(PromptLibraryError, match="Unknown prompt role"):
-        get_prompt_metadata("unknown")
+

@@ -653,21 +653,3 @@ def _log_provider_usage(
         ),
     )
     db.commit()
-
-
-def _log_consultation(
-    db: sqlite3.Connection | None,
-    parent_task: str,
-    query: str,
-    reply: str,
-) -> None:
-    if db is None:
-        return
-    db.execute(
-        """
-        INSERT INTO model_consultations (timestamp, parent_task, query, reply)
-        VALUES (?, ?, ?, ?)
-        """,
-        (datetime.now(timezone.utc).isoformat(), parent_task, query, reply),
-    )
-    db.commit()

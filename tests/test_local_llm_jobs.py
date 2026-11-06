@@ -11,7 +11,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from modules import heartbeat
 from modules.local_llm_jobs import (
     ERROR_KIND_CANCELLED,
     ERROR_KIND_STUCK,
@@ -411,7 +410,7 @@ class CrossProcessSerializationTests(unittest.IsolatedAsyncioTestCase):
                 "UPDATE local_llm_jobs SET status = 'running', started_at = ?, worker_id = ?, "
                 "lease_expires_at = ? WHERE id = ?",
                 (
-                    heartbeat.now_iso(),
+                    datetime.now(timezone.utc).isoformat(),
                     "another-host:4242:beef",
                     (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
                     job_id,
@@ -430,7 +429,7 @@ class CrossProcessSerializationTests(unittest.IsolatedAsyncioTestCase):
                 "UPDATE local_llm_jobs SET status = 'running', started_at = ?, worker_id = ?, "
                 "lease_expires_at = ? WHERE id = ?",
                 (
-                    heartbeat.now_iso(),
+                    datetime.now(timezone.utc).isoformat(),
                     "dead-host:1:dead",
                     (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
                     abandoned,

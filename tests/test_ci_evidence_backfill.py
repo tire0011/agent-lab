@@ -16,6 +16,11 @@ from modules.github_work_tracking import GitHubCIVerification, GitHubWorkTrackin
 from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 
+def _wait_for_thread(service, experiment_id, timeout=None):
+    thread = service._threads.get(experiment_id)
+    if thread is not None:
+        thread.join(timeout)
+
 class LegacyCIEvidenceBackfillTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fx = AdoptionRepoFixture()
@@ -186,7 +191,7 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
 
         with patch.object(adoption, "_run_adoption_pipeline"):
             adoption.start_adoption(self.experiment_id, superseded=assessment)
-            adoption.wait_for_thread(self.experiment_id, timeout=5)
+            _wait_for_thread(adoption, self.experiment_id, timeout=5)
         self.assertEqual(adoption.get(self.experiment_id).stale_retry_attempts, 1)
         history = adoption.failure_history(self.experiment_id)
         self.assertEqual(len(history), 1)
@@ -245,6 +250,31 @@ class LegacyCIEvidenceBackfillTests(unittest.TestCase):
             "SELECT COUNT(*) FROM github_ci_verifications"
         ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_a_red_run_with_failure_detail_is_still_parsed(self):
+        """The first line is the evidence; what follows it is detail (#472)."""
+        self._insert_legacy_ci_run(
+            output=(
+                f"GitHub Actions run {self.run_id} for commit {self.checkpoint_sha} "
+                "completed with conclusion failure. "
+                f"https://example.invalid/actions/runs/{self.run_id}\n"
+                "Failed job: unittest\n"
+                "Failed step: Run tests\n"
+                "Failing tests:\n"
+                "FAILED tests/test_a.py::test_one - boom\n"
+            ),
+            exit_code=1,
+        )
+
+        tracking, _ = self._restart_current_code_without_credentials()
+
+        details = tracking.recorded_ci_details(self.checkpoint_sha)
+        self.assertEqual(details["status"], "failed")
+        self.assertEqual(details["conclusion"], "failure")
+        self.assertEqual(details["run_id"], self.run_id)
+        self.assertEqual(
+            details["url"], f"https://example.invalid/actions/runs/{self.run_id}"
+        )
 
     def test_mismatched_ci_identity_is_not_backfilled(self):
         other_sha = "a" * 40

@@ -301,7 +301,12 @@ def test_run_tests_background_task_queued(monkeypatch):
         assert status["status"] == "running"
 
         may_finish.set()
-        assert svc.wait_for_task(task_id)
+        deadline = time.time() + 10
+        status = svc.execute("test_task_status", "tok", {"task_id": task_id})
+        while status["status"] == "running" and time.time() < deadline:
+            time.sleep(0.02)
+            status = svc.execute("test_task_status", "tok", {"task_id": task_id})
+        assert status["status"] != "running"
         final = svc.execute("test_task_result", "tok", {"task_id": task_id})
         assert final["status"] == "succeeded"
         assert "5 passed" in final["output"]
@@ -326,7 +331,12 @@ def test_run_tests_task_times_out(monkeypatch):
         result = svc.execute("run_tests", "tok")
         task_id = result["task_id"]
 
-    assert svc.wait_for_task(task_id)
+    deadline = time.time() + 10
+    status = svc.execute("test_task_status", "tok", {"task_id": task_id})
+    while status["status"] == "running" and time.time() < deadline:
+        time.sleep(0.02)
+        status = svc.execute("test_task_status", "tok", {"task_id": task_id})
+    assert status["status"] != "running"
     final = svc.execute("test_task_result", "tok", {"task_id": task_id})
     assert final["status"] == "timed_out"
     assert "timed out" in final["error"]

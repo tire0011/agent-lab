@@ -26,6 +26,7 @@ from modules.github_work_tracking import (
     LIFECYCLE_READINESS_MESSAGE,
     GitHubCIVerification,
     GitHubWorkTrackingError,
+    MergeForbiddenError,
     GitHubWorkTrackingService,
 )
 from modules.mailbox import MailboxLock
@@ -43,12 +44,17 @@ STATUS_ADOPTED = "adopted"
 STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
+# Everything but the merge is done: the task forbids it (#185). Not a
+# needs_review, which Nexus would try again.
+STATUS_READY_FOR_REVIEW = "ready_for_review"
 
 # Adoptions run in threads of this process; a short-lived caller such as the
 # initiative tick must wait for them before it exits (#358).
 ADOPTION_THREAD_PREFIX = "adopt-"
 
-_TERMINAL_STATUSES = {STATUS_ADOPTED, STATUS_NEEDS_REVIEW, STATUS_FAILED, STATUS_INTERRUPTED}
+_TERMINAL_STATUSES = {
+    STATUS_ADOPTED, STATUS_NEEDS_REVIEW, STATUS_FAILED, STATUS_INTERRUPTED, STATUS_READY_FOR_REVIEW,
+}
 _ACTIVE_STATUSES = {STATUS_QUEUED, STATUS_ADOPTING}
 
 _DEFAULT_GIT_TIMEOUT_SECONDS = 60
@@ -312,11 +318,6 @@ class ExperimentAdoptionService:
             ).fetchone()
         return _row_to_adoption(row, experiment_id)
 
-    def wait_for_thread(self, experiment_id: str, timeout: float | None = None) -> None:
-        thread = self._threads.get(experiment_id)
-        if thread is not None:
-            thread.join(timeout)
-
     def recover_after_restart(self) -> list[str]:
         """Resume adoptions that a process restart interrupted mid-flight.
 
@@ -399,6 +400,17 @@ class ExperimentAdoptionService:
             )
             return False
 
+        merge_refusal = self._merge_refusal_for(experiment_id)
+        if merge_refusal is not None:
+            self._set_status(
+                experiment_id,
+                STATUS_READY_FOR_REVIEW,
+                ended_at=_utcnow_iso(),
+                reason=sanitized_reason(merge_refusal),
+                updated_at=_utcnow_iso(),
+            )
+            return False
+
         blocker = self._recovery_blocker(experiment_id)
         if blocker is not None:
             self._set_status(
@@ -471,6 +483,13 @@ class ExperimentAdoptionService:
         if not worktree_path or not os.path.isdir(worktree_path):
             return "the experiment worktree is no longer available"
         return None
+
+    def _merge_refusal_for(self, experiment_id: str) -> str | None:
+        """The no-merge constraint on an experiment's existing pull request."""
+        work_ref = self.github_work_tracking.for_experiment(experiment_id)
+        if work_ref is None or work_ref.pr_number is None:
+            return None
+        return self.github_work_tracking.merge_refusal(work_ref)
 
     def _merged_sha_for(self, experiment_id: str) -> str | None:
         try:
@@ -1005,6 +1024,12 @@ class ExperimentAdoptionService:
             existing.status == STATUS_NEEDS_REVIEW and not reopening_review
         ):
             return existing
+        if existing.status == STATUS_READY_FOR_REVIEW:
+            # Asking again changes nothing, but the refusal is recorded (#185).
+            work_ref = self.github_work_tracking.for_experiment(experiment_id)
+            if work_ref is not None:
+                self.github_work_tracking.refuse_merge(work_ref)
+            return existing
 
         restarting_failure = (
             existing.status in {STATUS_FAILED, STATUS_INTERRUPTED} or reopening_review
@@ -1424,7 +1449,9 @@ class ExperimentAdoptionService:
             return "Änderungen unter communication/outbox/ werden nicht automatisch übernommen."
         if lower == ".env" or lower.endswith("/.env") or lower.endswith(".pem"):
             return "Sensible Konfigurationsdateien werden nicht automatisch übernommen."
-        if "secret" in lower or "credential" in lower:
+        # Test files may be named after what they test (fixtures such as
+        # "print_vault_secrets.md"); the reviewer reads their content.
+        if ("secret" in lower or "credential" in lower) and not lower.startswith("tests/"):
             return "Potentiell sensible Dateien werden nicht automatisch übernommen."
         return None
 
@@ -1681,30 +1708,45 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
-            cherry_pick = _run_git(
-                ["cherry-pick", "--no-commit", experiment_commit_sha or "HEAD"],
+            # The whole change since the experiment branch left main, not
+            # only its last commit: a retry builds on the earlier attempt's
+            # commits, and picking just its own commit either conflicts or
+            # lands half a change (#455, the reverted #410).
+            squash = _run_git(
+                ["merge", "--squash", experiment_commit_sha or "HEAD"],
                 cwd=str(integration_path),
                 timeout=120,
                 elog=elog,
                 phase="adoption",
             )
-            if cherry_pick.returncode != 0:
+            if squash.returncode != 0:
                 keep_integration = True
-                _run_git(
-                    ["cherry-pick", "--abort"],
-                    cwd=str(integration_path),
-                    timeout=60,
-                    elog=elog,
-                    phase="adoption",
-                )
+                conflicted = self._git_stdout(
+                    ["diff", "--name-only", "--diff-filter=U"], str(integration_path), elog
+                ).split()
+                _run_git(["reset", "--hard", "HEAD"], cwd=str(integration_path), timeout=60, elog=elog, phase="adoption")
                 return self._finish_review(
                     experiment_id,
-                    reason="Integrationskonflikt beim Cherry-Pick.",
+                    reason="Integrationskonflikt: " + (", ".join(conflicted[:10]) or "merge failed"),
                     actual_files=actual_files,
                     expected_files=expected_files,
                     diagnostic_worktree_path=str(integration_path),
                     elog=elog,
                 )
+            # Earlier attempts' files were never checked by an adoption.
+            staged = self._git_stdout(["diff", "--cached", "--name-only"], str(integration_path), elog).split()
+            for rel_path in staged:
+                denied = self._denied_path_reason(rel_path)
+                if denied is not None:
+                    keep_integration = True
+                    return self._finish_review(
+                        experiment_id,
+                        reason=denied,
+                        actual_files=actual_files,
+                        expected_files=expected_files,
+                        diagnostic_worktree_path=str(integration_path),
+                        elog=elog,
+                    )
 
             evidence = self._exact_commit_ci(experiment_id, phase="adoption", elog=elog)
             ci = evidence.verification
@@ -1860,7 +1902,16 @@ class ExperimentAdoptionService:
                 integrated_changed,
                 str(integration_path),
             )
-            if eval_result.outcome != "pass":
+            # Soft gate findings (#519) go to the reviewer; without one they
+            # stay a hard stop here, before anything is pushed.
+            integrated_soft = eval_result.soft_findings() if self.reviewer is not None else None
+            review_findings = [
+                f for f in (
+                    (experiment.quality_evaluation or {}).get("review_findings"),
+                    integrated_soft,
+                ) if f
+            ]
+            if eval_result.outcome != "pass" and integrated_soft is None:
                 keep_integration = True
                 return self._finish_review(
                     experiment_id,
@@ -1952,6 +2003,30 @@ class ExperimentAdoptionService:
                     elog=elog,
                 )
 
+            # CI ran on the experiment branch; what merges is that change on
+            # top of today's main. Test exactly that tree first (#455).
+            if published_sha and not (exact_ci and evidence.passed and published_sha == checkpoint_sha):
+                final_ci = self.github_work_tracking.wait_for_commit_ci(
+                    published_sha, experiment_id=experiment_id
+                )
+                if final_ci.status != "passed":
+                    keep_integration = True
+                    return self._finish_failure(
+                        experiment_id,
+                        reason=(
+                            f"CI on the integrated tree {published_sha[:12]} did not pass: "
+                            f"{final_ci.status} {final_ci.reason or final_ci.conclusion or ''}".strip()
+                        ),
+                        actual_files=actual_files,
+                        expected_files=expected_files,
+                        test_exit_code=test_exit_code,
+                        test_output=bounded_test_output,
+                        experiment_commit_sha=experiment_commit_sha,
+                        integrated_commit_sha=integrated_commit_sha,
+                        diagnostic_worktree_path=str(integration_path),
+                        elog=elog,
+                    )
+
             plan_title = ""
             if isinstance(experiment.plan, dict):
                 plan_title = str(experiment.plan.get("title") or "")
@@ -1971,7 +2046,10 @@ class ExperimentAdoptionService:
                     draft=False,
                 )
                 self.github_work_tracking.mark_pull_request_ready(work_ref)
-                blocked = self._review_blocks(experiment_id, experiment.goal, work_ref, integration_path, elog)
+                blocked = self._review_blocks(
+                    experiment_id, experiment.goal, work_ref, integration_path, elog,
+                    gate_findings="; ".join(dict.fromkeys(review_findings)),
+                )
                 if blocked is not None:
                     return self._finish_failure(
                         experiment_id,
@@ -1988,6 +2066,22 @@ class ExperimentAdoptionService:
                     work_ref,
                     expected_head_sha=published_sha,
                 ) or published_sha
+            except MergeForbiddenError as exc:
+                elog.warning(
+                    "adoption", "merge_refused", str(exc),
+                    pull_request_number=work_ref.pr_number,
+                )
+                return self._finish_review(
+                    experiment_id,
+                    reason=str(exc),
+                    status=STATUS_READY_FOR_REVIEW,
+                    actual_files=actual_files,
+                    expected_files=expected_files,
+                    test_exit_code=test_exit_code,
+                    test_output=bounded_test_output,
+                    experiment_commit_sha=experiment_commit_sha,
+                    integrated_commit_sha=integrated_commit_sha,
+                )
             except GitHubWorkTrackingError as exc:
                 keep_integration = True
                 return self._finish_review(
@@ -2070,24 +2164,33 @@ class ExperimentAdoptionService:
             logger.warning("could not classify GitHub lifecycle readiness", exc_info=True)
             return None
 
-    def _review_blocks(self, experiment_id, goal, work_ref, integration_path, elog) -> str | None:
+    def _review_blocks(
+        self, experiment_id, goal, work_ref, integration_path, elog, *, gate_findings: str = "",
+    ) -> str | None:
         """Review the change before the merge (#396); the reason if it is blocked.
 
         The review result goes on the pull request either way. A review that
         cannot run does not block: tests and the quality gate already passed.
+        With quality-gate findings (#519) only a real verdict may merge: the
+        reviewer was asked to judge them, so no verdict means no merge.
         """
+        no_verdict = (
+            f"Qualitäts-Gate-Befund ohne Reviewer-Urteil: {gate_findings}" if gate_findings else None
+        )
         if self.reviewer is None:
-            return None
+            return no_verdict
+        kwargs = {"gate_findings": gate_findings} if gate_findings else {}
         try:
             result = self.reviewer.review(
                 experiment_id=experiment_id,
                 goal=str(goal or ""),
                 worktree_path=str(integration_path),
                 base_sha=self._integration_base_sha(),
+                **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - a broken review must not block
             logger.warning("adoption review failed for %s: %s", experiment_id, exc)
-            return None
+            return no_verdict
         from modules.nexus_reviewer import review_comment
 
         if elog is not None:
@@ -2098,6 +2201,8 @@ class ExperimentAdoptionService:
             logger.warning("could not post the review on PR #%s: %s", work_ref.pr_number, exc)
         if result.blocks:
             return f"Review by {result.reviewer} blocked the merge: {result.summary}"
+        if gate_findings and result.verdict != "approve":
+            return no_verdict
         return None
 
     def _finish_failure(
@@ -2145,6 +2250,7 @@ class ExperimentAdoptionService:
         integrated_commit_sha: str | None = None,
         diagnostic_worktree_path: str | None = None,
         review_blocker: str | None = None,
+        status: str = STATUS_NEEDS_REVIEW,
         elog=None,
     ) -> ExperimentAdoption:
         """Park the adoption for review.
@@ -2165,7 +2271,7 @@ class ExperimentAdoptionService:
             )
         self._set_status(
             experiment_id,
-            STATUS_NEEDS_REVIEW,
+            status,
             review_blocker=review_blocker,
             ended_at=_utcnow_iso(),
             experiment_commit_sha=experiment_commit_sha,

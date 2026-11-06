@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -18,13 +19,22 @@ from typing import Any, Callable
 
 from modules.coding_provider import (
     build_random_worker,
+    build_worker,
+    is_provider_overload,
+    other_provider,
     provider_of,
     random_worker_factory,
 )
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
-from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
+from modules.central_logging import (
+    DEFAULT_LOG_DIR,
+    ExperimentLogger,
+    _tail_read_lines,
+    sanitize_command,
+)
+from modules.github_work_tracking import failing_test_names
 from modules.redaction import sanitized_reason
 from modules.run_store import (
     DEFAULT_DB_PATH,
@@ -44,9 +54,11 @@ from modules.verification_runner import (
 from .git_utils import _run_git
 from .models import (
     Experiment,
+    ExperimentAlreadyActiveError,
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
     ExperimentNotCancellableError,
+    PIPELINE_CRASH_ERROR_PREFIX,
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
@@ -61,54 +73,87 @@ from .models import (
     _TERMINAL_STATUSES,
     _row_to_experiment,
 )
-from .policy import _check_goal_policy, _policy_rule_for_reason
+from .policy import _check_goal_policy, _goal_secret_warning, _policy_rule_for_reason
 from .prompts import _build_direct_implementation_prompt, _build_repair_implementation_prompt
 from .text_utils import _truncate_text, _utcnow_iso
 
 logger = logging.getLogger("modules.experiment_service")
 
-# Statuses that represent a problem worth surfacing at WARNING level in the
-# journal (as opposed to ordinary forward progress, logged at INFO). Kept
-# as a small fixed set here so lifecycle logging in ``_transition``/
-# ``_force_status`` stays centralized and consistent.
+_GITHUB_ISSUE_GOAL_RE = re.compile(r"^GitHub Issue #(\d+):")
+
+# Statuses worth journalling at WARNING (vs INFO); kept as a small fixed set here
+# so lifecycle logging in ``_transition``/``_force_status`` stays centralized.
 _WARNING_STATUSES = frozenset(
     {"rejected", "failed", "timed_out", "needs_review", "cancelled", "interrupted"}
 )
 
-# Subset of the above that represents an actual failure (as opposed to a
-# policy rejection or a review handoff) — logged at ERROR in the
-# structured per-experiment JSONL log (journald keeps the coarser
-# WARNING/INFO split above for backward compatibility).
+# Subset of the above that is an actual failure (vs a policy rejection or review
+# handoff), logged at ERROR in the per-experiment JSONL log.
 _ERROR_STATUSES = frozenset({"failed", "timed_out"})
 
 _DEFAULT_MAX_TEST_OUTPUT_BYTES = 32 * 1024
+_MAX_ERROR_TEST_NAMES = 3
 _DEFAULT_MAX_DIFF_BYTES = 64 * 1024
 _DEFAULT_MAX_RAW_MESSAGE_BYTES = 16 * 1024
 _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES = 64 * 1024
 _DEFAULT_RESEARCH_TIMEOUT_SECONDS = 120
 _DEFAULT_PLAN_TIMEOUT_SECONDS = 90
 _REFORMAT_RETRY_TIMEOUT_SECONDS = 60
-# Absolute cap only (#327): the coding agent is progress-watched and stopped
-# when it stalls; see modules.coding_worker.agent_watchdog_limits.
+# Absolute cap only (#327): the coding agent is progress-watched and stopped when
+# it stalls; see modules.coding_worker.agent_watchdog_limits.
 _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
 _DEFAULT_MAX_REPAIR_ITERATIONS = 2
+<<<<<<< HEAD
 BASELINE_RECHECK_ENV_VAR = "NEXUS_BASELINE_RECHECK_SECONDS"
 DEFAULT_BASELINE_RECHECK_SECONDS = 120.0
+=======
+EXPERIMENT_TOKEN_BUDGET_ENV_VAR = "NEXUS_EXPERIMENT_TOKEN_BUDGET"
+>>>>>>> e952d64c2675dbf9563599af916e6bf037e35613
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
 
-# Worktree retention (#376). Every experiment keeps its worktree after it ends
-# so it can be inspected, retried or adopted - but a full checkout per run on a
-# 1 GB VM silently exhausts the disk. Terminal experiments whose ``ended_at``
-# is older than this many hours have their worktree directory removed; the
-# experiment row, its log and its branch are kept. ``0`` disables cleanup, and
-# so does anything unparsable or negative: a typo must not start deleting.
+# Worktree retention (#376): worktrees are kept after an experiment ends for
+# inspection/retry/adoption, but a full checkout per run exhausts a 1 GB VM's disk,
+# so terminal runs older than this many hours lose the directory (row, log and branch
+# are kept). ``0`` or anything unparsable disables cleanup - a typo must not start deleting.
 WORKTREE_RETENTION_ENV_VAR = "NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS"
 DEFAULT_WORKTREE_RETENTION_HOURS = 7 * 24
 
 # Adoption statuses that still need the experiment's worktree, whatever its age.
 _ADOPTION_TERMINAL_STATUSES = ("adopted", "needs_review", "failed", "interrupted")
+
+# Stall sweep (#400): fail an active experiment whose newest log or activity event
+# is older than its phase's hard limit plus this grace. A live worker logs
+# ``coding_agent_progress`` every 10 minutes, so a healthy run never nears the limit.
+STALL_GRACE_ENV_VAR = "NEXUS_EXPERIMENT_STALL_GRACE_SECONDS"
+DEFAULT_STALL_GRACE_SECONDS = 15 * 60
+_STALLED_ERROR_PREFIX = "stalled: "
+_STALL_SWEEP_STATUSES = (STATUS_QUEUED, STATUS_SELECTING, STATUS_IMPLEMENTING, STATUS_VERIFYING)
+# Time a stalled worker's process group gets after SIGTERM before SIGKILL.
+_STALL_TERMINATE_GRACE_SECONDS = 5.0
+# Only the end of an experiment log is read to find its newest entry.
+_STALL_LOG_TAIL_BYTES = 64 * 1024
+
+
+def stall_grace_seconds(raw: str | None = None) -> float:
+    """Configured stall grace in seconds; a typo falls back to the default."""
+    value = raw if raw is not None else os.environ.get(STALL_GRACE_ENV_VAR)
+    if value is None or not str(value).strip():
+        return float(DEFAULT_STALL_GRACE_SECONDS)
+    try:
+        seconds = float(str(value).strip())
+    except ValueError:
+        logger.warning("ignoring invalid %s value; using the default", STALL_GRACE_ENV_VAR)
+        return float(DEFAULT_STALL_GRACE_SECONDS)
+    if seconds < 0 or seconds != seconds or seconds == float("inf"):
+        return float(DEFAULT_STALL_GRACE_SECONDS)
+    return seconds
+
+
+def _is_stalled(status: str | None, error: str | None) -> bool:
+    """Whether the stall sweep ended this experiment (#400)."""
+    return status == STATUS_FAILED and str(error or "").startswith(_STALLED_ERROR_PREFIX)
 
 
 def worktree_retention_hours(raw: str | None = None) -> float:
@@ -122,6 +167,43 @@ def worktree_retention_hours(raw: str | None = None) -> float:
         logger.warning("ignoring invalid %s value; worktree cleanup disabled", WORKTREE_RETENTION_ENV_VAR)
         return 0.0
     return hours if hours > 0 and hours != float("inf") else 0.0
+
+
+def _experiment_token_budget(raw: str | None) -> int | None:
+    """Parse the optional shadow-mode budget; invalid values disable it safely."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        budget = int(raw)
+    except ValueError:
+        logger.warning("ignoring invalid %s value", EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        return None
+    if budget < 0:
+        logger.warning("ignoring negative %s value", EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        return None
+    return budget
+
+
+def worker_run_token_total(usage: dict[str, Any] | None) -> int:
+    """Return provider-independent tokens for one completed worker run.
+
+    Both workers flatten their final usage event.  Input and output tokens are
+    counted along with every reported cache-token counter; unrelated counters
+    (for example reasoning tokens) are deliberately excluded.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    keys = {"input_tokens", "output_tokens"}
+    keys.update(
+        key for key in usage
+        if isinstance(key, str) and "cache" in key.lower() and "token" in key.lower()
+    )
+    return sum(
+        max(0, int(usage.get(key, 0)))
+        for key in keys
+        if isinstance(usage.get(key, 0), (int, float))
+        and not isinstance(usage.get(key, 0), bool)
+    )
 
 
 def _parse_utc(timestamp: str | None) -> datetime | None:
@@ -142,45 +224,25 @@ class WorktreeCleanupResult:
     removed: list[str] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
 
-# Progress-aware local verification (#209). The verification subprocess is no
-# longer bounded by a fixed wall-clock timeout, adaptive or not: a wall-clock
-# limit cannot tell a healthy-but-slow suite from a stuck test, which is how
-# experiment df97d67bc08e45b4bc5c573db0c84d85 came to be reported as
-# ``timed_out`` with no exit code and nothing to diagnose. Instead the run is
-# watched for *progress* (see ``modules.verification_runner``): it continues
-# for as long as tests keep starting and finishing, and is aborted when they
-# stop. The absolute cap below survives only as a final guard against a
-# permanently orphaned process, deliberately far too large to be the normal
-# mechanism for deciding whether a run is failing.
-#
-# The total test count the suite last reported is persisted in
-# ``service_settings`` (see ``modules.run_store``), so a run in progress can
-# report "842 / 1873" rather than a bare count from its very first minute.
-# The watchdog's own numbers (and their environment variables and floors)
-# live with the watchdog in ``modules.verification_runner``; leaving these
-# unset here is what lets an operator tune a deployment through the
-# environment without editing code.
+# Progress-aware local verification (#209): the run is watched for *progress* (tests
+# starting/finishing), not bounded by a wall-clock limit, which cannot tell a slow
+# suite from a stuck test; the absolute cap below is only a final guard against a
+# permanently orphaned process. The last reported test total is persisted in
+# ``service_settings`` so a run can report "842 / 1873"; watchdog numbers stay
+# tunable through the environment without editing code.
 _TEST_TOTAL_SETTING_KEY = "verification_test_total"
 
-# Built-in default test command, keyed by a fixed identifier. The plan/LLM output
-# never supplies a raw shell string; the service only ever chooses one of
-# these fixed argv templates. "{python}" is substituted with the
-# configured test interpreter (see ExperimentService.test_python_executable)
-# so that worktrees without their own virtualenv can still run tests using
-# the main repository's already-installed interpreter/site-packages,
-# without copying a .venv or installing any package into the worktree.
-# ``-v`` rather than ``-q``: the verbose stream is the only in-band signal
-# that says which test is running right now, and the progress watchdog is
-# built on it. It does not make the persisted test output any larger - the
-# runner strips the per-test "... ok" lines back out again (see
-# ``modules.test_progress.UnittestStreamParser``), so what reaches
-# ``test_output`` (and its head-first truncation, and the failure tail the UI
-# shows) stays what ``-q`` produced, plus a one-liner per failing test.
+# Built-in default test commands, keyed by a fixed identifier: plan/LLM output never
+# supplies a raw shell string. "{python}" becomes the configured interpreter so
+# worktrees without their own venv can run the suite. ``-v`` because the verbose
+# stream is the in-band progress signal the watchdog is built on (the runner strips
+# the per-test "... ok" lines back out again).
 _TEST_COMMANDS: dict[str, list[str]] = {
     "unittest-discover": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-v"],
 }
 _DEFAULT_TEST_COMMAND_KEY = "unittest-discover"
 
+<<<<<<< HEAD
 
 def _is_real_test_id(test_id: str) -> bool:
     """Whether *test_id* names a collected test rather than a loader error."""
@@ -228,21 +290,18 @@ def _baseline_verdict(test_id: str, result: VerificationRunResult) -> str:
 # worktree only needs to be used as the *working directory* (``cwd``) for
 # ``python -m unittest``, since Python resolves ``tests/`` relative to cwd
 # while the interpreter and its installed packages come from the venv path.
+=======
+# Default test interpreter inside a worktree: the main repo's venv python, so no files
+# are copied and no package installed - the worktree is only the command's cwd.
+>>>>>>> e952d64c2675dbf9563599af916e6bf037e35613
 _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
 
 class ExperimentService:
-    """Orchestrates one bounded self-development experiment at a time.
-
-    Reuses the external coding-agent workers (``CodexWorker`` /
-    ``ClaudeWorker``) for both the read-only selection phase and the isolated
-    workspace-write implementation phase; no worker/subprocess logic is
-    duplicated here beyond git worktree management and the fixed verification
-    commands.
-
-    Which agent runs an experiment is selected by a persistent rotation (see
-    ``modules.coding_provider``) unless the caller injects its own worker or
-    factory. The selected provider is recorded on the experiment as
-    ``implementation_provider``.
+    """Orchestrates one bounded self-development experiment at a time, using the
+    external coding-agent workers (``CodexWorker``/``ClaudeWorker``) for the read-only
+    selection phase and the isolated implementation phase. The provider is chosen by
+    a persistent rotation (``modules.coding_provider``) unless a worker/factory is
+    injected, and recorded on the experiment as ``implementation_provider``.
     """
 
     def __init__(
@@ -264,84 +323,48 @@ class ExperimentService:
         test_safety_cap_seconds: float | None = None,
         max_repair_iterations: int = _DEFAULT_MAX_REPAIR_ITERATIONS,
         rng: Any | None = None,
+        base_ref: str = "HEAD",
+        test_command: list[str] | None = None,
     ) -> None:
         """
         Parameters
         ----------
         rng:
-            Deprecated compatibility argument. Provider selection is now a
-            deterministic, persistent rotation. Ignored when factories are injected.
+            Deprecated compatibility argument; ignored when factories are injected.
         selection_worker:
-            ``CodexWorker`` used for the read-only *research* phase (the
-            only phase that ever investigates the live repository).
-            Defaults to a real worker allowed only inside ``repo_root``.
+            Worker for the read-only research phase; defaults to one allowed only inside ``repo_root``.
         worker_factory:
-            Callable ``(worktree_path) -> CodexWorker`` used to build the
-            implementation-phase worker, scoped (legacy worker root configuration) to that
-            single worktree path only. Defaults to a factory that selects the
-            next coding agent once per worktree
-            (``modules.coding_provider.random_worker_factory``).
+            ``(worktree_path) -> worker`` for the implementation phase, scoped to that worktree only.
         plan_worker_factory:
-            Callable ``(scratch_dir) -> CodexWorker`` used to build the
-            *plan*-phase worker (and its one reformat retry), scoped
-            (legacy worker root configuration) to a fresh, empty scratch directory created
-            fresh for each experiment and removed afterwards. This worker
-            never sees ``repo_root`` and is given only the goal plus the
-            research summary as input — it cannot perform any further
-            repository research even if it tried to run a shell command,
-            since its working directory is empty. Defaults to a factory that
-            selects the next coding agent once per scratch directory.
+            ``(scratch_dir) -> worker`` for the plan phase, scoped to a fresh empty scratch dir that never sees ``repo_root``.
         repo_root:
-            Root of the main repository (default ``/agent``). Never
-            modified by this service.
+            Main repository root (default ``/agent``); never modified by this service.
         worktrees_root:
-            Parent directory under which per-experiment worktrees (and
-            plan-phase scratch directories) are created. Defaults to
-            ``~/agent-worktrees`` since ``/`` itself is typically not
-            writable by the agent user.
+            Parent dir for per-experiment worktrees and scratch dirs (default ``~/agent-worktrees``).
         test_python_executable:
-            Path to the Python interpreter used to run the verification
-            test command inside an experiment worktree. Defaults to the
-            main repository's own virtualenv interpreter
-            (``/agent/.venv/bin/python``) so a fresh git worktree — which
-            has no virtualenv of its own — can still run the existing test
-            suite: the worktree is used only as the test command's
-            *working directory*, never as the source of the interpreter
-            or its installed packages. No package is installed and no
-            ``.venv`` is copied into the worktree.
+            Interpreter for verification inside a worktree; defaults to the main repo's venv
+            python so no package is installed or copied into the worktree.
         experiment_log_dir:
-            Directory holding one durable, append-only JSONL log per
-            experiment (``<experiment_log_dir>/<experiment_id>.jsonl``),
-            written via ``modules.central_logging.ExperimentLogger``.
-            Defaults to ``<repo_root>/state/experiment-logs``.
-        test_stall_timeout_seconds:
-            How long a local verification run may go without a single test
-            starting or finishing before the watchdog calls it stalled and
-            aborts it. This - not total runtime - is what decides whether a
-            run is failing. ``None`` (the default) resolves it from
-            ``NEXUS_TEST_STALL_SECONDS``, or the watchdog's own default.
-        test_watchdog_interval_seconds:
-            How often the watchdog checks progress, and therefore how often
-            the test heartbeat reaches this experiment's log. ``None``
-            resolves it from ``NEXUS_TEST_WATCHDOG_INTERVAL_SECONDS``.
-        test_safety_cap_seconds:
-            Absolute ceiling on one local verification run, as a final guard
-            against a permanently orphaned process. Deliberately large; it
-            must never be the mechanism that ends a healthy run. ``None``
-            resolves it from ``NEXUS_TEST_SAFETY_CAP_SECONDS``.
-
-            All three are passed through as written when set explicitly, and
-            clamped to safe floors when they come from the environment - see
-            ``WatchdogConfig.resolve``.
+            Directory for the per-experiment append-only JSONL log; defaults to
+            ``<repo_root>/state/experiment-logs``.
+        test_stall_timeout_seconds / test_watchdog_interval_seconds / test_safety_cap_seconds:
+            Watchdog rules for local verification; ``None`` resolves from the environment
+            (clamped, see ``WatchdogConfig.resolve``). The safety cap is only a final guard
+            against an orphaned process, never the normal stop mechanism.
+        base_ref:
+            Commit an experiment's worktree starts from unless the GitHub lifecycle supplies one.
+        test_command:
+            Verification argv template replacing the built-in suite; ``{python}`` becomes
+            ``test_python_executable``. Trusted callers only - never build it from plan or
+            model output.
         """
         self.selection_worker = (
             selection_worker
             if selection_worker is not None
             else build_random_worker(db_path=db_path)[1]
         )
-        # One selection per worktree/scratch directory, i.e. one agent per
-        # experiment: the implementation call and any repair iteration run on
-        # the same provider, while the next experiment rotates again.
+        # One provider per worktree/scratch dir, i.e. one agent per experiment: the
+        # implementation call and any repair iteration share it, the next experiment rotates.
         self.worker_factory = worker_factory or random_worker_factory(db_path=db_path, rng=rng)
         self.plan_worker_factory = plan_worker_factory or random_worker_factory(db_path=db_path, rng=rng)
         self.db_path = db_path
@@ -356,13 +379,14 @@ class ExperimentService:
         self.test_watchdog_interval_seconds = test_watchdog_interval_seconds
         self.test_safety_cap_seconds = test_safety_cap_seconds
         self.max_repair_iterations = max(0, max_repair_iterations)
-        # Deliberately *not* derived from ``repo_root``: tests (and some
-        # deployments) point ``repo_root`` at a throwaway git checkout whose
-        # cleanliness is asserted directly, so the log directory must never
-        # live inside it (matching ``modules.run_log``'s plain
-        # ``state/runs`` default, which is likewise independent of any
-        # injected repo path). In production this resolves relative to the
-        # service's working directory (``/agent``).
+        self.experiment_token_budget = _experiment_token_budget(
+            os.environ.get(EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        )
+        self.base_ref = base_ref
+        self.test_command = test_command
+        # Deliberately *not* derived from ``repo_root``: tests point ``repo_root`` at a
+        # throwaway checkout whose cleanliness is asserted directly, so the log directory
+        # must never live inside it.
         self.experiment_log_dir = experiment_log_dir or DEFAULT_LOG_DIR
 
         conn = init_db(db_path)
@@ -557,10 +581,26 @@ class ExperimentService:
                 self._active_processes.pop(experiment_id, None)
             else:
                 self._active_processes[experiment_id] = process
-        # Close the narrow race where cancellation commits after the caller
-        # starts a phase but before that phase publishes its Popen handle.
-        if process is not None and self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+        # Workers run in their own process group (start_new_session); the id is persisted so
+        # a stall sweep in another process can stop it (#400).
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE experiments SET worker_pgid = ? WHERE id = ?",
+                (process.pid if process is not None else None, experiment_id),
+            )
+        # Close the race where cancellation (or the stall sweep) commits after a phase starts
+        # but before it publishes its Popen handle.
+        if process is not None and self._ended_from_outside(experiment_id):
             self._terminate_process(process)
+
+    def _ended_from_outside(self, experiment_id: str) -> bool:
+        """Cancelled by an operator or failed by the stall sweep while running.
+
+        The pipeline thread checks this after every blocking step and stops instead of
+        overwriting the outcome.
+        """
+        experiment = self.get_experiment(experiment_id)
+        return experiment.status == STATUS_CANCELLED or _is_stalled(experiment.status, experiment.error)
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen) -> None:
@@ -605,16 +645,12 @@ class ExperimentService:
             self._terminate_process(process)
         return self.get_experiment(experiment.id)
 
-    # ------------------------------------------------------------------
-    # verification test watchdog (#209)
-    # ------------------------------------------------------------------
 
     def _get_test_watchdog_config(self) -> WatchdogConfig:
         """Progress rules for the next local verification run.
 
-        Whatever this service was constructed with wins; anything left unset
-        falls through to the environment (clamped) and then to the watchdog's
-        defaults.
+        Constructor values win; anything unset falls through to the (clamped) environment
+        and then to the watchdog's defaults.
         """
         return WatchdogConfig.resolve(
             stall_timeout_seconds=self.test_stall_timeout_seconds,
@@ -625,9 +661,7 @@ class ExperimentService:
     def _get_expected_test_total(self) -> int | None:
         """How many tests the suite reported last time, if it ever finished.
 
-        Only used to make progress readable ("842 / 1873"); a wrong or
-        missing value costs nothing, so every failure here is simply "we do
-        not know the total yet".
+        Only for readable progress ("842 / 1873") - a wrong or missing value costs nothing.
         """
         with self._lock:
             raw = get_setting(self._conn, _TEST_TOTAL_SETTING_KEY)
@@ -649,9 +683,6 @@ class ExperimentService:
                 updated_at=_utcnow_iso(),
             )
 
-    # ------------------------------------------------------------------
-    # create_experiment
-    # ------------------------------------------------------------------
 
     def create_experiment(
         self,
@@ -663,39 +694,69 @@ class ExperimentService:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
+        normalized_goal = goal.strip()
+        issue_match = _GITHUB_ISSUE_GOAL_RE.match(normalized_goal)
+        issue_number = int(issue_match.group(1)) if issue_match is not None else None
         experiment_id = uuid.uuid4().hex
         created_at = _utcnow_iso()
 
-        with self._lock, self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO experiments (id, goal, status, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (experiment_id, goal.strip(), STATUS_QUEUED, created_at),
-            )
-            insert_activity(
-                self._conn,
-                timestamp=created_at,
-                entity_type="experiment",
-                entity_id=experiment_id,
-                event="created",
-                to_status=STATUS_QUEUED,
-                message=goal.strip(),
-            )
+        with self._lock:
+            # BEGIN IMMEDIATE reserves the writer before the SELECT: a deferred transaction would
+            # start only at the INSERT, letting two instances both pass the check before either
+            # owns the write lock.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if issue_number is not None:
+                    placeholders = ", ".join("?" for _ in _TERMINAL_STATUSES)
+                    active_rows = self._conn.execute(
+                        f"""
+                        SELECT id, status, goal FROM experiments
+                        WHERE status NOT IN ({placeholders})
+                        ORDER BY created_at ASC
+                        """,
+                        _TERMINAL_STATUSES,
+                    ).fetchall()
+                    active = next(
+                        (
+                            row
+                            for row in active_rows
+                            if (match := _GITHUB_ISSUE_GOAL_RE.match(row["goal"]))
+                            and int(match.group(1)) == issue_number
+                        ),
+                        None,
+                    )
+                    if active is not None:
+                        raise ExperimentAlreadyActiveError(active["id"], active["status"])
+                self._conn.execute(
+                    """
+                    INSERT INTO experiments (id, goal, status, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (experiment_id, normalized_goal, STATUS_QUEUED, created_at),
+                )
+                insert_activity(
+                    self._conn,
+                    timestamp=created_at,
+                    entity_type="experiment",
+                    entity_id=experiment_id,
+                    event="created",
+                    to_status=STATUS_QUEUED,
+                    message=normalized_goal,
+                )
+            except BaseException:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
 
-        self._implementation_timeout_seconds = timeout_seconds
         logger.info("experiment %s created (status=%s)", experiment_id, STATUS_QUEUED)
         self.get_experiment_logger(experiment_id).info(
             STATUS_QUEUED, "experiment_created",
-            f"Experiment created: {goal.strip()}",
+            f"Experiment created: {normalized_goal}",
             timeout_seconds=timeout_seconds,
         )
         return self.get_experiment(experiment_id)
 
-    # ------------------------------------------------------------------
-    # get_experiment
-    # ------------------------------------------------------------------
 
     def get_experiment(self, experiment_id: str) -> Experiment:
         with self._lock:
@@ -709,9 +770,8 @@ class ExperimentService:
     def _resolve_by_prefix(self, experiment_id: str) -> Experiment:
         """Resolve an exact id or an unambiguous >=8 hex-char id prefix.
 
-        Shared by both the public and the authenticated single-experiment
-        lookups so an operator can use the same short id (e.g. copied from
-        ``/activity/public`` or a log line) against either endpoint.
+        Shared by the public and authenticated single-experiment lookups so the same
+        short id works against either endpoint.
         """
         if re.fullmatch(r"[0-9a-f]{8,64}", experiment_id) is None:
             raise ExperimentNotFoundError("invalid experiment id")
@@ -731,13 +791,8 @@ class ExperimentService:
     def resolve_experiment(self, experiment_id: str) -> Experiment:
         """Authenticated equivalent of ``resolve_public_experiment``.
 
-        Accepts either a full experiment id or an unambiguous >=8 hex-char
-        prefix, exactly like the public endpoint, so an operator holding
-        only a short id (e.g. from ``/activity/public``) can still look up
-        full authenticated detail without first resolving it elsewhere.
-        Falls back to an exact-id lookup for ids that don't look like a
-        valid hex prefix (e.g. legacy/non-hex ids), preserving the previous
-        ``get_experiment`` behavior for exact matches.
+        Accepts an exact id or an unambiguous >=8 hex-char prefix like the public endpoint;
+        ids that are not valid hex prefixes fall back to an exact-id lookup.
         """
         if re.fullmatch(r"[0-9a-f]{8,64}", experiment_id) is not None:
             return self._resolve_by_prefix(experiment_id)
@@ -753,17 +808,28 @@ class ExperimentService:
             ).fetchall()
         return [_row_to_experiment(row) for row in rows]
 
-    # ------------------------------------------------------------------
-    # list_activity — persistent activity log (experiment lifecycle events)
-    # ------------------------------------------------------------------
+    def list_gate_recheck_candidates(self) -> list[Experiment]:
+        """Return only terminal runs eligible for a read-only gate recheck."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM experiments
+                WHERE status = ?
+                   OR (status = ? AND error LIKE 'quality evaluation:%')
+                ORDER BY created_at DESC, id DESC
+                """,
+                (STATUS_REJECTED, STATUS_NEEDS_REVIEW),
+            ).fetchall()
+        return [_row_to_experiment(row) for row in rows]
+
 
     def list_activity(
         self, limit: int = 50, experiment_id: str | None = None
     ) -> list[dict[str, Any]]:
         """Return recent persisted activity log entries, newest first.
 
-        Reuses ``modules.run_store.list_activity`` against the same
-        connection/lock used for all other experiment reads/writes.
+        Reuses ``modules.run_store.list_activity`` on the same connection/lock as all
+        other experiment reads/writes.
         """
         with self._lock:
             return list_activity(
@@ -772,34 +838,6 @@ class ExperimentService:
                 entity_type="experiment",
                 entity_id=experiment_id,
             )
-
-    def list_verification_runs(self, experiment_id: str) -> list[dict[str, Any]]:
-        """Return every persisted verification attempt for an experiment."""
-        with self._lock:
-            rows = self._conn.execute(
-                """SELECT iteration, started_at, ended_at, status, commit_sha,
-                          command_json, exit_code, output, error,
-                          failure_fingerprint
-                   FROM verification_runs
-                   WHERE experiment_id = ?
-                   ORDER BY iteration""",
-                (experiment_id,),
-            ).fetchall()
-        return [
-            {
-                "iteration": row[0],
-                "started_at": row[1],
-                "ended_at": row[2],
-                "status": row[3],
-                "commit_sha": row[4],
-                "command": json.loads(row[5]) if row[5] else None,
-                "exit_code": row[6],
-                "output": row[7],
-                "error": row[8],
-                "failure_fingerprint": row[9],
-            }
-            for row in rows
-        ]
 
     def mailbox_task_id_for_experiment(self, experiment_id: str) -> str | None:
         """Return the approval id linked to an experiment, if any."""
@@ -815,11 +853,8 @@ class ExperimentService:
     ) -> ExperimentLogger:
         """Build the (cheap, stateless) structured JSONL logger for one experiment.
 
-        Every caller anywhere in the pipeline — this service, the mailbox
-        approval bridge, or a test — goes through this single factory so
-        every log entry for a given experiment lands in exactly one file
-        (``<experiment_log_dir>/<experiment_id>.jsonl``), regardless of
-        which thread is writing.
+        Every pipeline caller goes through this single factory, so all log entries for an
+        experiment land in exactly one file regardless of which thread writes.
         """
         if mailbox_task_id is None:
             mailbox_task_id = self.mailbox_task_id_for_experiment(experiment_id)
@@ -833,16 +868,81 @@ class ExperimentService:
         """Path to an experiment's JSONL log file (may not exist yet)."""
         return Path(self.experiment_log_dir) / f"{experiment_id}.jsonl"
 
-    # ------------------------------------------------------------------
-    # Internal: status transition helper
-    # ------------------------------------------------------------------
+    def _record_worker_run_usage(
+        self,
+        experiment_id: str,
+        usage: dict[str, Any] | None,
+        elog: ExperimentLogger,
+    ) -> str | None:
+        """Accumulate one finished implementation/fallback/repair run.
+
+        When shadow mode is disabled this returns the historical raw usage JSON
+        without changing the database.  With a configured budget, the update and
+        warning-deduplication flag are committed atomically.
+        """
+        if self.experiment_token_budget is None:
+            return json.dumps(usage) if usage else None
+
+        run_tokens = worker_run_token_total(usage)
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT implementation_usage_json FROM experiments WHERE id = ?",
+                (experiment_id,),
+            ).fetchone()
+            previous: dict[str, Any] = {}
+            if row is not None and row[0]:
+                try:
+                    decoded = json.loads(row[0])
+                    if isinstance(decoded, dict):
+                        previous = decoded
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            total = int(previous.get("tokens_consumed", 0)) + run_tokens
+            run_count = int(previous.get("token_run_count", 0)) + 1
+            already_warned = bool(previous.get("token_budget_warning_logged", False))
+            crossed = total > self.experiment_token_budget and not already_warned
+            persisted = dict(usage) if isinstance(usage, dict) else {}
+            persisted.update(
+                token_budget=self.experiment_token_budget,
+                tokens_consumed=total,
+                token_run_count=run_count,
+                token_budget_warning_logged=already_warned or crossed,
+            )
+            encoded = json.dumps(persisted)
+            self._conn.execute(
+                "UPDATE experiments SET implementation_usage_json = ? WHERE id = ?",
+                (encoded, experiment_id),
+            )
+
+        if crossed:
+            elog.warning(
+                "implementation",
+                "token_budget_exceeded",
+                "Experiment token budget exceeded (shadow mode; execution continues)",
+                budget=self.experiment_token_budget,
+                total=total,
+                run_count=run_count,
+            )
+        else:
+            # ``nexus logs`` reads this same structured stream, so the current
+            # shadow total is visible even before crossing (and after the one
+            # deduplicated warning has already been emitted).
+            elog.info(
+                "implementation",
+                "token_budget_updated",
+                "Experiment token usage updated (shadow mode)",
+                budget=self.experiment_token_budget,
+                total=total,
+                run_count=run_count,
+            )
+        return encoded
+
 
     def _transition(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:
         """Atomically move ``from_status`` -> ``to_status`` iff still ``from_status``.
 
-        Returns True if the transition happened. Extra ``fields`` are set in
-        the same UPDATE. Unknown/disallowed transitions are refused by the
-        caller (checked via ``_STATE_TRANSITIONS`` before calling this).
+        Returns True if the transition happened; extra ``fields`` are set in the same
+        UPDATE. Disallowed transitions are refused by the caller via ``_STATE_TRANSITIONS``.
         """
         set_clauses = ["status = ?"]
         values: list[Any] = [to_status]
@@ -906,9 +1006,13 @@ class ExperimentService:
 
         with self._lock, self._conn:
             current = self._conn.execute(
-                "SELECT status FROM experiments WHERE id = ?", (experiment_id,)
+                "SELECT status, error FROM experiments WHERE id = ?", (experiment_id,)
             ).fetchone()
             if current is not None and current[0] == STATUS_CANCELLED and status != STATUS_CANCELLED:
+                return
+            # The pipeline thread of a stalled experiment may still wake up once its worker is
+            # stopped; the stall verdict stands (#400).
+            if current is not None and _is_stalled(current[0], current[1]):
                 return
             self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} WHERE id = ?",
@@ -945,31 +1049,18 @@ class ExperimentService:
             reason=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
         )
 
-    # ------------------------------------------------------------------
-    # mark_interrupted_experiments_failed — startup recovery (#281, #371)
-    # ------------------------------------------------------------------
 
     def mark_interrupted_experiments_failed(self) -> list[str]:
-        """Reconcile experiments orphaned by a service restart.
+        """Reconcile experiments orphaned by a service restart (#281).
 
-        An experiment runs in a daemon thread of the ``agent-api`` process, so
-        a restart kills it mid-flight and leaves its row in ``implementing`` or
-        ``verifying`` forever (#281). Intended to be called once at process
-        startup, before any new experiment is run: at that moment no thread in
-        this process can still own an active experiment.
+        An experiment runs in a daemon thread of the ``agent-api`` process, so a restart
+        kills it mid-flight and leaves its row active forever. Called once at process
+        startup, before any new experiment runs. Never resumes the work: moving to a
+        terminal status is what lets the waiting Nexus session resume and decide.
+        Implementation/verification become ``interrupted`` (legacy ``selecting`` becomes
+        ``failed``); worktrees are deliberately retained for inspection or retry.
 
-        Never resumes the work. Moving the experiment to a terminal status is
-        what lets the waiting Nexus session resume (see
-        ``MailboxTaskService.resume_finished_experiments``) and decide whether
-        the task continues or ends.
-
-        Implementation and verification runs become the distinct terminal
-        ``interrupted`` state. The legacy ``selecting`` phase still becomes
-        ``failed`` so old persisted rows retain their previous recovery
-        behaviour. Worktrees and their database references are deliberately
-        retained for inspection or retry.
-
-        Returns the list of experiment ids that were reconciled.
+        Returns the list of reconciled experiment ids.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -987,17 +1078,173 @@ class ExperimentService:
                 ended_at=_utcnow_iso(),
                 error=_INTERRUPTED_BY_RESTART_ERROR,
             ):
-                # A newly constructed service has no live handles, but clearing
-                # the registry here also makes explicit/in-process startup
-                # reconciliation safe and prevents stale cancellation targets.
+                # Clearing the registry also makes in-process startup reconciliation safe and prevents
+                # stale cancellation targets.
                 with self._process_lock:
                     self._active_processes.pop(row["id"], None)
                 marked.append(row["id"])
         return marked
 
-    # ------------------------------------------------------------------
-    # run_experiment — the whole pipeline, single entry point
-    # ------------------------------------------------------------------
+
+    def _phase_hard_limit_seconds(self, status: str) -> float:
+        """Longest a phase may legitimately go without a single log entry.
+
+        Verification runs the test suite under its own safety cap and may then start a
+        repair agent, so it gets the larger of both.
+        """
+        # The implementation timeout is the phase's upper bound, not a floor: a shorter
+        # coding-agent cap must make a silent phase sweep-eligible sooner.
+        agent_cap = min(agent_watchdog_limits()[1], float(_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS))
+        if status == STATUS_VERIFYING:
+            return max(agent_cap, float(self._get_test_watchdog_config().safety_cap_seconds))
+        return agent_cap
+
+    def _newest_log_entry(self, experiment_id: str) -> tuple[datetime | None, str]:
+        """Timestamp and event of the newest entry in the experiment's JSONL log."""
+        newest: datetime | None = None
+        event = ""
+        # A rotation leaves the active file briefly empty; the previous one then holds the
+        # newest entry.
+        for name in (f"{experiment_id}.jsonl", f"{experiment_id}-1.jsonl"):
+            path = Path(self.experiment_log_dir) / name
+            try:
+                lines = _tail_read_lines(path, _STALL_LOG_TAIL_BYTES)
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                stamp = _parse_utc(entry.get("timestamp"))
+                if stamp is not None and (newest is None or stamp >= newest):
+                    newest, event = stamp, str(entry.get("event") or "")
+            if newest is not None:
+                break
+        return newest, event
+
+    def _last_progress(self, experiment_id: str, row: sqlite3.Row) -> tuple[datetime | None, str]:
+        """Newest sign of life: log entry, activity event or lifecycle stamp."""
+        seen: list[tuple[datetime, str]] = []
+        log_at, log_event = self._newest_log_entry(experiment_id)
+        if log_at is not None:
+            seen.append((log_at, log_event or "log_entry"))
+        with self._lock:
+            activity = self._conn.execute(
+                "SELECT timestamp, event FROM activity_log "
+                "WHERE entity_type = 'experiment' AND entity_id = ? ORDER BY id DESC LIMIT 1",
+                (experiment_id,),
+            ).fetchone()
+        if activity is not None:
+            stamp = _parse_utc(activity[0])
+            if stamp is not None:
+                seen.append((stamp, f"activity:{activity[1]}"))
+        for column in ("created_at", "implementation_started_at", "implementation_ended_at"):
+            stamp = _parse_utc(row[column])
+            if stamp is not None:
+                seen.append((stamp, column))
+        if not seen:
+            return None, ""
+        return max(seen, key=lambda item: item[0])
+
+    def _stop_stalled_worker(self, experiment_id: str, pgid: int | None) -> str:
+        """Stop the worker's process group; returns what happened, never raises."""
+        with self._process_lock:
+            process = self._active_processes.pop(experiment_id, None)
+        if process is not None:
+            try:
+                self._terminate_process(process)
+            except (OSError, subprocess.SubprocessError) as exc:
+                return f"terminate failed: {type(exc).__name__}"
+            return "terminated"
+        if not pgid:
+            return "no worker recorded"
+        pgid = int(pgid)
+        # Never signal this process's own group, init, or anything below it.
+        if pgid <= 1 or pgid == os.getpgrp():
+            return "refused to signal own process group"
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return "worker no longer running"
+        except PermissionError:
+            return "not permitted to signal worker"
+        deadline = time.monotonic() + _STALL_TERMINATE_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return "terminated"
+            time.sleep(0.1)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        return "terminated"
+
+    def sweep_stalled_experiments(self, now: datetime | None = None) -> list[str]:
+        """Fail active experiments that logged nothing past their phase limit.
+
+        Startup reconciliation (#371) only helps on a restart; a worker that hangs silently
+        in a live process kept its experiment ``implementing`` for 11 hours (#400), blocking
+        the issue, the budget and retries. An experiment whose newest log entry or activity
+        event is older than the phase hard limit plus the grace
+        (``NEXUS_EXPERIMENT_STALL_GRACE_SECONDS``) moves to ``failed`` with a ``stalled:``
+        error and its worker's process group is stopped if still alive; anything that
+        logged within the limit is never touched. Idempotent: a swept experiment is terminal.
+
+        Returns the ids of the experiments marked stalled.
+        """
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        grace = stall_grace_seconds()
+        placeholders = ", ".join("?" * len(_STALL_SWEEP_STATUSES))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM experiments WHERE status IN ({placeholders})",
+                _STALL_SWEEP_STATUSES,
+            ).fetchall()
+        stalled: list[str] = []
+        for row in rows:
+            experiment_id, phase = row["id"], row["status"]
+            limit = self._phase_hard_limit_seconds(phase)
+            last_at, last_event = self._last_progress(experiment_id, row)
+            if last_at is None:
+                continue  # nothing to judge by; never guess
+            silent = (now - last_at).total_seconds()
+            if silent <= limit + grace:
+                continue
+            error = f"{_STALLED_ERROR_PREFIX}no progress for {int(silent)}s in phase {phase}"
+            # Claim the row first, conditionally: an experiment that moved on in between is left
+            # alone, and once failed the woken pipeline thread cannot overwrite the verdict.
+            if not self._transition(
+                experiment_id, phase, STATUS_FAILED,
+                ended_at=now.isoformat(), error=error, worker_pgid=None,
+            ):
+                continue
+            worker = self._stop_stalled_worker(experiment_id, row["worker_pgid"])
+            self.get_experiment_logger(experiment_id).error(
+                phase, "stalled_detected",
+                f"No progress for {int(silent)}s in phase {phase} "
+                f"(limit {int(limit)}s + grace {int(grace)}s); last event "
+                f"{last_event or 'unknown'} at {last_at.isoformat()}; worker: {worker}",
+                last_event=last_event,
+                last_event_at=last_at.isoformat(),
+                silent_seconds=int(silent),
+                limit_seconds=int(limit),
+                grace_seconds=int(grace),
+                worker=worker,
+            )
+            logger.warning(
+                "experiment %s stalled in phase %s: no progress for %ds (last event %s at %s); worker: %s",
+                experiment_id, phase, int(silent), last_event, last_at.isoformat(), worker,
+            )
+            stalled.append(experiment_id)
+        return stalled
+
 
     def run_experiment(self, experiment_id: str, github_work_tracking: Any | None = None) -> Experiment:
         experiment = self.get_experiment(experiment_id)  # raises if missing
@@ -1043,31 +1290,25 @@ class ExperimentService:
                 experiment_id,
                 STATUS_FAILED,
                 ended_at=_utcnow_iso(),
-                error=f"unhandled exception in experiment pipeline: {exc}",
+                error=f"{PIPELINE_CRASH_ERROR_PREFIX}{exc}",
             )
             return self.get_experiment(experiment_id)
 
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
         """Single-call implementation pipeline.
 
-        Phases (in order):
-          1. Goal security check (deterministic, no LLM call).
-          2. Isolated git worktree creation.
-          3. One coding-agent call (Codex or Claude, selected per experiment) —
-             the worker analyses the repo, plans, and implements the goal
-             directly inside the worktree.
-          4. Verification — git diff + tests + deterministic quality gate.
+        Phases: 1. goal security check (deterministic, no LLM call), 2. isolated git
+        worktree creation, 3. one coding-agent call inside the worktree, 4. verification
+        (git diff + tests + deterministic quality gate).
 
-        The injected GitHub lifecycle publishes a checkpoint through a
-        temporary index before verification; it never changes this worktree's
-        HEAD/index and never merges or deploys from this service.
-        Reuses the external coding-agent workers (no duplicated
-        subprocess/worker logic) and the existing SQLite store.
+        The injected GitHub lifecycle publishes a checkpoint through a temporary index
+        before verification; it never changes this worktree's HEAD/index and never
+        merges or deploys from this service.
         """
         experiment = self.get_experiment(experiment_id)
         elog = self.get_experiment_logger(experiment_id)
 
-        # ---- Security check: apply safety denylist to the raw goal --------
+        # Security check: apply the safety denylist to the raw goal.
         rejection_reason = _check_goal_policy(experiment.goal)
         if rejection_reason is not None:
             elog.warning(
@@ -1082,11 +1323,16 @@ class ExperimentService:
                 policy_rule=_policy_rule_for_reason(rejection_reason),
             )
             return self.get_experiment(experiment_id)
+        secret_warning = _goal_secret_warning(experiment.goal)
+        if secret_warning is not None:
+            elog.warning(
+                "implementing", "goal_policy_warning",
+                f"Goal may describe a secret action; continuing, the reviewer checks the change: {secret_warning}",
+            )
 
-        # ---- Isolated worktree --------------------------------------------
         branch_name = f"experiment/{experiment_id}"
         worktree_path = str(Path(self.worktrees_root) / experiment_id)
-        base_ref = "HEAD"
+        base_ref = self.base_ref
         if github_work_tracking is not None:
             base_ref = github_work_tracking.experiment_base_sha(experiment_id)
 
@@ -1142,16 +1388,17 @@ class ExperimentService:
             base_commit_sha=base_commit_sha,
         )
 
-        # ---- Single Codex implementation call -----------------------------
         elog.info(
             "implementation", "implementation_started",
             "Starting implementation (single coding-agent call: analyse, plan, implement)",
         )
         implementation_prompt = _build_direct_implementation_prompt(experiment.goal)
+        if github_work_tracking is not None:
+            implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
         implementation_task_id = uuid.uuid4().hex
         worker = self.worker_factory(worktree_path)
-        # Which coding agent got this experiment is recorded before the call,
-        # so a timeout or a crash still leaves the run attributable.
+        # Record which coding agent got this experiment before the call, so a timeout or
+        # crash still leaves the run attributable.
         implementation_provider = provider_of(worker)
         self._force_status(
             experiment_id, STATUS_IMPLEMENTING,
@@ -1175,8 +1422,46 @@ class ExperimentService:
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
         )
+        implementation_usage_json = self._record_worker_run_usage(
+            experiment_id, implementation_result.usage, elog
+        )
 
-        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+        fallback = other_provider(implementation_provider) if implementation_provider else None
+        if (
+            implementation_result.error
+            and not implementation_result.timed_out
+            and is_provider_overload(implementation_result.error)
+            and fallback is not None
+            and self.get_experiment(experiment_id).status != STATUS_CANCELLED
+        ):
+            # Provider overloaded, not the work wrong: let the other coding agent try instead
+            # of failing the experiment.
+            elog.warning(
+                "implementation", "implementation_provider_fallback",
+                f"{implementation_provider} is overloaded; implementation runs on {fallback}",
+                provider=fallback,
+            )
+            worker = build_worker(fallback, db_path=self.db_path)
+            implementation_provider = fallback
+            self._force_status(
+                experiment_id, STATUS_IMPLEMENTING,
+                implementation_provider=implementation_provider,
+            )
+            implementation_result = worker.run(
+                task=implementation_prompt,
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=max_seconds,
+                stall_seconds=stall_seconds,
+                experiment_logger=elog,
+                phase="implementation",
+                on_process=lambda process: self._track_process(experiment_id, process),
+            )
+            implementation_usage_json = self._record_worker_run_usage(
+                experiment_id, implementation_result.usage, elog
+            )
+
+        if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
 
         if implementation_result.timed_out:
@@ -1189,8 +1474,7 @@ class ExperimentService:
                 implementation_ended_at=_utcnow_iso(),
                 implementation_task_id=implementation_task_id,
                 implementation_runtime_ms=implementation_result.runtime_ms,
-                implementation_usage_json=json.dumps(implementation_result.usage)
-                if implementation_result.usage else None,
+                implementation_usage_json=implementation_usage_json,
                 error="implementation phase timed out"
                 + (f" ({implementation_result.error})" if implementation_result.error else "")
                 + checkpoint_error,
@@ -1207,8 +1491,7 @@ class ExperimentService:
                 implementation_ended_at=_utcnow_iso(),
                 implementation_task_id=implementation_task_id,
                 implementation_runtime_ms=implementation_result.runtime_ms,
-                implementation_usage_json=json.dumps(implementation_result.usage)
-                if implementation_result.usage else None,
+                implementation_usage_json=implementation_usage_json,
                 error=implementation_result.error + checkpoint_error,
             )
             return self.get_experiment(experiment_id)
@@ -1218,14 +1501,12 @@ class ExperimentService:
             implementation_ended_at=_utcnow_iso(),
             implementation_task_id=implementation_task_id,
             implementation_runtime_ms=implementation_result.runtime_ms,
-            implementation_usage_json=json.dumps(implementation_result.usage)
-            if implementation_result.usage else None,
+            implementation_usage_json=implementation_usage_json,
         )
 
-        if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+        if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
 
-        # ---- Verification -------------------------------------------------
         elog.info("verifying", "verification_started", "Starting verification phase (git diff + tests)")
         result = self._verify(
             experiment_id,
@@ -1236,6 +1517,43 @@ class ExperimentService:
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
+        )
+
+    def _merge_current_main(self, worktree_path: str, elog: ExperimentLogger) -> str:
+        """Bring today's main into a retry's issue branch (#478).
+
+        A retry continues the issue branch, which can lag far behind main and conflict at
+        adoption every time; merging main first lets the coding agent resolve a conflict
+        once, in the experiment, where tests and review still check it. Returns a note for
+        the prompt when conflict markers are left to resolve, else "".
+        """
+        def git(*args: str) -> subprocess.CompletedProcess:
+            return _run_git(
+                ["-c", "user.name=Nexus", "-c", "user.email=nexus@agent-lab.local", *args],
+                cwd=worktree_path, timeout=120, elog=elog, phase="implementation",
+            )
+
+        if git("fetch", "--no-tags", "origin", "main").returncode != 0:
+            return ""
+        if git("merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD").returncode == 0:
+            return ""
+        if git("merge", "--no-edit", "FETCH_HEAD").returncode == 0:
+            elog.info("implementation", "base_merged_clean", "Merged current main into the issue branch")
+            return ""
+        conflicted = git("diff", "--name-only", "--diff-filter=U").stdout.split()
+        if not conflicted:
+            git("merge", "--abort")
+            return ""
+        git("add", "-A")
+        git("commit", "--no-verify", "-m", "Merge main; conflicts left for the coding agent")
+        elog.warning(
+            "implementation", "base_merge_conflict",
+            f"Merging current main left conflicts in: {', '.join(conflicted[:20])}",
+        )
+        return (
+            "FIRST: merging the current main into this branch left conflict markers "
+            "(<<<<<<<, =======, >>>>>>>) in: " + ", ".join(conflicted[:20]) + ". Resolve "
+            "them, keeping what both sides intended, then do the task below.\n\n"
         )
 
     def _record_verification_run(
@@ -1320,7 +1638,8 @@ class ExperimentService:
                 phase="implementation_repair",
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
-            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            self._record_worker_run_usage(experiment_id, repair_result.usage, elog)
+            if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:
                 self._force_status(
@@ -1499,7 +1818,7 @@ class ExperimentService:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
-        test_command_template = _TEST_COMMANDS.get(test_command_key)
+        test_command_template = self.test_command or _TEST_COMMANDS.get(test_command_key)
         test_command = (
             [part.format(python=self.test_python_executable) for part in test_command_template]
             if test_command_template is not None
@@ -1523,7 +1842,11 @@ class ExperimentService:
             return self.get_experiment(experiment_id)
 
         test_timed_out = False
+<<<<<<< HEAD
         baseline_classifications: dict[str, str] | None = None
+=======
+        ci_failure_detail = None
+>>>>>>> e952d64c2675dbf9563599af916e6bf037e35613
         if not use_local_tests:
             test_command = ["GitHub Actions", "tests.yml", ci_verification.commit_sha]
             test_exit_code = 0 if ci_verification.status == "passed" else 1
@@ -1533,6 +1856,10 @@ class ExperimentService:
                 f"{ci_verification.conclusion or 'unknown'}."
                 + (f" {ci_verification.url}" if ci_verification.url else "")
             )
+            # The first line stays as it is: ci_evidence_backfill parses it.
+            ci_failure_detail = getattr(ci_verification, "failure_detail", None)
+            if ci_failure_detail:
+                test_output = f"{test_output}\n{ci_failure_detail}"
         else:
             watchdog = self._get_test_watchdog_config()
             expected_total = self._get_expected_test_total()
@@ -1558,14 +1885,12 @@ class ExperimentService:
                 run_id=experiment_id,
                 config=watchdog,
                 expected_total=expected_total,
-                # Publishing the test heartbeat into this experiment's own log
-                # is what keeps the global Nexus heartbeat alive while a long
-                # suite runs; the per-test entries stay in the dedicated test
-                # log rather than flooding this one.
+                # Publishing the test heartbeat into this experiment's log keeps the global Nexus
+                # heartbeat alive during a long suite; per-test entries stay in the dedicated test log.
                 on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
-            if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
+            if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             test_exit_code = test_run.exit_code
             test_output = test_run.output
@@ -1640,13 +1965,9 @@ class ExperimentService:
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
             elog.warning("verifying", "diff_check_issue", f"git diff --check reported issues: {diff_check_issue}")
         elif test_timed_out:
-            # An aborted test run is not a normal test failure: the tests
-            # never finished (exit_code=None is expected and must not be
-            # mistaken for a real failing exit status). Keep this branch
-            # ahead of the exit-code check below so it can never be folded
-            # into "tests failed". The distinct "test_stalled" /
-            # "test_safety_cap_exceeded" event was already logged above,
-            # with the diagnostics naming the test progress stopped on.
+            # An aborted test run is not a test failure (exit_code=None is expected): keep this
+            # branch ahead of the exit-code check so it can never fold into "tests failed". The
+            # distinct "test_stalled"/"test_safety_cap_exceeded" event was already logged above.
             final_status = STATUS_TIMED_OUT
             if use_local_tests and test_run.stalled:
                 error = (
@@ -1663,8 +1984,8 @@ class ExperimentService:
             if use_local_tests and test_run.stall_diagnostics:
                 error = f"{error}\n{test_run.stall_diagnostics}"
         elif use_local_tests and test_run.process_died:
-            # Killed by a signal (OOM, an operator, the host): the suite never
-            # reached a verdict, so it must not be filed as a test failure.
+            # Killed by a signal (OOM, an operator, the host): no verdict was reached, so it must
+            # not be filed as a test failure.
             final_status = STATUS_NEEDS_REVIEW
             error = "test process died before finishing (killed by a signal, no exit code)"
             if test_run.stall_diagnostics:
@@ -1672,6 +1993,9 @@ class ExperimentService:
         elif test_exit_code != 0:
             final_status = STATUS_FAILED if test_exit_code is not None else STATUS_NEEDS_REVIEW
             error = f"tests failed (exit code {test_exit_code})"
+            failing_tests = failing_test_names(ci_failure_detail, limit=_MAX_ERROR_TEST_NAMES)
+            if failing_tests:
+                error = f"{error}: {', '.join(failing_tests)}"
             elog.error(
                 "verifying",
                 "tests_failed" if repair_iteration == 0 else "tests_failed_repair",
@@ -1682,17 +2006,9 @@ class ExperimentService:
         else:
             elog.info("verifying", "tests_passed", "Verification tests passed")
 
-            # ---- Deterministic quality evaluation (no LLM call) --------
-            # Tests passing is necessary but never sufficient: this checks
-            # that the *actual* diff matches what the plan (and the
-            # original task) required — e.g. a plan for an implementation
-            # change that only touched test files must never become
-            # "succeeded" just because those tests happen to pass. A
-            # failure anywhere in this block (a bug in the evaluator
-            # itself, an unreadable plan, ...) must never be able to turn
-            # into a silent "succeeded" — it always downgrades to
-            # needs_review instead, with the worktree preserved for
-            # manual review.
+            # Deterministic quality evaluation (no LLM call): tests passing is necessary but never
+            # sufficient - the diff must match what plan and task required. Any failure in this
+            # block downgrades to needs_review with the worktree preserved, never a silent "succeeded".
             try:
                 experiment_for_eval = self.get_experiment(experiment_id)
                 changed = parse_git_status_short(git_status)
@@ -1705,7 +2021,20 @@ class ExperimentService:
                     worktree_path,
                 )
                 quality_evaluation = eval_result.to_dict()
-                if eval_result.outcome != "pass":
+                # Only artifact-evidence checks failed and tests are green: the reviewer decides at
+                # adoption (#519); every non-GitHub-tracked run keeps the hard stop.
+                review_findings = (
+                    eval_result.soft_findings() if github_work_tracking is not None else None
+                )
+                if review_findings is not None:
+                    quality_evaluation["outcome"] = "pass"
+                    quality_evaluation["review_findings"] = review_findings
+                    elog.warning(
+                        "verifying", "quality_evaluation_to_reviewer",
+                        f"Quality gate findings go to the reviewer: {review_findings}",
+                        evaluation_json=json.dumps(quality_evaluation),
+                    )
+                elif eval_result.outcome != "pass":
                     final_status = STATUS_NEEDS_REVIEW
                     error = f"quality evaluation: {eval_result.reason}"
                     elog.warning(
@@ -1786,16 +2115,12 @@ class ExperimentService:
                 )
         return self.get_experiment(experiment_id)
 
-    # ------------------------------------------------------------------
-    # Cleanup — explicit removal of worktree and branch
-    # ------------------------------------------------------------------
 
     def cleanup_worktree(self, experiment_id: str) -> None:
         """Explicitly remove an experiment's git worktree and branch.
 
-        Never called automatically by ``run_experiment``; the worktree is
-        kept after an experiment finishes so a human can inspect it. Safe to
-        call multiple times.
+        Never called automatically by ``run_experiment`` - the worktree is kept after an
+        experiment finishes so a human can inspect it. Safe to call multiple times.
         """
         elog = self.get_experiment_logger(experiment_id)
         experiment = self.get_experiment(experiment_id)
@@ -1811,9 +2136,6 @@ class ExperimentService:
             _run_git(["branch", "-D", experiment.branch_name], cwd=self.repo_root, elog=elog, phase="cleanup")
         elog.info("cleanup", "worktree_cleanup_done", "Experiment worktree and branch cleanup finished")
 
-    # ------------------------------------------------------------------
-    # Worktree retention (#376) — startup and periodic, terminal runs only
-    # ------------------------------------------------------------------
 
     def cleanup_expired_worktrees(
         self, retention_hours: float | None = None, *, now: datetime | None = None
@@ -1821,17 +2143,14 @@ class ExperimentService:
         """Remove worktrees of terminal experiments that ended over ``retention_hours`` ago.
 
         ``retention_hours`` defaults to ``NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS``
-        (see ``worktree_retention_hours``); ``0`` disables the pass. Only the
-        worktree directory goes: the experiment row (including its
-        ``worktree_path``), its JSONL log and its branch are kept, so the
-        record stays complete and committed work stays recoverable.
+        (see ``worktree_retention_hours``); ``0`` disables the pass. Only the worktree
+        directory goes - the experiment row, its JSONL log and its branch are kept, so
+        the record stays complete and committed work stays recoverable.
 
-        A worktree is never removed while its experiment is non-terminal, has
-        no ``ended_at``, ended within the retention window, or has an adoption
-        that has not finished, nor when its path lies outside
-        ``worktrees_root``. Already-missing directories are skipped silently,
-        so repeated passes are no-ops. A failure on one worktree is recorded
-        (activity log, experiment log) and does not stop the others.
+        Never removed while the experiment is non-terminal, has no ``ended_at``, ended
+        within the window, has an unfinished adoption, or has a path outside
+        ``worktrees_root``. Already-missing directories are skipped silently so repeated
+        passes are no-ops; a failure on one worktree is recorded and does not stop the others.
         """
         hours = worktree_retention_hours() if retention_hours is None else max(0.0, float(retention_hours))
         result = WorktreeCleanupResult(retention_hours=hours)
@@ -1867,8 +2186,8 @@ class ExperimentService:
         terminal = ", ".join("?" * len(_TERMINAL_STATUSES))
         finished = ", ".join("?" * len(_ADOPTION_TERMINAL_STATUSES))
         with self._lock:
-            # Re-checked right before deleting: an adoption may have been
-            # queued since the candidates were listed.
+            # Re-checked right before deleting: an adoption may have been queued since the
+            # candidates were listed.
             still_expired = self._conn.execute(
                 f"SELECT 1 FROM experiments e WHERE e.id = ? AND e.status IN ({terminal}) "
                 "AND NOT EXISTS (SELECT 1 FROM experiment_adoptions a "
@@ -1884,8 +2203,8 @@ class ExperimentService:
 
         elog = self.get_experiment_logger(experiment_id)
         try:
-            # Unregisters the worktree from the main repository; the rmtree
-            # below is what actually guarantees the directory is gone.
+            # Unregister the worktree from the main repository; the rmtree below is what actually
+            # guarantees the directory is gone.
             _run_git(
                 ["worktree", "remove", "--force", str(path)],
                 cwd=self.repo_root, elog=elog, phase="cleanup",

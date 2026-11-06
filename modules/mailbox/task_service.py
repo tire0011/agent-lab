@@ -1,4 +1,7 @@
-"""Approval-gated bridge from free-form mailbox tasks to Nexus capabilities.
+"""Bridge from free-form mailbox tasks to Nexus capabilities.
+
+A mailbox task goes straight to Nexus: it is recorded as ``queued`` and the
+worker hands it to the local controller without an approval step (#264).
 
 The local Nexus LLM is the orchestration layer. It may inspect real Nexus
 state, search memory, delegate bounded sub-problems, discuss ambiguity and
@@ -13,8 +16,7 @@ import logging
 import re
 import sqlite3
 import threading
-import uuid
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,10 +24,12 @@ from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from modules.experiment_handover import with_handover
+from modules.experiment_service import ExperimentAlreadyActiveError
 from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
+from .task_ingest import insert_task_approval
 from modules.outbox_publisher import (
     OutboxMessage,
     PUBLISH_PENDING_WRITE,
@@ -47,9 +51,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_STATUS_PENDING = "pending_approval"
-_STATUS_APPROVED = "approved"
-_STATUS_REJECTED = "rejected"
+# Entry state: recorded and waiting for the worker to hand it to Nexus. It
+# stays ``queued`` while Nexus decides, so a decision can claim it once.
+_STATUS_QUEUED = "queued"
+# Left by the removed approval step (#264). Old rows stay readable; nothing new
+# is written in these states and a ``pending_approval`` row is never run.
+_LEGACY_STATUS_PENDING = "pending_approval"
+_LEGACY_STATUS_APPROVED = "approved"
+_LEGACY_STATUS_REJECTED = "rejected"
 _STATUS_SUBMITTED = "submitted"
 _STATUS_RUNNING = "running"
 _STATUS_SUCCEEDED = "succeeded"
@@ -58,24 +67,25 @@ _STATUS_NEEDS_REVIEW = "needs_review"
 # Nexus decides what follows a failed experiment; poll_running keeps out (#263).
 _STATUS_NEXUS_DECIDING = "nexus_deciding"
 
-_TERMINAL_STATUSES = {_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STATUS_NEEDS_REVIEW}
+_TERMINAL_STATUSES = {
+    _LEGACY_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STATUS_NEEDS_REVIEW,
+}
 _NON_TERMINAL_STATUSES = {
-    _STATUS_PENDING, _STATUS_APPROVED, _STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_NEXUS_DECIDING,
+    _STATUS_QUEUED, _LEGACY_STATUS_PENDING, _LEGACY_STATUS_APPROVED,
+    _STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_NEXUS_DECIDING,
 }
 _EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected", "interrupted"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
 _EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review", "interrupted"}
+# Verified, and left open because the task forbids the merge (#185).
+_STATUS_READY_FOR_REVIEW = "ready_for_review"
+_TERMINAL_STATUSES.add(_STATUS_READY_FOR_REVIEW)
 # After a failed experiment Nexus may try again, but a task gets at most this
 # many experiments in total (#263 step 4).
 _MAX_EXPERIMENTS_PER_TASK = 2
-_REJECTION_REASON_RE = re.compile(r"^[\w\s.,!?()\'\"\-]{1,500}$")
 
 
 class ApprovalNotFoundError(LookupError):
-    pass
-
-
-class ApprovalStateError(RuntimeError):
     pass
 
 
@@ -85,6 +95,8 @@ class MailboxTaskApproval:
         "received_at", "status", "approved_at", "rejected_at",
         "rejection_reason", "experiment_id", "outbox_file",
         "publish_status", "publish_commit_sha", "result_summary", "error",
+        "idempotency_key",
+        "merge_forbidden", "merge_constraint_reason",
         "created_at", "updated_at",
     )
 
@@ -119,7 +131,7 @@ def _safe_error(error: str | None) -> str | None:
 
 
 class MailboxTaskService:
-    """Route approved free-form tasks through the persistent local controller."""
+    """Route free-form mailbox tasks through the persistent local controller."""
 
     def __init__(
         self,
@@ -226,15 +238,6 @@ class MailboxTaskService:
         except Exception:
             logger.exception("mailbox_task: background failure analysis crashed")
 
-    def _wait_for_failure_analyses(self, timeout: float | None = None) -> bool:
-        """Wait for already queued diagnoses; used by shutdown and tests."""
-        with self._failure_analysis_futures_lock:
-            pending = tuple(self._failure_analysis_futures)
-        if not pending:
-            return True
-        _done, not_done = wait(pending, timeout=timeout)
-        return not not_done
-
     def _failure_analysis(self, *, context: str | None = None) -> Any | None:
         """Lazily-built :class:`FailureAnalysisService`, or ``None`` if unavailable (#145).
 
@@ -338,7 +341,7 @@ class MailboxTaskService:
     def _task_logger(self, approval_id: str):
         """Durable, pre-experiment structured logger for one mailbox task.
 
-        Records intake/approval/rejection/queueing/orchestration events -
+        Records intake/queueing/orchestration events -
         everything before (and, for tasks that never create one, instead
         of) an experiment id existing - so the unified Logs feed shows the
         complete task path from the moment a task arrives. Never raises:
@@ -347,51 +350,47 @@ class MailboxTaskService:
         return get_task_logger(approval_id, log_dir=self._resolve_log_dir())
 
     # ------------------------------------------------------------------
-    # CRUD / approval state
+    # CRUD
     # ------------------------------------------------------------------
 
-    def create_approval(
+    def create_task(
         self,
         mailbox_msg_id: int,
         task_body: str,
         sender: str,
         file_path: str,
         received_at: str,
+        idempotency_key: str | None = None,
     ) -> MailboxTaskApproval:
+        """Record a task once per idempotency key (#378).
+
+        The key defaults to one derived from *mailbox_msg_id*; API callers
+        may pass their own. A repeated delivery returns the original task
+        unchanged, so it is approved and dispatched at most once.
+        """
         with self._lock:
-            existing = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
-                (mailbox_msg_id,),
-            ).fetchone()
-            if existing is not None:
-                return _row_to_approval(existing)
-            approval_id = uuid.uuid4().hex
-            now = _now_iso()
-            self._conn.execute(
-                """INSERT INTO mailbox_task_approvals
-                   (id, mailbox_msg_id, task_body, sender, file_path, received_at,
-                    status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    approval_id,
-                    mailbox_msg_id,
-                    task_body or "",
-                    sender,
-                    file_path,
-                    received_at,
-                    _STATUS_PENDING,
-                    now,
-                    now,
-                ),
+            approval_id, created = insert_task_approval(
+                self._conn,
+                mailbox_msg_id=mailbox_msg_id,
+                task_body=task_body,
+                sender=sender,
+                file_path=file_path,
+                received_at=received_at,
+                idempotency_key=idempotency_key,
             )
-            self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE id = ?", (approval_id,)
             ).fetchone()
-        self._task_logger(approval_id).info(
-            "mailbox", "task_received",
-            "mailbox task received, pending approval",
-        )
+        if created:
+            self._task_logger(approval_id).info(
+                "mailbox", "task_received",
+                "mailbox task received, handed to Nexus",
+            )
+        else:
+            self._task_logger(approval_id).info(
+                "mailbox", "task_duplicate_delivery",
+                "mailbox task delivered again, returning the original task",
+            )
         return _row_to_approval(row)
 
     def get(self, approval_id: str) -> MailboxTaskApproval:
@@ -404,10 +403,11 @@ class MailboxTaskService:
         return _row_to_approval(row)
 
     def list_pending(self, limit: int = 50) -> list[MailboxTaskApproval]:
+        """Tasks still waiting for Nexus to take them up."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE status=? ORDER BY created_at DESC LIMIT ?",
-                (_STATUS_PENDING, limit),
+                (_STATUS_QUEUED, limit),
             ).fetchall()
         return [_row_to_approval(row) for row in rows]
 
@@ -419,110 +419,23 @@ class MailboxTaskService:
             ).fetchall()
         return [_row_to_approval(row) for row in rows]
 
-    def approve(self, approval_id: str) -> MailboxTaskApproval:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id=?", (approval_id,)
-            ).fetchone()
-            if row is None:
-                raise ApprovalNotFoundError(f"no approval with id {approval_id!r}")
-            if row["status"] == _STATUS_APPROVED:
-                return _row_to_approval(row)
-            if row["status"] != _STATUS_PENDING:
-                raise ApprovalStateError(
-                    f"cannot approve approval in status {row['status']!r}"
-                )
-            now = _now_iso()
-            self._conn.execute(
-                "UPDATE mailbox_task_approvals SET status=?, approved_at=?, updated_at=? WHERE id=? AND status=?",
-                (_STATUS_APPROVED, now, now, approval_id, _STATUS_PENDING),
-            )
-            self._conn.commit()
-        self._task_logger(approval_id).info("mailbox", "task_approved", "mailbox task approved")
-        return self.get(approval_id)
-
-    def reject(self, approval_id: str, reason: str) -> MailboxTaskApproval:
-        reason = reason.strip()
-        if not _REJECTION_REASON_RE.match(reason):
-            raise ValueError("rejection reason contains disallowed characters or is empty")
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval_id,)
-            ).fetchone()
-            if row is None:
-                raise ApprovalNotFoundError(f"no approval with id {approval_id!r}")
-            if row["status"] != _STATUS_PENDING:
-                raise ApprovalStateError(
-                    f"cannot reject approval in status {row['status']!r}"
-                )
-            now = _now_iso()
-            self._conn.execute(
-                """UPDATE mailbox_task_approvals
-                   SET status=?, rejected_at=?, rejection_reason=?, updated_at=?
-                   WHERE id=? AND status=?""",
-                (_STATUS_REJECTED, now, reason, now, approval_id, _STATUS_PENDING),
-            )
-            self._conn.commit()
-        self._task_logger(approval_id).warning(
-            "mailbox", "task_rejected", "mailbox task rejected", reason=reason,
-        )
-        return self.get(approval_id)
-
     # ------------------------------------------------------------------
     # Persistent agentic orchestration
     # ------------------------------------------------------------------
 
-    def submit_approved(self) -> None:
-        """Let the local model inspect state and choose the actual Nexus action."""
+    def submit_queued(self) -> None:
+        """Hand the oldest queued task to Nexus, which chooses the actual action."""
         if self.experiment_service is None or self.operations_registry is None:
             return
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE status=? ORDER BY created_at LIMIT 1",
-                (_STATUS_APPROVED,),
+                (_STATUS_QUEUED,),
             ).fetchone()
         if row is None:
             return
         approval = _row_to_approval(row)
         self._orchestrate_approval(approval, approval.task_body)
-
-    def continue_discussion(self, approval_id: str, user_message: str) -> MailboxTaskApproval:
-        """Continue the SAME persistent Nexus task after a clarification/review reply.
-
-        This is an internal primitive for API/MCP/UI adapters. It deliberately
-        reuses the approval id as the controller source id, so the durable
-        Nexus task session and memory/history are recovered automatically.
-        """
-        message = (user_message or "").strip()
-        if not message:
-            raise ValueError("user_message must not be empty")
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM mailbox_task_approvals WHERE id=?", (approval_id,)
-            ).fetchone()
-            if row is None:
-                raise ApprovalNotFoundError(f"no approval with id {approval_id!r}")
-            approval = _row_to_approval(row)
-            if approval.status != _STATUS_NEEDS_REVIEW or approval.experiment_id:
-                raise ApprovalStateError(
-                    "discussion can only continue for a non-experiment task awaiting review"
-                )
-            combined = (
-                f"{approval.task_body.rstrip()}\n\n"
-                f"User follow-up:\n{message}"
-            )[:32000]
-            updated = self._conn.execute(
-                """UPDATE mailbox_task_approvals
-                   SET status=?, task_body=?, result_summary=NULL, error=NULL, updated_at=?
-                   WHERE id=? AND status=? AND experiment_id IS NULL""",
-                (_STATUS_APPROVED, combined, _now_iso(), approval.id, _STATUS_NEEDS_REVIEW),
-            ).rowcount
-            self._conn.commit()
-        if not updated:
-            raise ApprovalStateError("task discussion state changed concurrently")
-        refreshed = self.get(approval_id)
-        self._orchestrate_approval(refreshed, message)
-        return self.get(approval_id)
 
     def _orchestrate_approval(
         self,
@@ -615,7 +528,7 @@ class MailboxTaskService:
 
     def _start_new_experiment(
         self, approval: MailboxTaskApproval, decision: TaskDecision | None = None
-    ) -> None:
+    ) -> dict[str, str] | None:
         # Re-read task_body so clarification follow-ups accumulated by
         # continue_discussion are included in the implementation goal.
         current_approval = self.get(approval.id)
@@ -655,20 +568,42 @@ class MailboxTaskService:
             current = self._conn.execute(
                 "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
             ).fetchone()
-            if current is None or current["status"] != _STATUS_APPROVED:
+            if current is None or current["status"] != _STATUS_QUEUED:
                 return
             # What Nexus already learned travels with the task (#263).
-            experiment = self.experiment_service.create_experiment(
-                with_handover(
-                    current_approval.task_body,
-                    decision.experiment_handover if decision is not None else None,
+            try:
+                experiment = self.experiment_service.create_experiment(
+                    with_handover(
+                        current_approval.task_body,
+                        decision.experiment_handover if decision is not None else None,
+                    )
                 )
-            )
+            except ExperimentAlreadyActiveError as exc:
+                task_log.info(
+                    "queued", "already_active",
+                    "mailbox task matched an active experiment",
+                    experiment_id=exc.experiment_id,
+                    experiment_status=exc.status,
+                )
+                self._complete_without_experiment(
+                    approval,
+                    _STATUS_NEEDS_REVIEW,
+                    (
+                        "already_active: an experiment for this GitHub issue is "
+                        f"already active (experiment_id={exc.experiment_id}, "
+                        f"status={exc.status})"
+                    ),
+                )
+                return {
+                    "status": "already_active",
+                    "experiment_id": exc.experiment_id,
+                    "experiment_status": exc.status,
+                }
             work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
                    WHERE id=? AND status=?""",
-                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_APPROVED),
+                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_QUEUED),
             ).rowcount
             self._conn.commit()
         if not updated:
@@ -850,7 +785,7 @@ class MailboxTaskService:
                 updated = self._conn.execute(
                     """UPDATE mailbox_task_approvals SET status=?, updated_at=?
                        WHERE id=? AND status=?""",
-                    (_STATUS_APPROVED, _now_iso(), approval.id, _STATUS_NEXUS_DECIDING),
+                    (_STATUS_QUEUED, _now_iso(), approval.id, _STATUS_NEXUS_DECIDING),
                 ).rowcount
                 self._conn.commit()
             if updated:
@@ -903,7 +838,7 @@ class MailboxTaskService:
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
                    WHERE id=? AND status=?""",
-                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_APPROVED),
+                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_QUEUED),
             ).rowcount
             self._conn.commit()
         if not updated:
@@ -929,7 +864,7 @@ class MailboxTaskService:
         with self._lock:
             claimed = self._conn.execute(
                 "UPDATE mailbox_task_approvals SET status=?, updated_at=? WHERE id=? AND status=?",
-                (_STATUS_RUNNING, _now_iso(), approval.id, _STATUS_APPROVED),
+                (_STATUS_RUNNING, _now_iso(), approval.id, _STATUS_QUEUED),
             ).rowcount
             self._conn.commit()
         if not claimed:
@@ -1110,7 +1045,7 @@ class MailboxTaskService:
                     _safe_error(error),
                     _now_iso(),
                     approval.id,
-                    _STATUS_APPROVED,
+                    _STATUS_QUEUED,
                 ),
             ).rowcount
             self._conn.commit()
@@ -1214,7 +1149,7 @@ class MailboxTaskService:
                 f"source: {Path(approval.file_path).name}\n"
                 f"created_at: {approval.created_at}{test_result}\n"
                 "---\n\n"
-                "## Task Approval Result\n\n"
+                "## Task Result\n\n"
                 f"**Status:** {status}\n\n"
                 f"{summary[:32000]}\n"
             )
@@ -1240,16 +1175,6 @@ class MailboxTaskService:
         except Exception:
             logger.exception("mailbox_task: failed to write outbox for %s", approval.id)
             return None
-
-    # Backward-compatible name used by existing tests/helpers.
-    def _write_outbox(
-        self,
-        approval: MailboxTaskApproval,
-        status: str,
-        exp: Any,
-        summary: str,
-    ) -> str | None:
-        return self._write_result_outbox(approval, status, summary, exp)
 
     def _write_problem(
         self,
@@ -1299,9 +1224,9 @@ class MailboxTaskWorker(threading.Thread):
         logger.info("MailboxTaskWorker started (interval=%.0fs)", self._interval)
         while not self._stop_event.wait(self._interval):
             try:
-                self._service.submit_approved()
+                self._service.submit_queued()
             except Exception:
-                logger.exception("MailboxTaskWorker: submit_approved failed")
+                logger.exception("MailboxTaskWorker: submit_queued failed")
             try:
                 self._service.poll_running()
             except Exception:

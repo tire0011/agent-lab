@@ -6,41 +6,11 @@ lives in ``modules.outbox_publisher.OperationChainOutboxPublisher``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from modules.outbox_publisher import (
-    PUBLISH_COMMITTED,
-    PUBLISH_FAILED,
-    PUBLISH_PUSHED,
-    PUBLISH_WRITTEN,
-    OperationChainOutboxPublisher,
-)
+from modules.outbox_publisher import OperationChainOutboxPublisher
 from modules.run_store import DEFAULT_DB_PATH
-
-# ---------------------------------------------------------------------------
-# Backward-compatible state aliases
-# ---------------------------------------------------------------------------
-
-PUBLISH_PENDING = "pending"      # legacy alias for PUBLISH_WRITTEN
-PUBLISH_COMMITTING = "committing"
-# Re-export for tests and other callers.
-PUBLISH_COMMITTED = PUBLISH_COMMITTED  # noqa: F811
-PUBLISH_PUSHED = PUBLISH_PUSHED        # noqa: F811
-PUBLISH_FAILED = PUBLISH_FAILED        # noqa: F811
-
-
-@dataclass(slots=True)
-class PublishCandidate:
-    """Legacy dataclass kept for backward compatibility."""
-
-    request_id: str
-    outbox_file: str
-    publish_status: str
-    publish_commit_sha: str | None
-    publish_retry_count: int
-
 
 class OperationChainPublisher:
     """Backward-compatible shim that delegates to OperationChainOutboxPublisher."""

@@ -174,10 +174,6 @@ class OutboxPRNotifier:
         ).fetchall()
         return sum(1 for row in rows if self._attempt(row))
 
-    def status_of(self, message_id: str) -> dict[str, Any] | None:
-        row = self._row(message_id)
-        return dict(row) if row is not None else None
-
     # ------------------------------------------------------------------
     # Delivery
     # ------------------------------------------------------------------

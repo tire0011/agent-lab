@@ -101,10 +101,35 @@ class RetryAfterBlockedReviewTests(unittest.TestCase):
         fx.add_experiment("e1", "succeeded", adoption="failed")
         with sqlite3.connect(fx.db_path) as conn:
             conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e1', 9)")
-        svc = fx.service(issue_lister=lambda: [{"number": 9, "title": "x", "body": ""}])
+        svc = fx.service(issue_lister=lambda: [{"number": 9, "author": {"login": "tire0011"}, "title": "x", "body": ""}])
         self.addCleanup(svc.close)
         svc.tick()
         self.assertEqual(fx.controller.issues, [9])
+
+
+class EarlierAttemptsTests(unittest.TestCase):
+    def test_the_retry_gets_the_review_that_blocked_the_first_attempt(self):
+        fx = InitiativeFixture()
+        fx.add_experiment("e1", "succeeded", adoption="failed")
+        with sqlite3.connect(fx.db_path) as conn:
+            conn.execute("UPDATE experiment_adoptions SET reason=? WHERE experiment_id='e1'",
+                         ("Review by claude blocked the merge: missing tests count as pre_existing.",))
+            conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES ('e1', 9)")
+        bodies = []
+        fx.controller.handle_issue = lambda number, *, title, body: bodies.append(body)
+        svc = fx.service(issue_lister=lambda: [{"number": 9, "author": {"login": "tire0011"}, "title": "x", "body": "Do it."}])
+        self.addCleanup(svc.close)
+        svc.tick()
+        self.assertTrue(bodies[0].startswith("Do it."))
+        self.assertIn("Earlier attempts at this issue", bodies[0])
+        self.assertIn("missing tests count as pre_existing", bodies[0])
+
+    def test_paths_in_earlier_attempts_are_not_required_artifacts(self):
+        from modules.experiment_evaluation import extract_explicit_goal_artifacts
+        from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING
+
+        goal = f"Add modules/web_research.py\n\n{EARLIER_ATTEMPTS_HEADING}\n- erforderliches Artefakt git/hooks/a.sample fehlt"
+        self.assertEqual(extract_explicit_goal_artifacts(goal), ["modules/web_research.py"])
 
 
 if __name__ == "__main__":
