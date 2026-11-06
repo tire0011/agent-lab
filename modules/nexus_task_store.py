@@ -323,6 +323,34 @@ class NexusTaskStore:
             )
         return events
 
+    def get_event(self, session_id: str, event_id: int) -> dict[str, Any] | None:
+        """Read one persisted event of ``session_id`` by id, or ``None``.
+
+        Strictly read-only and scoped to the session: an event id from another
+        task's journal reads as absent (#232, ``read_tool_result``).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id, session_id, role, kind, content, metadata_json, created_at
+                   FROM nexus_task_events WHERE session_id=? AND id=?""",
+                (session_id, int(event_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        return {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "role": row["role"],
+            "kind": row["kind"],
+            "content": row["content"],
+            "metadata": metadata,
+            "created_at": row["created_at"],
+        }
+
     def user_inputs(self, session_id: str) -> list[str]:
         """Return complete user input events in their original order.
 

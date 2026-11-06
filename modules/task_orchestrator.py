@@ -99,6 +99,14 @@ from modules.runtime_execution import (
     resolve_python_interpreter,
 )
 from modules.tool_loop_guard import PersistentToolLoopGuard
+from modules.tool_result_view import (
+    TOOL_READ_TOOL_RESULT,
+    normalize_read_arguments,
+    page_identity,
+    parse_stored_content,
+    read_tool_result_slice,
+    repeated_page_recovery,
+)
 
 ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_ANSWER = "answer"
@@ -149,6 +157,7 @@ _ORCHESTRATOR_TOOLS = {
     "delegate",
     ACTION_COMMAND,
     TOOL_PYTHON_RUN,
+    TOOL_READ_TOOL_RESULT,
 }
 
 logger = logging.getLogger(__name__)
@@ -157,7 +166,8 @@ logger = logging.getLogger(__name__)
 # adds nothing to "why did it choose this".
 _DECISION_FIELDS = (
     "tool", "goal", "query", "request", "operation", "provider", "command",
-    "script", "module", "experiment_id", "capability",
+    "script", "module", "experiment_id", "capability", "event_id", "section",
+    "offset",
 )
 
 _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
@@ -180,6 +190,7 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
                     "delegate",
                     ACTION_COMMAND,
                     TOOL_PYTHON_RUN,
+                    TOOL_READ_TOOL_RESULT,
                     ACTION_NEW_EXPERIMENT,
                     ACTION_RESUME_EXPERIMENT,
                     ACTION_ANSWER,
@@ -193,6 +204,9 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
             "query": {"type": "string"},
             "request": {"type": "string"},
             "limit": {"type": "integer"},
+            "event_id": {"type": "integer"},
+            "section": {"type": "string"},
+            "offset": {"type": "integer"},
             "provider": {"type": "string"},
             "task": {"type": "string"},
             "context": {"type": "string"},
@@ -1111,6 +1125,15 @@ class NexusTaskOrchestrator:
                         # The guard refuses by hash and names no operation; the controller needs name +
                         # arguments to recognise the answer it already holds (#223).
                         observation = {**observation, **arguments}
+                    elif tool == TOOL_READ_TOOL_RESULT:
+                        # Re-reading a page is refused - it is already in hand and a stored
+                        # result does not change - but the way on is the next range, not
+                        # "another tool" (#232).
+                        observation = {
+                            **observation,
+                            **page_identity(arguments),
+                            "recovery": repeated_page_recovery(arguments),
+                        }
                     if terminal_not_found is not None:
                         # The guard already refuses and counts the repeat; pre-empting it would hide it
                         # from the budget that ends the loop - make the verdict actionable instead (#164).
@@ -1808,6 +1831,21 @@ class NexusTaskOrchestrator:
                     "script": "repository-relative .py path",
                     "module": "importable module name",
                     "argv": "list of arguments",
+                },
+            },
+            {
+                "name": TOOL_READ_TOOL_RESULT,
+                "description": (
+                    "Read part of a stored tool result that is summarized or not in this "
+                    "prompt, by its event_id: one named section, or a range of lines. "
+                    "Read-only. Each page reports next_offset; read a range once and "
+                    "continue from there."
+                ),
+                "arguments": {
+                    "event_id": "event id the summary or stub names",
+                    "section": "optional section name it lists",
+                    "offset": "first line, default 0",
+                    "limit": "number of lines, default 40",
                 },
             },
             {
@@ -2577,6 +2615,10 @@ Decide the next step now. Return JSON only.
             return tool, {"query": str(decision.get("query", "")).strip(), "limit": limit}
         if tool == TOOL_FIND_TOOL:
             return tool, {"goal": str(decision.get("goal", "")).strip()}
+        if tool == TOOL_READ_TOOL_RESULT:
+            # The page's identity: different ranges of one event are different calls,
+            # and spellings of the same range ("40" vs 40, limit omitted vs 40) are one.
+            return tool, normalize_read_arguments(decision)
         if tool == ACTION_KNOWLEDGE_COLLECTOR:
             return tool, {"request": str(decision.get("request", "")).strip()}
         if tool == "delegate":
@@ -3373,6 +3415,8 @@ Decide the next step now. Return JSON only.
             return self._run_command_with_recovery(command, tool=ACTION_COMMAND)
         if tool == TOOL_PYTHON_RUN:
             return self._execute_python_run(decision)
+        if tool == TOOL_READ_TOOL_RESULT:
+            return self._read_tool_result(decision)
         if tool == "memory_search":
             query = str(decision.get("query", "")).strip()
             if not query:
@@ -3415,6 +3459,34 @@ Decide the next step now. Return JSON only.
                 reason=str(decision.get("reason", "")),
             )
         raise TaskOrchestratorError(f"unknown tool {tool!r}")
+
+    def _read_tool_result(self, decision: dict[str, Any]) -> dict[str, Any]:
+        """One page of a persisted result of this session (#232).
+
+        Strictly read-only: a SELECT of one ``nexus_task_events`` row of the same
+        session, sliced by a pure function, so the same arguments always return
+        the same page.
+        """
+        arguments = normalize_read_arguments(decision)
+        session_id = str(decision.get("session_id", "")).strip()
+        event_id = arguments["event_id"]
+        event = self.task_store.get_event(session_id, event_id) if event_id > 0 else None
+        if event is None:
+            return {
+                "tool": TOOL_READ_TOOL_RESULT,
+                **page_identity(arguments),
+                "error": "event_not_found",
+                "recovery": (
+                    "use an event_id that a summary or stub in this run names"
+                ),
+            }
+        return read_tool_result_slice(
+            parse_stored_content(str(event.get("content") or "")),
+            event_id=event_id,
+            section=arguments["section"],
+            offset=arguments["offset"],
+            limit=arguments["limit"],
+        )
 
     def _repo_root(self) -> Path:
         return Path(getattr(self.operations_registry, "repo_root", "/agent"))

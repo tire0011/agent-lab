@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from modules.tool_result_view import semantic_summary
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEMINFO_PATH = "/proc/meminfo"
@@ -323,9 +325,11 @@ def compact_observations(
     """Bound observations sent to the model to a total character budget.
 
     The most recent ``keep_recent_full`` observations are kept closest to
-    full fidelity (still individually capped); older observations are
-    replaced by a small stub referencing their stable event id so the raw
-    result stays retrievable from the database without resending it inline.
+    full fidelity (still individually capped). An observation that does not
+    fit its share is first reduced to a semantic summary (#232); only when it
+    has no structure to summarise, or even the summary does not fit, is it
+    truncated (recent) or replaced by a small stub referencing its stable
+    event id, from which ``read_tool_result`` pages the raw result back.
     Returns ``(compacted_observations, omitted_indices)`` where
     ``omitted_indices`` are 0-based positions in the *input* list that were
     reduced to a stub.
@@ -350,6 +354,15 @@ def compact_observations(
         if len(serialized) <= fair_share:
             result[index] = obs
             remaining = max(0, remaining - len(serialized))
+            continue
+        # Rung 3 (#232): too large whole, so keep what the next decision needs -
+        # an issue's title, state, goal and acceptance criteria; a log's head,
+        # tail and failure lines - before falling back to truncation or a stub.
+        summary = semantic_summary(obs, fair_share)
+        if summary is not None:
+            # Not counted as omitted: it carries the result's substance.
+            result[index] = summary
+            remaining = max(0, remaining - len(json.dumps(summary, separators=(",", ":"))))
             continue
         if is_recent and remaining > 500:
             # Not counted as omitted: this still carries real content.
@@ -419,10 +432,11 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
     event_id = obs.get("event_id")
     if event_id is not None:
         stub["event_id"] = event_id
-        # Says what is missing, never what to do about it: there is no
-        # capability that fetches an event, so inviting one invites a retry.
+        # Says what is missing and names the one capability that reads it back
+        # (#232); never an instruction to repeat the call that produced it.
         stub["note"] = (
-            f"the result is not in this prompt; it is stored in event {event_id}"
+            f"the result is not in this prompt; it is stored in event {event_id}, "
+            f"and read_tool_result with event_id {event_id} returns it in pages"
         )
     return stub
 

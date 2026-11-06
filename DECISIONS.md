@@ -656,6 +656,35 @@ Decision log for architecture and operating choices.
 - Revisit if: a host shows real OOM kills from prompt size (not model load), or
   `CHARS_PER_TOKEN = 4` proves too optimistic for the prompt's JSON.
 
+### D-028: Oversized tool results are summarised, and the controller pages back into them
+
+- Status: Accepted (#232)
+- Decision: an observation too large for its share of the controller prompt
+  goes down a staged ladder: the whole result; then a semantic summary
+  (`modules/tool_result_view.py`); then, as before, truncation for the most
+  recent ones or a bare stub. An issue summary keeps number, title, state,
+  labels, goal and acceptance criteria. A multi-line log or test output keeps
+  its head, its tail and the lines that report errors or failures. Either way
+  the summary keeps operation, effective args, status and the event id, and
+  lists the result's sections. A single unstructured blob gets no summary.
+  The stub is used only when not even the tersest summary fits.
+  `read_tool_result(event_id, section | offset, limit)` is a controller action.
+  It reads one `nexus_task_events` row of the same session (a SELECT, nothing
+  else) and returns a deterministic page: lines, `total_lines`, `next_offset`,
+  at most 200 lines and 4000 characters. The loop guard's signature is the
+  normalised page (`event_id`, `section`, `offset`, `limit`), so different
+  pages are different calls. Reading the same page again is still refused, but
+  the recovery names the next offset instead of "choose a different tool".
+- Why: with two rungs, a result that did not fit reached the controller as "it
+  succeeded" with no content. The next decision needs the goal and the
+  acceptance criteria, not the whole body or none of it. A stored result does
+  not change, so a page read twice has nothing new to show. Refusing it is
+  correct, as long as the refusal points at the next page.
+- Evidence: `tests/test_issue_232_staged_tool_result_view.py`.
+- Revisit if: controllers page through whole results instead of the sections
+  they need (the step budget then becomes the limit), or a result type that
+  matters needs its own summariser beyond issue and log shapes.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns
