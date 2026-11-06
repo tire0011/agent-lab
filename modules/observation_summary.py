@@ -16,6 +16,7 @@ import re
 from typing import Any, Callable
 
 from modules.runtime_execution import exit_code_of
+from modules.tool_result_reader import read_hint
 
 # Fields every summary keeps when present: what ran, with what, and how it ended.
 _IDENTITY_FIELDS = (
@@ -297,6 +298,7 @@ def summarize_observation(obs: dict[str, Any], max_chars: int) -> dict[str, Any]
         if event_id is not None:
             summary["note"] = (
                 f"summary of a larger result; the full result is stored in event {event_id}"
+                + read_hint(obs, event_id)
             )
         if _size(summary) <= max_chars:
             return summary

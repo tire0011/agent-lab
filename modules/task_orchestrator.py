@@ -99,6 +99,13 @@ from modules.runtime_execution import (
     resolve_python_interpreter,
 )
 from modules.tool_loop_guard import PersistentToolLoopGuard
+from modules.tool_result_reader import (
+    TOOL_READ_TOOL_RESULT,
+    duplicate_read_guidance,
+    limit_cap as read_tool_result_limit_cap,
+    normalize_arguments as read_tool_result_arguments,
+    read_tool_result,
+)
 
 ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_ANSWER = "answer"
@@ -149,6 +156,7 @@ _ORCHESTRATOR_TOOLS = {
     "delegate",
     ACTION_COMMAND,
     TOOL_PYTHON_RUN,
+    TOOL_READ_TOOL_RESULT,
 }
 
 logger = logging.getLogger(__name__)
@@ -157,7 +165,7 @@ logger = logging.getLogger(__name__)
 # adds nothing to "why did it choose this".
 _DECISION_FIELDS = (
     "tool", "goal", "query", "request", "operation", "provider", "command",
-    "script", "module", "experiment_id", "capability",
+    "script", "module", "experiment_id", "capability", "event_id", "offset",
 )
 
 _PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
@@ -180,6 +188,7 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
                     "delegate",
                     ACTION_COMMAND,
                     TOOL_PYTHON_RUN,
+                    TOOL_READ_TOOL_RESULT,
                     ACTION_NEW_EXPERIMENT,
                     ACTION_RESUME_EXPERIMENT,
                     ACTION_ANSWER,
@@ -193,6 +202,8 @@ _ORCHESTRATOR_SCHEMA: dict[str, Any] = {
             "query": {"type": "string"},
             "request": {"type": "string"},
             "limit": {"type": "integer"},
+            "event_id": {"type": "integer"},
+            "offset": {"type": "integer"},
             "provider": {"type": "string"},
             "task": {"type": "string"},
             "context": {"type": "string"},
@@ -1085,6 +1096,14 @@ class NexusTaskOrchestrator:
             )
             if action in _ORCHESTRATOR_TOOLS:
                 execution_decision = self._action_to_tool_decision(decision)
+                if action == TOOL_READ_TOOL_RESULT:
+                    # Reduce limit to the cap before the guard sees the call, so a read above
+                    # the cap and one at it are the same range (#562).
+                    normalized, _ = read_tool_result_arguments(
+                        execution_decision, self._read_tool_result_cap(budget_plan)
+                    )
+                    if normalized is not None:
+                        execution_decision.update(normalized)
                 if task_logger is not None:
                     task_logger.info(
                         "orchestration",
@@ -1111,6 +1130,10 @@ class NexusTaskOrchestrator:
                         # The guard refuses by hash and names no operation; the controller needs name +
                         # arguments to recognise the answer it already holds (#223).
                         observation = {**observation, **arguments}
+                    if tool == TOOL_READ_TOOL_RESULT:
+                        # Another range of the event is progress; send the controller on to the
+                        # next range, not to another tool (#562).
+                        observation = {**observation, **duplicate_read_guidance(arguments)}
                     if terminal_not_found is not None:
                         # The guard already refuses and counts the repeat; pre-empting it would hide it
                         # from the budget that ends the loop - make the verdict actionable instead (#164).
@@ -1808,6 +1831,21 @@ class NexusTaskOrchestrator:
                     "script": "repository-relative .py path",
                     "module": "importable module name",
                     "argv": "list of arguments",
+                },
+            },
+            {
+                "name": TOOL_READ_TOOL_RESULT,
+                "description": (
+                    "Read one range of a tool result of this run that was too large for the "
+                    "prompt and is shown only as a summary or stub with its event_id. "
+                    "Returns content[offset:offset+limit], total_chars and next_offset; "
+                    "limit is capped. Read the next range with offset=next_offset. Only "
+                    "tool results of this session are readable."
+                ),
+                "arguments": {
+                    "event_id": "event_id of a tool observation of this run",
+                    "offset": "character offset to start at, 0 for the beginning",
+                    "limit": "number of characters to read (capped)",
                 },
             },
             {
@@ -2562,6 +2600,13 @@ Decide the next step now. Return JSON only.
         normalized["tool"] = action
         return normalized
 
+    @staticmethod
+    def _read_tool_result_cap(budget_plan: PromptBudgetPlan | None) -> int:
+        """``read_tool_result``'s limit cap: one slice fits the observation budget (#562)."""
+        return read_tool_result_limit_cap(
+            budget_plan.observation_chars if budget_plan is not None else None
+        )
+
     def _tool_identity(self, decision: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         tool = str(decision.get("tool", "")).strip()
         if tool == "operation":
@@ -2579,6 +2624,14 @@ Decide the next step now. Return JSON only.
             return tool, {"goal": str(decision.get("goal", "")).strip()}
         if tool == ACTION_KNOWLEDGE_COLLECTOR:
             return tool, {"request": str(decision.get("request", "")).strip()}
+        if tool == TOOL_READ_TOOL_RESULT:
+            # The effective range (limit already reduced to the cap): another range of one
+            # event is a different call, the same range is a duplicate (#562).
+            return tool, {
+                "event_id": decision.get("event_id"),
+                "offset": decision.get("offset", 0),
+                "limit": decision.get("limit"),
+            }
         if tool == "delegate":
             return tool, {
                 "provider": str(decision.get("provider", "")).strip(),
@@ -3373,6 +3426,13 @@ Decide the next step now. Return JSON only.
             return self._run_command_with_recovery(command, tool=ACTION_COMMAND)
         if tool == TOOL_PYTHON_RUN:
             return self._execute_python_run(decision)
+        if tool == TOOL_READ_TOOL_RESULT:
+            return read_tool_result(
+                self.task_store,
+                str(decision.get("session_id", "")),
+                decision,
+                cap=self._read_tool_result_cap(budget_plan),
+            )
         if tool == "memory_search":
             query = str(decision.get("query", "")).strip()
             if not query:
