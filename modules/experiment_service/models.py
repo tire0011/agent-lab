@@ -131,6 +131,7 @@ class Experiment:
     plan: dict[str, Any] | None = None
     worktree_path: str | None = None
     branch_name: str | None = None
+    base_commit_sha: str | None = None
     research_task_id: str | None = None
     research_started_at: str | None = None
     research_ended_at: str | None = None
@@ -165,6 +166,7 @@ class Experiment:
     error: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
+    baseline_test_classifications: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -183,6 +185,7 @@ class Experiment:
             "plan": self.plan,
             "worktree_path": self.worktree_path,
             "branch_name": self.branch_name,
+            "base_commit_sha": self.base_commit_sha,
             "research_task_id": self.research_task_id,
             "research_started_at": self.research_started_at,
             "research_ended_at": self.research_ended_at,
@@ -217,6 +220,7 @@ class Experiment:
             "error": self.error,
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
+            "baseline_test_classifications": self.baseline_test_classifications,
         }
 
 
@@ -244,6 +248,7 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         plan=_json_or_none(row["plan_json"]),
         worktree_path=row["worktree_path"],
         branch_name=row["branch_name"],
+        base_commit_sha=row["base_commit_sha"] if "base_commit_sha" in row.keys() else None,
         research_task_id=row["research_task_id"],
         research_started_at=row["research_started_at"],
         research_ended_at=row["research_ended_at"],
@@ -279,6 +284,10 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         policy_rule=row["policy_rule"] if "policy_rule" in row.keys() else None,
         quality_evaluation=(
             _json_or_none(row["quality_evaluation_json"]) if "quality_evaluation_json" in row.keys() else None
+        ),
+        baseline_test_classifications=(
+            _json_or_none(row["baseline_test_classifications_json"])
+            if "baseline_test_classifications_json" in row.keys() else None
         ),
     )
 
