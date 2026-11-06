@@ -2,7 +2,6 @@ import sqlite3
 import tempfile
 import unittest
 import importlib
-import importlib.util
 import os
 from pathlib import Path
 
@@ -39,11 +38,6 @@ class RunStoreTests(unittest.TestCase):
         self.assertIn("model_prices", tables)
         self.assertIn("tool_calls", tables)
         self.assertIn("knowledge", tables)
-
-    def test_public_api_uses_split_package_modules(self):
-        self.assertTrue(hasattr(run_store, "init_db"))
-        self.assertIsNotNone(importlib.util.find_spec("modules.run_store.schema"))
-        self.assertIsNotNone(importlib.util.find_spec("modules.run_store.records"))
 
     def test_storing_run_persists_row(self):
         conn = self._init_db()

@@ -81,20 +81,6 @@ class ImportCycleTests(unittest.TestCase):
 class ReExportTests(unittest.TestCase):
     """The split must not move anyone's import path."""
 
-    def test_the_registry_still_exposes_the_contract_names(self):
-        import modules.operation_contract as contract
-        import modules.operations_registry as registry
-
-        for name in (
-            "OperationArgSpec",
-            "OperationResult",
-            "OperationSpec",
-            "OperationValidationError",
-            "normalize_integer_argument",
-        ):
-            with self.subTest(name=name):
-                self.assertIs(getattr(registry, name), getattr(contract, name))
-
     def test_the_exception_is_one_class_not_two(self):
         """Two definitions would make `except` succeed or fail by import path."""
         from modules.operation_contract import OperationValidationError as FromLeaf

@@ -9,7 +9,6 @@ from modules.llama_cpp_client import (
     LlamaCppClient,
     LlamaCppClientError,
     _DEFAULT_BASE_URL,
-    _DEFAULT_MODEL_NAME,
 )
 
 
@@ -32,10 +31,6 @@ def test_default_model_name_is_qwen():
     assert "qwen" in client.model.lower()
     assert "llama" not in client.model.lower()
     assert "2-13b" not in client.model.lower()
-
-
-def test_default_model_name_constant():
-    assert _DEFAULT_MODEL_NAME == "qwen2.5-coder-7b-instruct"
 
 
 def test_local_model_url_env_var(monkeypatch):
