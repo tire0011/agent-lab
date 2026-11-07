@@ -192,6 +192,43 @@ class LlamaCppClient:
                 f"Unexpected response structure from llama-cpp server: {exc}"
             ) from exc
 
+    @property
+    def server_root(self) -> str:
+        """The server URL without the OpenAI ``/v1`` suffix (llama-server's own routes)."""
+        root = self.base_url
+        return root[: -len("/v1")] if root.endswith("/v1") else root
+
+    async def context_size(self) -> int:
+        """The context size (``n_ctx``) one request may use, from ``GET /props``.
+
+        Newer llama-server versions report the per-slot value under
+        ``default_generation_settings``; older ones at the top level.
+        Raises :class:`LlamaCppClientError` when the server does not say.
+        """
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{self.server_root}/props")
+        if resp.status_code != 200:
+            raise LlamaCppClientError(f"llama-cpp /props returned HTTP {resp.status_code}")
+        data = resp.json()
+        settings = data.get("default_generation_settings") if isinstance(data, dict) else None
+        for source in (settings, data):
+            if isinstance(source, dict):
+                value = source.get("n_ctx")
+                if isinstance(value, int) and value > 0:
+                    return value
+        raise LlamaCppClientError("llama-cpp /props did not report n_ctx")
+
+    async def count_tokens(self, text: str) -> int:
+        """Token count of *text* by the server's own tokenizer (``POST /tokenize``)."""
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{self.server_root}/tokenize", json={"content": text})
+        if resp.status_code != 200:
+            raise LlamaCppClientError(f"llama-cpp /tokenize returned HTTP {resp.status_code}")
+        tokens = resp.json().get("tokens")
+        if not isinstance(tokens, list):
+            raise LlamaCppClientError("llama-cpp /tokenize returned no token list")
+        return len(tokens)
+
     async def is_available(self) -> bool:
         """Return True if the llama-cpp server is reachable."""
         try:
