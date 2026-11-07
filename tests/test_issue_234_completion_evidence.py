@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,6 +16,40 @@ from modules.task_orchestrator import (
     NexusTaskOrchestrator,
 )
 
+
+
+# modules.task_orchestrator was split into modules/task_orchestrator_parts/ (#572):
+# a patched name is looked up in the parts module that uses it, so one mock is
+# installed in every parts module that looks the name up at call time.
+_ORCHESTRATOR_LOOKUPS = {
+    "process_command": ("modules.task_orchestrator_parts.execution",),
+    "compute_budget": (
+        "modules.task_orchestrator_parts.controller",
+        "modules.task_orchestrator_parts.providers",
+        "modules.task_orchestrator_parts.execution",
+    ),
+    "read_mem_available_kb": (
+        "modules.task_orchestrator_parts.controller",
+        "modules.task_orchestrator_parts.providers",
+        "modules.task_orchestrator_parts.execution",
+    ),
+    "logger": (
+        "modules.task_orchestrator_parts.session",
+        "modules.task_orchestrator_parts.controller",
+        "modules.task_orchestrator_parts.providers",
+        "modules.task_orchestrator_parts.knowledge",
+        "modules.task_orchestrator_parts.execution",
+    ),
+}
+
+
+@contextmanager
+def _patch_orchestrator(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _ORCHESTRATOR_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
 
 
 def _command_result(exit_code: int, output: str) -> str:
@@ -165,8 +200,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     side_effect=_writes(Path(tmp) / "issue-196-fixed.txt"),
                 ):
                     result = orchestrator.run("solve github issue #196")
@@ -197,8 +231,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     side_effect=_writes(Path(tmp) / "issue-253-fixed.txt"),
                 ):
                     result = orchestrator.run("solve github issue #238")
@@ -248,8 +281,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     side_effect=_writes(Path(tmp) / "issue-244-fixed.txt"),
                 ):
                     result = orchestrator.run("solve github issue #238")
@@ -296,8 +328,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     return_value=(_command_result(1, "failed"), None),
                 ):
                     result = orchestrator.run("solve github issue #238")
@@ -360,8 +391,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     side_effect=_writes(Path(tmp) / "applied.txt"),
                 ):
                     result = orchestrator.run("fix the repository behavior")
@@ -389,8 +419,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     return_value=(_command_result(1, "failed"), None),
                 ):
                     result = orchestrator.run("implement the requested change")
@@ -474,8 +503,7 @@ class Issue234CompletionEvidenceTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     return_value=(_command_result(0, ""), None),
                 ):
                     result = orchestrator.run("fix the repository behavior")
@@ -553,8 +581,7 @@ class Issue234EvidenceIntegrityTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     side_effect=_writes(Path(tmp) / "first.txt"),
                 ):
                     first = orchestrator.run("fix issue 196", source_id="stale-evidence")
@@ -670,8 +697,7 @@ class Issue234SelfCertificationTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     return_value=(_command_result(0, ""), None),
                 ):
                     result = orchestrator.run("fix the repository behavior")
@@ -698,8 +724,7 @@ class Issue234SelfCertificationTests(unittest.TestCase):
                 ],
             )
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     side_effect=_writes(Path(tmp) / "mislabelled.txt"),
                 ):
                     result = orchestrator.run("fix the repository behavior")
@@ -734,8 +759,7 @@ class Issue234SelfCertificationTests(unittest.TestCase):
                 return (_command_result(0, ""), None)
 
             try:
-                with patch(
-                    "modules.task_orchestrator.process_command",
+                with _patch_orchestrator("process_command",
                     side_effect=_writes_runtime_artifacts,
                 ):
                     result = orchestrator.run("fix the repository behavior")
