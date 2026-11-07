@@ -323,6 +323,28 @@ class NexusTaskStore:
             )
         return events
 
+    def tool_result_content(
+        self, session_id: str, event_id: int, kinds: frozenset[str] | set[str]
+    ) -> str | None:
+        """The stored content of one tool-call result of this session, else ``None``.
+
+        The access rule of ``read_tool_result`` (#562) is the WHERE clause: same
+        session, ``role='tool'``, and a kind from ``kinds``. Only ``content`` is
+        selected - never metadata - so nothing else can leak through a read.
+        """
+        allowed = sorted(str(kind)[:64] for kind in kinds)
+        if not session_id or not allowed:
+            return None
+        placeholders = ",".join("?" for _ in allowed)
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT content FROM nexus_task_events
+                    WHERE id=? AND session_id=? AND role='tool'
+                      AND kind IN ({placeholders})""",
+                (int(event_id), session_id, *allowed),
+            ).fetchone()
+        return None if row is None else str(row["content"])
+
     def user_inputs(self, session_id: str) -> list[str]:
         """Return complete user input events in their original order.
 

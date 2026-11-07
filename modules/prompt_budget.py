@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from modules.observation_summary import summarize_observation
+from modules.tool_result_reader import read_hint
 
 logger = logging.getLogger(__name__)
 
@@ -430,10 +431,11 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
     event_id = obs.get("event_id")
     if event_id is not None:
         stub["event_id"] = event_id
-        # Says what is missing, never what to do about it: there is no
-        # capability that fetches an event, so inviting one invites a retry.
+        # Says what is missing; names a way back only where one exists:
+        # read_tool_result (#562) pages through stored tool-call results only.
         stub["note"] = (
             f"the result is not in this prompt; it is stored in event {event_id}"
+            + read_hint(obs, event_id)
         )
     return stub
 
