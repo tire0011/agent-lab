@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -29,6 +30,27 @@ from modules.experiment_adoption_service import (
 from modules.experiment_service import ExperimentService
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 
+
+
+# modules.experiment_adoption_service was split into modules/experiment_adoption_parts/
+# (#574): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_ADOPTION_LOOKUPS = {
+    "_run_git": (
+        "modules.experiment_adoption_parts.integration",
+        "modules.experiment_adoption_parts.pipeline",
+    ),
+
+}
+
+
+@contextmanager
+def _patch_adoption(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _ADOPTION_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
 
 def _wait_for_thread(service, experiment_id, timeout=None):
     thread = service._threads.get(experiment_id)
@@ -409,7 +431,7 @@ class ExperimentAdoptionServiceTests(unittest.TestCase):
             recorded.append(list(args))
             return original_run_git(args, **kwargs)
 
-        with patch("modules.experiment_adoption_service._run_git", side_effect=spy):
+        with _patch_adoption("_run_git", side_effect=spy):
             started = self.fx.adoption_service.start_adoption(experiment_id)
             self.assertIn(started.status, {STATUS_QUEUED, STATUS_ADOPTING})
             adoption = self.fx.wait_terminal(experiment_id)

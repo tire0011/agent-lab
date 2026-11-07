@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from modules.experiment_adoption_service import STATUS_ADOPTED, STATUS_FAILED
 from modules.github_work_tracking import (
@@ -17,6 +18,26 @@ from modules.verification_runner import (
 )
 from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
+
+
+# modules.experiment_adoption_service was split into modules/experiment_adoption_parts/
+# (#574): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_ADOPTION_LOOKUPS = {
+    "run_verification_test_monitored": (
+        "modules.experiment_adoption_parts.pipeline",
+    ),
+
+}
+
+
+@contextmanager
+def _patch_adoption(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _ADOPTION_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
 
 class AdoptionAuthoritativeCIReuseTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -44,7 +65,7 @@ class AdoptionAuthoritativeCIReuseTests(unittest.TestCase):
 
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=ci) as wait_ci,
-            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
+            _patch_adoption("run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(experiment_id)
             adoption = self.fx.wait_terminal(experiment_id)
@@ -70,7 +91,7 @@ class AdoptionAuthoritativeCIReuseTests(unittest.TestCase):
 
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=ci),
-            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
+            _patch_adoption("run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(experiment_id)
             adoption = self.fx.wait_terminal(experiment_id)
@@ -93,8 +114,8 @@ class AdoptionAuthoritativeCIReuseTests(unittest.TestCase):
 
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=ci),
-            patch(
-                "modules.experiment_adoption_service.run_verification_test_monitored",
+            _patch_adoption(
+                "run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):

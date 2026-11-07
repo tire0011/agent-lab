@@ -19,7 +19,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import unittest
-from unittest.mock import patch
+from contextlib import ExitStack, contextmanager
+from unittest.mock import MagicMock, patch
 
 from modules.experiment_adoption_service import (
     STATUS_ADOPTED,
@@ -31,6 +32,26 @@ from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 _TIMEOUT_REASON = "Die Integrationstests konnten nicht erfolgreich abgeschlossen werden."
 
+
+
+# modules.experiment_adoption_service was split into modules/experiment_adoption_parts/
+# (#574): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_ADOPTION_LOOKUPS = {
+    "run_verification_test_monitored": (
+        "modules.experiment_adoption_parts.pipeline",
+    ),
+
+}
+
+
+@contextmanager
+def _patch_adoption(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _ADOPTION_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
 
 class PersistedCIEvidenceTests(unittest.TestCase):
     # Adoption always polls CI with a zero wait; the tests do the same so a
@@ -514,7 +535,7 @@ class PersistedCIEvidenceTests(unittest.TestCase):
                 "wait_for_ci",
                 side_effect=AssertionError("must not re-derive CI evidence"),
             ),
-            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
+            _patch_adoption("run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(
                 self.experiment_id, superseded=assessment
