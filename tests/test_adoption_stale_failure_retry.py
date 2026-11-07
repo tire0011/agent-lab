@@ -18,6 +18,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -41,6 +42,26 @@ from tests.test_experiment_adoption_service import AdoptionRepoFixture
 # The historical row from the issue: no exit code, output that only says
 # the command never returned, and the German reason adoption writes when
 # the tests could not be *completed* (as opposed to having failed).
+
+# modules.experiment_adoption_service was split into modules/experiment_adoption_parts/
+# (#574): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_ADOPTION_LOOKUPS = {
+    "run_verification_test_monitored": (
+        "modules.experiment_adoption_parts.pipeline",
+    ),
+
+}
+
+
+@contextmanager
+def _patch_adoption(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _ADOPTION_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
+
 def _wait_for_thread(service, experiment_id, timeout=None):
     thread = service._threads.get(experiment_id)
     if thread is not None:
@@ -267,7 +288,7 @@ class StaleFailureAssessmentTests(unittest.TestCase):
 
         with (
             patch.object(self.fx.github_work_tracking, "wait_for_ci", return_value=green),
-            patch("modules.experiment_adoption_service.run_verification_test_monitored"),
+            _patch_adoption("run_verification_test_monitored"),
         ):
             assessment = self.fx.adoption_service.assess_failure(self.experiment_id)
             self.fx.adoption_service.start_adoption(
@@ -316,7 +337,7 @@ class StaleFailureAssessmentTests(unittest.TestCase):
             patch.object(
                 self.fx.github_work_tracking, "wait_for_ci", return_value=self._green_ci()
             ),
-            patch("modules.experiment_adoption_service.run_verification_test_monitored") as local_tests,
+            _patch_adoption("run_verification_test_monitored") as local_tests,
         ):
             self.fx.adoption_service.start_adoption(self.experiment_id)
             adoption = self.fx.wait_terminal(self.experiment_id)
