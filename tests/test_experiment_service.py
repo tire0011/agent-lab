@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -52,6 +53,33 @@ from modules.experiment_service import (
     parse_plan,
     plan_violates_policy,
 )
+
+
+# modules.experiment_service.service was split into modules/experiment_service/service_parts/
+# (#576): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_SERVICE_LOOKUPS = {
+    "build_worker": (
+        "modules.experiment_service.service_parts.records",
+        "modules.experiment_service.service_parts.implementation",
+    ),
+    "other_provider": (
+        "modules.experiment_service.service_parts.implementation",
+    ),
+    "run_verification_test_monitored": (
+        "modules.experiment_service.service_parts.verification",
+    ),
+}
+
+
+@contextmanager
+def _patch_service(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _SERVICE_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
+
 
 def _verification_runs(service, experiment_id: str) -> list[dict]:
     with service._lock:
@@ -794,8 +822,8 @@ class ExperimentServiceTestCase(unittest.TestCase):
         fallback.run.return_value = _make_result(
             success=False, sandbox="workspace-write", error="real failure",
         )
-        with patch("modules.experiment_service.service.other_provider", return_value="codex"), patch(
-            "modules.experiment_service.service.build_worker", return_value=fallback
+        with _patch_service("other_provider", return_value="codex"), _patch_service(
+            "build_worker", return_value=fallback
         ) as build:
             experiment = self.service.create_experiment(goal="g")
             result = self.service.run_experiment(experiment.id)
@@ -811,7 +839,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.implementation_worker.run.return_value = _make_result(
             success=False, sandbox="workspace-write", error="kaboom",
         )
-        with patch("modules.experiment_service.service.build_worker") as build:
+        with _patch_service("build_worker") as build:
             experiment = self.service.create_experiment(goal="g")
             self.service.run_experiment(experiment.id)
         build.assert_not_called()
@@ -1472,7 +1500,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch("modules.experiment_service.service.run_verification_test_monitored") as local_tests:
+        with _patch_service("run_verification_test_monitored") as local_tests:
             result = self.service.run_experiment(
                 experiment.id, github_work_tracking=github
             )
@@ -1507,7 +1535,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch("modules.experiment_service.service.run_verification_test_monitored") as local_tests:
+        with _patch_service("run_verification_test_monitored") as local_tests:
             result = self.service.run_experiment(
                 experiment.id, github_work_tracking=github
             )
@@ -1533,8 +1561,8 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch(
-            "modules.experiment_service.service.run_verification_test_monitored",
+        with _patch_service(
+            "run_verification_test_monitored",
             wraps=run_verification_test_monitored,
         ) as local_tests:
             result = self.service.run_experiment(
