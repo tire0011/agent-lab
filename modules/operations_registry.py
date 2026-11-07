@@ -259,6 +259,16 @@ class OperationsRegistry:
                 mutates_state=False,
             ),
             "process_status": OperationSpec("process_status", "Prozessliste, sortiert nach RSS/%MEM.", [limit20], ["process", "memory", "rss", "host"], mutates_state=False),
+            "vm_maintenance_report": OperationSpec(
+                "vm_maintenance_report",
+                "Kurzer, rein lesender VM-Wartungsbericht: Updates, fehlgeschlagene "
+                "systemd-Units und Timer, Ressourcen, Prozesse und Zertifikate.",
+                tags=[
+                    "vm", "maintenance", "updates", "security", "systemd", "timer",
+                    "disk", "swap", "memory pressure", "process", "certificate", "expiry",
+                ],
+                mutates_state=False,
+            ),
             "service_logs": OperationSpec("service_logs", "journalctl-Auszug für einen systemd-Service (Standard: API-Service).", [service, limit50, since_minutes], ["service", "logs", "journalctl", "systemd"], mutates_state=False),
             "nexus_logs": OperationSpec(
                 "nexus_logs",
@@ -618,6 +628,73 @@ class OperationsRegistry:
             header, *rows = result.output_lines
             result.output_lines = [header] + rows[:limit]
         return result
+
+    def _op_vm_maintenance_report(self, args: dict[str, Any]) -> OperationResult:
+        """Collect a bounded host report without changing package or service state."""
+        if args:
+            raise OperationValidationError("vm_maintenance_report akzeptiert keine Argumente.")
+
+        started = time.perf_counter()
+        lines = ["VM maintenance report (read-only)"]
+
+        def run(label: str, command: list[str], *, max_lines: int = 8) -> list[str] | None:
+            result = self._run_command(command, timeout=20)
+            if not result.success:
+                lines.append(f"{label}: unknown")
+                return None
+            return bounded_lines("\n".join(result.output_lines), max_lines=max_lines)
+
+        updates = run("updates", ["apt", "list", "--upgradable"], max_lines=60)
+        if updates is not None:
+            packages = [
+                line for line in updates
+                if line.strip() and not line.startswith("Listing...") and not line.startswith("WARNING:")
+            ]
+            security = [line for line in packages if "security" in line.lower().split()[0]]
+            lines.append(f"updates: {len(packages)} upgradable; {len(security)} security")
+            if packages:
+                lines.append("  " + ", ".join(line.split("/", 1)[0] for line in packages[:10]))
+
+        failed_units = run(
+            "failed units",
+            ["systemctl", "--failed", "--no-legend", "--plain", "--no-pager"],
+        )
+        if failed_units is not None:
+            lines.append(f"failed units: {len(failed_units)}")
+            lines.extend(f"  {line}" for line in failed_units)
+
+        failed_timers = run(
+            "failed timers",
+            ["systemctl", "--failed", "--type=timer", "--no-legend", "--plain", "--no-pager"],
+        )
+        if failed_timers is not None:
+            lines.append(f"failed timers: {len(failed_timers)}")
+            lines.extend(f"  {line}" for line in failed_timers)
+
+        for label, command in (
+            ("disk", ["df", "-h", "--output=source,size,used,avail,pcent,target", "/"]),
+            ("memory/swap", ["free", "-h"]),
+            ("memory pressure", ["cat", "/proc/pressure/memory"]),
+            ("largest processes", ["ps", "-eo", "pid,pmem,rss,comm", "--sort=-rss"]),
+            (
+                "certificate expiry",
+                [
+                    "find", "-L", "/etc/letsencrypt/live", "-name", "fullchain.pem",
+                    "-exec", "openssl", "x509", "-in", "{}", "-noout", "-subject", "-enddate", ";",
+                ],
+            ),
+        ):
+            output = run(label, command, max_lines=6)
+            if output is not None:
+                lines.append(f"{label}:")
+                lines.extend(f"  {line}" for line in output or ["none"])
+
+        return OperationResult(
+            operation="vm_maintenance_report",
+            success=True,
+            output_lines=bounded_lines("\n".join(lines), max_lines=80),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
 
     def _op_service_status(self, args: dict[str, Any]) -> OperationResult:
         service = self._resolve_service(args)
