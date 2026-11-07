@@ -109,7 +109,11 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
         tool_names = ["operation", "memory_search", "delegate"]
         if self.allow_mutation:
             final_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
-            policy = "Execution explicitly requested: mutating command/experiment actions are allowed when useful."
+            policy = (
+                "Execution explicitly requested: every repository code change, including "
+                "a small edit, must use new_experiment. command and python_run are only for "
+                "reading or machine work and must not change the live repository."
+            )
             tool_names = [*tool_names, ACTION_COMMAND, TOOL_PYTHON_RUN]
         return "\n".join([
             "You are Nexus, the persistent local chat controller. Be concise and solve the current turn with the cheapest capable path.",

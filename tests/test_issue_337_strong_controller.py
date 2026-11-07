@@ -151,6 +151,32 @@ class GitHubWriteGuardTests(unittest.TestCase):
                 self.assertNotIn("error", observation)
                 run.assert_called_once()
 
+    def test_live_repository_writes_are_refused(self):
+        for command in (
+            "git checkout -b fix-issue-238",
+            "git apply /tmp/change.patch",
+            "sed -i 's/old/new/' modules/task_orchestrator.py",
+            "touch modules/new_feature.py",
+            "printf x > modules/new_feature.py",
+        ):
+            with self.subTest(command=command):
+                observation, run = self._command(command)
+                self.assertEqual(observation.get("error"), "repository_write_refused")
+                self.assertIn("new_experiment", observation.get("reason", ""))
+                run.assert_not_called()
+
+    def test_repository_reads_still_run(self):
+        for command in (
+            "git status --short",
+            "git diff -- modules/task_orchestrator.py",
+            "git log -1 --oneline",
+            "sed -n '1,20p' modules/task_orchestrator.py",
+        ):
+            with self.subTest(command=command):
+                observation, run = self._command(command)
+                self.assertNotIn("error", observation)
+                run.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

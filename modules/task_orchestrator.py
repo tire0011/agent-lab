@@ -131,6 +131,18 @@ _GITHUB_WRITE_COMMAND = re.compile(
     r"|\s(?:-f|-F|--field|--raw-field|--input)\b)",
     re.IGNORECASE,
 )
+# Repository mutations belong in an isolated experiment.  This is deliberately
+# narrower than a generic "mutating shell" deny-list: command remains available
+# for machine administration, while the Git and common file-writing forms that
+# can alter the controller's live checkout are refused before a shell starts.
+_REPOSITORY_WRITE_COMMAND = re.compile(
+    r"\bgit\s+(?:add|am|apply|branch|checkout|cherry-pick|clean|commit|merge|mv|"
+    r"pull|rebase|reset|restore|revert|rm|switch|tag)\b"
+    r"|(?:^|[;&|]\s*|\bsudo\s+)(?:cp|install|ln|mkdir|mv|rm|rmdir|touch|truncate)\b"
+    r"|\bsed\b[^\n;&|]*\s(?:-i|--in-place)(?:\b|=)"
+    r"|(?:^|[^<])(?:>>?|\|\s*tee(?:\s|$))\s*[^&|]",
+    re.IGNORECASE,
+)
 # External fallback prompts are cut to this length; size the prompt below it
 # first (#297).
 _EXTERNAL_PROMPT_CHARS = 16000
@@ -3407,6 +3419,17 @@ Decide the next step now. Return JSON only.
             command = str(decision.get("command", "")).strip()
             if not command:
                 raise TaskOrchestratorError("command tool requires command")
+            if _REPOSITORY_WRITE_COMMAND.search(command):
+                return {
+                    "tool": ACTION_COMMAND,
+                    "command": command,
+                    "error": "repository_write_refused",
+                    "reason": (
+                        "Commands that can change the live repository are not run from "
+                        "the controller. Use new_experiment for every repository change, "
+                        "including small edits and branch creation."
+                    ),
+                }
             if _GITHUB_WRITE_COMMAND.search(command):
                 return {
                     "tool": ACTION_COMMAND,
