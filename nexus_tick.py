@@ -441,7 +441,7 @@ _STALL_ALARM_HOURS = 6
 _STALL_ALARM_REPEAT_HOURS = 24
 _STALL_ALARM = "stall_alarm"
 # Decisions that explain a quiet stretch on their own.
-_EXPECTED_QUIET = ("busy", "budget_exhausted")
+_EXPECTED_QUIET = ("busy", "budget_exhausted", "paused")
 
 
 def _stall_alarm(db_path: str, now: datetime | None = None) -> str | None:

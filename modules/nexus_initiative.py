@@ -98,6 +98,9 @@ DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
 # is never dispatched: pending, revoked, content-changed and corrupted records
 # all land here. Approvals come only from the trusted private mailbox.
 DECISION_SKIPPED_UNAPPROVED_ISSUE = "skipped_unapproved_issue"
+# The owner paused Nexus: no new work, no adoption, no retries. Experiments
+# already running finish.
+DECISION_PAUSED = "paused"
 # Reasons only _check_goal_policy produces. A rejection with one of them is
 # known in advance from the goal text, so retrying the same text is pointless.
 _GOAL_POLICY_REASON_PREFIXES = tuple(
@@ -387,6 +390,10 @@ class NexusInitiativeService:
             return int(row[0]) if row else default
         except (sqlite3.Error, ValueError, TypeError):
             return default
+
+    def _paused(self) -> bool:
+        """The owner paused all new work by mailbox (``paused`` = 1)."""
+        return (self._text_setting("nexus.paused") or "0").strip() == "1"
 
     def _text_setting(self, key: str) -> str | None:
         """A text setting the owner stored by mailbox, else ``None``."""
@@ -1007,6 +1014,8 @@ class NexusInitiativeService:
     def resume_blocked_capability(self) -> InitiativeDecision:
         """Resume at most one capability-blocked session behind normal initiative gates."""
         tick_id = uuid.uuid4().hex
+        if self._paused():
+            return self._record(InitiativeDecision(DECISION_PAUSED, detail="paused by the owner", tick_id=tick_id))
         if self.controller is None:
             return self._record(
                 InitiativeDecision("idle", detail="no controller configured", tick_id=tick_id)
@@ -1223,6 +1232,8 @@ class NexusInitiativeService:
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
         self._planner_called = False
+        if self._paused():
+            return self._record(InitiativeDecision(DECISION_PAUSED, detail="paused by the owner", tick_id=tick_id))
         self._sweep_stalled_experiments()
         self.enforce_issue_approvals()
         busy = self.busy_reason()
