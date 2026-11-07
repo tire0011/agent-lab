@@ -17,6 +17,7 @@ from modules.coding_provider import (
     provider_of,
 )
 from modules.coding_worker import agent_watchdog_limits
+from modules.local_coding_worker import is_context_too_small
 
 from ..git_utils import _run_git
 from ..models import (
@@ -226,6 +227,40 @@ class ImplementationMixin:
         implementation_usage_json = self._record_worker_run_usage(
             experiment_id, implementation_result.usage, elog
         )
+
+        if (
+            implementation_provider == "local"
+            and is_context_too_small(implementation_result.error)
+            and self.get_experiment(experiment_id).status != STATUS_CANCELLED
+        ):
+            # The local model was not called: its context cannot hold the goal and the
+            # files it names (#569). Hand over to an external agent now, not next time.
+            worker = self.worker_factory(worktree_path)
+            implementation_provider = provider_of(worker)
+            elog.warning(
+                "implementation", "implementation_provider_fallback",
+                f"local model context too small; implementation runs on "
+                f"{implementation_provider or 'unknown'}: {implementation_result.error}",
+                provider=implementation_provider or "",
+                reason="context_too_small",
+            )
+            self._force_status(
+                experiment_id, STATUS_IMPLEMENTING,
+                implementation_provider=implementation_provider,
+            )
+            implementation_result = worker.run(
+                task=implementation_prompt,
+                working_dir=worktree_path,
+                sandbox="workspace-write",
+                timeout_seconds=max_seconds,
+                stall_seconds=stall_seconds,
+                experiment_logger=elog,
+                phase="implementation",
+                on_process=lambda process: self._track_process(experiment_id, process),
+            )
+            implementation_usage_json = self._record_worker_run_usage(
+                experiment_id, implementation_result.usage, elog
+            )
 
         fallback = (
             other_provider(implementation_provider)
