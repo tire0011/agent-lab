@@ -120,6 +120,8 @@ class GitHubWriteGuardTests(unittest.TestCase):
     def _command(self, command):
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator = _orchestrator(tmp, _AzureDelegation(), [])
+            # "{root}" stands for the live checkout the controller runs in.
+            command = command.replace("{root}", tmp)
             try:
                 with patch.object(orchestrator, "_run_command_with_recovery", return_value={"tool": ACTION_COMMAND, "ran": True}) as run:
                     observation = asyncio.run(orchestrator._execute_tool({"tool": ACTION_COMMAND, "command": command}))
@@ -151,13 +153,20 @@ class GitHubWriteGuardTests(unittest.TestCase):
                 self.assertNotIn("error", observation)
                 run.assert_called_once()
 
-    def test_live_repository_writes_are_refused(self):
+    def test_code_history_in_the_live_checkout_is_refused(self):
+        # #263 decision 1: code changes go through new_experiment, including
+        # the branch Nexus once created directly in /agent for #238.
         for command in (
             "git checkout -b fix-issue-238",
+            "git switch -c fix-issue-238",
             "git apply /tmp/change.patch",
-            "sed -i 's/old/new/' modules/task_orchestrator.py",
-            "touch modules/new_feature.py",
-            "printf x > modules/new_feature.py",
+            "git commit -am 'fix #238'",
+            "git am /tmp/0001-fix.patch",
+            "git cherry-pick abc123",
+            "git status && git checkout -b fix-issue-238",
+            "cd {root} && git commit -m x",
+            "git -C {root} merge feature",
+            "git -C modules commit -m x",
         ):
             with self.subTest(command=command):
                 observation, run = self._command(command)
@@ -165,18 +174,32 @@ class GitHubWriteGuardTests(unittest.TestCase):
                 self.assertIn("new_experiment", observation.get("reason", ""))
                 run.assert_not_called()
 
-    def test_repository_reads_still_run(self):
+    def test_machine_work_and_reading_still_run(self):
+        # Review of PR #568: the guard must not block routine administration.
         for command in (
             "git status --short",
             "git diff -- modules/task_orchestrator.py",
             "git log -1 --oneline",
+            "git pull --ff-only",
+            "git fetch origin",
+            "git checkout main",
+            "git branch --show-current",
             "sed -n '1,20p' modules/task_orchestrator.py",
+            "mkdir -p /opt/pwsh",
+            "rm -rf /tmp/old-build",
+            "cp /etc/hosts /tmp/hosts.bak",
+            "ln -sf /opt/pwsh/pwsh /usr/local/bin/pwsh",
+            "touch /tmp/marker",
+            "sudo apt-get install -y powershell",
+            "sudo sed -i 's/a/b/' /etc/apt/sources.list",
+            "echo ok > /tmp/out.txt",
+            "git -C /opt/other-repo commit -m x",
+            "cd /opt/other-repo && git checkout -b topic",
         ):
             with self.subTest(command=command):
                 observation, run = self._command(command)
                 self.assertNotIn("error", observation)
                 run.assert_called_once()
-
 
 if __name__ == "__main__":
     unittest.main()
