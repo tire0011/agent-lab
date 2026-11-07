@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +23,40 @@ from modules.task_orchestrator import (
     NexusTaskOrchestrator,
     TaskOrchestratorError,
 )
+
+
+# modules.task_orchestrator was split into modules/task_orchestrator_parts/ (#572):
+# a patched name is looked up in the parts module that uses it, so one mock is
+# installed in every parts module that looks the name up at call time.
+_ORCHESTRATOR_LOOKUPS = {
+    "process_command": ("modules.task_orchestrator_parts.execution",),
+    "compute_budget": (
+        "modules.task_orchestrator_parts.controller",
+        "modules.task_orchestrator_parts.providers",
+        "modules.task_orchestrator_parts.execution",
+    ),
+    "read_mem_available_kb": (
+        "modules.task_orchestrator_parts.controller",
+        "modules.task_orchestrator_parts.providers",
+        "modules.task_orchestrator_parts.execution",
+    ),
+    "logger": (
+        "modules.task_orchestrator_parts.session",
+        "modules.task_orchestrator_parts.controller",
+        "modules.task_orchestrator_parts.providers",
+        "modules.task_orchestrator_parts.knowledge",
+        "modules.task_orchestrator_parts.execution",
+    ),
+}
+
+
+@contextmanager
+def _patch_orchestrator(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _ORCHESTRATOR_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
 
 
 class _Client:
@@ -304,7 +339,6 @@ class TaskOrchestratorTests(unittest.TestCase):
         every turn pushed prompt_chars and omitted_observations - the values
         worth watching - into the noise.
         """
-        from unittest.mock import patch
 
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
         client = _Client([
@@ -314,7 +348,7 @@ class TaskOrchestratorTests(unittest.TestCase):
             '"message":"done","reason":"enough"}',
         ])
         orchestrator = self._orchestrator(client)
-        with patch("modules.task_orchestrator.logger") as log:
+        with _patch_orchestrator("logger") as log:
             try:
                 orchestrator.run("Search memory twice")
             finally:
@@ -332,7 +366,6 @@ class TaskOrchestratorTests(unittest.TestCase):
         Comparing the whole plan would log every turn again while looking like
         it does not.
         """
-        from unittest.mock import patch
 
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
         client = _Client([
@@ -344,9 +377,9 @@ class TaskOrchestratorTests(unittest.TestCase):
         orchestrator = self._orchestrator(client)
         readings = iter([8_000_000, 7_999_100, 8_000_300, 7_998_800])
 
-        with patch("modules.task_orchestrator.read_mem_available_kb",
+        with _patch_orchestrator("read_mem_available_kb",
                    side_effect=lambda *a, **k: next(readings, 8_000_000)), \
-             patch("modules.task_orchestrator.logger") as log:
+             _patch_orchestrator("logger") as log:
             try:
                 orchestrator.run("Search memory twice")
             finally:
@@ -365,7 +398,6 @@ class TaskOrchestratorTests(unittest.TestCase):
         from one nobody looked at - so the only way to know was to read the
         journal back with a script afterwards.
         """
-        from unittest.mock import patch
 
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
         client = _Client([
@@ -376,7 +408,7 @@ class TaskOrchestratorTests(unittest.TestCase):
             '"message":"done","reason":"the result is already here"}',
         ])
         orchestrator = self._orchestrator(client)
-        with patch("modules.task_orchestrator.logger") as log:
+        with _patch_orchestrator("logger") as log:
             try:
                 orchestrator.run("Inspect local repository changes")
             finally:
@@ -541,9 +573,8 @@ class TaskOrchestratorTests(unittest.TestCase):
         ]
         orchestrator = self._orchestrator(client, delegation=delegation)
         try:
-            from unittest.mock import patch
 
-            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+            with _patch_orchestrator("compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
                 def _low_memory(**kwargs):
@@ -587,8 +618,7 @@ class TaskOrchestratorTests(unittest.TestCase):
                 plans.append(real_compute_budget(**kwargs))
                 return plans[-1]
 
-            with patch("modules.task_orchestrator.read_mem_available_kb", return_value=1024), patch(
-                "modules.task_orchestrator.compute_budget", side_effect=_recording
+            with _patch_orchestrator("read_mem_available_kb", return_value=1024), _patch_orchestrator("compute_budget", side_effect=_recording
             ):
                 result = orchestrator.run("Answer despite measured memory pressure")
         finally:
@@ -956,9 +986,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 return_value=("exit_code: 0\nstdout:\nclean\n", None),
             ) as command_mock:
                 result = orchestrator.run("Inspect the repository")
@@ -1049,9 +1077,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 side_effect=[
                     ("exit_code: 127\nstderr:\ncargo: not found", None),
                     ("exit_code: 0\nstdout:\nbuilt", None),
@@ -1077,9 +1103,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 side_effect=[
                     ("exit_code: 127\nstderr:\npython: not found", None),
                     ("exit_code: 0\nstdout:\n0.2.0", None),
@@ -1112,9 +1136,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 return_value=("exit_code: 0\nstdout:\n0.2.0", None),
             ) as command_mock:
                 result = orchestrator.run("Print the Nexus version")
@@ -1143,9 +1165,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 return_value=("exit_code: 0\nstdout:\nOK", None),
             ) as command_mock:
                 result = orchestrator.run("Run the tests")
@@ -1186,9 +1206,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 return_value=("exit_code: 0\nstdout:\nOK", None),
             ) as command_mock:
                 result = orchestrator.run("Run both test suites")
@@ -1219,9 +1237,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 return_value=("exit_code: 0\nstdout:\nOK", None),
             ) as command_mock:
                 result = orchestrator.run("Run the tests")
@@ -1296,7 +1312,6 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertIn("Improve model routing", client.prompts[1])
 
     def test_knowledge_collector_is_not_automatic_preflight(self):
-        from unittest.mock import patch
 
         client = _Client([
             '{"action":"answer","message":"No research needed.","reason":"task is already clear"}',
@@ -1315,7 +1330,6 @@ class TaskOrchestratorTests(unittest.TestCase):
             orchestrator.close()
 
     def test_controller_can_explicitly_invoke_knowledge_collector(self):
-        from unittest.mock import patch
 
         client = _Client([
             '{"action":"knowledge_collector",'
@@ -1347,7 +1361,6 @@ class TaskOrchestratorTests(unittest.TestCase):
             orchestrator.close()
 
     def test_knowledge_collector_reports_used_sources_dynamically(self):
-        from unittest.mock import patch
 
         client = _Client([
             '{"action":"knowledge_collector",'
@@ -1432,9 +1445,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 return_value=("exit_code: 0\nstdout:\nrepaired\n", None),
             ) as command_mock:
                 # Read-only wording on purpose: this test is about repairing
@@ -1552,14 +1563,11 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client)
         try:
-            from unittest.mock import patch
 
             huge_output = "y" * 50000
-            with patch(
-                "modules.task_orchestrator.process_command",
+            with _patch_orchestrator("process_command",
                 return_value=(f"exit_code: 0\nstdout:\n{huge_output}", None),
-            ), patch(
-                "modules.task_orchestrator.compute_budget"
+            ), _patch_orchestrator("compute_budget"
             ) as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
@@ -1656,9 +1664,8 @@ class TaskOrchestratorTests(unittest.TestCase):
         client = _FailingClient([])
         orchestrator = self._orchestrator(client, delegation=delegation)
         try:
-            from unittest.mock import patch
 
-            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+            with _patch_orchestrator("compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
                 compute_budget_mock.side_effect = real_compute_budget
@@ -1701,9 +1708,8 @@ class TaskOrchestratorTests(unittest.TestCase):
         client = _FailingClient([])
         orchestrator = self._orchestrator(client, delegation=delegation)
         try:
-            from unittest.mock import patch
 
-            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+            with _patch_orchestrator("compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
                 compute_budget_mock.side_effect = real_compute_budget
@@ -1748,9 +1754,8 @@ class TaskOrchestratorTests(unittest.TestCase):
         original_submit = orchestrator.llm_jobs.submit
         orchestrator.llm_jobs.submit = MagicMock(side_effect=original_submit)
         try:
-            from unittest.mock import patch
 
-            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+            with _patch_orchestrator("compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
                 call_count = 0
@@ -1788,9 +1793,8 @@ class TaskOrchestratorTests(unittest.TestCase):
         ])
         orchestrator = self._orchestrator(client, delegation=_EmptyDelegation())
         try:
-            from unittest.mock import patch
 
-            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+            with _patch_orchestrator("compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
                 call_count = 0
@@ -1818,9 +1822,8 @@ class TaskOrchestratorTests(unittest.TestCase):
         delegation.catalog.return_value = []
         orchestrator = self._orchestrator(client, delegation=delegation)
         try:
-            from unittest.mock import patch
 
-            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+            with _patch_orchestrator("compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
                 compute_budget_mock.side_effect = real_compute_budget
@@ -1843,9 +1846,8 @@ class TaskOrchestratorTests(unittest.TestCase):
         client = _Client([])
         orchestrator = self._orchestrator(client, delegation=_EmptyDelegation())
         try:
-            from unittest.mock import patch
 
-            with patch("modules.task_orchestrator.compute_budget") as compute_budget_mock:
+            with _patch_orchestrator("compute_budget") as compute_budget_mock:
                 from modules.prompt_budget import compute_budget as real_compute_budget
 
                 def _forces_fallback(**kwargs):
