@@ -372,6 +372,8 @@ SETTINGS: dict[str, tuple[str, int, int]] = {
     "daily_budget": ("nexus.daily_budget", 0, 50),
     # Starts on top of the daily budget for the next 24 hours (#523).
     "extra_budget": ("nexus.extra_budget", 0, 20),
+    # 1 pauses all new work (no starts, adoptions or retries); 0 resumes.
+    "paused": ("nexus.paused", 0, 1),
 }
 
 
