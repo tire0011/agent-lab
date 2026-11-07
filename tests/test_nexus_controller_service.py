@@ -7,9 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from models import Idea
-from modules.github_work_tracking import GitHubWorkTrackingError
-from modules.experiment_handover import HANDOVER_HEADING
 from modules.nexus_controller_service import NexusControllerService
+from modules.nexus_experiment_tool import (
+    LAUNCH_ALREADY_ACTIVE,
+    LAUNCH_BLOCKED,
+    LAUNCH_SUBMITTED,
+    ExperimentLaunch,
+    NexusExperimentTool,
+)
 from modules.nexus_task_store import NexusTaskStore
 from modules.task_orchestrator import ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, TaskDecision
 from modules.nexus_sources import task_source
@@ -25,6 +30,7 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.orchestrator.operations_registry = SimpleNamespace(repo_root=Path(self.tmp.name))
         self.orchestrator.task_store = MagicMock()
         self.orchestrator.task_store.user_inputs.return_value = []
+        self.orchestrator.experiment_tool = None
         self.github = MagicMock()
         self.github.ensure_for_source.return_value = SimpleNamespace(
             issue_number=42, branch_name="nexus/42-controller"
@@ -63,59 +69,54 @@ class NexusControllerServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["source_type"], "idea")
         self.assertEqual(kwargs["source_id"], "idea-3")
 
-    def test_selected_new_experiment_is_actually_dispatched(self):
-        experiment = SimpleNamespace(id="exp-123")
+    def test_nexus_gets_its_experiment_tool_wired_to_this_service(self):
+        # #263 step 4: the service configures the tool, Nexus executes it.
+        tool = self.orchestrator.experiment_tool
+        self.assertIsInstance(tool, NexusExperimentTool)
+        self.assertIs(tool.github_work_tracking, self.github)
+        self.assertEqual(tool.background, self.service._start_experiment_thread)
+        self.assertEqual(tool.on_finished, self.service._resume_after_experiment)
+
+    def test_a_new_experiment_decision_is_not_executed_by_the_service(self):
+        # Without a launch from Nexus the service does not start one itself.
         self.orchestrator.run.return_value = TaskDecision(
-            action=ACTION_NEW_EXPERIMENT,
-            session_id="session-1",
-        )
-        self.orchestrator.experiment_service.create_experiment.return_value = experiment
-
-        self.service.handle_source(task_source("Implement the requested feature", source_id="task-1"))
-
-        self.orchestrator.experiment_service.create_experiment.assert_called_once_with(
-            "Implement the requested feature",
-            complexity=None,
-            source_type="task",
-            source_id="task-1",
-        )
-        self.github.ensure_for_source.assert_called_once()
-        self.github.bind_experiment.assert_called_once()
-
-    def test_new_experiment_goal_is_the_task_followed_by_the_handover(self):
-        # #263: what Nexus already found travels with the task.
-        self.orchestrator.run.return_value = TaskDecision(
-            action=ACTION_NEW_EXPERIMENT,
-            session_id="session-1",
-            experiment_handover="What Nexus already found (handover):\n\nNexus goal:\nadd a kind filter",
-        )
-        self.orchestrator.experiment_service.create_experiment.return_value = SimpleNamespace(
-            id="exp-263"
+            action=ACTION_NEW_EXPERIMENT, session_id="session-1"
         )
 
         self.service.handle_source(task_source("Implement the requested feature", source_id="task-1"))
-
-        goal = self.orchestrator.experiment_service.create_experiment.call_args[0][0]
-        self.assertTrue(goal.startswith("Implement the requested feature\n\n"))
-        # #263 step 3: the session pauses on the experiment it started.
-        self.orchestrator.task_store.wait_for_experiment.assert_called_once_with(
-            "session-1", "exp-263"
-        )
-        self.assertIn("Nexus goal:\nadd a kind filter", goal)
-
-    def test_missing_github_configuration_blocks_before_experiment_creation(self):
-        self.orchestrator.run.return_value = TaskDecision(
-            action=ACTION_NEW_EXPERIMENT,
-            session_id="session-1",
-        )
-        self.github.ensure_for_source.side_effect = GitHubWorkTrackingError(
-            "Configure GITHUB_TOKEN/GH_TOKEN"
-        )
-
-        with self.assertRaises(GitHubWorkTrackingError):
-            self.service.handle_source(task_source("Implement the requested feature", source_id="task-1"))
 
         self.orchestrator.experiment_service.create_experiment.assert_not_called()
+        self.github.ensure_for_source.assert_not_called()
+        self.orchestrator.task_store.wait_for_experiment.assert_not_called()
+
+    def test_a_started_launch_is_recorded_and_returns_the_decision(self):
+        decision = TaskDecision(
+            action=ACTION_NEW_EXPERIMENT,
+            session_id="session-1",
+            experiment_id="exp-263",
+            experiment_launch=ExperimentLaunch(status=LAUNCH_SUBMITTED, experiment_id="exp-263"),
+        )
+        self.orchestrator.run.return_value = decision
+
+        result = self.service.handle_source(task_source("Implement it", source_id="task-1"))
+
+        self.assertIs(result, decision)
+        kinds = [c.kwargs["kind"] for c in self.orchestrator.task_store.append_event.call_args_list]
+        self.assertIn("experiment_started", kinds)
+
+    def test_a_launch_that_did_not_start_is_returned_to_the_caller(self):
+        for launch in (
+            ExperimentLaunch(status=LAUNCH_ALREADY_ACTIVE, experiment_id="exp-1",
+                             experiment_status="running", reason="already active"),
+            ExperimentLaunch(status=LAUNCH_BLOCKED, reason="Configure GITHUB_TOKEN/GH_TOKEN"),
+        ):
+            with self.subTest(status=launch.status):
+                self.orchestrator.run.return_value = TaskDecision(
+                    action=ACTION_NEW_EXPERIMENT, session_id="session-1", experiment_launch=launch
+                )
+                result = self.service.handle_source(task_source("Implement it", source_id="task-1"))
+                self.assertEqual(result["status"], launch.status)
+                self.assertEqual(result.get("reason"), launch.reason)
 
     def test_resume_recovers_same_experiment_before_starting_thread(self):
         experiment = SimpleNamespace(id="exp-existing", goal="Existing goal")
@@ -130,24 +131,6 @@ class NexusControllerServiceTests(unittest.TestCase):
 
         self.github.recover_experiment.assert_called_once_with(experiment)
 
-    def test_reply_new_experiment_uses_original_input_and_followup(self):
-        experiment = SimpleNamespace(id="exp-after-reply")
-        self.orchestrator.continue_session.return_value = TaskDecision(
-            action=ACTION_NEW_EXPERIMENT,
-            session_id="session-1",
-        )
-        self.orchestrator.experiment_service.create_experiment.return_value = experiment
-        self.orchestrator.task_store.user_inputs.return_value = [
-            "Improve model routing",
-            "Optimize for cost",
-        ]
-
-        self.service.reply("session-1", "Optimize for cost")
-
-        goal = self.orchestrator.experiment_service.create_experiment.call_args[0][0]
-        self.assertIn("Improve model routing", goal)
-        self.assertIn("Optimize for cost", goal)
-
     def test_execution_goal_uses_full_original_input_and_followup(self):
         store = NexusTaskStore(str(Path(self.tmp.name) / "goals.db"))
         self.addCleanup(store.close)
@@ -161,28 +144,6 @@ class NexusControllerServiceTests(unittest.TestCase):
         goal = self.service._execution_goal(session.id, "fallback")
 
         self.assertEqual(goal, f"{original}\n\nUser follow-up:\n{followup}")
-
-    def test_continue_path_passes_full_issue_body_before_handover(self):
-        store = NexusTaskStore(str(Path(self.tmp.name) / "continue.db"))
-        self.addCleanup(store.close)
-        session = store.get_or_create(source_type="issue", source_id="406-continue")
-        issue_body = "b" * 4000 + "\nISSUE-END-MARKER"
-        store.append_event(session.id, role="user", kind="input", content=issue_body)
-        self.orchestrator.task_store = store
-        self.orchestrator.experiment_service.create_experiment.return_value = SimpleNamespace(
-            id="exp-continue"
-        )
-        decision = TaskDecision(
-            action=ACTION_NEW_EXPERIMENT,
-            session_id=session.id,
-            experiment_handover=f"{HANDOVER_HEADING}\n\nNexus goal:\nfinish it",
-        )
-
-        with patch.object(self.service, "_start_experiment_thread"):
-            self.service._continue_after_experiment([decision])
-
-        goal = self.orchestrator.experiment_service.create_experiment.call_args.args[0]
-        self.assertEqual(goal.split(HANDOVER_HEADING, 1)[0].strip(), issue_body)
 
     def test_execution_goal_cap_is_recorded(self):
         store = NexusTaskStore(str(Path(self.tmp.name) / "truncated.db"))

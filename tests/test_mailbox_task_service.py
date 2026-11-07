@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import threading
@@ -25,6 +26,7 @@ from modules.task_orchestrator import (
     ACTION_CLARIFICATION,
     ACTION_NEW_EXPERIMENT,
     ACTION_RESUME_EXPERIMENT,
+    NexusTaskOrchestrator,
     TaskDecision,
 )
 
@@ -47,10 +49,23 @@ class _FixedOrchestrator:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.experiment_tool = None
+        self.task_store = MagicMock()
+        self.task_store.recent_events.return_value = []
 
     def run(self, task, **kwargs):
         type(self).calls.append((task, kwargs))
-        return self.decision
+        decision = dataclasses.replace(self.decision, session_id="session-fixed")
+        if decision.action == ACTION_NEW_EXPERIMENT:
+            # The real step by which Nexus executes its own new_experiment (#263).
+            session = SimpleNamespace(
+                id="session-fixed",
+                source_type=kwargs.get("source_type"),
+                source_id=kwargs.get("source_id"),
+                title=kwargs.get("title"),
+            )
+            NexusTaskOrchestrator._launch_experiment(self, session, task, decision)
+        return decision
 
     def close(self):
         return None

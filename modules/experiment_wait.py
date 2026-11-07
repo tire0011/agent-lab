@@ -69,10 +69,18 @@ def resume_with_new_orchestrator(
     experiment_service: Any,
     github_work_tracking: Any | None,
     experiment_id: str,
+    *,
+    experiment_tool: Any | None = None,
     **factory_kwargs: Any,
 ) -> list[Any]:
-    """Resume with an orchestrator that lives only for this continuation."""
+    """Resume with an orchestrator that lives only for this continuation.
+
+    With *experiment_tool* the resumed Nexus can start its next experiment
+    itself, for example a retry after a failed one (#263 step 4).
+    """
     orchestrator = orchestrator_factory(experiment_service=experiment_service, **factory_kwargs)
+    if experiment_tool is not None:
+        orchestrator.experiment_tool = experiment_tool
     try:
         decisions = resume_after_experiment(
             orchestrator, experiment_service, github_work_tracking, experiment_id

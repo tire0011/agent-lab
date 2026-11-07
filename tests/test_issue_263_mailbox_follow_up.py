@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from modules.mailbox.task_service import (
@@ -16,7 +17,12 @@ from modules.mailbox.task_service import (
     _STATUS_SUCCEEDED,
 )
 from modules.nexus_task_store import NexusTaskStore
-from modules.task_orchestrator import ACTION_ANSWER, ACTION_NEW_EXPERIMENT, TaskDecision
+from modules.task_orchestrator import (
+    ACTION_ANSWER,
+    ACTION_NEW_EXPERIMENT,
+    NexusTaskOrchestrator,
+    TaskDecision,
+)
 from tests.test_mailbox_task_service import _insert_mailbox_msg, _make_exp, _make_service
 
 _RESUME = "modules.mailbox.task_service.resume_with_new_orchestrator"
@@ -62,13 +68,30 @@ class MailboxFollowUpTests(unittest.TestCase):
     def _decision(self, action, **fields):
         return TaskDecision(action=action, session_id=self.session.id, **fields)
 
+    def _nexus_continues(self, decision, before=None):
+        """Stand-in for the resumed Nexus: it decides, then runs its own tool."""
+
+        def resume(*_args, experiment_tool=None, **_kwargs):
+            if before is not None:
+                before()
+            if decision.action == ACTION_NEW_EXPERIMENT:
+                self.assertIsNotNone(experiment_tool, "the resumed Nexus needs its tool")
+                nexus = SimpleNamespace(experiment_tool=experiment_tool, task_store=self.store)
+                session = self.store.get(self.session.id)
+                NexusTaskOrchestrator._launch_experiment(
+                    nexus, session, "solve github issue #238", decision
+                )
+            return [decision]
+
+        return resume
+
     def test_nexus_retry_starts_a_second_experiment_for_the_same_task(self):
         self._observed_experiments(1)
         self.svc.experiment_service.create_experiment.return_value = _make_exp("exp2")
         decision = self._decision(
             ACTION_NEW_EXPERIMENT, experiment_handover="What Nexus already found (handover):\n\nfix the test"
         )
-        with patch(_RESUME, return_value=[decision]):
+        with patch(_RESUME, side_effect=self._nexus_continues(decision)):
             self.svc._after_experiment("exp1")
 
         approval = self.svc.get(self.approval_id)
@@ -82,7 +105,8 @@ class MailboxFollowUpTests(unittest.TestCase):
 
     def test_the_limit_of_two_experiments_ends_the_task(self):
         self._observed_experiments(2)
-        with patch(_RESUME, return_value=[self._decision(ACTION_NEW_EXPERIMENT)]):
+        decision = self._decision(ACTION_NEW_EXPERIMENT)
+        with patch(_RESUME, side_effect=self._nexus_continues(decision)):
             self.svc._after_experiment("exp1")
 
         approval = self.svc.get(self.approval_id)
@@ -118,13 +142,13 @@ class MailboxFollowUpTests(unittest.TestCase):
         self._observed_experiments(1)
         self.svc.experiment_service.create_experiment.return_value = _make_exp("exp2")
 
-        def resume_then_poll(*_args, **_kwargs):
+        def poll_in_between():
             self.store.set_status(self.session.id, "action_selected")
             self.svc.poll_running()
             self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_NEXUS_DECIDING)
-            return [self._decision(ACTION_NEW_EXPERIMENT)]
 
-        with patch(_RESUME, side_effect=resume_then_poll):
+        resume = self._nexus_continues(self._decision(ACTION_NEW_EXPERIMENT), poll_in_between)
+        with patch(_RESUME, side_effect=resume):
             self.svc._after_experiment("exp1")
 
         approval = self.svc.get(self.approval_id)

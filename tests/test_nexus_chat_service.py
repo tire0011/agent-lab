@@ -2,12 +2,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from modules.experiment_handover import HANDOVER_HEADING
 from modules.github_work_tracking import GitHubWorkTrackingError
 from modules.nexus_chat_service import NexusChatService, is_execution_request
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_NEW_EXPERIMENT,
     ACTION_RESUME_EXPERIMENT,
+    NexusTaskOrchestrator,
     TaskDecision,
 )
 
@@ -24,6 +26,12 @@ class FakeTaskStore:
         self.waiting.append((session_id, experiment_id))
         return True
 
+    def append_event(self, *args, **kwargs):
+        return 1
+
+    def user_inputs(self, session_id):
+        return [e["content"] for e in self._history if e.get("role") == "user"]
+
 
 class FakeOrchestrator:
     def __init__(self, *, decision, history, calls, allow_mutation, **kwargs):
@@ -31,14 +39,24 @@ class FakeOrchestrator:
         self.task_store = FakeTaskStore(history)
         self.calls = calls
         self.calls.append(("constructed", allow_mutation))
+        self.experiment_tool = None
+
+    def _decide(self, text):
+        # The real step by which Nexus executes its own new_experiment (#263).
+        if self.decision.action == ACTION_NEW_EXPERIMENT:
+            session = SimpleNamespace(
+                id=self.decision.session_id, source_type="chat", source_id=None, title="Nexus chat"
+            )
+            NexusTaskOrchestrator._launch_experiment(self, session, text, self.decision)
+        return self.decision
 
     def run(self, text, **kwargs):
         self.calls.append(("run", text, kwargs))
-        return self.decision
+        return self._decide(text)
 
     def continue_session(self, session_id, text):
         self.calls.append(("continue", session_id, text))
-        return self.decision
+        return self._decide(text)
 
     def close(self):
         self.calls.append(("close",))
@@ -96,7 +114,12 @@ class NexusChatServiceTests(unittest.TestCase):
         self.assertIn(("continue", "chat-1", "Und warum?"), calls)
 
     def test_explicit_execution_starts_new_experiment_with_conversation_goal(self):
-        decision = TaskDecision(action=ACTION_NEW_EXPERIMENT, message="Ich setze es um.", session_id="chat-1")
+        decision = TaskDecision(
+            action=ACTION_NEW_EXPERIMENT,
+            message="Ich setze es um.",
+            session_id="chat-1",
+            experiment_handover=f"{HANDOVER_HEADING}\n\nKnowledge briefing:\nUI lives in static/",
+        )
         history = [
             {"role": "user", "content": "Wir wollen im Chat die bestehende Statusanzeige erweitern."},
             {"role": "assistant", "content": "Dann würde ich die bestehende UI wiederverwenden."},
@@ -110,7 +133,11 @@ class NexusChatServiceTests(unittest.TestCase):
         goal = experiments.create_experiment.call_args.args[0]
         self.assertIn("bestehende Statusanzeige", goal)
         self.assertNotEqual(goal.strip(), "Mach das.")
+        self.assertIn("Knowledge briefing:\nUI lives in static/", goal)
         self.assertEqual(result.experiment_id, "exp-123")
+        self.assertEqual(result.status, "submitted")
+        # The chat source is the session itself.
+        self.assertEqual(experiments.create_experiment.call_args.kwargs["source_id"], "chat-1")
         self.assertIn(("constructed", True), calls)
         self.assertIn(("background", "exp-123"), calls)
         github.ensure_for_source.assert_called_once()
@@ -130,10 +157,21 @@ class NexusChatServiceTests(unittest.TestCase):
             decision, github_work_tracking=github
         )
 
-        with self.assertRaises(GitHubWorkTrackingError):
-            service.handle("Mach das.", session_id="chat-1")
+        result = service.handle("Mach das.", session_id="chat-1")
 
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("GITHUB_TOKEN", result.reply)
         experiments.create_experiment.assert_not_called()
+
+    def test_discussion_turn_gives_nexus_no_experiment_tool(self):
+        decision = TaskDecision(action=ACTION_NEW_EXPERIMENT, session_id="chat-1")
+        service, experiments, github, _ = self._service(decision)
+
+        result = service.handle("Welche Variante würdest du nehmen?", session_id="chat-1")
+
+        self.assertEqual(result.status, "discussion")
+        experiments.create_experiment.assert_not_called()
+        github.ensure_for_source.assert_not_called()
 
     def test_explicit_execution_resumes_selected_experiment(self):
         decision = TaskDecision(

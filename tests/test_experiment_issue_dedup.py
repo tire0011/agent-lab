@@ -12,9 +12,8 @@ from modules.experiment_service import (
     ExperimentService,
     STATUS_FAILED,
 )
-from modules.nexus_controller_service import NexusControllerService
+from modules.nexus_experiment_tool import NexusExperimentTool
 from modules.task_orchestrator import ACTION_NEW_EXPERIMENT, TaskDecision
-from modules.nexus_sources import task_source
 
 
 class ExperimentIssueDedupTests(unittest.TestCase):
@@ -113,40 +112,32 @@ class ExperimentIssueDedupTests(unittest.TestCase):
         self.assertEqual(self._count(), 4)
 
 
-class ControllerAlreadyActiveTests(unittest.TestCase):
-    def test_controller_returns_already_active_without_binding_or_starting(self) -> None:
-        orchestrator = MagicMock()
-        orchestrator.experiment_service.db_path = ":memory:"
-        orchestrator.operations_registry = SimpleNamespace(repo_root=Path("/tmp"))
-        orchestrator.experiment_service.create_experiment.side_effect = (
+class NexusToolAlreadyActiveTests(unittest.TestCase):
+    def test_nexus_reports_already_active_without_binding_or_starting(self) -> None:
+        experiment_service = MagicMock()
+        experiment_service.create_experiment.side_effect = (
             ExperimentAlreadyActiveError("existing-id", "implementing")
         )
         github = MagicMock()
         github.ensure_for_source.return_value = SimpleNamespace(
             issue_number=7, branch_name="nexus/7-test"
         )
-        controller = NexusControllerService(
-            orchestrator, github_work_tracking=github
-        )
-        decision = TaskDecision(
-            action=ACTION_NEW_EXPERIMENT, session_id="session-1"
+        background = MagicMock()
+        store = MagicMock()
+        store.user_inputs.return_value = ["GitHub Issue #7: duplicate"]
+        tool = NexusExperimentTool(experiment_service, github, background=background)
+        session = SimpleNamespace(id="session-1", source_type="task", source_id="t-7", title="t")
+
+        launch = tool.start(
+            store, session, TaskDecision(action=ACTION_NEW_EXPERIMENT, session_id="session-1"), ""
         )
 
-        orchestrator.run.return_value = decision
-
-        with patch.object(controller, "_start_experiment_thread") as start:
-            result = controller.handle_source(task_source("GitHub Issue #7: duplicate"))
-
-        self.assertEqual(
-            result,
-            {
-                "status": "already_active",
-                "experiment_id": "existing-id",
-                "experiment_status": "implementing",
-            },
-        )
+        self.assertEqual(launch.status, "already_active")
+        self.assertEqual(launch.experiment_id, "existing-id")
+        self.assertEqual(launch.experiment_status, "implementing")
         github.bind_experiment.assert_not_called()
-        start.assert_not_called()
+        store.wait_for_experiment.assert_not_called()
+        background.assert_not_called()
 
 
 if __name__ == "__main__":
