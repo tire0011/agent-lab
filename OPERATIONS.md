@@ -489,13 +489,15 @@ link and controller-session tables:
 
 ```
 lifecycle         queued | running | waiting | needs_review | succeeded
-                  | failed | rejected | merged | abandoned
+                  | failed | rejected | merged | abandoned | cancelled
 status            the owning subsystem's own status value
 branch, commit, issue_number, pr_number
 worker_id, service
 last_error
 correlation_ids   mailbox_task_id / experiment_id / session_id
 progress          running | interrupted | completed | not_started | unknown
+outcome           running | waiting | succeeded | failed | cancelled
+                  | needs_review | stale | interrupted | unknown
 ```
 
 `progress` is the part worth reading twice. A worker that died mid-run never
@@ -508,6 +510,40 @@ staleness threshold is the clamped one from `NEXUS_STALE_HEARTBEAT_SECONDS`;
 no query can lower it far enough to call live work dead.
 
 `last-failure` counts a stalled subject as a failure for the same reason.
+
+`outcome` (#163) answers the sharper question *what happened*, from the
+durable terminal record and the heartbeat - `updated_at` alone is never
+treated as proof of life:
+
+| `outcome.outcome` | Meaning |
+| --- | --- |
+| `running` | working, heartbeat (or, inconclusively, a log entry) within the stale timeout |
+| `waiting` | resting by design, or queued and not yet picked up |
+| `succeeded` | reached a successful terminal state |
+| `failed` | explicit failure; `probable_cause` quotes the recorded error |
+| `cancelled` | stopped on purpose (cancelled, rejected, `turn_cancelled`) |
+| `needs_review` | handed to a human |
+| `stale` | the worker stopped heartbeating without recording an outcome |
+| `interrupted` | a service restart is on record as having ended it |
+| `unknown` | evidence missing or contradictory - never read this as success |
+
+Alongside it: `conclusive` (false when the verdict rests on weaker evidence
+than it needs), `evidence_gaps`, `last_healthy_heartbeat_at` (preserved from
+the `heartbeat_timeout` event once a stale claim was reconciled),
+`last_event` (newest meaningful step; liveness ticks are skipped) and a
+`retry` hint (`not_needed`, `possible`, `not_recommended`,
+`insufficient_evidence`). A restart is only reported when one was recorded;
+silence alone is `stale`, because a crash leaves the same silence.
+
+A task or experiment normally has no claim of its own, so while it is still
+working the controller session driving it speaks for it - linked by the
+session's source, the task's experiment, or `waiting_experiment_id`. A session
+reconciled with `heartbeat_timeout` makes the work conclusively `stale`, and
+`progress` then reads `interrupted`, whatever `updated_at` says; a session
+abandoned by the older inactivity sweep gives an inconclusive `stale`. If the
+work kept logging after that session stopped, the two records disagree and the
+outcome is `unknown`. A subject that already reached a terminal state keeps its
+own outcome: a session ending later says nothing about finished work.
 
 Output is bounded by default (50 log entries; `lines=` up to 500).
 

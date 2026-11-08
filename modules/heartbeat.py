@@ -94,8 +94,13 @@ def parse_timestamp(value: object) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        # Structured logs write a ``Z`` suffix, which ``fromisoformat`` only
+        # accepts from Python 3.11 on; the VM runs 3.10.
+        if text[-1:] in ("Z", "z"):
+            text = text[:-1] + "+00:00"
         try:
-            parsed = datetime.fromisoformat(value.strip())
+            parsed = datetime.fromisoformat(text)
         except ValueError:
             return None
     else:
