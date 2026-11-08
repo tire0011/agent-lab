@@ -1,0 +1,68 @@
+{
+  "description": "Issue #74 comment/docstring cleanup",
+  "command": "python scripts/measure_python_context.py [--revision HEAD] modules/experiment_evaluation.py modules/experiment_service/policy.py",
+  "approximation": "approx_comment_docstring_tokens = round(comment_docstring_chars / 4) per file",
+  "baseline_revision": "HEAD before the Issue #74 cleanup",
+  "files": {
+    "modules/experiment_evaluation.py": {
+      "baseline": {
+        "total_lines": 683,
+        "code_lines": 377,
+        "comment_lines": 93,
+        "docstring_lines": 110,
+        "comment_docstring_chars": 11986,
+        "approx_comment_docstring_tokens": 2996
+      },
+      "after": {
+        "total_lines": 495,
+        "code_lines": 377,
+        "comment_lines": 15,
+        "docstring_lines": 14,
+        "comment_docstring_chars": 2041,
+        "approx_comment_docstring_tokens": 510
+      }
+    },
+    "modules/experiment_service/policy.py": {
+      "baseline": {
+        "total_lines": 467,
+        "code_lines": 313,
+        "comment_lines": 65,
+        "docstring_lines": 38,
+        "comment_docstring_chars": 6859,
+        "approx_comment_docstring_tokens": 1715
+      },
+      "after": {
+        "total_lines": 386,
+        "code_lines": 313,
+        "comment_lines": 12,
+        "docstring_lines": 9,
+        "comment_docstring_chars": 1533,
+        "approx_comment_docstring_tokens": 383
+      }
+    }
+  },
+  "baseline": {
+    "total_lines": 1150,
+    "code_lines": 690,
+    "comment_lines": 158,
+    "docstring_lines": 148,
+    "comment_chars": 10883,
+    "docstring_chars": 7962,
+    "comment_docstring_chars": 18845,
+    "approx_comment_docstring_tokens": 4711
+  },
+  "after": {
+    "total_lines": 881,
+    "code_lines": 690,
+    "comment_lines": 27,
+    "docstring_lines": 23,
+    "comment_chars": 1920,
+    "docstring_chars": 1654,
+    "comment_docstring_chars": 3574,
+    "approx_comment_docstring_tokens": 893
+  },
+  "reduction": {
+    "comment_docstring_chars_percent": 81.03,
+    "approx_comment_docstring_tokens_percent": 81.04
+  }
+}

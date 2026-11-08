@@ -10,3 +10,5 @@
 - Use `pathlib.Path` for filesystem paths and UTF-8 for text files.
 - Keep database access parameterized and commit transactional state changes
   deliberately.
+- Comments explain why, not what. Keep public docstrings concise and preserve
+  non-obvious constraints, invariants, and architectural rationale.
