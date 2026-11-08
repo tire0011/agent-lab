@@ -28,13 +28,10 @@ class FakeGitHub:
         self.commit_parents = {}
         self.pulls = []
         self.workflow_runs = []
-<<<<<<< HEAD
         self.comments = []
         self.fail_comments = False
-=======
         self.jobs = []
         self.job_log = ""
->>>>>>> f37de2ccae2815173b5d42bd0942ad2bd396fa5d
         self.calls = []
 
     def __call__(self, method, path, payload):

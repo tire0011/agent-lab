@@ -30,6 +30,16 @@ logger = logging.getLogger("modules.experiment_adoption_service")
 class FailureMixin:
     """Failure handling and stale-failure assessment of :class:`ExperimentAdoptionService`."""
 
+    def _report_issue_progress(self, experiment_id: str, state: str, detail: str | None = None) -> None:
+        """Best-effort Issue progress reporting for adoption outcomes."""
+        post = getattr(self.github_work_tracking, "post_progress", None)
+        if post is None:
+            return
+        try:
+            post(experiment_id, state, detail=detail)
+        except Exception:  # noqa: BLE001 - lifecycle reporting is informational
+            return
+
     def assess_failure(self, experiment_id: str) -> StaleFailureAssessment:
         """Decide whether a persisted adoption failure still stands.
 
@@ -226,6 +236,9 @@ class FailureMixin:
             diagnostic_worktree_path=diagnostic_worktree_path,
             updated_at=_utcnow_iso(),
         )
+        self._report_issue_progress(
+            experiment_id, "failed", f"Reason: {sanitized_reason(reason)}"
+        )
         return self.get(experiment_id)
 
 
@@ -270,5 +283,8 @@ class FailureMixin:
             reason=sanitized_reason(reason),
             diagnostic_worktree_path=diagnostic_worktree_path,
             updated_at=_utcnow_iso(),
+        )
+        self._report_issue_progress(
+            experiment_id, "needs_review", f"Reason: {sanitized_reason(reason)}"
         )
         return self.get(experiment_id)
