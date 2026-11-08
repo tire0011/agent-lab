@@ -98,6 +98,12 @@ class InstallToolScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertFalse(self._installed())
 
+    def test_an_already_installed_denied_package_is_refused(self):
+        # apt plans nothing for an installed package; the name alone decides.
+        result = self._run("openssh-server", plan="")
+        self.assertEqual(result.returncode, 3)
+        self.assertFalse(self.log.exists())
+
     def test_a_denied_dependency_is_refused(self):
         result = self._run("harmless", plan="harmless docker.io")
         self.assertEqual(result.returncode, 3)
