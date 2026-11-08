@@ -694,6 +694,9 @@ class ControllerLoopMixin:
                     session_id=session.id,
                 )
             self._persist_final(session.id, task, result)
+            if action == ACTION_NEW_EXPERIMENT:
+                # Nexus carries out its own new_experiment (#263 step 4).
+                self._launch_experiment(session, task, result, task_logger=task_logger)
             return result
 
         self._log_result_reuse(session.id, observations, redundant_requests)

@@ -22,6 +22,8 @@ from modules.nexus_experiment_tool import (
     LAUNCH_EVENT_KIND,
     LAUNCH_LIMIT_REACHED,
     LAUNCH_NOT_LINKED,
+    LAUNCH_NOT_PARKED,
+    LAUNCH_NOT_STARTED,
     LAUNCH_SUBMITTED,
     NexusExperimentTool,
 )
@@ -210,13 +212,58 @@ class ExperimentToolTests(unittest.TestCase):
         self.experiments.create_experiment.assert_not_called()
         self.assertNotEqual(self.store.get(self.session.id).status, "waiting_for_experiment")
 
-    def test_a_caller_that_does_not_link_the_experiment_keeps_it_from_running(self):
+    def test_a_caller_that_does_not_link_the_experiment_ends_it_instead_of_orphaning_it(self):
         launch = self._tool(on_created=lambda *_: False).start(
             self.store, self.session, self._decision(), "Fix it"
         )
         self.assertEqual(launch.status, LAUNCH_NOT_LINKED)
         self.background.assert_not_called()
         self.assertIsNone(self.store.get(self.session.id).waiting_experiment_id)
+        # The created experiment does not stay active and block the issue.
+        self.experiments.fail_unfinished_experiment.assert_called_once()
+        experiment_id, reason = self.experiments.fail_unfinished_experiment.call_args.args
+        self.assertEqual(experiment_id, "exp-1")
+        self.assertIn("no longer waiting", reason)
+
+    def test_a_bind_failure_ends_the_created_experiment(self):
+        self.github.bind_experiment.side_effect = GitHubWorkTrackingError("bind lost")
+        launch = self._tool().start(self.store, self.session, self._decision(), "Fix it")
+        self.assertEqual(launch.status, LAUNCH_BLOCKED)
+        self.assertIn("bind lost", launch.reason)
+        self.background.assert_not_called()
+        self.assertNotEqual(self.store.get(self.session.id).status, "waiting_for_experiment")
+        self.experiments.fail_unfinished_experiment.assert_called_once()
+        self.assertEqual(self.experiments.fail_unfinished_experiment.call_args.args[0], "exp-1")
+
+    def test_a_caller_link_error_ends_the_created_experiment(self):
+        def boom(*_):
+            raise RuntimeError("db locked")
+
+        launch = self._tool(on_created=boom).start(
+            self.store, self.session, self._decision(), "Fix it"
+        )
+        self.assertEqual(launch.status, LAUNCH_BLOCKED)
+        self.assertIn("db locked", launch.reason)
+        self.background.assert_not_called()
+        self.experiments.fail_unfinished_experiment.assert_called_once()
+
+    def test_no_launch_when_the_session_cannot_pause(self):
+        store = MagicMock(wraps=self.store)
+        store.wait_for_experiment.return_value = False
+        launch = self._tool().start(store, self.session, self._decision(), "Fix it")
+        self.assertEqual(launch.status, LAUNCH_NOT_PARKED)
+        self.background.assert_not_called()
+        self.experiments.run_experiment.assert_not_called()
+        self.experiments.fail_unfinished_experiment.assert_called_once()
+        self.assertIn("could not pause", launch.reason)
+
+    def test_a_background_start_failure_ends_the_experiment(self):
+        self.background.side_effect = RuntimeError("can't start new thread")
+        launch = self._tool().start(self.store, self.session, self._decision(), "Fix it")
+        self.assertEqual(launch.status, LAUNCH_NOT_STARTED)
+        self.experiments.fail_unfinished_experiment.assert_called_once()
+        # Still parked on the now-ended experiment: the recovery resumes it.
+        self.assertEqual(self.store.get(self.session.id).waiting_experiment_id, "exp-1")
 
     def test_the_per_task_limit_counts_ended_experiments(self):
         for n in range(2):
@@ -231,16 +278,96 @@ class ExperimentToolTests(unittest.TestCase):
         self.assertIn("limit of 2 experiments per task", launch.reason)
         self.experiments.create_experiment.assert_not_called()
 
-    def test_the_run_is_followed_by_the_continuation_even_when_it_raises(self):
-        finished = []
+    def test_a_runner_crash_fails_the_experiment_before_the_continuation(self):
+        calls = []
         self.experiments.run_experiment.side_effect = RuntimeError("pipeline crashed")
-        self._tool(on_finished=finished.append).start(
+        self.experiments.fail_unfinished_experiment.side_effect = (
+            lambda experiment_id, reason: calls.append(("fail", experiment_id, reason)) or True
+        )
+        self._tool(on_finished=lambda eid: calls.append(("resume", eid))).start(
             self.store, self.session, self._decision(), "Fix it"
         )
         target = self.background.call_args.args[1]
-        with self.assertRaises(RuntimeError):
-            target()
-        self.assertEqual(finished, ["exp-1"])
+        target()  # the crash is recorded on the experiment, not re-raised
+        self.assertEqual([c[0] for c in calls], ["fail", "resume"])
+        self.assertEqual(calls[0][1], "exp-1")
+        self.assertIn("RuntimeError: pipeline crashed", calls[0][2])
+
+
+class RunnerCrashResumesTheParkedSessionTests(unittest.TestCase):
+    """A real parked session leaves the waiting state after a runner crash."""
+
+    def test_crashed_runner_resumes_the_session_with_a_failure_observation(self):
+        from modules.experiment_service import ExperimentService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "state.db")
+            service = ExperimentService(
+                db_path=db, repo_root=tmp, worktrees_root=str(Path(tmp) / "wt"),
+                experiment_log_dir=str(Path(tmp) / "logs"),
+            )
+            client = _Client([
+                '{"action":"new_experiment","arguments":{"goal":"fix it"},"reason":"implement"}',
+                '{"action":"clarification","message":"The runner crashed.","reason":"report"}',
+            ])
+            orchestrator = NexusTaskOrchestrator(
+                operations_registry=_Registry(db, tmp),
+                experiment_service=service,
+                llama_client=client,
+                delegation_service=_Delegation(),
+            )
+            pending: list = []
+            resumed: list = []
+            github = _github()
+            service.run_experiment = MagicMock(side_effect=RuntimeError("worker died"))
+            orchestrator.experiment_tool = NexusExperimentTool(
+                service,
+                github,
+                background=lambda _name, target: pending.append(target),
+                on_finished=lambda experiment_id: resumed.extend(
+                    resume_after_experiment(orchestrator, service, github, experiment_id)
+                ),
+            )
+            try:
+                first = orchestrator.run("fix the bug", source_type="issue", source_id="crash")
+                self.assertEqual(
+                    orchestrator.task_store.get(first.session_id).status, "waiting_for_experiment"
+                )
+                pending.pop()()
+                experiment = service.get_experiment(first.experiment_id)
+                after = orchestrator.task_store.get(first.session_id)
+            finally:
+                orchestrator.close()
+                service.close()
+
+        self.assertEqual(experiment.status, "failed")
+        self.assertIn("worker died", experiment.error)
+        self.assertNotEqual(after.status, "waiting_for_experiment")
+        self.assertEqual([d.session_id for d in resumed], [first.session_id])
+        observations = client.prompts[1].partition("OBSERVATIONS FROM TOOLS")[2]
+        self.assertIn('"status":"failed"', observations)
+        self.assertIn("worker died", observations)
+
+
+class FailUnfinishedExperimentTests(unittest.TestCase):
+    def test_a_queued_experiment_is_failed_and_no_longer_blocks_the_issue(self):
+        from modules.experiment_service import ExperimentService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ExperimentService(
+                db_path=str(Path(tmp) / "s.db"), repo_root=tmp,
+                worktrees_root=str(Path(tmp) / "wt"), experiment_log_dir=str(Path(tmp) / "logs"),
+            )
+            self.addCleanup(service.close)
+            experiment = service.create_experiment("GitHub Issue #238: first attempt")
+            self.assertTrue(service.fail_unfinished_experiment(experiment.id, "not linked"))
+            failed = service.get_experiment(experiment.id)
+            # Terminal ones stay as they are.
+            self.assertFalse(service.fail_unfinished_experiment(experiment.id, "again"))
+            again = service.create_experiment("GitHub Issue #238: second attempt")
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.error, "not linked")
+        self.assertNotEqual(again.id, experiment.id)
 
 
 class CallSitesDoNotRunExperimentsTests(unittest.TestCase):

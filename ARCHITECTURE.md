@@ -237,6 +237,15 @@ signature stay the same.
   The mailbox, `NexusControllerService` and the chat only configure the tool (thread
   starter, linking the experiment to their record, continuation) and report its
   `ExperimentLaunch`; none of them creates experiments.
+- Failure-safe launch: once created, an experiment Nexus cannot bind, link, park on or
+  start is moved to `failed` with a reason (`fail_unfinished_experiment`), so it never
+  stays active and blocks the issue. A crashing runner fails the experiment before the
+  session resumes.
+- Durable resume: the waiting session is a task-store row. `experiment_wait.
+  resume_finished_experiments` finds sessions whose experiment ended unnoticed (restart,
+  failed callback); each owner resumes only its own source types - the mailbox worker
+  `task`, and the API's `ExperimentResumeWorker` (startup + every 30 s) `chat` and the
+  controller's issue/idea/discussion sessions.
 - Every repository code change, small ones included, goes through `new_experiment`;
   `command` refuses Git commits, branch creation, patches and merges in the live checkout
   and stays available for machine work and reading.

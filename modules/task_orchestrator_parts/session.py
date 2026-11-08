@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import json
 import os
 from typing import Any
 from modules.llama_cpp_client import LlamaCppClient
@@ -56,9 +57,13 @@ class SessionMixin:
         max_total_steps: int | None = None,
         max_identical_calls: int | None = None,
         max_non_progressing_cycles: int | None = None,
+        experiment_tool: Any | None = None,
     ) -> None:
         self.operations_registry = operations_registry
         self.experiment_service = experiment_service
+        # Nexus' own new_experiment tool (#263 step 4); callers configure it,
+        # Nexus executes it. ``modules.nexus_experiment_tool.NexusExperimentTool``.
+        self.experiment_tool = experiment_tool
         self.llama = llama_client or LlamaCppClient(timeout=local_llm_watchdog_seconds())
         self.max_steps = max(1, min(max_steps, 10))
         db_path = getattr(operations_registry, "db_path", DEFAULT_DB_PATH)
@@ -371,6 +376,53 @@ class SessionMixin:
                 heartbeat.stop()
                 self._claims.pop(session.id, None)
         return resumed
+
+    def _launch_experiment(
+        self,
+        session: Any,
+        task: str,
+        result: TaskDecision,
+        *,
+        task_logger: Any | None = None,
+    ) -> None:
+        """Execute ``new_experiment`` as Nexus' own tool (#263 step 4).
+
+        Runs after the turn is persisted and its claim released: the tool
+        parks the session on the experiment, so it holds neither the claim
+        nor the local model while the experiment runs. Without a configured
+        tool the decision is returned unexecuted (dry runs, benchmarks).
+        """
+        tool = self.experiment_tool
+        if tool is None:
+            return
+        launch = tool.start(self.task_store, session, result, task)
+        result.experiment_launch = launch
+        if launch.experiment_id:
+            result.experiment_id = launch.experiment_id
+        if not launch.started:
+            # The session did not park; record why, so the next turn sees it.
+            self.task_store.append_event(
+                session.id,
+                role="tool",
+                kind="experiment_launch",
+                content=json.dumps(launch.as_dict(), separators=(",", ":")),
+                metadata={"experiment_id": launch.experiment_id},
+            )
+        logger.info(
+            "new_experiment executed by Nexus session_id=%s status=%s experiment_id=%s",
+            session.id,
+            launch.status,
+            launch.experiment_id,
+        )
+        if task_logger is not None:
+            task_logger.info(
+                "orchestration",
+                "experiment_launch",
+                f"Nexus new_experiment: {launch.status}",
+                session_id=session.id,
+                launch_status=launch.status,
+                experiment_id=launch.experiment_id,
+            )
 
     def _restore_missing_capability_block(
         self,

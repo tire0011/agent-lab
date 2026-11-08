@@ -30,8 +30,9 @@ from typing import Any, Callable
 
 from modules.experiment_handover import with_handover
 from modules.experiment_service import ExperimentAlreadyActiveError
-from modules.experiment_wait import run_then_resume
+from modules.experiment_wait import fail_experiment, run_then_resume
 from modules.github_work_tracking import GitHubWorkTrackingError
+from modules.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ LAUNCH_ALREADY_ACTIVE = "already_active"
 LAUNCH_BLOCKED = "blocked"
 LAUNCH_LIMIT_REACHED = "limit_reached"
 LAUNCH_NOT_LINKED = "not_linked"
+LAUNCH_NOT_PARKED = "not_parked"
+LAUNCH_NOT_STARTED = "not_started"
 
 # Kind of the session event that records a launch. Deliberately not
 # ``new_experiment``: those events are the results Nexus resumes with, and
@@ -267,25 +270,61 @@ class NexusExperimentTool:
                 ),
             )
 
-        work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
+        experiment_id = experiment.id
         launch = ExperimentLaunch(
             status=LAUNCH_SUBMITTED,
-            experiment_id=experiment.id,
+            experiment_id=experiment_id,
             issue_number=work_ref.issue_number,
             branch_name=work_ref.branch_name,
         )
-        if self.on_created is not None and self.on_created(experiment, decision) is False:
+
+        # From here on the experiment exists and is active. Every way out that
+        # does not run it ends it with a reason, so it can never block later
+        # experiments for the issue as an orphan.
+        try:
+            work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment_id)
+        except Exception as exc:  # noqa: BLE001 - ended below, reported to Nexus
+            return self._abandon(
+                launch,
+                LAUNCH_BLOCKED,
+                f"GitHub work tracking could not bind the experiment: {exc}",
+            )
+        launch.issue_number = work_ref.issue_number
+        launch.branch_name = work_ref.branch_name
+
+        try:
+            linked = self.on_created is None or self.on_created(experiment, decision) is not False
+        except Exception as exc:  # noqa: BLE001 - ended below, reported to Nexus
+            return self._abandon(
+                launch,
+                LAUNCH_BLOCKED,
+                f"the caller could not link the experiment: {exc}",
+            )
+        if not linked:
             logger.warning(
                 "nexus_experiment_tool: caller did not link experiment %s; not started",
-                experiment.id,
+                experiment_id,
             )
-            launch.status = LAUNCH_NOT_LINKED
-            launch.reason = "the task was no longer waiting for an experiment"
-            return launch
-        self._event("experiment_created", "experiment created by Nexus", experiment_id=experiment.id)
+            return self._abandon(
+                launch, LAUNCH_NOT_LINKED, "the task was no longer waiting for an experiment"
+            )
+        self._event("experiment_created", "experiment created by Nexus", experiment_id=experiment_id)
 
         # Nexus pauses on the experiment and continues the moment it ends (#263).
-        task_store.wait_for_experiment(session.id, experiment.id)
+        # Without a parked session nobody would resume with the result, so the
+        # experiment does not run.
+        try:
+            parked = bool(task_store.wait_for_experiment(session.id, experiment_id))
+        except Exception as exc:  # noqa: BLE001 - ended below, reported to Nexus
+            return self._abandon(
+                launch, LAUNCH_NOT_PARKED, f"the Nexus session could not pause: {exc}"
+            )
+        if not parked:
+            return self._abandon(
+                launch,
+                LAUNCH_NOT_PARKED,
+                "the Nexus session could not pause on the experiment (session not found)",
+            )
         try:
             task_store.append_event(
                 session.id,
@@ -294,22 +333,52 @@ class NexusExperimentTool:
                 content=json.dumps(
                     {**launch.as_dict(), "goal": goal[:4000]}, separators=(",", ":")
                 ),
-                metadata={"experiment_id": experiment.id},
+                metadata={"experiment_id": experiment_id},
             )
         except Exception:  # noqa: BLE001 - the experiment record holds the goal too
             logger.debug("nexus_experiment_tool: could not journal launch", exc_info=True)
 
         on_finished = self.on_finished
-        experiment_id = experiment.id
-        self.background(
-            experiment_id,
-            lambda: run_then_resume(
-                lambda: self.experiment_service.run_experiment(
-                    experiment_id,
-                    github_work_tracking=self.github_work_tracking,
-                ),
-                (lambda: on_finished(experiment_id)) if on_finished else (lambda: None),
+        try:
+            self.background(
                 experiment_id,
-            ),
+                lambda: run_then_resume(
+                    lambda: self.experiment_service.run_experiment(
+                        experiment_id,
+                        github_work_tracking=self.github_work_tracking,
+                    ),
+                    (lambda: on_finished(experiment_id)) if on_finished else (lambda: None),
+                    experiment_id,
+                    fail=lambda reason: fail_experiment(
+                        self.experiment_service, experiment_id, reason
+                    ),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - ended below, reported to Nexus
+            # The session stays parked on the now-ended experiment; the durable
+            # recovery resumes it with this failure as its observation.
+            return self._abandon(
+                launch, LAUNCH_NOT_STARTED, f"the experiment could not be started: {exc}"
+            )
+        return launch
+
+    def _abandon(self, launch: ExperimentLaunch, status: str, reason: str) -> ExperimentLaunch:
+        """End an experiment Nexus created but will not run, and say why."""
+        reason = redact_secrets(reason)[:500]
+        if launch.experiment_id:
+            ended = fail_experiment(self.experiment_service, launch.experiment_id, reason)
+            if not ended:
+                logger.error(
+                    "nexus_experiment_tool: could not end unstarted experiment %s",
+                    launch.experiment_id,
+                )
+            launch.experiment_status = "failed" if ended else None
+        launch.status = status
+        launch.reason = reason
+        self._event(
+            "experiment_not_started",
+            f"experiment not started: {reason}",
+            experiment_id=launch.experiment_id,
+            launch_status=status,
         )
         return launch

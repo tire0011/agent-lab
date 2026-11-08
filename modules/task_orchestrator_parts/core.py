@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import (
     dataclass,
@@ -66,6 +67,47 @@ _GITHUB_WRITE_COMMAND = re.compile(
     r"|\s(?:-f|-F|--field|--raw-field|--input)\b)",
     re.IGNORECASE,
 )
+
+
+# Code changes belong in an isolated experiment (#263 decision 1). The guard is
+# deliberately narrow: it refuses only Git commands that *author* code history
+# in the live checkout (commit, branch creation, patches, merges). File
+# commands, package installs, `git pull`/`fetch`/`status`/`log`/`diff` and Git
+# in any other directory stay available for machine work and reading.
+_GIT_AUTHORING_COMMAND = re.compile(
+    r"(?:^|[;&|(]\s*|\bsudo\s+)git"
+    r"(?P<options>(?:\s+-C\s+\S+|\s+-c\s+\S+|\s+--git-dir(?:=|\s+)\S+|\s+--work-tree(?:=|\s+)\S+)*)"
+    r"\s+(?:commit|am|apply|cherry-pick|merge|rebase|revert"
+    r"|checkout\s+(?:\S+\s+)*-[bB]\b|switch\s+(?:\S+\s+)*(?:-[cC]\b|--create\b))",
+    re.IGNORECASE,
+)
+_CD_TARGET = re.compile(r"(?:^|[;&|(]\s*)cd\s+(\S+)")
+
+
+def _live_checkout_git_write(command: str, repo_root: str) -> bool:
+    """Whether *command* would author code history in the live checkout *repo_root*.
+
+    A command that first changes into another directory, or points Git at one
+    with ``-C``/``--git-dir``/``--work-tree``, works elsewhere and is allowed.
+    """
+    root = os.path.normpath(str(repo_root))
+
+    def _elsewhere(path: str) -> bool:
+        path = path.strip("'\"")
+        return os.path.normpath(path) != root and not os.path.normpath(
+            os.path.join(root, path)
+        ).startswith(root + os.sep) and path not in (".", "")
+
+    for match in _GIT_AUTHORING_COMMAND.finditer(command):
+        options = match.group("options") or ""
+        targets = re.findall(r"(?:-C\s+|--git-dir(?:=|\s+)|--work-tree(?:=|\s+))(\S+)", options)
+        if targets and all(_elsewhere(target) for target in targets):
+            continue
+        cds = _CD_TARGET.findall(command[: match.start()])
+        if cds and _elsewhere(cds[-1]):
+            continue
+        return True
+    return False
 
 
 # External fallback prompts are cut to this length; size the prompt below it
@@ -289,6 +331,10 @@ class TaskDecision:
     # the coding agent does not begin from the bare task text (#263).
     experiment_handover: str | None = None
     complexity: str | None = None
+    # What Nexus' own new_experiment tool did (#263 step 4): an
+    # ``ExperimentLaunch`` with status, experiment id and - if it did not
+    # start - the reason. ``None`` when no experiment tool is configured.
+    experiment_launch: Any | None = None
 
 
 class TaskOrchestratorError(RuntimeError):

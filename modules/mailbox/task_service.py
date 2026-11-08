@@ -23,7 +23,11 @@ from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
-from modules.experiment_wait import resume_with_new_orchestrator
+from modules.experiment_wait import (
+    MAILBOX_SOURCE_TYPES,
+    resume_finished_experiments,
+    resume_with_new_orchestrator,
+)
 from modules.nexus_experiment_tool import (
     LAUNCH_ALREADY_ACTIVE,
     LAUNCH_NOT_LINKED,
@@ -617,20 +621,16 @@ class MailboxTaskService:
         """
         if self.experiment_service is None:
             return
-        waiting = self._with_task_store(lambda store: store.sessions_waiting_for_experiments())
-        for session in waiting:
-            experiment_id = session.waiting_experiment_id
-            if not experiment_id:
-                continue
-            try:
-                experiment = self.experiment_service.get_experiment(experiment_id)
-                if experiment.status not in _EXP_TERMINAL:
-                    continue
-                self._after_experiment(experiment_id)
-            except Exception:
-                logger.exception(
-                    "mailbox_task: resume after experiment %s failed", experiment_id
-                )
+        # Only the mailbox's own sessions: chat and controller sessions resume
+        # through their own services (``experiment_wait``).
+        self._with_task_store(
+            lambda store: resume_finished_experiments(
+                store,
+                self.experiment_service,
+                self._after_experiment,
+                source_types=MAILBOX_SOURCE_TYPES,
+            )
+        )
 
     def _after_experiment(self, experiment_id: str) -> None:
         """Continue the Nexus session, then carry out what it decided (#263 step 4).

@@ -7,10 +7,16 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
-from modules.experiment_wait import resume_with_new_orchestrator
+from modules.experiment_wait import (
+    CHAT_SOURCE_TYPES,
+    resume_finished_experiments,
+    resume_with_new_orchestrator,
+)
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.nexus_experiment_tool import LAUNCH_ALREADY_ACTIVE, NexusExperimentTool
+from modules.nexus_task_store import NexusTaskStore
+from modules.run_store import DEFAULT_DB_PATH
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
@@ -99,7 +105,15 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
         compact.reverse()
         return compact
 
-    def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
+    def _prompt(
+        self,
+        session: Any,
+        current_input: str,
+        history: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        *,
+        capabilities_json: str | None = None,  # noqa: ARG002 - the chat renders its own compact list
+    ) -> str:
         import json
         final_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
         policy = "Discussion only: use read-only tools when needed; do not mutate."
@@ -273,16 +287,41 @@ class NexusChatService:
             self.experiment_service,
             self.github_work_tracking,
             background=self.background_starter,
-            on_finished=lambda experiment_id: resume_with_new_orchestrator(
-                self.orchestrator_factory,
-                self.experiment_service,
-                self.github_work_tracking,
-                experiment_id,
-                operations_registry=self.operations_registry,
-                allow_mutation=False,
-            ),
+            on_finished=self._resume_after_experiment,
             goal_for=self._implementation_goal,
         )
+
+    def _resume_after_experiment(self, experiment_id: str) -> list[Any]:
+        """Continue the chat session parked on *experiment_id* with its result."""
+        return resume_with_new_orchestrator(
+            self.orchestrator_factory,
+            self.experiment_service,
+            self.github_work_tracking,
+            experiment_id,
+            operations_registry=self.operations_registry,
+            allow_mutation=False,
+        )
+
+    def resume_finished_experiments(self, task_store: NexusTaskStore | None = None) -> list[str]:
+        """Durable half of the pause for chat sessions (#263).
+
+        The experiment thread resumes its chat session when it ends; after a
+        restart, or when that callback failed, this finds the parked session
+        in the task store and resumes it. Returns the experiment ids resumed.
+        """
+        store = task_store or NexusTaskStore(
+            db_path=str(getattr(self.operations_registry, "db_path", DEFAULT_DB_PATH))
+        )
+        try:
+            return resume_finished_experiments(
+                store,
+                self.experiment_service,
+                self._resume_after_experiment,
+                source_types=CHAT_SOURCE_TYPES,
+            )
+        finally:
+            if task_store is None:
+                store.close()
 
     @staticmethod
     def _implementation_goal(task_store: Any, session: Any, current_input: str) -> str:

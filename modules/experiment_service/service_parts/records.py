@@ -624,6 +624,30 @@ class RecordsMixin:
         )
 
 
+    def fail_unfinished_experiment(self, experiment_id: str, reason: str) -> bool:
+        """Move a non-terminal experiment to ``failed`` with *reason* (#263).
+
+        Used when Nexus created an experiment it then could not bind, link,
+        park on or run to the end: without this its active row would block
+        every later experiment for the issue. A terminal experiment is left
+        alone. Returns whether the status changed.
+        """
+        try:
+            current = self.get_experiment(experiment_id)
+        except Exception:  # noqa: BLE001 - nothing to fail
+            return False
+        if current.status in _TERMINAL_STATUSES:
+            return False
+        self._force_status(
+            experiment_id,
+            STATUS_FAILED,
+            ended_at=_utcnow_iso(),
+            error=sanitized_reason(str(reason or "experiment abandoned"))[:1000],
+        )
+        with self._process_lock:
+            self._active_processes.pop(experiment_id, None)
+        return self.get_experiment(experiment_id).status == STATUS_FAILED
+
     def mark_interrupted_experiments_failed(self) -> list[str]:
         """Reconcile experiments orphaned by a service restart (#281).
 

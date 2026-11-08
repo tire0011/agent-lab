@@ -348,6 +348,57 @@ def _start_stall_sweeper(stop: threading.Event) -> threading.Thread:
     return thread
 
 
+def _resume_finished_chat_experiments() -> None:
+    """Resume chat sessions whose experiment ended unnoticed (#263)."""
+    get_nexus_chat_service().resume_finished_experiments()
+
+
+def _resume_finished_controller_experiments() -> None:
+    """Resume issue/idea/discussion sessions whose experiment ended unnoticed (#263).
+
+    One query decides; an orchestrator is built only when such a session exists.
+    """
+    from modules.experiment_wait import (
+        CONTROLLER_EXCLUDED_SOURCE_TYPES,
+        finished_waiting_experiments,
+    )
+
+    experiment_service = _resolve_experiment_service()
+    store = NexusTaskStore()
+    try:
+        pending = finished_waiting_experiments(
+            store,
+            experiment_service,
+            exclude_source_types=CONTROLLER_EXCLUDED_SOURCE_TYPES,
+        )
+    finally:
+        store.close()
+    if not pending:
+        return
+
+    from modules.nexus_controller_service import NexusControllerService
+    from modules.task_orchestrator import NexusTaskOrchestrator
+
+    registry = OperationsRegistry(experiment_service=experiment_service)
+    orchestrator = None
+    try:
+        orchestrator = NexusTaskOrchestrator(
+            operations_registry=registry,
+            experiment_service=experiment_service,
+        )
+        resumed = NexusControllerService(orchestrator=orchestrator).resume_finished_experiments()
+        if resumed:
+            _logger.info(
+                "resumed controller session(s) after experiment(s): %s", ", ".join(resumed[:10])
+            )
+    finally:
+        if orchestrator is not None:
+            orchestrator.close()
+        close = getattr(registry, "close", None)
+        if callable(close):
+            close()
+
+
 def _resume_blocked_capabilities_after_startup() -> None:
     """Resume one eligible capability blocker behind normal initiative gates."""
     store = None
@@ -541,6 +592,14 @@ async def lifespan(app: FastAPI):
 
         worker = MailboxTaskWorker(mts)
         worker.start()
+        # Chat and controller sessions parked on an experiment (#263): resumed
+        # at startup and then periodically; the mailbox worker covers its own.
+        from modules.experiment_wait import ExperimentResumeWorker
+
+        experiment_resume_worker = ExperimentResumeWorker(
+            [_resume_finished_chat_experiments, _resume_finished_controller_experiments]
+        )
+        experiment_resume_worker.start()
         stall_sweep_stop = threading.Event()
         _start_stall_sweeper(stall_sweep_stop)
         try:
@@ -548,6 +607,7 @@ async def lifespan(app: FastAPI):
         finally:
             stall_sweep_stop.set()
             worker.stop()
+            experiment_resume_worker.stop()
 
 
 app = FastAPI(lifespan=lifespan)

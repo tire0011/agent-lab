@@ -6,7 +6,11 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-from modules.experiment_wait import resume_after_experiment
+from modules.experiment_wait import (
+    CONTROLLER_EXCLUDED_SOURCE_TYPES,
+    resume_after_experiment,
+    resume_finished_experiments,
+)
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.mailbox.development import process_command
@@ -143,6 +147,21 @@ class NexusControllerService:
                 self.github_work_tracking,
                 experiment_id,
             )
+        )
+
+    def resume_finished_experiments(self) -> list[str]:
+        """Durable half of the pause for controller sessions (#263).
+
+        Experiment threads resume their session when they end; a restart or a
+        failed callback loses that moment. This finds the parked issue, idea
+        and discussion sessions in the task store and resumes them. Mailbox
+        and chat sessions are left to their own services.
+        """
+        return resume_finished_experiments(
+            self.orchestrator.task_store,
+            self.experiment_service,
+            self._resume_after_experiment,
+            exclude_source_types=CONTROLLER_EXCLUDED_SOURCE_TYPES,
         )
 
     def _continue_after_experiment(self, decisions: list[TaskDecision]) -> list[TaskDecision]:
