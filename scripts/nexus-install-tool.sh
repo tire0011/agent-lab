@@ -30,6 +30,12 @@ denied() {
     return 1
 }
 
+if denied "$pkg"; then
+    echo "refused: $pkg is on the denylist" >&2
+    logger -t nexus-install-tool "refused $pkg (denied)" 2>/dev/null || true
+    exit 3
+fi
+
 plan="$(DEBIAN_FRONTEND=noninteractive apt-get -s -q install --no-install-recommends -- "$pkg" 2>&1)" || {
     echo "$plan" | tail -5 >&2
     exit 1
