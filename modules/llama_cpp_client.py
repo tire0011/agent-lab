@@ -1,21 +1,9 @@
-"""Wrapper for OpenAI-compatible local model REST APIs.
-
-The llama-server (llama.cpp) exposes an OpenAI-compatible
-``/v1/chat/completions`` endpoint.  This client wraps it with minimal
-dependencies so the rest of the codebase can treat it identically to the
-Azure OpenAI client.
-
-Configuration is driven entirely by environment variables so the local model
-can be swapped (different GGUF, different quantisation, different server) without
-changing any orchestration code:
-
-* ``LOCAL_MODEL_URL``  — server base URL (default: ``http://127.0.0.1:8080/v1``)
-* ``LOCAL_MODEL_NAME`` — model name sent in requests, for logging
-                         (default: ``qwen2.5-coder-7b-instruct``)
-
-Deprecated aliases (still accepted for backward compatibility):
-* ``LLAMA_CPP_BASE_URL`` — maps to ``LOCAL_MODEL_URL``
-* ``LLAMA_CPP_MODEL``    — maps to ``LOCAL_MODEL_NAME``
+"""Wrapper for OpenAI-compatible local model REST APIs (llama.cpp / llama-server),
+so the local model is treated identically to the Azure OpenAI client. Configured
+entirely by env vars (``LOCAL_MODEL_URL``, default ``http://127.0.0.1:8080/v1``;
+``LOCAL_MODEL_NAME``, default ``qwen2.5-coder-7b-instruct``; legacy aliases
+``LLAMA_CPP_BASE_URL``/``LLAMA_CPP_MODEL`` still accepted), so the model can be
+swapped without touching orchestration code.
 """
 
 from __future__ import annotations
@@ -32,20 +20,10 @@ _DEFAULT_MODEL_NAME = "qwen2.5-coder-7b-instruct"
 
 
 def json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
-    """The wire shape a JSON schema has to be sent in to actually be applied.
-
-    llama-server reads the schema from ``response_format.json_schema.schema``
-    and Azure OpenAI expects the same OpenAI-standard envelope. Nexus used to
-    send ``{"type": "json_schema", "schema": {...}}`` - the schema one level
-    too high - which neither server finds, so every schema was silently
-    ignored and every declared enum was a suggestion. That is how a tool
-    resolver constrained to four ``status`` values answered with a fifth,
-    fenced in Markdown, and had its otherwise correct selection thrown away
-    (#218).
-
-    Silently is the operative word: an ignored schema looks exactly like a
-    model that happens to comply, right up until it does not.
-    """
+    """The wire shape a JSON schema must be sent in to actually be applied: both
+    llama-server and Azure OpenAI read ``response_format.json_schema.schema``.
+    Sending it one level higher (``{"type": "json_schema", "schema": ...}``) is
+    silently ignored by both, so every enum became a suggestion (#218)."""
     return {
         "type": "json_schema",
         "json_schema": {"name": name, "schema": schema, "strict": True},
@@ -57,11 +35,7 @@ class LlamaCppClientError(Exception):
 
 
 def extract_json(text: str) -> dict[str, Any]:
-    """Extract the first JSON object from *text*.
-
-    llama-cpp models sometimes add prose around the JSON block; this
-    function is tolerant of that.
-    """
+    """Extract the first JSON object from *text* (tolerant of surrounding prose)."""
     start = text.find("{")
     end = text.rfind("}") + 1
     if start == -1 or end == 0:
@@ -78,25 +52,11 @@ def extract_json(text: str) -> dict[str, Any]:
 
 
 class LlamaCppClient:
-    """Minimal async client for a local OpenAI-compatible model server.
-
-    Works with llama-server (llama.cpp) or any server that exposes the
-    ``/v1/chat/completions`` endpoint.
-
-    Parameters
-    ----------
-    base_url:
-        Base URL of the server (default: ``LOCAL_MODEL_URL`` env var,
-        falling back to ``http://127.0.0.1:8080/v1``).
-        The legacy ``LLAMA_CPP_BASE_URL`` env var is also accepted.
-    timeout:
-        HTTP request timeout in seconds. Inference on CPU can be slow, so the
-        default is intentionally high (300 s).
-    model:
-        Model name sent in the request body (default: ``LOCAL_MODEL_NAME`` env
-        var, falling back to ``qwen2.5-coder-7b-instruct``).  The server
-        typically ignores this field but it is useful for logging and tracing.
-        The legacy ``LLAMA_CPP_MODEL`` env var is also accepted.
+    """Minimal async client for a local OpenAI-compatible model server
+    (``/v1/chat/completions``). base_url defaults to ``LOCAL_MODEL_URL`` (legacy
+    ``LLAMA_CPP_BASE_URL`` accepted); timeout defaults high (300 s) because CPU
+    inference is slow; model defaults to ``LOCAL_MODEL_NAME`` (legacy
+    ``LLAMA_CPP_MODEL`` accepted) and is mainly used for logging.
     """
 
     def __init__(
@@ -126,19 +86,8 @@ class LlamaCppClient:
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Send a chat-completion request and return the raw response dict.
-
-        Parameters
-        ----------
-        messages:
-            List of ``{"role": ..., "content": ...}`` dicts.
-        temperature:
-            Sampling temperature (0.0 = deterministic).
-        max_tokens:
-            Maximum tokens to generate.
-        **kwargs:
-            Extra fields forwarded to the request body.
-        """
+        """Send a chat-completion request and return the raw response dict; extra
+        kwargs are forwarded into the request body."""
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -192,6 +141,40 @@ class LlamaCppClient:
                 f"Unexpected response structure from llama-cpp server: {exc}"
             ) from exc
 
+    @property
+    def server_root(self) -> str:
+        """The server URL without the OpenAI ``/v1`` suffix (llama-server's own routes)."""
+        root = self.base_url
+        return root[: -len("/v1")] if root.endswith("/v1") else root
+
+    async def context_size(self) -> int:
+        """The context size (``n_ctx``) per request from ``GET /props`` (newer servers
+        under ``default_generation_settings``, older at top level); raises
+        :class:`LlamaCppClientError` when the server does not say."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{self.server_root}/props")
+        if resp.status_code != 200:
+            raise LlamaCppClientError(f"llama-cpp /props returned HTTP {resp.status_code}")
+        data = resp.json()
+        settings = data.get("default_generation_settings") if isinstance(data, dict) else None
+        for source in (settings, data):
+            if isinstance(source, dict):
+                value = source.get("n_ctx")
+                if isinstance(value, int) and value > 0:
+                    return value
+        raise LlamaCppClientError("llama-cpp /props did not report n_ctx")
+
+    async def count_tokens(self, text: str) -> int:
+        """Token count of *text* by the server's own tokenizer (``POST /tokenize``)."""
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{self.server_root}/tokenize", json={"content": text})
+        if resp.status_code != 200:
+            raise LlamaCppClientError(f"llama-cpp /tokenize returned HTTP {resp.status_code}")
+        tokens = resp.json().get("tokens")
+        if not isinstance(tokens, list):
+            raise LlamaCppClientError("llama-cpp /tokenize returned no token list")
+        return len(tokens)
+
     async def is_available(self) -> bool:
         """Return True if the llama-cpp server is reachable."""
         try:
@@ -201,8 +184,8 @@ class LlamaCppClient:
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
 
-    # Keep as an instance method for backward compatibility; delegates to the
-    # module-level function which does not require any client state.
+    # Instance method kept for backward compatibility; delegates to the module-level
+    # function, which needs no client state.
     def extract_json(self, text: str) -> dict[str, Any]:
         """Extract the first JSON object from *text* (delegates to module-level function)."""
         return extract_json(text)

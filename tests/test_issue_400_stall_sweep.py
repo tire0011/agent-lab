@@ -26,7 +26,10 @@ from modules.experiment_service import (
     ExperimentService,
     stall_grace_seconds,
 )
-from modules.experiment_service import service as service_module
+# The stall-sweep constants live in modules/experiment_service/service_parts/stall.py
+# after the split (#576); patch.object below must hit the module that looks the
+# name up at call time.
+from modules.experiment_service.service_parts import stall as service_module
 from modules.nexus_initiative import NexusInitiativeService
 
 # Default limits: 3h agent cap + 15 min grace.

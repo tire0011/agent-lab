@@ -1,8 +1,6 @@
-"""Construction of the Azure OpenAI client and the MCP filesystem server.
-
-Kept separate from agent.py so the wiring of external services (Azure
-OpenAI SDK, MCP filesystem server) can be read, tested, and swapped
-independently of the run/log orchestration logic.
+"""Construction of the Azure OpenAI client and the MCP filesystem server, kept
+separate from agent.py so the external-service wiring can be read, tested, and
+swapped independently of the run/log orchestration logic.
 """
 
 import os

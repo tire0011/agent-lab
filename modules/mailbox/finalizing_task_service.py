@@ -25,12 +25,8 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
         super().close()
 
     def _analyze_finalization_failure(self, approval: Any, exp: Any, finalization_summary: str) -> None:
-        """Best-effort diagnosis when finalization lands in needs_review (#145).
-
-        Never allowed to affect the finalization outcome that already
-        happened - this runs strictly after the terminal state and its
-        outbox/problem record are already persisted.
-        """
+        """Best-effort diagnosis when finalization lands in needs_review (#145); never
+        affects the already-persisted terminal outcome and its records."""
         service = self._failure_analysis(
             context=f"finalization mailbox_task={approval.id} experiment={exp.id}"
         )
@@ -99,9 +95,8 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
                 self._transition_terminal(approval, _base._STATUS_NEEDS_REVIEW, exp)
 
     def _advance_verified(self, approval: Any, exp: Any) -> None:
-        # Old/non-development callers can still produce synthetic succeeded
-        # experiments without the deterministic quality record.  Only real
-        # verified development experiments enter the autonomous merge/deploy loop.
+        # Synthetic succeeded experiments without the deterministic quality record
+        # never enter the autonomous merge/deploy loop.
         if not isinstance(getattr(exp, "quality_evaluation", None), dict):
             self._transition_terminal(approval, _base._STATUS_SUCCEEDED, exp)
             return
@@ -109,8 +104,8 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
         if self.finalization_coordinator is None:
             try:
                 # Lazy import avoids the ExperimentAdoptionService -> mailbox
-                # package bootstrap cycle and avoids constructing deployment
-                # machinery for tasks that never reach verification success.
+                # bootstrap cycle and building deployment machinery for tasks that
+                # never reach verification success.
                 from modules.task_finalization import TaskFinalizationCoordinator
 
                 self.finalization_coordinator = TaskFinalizationCoordinator(
@@ -248,12 +243,9 @@ class FinalizingMailboxTaskService(_base.MailboxTaskService):
 
 
 def install() -> None:
-    """Install the finalizing service behind the existing import surface.
-
-    `api.py` and older callers import `MailboxTaskService` from
-    `modules.mailbox.task_service`.  Keep that stable public path while the
-    lifecycle extension lives in its own focused module.
-    """
+    """Install the finalizing service behind the existing import surface: api.py and
+    older callers keep importing ``MailboxTaskService`` from
+    ``modules.mailbox.task_service``."""
 
     if _base.MailboxTaskService is not FinalizingMailboxTaskService:
         _base.MailboxTaskService = FinalizingMailboxTaskService

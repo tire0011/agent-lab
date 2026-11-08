@@ -1,7 +1,6 @@
-"""Development extensions for the Git-backed Nexus mailbox.
-
-The command channel is available for the trusted development mailbox.
-Mailbox tasks need nothing here: they go straight to Nexus (#264).
+"""Development extensions for the Git-backed Nexus mailbox: the command channel,
+available for the trusted development mailbox only (mailbox tasks go straight to
+Nexus, #264).
 """
 
 from __future__ import annotations
@@ -57,10 +56,9 @@ def _command_environment() -> dict[str, str]:
 
 
 def _bounded_redacted(text: str | None) -> str:
-    # Credentials only (#220): every configured credential value and every
-    # generic credential shape becomes ``****``. The rest of the output - paths,
-    # URLs, ordinary text - is the diagnostic payload and stays as printed.
-    # Masked before truncation, so a cut can never split a value in two.
+    # Credentials only (#220): every configured credential value and generic
+    # credential shape becomes ``****``; the rest (paths, URLs, text) is the
+    # diagnostic payload. Masked before truncation so a cut cannot split a value.
     clean = redact_outbound(text)
     if len(clean) <= MAX_OUTPUT_CHARS:
         return clean
@@ -149,8 +147,8 @@ def process_command(
     if not command:
         raise ValueError("command body must not be empty")
 
-    # Internal orchestrator commands predate mailbox front matter and provide
-    # only a body. Treat absent metadata exactly like an empty header.
+    # Internal orchestrator commands predate front matter and provide only a body;
+    # treat absent metadata like an empty header.
     meta = getattr(msg, "meta", None)
     timeout = _command_timeout(meta)
     unknown_meta = _unknown_command_meta(meta)
@@ -306,11 +304,9 @@ def process_command(
                     partial_stderr.rstrip("\n") + "\n" if partial_stderr.strip() else ""
                 ) + evidence_line
 
-                # Persist the recovered outcome once so a later poll (including
-                # one triggered by a second restart) reads this cached result
-                # via the exit_path branch above instead of re-deriving it —
-                # this is what keeps the eventual Outbox reply a single,
-                # idempotent publication.
+                # Persist the recovered outcome once so a later poll (even after a
+                # second restart) reads this cached result instead of re-deriving
+                # it - this keeps the Outbox reply a single idempotent publication.
                 try:
                     exit_path.write_text(str(returncode))
                     stderr_path.write_text(raw_stderr)

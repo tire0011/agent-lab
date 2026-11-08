@@ -1,22 +1,10 @@
-"""Publish Outbox messages as comments on the persistent communication PR (#196).
+"""Publish Outbox messages as comments on the communication PR (#196).
 
-The ChatGPT Work trigger watches one long-lived *Nexus communication* pull
-request (#194).  Every Outbox message that Nexus persists must therefore also
-appear as a top-level conversation comment on that PR, so the external trigger
-wakes up.
-
-Contract
---------
-- Delivery is keyed by Outbox message id: one message produces at most one
-  comment, no matter how often it is reprocessed.
-- A GitHub failure never rolls back or loses the Outbox message.  The
-  notification stays ``pending`` and is retried with bounded exponential
-  backoff by :meth:`OutboxPRNotifier.deliver_pending`.
-- A closed communication PR is reopened (recreating its head branch first if
-  GitHub deleted it) rather than replaced.
-- Only when the original PR is genuinely unusable is an equivalent channel
-  recreated - and that condition is logged at ERROR with the new number and
-  URL, because the external trigger is still scoped to the old PR.
+- One comment per Outbox message id, however often it is reprocessed.
+- A GitHub failure never loses the message: it stays ``pending`` and is
+  retried with bounded backoff by :meth:`OutboxPRNotifier.deliver_pending`.
+- A closed PR is reopened (its branch recreated if needed); only an unusable
+  one is replaced, logged at ERROR with the new number.
 - The communication PR is never merged from here.
 """
 
@@ -143,13 +131,7 @@ class OutboxPRNotifier:
     # ------------------------------------------------------------------
 
     def enqueue(self, message_id: str, content: str, created_at: str | None = None) -> None:
-        """Durably record that this message must be announced.
-
-        Separate from :meth:`notify` so a producer can persist the intent
-        before the step that would otherwise be able to lose it (see
-        ``OutboxPublisher._enqueue_notification``). Repeat calls for the
-        same id are no-ops, which is what keeps delivery single-comment.
-        """
+        """Durably record that this message must be announced; repeat calls are no-ops."""
         if not message_id:
             return
         self._enqueue(message_id, content, created_at or _utcnow_iso())
@@ -297,13 +279,10 @@ class OutboxPRNotifier:
         return str(sha)
 
     def _recreate_channel(self) -> int:
-        """Last resort: build an equivalent channel and shout about the new number.
+        """Last resort: create an equivalent channel and log the new number.
 
-        The replacement always gets its own branch cut from the base head and
-        its own commit on top. Reusing ``communication_branch`` would fail
-        exactly when recreation is most likely - after the old PR was merged,
-        the branch still exists and its file is already in base, so GitHub
-        rejects the new PR with "No commits between base and head".
+        It gets its own branch and commit: after a merged PR, the old branch
+        has no diff to base and GitHub would refuse the new PR.
         """
         branch = f"{self.communication_branch}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
         self._request(
@@ -340,12 +319,7 @@ class OutboxPRNotifier:
         return new_number
 
     def _write_communication_file(self, branch: str) -> None:
-        """Commit the channel file on *branch* so it differs from the base.
-
-        Written unconditionally, and updated in place when the file is
-        already there (the merged-PR case): a branch identical to its base
-        cannot become a pull request.
-        """
+        """Commit the channel file on *branch* so it differs from the base."""
         existing_sha: str | None = None
         try:
             current = self._request(

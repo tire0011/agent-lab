@@ -1,10 +1,7 @@
-"""Nexus pauses on its experiment and continues with the result (#263 step 3).
-
-A turn that ends in ``new_experiment`` parks its session. The moment the
-experiment ends, the thread that ran it continues the session with one
-observation: status, PR number and - on failure - a short reason. A restart
-loses that moment, so the caller's cheap poll resumes whatever the event
-missed.
+"""Nexus pauses on its experiment and continues with the result (#263 step 3): when
+the experiment ends, its session is continued with one observation (status, PR
+number, short reason on failure). A restart loses that moment, so the caller's
+cheap poll resumes whatever the event missed.
 """
 
 from __future__ import annotations

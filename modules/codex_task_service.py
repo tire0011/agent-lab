@@ -1,35 +1,10 @@
-"""Persistent Codex coding-task lifecycle built on the existing SQLite store.
+"""Persistent Codex coding-task lifecycle in the shared SQLite store (``codex_tasks``),
+executed through the existing workers, synchronously in the caller's thread - no
+queue, threads, or parallelism.
 
-``CodexTaskService`` records coding tasks in the same SQLite database used by
-``modules/run_store/`` package (table ``codex_tasks``), executes them through the
-existing ``CodexWorker`` (never duplicated), and persists their final state.
-
-Scope of this step (implemented; see ARCHITECTURE.md "3) API surface" and
-"4) Client" for the resulting Codex task API/CLI surface):
-  - No API, web, chat, or background-queue wiring.
-  - No parallel processing, no background threads, no external queue system.
-  - Tasks are created (``queued``) and later executed one at a time via
-    ``run_task`` from the same process/thread that calls it.
-
-Status lifecycle
------------------
-    queued -> running -> succeeded | blocked | failed | timed_out
-
-``queued``    : task recorded, not yet started.
-``running``   : worker invocation in progress (or presumed in progress after
-                a crash — see ``mark_interrupted_tasks_failed``).
-``succeeded`` : worker exit code 0, no worker-level error, not timed out.
-``timed_out`` : worker reported ``timed_out=True``.
-``failed``    : worker-level error (bad config, missing binary, non-zero
-                exit code, or any exception raised while running the task).
-``blocked``   : reserved for a future, reliably-detected "Codex refused to
-                proceed" signal. ``CodexResult`` currently exposes no field
-                that reliably distinguishes "blocked by sandbox/approval"
-                from any other non-zero exit. Per the task instructions we do
-                not guess: such cases map to ``failed`` until a reliable
-                signal exists. This is a documented limitation, not a bug.
-
-Mapping function: see ``_map_result_to_status``.
+Status lifecycle: queued -> running -> succeeded | failed | timed_out (``blocked``
+is reserved; ``CodexResult`` has no reliable signal for it, so such cases map to
+``failed`` rather than being guessed - see ``_map_result_to_status``).
 """
 
 from __future__ import annotations
@@ -52,9 +27,7 @@ from modules.codex_worker import CodexResult, CodexWorker, SANDBOX_MODES
 from modules.codex_worker import PROVIDER as PROVIDER_CODEX
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
-# ---------------------------------------------------------------------------
 # Status constants
-# ---------------------------------------------------------------------------
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -65,9 +38,9 @@ STATUS_TIMED_OUT = "timed_out"
 
 _TERMINAL_STATUSES = (STATUS_SUCCEEDED, STATUS_BLOCKED, STATUS_FAILED, STATUS_TIMED_OUT)
 
-_DEFAULT_MAX_PROMPT_BYTES = 16 * 1024  # 16 KB
-_DEFAULT_MAX_FINAL_MESSAGE_BYTES = 16 * 1024  # 16 KB
-_DEFAULT_MAX_ERROR_BYTES = 4 * 1024  # 4 KB
+_DEFAULT_MAX_PROMPT_BYTES = 16 * 1024
+_DEFAULT_MAX_FINAL_MESSAGE_BYTES = 16 * 1024
+_DEFAULT_MAX_ERROR_BYTES = 4 * 1024
 
 
 def _utcnow_iso() -> str:
@@ -137,8 +110,7 @@ def _row_to_task(row: sqlite3.Row) -> CodexTask:
     usage_json = row["usage_json"]
     usage = json.loads(usage_json) if usage_json else None
     timed_out = row["timed_out"]
-    # Rows written before the second coding agent existed carry no provider;
-    # they were all Codex runs.
+    # Pre-second-agent rows carry no provider; they were all Codex runs.
     provider = (
         row["provider"] if "provider" in row.keys() and row["provider"] else PROVIDER_CODEX
     )
@@ -164,19 +136,9 @@ def _row_to_task(row: sqlite3.Row) -> CodexTask:
 
 
 def _map_result_to_status(result: CodexResult) -> tuple[str, str | None]:
-    """Map a ``CodexResult`` to a final ``(status, error)`` pair.
-
-    Deterministic, documented rules (no guessing of ``blocked``):
-      1. ``result.timed_out`` -> ``timed_out`` (checked first: a timeout also
-         sets ``result.error`` to a descriptive message, but the more
-         specific ``timed_out`` status takes precedence).
-      2. ``result.error`` set (worker-level failure: bad config, missing
-         binary, unexpected OSError, ...) -> ``failed``.
-      3. ``result.success`` (exit_code == 0) -> ``succeeded``.
-      4. Anything else (non-zero exit code, no worker error, no timeout)
-         -> ``failed``. We do not attempt to infer ``blocked`` here because
-         ``CodexResult`` carries no reliable signal for "approval refused"
-         vs. any other failure exit code.
+    """Map a ``CodexResult`` to a final ``(status, error)`` pair: timed_out first,
+    then worker error or non-zero exit -> ``failed``, exit 0 -> ``succeeded``.
+    ``blocked`` is never guessed - ``CodexResult`` has no reliable signal for it.
     """
     if result.timed_out:
         return STATUS_TIMED_OUT, result.error
@@ -188,17 +150,13 @@ def _map_result_to_status(result: CodexResult) -> tuple[str, str | None]:
 
 
 class CodexTaskService:
-    """Creates, persists, and runs external coding-agent tasks.
+    """Creates, persists, and runs external coding-agent tasks synchronously in
+    the caller's thread, reusing the ``run_store`` SQLite infrastructure and the
+    existing workers.
 
-    Reuses the existing SQLite infrastructure (``modules.run_store``) and the
-    existing workers for execution. Does not add a queue, threads, or
-    parallelism: ``run_task`` executes synchronously in the caller's thread.
-
-    Which agent runs a task is decided **once, at creation time**, and stored
-    with the task: either the caller names it, or it is selected by the durable rotation from
-    the installed providers (see ``modules.coding_provider``). Injecting a
-    *worker* pins every task of this service to that worker instead, which is
-    what tests and single-provider deployments do.
+    The agent is decided once, at creation time, and stored with the task (caller-
+    named, or the durable provider rotation); an injected *worker* pins every
+    task to that worker instead (what tests and single-provider setups do).
     """
 
     def __init__(
@@ -210,17 +168,9 @@ class CodexTaskService:
         max_error_bytes: int = _DEFAULT_MAX_ERROR_BYTES,
         rng: Any | None = None,
     ) -> None:
-        """
-        Parameters
-        ----------
-        worker:
-            Optional fixed worker. When given, every task of this service runs
-            on it and is recorded under its provider. When ``None`` (the
-            production default), each task selects its own provider and the
-            matching worker is built when the task runs.
-        rng:
-            Deprecated compatibility argument. Provider selection is now a
-            deterministic, persistent rotation.
+        """worker pins every task to that worker (``None`` = production default:
+        per-task provider rotation). rng is a deprecated compatibility argument;
+        provider selection is a deterministic, persistent rotation.
         """
         self.worker = worker
         self.rng = rng
@@ -232,20 +182,15 @@ class CodexTaskService:
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
-        # A single sqlite3.Connection is kept for the service's lifetime, but
-        # FastAPI runs sync route handlers in a threadpool, so a given call
-        # may arrive on a different OS thread each time. sqlite3 connections
-        # are not safe for concurrent multi-thread access; this lock
-        # serializes access to ``self._conn`` (short-held, per DB statement
-        # group) without adding a queue or background execution.
+        # One connection for the service lifetime; FastAPI sync handlers arrive on
+        # varying threads and sqlite3 connections are not thread-safe, so this lock
+        # serializes access (short-held, per statement group).
         self._lock = threading.Lock()
 
     def close(self) -> None:
         self._conn.close()
 
-    # ------------------------------------------------------------------
     # create_task
-    # ------------------------------------------------------------------
 
     def create_task(
         self,
@@ -255,11 +200,8 @@ class CodexTaskService:
         timeout_seconds: int = 120,
         provider: str | None = None,
     ) -> CodexTask:
-        """Persist a new task in status ``queued``. Does not execute it.
-
-        *provider* names the coding agent to use; omit it to let the service
-        decide (the injected worker's provider, otherwise the provider rotation).
-        """
+        """Persist a new task in status ``queued``; does not execute it. *provider*
+        names the agent, or omit it for the service's rotation."""
         if not prompt or not prompt.strip():
             raise ValueError("prompt must not be empty")
         if sandbox not in SANDBOX_MODES:
@@ -302,9 +244,8 @@ class CodexTaskService:
     def _provider_for_new_task(self) -> str:
         """Provider for a task whose caller did not name one."""
         if self.worker is not None:
-            # A worker may be a test double without a usable provider name;
-            # anything other than a known provider is recorded as Codex, the
-            # only provider that existed when such callers were written.
+            # A test double may lack a usable provider name; anything unknown is
+            # recorded as Codex, the only provider such callers were written for.
             return provider_of(self.worker, PROVIDER_CODEX) or PROVIDER_CODEX
         return choose_provider(self.rng, db_path=self.db_path)
 
@@ -314,9 +255,7 @@ class CodexTaskService:
             return self.worker
         return build_worker(task.provider)
 
-    # ------------------------------------------------------------------
     # get_task / list_tasks
-    # ------------------------------------------------------------------
 
     def get_task(self, task_id: str) -> CodexTask:
         with self._lock:
@@ -337,22 +276,13 @@ class CodexTaskService:
             ).fetchall()
         return [_row_to_task(row) for row in rows]
 
-    # ------------------------------------------------------------------
     # run_task
-    # ------------------------------------------------------------------
 
     def run_task(self, task_id: str) -> CodexTask:
-        """Execute *task_id* via the worker for its recorded provider.
-
-        Steps:
-          1. Load the stored task (``TaskNotFoundError`` if missing).
-          2. Atomically transition ``queued`` -> ``running``; reject a
-             second start (``TaskNotRunnableError``) for any other status.
-          3. Run the worker for this task only.
-          4. Persist the worker result and final status.
-          5. On any exception while running, persist ``failed`` with a
-             descriptive error instead of leaving the task ``running``.
-        """
+        """Execute *task_id* via the worker for its recorded provider: load (raises
+        ``TaskNotFoundError``), atomically transition queued -> running (rejects a
+        second start), run, persist the result; any exception persists ``failed``
+        instead of leaving the task ``running``."""
         task = self.get_task(task_id)  # raises TaskNotFoundError if missing
 
         started_at = _utcnow_iso()
@@ -445,19 +375,11 @@ class CodexTaskService:
                 ),
             )
 
-    # ------------------------------------------------------------------
     # Interrupted-task recovery (no auto-restart)
-    # ------------------------------------------------------------------
 
     def mark_interrupted_tasks_failed(self) -> list[str]:
-        """Mark orphaned ``running`` tasks as ``failed``.
-
-        Intended to be called once at process startup, before any new task
-        is run. Never restarts execution; only fixes bookkeeping left behind
-        by a crash or restart while a task was mid-flight.
-
-        Returns the list of task ids that were marked.
-        """
+        """Mark orphaned ``running`` tasks as ``failed`` (startup bookkeeping only,
+        never restarts); returns the marked task ids."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id FROM codex_tasks WHERE status = ?", (STATUS_RUNNING,)
@@ -488,9 +410,7 @@ class CodexTaskService:
         return ids
 
 
-# ---------------------------------------------------------------------------
 # CLI entry point for manual smoke-testing
-# ---------------------------------------------------------------------------
 
 def _build_cli_parser():
     import argparse

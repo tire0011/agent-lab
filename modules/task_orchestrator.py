@@ -107,6 +107,7 @@ from modules.tool_result_reader import (
     read_tool_result,
 )
 
+<<<<<<< HEAD
 ACTION_NEW_EXPERIMENT = "new_experiment"
 ACTION_ANSWER = "answer"
 ACTION_CLARIFICATION = "clarification"
@@ -197,97 +198,61 @@ _ORCHESTRATOR_TOOLS = {
     TOOL_PYTHON_RUN,
     TOOL_READ_TOOL_RESULT,
 }
+=======
+>>>>>>> 2db34389bd335009207359c416bb7f07eb137116
 
 logger = logging.getLogger(__name__)
 
-# Decision fields worth journalling; `message` can be a page of prose and
-# adds nothing to "why did it choose this".
-_DECISION_FIELDS = (
-    "tool", "goal", "query", "request", "operation", "provider", "command",
-    "script", "module", "experiment_id", "capability", "event_id", "offset",
+
+from modules.task_orchestrator_parts.core import (
+    ACTION_ANSWER,
+    ACTION_CLARIFICATION,
+    ACTION_KNOWLEDGE_COLLECTOR,
+    ACTION_NEW_EXPERIMENT,
+    ControllerBudgetExceededError,
+    TOOL_KNOWLEDGE_BRIEFING,
+    TaskDecision,
+    TaskOrchestratorError,
+    _AZURE_CONTROLLER_MAX_TOKENS,
+    _CONTROLLER_PROVIDER_ENV,
+    _DECISION_FIELDS,
+    _EXPERIMENT_ID_PATTERN,
+    _EXTERNAL_FALLBACK_ORDER,
+    _EXTERNAL_PREAMBLE_CHARS,
+    _EXTERNAL_PROMPT_CHARS,
+    _FINAL_ACTIONS,
+    _GITHUB_WRITE_COMMAND,
+    _HISTORY_HEADER,
+    _KNOWLEDGE_COLLECTOR_RESPONSE_FORMAT,
+    _KNOWLEDGE_COLLECTOR_SCHEMA,
+    _KNOWLEDGE_LOOKUP_REASON,
+    _MAX_EXPERIMENT_ID_CANDIDATES,
+    _MAX_RESOLVER_CANDIDATES,
+    _ORCHESTRATOR_RESPONSE_FORMAT,
+    _ORCHESTRATOR_SCHEMA,
+    _ORCHESTRATOR_TOOLS,
+    _PROVIDER_FALLBACKS,
+    _RESUME_INTENT_PATTERN,
+    _SOLVE_ISSUE_RE,
+    _TOOL_ACCURACY_CORRECT,
+    _TOOL_ACCURACY_INCORRECT,
+    _TOOL_ACCURACY_UNKNOWN,
+    _TOOL_RESOLVER_RESPONSE_FORMAT,
+    _TOOL_SEARCH_STOP_WORDS,
+    _TaskStoreGrantLedger,
+    _guidance_core,
+    _issue_briefing_decision,
+    _repeats_tool_guidance,
 )
-
-_PROVIDER_FALLBACKS: dict[str, tuple[str, ...]] = {
-    "free_tier": ("free_tier", "azure_openai", "local_worker", "codex_readonly"),
-    "local_worker": ("local_worker", "azure_openai", "codex_readonly"),
-    "azure_openai": ("azure_openai", "local_worker", "codex_readonly"),
-    "codex_readonly": ("codex_readonly", "azure_openai", "local_worker"),
-}
-
-_ORCHESTRATOR_SCHEMA: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": [
-                    TOOL_FIND_TOOL,
-                    ACTION_CALL_TOOL,
-                    "memory_search",
-                    ACTION_KNOWLEDGE_COLLECTOR,
-                    "delegate",
-                    ACTION_COMMAND,
-                    TOOL_PYTHON_RUN,
-                    TOOL_READ_TOOL_RESULT,
-                    ACTION_NEW_EXPERIMENT,
-                    ACTION_RESUME_EXPERIMENT,
-                    ACTION_ANSWER,
-                    ACTION_MISSING_CAPABILITY,
-                    ACTION_CLARIFICATION,
-                ],
-            },
-            "goal": {"type": "string"},
-            "tool": {"type": "string"},
-            "arguments": {"type": "object", "additionalProperties": True},
-            "query": {"type": "string"},
-            "request": {"type": "string"},
-            "limit": {"type": "integer"},
-            "event_id": {"type": "integer"},
-            "offset": {"type": "integer"},
-            "provider": {"type": "string"},
-            "task": {"type": "string"},
-            "context": {"type": "string"},
-            "command": {"type": "string"},
-            "script": {"type": "string"},
-            "module": {"type": "string"},
-            "argv": {"type": "array", "items": {"type": "string"}},
-            "cwd": {"type": "string"},
-            "effect": {"type": "string", "enum": ["read", "change", "verify"]},
-            "experiment_id": {"type": ["string", "null"]},
-            "message": {"type": "string"},
-            "verified_noop": {"type": "boolean"},
-            "reason": {"type": "string"},
-            "information_gap": {"type": "string"},
-            "gap_kind": {
-                "type": "string",
-                "enum": [
-                    "user_intent",
-                    "user_preference",
-                    "user_authorization",
-                    "external_information",
-                    "missing_capability",
-                ],
-            },
-            "evidence_event_ids": {
-                "type": "array",
-                "items": {"type": "integer"},
-                "maxItems": 10,
-            },
-            "why_human_required": {"type": "string"},
-            "capability": {"type": "string"},
-            "required_inputs": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": 20,
-            },
-        },
-    "required": ["action"],
-    "additionalProperties": False,
-}
-_ORCHESTRATOR_RESPONSE_FORMAT: dict[str, Any] = json_schema_response_format(
-    "nexus_controller_decision", _ORCHESTRATOR_SCHEMA
-)
+from modules.task_orchestrator_parts.session import SessionMixin
+from modules.task_orchestrator_parts.controller import ControllerLoopMixin
+from modules.task_orchestrator_parts.providers import ProviderToolMixin
+from modules.task_orchestrator_parts.knowledge import KnowledgeCollectorMixin
+from modules.task_orchestrator_parts.context import ContextMixin
+from modules.task_orchestrator_parts.execution import ExecutionMixin
 
 
+<<<<<<< HEAD
 # Nexus receives only the collector's final compact factual knowledge product.
 TOOL_KNOWLEDGE_BRIEFING = ACTION_KNOWLEDGE_COLLECTOR
 
@@ -4119,3 +4084,14 @@ Decide the next step now. Return JSON only.
             )
         except OSError:
             return
+=======
+class NexusTaskOrchestrator(
+    SessionMixin,
+    ControllerLoopMixin,
+    ProviderToolMixin,
+    KnowledgeCollectorMixin,
+    ContextMixin,
+    ExecutionMixin,
+):
+    """Persistent local-LLM controller that chooses Nexus's next action."""
+>>>>>>> 2db34389bd335009207359c416bb7f07eb137116

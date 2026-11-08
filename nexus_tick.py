@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Nexus initiative tick — decide and start one piece of Nexus's own work.
+"""Nexus initiative tick - decide and start one piece of Nexus's own work.
 
-This is the entry point that makes Nexus self-directed. Everything else in the
-system waits to be asked: the mailbox timer waits for a human to write a file,
-the chat waits for someone to type, the task worker waits for an approval. This
-runs on a timer, looks at Nexus's own state, picks the single most useful thing
-to do next, records why, and hands it to the existing pipeline.
-
-The services are built exactly as ``api.py`` builds them, so a tick observes the
-same lifecycle rules as every other caller.
+Runs on a timer, looks at Nexus's own state, picks the single most useful
+next step, records why, and hands it to the existing pipeline. Services are
+built as ``api.py`` builds them.
 """
 
 from __future__ import annotations
@@ -88,14 +83,10 @@ def _main_commit_date(repo_root: str) -> str:
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
-    """Return the open GitHub issue backlog available to Nexus.
+    """The open GitHub issue backlog available to Nexus (no label gate).
 
-    The initiative budget and one-at-a-time gate are the safety boundary.  A
-    label gate made the supposedly self-directed tick depend on a human first
-    labelling every issue, and in production that left it with no work to
-    plan. Pull a bounded view of the ordinary issue backlog instead. Pull
-    requests are excluded by ``gh issue list`` and linked issues are filtered
-    by :class:`NexusInitiativeService` before dispatch.
+    The budget and the one-at-a-time gate are the safety boundary; pull
+    requests are excluded and linked issues are filtered before dispatch.
     """
     try:
         proc = subprocess.run(
@@ -312,11 +303,8 @@ def _build_service(args) -> NexusInitiativeService:
 def _reconcile_stale_claims(db_path: str) -> None:
     """Release controller claims whose worker stopped heartbeating (#162).
 
-    The tick runs on a timer, which makes it the natural place to notice a dead
-    worker: the API only reconciles at startup, and a worker that dies while
-    the API keeps running would otherwise hold its claim until the next
-    restart. Never resumes the work and never fails the tick - a tick that
-    could not reap is still a tick that can decide.
+    The API only reconciles at startup, so the timer is where a dead worker is
+    noticed. Never resumes work and never fails the tick.
     """
     store = None
     try:
@@ -378,9 +366,8 @@ def _sweep_stalled_experiments(service) -> None:
 def _wait_for_experiments(service=None) -> None:
     """Keep the process alive until the work it started has ended (#358).
 
-    The controller runs an experiment, and the adoption service an
-    integration, in a daemon thread of this process; the oneshot unit would
-    otherwise exit and kill it while it is still queued or adopting.
+    Experiments and adoptions run in daemon threads; the oneshot unit would
+    otherwise kill them on exit.
     """
     from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
     from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX

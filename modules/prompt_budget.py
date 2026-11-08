@@ -1,19 +1,10 @@
 """Prompt budget for the persistent Nexus controller, bounded by the context window.
 
-The controller resends its observations every turn, so an unbounded prompt
-would outgrow the model's context window. The window is the one hard limit:
-llama-server allocates its KV cache for ``n_ctx`` up front, and on the VM a
-full-context prompt costs ~109 MB more RSS than a tiny one, once (#230). Host
-memory is therefore reported as a signal (``low_memory``,
-``safe_local_budget_chars``) and never shrinks the budget or gates a local
-call.
-
-The sections that are not compacted - the rules and the capability catalog -
-are passed in as their measured length (``fixed_chars``), not guessed as a
-share. What remains goes to the current input, the observations and, last,
-the persisted (and re-readable) history.
-
-Kept dependency-free so it stays unit testable.
+The context window is the one hard limit; host memory is only reported
+(``low_memory``, ``safe_local_budget_chars``) and never shrinks the budget
+(#230). Sections rendered in full are passed in as their measured length
+(``fixed_chars``); the rest goes to the current input, the observations and,
+last, the re-readable history. Dependency-free for unit tests.
 """
 
 from __future__ import annotations
@@ -35,10 +26,8 @@ DEFAULT_MEMINFO_PATH = "/proc/meminfo"
 # coarse budgeting, never for exact tokenizer-accurate truncation.
 CHARS_PER_TOKEN = 4
 
-# Shares of the *variable* room (budget minus the measured fixed sections).
-# The current input is capped, history keeps a small reserved floor, and the
-# observations get everything else - they carry the answer to the current
-# task, while history is persisted and can be re-read.
+# Shares of the variable room (budget minus measured fixed sections): the input
+# is capped, history keeps a small floor, observations get the rest.
 INPUT_SHARE = 0.20
 HISTORY_FLOOR_SHARE = 0.10
 # Below this much variable room a controller cannot see its own tool results
@@ -67,23 +56,12 @@ def read_mem_available_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | Non
 
 
 def read_swap_free_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
-    """Best-effort read of ``SwapFree`` (kB) from ``/proc/meminfo``.
-
-    Low/absent swap is an additional low-memory signal: a host relying on
-    swap to absorb an inference spike is already close to OOM pressure even
-    if ``MemAvailable`` alone looks tolerable. Meaningful only when swap is
-    actually configured; see ``read_swap_total_kb``.
-    """
+    """Best-effort ``SwapFree`` (kB) from ``/proc/meminfo``; only meaningful if swap is configured."""
     return _read_meminfo_field(meminfo_path, "SwapFree")
 
 
 def read_swap_total_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
-    """Best-effort read of ``SwapTotal`` (kB) from ``/proc/meminfo``.
-
-    A host without swap configured always reports ``SwapFree: 0``, which is
-    not itself a low-memory signal; callers must check ``SwapTotal > 0``
-    before treating a low ``SwapFree`` reading as pressure.
-    """
+    """Best-effort ``SwapTotal`` (kB) from ``/proc/meminfo``; check it before reading low ``SwapFree`` as pressure."""
     return _read_meminfo_field(meminfo_path, "SwapTotal")
 
 
@@ -104,18 +82,13 @@ def _read_meminfo_field(meminfo_path: str, field: str) -> int | None:
 
 @dataclass(slots=True)
 class PromptBudgetPlan:
-    """One budget computation, used both for prompt sizing and for logging.
+    """One budget computation, used for prompt sizing and for logging.
 
-    ``effective_budget_chars`` is the whole rendered prompt, bounded by the
-    context window minus the reserved output. It splits into
-    ``fixed_chars`` (measured, never compacted) and ``variable_chars``,
-    which in turn splits into ``current_input_chars`` (a cap),
-    ``observation_chars`` and ``history_chars`` (a reserved floor; history
-    also gets whatever the observations leave unused). For a plan that is
-    not ``starved`` the four sections sum to ``effective_budget_chars``.
-
-    The memory fields are advisory signals only: they are logged and
-    reported, and never shrink a section or gate a local call (#230).
+    ``effective_budget_chars`` (context window minus reserved output) splits
+    into ``fixed_chars`` and ``variable_chars``; the latter into
+    ``current_input_chars`` (a cap), ``observation_chars`` and
+    ``history_chars`` (a floor plus what observations leave). Memory fields
+    are advisory only (#230).
     """
 
     model_context_tokens: int
@@ -185,15 +158,9 @@ def compute_budget(
 ) -> PromptBudgetPlan:
     """Compute the prompt budget from the context window.
 
-    ``fixed_chars`` is the measured length of every prompt section that is
-    rendered in full (rules, capability catalog, framing). It is subtracted
-    as-is; only the remainder is shared between input, observations and
-    history.
-
-    Host memory is read only to report pressure. It does not change any
-    section: a resident model's KV cache is already sized for the whole
-    context window, so a larger prompt costs a bounded ~100 MB, and an
-    attempt can succeed where a prediction said it would not.
+    ``fixed_chars`` (sections rendered in full) is subtracted as-is; the rest
+    is shared between input, observations and history. Memory is read only to
+    report pressure.
     """
     model_context_tokens = model_context_tokens if model_context_tokens is not None else _env_int(
         "NEXUS_LOCAL_MODEL_CONTEXT_TOKENS", 8192
@@ -294,14 +261,9 @@ def truncate_text(text: str, max_chars: int, *, note: str = "truncated") -> tupl
 
 
 def prompt_json(value: Any) -> str:
-    """Serialise for a model prompt, without the parts that carry no meaning.
-
-    ``"arguments":[]`` and ``"default":null`` say what their absence says,
-    and at seven tokens a second each is paid for in wall-clock time.
-
-    Prompts only. ``OperationSpec.to_dict`` also answers the catalog
-    endpoint, where a stable shape is the contract.
-    """
+    """Serialise for a model prompt without fields that carry no meaning
+    (``"arguments":[]``, ``"default":null``). Prompts only; the catalog
+    endpoint keeps the stable shape."""
     return json.dumps(_without_empties(value), separators=(",", ":"))
 
 
@@ -325,15 +287,11 @@ def compact_observations(
 ) -> tuple[list[dict[str, Any]], list[int]]:
     """Bound observations sent to the model to a total character budget.
 
-    An observation that fits its share is passed through unchanged. One that
-    does not is replaced by a semantic summary (``observation_summary``) when
-    that fits; the most recent ``keep_recent_full`` may otherwise still be
-    truncated in place; everything else becomes a small stub referencing its
-    stable event id, so the raw result stays retrievable from the database
-    without resending it inline.
-    Returns ``(compacted_observations, omitted_indices)`` where
-    ``omitted_indices`` are 0-based positions in the *input* list that were
-    reduced to a stub.
+    An observation that fits is passed through; otherwise it becomes a semantic
+    summary if that fits, the most recent ``keep_recent_full`` may be truncated
+    in place, and the rest become stubs naming their event id. Returns
+    ``(compacted_observations, omitted_indices)`` (0-based input positions
+    reduced to a stub).
     """
     n = len(observations)
     if n == 0 or budget_chars <= 0:
@@ -381,11 +339,8 @@ def compact_observations(
     return [item for item in result if item is not None], sorted(omitted)
 
 
-# What a next decision depends on, kept even when the body is dropped. These
-# cost tens of characters; the body is what is expensive. A stub without them
-# reads "a github_issue happened here", which cannot stop the controller
-# asking the identical question again (#218, #223). With them it reads
-# "github_issue(196) succeeded, event 158" - the whole decision.
+# What a next decision depends on, kept even when the body is dropped, so a stub
+# reads "github_issue(196) succeeded, event 158" (#218, #223).
 _STUB_IDENTITY_FIELDS = (
     "goal",
     "status",
@@ -458,11 +413,8 @@ def _shrink(obs: dict[str, Any], max_chars: int) -> tuple[dict[str, Any], bool]:
             truncated = truncated or was_truncated
             remaining -= len(shrunk[field])
         elif isinstance(value, dict):
-            # The production shape of an operation result: `result` is a dict
-            # whose `output_lines` carry the bulk. Without this branch a dict
-            # matched neither case below and the observation was returned at
-            # full size - the budget was computed, reported, and then not
-            # applied, on the controller prompt as much as the preflight one.
+            # Operation results carry their bulk in result["output_lines"]; without
+            # this branch they were never compacted.
             shrunk[field], was_truncated = _shrink(value, remaining)
             truncated = truncated or was_truncated
             remaining -= len(json.dumps(shrunk[field], separators=(",", ":"), default=str))
@@ -481,13 +433,7 @@ def dedupe_nested_results(
     *,
     already_seen: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Drop memory-search hits that duplicate content already in this prompt.
-
-    Repeated ``memory_search`` calls can surface earlier task/history results
-    (including previous tool observations) again, which nests duplicate
-    context inside an already-duplicated section. This keeps only the first
-    occurrence of any given result body across the whole observation list.
-    """
+    """Drop memory-search hits that duplicate a result body already in the prompt."""
     seen = set(already_seen or ())
     deduped: list[dict[str, Any]] = []
     for obs in observations:

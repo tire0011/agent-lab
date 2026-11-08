@@ -1,19 +1,9 @@
-"""Probes: should a step go from the local model to a stronger one? (#297)
+"""Probes deciding whether a step escalates from the local model to a stronger one (#297).
 
-The local 7B model does not notice when it is wrong: in the #288 runs it
-copied its own outdated summary from memory and was confident about it. These
-probes test three concrete ways to detect such a step. They only *decide*;
-nothing here calls an external model.
-
-Only approach 3 worked in the live tests and is used in production by the
-knowledge collector; 1 and 2 stay for the live measurements.
-
-1. ``escalate`` action: the knowledge collector may answer ``escalate`` when
-   fixed triggers hold (current source and memory disagree, ...).
-2. Narrow yes/no question: "does the memory describe the same requirement as
-   the current issue?" ``no`` escalates.
-3. Measured confidence: the same question, asked directly with token
-   log-probabilities; ``no`` or a low probability for the answer escalates.
+Three ways to detect an overconfident-but-wrong local answer (the #288 runs):
+an ``escalate`` action, a narrow yes/no question, and a measured-confidence
+logprob question. Only the logprob approach (3) is used in production; these
+only decide, they never call an external model themselves.
 """
 
 from __future__ import annotations
@@ -26,8 +16,8 @@ from typing import Any
 
 
 
-# Below this probability for "yes" the model counts as unsure. Measured on 10
-# live cases (#297): accurate memory gave p_yes >= 0.968, outdated <= 0.905.
+# Below this p_yes the model counts as unsure; measured on 10 live cases (#297):
+# accurate memory >= 0.968, outdated <= 0.905.
 LOGPROB_CONFIDENCE_THRESHOLD = 0.95
 
 

@@ -61,14 +61,9 @@ def _finalize_terminal_validation_errors(
     mailbox_module: Any,
     dry_run: bool,
 ) -> list[dict[str, Any]]:
-    """Turn deterministic inbox validation failures into rejected outbox replies.
-
-    Parser/schema failures cannot succeed on retry without changing the source
-    message.  They are therefore terminal: produce a bounded/redacted outbox
-    response, mark the DB row done, and finalize the normal inbox/outbox git
-    commit.  Runtime/processing failures are deliberately left untouched so the
-    existing retry policy still applies to transient failures.
-    """
+    """Turn deterministic inbox validation failures into terminal rejected outbox
+    replies (bounded/redacted, DB row done, normal git commit); runtime failures are
+    left untouched so the retry policy still applies to them."""
     for result in results:
         if result.get("status") != "failed":
             continue
@@ -143,13 +138,10 @@ def _worktree_safe_for_mailbox_sync(
     repo_path: Path,
     ignored_untracked_prefixes: tuple[str, ...] = (),
 ) -> bool:
-    """Return whether mailbox Git operations can proceed safely.
-
-    Untracked files below explicitly supplied machine-managed prefixes (normally
-    the outbox directory) are tolerated.  The publisher commits exact pathspecs,
-    so these files cannot be swept into unrelated commits.  Staged changes,
-    modified tracked files, and untracked files elsewhere remain blocking.
-    """
+    """Return whether mailbox Git operations can proceed safely. Untracked files
+    under the explicitly supplied machine-managed prefixes (the outbox) are tolerated
+    - the publisher commits exact pathspecs, so they cannot be swept into unrelated
+    commits. Staged/modified/untracked elsewhere remain blocking."""
     status = mailbox_module._git(["status", "--porcelain"], repo_path, check=False)
     if status.returncode != 0:
         return False
@@ -174,10 +166,8 @@ def _sync_mailbox_repo(
 ) -> bool:
     """Synchronize append-oriented mailbox commits without discarding local work."""
     run_name = threading.current_thread().name
-    # Preserve the original direct helper contract when no machine-managed
-    # untracked paths need to be tolerated.  The mailbox poller passes the
-    # configured outbox prefix explicitly; legacy/direct callers continue to
-    # use git_is_clean(), which also keeps their retry behavior unchanged.
+    # Without tolerated prefixes keep the direct helper contract: legacy callers use
+    # git_is_clean() and keep their retry behavior unchanged.
     if ignored_untracked_prefixes:
         worktree_safe = _worktree_safe_for_mailbox_sync(
             mailbox_module, repo_path, ignored_untracked_prefixes
@@ -232,14 +222,10 @@ def _sync_mailbox_repo(
 
 @dataclass
 class _DrainOutcome:
-    """What a drain loop produced, and whether it ended on a fault.
-
-    Work already finished is kept in ``results`` whatever ended the loop, but
-    the reason still has to reach the caller: reaching a drain bound is a
-    normal, successful stop, while a resync that failed mid-drain is the same
-    real fault the initial sync reports as ``sync_failed``.  Returning results
-    alone would let a broken mailbox checkout exit as a clean poll.
-    """
+    """What a drain loop produced, and whether it ended on a fault: finished work is
+    kept in ``results`` either way, but a failed mid-drain resync must still reach the
+    caller as ``sync_failed`` - returning results alone would let a broken checkout
+    exit as a clean poll."""
 
     results: list[dict[str, Any]]
     status: str = "processed"
@@ -254,33 +240,18 @@ def _drain_inbox(
     resync: Callable[[], bool] | None,
     run_name: str,
 ) -> _DrainOutcome:
-    """Process the inbox, then keep re-scanning it until no new work appears.
-
-    The inbox is the queue.  A timer invocation that finds the lock held does
-    no work at all, so the processor holding the lock is the only one that can
-    notice a message which arrived while it was busy - hence the rescan instead
-    of a second queue or a pending-work flag.
-
-    Only files that no earlier pass has seen are processed again.  A message
-    left in the inbox on purpose - deferred, awaiting a retry, or out of
-    retries - therefore waits for a later invocation rather than being re-run
-    in a tight loop.
-
-    ``resync`` refreshes the mailbox checkout between passes; new inbox
-    messages reach this worker as commits, so without it a rescan could only
-    ever see what was already on disk.  A failed resync ends the drain and is
-    reported as ``sync_failed``: the work already done stands, but the run is
-    a fault, not a clean poll.
-
-    ``limits`` bounds the loop so continuous inbox traffic cannot keep one
-    worker running forever.  Both bounds are checked between passes, never
-    inside one, so the batch in flight always finishes before the worker stops.
-    """
+    """Process the inbox, then re-scan until no new work appears. The inbox is the
+    queue and the lock owner is the only one who can notice a message that arrived
+    while it was busy, hence the rescan. Only unseen files are processed again, so
+    deferred/retrying messages wait for a later invocation. ``resync`` refreshes the
+    checkout between passes (new messages arrive as commits); a failed resync ends
+    the drain as ``sync_failed`` - completed work stands, but it is a fault, not a
+    clean poll. ``limits`` bounds the loop between passes, never inside one."""
     started = time.monotonic()
 
-    # Snapshot before processing: a message that lands between this scan and
-    # the processor's own scan is then merely rescanned (and skipped as already
-    # done) instead of being missed for a whole timer period.
+    # Snapshot before processing: a message landing between this scan and the
+    # processor's own scan is then merely rescanned (skipped as done), not missed
+    # for a whole timer period.
     seen = {str(path) for path in processor.list_inbox_files()}
     results = _finalize_terminal_validation_errors(
         processor=processor,
@@ -358,16 +329,16 @@ def run_mailbox_poll_once(
     limits = drain_limits if drain_limits is not None else MailboxDrainLimits.from_env()
     logger.info("Mailbox poll start run=%s dry_run=%s", run_name, dry_run)
 
-    # Register unrestricted mailbox commands before any inbox file is parsed.
+    # Register unrestricted mailbox commands before any inbox file is parsed;
     # NEXUS_DEVELOPMENT_MODE only controls optional task auto-approval.
     install_mailbox_development(mailbox_module)
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = MailboxLock(lock_path)
     if not lock.acquire():
-        # Normal contention, not a fault: the processor that owns the lock
-        # rescans the inbox before it exits, so whatever triggered this run is
-        # still picked up.  Callers translate `busy` into a successful exit.
+        # Normal contention, not a fault: the lock owner rescans the inbox before it
+        # exits, so whatever triggered this run is still picked up; callers translate
+        # `busy` into a successful exit.
         logger.info(
             "Mailbox poll skipped run=%s reason=busy: another processor is already running",
             run_name,
@@ -404,9 +375,9 @@ def run_mailbox_poll_once(
             mailbox_config=mailbox_config,
             task_log_dir=getattr(experiment_service, "experiment_log_dir", DEFAULT_LOG_DIR),
         )
-        # Outbox messages are also announced on the persistent communication
-        # PR (#196). Unconfigured GitHub credentials leave this None and the
-        # outbox itself keeps working unchanged.
+        # Outbox messages are also announced on the persistent communication PR
+        # (#196); unconfigured GitHub credentials leave this None and the outbox
+        # itself keeps working unchanged.
         try:
             outbox_notifier = notifier_from_env(db_path=db_path)
         except Exception as exc:  # noqa: BLE001 - never block the poll
@@ -433,8 +404,8 @@ def run_mailbox_poll_once(
             task_publisher.publish_pending()
             failure_analysis_publisher.publish_pending()
             if outbox_notifier is not None:
-                # Retry notifications whose GitHub call failed earlier; the
-                # outbox entries themselves are already pushed and intact.
+                # Retry notifications whose GitHub call failed earlier; the outbox
+                # entries themselves are already pushed and intact.
                 try:
                     outbox_notifier.deliver_pending()
                 except Exception as exc:  # noqa: BLE001 - never block the poll
@@ -444,11 +415,9 @@ def run_mailbox_poll_once(
                         type(exc).__name__,
                     )
             processor.retry_pending_git_commits()
-            # Prune only after pending commits have been retried: a file
-            # still needed to finalize one is protected, and retrying first
-            # lets those records reach `done` so they become prunable. The
-            # deletions are committed locally here and pushed by the sync
-            # below, rather than opening a second push path.
+            # Prune only after pending commits have been retried (files still needed
+            # to finalize one are protected); deletions are committed locally and
+            # pushed by the sync below, not via a second push path.
             try:
                 processor.prune_old_messages()
             except Exception as exc:  # noqa: BLE001 - never block the poll
@@ -496,15 +465,15 @@ def run_mailbox_poll_once(
                     len(outcome.results),
                     _safe_result_summary(outcome.results),
                 )
-                # A resync that failed mid-drain keeps the completed work but
-                # still reports the fault, exactly as the initial sync does.
+                # A resync that failed mid-drain keeps the completed work but still
+                # reports the fault, exactly as the initial sync does.
                 result = MailboxPollRunResult(
                     status=outcome.status, results=outcome.results
                 )
         else:
-            # A dry run touches neither git nor the inbox, so there is nothing
-            # to resync between passes; the rescan still catches a message that
-            # lands while this run is working.
+            # A dry run touches neither git nor the inbox, so there is nothing to
+            # resync between passes; the rescan still catches a message that lands
+            # while this run is working.
             outcome = _drain_inbox(
                 processor=processor,
                 mailbox_module=mailbox_module,

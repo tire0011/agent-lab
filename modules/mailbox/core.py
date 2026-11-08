@@ -1,8 +1,5 @@
-"""Core mailbox parsing, validation, persistence, and git helpers.
-
-This module holds the low-level mailbox primitives that were previously embedded
-in modules/mailbox.py. The higher-level inbox/outbox processing remains in
-mailbox_processing.py to keep the responsibilities separated.
+"""Core mailbox parsing, validation, persistence, and git helpers - the low-level
+primitives; higher-level inbox/outbox processing lives in processing.py.
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 logger = logging.getLogger(__name__)
 
-MAX_FILE_SIZE = 65536  # 64 KB
+MAX_FILE_SIZE = 65536
 MAX_RETRY = 3
 STATUS_DONE = "done"
 STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
@@ -186,12 +183,11 @@ class MailboxMessage:
         except ValueError as exc:
             meta, body, parse_error = {}, "", exc
 
-        # A command may name a credential - `curl -H "x-api-key: $AGENT_API_KEY"`
-        # is how a diagnostic reaches the local API - so its input is not
-        # screened (#220). What protects the credential is the outbound side:
-        # every command result is redacted before it reaches the outbox (see
-        # ``redact_outbound``). Every other message type is still rejected,
-        # because its text is stored or forwarded as it is.
+        # A command may name a credential (`curl -H "x-api-key: ..."` is how a
+        # diagnostic reaches the local API), so command input is not screened
+        # (#220); protection is on the outbound side - every command result is
+        # redacted before the outbox (``redact_outbound``). Every other message
+        # type is still rejected because its text is stored/forwarded as is.
         if meta.get("type", "").strip() != COMMAND_TYPE and _has_secret(text):
             raise ValueError("Potential secret detected in message content")
         if parse_error is not None:
@@ -413,9 +409,9 @@ def _build_outbox_content(
     lines += ["---", "", "## Result", "", result_body]
     content = "\n".join(lines) + "\n"
     if msg.msg_type == COMMAND_TYPE:
-        # Last stop before the outbox file is written and committed: the
-        # whole document, not only the stdout/stderr the processor already
-        # masked, so no field a command produced can carry a credential (#220).
+        # Last stop before the outbox write: redact the whole document, not only
+        # the stdout/stderr already masked, so no command-produced field can
+        # carry a credential (#220).
         content = redact_outbound(content)
     return content
 

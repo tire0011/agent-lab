@@ -5,9 +5,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
-# ---------------------------------------------------------------------------
 # Status constants — small deterministic state machine.
-# ---------------------------------------------------------------------------
 
 # Start of the error of a run the pipeline itself crashed in. Nexus reads it to
 # tell such a run from a judged attempt (#467).
@@ -36,11 +34,9 @@ _TERMINAL_STATUSES = (
     STATUS_INTERRUPTED,
 )
 
-# Valid forward state transitions. ``run_experiment`` walks this graph and
-# refuses to run twice: only queued -> implementing is a valid entry point
-# for new experiments. queued -> selecting is retained for backward
-# compatibility with any stored experiments that began under the old
-# multi-phase pipeline (research → selection → implementation).
+# Valid forward transitions; run_experiment walks this graph and refuses to run
+# twice (only queued -> implementing is a valid entry point; queued -> selecting
+# is kept for stored experiments from the old multi-phase pipeline).
 _STATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
     STATUS_QUEUED: (STATUS_IMPLEMENTING, STATUS_REJECTED, STATUS_FAILED, STATUS_SELECTING),
     STATUS_SELECTING: (STATUS_REJECTED, STATUS_IMPLEMENTING, STATUS_FAILED, STATUS_TIMED_OUT),
@@ -75,14 +71,10 @@ class ExperimentNotCancellableError(RuntimeError):
 class ExperimentPlan:
     """Structured feature plan as selected by the read-only selection phase.
 
-    ``change_kind``, ``required_artifacts``, and ``acceptance_criteria``
-    were added for the deterministic quality evaluation in
-    ``modules.experiment_evaluation`` (see ``validate_plan``/
-    ``evaluate_implementation``). They all default to safe,
-    backward-compatible values so plans parsed from an older raw model
-    response (before these keys existed) keep working unchanged —
-    ``change_kind`` defaults to ``"implementation"`` (the strictest of the
-    four kinds), and the two list fields default to empty.
+    ``change_kind``/``required_artifacts``/``acceptance_criteria`` serve the
+    deterministic quality evaluation (``experiment_evaluation``) and default to
+    safe values, so older stored plans keep working: ``change_kind`` defaults to
+    ``"implementation"``, the strictest kind; the lists default to empty.
     """
 
     title: str
@@ -121,7 +113,7 @@ class Experiment:
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
     # Coding agent that ran the implementation (codex | claude); None for
-    # experiments from before the second agent existed.
+    # pre-second-agent experiments.
     implementation_provider: str | None = None
     complexity: str | None = None
     source_type: str | None = None
@@ -301,4 +293,3 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
     )
 
 
-# ---------------------------------------------------------------------------

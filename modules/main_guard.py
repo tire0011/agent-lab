@@ -1,13 +1,9 @@
-"""Take back a Nexus merge that turned main red.
-
-CI runs on every push to main. When the newest commit on main is one of
-Nexus's own merges (its message carries the ``Nexus-Experiment:`` trailer)
-and that CI run failed, the merge is reverted, its issue is reopened, and the
-tick reports it. A merge that broke main must not stay there while every
-later experiment builds on it (the partial #410 crashed all of them).
-
-Only Nexus's own merge at the tip of main is reverted: a human commit, or a
-Nexus merge that something else already built on, is reported, not undone.
+"""Take back a Nexus merge that turned main red: when the tip of main is a Nexus
+merge (``Nexus-Experiment:`` trailer) whose CI failed, revert it, reopen its issue,
+and let the tick report it - a merge that broke main must not stay while later
+experiments build on it (#410). Only Nexus's own merge at the tip is reverted; a
+human commit, or a Nexus merge something else already built on, is reported, not
+undone.
 """
 
 from __future__ import annotations

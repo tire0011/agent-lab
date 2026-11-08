@@ -1,29 +1,11 @@
-"""Multi-Provider Orchestrator.
-
-Coordinates the strictly-sequential execution pipeline used when
-``--use-router`` is active.  Each step returns control to Nexus before the
-next role/provider is selected.
-
-Pipeline
---------
-1. **Router** (local model) — decides *provider* (local / azure_openai / codex)
-   and *role* (developer by default).  Roles and providers are independent:
-   any role can run on any provider.
-2. **Context Gatherer** (local model) — reads relevant files, git log, and
-   state; packages a compact context string for the downstream steps.
-3. **Planner** (local model) — breaks the task into ordered sub-tasks with
-   per-sub-task provider hints.
-4. **Developer** (chosen provider) — implements each sub-task.  External
-   providers receive only the prepared context, not the whole repo.
-5. **Verifier** (real tools: git diff + test runner) — produces an objective
-   pass/fail result.  No LLM involvement at this stage.
-6. **Reviewer** (local model) — interprets the real verification output and
-   returns a structured assessment.
-
-Provider/usage events are written to SQLite so costs and routing patterns can
-be reported later.  The ``provider_actually_used`` column records the provider
-that *ran* the sub-task, which may differ from the router hint if a fallback
-was triggered.
+"""Multi-Provider Orchestrator: the strictly-sequential pipeline used with
+``--use-router``, each step returning control to Nexus before the next role/provider
+is selected. Router (local) picks provider+role; context gatherer and planner (local)
+prepare context and sub-tasks; the developer step runs on the chosen provider and
+receives only the prepared context, not the whole repo; verification uses real tools
+(git diff + test runner, no LLM); the reviewer (local) interprets the result.
+Provider/usage events go to SQLite; ``provider_actually_used`` records what actually
+ran, which may differ from the router hint after a fallback.
 """
 
 from __future__ import annotations
@@ -43,7 +25,7 @@ from modules.llama_router import LlamaRouter, RouterDecision
 from modules.prompt_library import render_prompt
 
 
-# ── Result dataclasses ────────────────────────────────────────────────────────
+# Result dataclasses
 
 @dataclass
 class ContextResult:
@@ -114,38 +96,15 @@ class OrchestratorResult:
     error: str = ""
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────────
+# Orchestrator
 
 class MultiProviderOrchestrator:
-    """Coordinates a local model with Azure OpenAI and Codex for task execution.
-
-    The local model acts as the persistent brain: it routes, gathers context,
-    plans, and reviews.  External providers (azure_openai, codex) handle only
-    the developer step when the router selects them, and receive only the
-    context package prepared by the local model.
-
-    Parameters
-    ----------
-    llama_client:
-        Client for the local model server.
-    azure_run_fn:
-        Async callable ``(task: str) -> str`` that forwards the task to the
-        Azure OpenAI agent and returns its final text response.
-    codex_run_fn:
-        Async callable ``(task: str) -> str`` that forwards the task to the
-        Codex task service and returns its final text response.
-    db:
-        Open SQLite connection used to persist provider_usage and
-        model_consultations rows.
-    prompts_dir:
-        Override the default prompts directory (useful in tests).
-    repo_root:
-        Root directory of the repository for git diff / test runner.
-        Defaults to the ``REPO_ROOT`` env var or the current working directory.
-    test_cmd:
-        Command used to run the test suite during verification.  Defaults to
-        ``python -m pytest tests/ -q --tb=short``.
-    """
+    """Coordinates a local model with Azure OpenAI and Codex: the local model routes,
+    gathers context, plans and reviews; external providers handle only the developer
+    step and receive only the prepared context package. Params: llama_client,
+    azure_run_fn/codex_run_fn (``(task) -> str`` callables), db (SQLite),
+    prompts_dir override, repo_root (``REPO_ROOT`` or cwd), test_cmd (default
+    ``python -m pytest tests/ -q --tb=short``)."""
 
     def __init__(
         self,
@@ -170,20 +129,17 @@ class MultiProviderOrchestrator:
             prompts_dir=prompts_dir,
         )
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    # Public entry point
 
     async def run(self, task: str) -> OrchestratorResult:
-        """Execute *task* through the full sequential pipeline.
-
-        Returns an :class:`OrchestratorResult` regardless of whether the run
-        succeeded or failed; callers should check ``result.error``.
-        """
+        """Execute *task* through the full sequential pipeline; returns an
+        :class:`OrchestratorResult` either way - check ``result.error``."""
         result = OrchestratorResult(
             task=task,
             router_decision=RouterDecision(provider="local", role="developer"),
         )
 
-        # ── Step 1: Route ─────────────────────────────────────────────────────
+        # Step 1: Route
         try:
             decision = await self._router.route(task)
             result.router_decision = decision
@@ -191,7 +147,7 @@ class MultiProviderOrchestrator:
             result.error = f"Router failed: {exc}"
             return result
 
-        # ── Step 2: Gather context ────────────────────────────────────────────
+        # Step 2: Gather context
         try:
             ctx = await self._gather_context(task)
             result.context = ctx
@@ -199,7 +155,7 @@ class MultiProviderOrchestrator:
             result.error = f"Context gatherer failed: {exc}"
             return result
 
-        # ── Step 3: Plan ──────────────────────────────────────────────────────
+        # Step 3: Plan
         try:
             plan = await self._plan(task, ctx.context_package)
             result.plan = plan
@@ -207,7 +163,7 @@ class MultiProviderOrchestrator:
             result.error = f"Planner failed: {exc}"
             return result
 
-        # ── Step 4: Develop ───────────────────────────────────────────────────
+        # Step 4: Develop
         for sub_task in plan.sub_tasks:
             sub_desc = sub_task.get("description", str(sub_task))
             # Sub-task may override provider; fall back to router decision.
@@ -224,7 +180,7 @@ class MultiProviderOrchestrator:
                 result.error = f"Developer failed on sub-task {sub_desc!r}: {exc}"
                 return result
 
-        # ── Step 5: Verify (real tools) ───────────────────────────────────────
+        # Step 5: Verify (real tools)
         try:
             files_changed = [f for dr in result.developer_results for f in dr.files_changed]
             verification = self._verify(files_changed=files_changed)
@@ -233,7 +189,7 @@ class MultiProviderOrchestrator:
             result.error = f"Verifier failed: {exc}"
             return result
 
-        # ── Step 6: Review (local model interprets real results) ──────────────
+        # Step 6: Review (local model interprets real results)
         try:
             reviewer_result = await self._review(verification, result.developer_results)
             result.reviewer_result = reviewer_result
@@ -244,16 +200,12 @@ class MultiProviderOrchestrator:
         result.final_response = _build_final_response(result)
         return result
 
-    # ── Private step implementations ──────────────────────────────────────────
+    # Private step implementations
 
     async def _gather_context(self, task: str) -> ContextResult:
-        """Ask the local model to identify relevant files and prepare a context package.
-
-        Always provides deterministic, bounded repo evidence to the model even on
-        a clean worktree where ``git diff HEAD`` is empty: the tracked-file listing,
-        recent git log, and git status are included so the model never infers that
-        the repository is empty.
-        """
+        """Ask the local model to identify relevant files and prepare a context package,
+        always with deterministic bounded repo evidence (tracked files, git log,
+        status) so an empty ``git diff HEAD`` is never mistaken for an empty repo."""
         git_diff = _run_git_diff(self._repo_root)
         tracked_files = _list_tracked_files(self._repo_root, limit=100)
         git_log = _run_git_log(self._repo_root, lines=10)
@@ -274,8 +226,8 @@ class MultiProviderOrchestrator:
         try:
             data = extract_json(raw)
         except LlamaCppClientError:
-            # Build a deterministic fallback context so downstream steps always have
-            # repo evidence even when the model response cannot be parsed.
+            # Deterministic fallback context, so downstream steps always have repo
+            # evidence even when the model response cannot be parsed.
             fallback_context = (
                 f"Task: {task}\n\n"
                 f"Repository files:\n{tracked_files[:800]}\n\n"
@@ -344,16 +296,10 @@ class MultiProviderOrchestrator:
         return _parse_developer_response(raw, provider_hint=provider_hint, provider_used=provider_actually_used)
 
     def _verify(self, files_changed: list[str] | None = None) -> VerificationResult:
-        """Run real verification tools and return an objective result.
-
-        Uses ``git diff HEAD`` to capture changes.  If neither the git diff nor the
-        developer-reported ``files_changed`` list indicates any modifications, the
-        task is treated as read-only: the test suite is skipped and the verification
-        confirms only that the worktree remained clean.  For code-changing tasks the
-        configured test command is executed with a bounded timeout.
-
-        The LLM is not involved in this step.
-        """
+        """Run real verification tools (no LLM) and return an objective result. An empty
+        ``git diff HEAD`` and empty ``files_changed`` means read-only: skip the tests
+        and confirm the worktree stayed clean. Otherwise run the configured test
+        command with a bounded timeout."""
         git_diff = _run_git_diff(self._repo_root)
         is_read_only = not git_diff.strip() and not (files_changed or [])
 
@@ -428,7 +374,7 @@ class MultiProviderOrchestrator:
         return _parse_reviewer_response(raw, verification)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 def _run_git_diff(repo_root: str) -> str:
     """Return ``git diff HEAD`` output, or empty string on error."""
@@ -614,7 +560,7 @@ def _build_final_response(result: OrchestratorResult) -> str:
     return "\n".join(lines)
 
 
-# ── SQLite helpers ────────────────────────────────────────────────────────────
+# SQLite helpers
 # Note: the router_decisions, provider_usage, and model_consultations tables
 # are created by modules/run_store/schema.py (_migrate_router_tables). The orchestrator
 # relies on run_store.init_db() having been called before use.

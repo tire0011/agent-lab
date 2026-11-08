@@ -6,16 +6,35 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from modules.experiment_service import ExperimentService, STATUS_VERIFYING
 from modules.experiment_service.service import _test_file_for_id
 from modules.test_progress import parse_failed_test_ids
 from modules.verification_runner import VerificationRunResult, run_verification_test_monitored
 
-RUNNER = "modules.experiment_service.service.run_verification_test_monitored"
 TEST_A = "test_sample.T.test_a"
+
+
+# modules.experiment_service.service was split into modules/experiment_service/service_parts/
+# (#576): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_SERVICE_LOOKUPS = {
+    "run_verification_test_monitored": (
+        "modules.experiment_service.service_parts.verification",
+    ),
+}
+
+
+@contextmanager
+def _patch_service(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _SERVICE_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
 
 
 def _source(*methods: str) -> str:
@@ -141,7 +160,7 @@ class BaselineRecheckTests(unittest.TestCase):
         self._write_test(PASSING)
         self._commit()
         self._change_unrelated_file()
-        with patch(RUNNER, side_effect=[_stalled(), _stalled()]) as runner, patch.dict(
+        with _patch_service("run_verification_test_monitored", side_effect=[_stalled(), _stalled()]) as runner, patch.dict(
             os.environ, {"NEXUS_BASELINE_RECHECK_SECONDS": "7"},
         ):
             result = self._verify()
@@ -178,7 +197,7 @@ class BaselineRecheckTests(unittest.TestCase):
         passed = VerificationRunResult(
             0, "", "", False, None, 1, failed_test_ids=[], observed_test_ids=[TEST_A],
         )
-        with patch(RUNNER, side_effect=[_stalled(), passed]):
+        with _patch_service("run_verification_test_monitored", side_effect=[_stalled(), passed]):
             result = self._verify()
 
         self.assertEqual(result.status, "timed_out")
@@ -190,7 +209,7 @@ class BaselineRecheckTests(unittest.TestCase):
         self._change_unrelated_file()
         never_started = _stalled()
         never_started.observed_test_ids = []
-        with patch(RUNNER, side_effect=[_stalled(), never_started]):
+        with _patch_service("run_verification_test_monitored", side_effect=[_stalled(), never_started]):
             result = self._verify()
 
         self.assertEqual(result.status, "timed_out")
@@ -202,7 +221,7 @@ class BaselineRecheckTests(unittest.TestCase):
         self._change_unrelated_file()
         aborted = _stalled()
         aborted.aborted_test_id = None
-        with patch(RUNNER, return_value=aborted) as runner:
+        with _patch_service("run_verification_test_monitored", return_value=aborted) as runner:
             result = self._verify()
 
         self.assertEqual(result.status, "timed_out")
@@ -214,7 +233,7 @@ class BaselineRecheckTests(unittest.TestCase):
         self._commit()
         self._write_test(FAILING)
 
-        with patch(RUNNER, wraps=run_verification_test_monitored) as runner:
+        with _patch_service("run_verification_test_monitored", wraps=run_verification_test_monitored) as runner:
             result = self._verify()
 
         self.assertEqual(result.status, "failed")
@@ -349,7 +368,7 @@ class BaselineRecheckTests(unittest.TestCase):
             1, "", "", False, None, 1, failed_test_ids=[TEST_A],
             observed_test_ids=[TEST_A],
         )
-        with patch(RUNNER, side_effect=[failed, RuntimeError("runner broke")]):
+        with _patch_service("run_verification_test_monitored", side_effect=[failed, RuntimeError("runner broke")]):
             result = self._verify()
 
         self.assertEqual(result.status, "failed")

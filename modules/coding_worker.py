@@ -1,24 +1,10 @@
-"""Shared building blocks for the external coding-agent workers.
-
-Nexus can delegate a bounded coding task to more than one external CLI agent
-(Codex via ``modules.codex_worker``, Claude Code via ``modules.claude_worker``).
-Both must be interchangeable for their callers — ``CodexTaskService`` and the
-implementation phase of ``ExperimentService`` pick one at runtime — so the
-result shape, the sandbox vocabulary, the validation rules, and the
-environment minimisation live here once instead of being duplicated per agent.
-
-A worker implementation is expected to:
-
-  - run its CLI as a subprocess, never via ``shell=True`` and never from a
-    shell-composed command string;
-  - reject an invalid configuration before starting anything
-    (``validate_worker_config``);
-  - cap stdout/stderr (``truncate_output``) and flag the truncation;
-  - pass only the variables its CLI needs (``filtered_env``), never the full
-    environment, so application secrets such as ``AGENT_API_KEY`` cannot leak
-    into an external agent;
-  - return a :class:`WorkerResult` describing what happened, including which
-    provider produced it.
+"""Shared building blocks for the external coding-agent workers (Codex, Claude),
+so both are interchangeable for their callers. A worker must: run its CLI as a
+subprocess, never via ``shell=True`` or a shell-composed string; reject invalid
+config before starting anything (``validate_worker_config``); cap stdout/stderr
+(``truncate_output``); pass only the variables its CLI needs (``filtered_env``) -
+application secrets such as ``AGENT_API_KEY`` are never handed to an external
+agent; and return a :class:`WorkerResult` naming the provider.
 """
 
 from __future__ import annotations
@@ -33,15 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-# Sandbox vocabulary shared by every worker. Each implementation maps these
-# to whatever its own CLI offers; the *meaning* is fixed here:
-#   read-only          -> may inspect the working directory, must not change it
-#   workspace-write    -> may change files inside the working directory
-#   danger-full-access -> no confinement; only ever on explicit request
+# Sandbox vocabulary shared by every worker (each CLI maps these to its own flags;
+# the meaning is fixed here): read-only may inspect but must not change the
+# working directory; workspace-write may change files inside it; danger-full-access
+# has no confinement and is only ever used on explicit request.
 SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
-# Environment variables every CLI needs regardless of provider. Provider
-# specific additions (auth, endpoints, config homes) are passed by the worker.
+# Environment variables every CLI needs regardless of provider; provider-specific
+# additions (auth, endpoints, config homes) are passed by the worker.
 BASE_ENV_PASSTHROUGH: frozenset[str] = frozenset(
     {
         "HOME",
@@ -63,13 +48,8 @@ class WorkerConfigError(ValueError):
 
 @dataclass
 class WorkerResult:
-    """Outcome of one external coding-agent call.
-
-    ``provider`` names the agent that produced this result (``"codex"``,
-    ``"claude"``, …). It defaults to ``"codex"`` because that was the only
-    provider before the Claude worker existed, so results constructed by
-    older code keep their meaning.
-    """
+    """Outcome of one external coding-agent call. ``provider`` names the agent
+    (defaults to ``"codex"``, the only provider older code knew)."""
 
     success: bool
     exit_code: int | None
@@ -121,11 +101,8 @@ def truncate_output(text: str, max_bytes: int) -> tuple[str, bool]:
 
 
 def validate_worker_config(task: str, working_dir: str, sandbox: str) -> None:
-    """Reject an unusable call before any subprocess is started.
-
-    Raises ``WorkerConfigError`` for an empty task, an unknown sandbox mode,
-    a relative working directory, or a working directory that does not exist.
-    """
+    """Reject an unusable call before any subprocess starts: empty task, unknown
+    sandbox, relative or non-existing working directory -> ``WorkerConfigError``."""
     if not task or not task.strip():
         raise WorkerConfigError("task must not be empty")
 
@@ -147,26 +124,20 @@ def validate_worker_config(task: str, working_dir: str, sandbox: str) -> None:
 
 
 def filtered_env(extra_keys: frozenset[str] | set[str] | tuple[str, ...] = ()) -> dict[str, str]:
-    """Minimal environment for a worker subprocess.
-
-    Only ``BASE_ENV_PASSTHROUGH`` plus the provider's own *extra_keys* are
-    passed on. Application secrets (``AGENT_API_KEY`` and friends) are never
-    handed to an external agent.
-    """
+    """Minimal environment for a worker subprocess: only ``BASE_ENV_PASSTHROUGH``
+    plus the provider's *extra_keys*; application secrets (``AGENT_API_KEY`` and
+    friends) are never handed to an external agent."""
     allowed = BASE_ENV_PASSTHROUGH | frozenset(extra_keys)
     return {key: value for key, value in os.environ.items() if key in allowed}
 
 
-# Progress-aware agent runs (#327). A coding agent is no longer bounded by a
-# fixed wall-clock timeout: 20 minutes cut off finished work (#319, #326).
-# Instead every line the agent writes counts as progress. The run is stopped
-# only when the agent has been silent for the stall window, or, as a final
-# guard, when the absolute cap is reached.
+# Progress-aware agent runs (#327): every output line counts as progress, so the
+# run stops only after a silent stall window, or at the absolute cap as a final
+# guard (a fixed timeout cut off finished work, #319/#326).
 AGENT_STALL_ENV_VAR = "NEXUS_AGENT_STALL_SECONDS"
 AGENT_MAX_ENV_VAR = "NEXUS_AGENT_MAX_SECONDS"
-# 30 minutes: a coding agent says nothing while its own test run is going, and
-# the full suite on the VM can take longer than 10 minutes (#340 was stopped
-# after 26 minutes of good work, during a silent stretch of 10).
+# 30 min default: an agent says nothing while its own test run is going (#340 was
+# stopped after 26 min of good work during a 10 min silent stretch).
 DEFAULT_AGENT_STALL_SECONDS = 1800
 DEFAULT_AGENT_MAX_SECONDS = 3 * 60 * 60
 # Floors for values from the environment, like NEXUS_TEST_STALL_SECONDS (#209).
@@ -176,15 +147,13 @@ MIN_AGENT_MAX_SECONDS = 30 * 60
 STOP_STALLED = "stalled"
 STOP_MAX_RUNTIME = "max_runtime"
 
-# Output kept while the agent runs (review on #328): the start (Codex names its
-# thread there) and the end (result and usage events), never all of it.
+# Output kept while the agent runs (#328 review): head and tail only, never all.
 CAPTURE_HEAD_BYTES = 64 * 1024
 CAPTURE_TAIL_BYTES = 1024 * 1024
 # Time the agent's process group gets to exit after SIGTERM before SIGKILL.
 TERMINATE_GRACE_SECONDS = 10.0
-# While the agent is alive a progress entry is logged at least this often
-# (#400), so the experiment stall sweep has something to read and a silent
-# worker stands out in the log.
+# Progress is logged at least this often while the agent lives (#400), so the
+# stall sweep has something to read and a silent worker stands out.
 PROGRESS_HEARTBEAT_SECONDS = 10 * 60
 
 
@@ -273,15 +242,11 @@ def run_watched(
     on_heartbeat: Callable[[float, float], None] | None = None,
     heartbeat_seconds: float = PROGRESS_HEARTBEAT_SECONDS,
 ) -> WatchedRun:
-    """Run *cmd* and stop it only when it stalls or reaches the absolute cap.
-
-    Any line on stdout or stderr is progress. The agent runs in its own
-    process group, so stopping it also stops the commands it started; after
-    a normal exit, leftovers of that group are stopped too. Raises ``OSError``
-    (including ``FileNotFoundError``) when the process cannot be started.
-
-    While the agent runs, *on_heartbeat* is called every *heartbeat_seconds*
-    with the runtime and the seconds since its last output line.
+    """Run *cmd*, stopping it only on a stall or at the absolute cap. Any output
+    line is progress. The agent runs in its own process group, so stopping it
+    also stops its children; leftovers are stopped after a normal exit too.
+    Raises ``OSError`` (incl. ``FileNotFoundError``) if the process cannot start.
+    Calls *on_heartbeat* every *heartbeat_seconds* with runtime and silence time.
     """
     proc = subprocess.Popen(
         cmd,
