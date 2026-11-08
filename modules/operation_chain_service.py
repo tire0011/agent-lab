@@ -90,14 +90,9 @@ class OperationChainService:
             self.outbox_dir = Path(outbox_dir)
         self.db_path = db_path
         self.operations_registry = operations_registry
-        # RLock (not Lock): several code paths call locked helper methods while
-        # already holding the lock (e.g. the exception handler in
-        # _run_chain_pipeline calls _get_created_at/_get_started_at/_store_result
-        # while holding self._lock). A plain Lock would deadlock there; an RLock
-        # allows safe reentrant acquisition from the same thread while still
-        # serializing all sqlite3 access across threads (the shared connection
-        # is opened with check_same_thread=False and is not safe for
-        # unsynchronized concurrent use).
+        # RLock: locked helpers are called while the lock is already held (e.g.
+        # in _run_chain_pipeline's exception handler); it still serializes all
+        # access to the shared check_same_thread=False connection.
         self._lock = threading.RLock()
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
@@ -105,13 +100,8 @@ class OperationChainService:
         self._running_threads: dict[str, threading.Thread] = {}
 
     def close(self) -> None:
-        """Join any still-running chain-execution threads before closing the
-        shared sqlite3 connection. The connection is opened with
-        check_same_thread=False specifically so the background pipeline
-        threads can use it, so it must not be closed (or its backing file
-        removed) while one of those threads might still be executing a
-        query -- doing so corrupts the connection and can segfault the
-        interpreter."""
+        """Join running chain threads before closing the shared sqlite3
+        connection; closing it under a running query corrupts it."""
         for thread in list(self._running_threads.values()):
             thread.join(timeout=10)
         self._conn.close()
@@ -132,11 +122,8 @@ class OperationChainService:
                 steps_successful=0,
                 steps_failed=0,
             )
-            # Rejected chains still need a persistent row before the outbox
-            # publish lifecycle is recorded.  Previously _store_result() and
-            # _write_outbox_result() only issued UPDATE statements against a
-            # row that did not exist yet, leaving an untracked outbox file with
-            # no DB publish state and permanently blocking later mailbox polls.
+            # Rejected chains need a row before the outbox lifecycle is recorded,
+            # or the outbox file stays untracked and blocks later polls.
             with self._lock:
                 chain_id = uuid.uuid4().hex
                 now = _now_iso()

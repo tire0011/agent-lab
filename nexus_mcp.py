@@ -51,11 +51,10 @@ _TESTS_MAX_OUTPUT_BYTES: int = 512 * 1024  # 512 KiB
 
 
 def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
-    """Run ``python -m unittest discover`` with streaming output bounding.
+    """Run ``python -m unittest discover`` with bounded streaming output.
 
-    A ``threading.Timer`` enforces the wall-clock deadline independently of
-    stdout state, so a test process that closes its pipe early cannot bypass
-    the timeout.  The entire process group is killed when the deadline fires.
+    A timer enforces the deadline even if the process closes its stdout early,
+    and kills the whole process group.
     """
     from modules.redaction import bounded_lines
 
@@ -561,11 +560,8 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         limit = _validate_limit(limit, minimum=1, maximum=200)
         return {"log": _read_command(["git", "log", f"-{limit}", "--format=%h %ad %s", "--date=short"])}
 
-    # ------------------------------------------------------------------
-    # Write tools — only active when MCP_WRITE_ENABLED=true
-    # All tools call _require_write_enabled() as their first action so
-    # they fail immediately (and loudly) when the flag is off.
-    # ------------------------------------------------------------------
+    # Write tools, only with MCP_WRITE_ENABLED=true: each calls
+    # _require_write_enabled() first.
 
     @mcp.tool(
         description=(
