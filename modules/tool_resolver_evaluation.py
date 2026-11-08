@@ -71,6 +71,7 @@ _TOOL_SEARCH_STOP_WORDS = {
     "needs",
     "nexus",
     "of",
+    "repository",
     "show",
     "the",
     "to",
