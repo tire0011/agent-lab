@@ -30,6 +30,8 @@ _DEFAULT_CI_WORKFLOW = "tests.yml"
 _DEFAULT_CI_START_TIMEOUT_SECONDS = 90.0
 _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS = 1500.0
 _DEFAULT_CI_POLL_INTERVAL_SECONDS = 10.0
+NEED_TITLE_PREFIX = "Nexus needs: "
+NEED_ISSUES_PER_DAY = 3
 _MAX_COMMIT_TITLE_CHARS = 72
 _MAX_CI_FAILURE_DETAIL_CHARS = 8000
 _MAX_CI_FAILURE_TAIL_LINES = 80
@@ -1541,6 +1543,33 @@ class GitHubWorkTrackingService:
             if _normalise_title(str(item.get("title") or "")) == wanted
         ]
         return matches[0] if len(matches) == 1 else None
+
+    def open_need_issue(self, title: str, body: str, *, daily_limit: int = NEED_ISSUES_PER_DAY) -> dict[str, Any]:
+        """Ask the owner for something Nexus cannot get itself (#592).
+
+        Opens a ``proposal`` issue titled ``Nexus needs: ...``, so the tick
+        does not work on it. An open issue with the same title is reused; at
+        most ``daily_limit`` new ones a day.
+        """
+        title = self._issue_title(title, body)
+        if not title.lower().startswith(NEED_TITLE_PREFIX.lower()):
+            title = f"{NEED_TITLE_PREFIX}{title}"[:240]
+        existing = self._find_exact_open_issue(title)
+        if existing:
+            return {"number": existing.get("number"), "url": existing.get("html_url"), "reused": True}
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        query = urllib.parse.urlencode(
+            {"q": f'repo:{self.repository} is:issue in:title "{NEED_TITLE_PREFIX.strip()}" created:>={today}', "per_page": 1}
+        )
+        if int(self._request("GET", f"/search/issues?{query}").get("total_count") or 0) >= daily_limit:
+            raise GitHubWorkTrackingError(f"daily limit of {daily_limit} need issues reached")
+        footer = "\n\n---\nOpened by Nexus because it is blocked. Remove the `proposal` label to let Nexus work on it."
+        issue = self._request(
+            "POST",
+            f"/repos/{self.repository}/issues",
+            {"title": title, "body": body[:30000] + footer, "labels": ["proposal"]},
+        )
+        return {"number": issue.get("number"), "url": issue.get("html_url"), "reused": False}
 
     def _create_issue(self, title: str, content: str) -> dict[str, Any]:
         body = (
