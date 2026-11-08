@@ -1,39 +1,16 @@
-"""Shared, persistent publish lifecycle for all outbox results.
+"""Shared, persistent publish lifecycle for all outbox results. Every async producer
+supplies only an ``OutboxMessage`` (``id`` and ``content``); this module derives the
+canonical path, atomically writes the file, commits the exact file, pushes, and
+persists the state: pending_write -> written -> committing -> committed -> pushed,
+failed retryable. Recovery is idempotent per the documented contract (re-write from
+content, commit+push existing file, push existing commit, adopt matching untracked
+file, never stage foreign files).
 
-Every asynchronous producer (MailboxTaskService, OperationChainService, and
-FailureAnalysisService) supplies only an :class:`OutboxMessage` (``id`` and
-``content``). This module derives the canonical path, atomically writes the
-file, commits the exact file, pushes it, and persists the resulting state.
-
-Lifecycle
----------
-    pending_write  → written  → committing  → committed  → pushed
-                                                         ↘ failed (retryable)
-
-Recovery contract (per acceptance criteria)
--------------------------------------------
-1. DB=pending_write, file missing          → re-write from content_fn, then commit+push.
-2. DB=written/pending, file present        → commit + push.
-3. DB=committed, commit_sha present        → push existing commit only.
-4. DB=pushed but push was not applied      → caller detects via remote check; n/a here.
-5. Repeated calls are idempotent.
-6. Concurrent publishers are serialised via a per-repo file lock.
-7. Existing untracked matching file is adopted as-is.
-8. Foreign untracked/dirty files → safe error; never staged or committed.
-
-Security
---------
-- Only ``MailboxConfig.mailbox_repo_path`` / ``outbox_dir`` are touched.
-- Path-traversal and symlink protection on every path.
-- Exact pathspec on ``git add`` and ``git commit``; never ``git add -A``.
-- No force-push.
-- ``shell=False`` throughout.
-- Per-repo ``fcntl.flock`` lock serialises write/commit/push across threads
-  and processes.
-- No secrets / remote URLs in logs.
-- Atomic write via temp file + rename.
-- A publish error never mutates the caller's business-logic DB state.
-"""
+Security: only the configured mailbox repo/outbox is touched; path-traversal and
+symlink protection on every path; exact pathspec on add/commit, never ``git add -A``;
+no force-push; ``shell=False`` throughout; per-repo flock serialises across threads and
+processes; no secrets/URLs in logs; atomic temp-file+rename writes; a publish error
+never mutates the caller's business-logic DB state."""
 
 from __future__ import annotations
 
@@ -55,15 +32,9 @@ logger = logging.getLogger(__name__)
 
 
 def git_push(repo_root: Any) -> bool:
-    """Push the mailbox repo, resolving ``modules.mailbox`` at call time.
-
-    Imported lazily rather than at module scope: ``modules.mailbox``'s package
-    __init__ eagerly installs the finalizing task service, which imports
-    ``modules.mailbox.task_service``, which imports this module - so importing
-    ``modules.outbox_publisher`` first raised `ImportError: cannot import name
-    'PUBLISH_PENDING_WRITE' from partially initialized module`. That made whole
-    test files uncollectable depending on import order.
-    """
+    """Push the mailbox repo, resolving ``modules.mailbox`` at call time - imported lazily
+    because the mailbox package __init__ transitively imports this module, and importing it
+    first raised ImportError from the partially initialized module."""
     from modules.mailbox import git_push as _git_push
 
     return _git_push(repo_root)
@@ -79,8 +50,8 @@ PUBLISH_COMMITTED = "committed"
 PUBLISH_PUSHED = "pushed"
 PUBLISH_FAILED = "failed"
 
-# Legacy alias: operation_chains used "pending" before this module existed.
-# Treat it the same as PUBLISH_WRITTEN so that old rows are handled correctly.
+# Legacy alias: operation_chains used "pending" before this module existed; treat it
+# as PUBLISH_WRITTEN so old rows are handled correctly.
 _PENDING_COMPAT = "pending"
 
 _ACTIONABLE_STATUSES = {
@@ -100,11 +71,8 @@ _ACTIONABLE_STATUSES = {
 
 @dataclass(frozen=True, slots=True)
 class OutboxMessage:
-    """Producer-owned outbox payload.
-
-    Deliberately contains no filename or path.  The publisher is the sole
-    owner of mapping a message to a location in the configured outbox.
-    """
+    """Producer-owned outbox payload - deliberately no filename or path: the publisher is
+    the sole owner of mapping a message to a location in the configured outbox."""
 
     id: str
     content: str
@@ -119,7 +87,7 @@ class PublishRecord:
     publish_commit_sha: str | None = None
     publish_retry_count: int = 0
     content_available: bool = True
-    # Read only for rows created before #180. New producers never supply paths.
+    # Read only for rows created before #180; new producers never supply paths.
     legacy_outbox_file: str | None = field(default=None, compare=False)
 
     @property
@@ -138,7 +106,7 @@ class RepoLock:
     def __init__(self, repo_root: Path) -> None:
         lock_dir = repo_root / ".git"
         if not lock_dir.is_dir():
-            # bare repo or misconfigured; fall back to repo root
+            # Bare repo or misconfigured; fall back to the repo root.
             lock_dir = repo_root
         self._lock_path = lock_dir / "outbox_publisher.lock"
         self._fd: int | None = None
@@ -167,23 +135,10 @@ class RepoLock:
 
 
 class OutboxPublisher:
-    """Shared git-lifecycle publisher for outbox results.
-
-    Instantiate once per process; the class serialises concurrent calls via a
-    per-repo file lock so that multiple threads (or a concurrent process) never
-    produce duplicate commits for the same file.
-
-    Parameters
-    ----------
-    mailbox_config:
-        ``MailboxConfig`` instance that provides ``mailbox_repo_path`` and
-        ``outbox_dir``.  At least one of *mailbox_config* or *repo_root* must
-        be supplied.
-    db_path:
-        Path to the SQLite state database.
-    repo_root:
-        Mailbox repository root when *mailbox_config* is ``None``.
-    """
+    """Shared git-lifecycle publisher for outbox results: instantiate once per process; a
+    per-repo file lock serialises concurrent calls so threads or a concurrent process never
+    produce duplicate commits for the same file. Takes a ``MailboxConfig`` (or a bare
+    ``repo_root``) plus the SQLite ``db_path`` for publish state."""
 
     def __init__(
         self,
@@ -219,11 +174,8 @@ class OutboxPublisher:
     # ------------------------------------------------------------------
 
     def publish(self, record: PublishRecord) -> bool:
-        """Publish one record through the full lifecycle.
-
-        Returns True if the record reached PUBLISH_PUSHED, False otherwise.
-        The caller's business-logic state is never changed by this method.
-        """
+        """Publish one record through the full lifecycle; True once it reached PUBLISH_PUSHED.
+        The caller's business-logic state is never changed by this method."""
         with self._repo_lock:
             self._enqueue_notification(record)
             published = self._publish_locked(record)
@@ -232,19 +184,12 @@ class OutboxPublisher:
         return published
 
     def _enqueue_notification(self, record: PublishRecord) -> None:
-        """Persist the intent to announce this message *before* pushing it.
-
-        The enqueue has to precede the ``pushed`` transition, not follow it.
-        A record that reaches ``pushed`` is never selected by ``fetch_pending``
-        again, so a crash between the push and the enqueue would strand that
-        message with no notification row for ``deliver_pending`` to recover -
-        the one outcome the notification contract does not allow.
-
-        Enqueuing first trades that for a weaker, self-healing failure mode:
-        a message whose publish then fails is announced from content the
-        producer had already committed to SQLite, while the file itself is
-        still retried by the next poll.
-        """
+        """Persist the intent to announce this message *before* pushing it: a record that
+        reaches ``pushed`` is never selected by ``fetch_pending`` again, so a crash between push
+        and enqueue would strand the message with no notification row - the one outcome the
+        contract disallows. Enqueuing first trades that for a self-healing failure mode (a
+        failed publish is still announced from the producer's durable content, while the file
+        is retried by the next poll)."""
         if self._notifier is None:
             return
         try:
@@ -257,12 +202,9 @@ class OutboxPublisher:
             )
 
     def _notify(self, record: PublishRecord) -> None:
-        """Announce a published message on the communication PR (#196).
-
-        Best-effort by construction: the row enqueued above is already
-        durable, so a failure here only delays delivery to the next
-        ``deliver_pending`` sweep and never undoes a pushed outbox message.
-        """
+        """Announce a published message on the communication PR (#196). Best-effort: the row is
+        already durable, so a failure only delays delivery to the next ``deliver_pending`` sweep
+        and never undoes a pushed message."""
         if self._notifier is None:
             return
         try:
@@ -339,8 +281,8 @@ class OutboxPublisher:
             return False
 
         if path.is_file():
-            # File already exists (e.g. a previous run wrote it but crashed
-            # before advancing the state).  Adopt as-is.
+            # File already exists (previous run wrote it but crashed before advancing the state):
+            # adopt as-is.
             self._record_outbox_file(record, path)
             self._advance_status(record, PUBLISH_WRITTEN)
             try:
@@ -379,7 +321,7 @@ class OutboxPublisher:
         """written/committing → commit → committed → push → pushed."""
         self._advance_status(record, PUBLISH_COMMITTING)
 
-        # Check for foreign dirty files before touching the index
+        # Check for foreign dirty files before touching the index.
         expected_rel = str(path.relative_to(self._repo_root))
         if self._has_foreign_dirty_files(expected_rel):
             self._on_error(record, "foreign dirty files in mailbox repo; aborting")
@@ -404,12 +346,9 @@ class OutboxPublisher:
         return True
 
     def _push_and_record(self, record: PublishRecord) -> bool:
-        """committed → push only (commit already exists).
-
-        If the commit is already on the remote (push succeeded but DB update
-        crashed), we detect this via ``git branch -r --contains <sha>`` and
-        mark the record as pushed without a duplicate push.
-        """
+        """committed If the commit is already on the remote (push
+        succeeded but the DB update crashed), detect it via ``git branch -r --contains <sha>``
+        and mark pushed without a duplicate push."""
         sha = record.publish_commit_sha
         if sha and self._commit_already_on_remote(sha):
             logger.info(
@@ -427,7 +366,7 @@ class OutboxPublisher:
     def _recover_failed(self, record: PublishRecord) -> bool:
         """Best-effort recovery for a previously-failed record."""
         if record.publish_commit_sha:
-            # Commit exists → just retry push
+            # Commit exists -> just retry the push.
             return self._push_and_record(record)
 
         try:
@@ -435,7 +374,7 @@ class OutboxPublisher:
         except ValueError:
             path = None
         if path is not None and path.is_file():
-            # Synthesise a written record to resume the pipeline
+            # Synthesise a written record to resume the pipeline.
             pseudo = PublishRecord(
                 message=record.message,
                 publish_status=PUBLISH_WRITTEN,
@@ -495,12 +434,10 @@ class OutboxPublisher:
         return path
 
     def _validate_outbox_path_for_write(self, outbox_file: str) -> Path:
-        """Validate path structure and containment *before* the file exists.
-
-        Unlike ``_validate_outbox_path`` this does not require the file to be
-        present on disk, making it safe to call at the start of
-        ``_write_then_publish`` before any directory/file is created.
-        """
+        """Validate path structure and containment *before* the file exists (safe to call at
+        the start of ``_write_then_publish``). The parent dir is resolved to check containment
+        without requiring the file itself; ``is_relative_to`` avoids false positives from
+        string-prefix matching (e.g. /outbox_extra vs /outbox)."""
         rel = Path(outbox_file)
         if rel.is_absolute():
             raise ValueError("outbox path must be relative")
@@ -544,14 +481,10 @@ class OutboxPublisher:
         return path
 
     def _has_foreign_dirty_files(self, expected_rel: str) -> bool:
-        """Return True if there are foreign *staged* changes in the index.
-
-        Unstaged modifications and untracked files are harmless because
-        ``git add -- <path>`` and ``git commit -- <path>`` only touch the
-        exact pathspec.  We abort only when another process has already staged
-        foreign changes that would pollute the index in a way we cannot undo
-        safely.
-        """
+        """Return True if there are foreign *staged* changes in the index. Unstaged modifications
+        and untracked files are harmless - ``git add -- <path>``/``git commit -- <path>`` touch
+        only the exact pathspec; abort only when another process already staged foreign changes
+        that would pollute the index irreversibly."""
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=str(self._repo_root),
@@ -564,13 +497,14 @@ class OutboxPublisher:
         for line in result.stdout.splitlines():
             if len(line) < 3:
                 continue
+            # Column 1 is the staging-area status.
             index_status = line[0]  # column 1: staging-area status
             file_path = line[3:].strip('"')
             # Skip untracked files and unstaged-only changes (index_status == ' ').
             if index_status in (" ", "?"):
                 continue
-            # A staged change for a file OTHER than our expected outbox file is
-            # foreign and must not be swept into the commit.
+            # A staged change for a file other than our expected outbox file is foreign and must
+            # not be swept into the commit.
             if file_path != expected_rel:
                 return True
         return False
@@ -589,11 +523,8 @@ class OutboxPublisher:
         return result.returncode == 0
 
     def _commit_exact_file(self, record_id: str, path: Path) -> str | None:
-        """Commit only *path* and return the new HEAD SHA.
-
-        If the file is already committed (crash-recovery scenario) the
-        existing SHA is returned without creating a duplicate commit.
-        """
+        """Commit only *path* and return the new HEAD SHA; if the file is already committed
+        (crash after commit, before DB write) return the existing SHA without a duplicate."""
         rel = str(path.relative_to(self._repo_root))
         message = f"outbox: publish {record_id}"
         result = subprocess.run(
@@ -632,12 +563,8 @@ class OutboxPublisher:
         return result.stdout.strip()
 
     def _commit_already_on_remote(self, sha: str) -> bool:
-        """Return True if *sha* is reachable from any remote-tracking branch.
-
-        This detects the "push succeeded, DB update crashed" scenario:
-        ``git push`` applied the commit but the process died before advancing
-        ``publish_status`` to ``pushed``.
-        """
+        """Return True if *sha* is reachable from any remote-tracking branch - detects "push
+        succeeded, DB update crashed" so the record is marked pushed without a duplicate push."""
         result = subprocess.run(
             ["git", "branch", "-r", "--contains", sha],
             cwd=str(self._repo_root),
@@ -673,22 +600,17 @@ class OutboxPublisher:
 
 
 class _TablePublisher(OutboxPublisher):
-    """OutboxPublisher backed by a specific SQLite table.
-
-    Subclasses set ``_TABLE``, ``_ID_COLUMN``, and ``_COMMIT_SHA_COLUMN``.
-    """
+    """OutboxPublisher backed by a specific SQLite table; subclasses set ``_TABLE``,
+    ``_ID_COLUMN`` and ``_COMMIT_SHA_COLUMN``."""
 
     _TABLE: str = ""
     _ID_COLUMN: str = "request_id"
     _COMMIT_SHA_COLUMN: str = "publish_commit_sha"
 
     def write_message(self, message: OutboxMessage) -> str:
-        """Atomically create the publisher-owned file for a producer payload.
-
-        The producer supplies only ``id`` and ``content``.  Persisting the
-        canonical path and advancing ``pending_write`` to ``written`` happen
-        under the same repository lock used by publication.
-        """
+        """Atomically create the publisher-owned file for a producer payload (only ``id`` and
+        ``content`` supplied); persisting the canonical path and advancing pending_write ->
+        written happen under the same repository lock as publication."""
         record = PublishRecord(message=message, publish_status=PUBLISH_PENDING_WRITE)
         with self._repo_lock:
             path = self._canonical_path(message)
@@ -842,16 +764,10 @@ class TaskApprovalOutboxPublisher(_TablePublisher):
 
 
 class FailureAnalysisOutboxPublisher(_TablePublisher):
-    """Publishes failure-analysis outbox notifications (#148).
-
-    Same shared git lifecycle as the other producers: the analysis service
-    persists the message content, and this publisher owns the file path,
-    atomic write, commit, and push. A given
-    analysis row is only ever picked up here once its ``publish_status``
-    leaves ``pushed`` behind is impossible - ``fetch_pending`` simply never
-    selects a ``pushed`` row again, so restart/re-polling cannot produce a
-    second commit for the same analysis.
-    """
+    """Publishes failure-analysis outbox notifications (#148): same shared git lifecycle -
+    the analysis service persists the content, this publisher owns path, atomic write,
+    commit and push. A ``pushed`` row is never selected by ``fetch_pending`` again, so
+    restarts and re-polls cannot produce a second commit for the same analysis."""
 
     _TABLE = "failure_analyses"
     _ID_COLUMN = "id"

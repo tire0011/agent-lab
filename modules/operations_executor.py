@@ -1,13 +1,6 @@
-"""Central executor for self-healing operations.
-
-All operations are:
-* dispatched through the registered operation implementation,
-* run with a timeout,
-* logged to the ``operation_log`` SQLite table via :func:`modules.run_store.log_operation`.
-
-Sensitive output is redacted before storage and before being returned to
-API callers.
-"""
+"""Central executor for self-healing operations: every operation is dispatched through
+its registered implementation, run with a timeout, and logged to the ``operation_log``
+table; sensitive output is redacted before storage and before being returned."""
 
 from __future__ import annotations
 
@@ -32,27 +25,22 @@ from modules.log_reader import LogReader
 from modules.redaction import redact
 from modules.service_operations import ServiceOperations
 
-# A lock file is considered stale only when it is older than this threshold
-# AND its owning process (if recorded inside the file) is no longer alive.
+# A lock file is stale only when older than this threshold AND its owning process
+# (if a PID is recorded inside) is no longer alive.
 _LOCK_STALE_AGE_SECONDS: int = 3600  # 1 hour
 
-# Keys whose values must never be stored in the audit log parameters/results.
+# Keys whose values must never be stored in the audit log.
 _AUDIT_REDACT_KEYS_RE = re.compile(r"(?i)(key|secret|token|password|credential|value)")
 
-# Keys whose string values must be run through the string redactor before
-# storage (they may contain embedded secrets even though the key name itself
-# does not match the sensitive-key pattern).
+# Keys whose string values go through the string redactor before storage - they can
+# contain embedded secrets (e.g. tokens inside a shell command) even though the key
+# name itself does not match the sensitive-key pattern.
 _AUDIT_REDACT_VALUE_KEYS: frozenset[str] = frozenset({"command"})
 
 
 def _is_stale_lock(path: Path) -> bool:
-    """Return True only if *path* is definitely a stale, ownerless lock file.
-
-    A lock is considered safe to remove when **all** of the following hold:
-    1. The file is older than ``_LOCK_STALE_AGE_SECONDS``.
-    2. The file does NOT contain a PID of a running process (if it contains
-       one at all — empty/non-numeric files satisfy this condition trivially).
-    """
+    """Return True only if *path* is definitely a stale, ownerless lock file: older than
+    ``_LOCK_STALE_AGE_SECONDS`` AND (no PID recorded OR that PID is dead)."""
     try:
         age = time.time() - path.stat().st_mtime
         if age < _LOCK_STALE_AGE_SECONDS:
@@ -62,21 +50,21 @@ def _is_stale_lock(path: Path) -> bool:
         try:
             content = path.read_text(errors="replace").strip()
         except OSError:
-            # Can't read → treat as potentially active.
+            # Unreadable -> treat as potentially active.
             return False
 
         if content.isdigit():
             pid = int(content)
             try:
-                # Signal 0 checks liveness without actually signalling.
+                # Signal 0 checks liveness without signalling.
                 os.kill(pid, 0)
-                # Process is alive → lock is not stale.
+                # Process alive -> lock is not stale.
                 return False
             except ProcessLookupError:
-                # PID does not exist → process is gone.
+                # PID does not exist -> process is gone.
                 pass
             except PermissionError:
-                # Process exists but we can't signal it → treat as active.
+                # Process exists but we cannot signal it -> treat as active.
                 return False
 
         return True
@@ -96,17 +84,10 @@ def _redact_audit_value(v: object) -> object:
 
 
 def _redact_audit_dict(d: dict | None) -> dict:
-    """Return a deep copy of *d* with sensitive values replaced at any depth.
-
-    Keys matching the sensitive-key pattern have their value replaced with
-    ``"***"`` regardless of how deeply they are nested.  Keys in
-    ``_AUDIT_REDACT_VALUE_KEYS`` have their string values run through the
-    string redactor so that embedded secrets (e.g. tokens inside a shell
-    command) are also sanitised.  Non-sensitive values are recursed into so
-    that nested structures are also sanitized.
-
-    If *d* is not a dict (e.g. ``None`` for failed operations), returns ``{}``.
-    """
+    """Deep-copy *d* with sensitive values replaced at any depth: keys matching the
+    sensitive-key pattern become ``"***"``; keys in ``_AUDIT_REDACT_VALUE_KEYS`` get
+    their string values run through the string redactor (embedded secrets). Non-dict
+    input returns ``{}``."""
     if not isinstance(d, dict):
         return {}
     out: dict = {}
@@ -123,37 +104,20 @@ _logger = logging.getLogger(__name__)
 
 _REPO_ROOT: str = os.environ.get("AGENT_FS_ROOT", "/agent")
 
-# Shell tool limits (bootstrap-phase only, available when MCP_WRITE_ENABLED=true).
+# Shell tool limits (bootstrap phase only, when MCP_WRITE_ENABLED=true).
 _SHELL_MAX_TIMEOUT: int = 120         # hard ceiling in seconds
 _SHELL_DEFAULT_TIMEOUT: int = 30
 _SHELL_MAX_OUTPUT_BYTES: int = 16_384  # 16 KiB before truncation
 
-# Path to ``systemd-run`` and the scope mode (``"user"`` or ``"system"``)
-# when a ``--scope`` invocation is actually usable on this host.
-#
-# Two modes are probed in order:
-#   1. ``--user`` scope — works in a user session or when user lingering is
-#      enabled (``loginctl enable-linger <user>`` + ``XDG_RUNTIME_DIR`` set).
-#      This is the preferred mode.
-#   2. System scope (no ``--user`` flag) — available when the process has
-#      sufficient privileges (root or ``CAP_SYS_ADMIN``).  Used when
-#      ``agent-api`` runs as a *system* service without a user manager.
-#
-# Checking binary existence alone is not sufficient: the binary may be present
-# but ``systemd --user`` unreachable ("Failed to connect to bus"), or the
-# process may lack permissions for system scope.  The probe detects both cases.
-#
-# On the VM: enable user scope for the service user with
-#   loginctl enable-linger <user>
-# and add ``XDG_RUNTIME_DIR=/run/user/<uid>`` to the service environment file
-# (``/etc/agent-api.env``).  Then restart ``agent-api`` — the probe will
-# succeed with ``"user"`` mode and the shell tool becomes available.
+# Path to ``systemd-run`` and the usable scope mode ("user" or "system"). Two modes
+# are probed in order: ``--user`` scope (user session or lingering enabled) is
+# preferred; system scope needs root/CAP_SYS_ADMIN. Binary existence alone is not
+# sufficient - the bus may be unreachable or permissions missing, so both cases are
+# probed. On the VM: ``loginctl enable-linger <user>`` + ``XDG_RUNTIME_DIR`` in the
+# service environment, then restart agent-api.
 def _probe_systemd_scope() -> tuple[str, str] | None:
-    """Return ``(systemd_run_path, mode)`` if a scope can be created, else ``None``.
-
-    *mode* is ``"user"`` when ``--scope --user`` works, ``"system"`` when the
-    process can create a system-level scope.  Returns ``None`` if neither works.
-    """
+    """Return ``(systemd_run_path, mode)`` if a scope can be created, else ``None``:
+    mode is ``"user"`` when ``--scope --user`` works, ``"system"`` for a system-level scope."""
     path = shutil.which("systemd-run")
     if path is None:
         return None
@@ -217,9 +181,8 @@ class OperationResult:
 
 
 class OperationsExecutor:
-    """High-level executor that wires together git, service, log and
-    healing helpers, records every invocation in the audit log, and
-    ensures no secrets are exposed in return values."""
+    """High-level executor wiring git, service, log and healing helpers together; records
+    every invocation in the audit log and never exposes secrets in return values."""
 
     def __init__(
         self,
@@ -234,7 +197,7 @@ class OperationsExecutor:
         self._git = git or GitOperations()
         self._services = services or ServiceOperations()
         self._logs = logs or LogReader()
-        # lazy connection — avoid connecting at import time (tests mock this)
+        # Lazy connection - avoid connecting at import time (tests mock this).
         self._conn: sqlite3.Connection | None = None
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -243,9 +206,7 @@ class OperationsExecutor:
             self._conn = init_db(self._db_path)
         return self._conn
 
-    # ------------------------------------------------------------------
     # Audit logging
-    # ------------------------------------------------------------------
 
     def _log_operation(
         self,
@@ -281,9 +242,7 @@ class OperationsExecutor:
         except Exception:
             _logger.exception("failed to write operation_log entry")
 
-    # ------------------------------------------------------------------
     # Public helpers
-    # ------------------------------------------------------------------
 
     async def git_pull(self) -> dict:
         return await self._git.pull()
@@ -523,21 +482,14 @@ class OperationsExecutor:
             return {"success": False, "model": "llama", "latency_ms": 0,
                     "response": None, "error": type(exc).__name__}
 
-    # ------------------------------------------------------------------
     # Bootstrap shell (bounded, redacted, audited)
-    # ------------------------------------------------------------------
 
     async def shell(self, command: str, timeout_seconds: int = _SHELL_DEFAULT_TIMEOUT) -> dict:
-        """Run *command* in a bounded, audited shell.
-
-        Only available when ``MCP_WRITE_ENABLED=true``. Executes as the current
-        service user with cwd ``AGENT_FS_ROOT`` (default ``/agent``). The
-        process is started in its own process group so that the entire group
-        (including any child processes) is reliably killed on timeout or output
-        overflow — preventing background-daemon spawning.  Output is streamed
-        with a hard byte cap; the process is killed if the cap is exceeded.
-        Output is redacted before returning.
-        """
+        """Run *command* in a bounded, audited shell. Only when ``MCP_WRITE_ENABLED=true``;
+        cwd is ``AGENT_FS_ROOT`` (default ``/agent``). The process runs in its own process
+        group inside a transient cgroup scope, so timeout or output-overflow kills the whole
+        group - no background daemons. Output is streamed with a hard byte cap and redacted
+        before returning."""
         if not command or not command.strip():
             raise ValueError("command must not be empty")
         timeout_seconds = max(1, min(timeout_seconds, _SHELL_MAX_TIMEOUT))
@@ -545,43 +497,15 @@ class OperationsExecutor:
         return await asyncio.to_thread(self._shell_sync, command, timeout_seconds, cwd)
 
     def _shell_sync(self, command: str, timeout_seconds: int, cwd: str | None) -> dict:
-        """Synchronous core of :meth:`shell`; runs in a thread pool worker.
-
-        Confinement strategy
-        --------------------
-        The command is wrapped in a transient cgroup via ``systemd-run --scope``.
-        The mode (``user`` or ``system``) is selected at import time by
-        :func:`_probe_systemd_scope`.  Every process spawned by the shell —
-        including those that call ``setsid()`` — remains inside the same cgroup
-        and is killed when the scope is stopped.
-
-        The shell **refuses to execute** (returns ``success=False``) when a
-        usable cgroup scope cannot be established.  There is no unsafe fallback
-        to pgid-only kill: a ``setsid`` child can escape a bare process group,
-        which violates the "no background daemon spawning" contract.
-
-        Timeout enforcement
-        -------------------
-        A ``threading.Timer`` fires after exactly *timeout_seconds* and kills
-        the scope regardless of whether the stdout pipe has been closed.  This
-        prevents commands like ``exec >/dev/null 2>&1; sleep 300`` from
-        bypassing the deadline by closing the pipe early.
-
-        Killing on normal exit
-        ----------------------
-        A ``killer_thread`` blocks on ``proc.wait()`` and kills the scope as
-        soon as the shell exits with any code, freeing pipes that background
-        children may be holding open.
-
-        Scope cleanup
-        -------------
-        Cleanup is idempotent: if the scope has already been collected by
-        systemd (because the shell exited normally and ``--collect`` triggered
-        auto-removal) ``systemctl stop`` returns non-zero, but
-        ``systemctl is-active`` will confirm the unit is inactive.  That case
-        is treated as success.  Only when the unit is still active but cannot
-        be stopped is ``success`` forced to ``False``.
-        """
+        """Synchronous core of :meth:`shell`. Confinement: a transient cgroup via
+        ``systemd-run --scope`` (mode probed at import) contains every child, including
+        ``setsid()`` ones; the shell REFUSES to run (success=False) when no scope can be
+        established - no pgid-only fallback, which a setsid child could escape. A
+        ``threading.Timer`` is the absolute deadline and kills the scope even if the command
+        closed its pipe early; a killer thread kills the scope on normal exit so background
+        children cannot hold pipes open. Cleanup is idempotent: an already auto-collected
+        scope (``is-active`` non-active) counts as success; only a still-active unit whose
+        stop fails sets ``cleanup_failed``."""
         import subprocess
         import threading
 
@@ -619,16 +543,11 @@ class OperationsExecutor:
         ]
 
         def _kill_scope_and_group(pgid: int | None) -> None:
-            """Stop the scope cgroup; also kill pgid as belt-and-suspenders.
-
-            Idempotent: if the scope was already auto-collected by systemd
-            (``--collect`` on normal exit), ``systemctl stop`` returns non-zero
-            but ``is-active`` confirms the unit is inactive — that is success.
-            Only when the scope is still active but stop fails is
-            ``cleanup_failed`` set.
-            """
+            """Stop the scope cgroup; also kill the pgid as belt-and-suspenders. Idempotent: an
+            already auto-collected scope (``is-active`` non-active) is success; only a
+            still-active unit whose stop fails sets ``cleanup_failed``."""
             nonlocal cleanup_failed
-            # systemd scope: kills all cgroup members regardless of setsid
+            # systemd scope kills all cgroup members regardless of setsid.
             try:
                 r = subprocess.run(
                     ["systemctl"] + _mode_flags + ["stop", scope_unit],
@@ -636,10 +555,7 @@ class OperationsExecutor:
                     capture_output=True,
                 )
                 if r.returncode != 0:
-                    # Idempotency: check whether the unit is already inactive.
-                    # systemctl is-active returns 0 (active) or non-zero
-                    # (inactive/not-found/error).  Any non-zero reply means the
-                    # scope is gone — treat that as successful cleanup.
+                    # Idempotency: any non-zero ``is-active`` reply means the scope is gone - success.
                     try:
                         ia = subprocess.run(
                             ["systemctl"] + _mode_flags + ["is-active", scope_unit],
@@ -647,7 +563,7 @@ class OperationsExecutor:
                             capture_output=True,
                         )
                         if ia.returncode == 0:
-                            # Unit still active — stop genuinely failed.
+                            # Unit still active - stop genuinely failed.
                             cleanup_failed = True
                         # else: inactive/not-found → auto-collected, success.
                     except Exception:
@@ -666,10 +582,11 @@ class OperationsExecutor:
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            # Safe in multithreaded/asyncio contexts.
             start_new_session=True,  # safe in multithreaded/asyncio contexts
             cwd=cwd,
         ) as proc:
-            # Capture PGID immediately while the process is alive.
+            # Capture the PGID immediately while the process is alive.
             try:
                 _pgid: int | None = os.getpgid(proc.pid)
             except (ProcessLookupError, OSError):
@@ -678,10 +595,8 @@ class OperationsExecutor:
             def _kill() -> None:
                 _kill_scope_and_group(_pgid)
 
-            # ------------------------------------------------------------------
-            # Absolute deadline timer — fires after timeout_seconds regardless
-            # of stdout state.  Prevents pipe-close bypass.
-            # ------------------------------------------------------------------
+            # Absolute deadline timer - fires after timeout_seconds regardless of stdout state,
+            # preventing pipe-close bypass.
             def _on_timeout() -> None:
                 nonlocal timed_out
                 timed_out = True
@@ -691,10 +606,8 @@ class OperationsExecutor:
             timer.daemon = True
             timer.start()
 
-            # ------------------------------------------------------------------
-            # killer_thread: wait for shell exit then free the pipe; sets
-            # _proc_done so the main thread knows the process is truly gone.
-            # ------------------------------------------------------------------
+            # killer_thread: wait for shell exit, free the pipe, set _proc_done so the main
+            # thread knows the process is truly gone.
             _proc_done = threading.Event()
 
             def _killer() -> None:
@@ -708,9 +621,7 @@ class OperationsExecutor:
             killer_thread = threading.Thread(target=_killer, daemon=True)
             killer_thread.start()
 
-            # ------------------------------------------------------------------
-            # reader_thread: bounded stdout read
-            # ------------------------------------------------------------------
+            # reader_thread: bounded stdout read.
             def _reader() -> None:
                 nonlocal total_bytes, truncated
                 assert proc.stdout is not None
@@ -727,8 +638,7 @@ class OperationsExecutor:
                             pass
                         break
                     if len(chunk) > remaining:
-                        # Bytes beyond the cap were already consumed —
-                        # trimming always means truncation.
+                        # Bytes beyond the cap were already consumed - trimming always means truncation.
                         chunks.append(chunk[:remaining])
                         total_bytes += remaining
                         truncated = True
@@ -739,9 +649,8 @@ class OperationsExecutor:
                     chunks.append(chunk)
                     total_bytes += len(chunk)
                     if total_bytes >= _SHELL_MAX_OUTPUT_BYTES:
-                        # One-byte lookahead: if EOF the output was exactly at
-                        # the cap (not truncated); if a byte is returned we are
-                        # over the cap and the byte is correctly discarded.
+                        # One-byte lookahead: EOF means the output was exactly at the cap (not truncated);
+                        # a returned byte means over the cap and is discarded.
                         lookahead = proc.stdout.read(1)
                         if lookahead:
                             truncated = True
@@ -753,30 +662,26 @@ class OperationsExecutor:
             reader_thread = threading.Thread(target=_reader, daemon=True)
             reader_thread.start()
 
-            # ------------------------------------------------------------------
-            # Wait for reader.  The Timer is the true deadline; cancelling it
-            # is only safe when the process is CONFIRMED dead (via _proc_done).
-            # If the command closed its stdout early (e.g. exec >/dev/null) the
-            # reader exits immediately but the process keeps running — in that
-            # case we must NOT cancel the timer; it will fire and kill the
-            # process after timeout_seconds.
-            # ------------------------------------------------------------------
+            # Wait for the reader. The Timer is the true deadline; cancelling it is only safe
+            # once the process is CONFIRMED dead via _proc_done - if the command closed stdout
+            # early, the timer must still fire and kill the process.
             reader_thread.join(timeout=timeout_seconds + 10)
 
             if _proc_done.is_set():
                 # Process exited naturally before the deadline.
                 timer.cancel()
-            # else: timer will fire (or already fired) to kill the process.
+            # Else the timer will fire (or already fired) to kill the process.
 
             if reader_thread.is_alive():
-                # Reader still blocked — process must still be running.
-                # The timer should fire soon; kill defensively now too.
+                # Reader still blocked - process must still be running; the timer should fire soon,
+                # kill defensively now too.
                 timed_out = True
                 _kill()
                 reader_thread.join(timeout=5)
 
-            # Ensure the killer thread also finishes before reading returncode.
+            # Ensure the killer thread finished before reading returncode.
             killer_thread.join(timeout=5)
+            # Idempotent; ensures returncode is set.
             proc.wait()  # idempotent; ensures returncode is set
             returncode = proc.returncode if proc.returncode is not None else -1
 
@@ -791,8 +696,8 @@ class OperationsExecutor:
         raw = b"".join(chunks).decode(errors="replace")
         output = redact(raw)
         if cleanup_failed:
-            # Scope teardown failed — a detached child may still be running.
-            # Force success=False so callers are never silently misled.
+            # Scope teardown failed - a detached child may still be running; force success=False
+            # so callers are never silently misled.
             return {
                 "success": False,
                 "exit_code": returncode,
@@ -806,9 +711,7 @@ class OperationsExecutor:
             "output": output,
         }
 
-    # ------------------------------------------------------------------
     # Unified entry point with audit logging
-    # ------------------------------------------------------------------
 
     async def execute(self, operation: str, params: dict) -> OperationResult:
         t0 = time.monotonic()
@@ -824,6 +727,7 @@ class OperationsExecutor:
             success = False
         except Exception as exc:
             _logger.exception("OperationsExecutor.execute failed: %s", operation)
+            # No traceback exposed.
             error = type(exc).__name__  # no traceback exposed
             success = False
         duration_ms = int((time.monotonic() - t0) * 1000)

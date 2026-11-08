@@ -1,11 +1,7 @@
-"""Bridge from free-form mailbox tasks to Nexus capabilities.
-
-A mailbox task goes straight to Nexus: it is recorded as ``queued`` and the
-worker hands it to the local controller without an approval step (#264).
-
-The local Nexus LLM is the orchestration layer. It may inspect real Nexus
-state, search memory, delegate bounded sub-problems, discuss ambiguity and
-only then select an execution primitive.
+"""Bridge from free-form mailbox tasks to Nexus capabilities: a task is recorded as
+``queued`` and handed to the local controller without an approval step (#264). The
+local Nexus LLM is the orchestration layer - it inspects real state, searches memory,
+delegates sub-problems, and only then selects an execution primitive.
 """
 
 from __future__ import annotations
@@ -36,14 +32,11 @@ from modules.outbox_publisher import (
     TaskApprovalOutboxPublisher,
 )
 from modules.run_store import DEFAULT_DB_PATH, init_db
-# ``modules.task_orchestrator`` is imported lazily, not here. It imports
-# ``modules.mailbox.development``, which runs this package's ``__init__`` and
-# comes straight back to this module - so importing the orchestrator *first*
-# raised `ImportError: cannot import name 'ACTION_ANSWER' from partially
-# initialized module`. The cycle made whole test files uncollectable and left
-# `import modules.task_orchestrator` working only when something happened to
-# import the mailbox package before it. Annotations are already lazy here
-# (`from __future__ import annotations`), so only the runtime uses need it.
+# ``modules.task_orchestrator`` is imported lazily, not here: it imports
+# ``modules.mailbox.development``, which runs this package's ``__init__`` and comes
+# straight back - importing the orchestrator first raised ImportError from the
+# partially initialized module. Annotations are already lazy
+# (`from __future__ import annotations`), so only runtime uses need this.
 
 if TYPE_CHECKING:
     from modules.experiment_service import ExperimentService
@@ -51,11 +44,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Entry state: recorded and waiting for the worker to hand it to Nexus. It
-# stays ``queued`` while Nexus decides, so a decision can claim it once.
+# Entry state: recorded, waiting for the worker to hand it to Nexus; it stays
+# ``queued`` while Nexus decides, so a decision can claim it once.
 _STATUS_QUEUED = "queued"
-# Left by the removed approval step (#264). Old rows stay readable; nothing new
-# is written in these states and a ``pending_approval`` row is never run.
+# Left by the removed approval step (#264): old rows stay readable, nothing new is
+# written in this state, and a ``pending_approval`` row is never run.
 _LEGACY_STATUS_PENDING = "pending_approval"
 _LEGACY_STATUS_APPROVED = "approved"
 _LEGACY_STATUS_REJECTED = "rejected"
@@ -80,8 +73,8 @@ _EXP_FAILED_TERMINAL = {"failed", "timed_out", "needs_review", "interrupted"}
 # Verified, and left open because the task forbids the merge (#185).
 _STATUS_READY_FOR_REVIEW = "ready_for_review"
 _TERMINAL_STATUSES.add(_STATUS_READY_FOR_REVIEW)
-# After a failed experiment Nexus may try again, but a task gets at most this
-# many experiments in total (#263 step 4).
+# After a failed experiment Nexus may try again, but a task gets at most this many
+# experiments in total (#263 step 4).
 _MAX_EXPERIMENTS_PER_TASK = 2
 
 
@@ -193,7 +186,7 @@ class MailboxTaskService:
 
     def close(self) -> None:
         # Finish queued diagnoses before closing their shared service/SQLite
-        # connection. Analysis runs outside the mailbox poll loop.
+        # connection; analysis runs outside the mailbox poll loop.
         self._failure_analysis_executor.shutdown(wait=True)
         nexus_task_store = getattr(self, "_nexus_task_store", None)
         if nexus_task_store is not None:
@@ -239,22 +232,13 @@ class MailboxTaskService:
             logger.exception("mailbox_task: background failure analysis crashed")
 
     def _failure_analysis(self, *, context: str | None = None) -> Any | None:
-        """Lazily-built :class:`FailureAnalysisService`, or ``None`` if unavailable (#145).
-
-        Diagnosis reuses an already-optional capability: a Nexus deployment
-        without a reachable local LLM must still process mailbox tasks
-        normally, so any failure to construct the service here degrades to
-        "no diagnosis" rather than blocking task processing. Shared across
-        every terminal-failure call site (this base class's own
-        ``_transition_terminal`` and the finalization subclass), so at most
-        one instance - and one lazily-opened SQLite connection to the run
-        store - exists per service.
-
-        *context* identifies the originating experiment/task (#150) so an
-        operator can tell, from this log line alone, which lifecycle event
-        went undiagnosed - construction is retried (and re-logged) on every
-        caller until it succeeds, since a transient cause (e.g. an
-        unwritable path) can clear between calls.
+        """Lazily-built :class:`FailureAnalysisService`, or ``None`` if unavailable
+        (#145). A deployment without a reachable local LLM must still process tasks,
+        so construction failure degrades to "no diagnosis", never blocks. Shared
+        across all terminal-failure call sites, so at most one instance (and one
+        lazily-opened SQLite connection) exists per service. *context* identifies the
+        originating experiment/task (#150) in the log line; construction is retried on
+        every caller until it succeeds.
         """
         if self.failure_analysis_service is None:
             try:
@@ -265,9 +249,9 @@ class MailboxTaskService:
                     log_dir=self._resolve_log_dir(),
                     outbox_dir=self.outbox_dir,
                     repo_root=self.mailbox_repo_path,
-                    # The same read-only capability catalog the controller
-                    # resolves against (#172), so a diagnosis here can check a
-                    # runtime claim instead of only repeating it.
+                    # The same read-only capability catalog the controller resolves
+                    # against (#172), so a diagnosis can check a runtime claim
+                    # instead of only repeating it.
                     operations_registry=self.operations_registry,
                     experiment_service=self.experiment_service,
                 )
@@ -280,15 +264,9 @@ class MailboxTaskService:
         return self.failure_analysis_service
 
     def _analyze_task_failure(self, approval: MailboxTaskApproval, status: str, exp: Any) -> None:
-        """Best-effort diagnosis for a mailbox task that failed or needs review (#145).
-
-        Distinct from the finalization-phase integration
-        (``FinalizingMailboxTaskService._analyze_finalization_failure``):
-        this covers the earlier development/verification stage, before
-        adoption/finalization is even attempted - a demonstration that the
-        analyzer is reusable beyond the finalization call site it was first
-        written for.
-        """
+        """Best-effort diagnosis for a mailbox task that failed or needs review (#145),
+        covering the earlier development/verification stage - distinct from the
+        finalization-phase integration."""
         service = self._failure_analysis(
             context=f"mailbox_task={approval.id} experiment={exp.id}"
         )
@@ -322,14 +300,10 @@ class MailboxTaskService:
             )
 
     def _resolve_log_dir(self) -> str | Path:
-        """The structured-log directory this service actually writes to.
-
-        Shared by ``_task_logger`` and the failure-analysis integration
-        (``_failure_analysis``/``_analyze_task_failure``): the latter must
-        read evidence from the exact same directory the former writes to,
-        or a deployment/test using a non-default ``task_log_dir`` would
-        silently get an empty evidence bundle.
-        """
+        """The structured-log directory this service writes to, shared by
+        ``_task_logger`` and the failure-analysis integration - the latter must read
+        the same directory or a non-default ``task_log_dir`` would silently yield an
+        empty evidence bundle."""
         if self._task_log_dir is not None:
             return self._task_log_dir
         if self.experiment_service is not None:
@@ -339,19 +313,13 @@ class MailboxTaskService:
         return DEFAULT_LOG_DIR
 
     def _task_logger(self, approval_id: str):
-        """Durable, pre-experiment structured logger for one mailbox task.
-
-        Records intake/queueing/orchestration events -
-        everything before (and, for tasks that never create one, instead
-        of) an experiment id existing - so the unified Logs feed shows the
-        complete task path from the moment a task arrives. Never raises:
-        a logging failure must not interrupt task processing.
-        """
+        """Durable pre-experiment structured logger for one mailbox task, recording
+        intake/queueing/orchestration events so the unified Logs feed shows the
+        complete task path from arrival. Never raises - logging must not interrupt
+        task processing."""
         return get_task_logger(approval_id, log_dir=self._resolve_log_dir())
 
-    # ------------------------------------------------------------------
     # CRUD
-    # ------------------------------------------------------------------
 
     def create_task(
         self,
@@ -362,12 +330,9 @@ class MailboxTaskService:
         received_at: str,
         idempotency_key: str | None = None,
     ) -> MailboxTaskApproval:
-        """Record a task once per idempotency key (#378).
-
-        The key defaults to one derived from *mailbox_msg_id*; API callers
-        may pass their own. A repeated delivery returns the original task
-        unchanged, so it is approved and dispatched at most once.
-        """
+        """Record a task once per idempotency key (#378): the key defaults to one
+        derived from *mailbox_msg_id*, API callers may pass their own, and a repeated
+        delivery returns the original task unchanged (dispatched at most once)."""
         with self._lock:
             approval_id, created = insert_task_approval(
                 self._conn,
@@ -419,9 +384,7 @@ class MailboxTaskService:
             ).fetchall()
         return [_row_to_approval(row) for row in rows]
 
-    # ------------------------------------------------------------------
     # Persistent agentic orchestration
-    # ------------------------------------------------------------------
 
     def submit_queued(self) -> None:
         """Hand the oldest queued task to Nexus, which chooses the actual action."""
@@ -530,7 +493,7 @@ class MailboxTaskService:
         self, approval: MailboxTaskApproval, decision: TaskDecision | None = None
     ) -> dict[str, str] | None:
         # Re-read task_body so clarification follow-ups accumulated by
-        # continue_discussion are included in the implementation goal.
+        # continue_discussion are included in the goal.
         current_approval = self.get(approval.id)
         task_log = self._task_logger(approval.id)
         task_log.info("queued", "github_work_tracking_started", "starting GitHub work tracking")
@@ -555,9 +518,8 @@ class MailboxTaskService:
                 error=str(exc),
             )
             return
-        # Issue #184: make the chosen Issue visible at the moment it is
-        # chosen, so "did Nexus reuse #180 or open a duplicate?" is an
-        # answerable question rather than an inference from GitHub state.
+        # Issue #184: log the chosen Issue at the moment it is chosen, so "reuse or
+        # duplicate?" is answerable from the log, not inferred from GitHub state.
         task_log.info(
             "queued", "github_work_tracking_linked",
             f"work tracked on GitHub issue #{work_ref.issue_number}",
@@ -612,10 +574,8 @@ class MailboxTaskService:
         if not updated:
             logger.warning("mailbox_task: lost race after creating experiment %s", experiment.id)
             return
-        # Correlating event: this is the moment the pre-experiment task
-        # log and the experiment's own log become joinable, so the
-        # unified feed can follow one task from mailbox intake through to
-        # this new experiment id.
+        # Correlating event: the task log and the experiment's own log become joinable,
+        # so the unified feed can follow one task from intake to this experiment id.
         task_log.info(
             "queued", "experiment_created", "experiment created for mailbox task",
             experiment_id=experiment.id,
@@ -638,26 +598,21 @@ class MailboxTaskService:
         )
 
     def _with_task_store(self, action: Any) -> Any:
-        """Run *action* against the Nexus task store the orchestrator uses.
-
-        Opened once and kept: the worker checks it every cycle.
-        """
+        """Run *action* against the Nexus task store the orchestrator uses, opened once
+        and kept (the worker checks it every cycle)."""
         if getattr(self, "_nexus_task_store", None) is None:
             from modules.nexus_task_store import NexusTaskStore
 
-            # The service's own database: the same file as the orchestrator's
-            # in production, and never a mock's attribute in tests (#279).
+            # The service's own database: same file as the orchestrator's in
+            # production, never a mock's attribute in tests (#279).
             self._nexus_task_store = NexusTaskStore(db_path=self.db_path)
         return action(self._nexus_task_store)
 
     def resume_finished_experiments(self) -> None:
-        """Safety net for #263: continue sessions whose experiment ended unnoticed.
-
-        The experiment thread continues its session the moment it ends; a
-        restart in between loses that moment. Checking is one query, so this
-        runs every worker cycle and builds an orchestrator only when a waiting
-        session exists.
-        """
+        """Safety net for #263: continue sessions whose experiment ended unnoticed (the
+        experiment thread continues the session when it ends; a restart loses that
+        moment). One query per worker cycle, building an orchestrator only when a
+        waiting session exists."""
         if self.experiment_service is None:
             return
         waiting = self._with_task_store(lambda store: store.sessions_waiting_for_experiments())
@@ -676,14 +631,11 @@ class MailboxTaskService:
                 )
 
     def _after_experiment(self, experiment_id: str) -> None:
-        """Continue the Nexus session, then carry out what it decided (#263 step 4).
-
-        A succeeded experiment keeps its existing path (``poll_running`` and
-        finalization). After a failed one the task stays open until Nexus has
-        decided: another experiment, within the limit, or an end with Nexus'
-        own words. The task is claimed as ``nexus_deciding`` before Nexus
-        resumes, so ``poll_running`` cannot close it in between.
-        """
+        """Continue the Nexus session, then carry out what it decided (#263 step 4). A
+        succeeded experiment keeps its existing path; after a failed one the task
+        stays open until Nexus decided (another experiment within the limit, or an end
+        in Nexus' own words), claimed as ``nexus_deciding`` first so ``poll_running``
+        cannot close it in between."""
         experiment = self.experiment_service.get_experiment(experiment_id)
         claimed = experiment.status in _EXP_FAILED_TERMINAL and self._claim_decision(experiment_id)
         try:
@@ -737,12 +689,9 @@ class MailboxTaskService:
         return _row_to_approval(row) if row else None
 
     def _nexus_decides_failure(self, approval: MailboxTaskApproval) -> bool:
-        """Whether Nexus is still deciding what follows a failed experiment.
-
-        ``poll_running`` leaves such a task open; ``_after_experiment`` closes
-        it. A resume that dies leaves the session failed or abandoned, and
-        the ordinary path takes over again.
-        """
+        """Whether Nexus is still deciding what follows a failed experiment:
+        ``poll_running`` leaves such a task open, ``_after_experiment`` closes it, and a
+        dead resume falls back to the ordinary path."""
         session = self._with_task_store(
             lambda store: store.find_by_source("task", approval.id)
         )
@@ -910,9 +859,7 @@ class MailboxTaskService:
             name=f"mts-exp-{experiment_id[:8]}",
         ).start()
 
-    # ------------------------------------------------------------------
     # Experiment polling / recovery
-    # ------------------------------------------------------------------
 
     def poll_running(self) -> None:
         if self.experiment_service is None:
@@ -982,9 +929,7 @@ class MailboxTaskService:
             )
         self.poll_running()
 
-    # ------------------------------------------------------------------
     # Terminal results / outbox
-    # ------------------------------------------------------------------
 
     def _transition_terminal(
         self,
@@ -1098,8 +1043,8 @@ class MailboxTaskService:
 
     def _make_result_summary(self, exp: Any) -> str:
         parts = [f"status={exp.status}"]
-        # Issue #184: report the Issue the work was tracked on so a reused
-        # Issue number is externally verifiable from the task result alone.
+        # Issue #184: report the Issue the work was tracked on, so a reused Issue
+        # number is externally verifiable from the task result alone.
         work_ref = self._work_ref_for(exp)
         issue_number = getattr(work_ref, "issue_number", None)
         if isinstance(issue_number, int):

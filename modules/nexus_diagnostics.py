@@ -1,52 +1,20 @@
-"""One backend for "what happened to this work, and is it still alive?" (#188).
+"""One read-only backend for "what happened to this work, and is it still alive?" (#188).
 
-Diagnosing a Nexus failure used to mean assembling the answer by hand: probe
-Git for a branch, guess which systemd unit the worker runs under, build a
-``journalctl`` invocation, then correlate that against whichever of the four
-id namespaces (mailbox task, experiment, controller session, issue/PR) the
-operator happened to know. The #186/#187 investigation is the worked example:
-Nexus created a branch and then produced no implementation commit and no PR,
-and finding out *where* execution stopped took a chain of ad-hoc shell
-commands composed through the mailbox.
+Resolves any reference an operator has to hand (mailbox task, experiment, session,
+issue/PR, inbox filename) to the subsystem that owns it, and returns its lifecycle
+state plus a bounded slice of the relevant logs (structured JSONL, service journal).
 
-This module is the missing first-class answer. It resolves any reference an
-operator plausibly has to hand, reads the lifecycle state out of the
-subsystem that owns it, and returns that together with a bounded slice of the
-relevant logs - structured JSONL and, where it helps, the service journal.
-Everything here is read-only by construction rather than by convention. The
-database is opened in SQLite's ``mode=ro`` and further pinned with
-``PRAGMA query_only``, so a write is refused by the connection itself rather
-than merely absent from the code; nothing here creates the file, applies a
-migration, runs a backfill, reaps or retries. That is what makes it safe to
-hand to the mailbox/chat interface, and safe to point at a suspect task
-without changing its state.
+Read-only by construction, not convention: the database is opened in SQLite
+``mode=ro`` and pinned with ``PRAGMA query_only``, so a write is refused by the
+connection itself; nothing here creates the file, migrates, backfills, reaps or
+retries. Safe to hand to the mailbox/chat interface and to point at a suspect task.
 
-Extending the heartbeat contract
---------------------------------
-#162 gave *controller sessions* an explicit heartbeat, which is what makes
-"is this still running?" answerable rather than guessable. Mailbox tasks and
-experiments never got one: they are driven through several processes and
-phases, and no single owner is alive for the whole span, so there is nothing
-to beat. Their liveness question is just as real, though - a task that stops
-midway looks exactly like a slow one from the outside.
-
-So the heartbeat contract is *extended* rather than duplicated. A subject's
-liveness is derived from its **last progress signal**, which is the newest of:
-
-* the heartbeat of a controller session claiming it, when one exists (the
-  strongest signal - an explicit "I am alive"),
-* the newest structured log entry written under any of its correlation ids
-  (a witnessed side effect: weaker than a heartbeat, because a live worker
-  can be quiet, but far stronger than nothing),
-* the row's own ``updated_at`` (the weakest: "something changed then").
-
-The staleness rule is then exactly the one :mod:`modules.heartbeat` already
-defines, applied to that signal - including its clamped floor, so no caller
-can pick a timeout that makes healthy work look dead. Which of the three
-sources answered is reported alongside the verdict, because "interrupted, and
-the last thing we saw was a log line 40 minutes ago" and "interrupted, and a
-worker's heartbeat stopped 40 minutes ago" are different facts about how much
-we know.
+Liveness for subjects without their own heartbeat (#162) is derived from the **last
+progress signal** - newest of: a claiming session's heartbeat (strongest), the newest
+structured log entry under any correlation id, the row's ``updated_at`` (weakest) -
+judged by :mod:`modules.heartbeat`'s clamped staleness rule, so no caller can declare
+healthy work dead. The answering source is reported with the verdict, because the
+sources say different things about how much is known.
 """
 
 from __future__ import annotations
@@ -75,11 +43,9 @@ SUBJECT_TASK = "task"
 SUBJECT_EXPERIMENT = "experiment"
 SUBJECT_SESSION = "session"
 
-# Lifecycle vocabulary. Each subsystem keeps its own status values - they mean
-# something precise there and renaming them would be a lie - and this is the
-# small shared vocabulary they are *mapped onto*, so one caller can compare a
-# mailbox task against an experiment against an adoption without learning
-# three status tables.
+# Lifecycle vocabulary: each subsystem keeps its own status values; this is the
+# small shared vocabulary they map onto, so one caller can compare a mailbox task,
+# an experiment and an adoption without learning three status tables.
 LIFECYCLE_QUEUED = "queued"
 LIFECYCLE_RUNNING = "running"
 LIFECYCLE_WAITING = "waiting"
@@ -91,8 +57,8 @@ LIFECYCLE_MERGED = "merged"
 LIFECYCLE_ABANDONED = "abandoned"
 LIFECYCLE_UNKNOWN = "unknown"
 
-# Lifecycles in which somebody is supposed to be driving the work. Only these
-# can be *interrupted*; silence anywhere else is either correct or final.
+# Lifecycles where somebody should be driving the work; only these can be
+# *interrupted* - silence anywhere else is correct or final.
 WORKING_LIFECYCLES: frozenset[str] = frozenset({LIFECYCLE_QUEUED, LIFECYCLE_RUNNING})
 # Lifecycles that have reached an outcome. Silence here is the expected state.
 TERMINAL_LIFECYCLES: frozenset[str] = frozenset(
@@ -109,17 +75,16 @@ TERMINAL_LIFECYCLES: frozenset[str] = frozenset(
 # when two subjects are equally recent.
 FAILED_LIFECYCLES: frozenset[str] = frozenset({LIFECYCLE_FAILED, LIFECYCLE_ABANDONED})
 
-# Progress verdicts: the question "was this interrupted, is it still running,
-# or did it finish?" that the failure-analysis routine needs answered before
-# it can say anything useful about a stalled task.
+# Progress verdicts ("interrupted / still running / finished?") that failure
+# analysis needs answered before it can say anything about a stalled task.
 PROGRESS_RUNNING = "running"
 PROGRESS_INTERRUPTED = "interrupted"
 PROGRESS_COMPLETED = "completed"
 PROGRESS_NOT_STARTED = "not_started"
 PROGRESS_UNKNOWN = "unknown"
 
-# Where a last-progress timestamp came from, strongest first. Reported with
-# the verdict because it says how much the verdict is worth.
+# Where a last-progress timestamp came from, strongest first; reported with the
+# verdict because it says how much the verdict is worth.
 PROGRESS_SOURCE_HEARTBEAT = "heartbeat"
 PROGRESS_SOURCE_LOG = "log_entry"
 PROGRESS_SOURCE_ROW = "updated_at"
@@ -177,17 +142,17 @@ _SESSION_LIFECYCLE: dict[str, str] = {
 DEFAULT_LOG_LINES = 50
 MAX_LOG_LINES = 500
 DEFAULT_SERVICE_LINES = 100
-# Bounded by default, with an explicit way to ask for more: an unbounded
-# diagnostic run from chat is how a "quick look" becomes a context overflow.
+# Bounded by default, with an explicit way to ask for more: an unbounded diagnostic
+# run from chat is how a "quick look" becomes a context overflow.
 DEFAULT_LAST_FAILURE_CANDIDATES = 25
 MAX_LAST_FAILURE_CANDIDATES = 200
 _MAX_MESSAGE_CHARS = 500
 _MAX_ERROR_CHARS = 1000
 
-# The systemd units a Nexus deployment runs. Naming them here is what lets a
-# caller say `logs service mailbox` instead of knowing unit names; anything
-# not in this map is still accepted verbatim but validated as a unit name, so
-# no caller can smuggle a shell fragment into journalctl.
+# The systemd units a Nexus deployment runs, so a caller can say `logs service
+# mailbox` without knowing unit names. Anything not in this map is still accepted
+# verbatim but validated as a unit name, so no caller can smuggle a shell fragment
+# into journalctl.
 SERVICE_ALIASES: dict[str, str] = {
     "api": "agent-api",
     "agent-api": "agent-api",
@@ -201,9 +166,8 @@ SERVICE_ALIASES: dict[str, str] = {
 }
 KNOWN_SERVICES: tuple[str, ...] = ("agent-api", "nexus-mailbox", "llama-server")
 
-# The id namespaces a bare reference is resolved against, in the order an
-# exact match is preferred. Prefix matches are gathered from all of them
-# before any verdict is reached (see NexusDiagnostics.resolve).
+# The id namespaces a bare reference is resolved against; prefix matches are
+# gathered from all of them before any verdict (see NexusDiagnostics.resolve).
 _RESOLUTION_TABLES: tuple[tuple[str, str], ...] = (
     (SUBJECT_TASK, "mailbox_task_approvals"),
     (SUBJECT_EXPERIMENT, "experiments"),
@@ -221,24 +185,12 @@ class DiagnosticsError(ValueError):
 
 
 def _connect_read_only(db_path: str) -> sqlite3.Connection:
-    """Open an existing Nexus database without being able to change it.
-
-    Deliberately *not* ``run_store.init_db``. That helper is the write path's
-    entry point: it creates the file and its parent directory, applies the
-    full schema and every additive migration, and runs the mailbox-approval
-    backfill - all of which are writes. Calling it here would have made a
-    diagnostic read mutate the very database it was asked to describe, which
-    is exactly what a read-only command must not do, and would have done it on
-    the databases most worth inspecting: the incomplete ones.
-
-    So the connection is opened in SQLite's ``mode=ro`` and pinned with
-    ``PRAGMA query_only``. The two are independent: the first refuses to open
-    the file for writing at all, the second refuses write statements on the
-    connection even if it were writable. Nothing is created, so a missing
-    database is reported rather than conjured, and a schema this build has
-    never seen is simply read as far as it goes - ``_fetchall`` already treats
-    a missing table or column as "nothing known about that".
-    """
+    """Open an existing Nexus database without being able to change it. Deliberately
+    not ``run_store.init_db`` (that creates the file, applies migrations and runs
+    backfills - all writes). The connection uses SQLite ``mode=ro`` plus
+    ``PRAGMA query_only``: the first refuses to open the file for writing, the
+    second refuses write statements even if it were writable. Nothing is created, so
+    a missing database is reported rather than conjured."""
     path = Path(db_path)
     if not path.is_file():
         raise DiagnosticsError(f"no Nexus database at {path}")
@@ -255,9 +207,8 @@ def _connect_read_only(db_path: str) -> sqlite3.Connection:
 
 
 def _like_escape(value: str) -> str:
-    """Escape a literal for use inside a ``LIKE`` pattern.
-
-    ``_`` is both a legal id/path character and a single-character wildcard,
+    """Escape a literal for use inside a ``LIKE`` pattern: ``_`` is both a legal
+    id/path character and a single-character wildcard,
     and a shorthand that silently matched any character in that position would
     answer for the wrong task - the one failure mode a diagnostic cannot
     afford. Paired with ``ESCAPE '\\'`` at every call site.
@@ -288,13 +239,10 @@ def _text(value: Any, limit: int = _MAX_MESSAGE_CHARS) -> str | None:
 
 
 def _newest(*timestamps: Any) -> tuple[str | None, int]:
-    """Return the newest parsable timestamp and which argument it came from.
-
-    Ordering is by parsed instant, not string compare: the three sources use
-    three different ISO spellings (``...+00:00``, ``...123Z``, second
-    precision), and comparing those as strings gets the order wrong exactly
-    when it matters - between a heartbeat and a log line seconds apart.
-    """
+    """Return the newest parsable timestamp and which argument it came from. Ordered
+    by parsed instant, not string compare: the sources use different ISO spellings
+    (``...+00:00``, ``...123Z``, second precision), and string compare gets the order
+    wrong exactly when it matters - a heartbeat vs a log line seconds apart."""
     best: datetime | None = None
     best_index = -1
     best_raw: str | None = None
@@ -309,12 +257,9 @@ def _newest(*timestamps: Any) -> tuple[str | None, int]:
 
 @dataclass(slots=True)
 class ProgressVerdict:
-    """Is this still running, was it interrupted, or did it finish? (#188)
-
-    ``state`` is the answer; ``source`` says which signal produced
-    ``last_progress_at`` (see the module docstring), and ``reason`` is the
-    one-line explanation an operator or a failure analysis can quote.
-    """
+    """Is this still running, was it interrupted, or did it finish? (#188): ``state``
+    is the answer, ``source`` which signal produced ``last_progress_at``, and
+    ``reason`` the one-line explanation an operator or failure analysis can quote."""
 
     state: str
     reason: str
@@ -330,13 +275,9 @@ class ProgressVerdict:
 
 @dataclass(slots=True)
 class LifecycleState:
-    """Everything about a unit of work that is not a log line.
-
-    The field list is the issue's checklist: lifecycle state, branch, commit,
-    PR, the worker/service responsible, the last progress timestamp and the
-    last error - all under stable names, so a caller never has to know which
-    subsystem's table an answer came out of.
-    """
+    """Everything about a unit of work that is not a log line (lifecycle, branch,
+    commit, PR, worker/service, last progress, last error) under stable names, so a
+    caller never needs to know which subsystem's table an answer came from."""
 
     subject_type: str
     subject_id: str
@@ -412,15 +353,11 @@ def assess_progress(
     stale_after_seconds: object = None,
     now: datetime | None = None,
 ) -> ProgressVerdict:
-    """Decide running / interrupted / completed from the strongest signal.
-
-    This is the heartbeat contract of #162 applied to subjects that have no
-    heartbeat of their own (see the module docstring). The timeout is resolved
-    through :func:`modules.heartbeat.resolve_stale_timeout`, so it inherits the
-    same clamped floor: a caller cannot pass a value that declares live work
-    dead, which matters more here than anywhere else because this verdict is
-    what a failure analysis will act on.
-    """
+    """Decide running / interrupted / completed from the strongest signal - the #162
+    heartbeat contract applied to subjects without their own heartbeat. The timeout
+    goes through :func:`modules.heartbeat.resolve_stale_timeout`, inheriting the
+    clamped floor: no caller may declare live work dead, which matters most here
+    because failure analysis acts on this verdict."""
     timeout = resolve_stale_timeout(stale_after_seconds)
     interval = resolve_interval()
     reference = now or _now()
@@ -449,8 +386,8 @@ def assess_progress(
             f"reached the terminal lifecycle state '{lifecycle}'",
         )
     if lifecycle == LIFECYCLE_WAITING:
-        # A resting state has no worker by design, so its silence is correct
-        # and must never be reported as an interruption (#162).
+        # A resting state has no worker by design; its silence is correct and must
+        # never be reported as an interruption (#162).
         return verdict(PROGRESS_RUNNING, "resting: waiting by design, not stalled")
     if lifecycle not in WORKING_LIFECYCLES:
         return verdict(PROGRESS_UNKNOWN, f"no progress rule for lifecycle '{lifecycle}'")
@@ -473,12 +410,9 @@ def assess_progress(
 
 
 def resolve_service(name: str | None) -> str:
-    """Map a friendly service name onto a systemd unit, safely.
-
-    An unknown name is not rejected - a deployment may run units this module
-    has never heard of - but it is validated against a unit-name pattern
-    before it can reach ``journalctl``.
-    """
+    """Map a friendly service name onto a systemd unit, safely: unknown names are
+    not rejected (deployments may run units this module never heard of) but are
+    validated against a unit-name pattern before reaching ``journalctl``."""
     candidate = (name or "").strip()
     if not candidate:
         return KNOWN_SERVICES[0]
@@ -494,14 +428,8 @@ def resolve_service(name: str | None) -> str:
 def _bound_int(
     value: object, *, default: int, maximum: int, name: str = "lines"
 ) -> int:
-    """Clamp a caller-supplied bound, refusing only what is not a number.
-
-    Out-of-range is clamped rather than rejected: a caller asking for more
-    history than the ceiling allows wants as much as it can have, and a 400
-    there would be pedantry. A non-number is a different thing - it means the
-    caller believes it asked for something this does not understand - so it is
-    reported.
-    """
+    """Clamp a caller-supplied bound; only a non-number is refused (out-of-range is
+    clamped - the caller wants as much as it can have)."""
     if value is None:
         return default
     if isinstance(value, bool):
@@ -535,13 +463,9 @@ def _compact(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 class NexusDiagnostics:
-    """Read-only diagnostic backend shared by the API, operations and analysis.
-
-    One instance owns one SQLite connection, in the same
-    open-per-request/close style the other diagnostic surfaces use. Every
-    statement it issues is a SELECT; there is deliberately no code path here
-    that writes, so exposing it through the mailbox cannot change state.
-    """
+    """Read-only diagnostic backend shared by the API, operations and analysis: one
+    SQLite connection, every statement a SELECT - no code path here writes, so
+    exposing it through the mailbox cannot change state."""
 
     def __init__(
         self,
@@ -555,9 +479,8 @@ class NexusDiagnostics:
         self._conn = _connect_read_only(db_path)
         self.db_path = db_path
         self.log_dir = Path(log_dir or central_logging.resolve_log_dir())
-        # Public and rebindable: the API injects the process's shared
-        # LogReader per request, and a test injects a fake, so neither has
-        # to reach past a private name.
+        # Public and rebindable: the API injects the shared LogReader per request and
+        # tests inject a fake, so neither reaches past a private name.
         self.log_reader = log_reader
         self.stale_after_seconds = resolve_stale_timeout(stale_after_seconds)
         self._now = now or _now
@@ -571,23 +494,14 @@ class NexusDiagnostics:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
-    # ------------------------------------------------------------------
     # Reference resolution
-    # ------------------------------------------------------------------
 
     def resolve(self, reference: str) -> tuple[str, str]:
-        """Turn whatever the operator has to hand into ``(subject_type, id)``.
-
-        Resolution is ordered by how specific a match is, not by how likely
-        the caller is to have used that namespace: an exact id in any table
-        beats a prefix in any other, so a full id is never shadowed by some
-        other row that happens to start with the same characters. A prefix
-        must then be unique across *every* namespace, not merely within the
-        first one that matches - otherwise the order of this list, rather than
-        the operator's input, would be deciding the answer. Issue and PR
-        references resolve through the GitHub work links, which is the only
-        place that mapping is durably recorded.
-        """
+        """Turn whatever the operator has to hand into ``(subject_type, id)``: an exact
+        id in any table beats a prefix in any other, and a prefix must be unique
+        across *every* namespace - otherwise the table order, not the input, would
+        decide. Issues/PRs resolve through the GitHub work links, the only durable
+        mapping."""
         candidate = (reference or "").strip()
         if not candidate:
             raise DiagnosticsError("a reference is required")
@@ -605,17 +519,16 @@ class NexusDiagnostics:
             if resolved:
                 return resolved
             if not candidate.isdigit():
-                # "#188" / "issue 188" is a promise that this *is* an issue, so
-                # failing to find it is the answer. A bare "188" is only a
-                # guess, and might equally be the start of an id, so it falls
-                # through to id resolution below.
+                # "#188" / "issue 188" promises this *is* an issue, so not finding it
+                # is the answer; a bare "188" is only a guess and falls through to id
+                # resolution.
                 raise DiagnosticsError(
                     f"no Nexus work is linked to issue #{issue_match.group(1)}"
                 )
 
         if not _SAFE_ID_RE.fullmatch(candidate):
-            # Not an id at all - most likely an inbox filename, which carries
-            # its own derived task id.
+            # Not an id at all - most likely an inbox filename, which carries its
+            # own derived task id.
             resolved = self._resolve_inbox_filename(candidate)
             if resolved:
                 return resolved
@@ -625,11 +538,9 @@ class NexusDiagnostics:
             if self._exists(table, candidate):
                 return subject_type, candidate
 
-        # Prefix uniqueness is judged across *all* namespaces at once, not one
-        # table at a time. Checking per table and returning the first hit would
-        # have let namespace order silently decide between a mailbox task and
-        # an experiment that share a prefix - which is precisely the guess the
-        # contract promises not to make.
+        # Prefix uniqueness is judged across *all* namespaces at once, not one table
+        # at a time - per-table first-hit would let namespace order decide between two
+        # subjects sharing a prefix, exactly the guess the contract promises not to make.
         matches: list[tuple[str, str]] = []
         for subject_type, table in _RESOLUTION_TABLES:
             matches.extend(
@@ -640,10 +551,9 @@ class NexusDiagnostics:
         if len(matches) == 1:
             return matches[0]
 
-        # An inbox filename can look like a safe id (dots and dashes are legal
-        # in both), so it is tried before either verdict below: a reference
-        # that names a real message is answerable even if it also happens to
-        # prefix something.
+        # An inbox filename can look like a safe id (dots and dashes are legal in
+        # both), so it is tried before either verdict: a reference naming a real
+        # message is answerable even if it also happens to prefix something.
         resolved = self._resolve_inbox_filename(candidate)
         if resolved:
             return resolved
@@ -656,17 +566,10 @@ class NexusDiagnostics:
         raise DiagnosticsError(f"no task, experiment or session matches {candidate[:64]!r}")
 
     def _fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        """SELECT, treating a table that does not exist yet as "no rows".
-
-        Several of the tables joined here are created lazily by the service
-        that owns them - the controller store, the GitHub work tracker - so a
-        deployment that has not yet run one of them simply has no such table.
-        A diagnostic must degrade to "nothing known about that" there, not
-        fail: the databases most worth inspecting are the incomplete ones.
-        A column missing for the same reason (an additive migration a caller's
-        database has not run) is treated the same way. Any other SQL error is
-        a bug here and stays loud.
-        """
+        """SELECT, treating a missing table or column as "no rows": the tables are
+        created lazily by their owning services, and the databases most worth
+        inspecting are the incomplete ones - a diagnostic must degrade to "nothing
+        known", not fail. Any other SQL error is a bug here and stays loud."""
         try:
             return list(self._conn.execute(sql, tuple(params)).fetchall())
         except sqlite3.OperationalError as exc:
@@ -688,14 +591,10 @@ class NexusDiagnostics:
         )
 
     def _prefix_matches(self, table: str, identifier: str) -> list[str]:
-        """Ids in *table* starting with *identifier*, capped at two.
-
-        Two is all any caller needs: one match is a resolution, and two is
-        already "ambiguous" - counting the rest would only cost a bigger scan
-        to reach the same verdict. The caller sums these across namespaces,
-        because ambiguity is a property of the whole id space, not of one
-        table.
-        """
+        """Ids in *table* starting with *identifier*, capped at two: one match is a
+        resolution, two is already "ambiguous" - counting more would only cost a
+        bigger scan for the same verdict. Ambiguity is a property of the whole id
+        space, so the caller sums these across namespaces."""
         rows = self._fetchall(
             f"SELECT id FROM {table} WHERE id LIKE ? ESCAPE '\\' ORDER BY id LIMIT 2",  # noqa: S608
             (_like_prefix(identifier),),
@@ -744,9 +643,7 @@ class NexusDiagnostics:
             return SUBJECT_TASK, str(row["id"])
         return None
 
-    # ------------------------------------------------------------------
     # Lifecycle state
-    # ------------------------------------------------------------------
 
     def status(self, reference: str) -> LifecycleState:
         """``nexus status <reference>``: lifecycle only, no log bodies."""
@@ -754,11 +651,8 @@ class NexusDiagnostics:
         return self.status_for(subject_type, subject_id)
 
     def status_report(self, reference: str) -> DiagnosticReport:
-        """``nexus status <reference>`` as a report, so one shape serves both.
-
-        Same envelope as :meth:`diagnose` with the log bodies left out, rather
-        than a second response shape a caller would have to branch on.
-        """
+        """``nexus status <reference>`` as a report, so one shape serves both - same envelope as
+        :meth:`diagnose` with the log bodies left out, rather than a second response shape."""
         state = self.status(reference)
         return DiagnosticReport(
             generated_at=_iso(self._now()),
@@ -777,15 +671,9 @@ class NexusDiagnostics:
         raise DiagnosticsError(f"unknown subject type: {subject_type!r}")
 
     def task_status(self, task_id: str) -> LifecycleState:
-        """Lifecycle of one mailbox task, joined across every subsystem it touched.
-
-        A task's story is spread over four tables - the approval row owns
-        intake and outcome, the experiment owns the implementation phase, the
-        GitHub link owns branch/PR, and the controller session owns the
-        heartbeat - and the operator's question ("where did this stop?") is
-        answerable only from all four at once. That join is the point of this
-        method; doing it by hand is what #188 is about.
-        """
+        """Lifecycle of one mailbox task, joined across every subsystem it touched: the approval row owns intake
+        and outcome, the experiment the implementation phase, the GitHub link branch/PR, the controller session the
+        heartbeat - "where did this stop?" is answerable only from all four at once (#188)."""
         row = self._fetchone(
             "SELECT * FROM mailbox_task_approvals WHERE id = ?", (task_id,)
         )
@@ -806,9 +694,8 @@ class NexusDiagnostics:
             title=_text(row["task_body"], 200),
             created_at=_column(row, "received_at") or _column(row, "created_at"),
             updated_at=_column(row, "updated_at"),
-            # Approval is where a task *starts*, not where it ends, so only a
-            # rejection ends it here; a task that ran ends when its experiment
-            # does, which is attached below.
+            # Approval is where a task *starts*, not where it ends: only rejection ends it here; a task that ran ends
+            # when its experiment does, attached below.
             ended_at=_column(row, "rejected_at"),
             last_error=_text(
                 _column(row, "error")
@@ -836,9 +723,8 @@ class NexusDiagnostics:
             state.branch = _column(experiment, "branch_name")
             state.ended_at = state.ended_at or _column(experiment, "ended_at")
             if lifecycle in WORKING_LIFECYCLES:
-                # While the task itself is still open, the experiment is the
-                # phase actually running, so it - not the coarser task row -
-                # is what "where is this now?" should report.
+                # While the task is still open, the experiment is the phase actually running - not the coarser task row -
+                # so it is what "where is this now?" should report.
                 lifecycle = _EXPERIMENT_LIFECYCLE.get(experiment_status, lifecycle)
                 state.lifecycle = lifecycle
             if not state.last_error:
@@ -921,20 +807,14 @@ class NexusDiagnostics:
         state.progress = self._progress(state, row)
         return state
 
-    # ------------------------------------------------------------------
     # Joins onto the subsystems that own the remaining facts
-    # ------------------------------------------------------------------
 
     def _attach_github(
         self, state: LifecycleState, *, experiment_id: Any, source_id: str | None
     ) -> None:
-        """Branch / issue / PR, from whichever link row covers this work.
-
-        The branch is looked up even when the experiment already carries one:
-        the #186/#187 case is precisely "the branch exists but nothing came
-        after it", and a caller that cannot see the branch cannot tell that
-        case from "never started".
-        """
+        """Branch / issue / PR from whichever link row covers this work - looked up even when the experiment already
+        carries one, because the #186/#187 case is precisely "branch exists but nothing came after it", and a caller
+        that cannot see the branch cannot tell that from "never started"."""
         row = None
         if experiment_id:
             row = self._fetchone(
@@ -989,8 +869,7 @@ class NexusDiagnostics:
             or state.commit
         )
         if status == "adopted":
-            # Merged is further along than "the experiment succeeded", and it
-            # is the state an operator asking "did this ship?" means.
+            # Merged is further along than "the experiment succeeded" - the state "did this ship?" means.
             state.lifecycle = LIFECYCLE_MERGED
         elif status in ("failed", "interrupted") and state.lifecycle not in TERMINAL_LIFECYCLES:
             state.lifecycle = _ADOPTION_LIFECYCLE[status]
@@ -998,12 +877,8 @@ class NexusDiagnostics:
                 state.last_error = _text(_column(row, "reason"), _MAX_ERROR_CHARS)
 
     def _session_for(self, subject_id: str, experiment_id: Any) -> sqlite3.Row | None:
-        """The controller session driving this work, when one claimed it.
-
-        Preferred over every other progress signal because it is the only
-        one that means "a worker said it was alive" rather than "something
-        happened".
-        """
+        """The controller session driving this work, when one claimed it - preferred over every other progress signal
+        because it is the only one that means "a worker said it was alive" rather than "something happened"."""
         candidates = [subject_id]
         if experiment_id and str(experiment_id) != subject_id:
             candidates.append(str(experiment_id))
@@ -1044,9 +919,7 @@ class NexusDiagnostics:
             now=self._now(),
         )
 
-    # ------------------------------------------------------------------
     # Logs
-    # ------------------------------------------------------------------
 
     def _log_paths(self, correlation_ids: dict[str, str]) -> list[Path]:
         paths: list[Path] = []
@@ -1064,12 +937,8 @@ class NexusDiagnostics:
     def _read_logs(
         self, correlation_ids: dict[str, str], *, limit: int
     ) -> tuple[list[dict[str, Any]], list[str], bool]:
-        """Merge every log a subject wrote, newest-bounded and chronological.
-
-        Reading is best-effort per file: a diagnosis of a task whose experiment
-        log is missing is still worth having, and is in fact the more
-        interesting case, so a missing file is a note rather than an error.
-        """
+        """Merge every log a subject wrote, newest-bounded and chronological - best-effort per file: a missing
+        experiment log is a note, not an error (it is often the more interesting case)."""
         entries: list[dict[str, Any]] = []
         sources: list[str] = []
         for path in self._log_paths(correlation_ids):
@@ -1088,12 +957,8 @@ class NexusDiagnostics:
         return entries, sources, truncated
 
     def _last_log_timestamp(self, correlation_ids: dict[str, str]) -> str | None:
-        """Newest log timestamp across a subject's files, read from the tail.
-
-        Only the tail of each file is read: this runs on every status call,
-        including the scan behind ``last-failure``, and the newest entry is by
-        construction at the end.
-        """
+        """Newest log timestamp across a subject files, read from the tail only - this runs on every status call,
+        and the newest entry is by construction at the end."""
         newest: str | None = None
         for path in self._log_paths(correlation_ids):
             try:
@@ -1151,20 +1016,11 @@ class NexusDiagnostics:
         mailbox_task_id: str | None = None,
         limit: int = 200,
     ) -> tuple[LifecycleState | None, list[dict[str, Any]]]:
-        """Lifecycle state plus raw log entries, for the failure-analysis path.
-
-        The same resolution and the same merge the ``logs``/``status``
-        commands use, so a diagnosis and an operator looking at the same task
-        see the same facts (#188). Entries come back *raw* rather than
-        compacted: the analyzer applies its own relevance filter and its own
-        bounds, and pre-compacting here would silently drop the fields that
-        filter reads.
-
-        Best-effort throughout. A subject that cannot be resolved, or a log
-        directory that cannot be read, yields ``(None, [])`` - a diagnosis
-        with no lifecycle context is weaker but still worth having, and
-        evidence collection must never be the reason an analysis fails.
-        """
+        """Lifecycle state plus raw log entries, for the failure-analysis path - the same resolution and merge as
+        ``logs``/``status``, so a diagnosis and an operator see the same facts (#188). Entries come back *raw* rather
+        than compacted (the analyzer applies its own filter and bounds; pre-compacting would drop fields it reads).
+        Best-effort throughout: an unresolvable subject or unreadable log dir yields ``(None, [])`` - evidence collection
+        must never be the reason an analysis fails."""
         state: LifecycleState | None = None
         for subject_type, subject_id in (
             (SUBJECT_EXPERIMENT, experiment_id),
@@ -1179,8 +1035,8 @@ class NexusDiagnostics:
                 continue
 
         correlation = dict(state.correlation_ids) if state else {}
-        # Even with no resolvable row, the ids the caller handed us still name
-        # log files; reading them is the whole point of this call.
+        # Even with no resolvable row, the ids the caller handed us still name log files; reading them is the whole
+        # point of this call.
         if experiment_id:
             correlation.setdefault("experiment_id", experiment_id)
         if mailbox_task_id:
@@ -1195,20 +1051,12 @@ class NexusDiagnostics:
             entries = []
         return state, entries
 
-    # ------------------------------------------------------------------
     # last-failure
-    # ------------------------------------------------------------------
 
     def last_failure(self, *, lines: object = None, scan: object = None) -> DiagnosticReport:
-        """The most recent failed *or stalled* piece of work, with its context.
-
-        Stalled counts as failed here on purpose. The failure an operator is
-        looking for after a silent night is usually not a row that says
-        ``failed`` - a process that died mid-run never got to write one - it is
-        a row still claiming to be ``implementing`` whose last progress signal
-        is hours old. Finding only the former is what made the #186/#187
-        investigation start from a blank page.
-        """
+        """The most recent failed *or stalled* piece of work, with its context. Stalled counts as failed on purpose:
+        after a silent night the interesting row is usually one still claiming ``implementing`` whose last progress signal
+        is hours old, not one that says ``failed`` (#186/#187)."""
         candidates = self._failure_candidates(scan=scan)
         if not candidates:
             raise DiagnosticsError("no failed or stalled task or experiment was found")
@@ -1257,9 +1105,8 @@ class NexusDiagnostics:
             interrupted = progress is not None and progress.state == PROGRESS_INTERRUPTED
             if state.lifecycle not in FAILED_LIFECYCLES and not interrupted:
                 continue
-            # Order by when the work was last seen alive, not by when its row
-            # was created: "the latest failure" means the one that stopped most
-            # recently.
+            # Order by when the work was last seen alive, not when its row was created: "the latest failure" means the one
+            # that stopped most recently.
             marker = (
                 (progress.last_progress_at if progress else None)
                 or state.ended_at
@@ -1270,11 +1117,9 @@ class NexusDiagnostics:
             scored.append((marker, subject_type, subject_id))
             if subject_type == SUBJECT_TASK:
                 covered_experiments.add(state.correlation_ids.get("experiment_id") or "")
-        # A task and the experiment it spawned are one piece of work seen from
-        # two sides, and both are candidates. The task view is the complete
-        # one - it already carries the experiment's lifecycle, branch and logs
-        # - so reporting the experiment separately would just be the same
-        # failure a second time, with less context.
+        # A task and the experiment it spawned are one piece of work seen from two sides, and both are candidates - but
+        # the task view already carries the experiment lifecycle, branch and logs, so reporting the experiment separately
+        # would just repeat the same failure with less context.
         scored = [
             entry
             for entry in scored
@@ -1287,9 +1132,7 @@ class NexusDiagnostics:
         )
         return scored
 
-    # ------------------------------------------------------------------
     # Service logs
-    # ------------------------------------------------------------------
 
     async def service_logs(
         self,
@@ -1298,14 +1141,9 @@ class NexusDiagnostics:
         lines: object = None,
         since_minutes: object = None,
     ) -> ServiceLogs:
-        """``nexus logs service <name>``: a bounded journal slice, no journalctl.
-
-        The caller names a service, not a unit, and never builds a command
-        line. A journal that cannot be read (no systemd, unknown unit, a
-        timeout) is reported in ``error`` rather than raised: a missing
-        journal is itself a diagnostic finding, and the rest of the answer
-        (which unit was consulted, over what window) still stands.
-        """
+        """``nexus logs service <name>``: a bounded journal slice, no journalctl - the caller names a service, never a
+        command line. A journal that cannot be read is reported in ``error`` rather than raised: a missing journal is
+        itself a diagnostic finding, and which unit was consulted over what window still stands."""
         unit = resolve_service(service)
         limit = _bound_lines(lines, default=DEFAULT_SERVICE_LINES)
         reader = self.log_reader
@@ -1343,19 +1181,12 @@ class NexusDiagnostics:
         result.entries = [_compact(entry) for entry in entries]
         return result
 
-    # ------------------------------------------------------------------
     # Local LLM jobs (#259)
-    # ------------------------------------------------------------------
 
     def llm_job(self, job_id: str) -> dict[str, Any]:
-        """One persisted ``local_llm_jobs`` row, looked up by its exact id.
-
-        Exact id only: a job id is what the controller and the journal print,
-        and a prefix match here would add a second resolution rule for no
-        gain. Free text (prompt, system, result, error) has credential values
-        masked on the way out - paths, URLs and JSON stay intact, because
-        they are what the analysis needs; the row itself is only read.
-        """
+        """One persisted ``local_llm_jobs`` row by exact id (a prefix match would add a second resolution rule for no
+        gain). Free text (prompt, system, result, error) has credential values masked on the way out - paths, URLs and
+        JSON stay intact because they are what analysis needs; the row itself is only read."""
         candidate = (job_id or "").strip()
         if not candidate:
             raise DiagnosticsError("a job id is required")
@@ -1372,13 +1203,9 @@ class NexusDiagnostics:
 
 
 def _column(row: Any, name: str) -> Any:
-    """Read a column that may not exist on an older row shape.
-
-    Schema migrations here are additive, so a database written before a column
-    existed still answers every other question correctly; a diagnostic that
-    raised ``no such column`` on it would be useless exactly when the history
-    being diagnosed is old.
-    """
+    """Read a column that may not exist on an older row shape: migrations are additive, so a database written before
+    the column existed still answers every other question - a diagnostic raising ``no such column`` on it would be
+    useless exactly when the history being diagnosed is old."""
     if row is None:
         return None
     try:
@@ -1391,12 +1218,8 @@ def _column(row: Any, name: str) -> Any:
 
 
 def render_report(report: DiagnosticReport) -> list[str]:
-    """Flat, stable key/value lines for the operations/chat surface.
-
-    The API returns structured JSON; this is the same content rendered for
-    callers whose transport is a list of lines. The shape is deliberately
-    ``key: value`` so it stays parseable rather than becoming prose.
-    """
+    """Flat, stable key/value lines for the operations/chat surface: the API returns structured JSON, this is the
+    same content for line-based transports, deliberately ``key: value`` so it stays parseable rather than prose."""
     state = report.lifecycle
     lines = [
         f"subject: {state.subject_type} {state.subject_id}",
@@ -1438,7 +1261,7 @@ def render_report(report: DiagnosticReport) -> list[str]:
 
 
 LLM_JOB_VIEWS = ("summary", "result", "prompt")
-# Bounds the full-text views; a local model's answer is far below this.
+# Bounds the full-text views
 _MAX_LLM_JOB_TEXT_CHARS = 50_000
 
 
@@ -1484,8 +1307,7 @@ def render_llm_job(job: dict[str, Any], *, view: str = "summary") -> list[str]:
         f"job_id: {job['id']}",
         f"role: {job.get('role') or '-'}",
         f"session_id: {job.get('session_id') or '-'}",
-        # Every job runs on the local llama.cpp server; the model name is
-        # not persisted per job.
+        # Every job runs on the local llama.cpp server; the model name is not persisted per job.
         "provider: local",
         f"status: {job.get('status') or '-'}",
         f"created_at: {job.get('created_at') or '-'}",

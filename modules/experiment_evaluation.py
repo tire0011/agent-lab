@@ -1,42 +1,10 @@
 """Deterministic (non-LLM) quality evaluation for Nexus experiments.
 
-The verification phase in ``modules.experiment_service`` already runs the
-project's test suite and rejects a diff that fails it. That is necessary
-but not sufficient: a test suite passing says nothing about whether the
-*actual* changes made by the implementation phase match what was planned
-and what the original task asked for. The regression this module fixes:
-an experiment whose task was "extract the Logs functionality from
-``static/app.js`` into a new ``static/logs.js`` module" ended up only
-editing ``tests/test_api.py`` (adding tests that happen to already pass
-against the *existing*, unchanged ``app.js``) and was still marked
-``succeeded``.
-
-This module adds one more, fully deterministic gate between "tests
-passed" and "status = succeeded":
-
-  * it classifies the experiment's *actual* changes (tracked-modified vs
-    newly-created untracked files, already excluding VCS/venv/cache/log
-    noise),
-  * it compares them against the structured plan's declared
-    ``change_kind`` (``implementation`` / ``tests_only`` / ``documentation``
-    / ``analysis``), its named non-test files, and any ``required_artifacts``,
-  * and — as a conservative fallback only used when the plan itself names
-    nothing concrete — against any explicit repo-relative file path
-    literally mentioned in the original task text (e.g. ``static/logs.js``).
-
-No additional LLM call is used anywhere in this module: every check below
-is a plain, inspectable, deterministic function over strings/paths.
-
-Two entry points are used by ``ExperimentService``:
-
-  * ``validate_plan(plan, goal)`` — cheap, pre-implementation sanity check
-    on the structured plan itself (before spending an implementation Codex
-    call). Returns a rejection reason or ``None``.
-  * ``evaluate_implementation(plan, goal, changed, worktree_path)`` — the
-    post-implementation, post-tests-passed check. Returns an
-    ``EvaluationResult`` whose ``outcome`` is ``"pass"`` or
-    ``"needs_review"`` — it is never used to promote a *failed* test run to
-    success, only to potentially downgrade an otherwise-"tests passed" run.
+An extra gate between "tests passed" and "succeeded": classifies the experiment's
+actual changes and compares them against the plan's declared change_kind, named
+non-test files, and required_artifacts (fallback: file paths named in the task).
+Entry points: ``validate_plan`` (pre-implementation) and
+``evaluate_implementation`` (post-tests; never promotes a failed test run).
 """
 
 from __future__ import annotations
@@ -48,29 +16,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-# ---------------------------------------------------------------------------
 # Change-kind vocabulary
-# ---------------------------------------------------------------------------
 
 VALID_CHANGE_KINDS: tuple[str, ...] = ("implementation", "tests_only", "documentation", "analysis")
 
-# Conservative default for plans that predate the ``change_kind`` field
-# (backward compatibility, see ``PlanLike``). "implementation" is the
-# *strictest* of the four kinds with respect to the checks below (it is
-# the only one that unconditionally requires real non-test evidence), so
-# defaulting to it can only ever make evaluation stricter for legacy data,
-# never accidentally more permissive.
+# Default for legacy plans without change_kind: "implementation" is the strictest
+# kind, so defaulting can only make legacy evaluation stricter, never looser.
 DEFAULT_CHANGE_KIND = "implementation"
 
-# Bounds applied to every list/field written into logs or the DB so a
-# pathological diff (thousands of files) can never blow up storage.
+# Bounds on every list written to logs/DB so a pathological diff cannot blow up storage.
 MAX_EVAL_LIST_ITEMS = 50
 MAX_EVAL_ITEM_CHARS = 300
 
 
-# ---------------------------------------------------------------------------
 # Test-path classification
-# ---------------------------------------------------------------------------
 
 _TEST_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(^|/)tests?/"),
@@ -82,17 +41,16 @@ _TEST_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 def _normalize_path(path: str) -> str:
     normalized = path.strip().strip('"').replace("\\", "/")
-    # Strip a leading "./" prefix (possibly repeated), but never touch a
-    # genuine leading dot of a dotfile/dotdir (e.g. ".git/...") — a naive
-    # ``str.lstrip("./")`` would incorrectly also eat that leading dot.
+    # Strip a leading "./" (repeatedly), but never a genuine dot of a dotfile -
+    # lstrip("./") would eat that leading dot too.
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized
 
 
 def is_test_path(path: str) -> bool:
-    """True if *path* is a test file/directory by a fixed, inspectable
-    naming convention (not a keyword scan of file *content*)."""
+    """True if *path* is a test file/directory by fixed naming convention (no
+    content scan)."""
     normalized = _normalize_path(path)
     return any(pattern.search(normalized) for pattern in _TEST_PATH_PATTERNS)
 
@@ -108,13 +66,8 @@ def split_test_and_non_test(paths: Iterable[str]) -> tuple[list[str], list[str]]
     return test_paths, non_test_paths
 
 
-# ---------------------------------------------------------------------------
-# Noise filtering: paths that must never count as "actual implementation
-# evidence" even if they somehow surface in a git status listing. This is
-# defense in depth — such paths are normally already excluded by
-# .gitignore — for the (untracked-file) case where a stray ignored path
-# could otherwise still appear.
-# ---------------------------------------------------------------------------
+# Noise filtering: paths that must never count as implementation evidence
+# (defense in depth; .gitignore normally excludes them already).
 
 _IGNORED_PATH_PREFIXES: tuple[str, ...] = (
     ".git/", ".venv/", ".venv-agent/", "venv/", "env/", "node_modules/",
@@ -133,11 +86,8 @@ def is_ignored_support_path(path: str) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Changed-file collection (git status --short / porcelain v1 parsing only;
-# the actual subprocess call is made elsewhere with shell=False — this
-# function only parses already-captured text, never invokes a shell).
-# ---------------------------------------------------------------------------
+# Changed-file collection: parses captured `git status --short` text only; the
+# subprocess elsewhere runs with shell=False - this module never invokes a shell.
 
 
 @dataclass
@@ -165,8 +115,7 @@ def parse_git_status_short(git_status_text: str | None) -> ChangedFiles:
         if not match:
             continue
         code_x, code_y, rest = match.group("x"), match.group("y"), match.group("rest")
-        # Renames/copies are rendered as "old -> new"; only the resulting
-        # (new) path reflects the current worktree contents.
+        # Renames/copies render as "old -> new"; only the new path reflects the worktree.
         if " -> " in rest:
             rest = rest.split(" -> ", 1)[1]
         path = _normalize_path(rest)
@@ -182,18 +131,12 @@ def parse_git_status_short(git_status_text: str | None) -> ChangedFiles:
     )
 
 
-# ---------------------------------------------------------------------------
-# Explicit file-path extraction from free-text task goals. Used only as a
-# conservative fallback "required artifact" source when the plan itself
-# names nothing concrete for a non-tests_only change — never to override a
-# more specific plan, and never to *approve* anything by itself (a goal
-# mentioning no path just means no fallback artifact is added).
-# ---------------------------------------------------------------------------
+# Explicit file paths extracted from task goals - a conservative fallback artifact
+# source when the plan names nothing concrete; never overrides the plan, never
+# approves anything by itself.
 
-# Requires at least one path separator so incidental mentions of bare
-# documentation files (e.g. "see README.md") are not treated as a
-# required-artifact path; matches project-relative paths such as
-# "static/logs.js" or "modules/experiment_evaluation.py".
+# At least one path separator, so bare doc mentions ("see README.md") are not
+# artifacts; matches project-relative paths like "static/logs.js".
 _GOAL_PATH_RE = re.compile(r"\b[\w][\w-]*(?:/[\w.-]+)+\.[A-Za-z0-9]{1,8}\b")
 
 
@@ -206,11 +149,8 @@ _SECTION_HEADING_RE = re.compile(
 
 
 def _change_section(task: str) -> str:
-    """The Change section of an issue that has sections, else the whole text.
-
-    Problem and Test sections name files that already exist or test fixtures
-    (#416: example paths made #403 and #416 fail their own gate).
-    """
+    """The Change section of a sectioned issue, else the whole text - Problem and
+    Test sections name existing files or fixtures (#416, #403)."""
     headings = list(_SECTION_HEADING_RE.finditer(task))
     for index, heading in enumerate(headings):
         if heading.group(1).lower() in ("change", "changes"):
@@ -220,9 +160,8 @@ def _change_section(task: str) -> str:
 
 
 def extract_explicit_goal_artifacts(goal: str) -> list[str]:
-    # Only the task itself names files to create. The handover appended to it
-    # (#263) quotes whatever Nexus looked at - file listings, command output -
-    # and made ".git/hooks/*.sample" a required artifact for #349.
+    # Only the task itself names files to create; the appended handover (#263)
+    # quotes listings/output and once made ".git/hooks/*.sample" an artifact (#349).
     from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
 
     task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
@@ -231,12 +170,11 @@ def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
         if match.start() > 0 and task[match.start() - 1] == ".":
-            # "\b" starts the match after a leading dot: ".git/hooks/x" would
-            # become "git/hooks/x". Dot paths are never artifacts (#403).
+            # "\b" starts after a leading dot: ".git/hooks/x" would become
+            # "git/hooks/x". Dot paths are never artifacts (#403).
             continue
         if path.startswith("git/"):
-            # The same paths quoted from gate output, already without the dot;
-            # the repository has no git/ directory (#403).
+            # Gate-output paths without the dot; the repo has no git/ directory (#403).
             continue
         if is_test_path(path) or is_ignored_support_path(path) or _is_placeholder_path(path):
             continue
@@ -255,14 +193,9 @@ def _is_placeholder_path(path: str) -> bool:
     return len(stem) == 1 or stem in _PLACEHOLDER_STEMS
 
 
-# ---------------------------------------------------------------------------
-# "tests_only" goal justification: a plan may only declare
-# change_kind="tests_only" when the *original* task explicitly and
-# narrowly asked for a tests-only change, or structurally names only test
-# paths. This intentionally does not classify arbitrary free text by broad
-# keyword scanning. A concrete non-test file path remains a stronger signal
-# that real implementation work was requested than either form of evidence.
-# ---------------------------------------------------------------------------
+# "tests_only" justification: only an explicit, narrow tests-only request or
+# structurally test-only paths may declare tests_only; a concrete non-test path is
+# stronger evidence that implementation work was requested.
 
 _TESTS_ONLY_GOAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bnur\s+tests?\b", re.IGNORECASE),
@@ -285,12 +218,8 @@ def goal_is_explicit_tests_only(goal: str) -> bool:
 
 
 def goal_names_only_test_paths(goal: str) -> bool:
-    """True when every path named by *goal* is test/support-only.
-
-    At least one named path must be an actual test path; a goal that names
-    no paths (or only ignored runtime/support paths) is not enough evidence
-    to relax the implementation gate.
-    """
+    """True when every path named by *goal* is test/support-only; at least one must
+    be a real test path - naming no paths is not evidence to relax the gate."""
     paths = [match.group(0) for match in _GOAL_PATH_RE.finditer(goal or "")]
     return (
         any(is_test_path(path) for path in paths)
@@ -298,22 +227,14 @@ def goal_names_only_test_paths(goal: str) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
 # Backward-compatible plan view
-# ---------------------------------------------------------------------------
 
 
 class PlanLike:
-    """Minimal, backward-compatible read-only view over a structured plan.
+    """Minimal read-only view over a plan (dataclass or dict from plan_json).
 
-    Accepts either an ``ExperimentPlan`` dataclass instance (has attributes)
-    or a plain ``dict`` (as stored in ``experiments.plan_json``/returned by
-    ``Experiment.plan``). Older stored plans that predate ``change_kind``,
-    ``required_artifacts``, and ``acceptance_criteria`` always get the
-    safe, conservative defaults below rather than raising — so historical
-    experiments keep working exactly as if they had been explicitly
-    declared as a generic ``implementation`` change with no extra
-    guarantees, which is the strictest of the four kinds.
+    Plans predating change_kind/required_artifacts get the safe defaults - the
+    equivalent of a plain ``implementation`` plan, the strictest kind.
     """
 
     __slots__ = ("title", "affected_files", "change_kind", "required_artifacts", "acceptance_criteria")
@@ -351,22 +272,15 @@ class PlanLike:
         return non_test
 
 
-# ---------------------------------------------------------------------------
 # Pre-implementation plan validation
-# ---------------------------------------------------------------------------
 
 
 def validate_plan(plan: Any, goal: str) -> str | None:
-    """Deterministic, pre-implementation completeness check.
+    """Deterministic pre-implementation completeness check; returns a rejection
+    reason or ``None``.
 
-    Independent of and additional to
-    ``experiment_service.plan_violates_policy`` — never loosens any
-    existing safety rule; only adds change-kind-aware completeness rules
-    so an insufficient plan is rejected (and, per the existing pipeline,
-    gets exactly one policy-replan retry) *before* an expensive
-    implementation Codex call is spent on it.
-
-    Returns a human-readable rejection reason, or ``None`` if acceptable.
+    Additional to ``plan_violates_policy`` - never loosens an existing safety
+    rule; rejects insufficient plans before an implementation call is spent.
     """
     p = PlanLike.from_any(plan)
 
@@ -396,16 +310,13 @@ def validate_plan(plan: Any, goal: str) -> str | None:
             )
         return None
 
-    # change_kind == "analysis": a read-only investigation is not required
-    # to name a file to change; plan_violates_policy()'s existing
-    # "must touch a concrete code or test file" rule still applies upstream
-    # for any plan that reaches the (workspace-write) implementation phase.
+    # change_kind == "analysis": a read-only investigation need not name a file
+    # to change; the upstream "must touch a concrete file" rule still applies
+    # before any workspace-write phase.
     return None
 
 
-# ---------------------------------------------------------------------------
 # Post-implementation evaluation
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -437,11 +348,10 @@ class EvaluationResult:
     missing_artifacts: list[str] = field(default_factory=list)
 
     def soft_findings(self) -> str | None:
-        """The reason, when only artifact-evidence checks failed; else ``None``.
+        """The reason when only artifact-evidence checks failed, else ``None``.
 
-        These checks read file paths out of free task text and have raised
-        many false alarms (#461, #499, #513). With green tests they no longer
-        stop the run: the reviewer gets them and decides (#519). Any other
+        Those checks read paths from free task text and false-alarmed often (#461,
+        #499, #513); with green tests they go to the reviewer (#519). Any other
         failed check, or an empty diff, stays a hard stop.
         """
         failed = [c for c in self.checks if not c.passed]
@@ -478,10 +388,9 @@ def _git_ignored(path: str, worktree_path: str | None) -> bool:
 def _artifact_exists(artifact: str, worktree_path: str | None) -> bool:
     """True if *artifact* exists as a real file inside *worktree_path*.
 
-    Defensive: refuses absolute paths and ``..`` traversal (never treats
-    those as "present" — an artifact outside the worktree can never
-    satisfy a requirement about the worktree's own contents), and never
-    raises (a filesystem error is treated as "missing", never as "present").
+    Refuses absolute paths and ``..`` traversal (outside the worktree never
+    satisfies a worktree requirement) and never raises - a filesystem error
+    counts as missing, never as present.
     """
     if not worktree_path or not artifact:
         return False
@@ -507,19 +416,16 @@ def evaluate_implementation(
 ) -> EvaluationResult:
     """Deterministic post-implementation, post-tests-passed quality gate.
 
-    Never called to override a *failed* test run — callers must only
-    invoke this after tests have already passed, and must still treat any
-    exception raised here as ``needs_review`` (never as ``succeeded``).
+    Never overrides a *failed* test run, and callers must treat any exception
+    raised here as ``needs_review``, never as ``succeeded``.
     """
     p = PlanLike.from_any(plan)
     all_changed = changed.all_paths()
     test_changed, non_test_changed = split_test_and_non_test(all_changed)
-    # A plan-less run, or an implementation plan that itself names only test
-    # files, may be promoted when the goal structurally or explicitly asks
-    # for tests only. Any affected non-test file keeps a plan classified as
-    # implementation, preserving the stricter non-test-evidence gate - unless
-    # the task explicitly asked for tests only and only tests changed: the
-    # planner may list non-test files it only had to read (#493).
+    # A plan-less run, or a plan naming only test files, may be promoted when the
+    # goal asks for tests only; any affected non-test file keeps the stricter
+    # non-test-evidence gate (#493: the planner may list non-test files it only
+    # had to read).
     affected_files_are_tests_only = (
         bool(p.affected_files) and all(is_test_path(path) for path in p.affected_files)
     )
@@ -553,9 +459,8 @@ def evaluate_implementation(
             "analysis_scope", True, "analysis/investigation plans are not required to change files",
         ))
     else:
-        # "implementation" or "documentation" (and, defensively, any other
-        # value — validate_plan() already rejects truly unknown kinds
-        # before implementation is ever attempted).
+        # "implementation" or "documentation" (defensively any other value -
+        # validate_plan() rejects unknown kinds before implementation).
         non_test_affected = p.expected_non_test_files()
 
         if not non_test_changed:
@@ -576,8 +481,8 @@ def evaluate_implementation(
             required_artifacts = extract_explicit_goal_artifacts(goal)
         expected_files = required_artifacts
 
-        # A git-ignored path (runtime state such as state/mailbox.lock) can
-        # never be committed, so it cannot be a required artifact (#185).
+        # A git-ignored path (runtime state such as state/mailbox.lock) can never
+        # be committed, so it cannot be a required artifact (#185).
         required_artifacts = [a for a in required_artifacts if not _git_ignored(a, worktree_path)]
         missing_artifacts = [a for a in required_artifacts if not _artifact_exists(a, worktree_path)]
         if missing_artifacts:
@@ -609,7 +514,7 @@ def evaluate_implementation(
 
     if reasons:
         outcome = "needs_review"
-        reason = "; ".join(dict.fromkeys(reasons))  # de-duplicate, preserve order
+        reason = "; ".join(dict.fromkeys(reasons))
     else:
         outcome = "pass"
         reason = "deterministic quality checks passed"
@@ -624,9 +529,7 @@ def evaluate_implementation(
     )
 
 
-# ---------------------------------------------------------------------------
 # Compact history view of a stored evaluation error (#444)
-# ---------------------------------------------------------------------------
 
 _ERROR_PREFIX = "quality evaluation: "
 _MISSING_ARTIFACT_RE = re.compile(r"erforderliches Artefakt (.+) fehlt")
@@ -646,12 +549,10 @@ def _cut_at_word(text: str, limit: int) -> str:
 def summarize_error(error: str, limit: int = 200) -> str:
     """``error`` in one line of at most ``limit`` characters.
 
-    The quality evaluation repeats "erforderliches Artefakt <path> fehlt" for
-    every path, so a plain cut hides how many artifacts failed and which kinds.
-    Those items become a total, a count per repeated top-level directory and a
-    few examples, each from a different directory first: one real gap must stay
-    visible beside dozens of ``git/`` false positives. Its other reasons are
-    separate failures and are kept. An error that fits needs no summary.
+    Repeated "artifact <path> missing" items become a total plus per-directory
+    counts and a few examples, so one real gap stays visible beside dozens of
+    git/ false positives; other reasons are kept. An error that fits needs no
+    summary.
     """
     text = " ".join(str(error or "").split())
     if len(text) <= limit:

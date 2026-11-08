@@ -27,17 +27,14 @@ STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 _TERMINAL = {STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED}
 
-# Job roles (#167). Every local-model caller submits through this one service,
-# so the role is what keeps their jobs separable in the queue, in the database
-# and in the logs. Roles are free-form strings; these are the ones Nexus ships.
+# Job roles (#167): the role keeps jobs separable in the queue, database and logs.
 ROLE_CONTROLLER = "controller"
 ROLE_FAILURE_ANALYSIS = "failure_analysis"
 ROLE_LOCAL_WORKER = "local_worker"
 ROLE_TOOL_ROUTER = "tool_router"
 
-# Error classification (#167). A job's failure reason is part of the shared
-# observability contract: callers should be able to tell a wedged worker from
-# a refused connection without parsing exception text themselves.
+# Error classification (#167): lets callers tell a wedged worker from a refused
+# connection without parsing exception text.
 ERROR_KIND_TIMEOUT = "timeout"
 ERROR_KIND_CONNECTION = "connection"
 ERROR_KIND_PROTOCOL = "protocol"
@@ -47,39 +44,30 @@ ERROR_KIND_INTERRUPTED = "interrupted"
 ERROR_KIND_STUCK = "stuck"
 ERROR_KIND_UNKNOWN = "unknown"
 
-# The watchdog: one hard deadline for a whole local model call (#236), so a
-# hung call fails in bounded time and its caller can move on - the controller
-# to the external-provider fallback. 900s sits above nearly all real VM jobs
-# (controller p50 ~2min, p95 ~9min, p99 ~15min). The bounds only catch
-# misconfiguration: the floor is below a typical call on purpose, so an
-# operator can still ask for a fast fallback.
+# One hard deadline per local model call (#236), so a hung call fails in bounded
+# time. The bounds only catch misconfiguration; the floor is below a typical
+# call so an operator can still ask for a fast fallback.
 _WATCHDOG_ENV_VAR = "NEXUS_LOCAL_LLM_JOB_WATCHDOG_SECONDS"
 _DEFAULT_WATCHDOG_SECONDS = 900.0
 _MIN_WATCHDOG_SECONDS = 60.0
 _MAX_WATCHDOG_SECONDS = 7200.0
-# How long a `running` job may outlive the watchdog before it is treated as
-# stuck. The worker enforces the watchdog itself, so anything still `running`
-# well past it means the worker - not the model - is wedged, and a waiter
-# would otherwise block forever.
+# How long a `running` job may outlive the watchdog before it counts as stuck:
+# past it the worker, not the model, is wedged and a waiter would block forever.
 _STUCK_GRACE_SECONDS = 120.0
-# Cheap opportunistic sweep: at most one stuck-job UPDATE per interval, no
-# extra thread. Waiters poll anyway, so this is where liveness is enforced.
+# Cheap opportunistic sweep: at most one stuck-job UPDATE per interval; waiters
+# poll anyway, so liveness is enforced here.
 _STUCK_SWEEP_INTERVAL_SECONDS = 30.0
 
-# Cross-process serialization (#167 review). A process-wide singleton only
-# stops one process from racing itself; Nexus runs the controller (nexus_tick)
-# and the API in separate processes against the same database, so the "one
-# request at a time" rule has to live in the database. A worker claims the
-# single inference slot by transitioning a job to `running` inside one
-# IMMEDIATE transaction, and states its liveness on the claim (D-018) rather
-# than letting a dead process hold the slot forever.
+# Cross-process serialization: controller and API run in separate processes
+# against one database, so the "one request at a time" rule lives in the
+# database - a worker claims the single inference slot in one IMMEDIATE
+# transaction and states its liveness on the claim (D-018).
 _LEASE_ENV_VAR = "NEXUS_LOCAL_LLM_LEASE_SECONDS"
 _DEFAULT_LEASE_SECONDS = 120
-# How long a worker blocks on SQLite's write lock before giving up. Claims are
-# short (a few statements), so contention resolves well inside this.
+# How long a worker blocks on SQLite's write lock; claims are short, so
+# contention resolves well inside this.
 _BUSY_TIMEOUT_MS = 10_000
-# How often an otherwise idle worker looks for work another process queued, or
-# for the inference slot another process released.
+# How often an idle worker looks for work another process queued or a slot it released.
 _DEFAULT_IDLE_POLL_SECONDS = 1.0
 
 _LOGGER = logging.getLogger(__name__)
@@ -111,12 +99,8 @@ def local_llm_watchdog_seconds() -> float:
 
 
 class LocalLlmJobError(RuntimeError):
-    """A local-LLM job did not produce a result.
-
-    Carries the job id and the shared error classification so a caller can
-    report *why* inference did not happen (failed, cancelled, stuck) without
-    re-deriving it from the message text.
-    """
+    """A local-LLM job did not produce a result; carries the job id and shared
+    error kind so callers can report why without parsing message text."""
 
     def __init__(
         self,
@@ -133,11 +117,8 @@ class LocalLlmJobError(RuntimeError):
 
 
 def classify_job_error(exc: BaseException) -> str:
-    """Map an inference exception onto one of the shared ``ERROR_KIND_*`` values.
-
-    Deliberately type-name based: the worker must classify transport errors
-    from httpx (or any future client) without this module importing them.
-    """
+    """Map an inference exception onto one of the shared ``ERROR_KIND_*`` values,
+    by type name so this module need not import httpx or future clients."""
     name = type(exc).__name__.lower()
     if "cancel" in name:
         return ERROR_KIND_CANCELLED
@@ -155,14 +136,9 @@ def classify_job_error(exc: BaseException) -> str:
 def llama_server_failure_diagnostics(
     journal_lines: int = _DIAG_JOURNAL_LINES,
 ) -> dict[str, Any]:
-    """Best-effort, cheap snapshot of llama-server health for failure logs.
-
-    Collects ``systemctl show`` properties (active state, PID, restart count)
-    and the last few ``journalctl`` lines for the llama-server unit. Never
-    raises: any missing tool, permission error, or timeout is reported as a
-    string under ``"error"`` instead of propagating, since this is only ever
-    called from an exception handler and must not itself fail a job.
-    """
+    """Best-effort snapshot of llama-server health for failure logs. Never raises:
+    any failure is reported under ``"error"`` - this is called from exception
+    handlers and must not itself fail a job."""
     diagnostics: dict[str, Any] = {"service": _LLAMA_SERVICE_NAME}
     try:
         result = subprocess.run(
@@ -239,18 +215,13 @@ class LocalLlmJob:
 class LocalLlmJobService:
     """Persist and serialize slow local-LLM inference behind one claimed slot.
 
-    One daemon worker per process, SQLite persistence and polling;
-    llama-server remains the inference backend and callers never own the long
-    HTTP request themselves.
-
-    Serialization is enforced in the database, not in the process: a worker
-    runs a job only after claiming the single inference slot in one IMMEDIATE
-    transaction, so the controller process and the API process cannot both be
-    talking to llama-server at once. A claim states its own liveness
-    (``worker_id`` + ``lease_expires_at``, refreshed while the request is in
-    flight); a claim whose lease expired belonged to a process that died, and
-    is reclaimed. Queued work is visible to every worker, so a job submitted
-    by a process that then exits is still executed.
+    Serialization is enforced in the database, not the process: a worker runs a
+    job only after claiming the single inference slot in one IMMEDIATE
+    transaction, so the controller and API processes cannot both talk to
+    llama-server at once. A claim states its own liveness (worker_id + lease,
+    refreshed in flight); an expired lease belonged to a dead process and is
+    reclaimed. Queued work is visible to every worker, so a job submitted by a
+    process that exits is still executed.
     """
 
     def __init__(
@@ -272,17 +243,16 @@ class LocalLlmJobService:
         )
         self._stuck_after_seconds = watchdog + _STUCK_GRACE_SECONDS
         self._last_stuck_sweep = 0.0
-        # Identity and liveness come from the shared heartbeat contract
-        # (D-018): who owns a claim, and for how long silence still means
-        # "alive". The lease floor is deliberate - calling live work dead is
+        # Claim ownership/liveness come from the shared heartbeat contract
+        # (D-018); the lease floor is deliberate - calling live work dead is
         # worse than noticing a dead worker late.
         self.worker_id = heartbeat.worker_id()
         self.lease_seconds = heartbeat.resolve_stale_timeout(
             os.environ.get(_LEASE_ENV_VAR, _DEFAULT_LEASE_SECONDS)
         )
         self._lock = threading.RLock()
-        # Autocommit: the claim below is one explicit IMMEDIATE transaction,
-        # and everything else is a single statement.
+        # Autocommit: the claim is one explicit IMMEDIATE transaction, everything
+        # else a single statement.
         self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
@@ -315,9 +285,8 @@ class LocalLlmJobService:
             self._conn.execute(
                 "ALTER TABLE local_llm_jobs ADD COLUMN response_format TEXT"
             )
-        # Additive migrations for databases created before #167. Existing rows
-        # are controller jobs by construction, which is exactly what the
-        # column default backfills.
+        # Additive migrations for pre-#167 databases; the column default
+        # backfills existing rows as controller jobs.
         if "role" not in columns:
             self._conn.execute(
                 "ALTER TABLE local_llm_jobs ADD COLUMN role TEXT NOT NULL DEFAULT 'controller'"
@@ -336,11 +305,10 @@ class LocalLlmJobService:
             "CREATE INDEX IF NOT EXISTS idx_local_llm_jobs_status_created "
             "ON local_llm_jobs (status, created_at)"
         )
-        # A process that died cannot keep an in-flight HTTP request alive, so
-        # its claim is released here. Only dead claims: a `running` job whose
-        # lease is still being refreshed belongs to another live process, and
-        # killing it on our startup is exactly the cross-process damage this
-        # lease exists to prevent.
+        # A dead process cannot keep an in-flight request alive, so its claim is
+        # released here - but only dead claims: a still-refreshed lease belongs
+        # to another live process, and killing it on startup is exactly the
+        # cross-process damage the lease prevents.
         self._reclaim_dead_leases()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._closed = threading.Event()
@@ -357,15 +325,10 @@ class LocalLlmJobService:
         self._closed.set()
         self._queue.put(None)
         self._worker.join(timeout=2.0)
-        # A worker drains every queued job, including ones another process
-        # submitted and is still waiting for. A short-lived process (the tick,
-        # a mailbox run) that finishes its own job can claim such a job just
-        # before it closes. Exiting then took the claim down with it: the job
-        # sat `running` until its lease lapsed and failed as interrupted,
-        # although its submitter was alive the whole time. So an in-flight
-        # job is finished first. It is bounded by the client watchdog, and
-        # handing it back mid-request instead would put a second request on
-        # llama-server while this one is still running.
+        # Finish an in-flight job before closing: a short-lived process could
+        # otherwise claim another process's queued job and take the claim down
+        # on exit. Bounded by the client watchdog; handing the job back
+        # mid-request would double-book llama-server.
         if self._worker.is_alive() and self._current_job is not None:
             _LOGGER.info(
                 "local_llm service closing; finishing in-flight job_id=%s first",
@@ -390,14 +353,9 @@ class LocalLlmJobService:
     ) -> str:
         """Queue one local-model call and return its job id.
 
-        *role* records which Nexus feature the job belongs to (see the
-        ``ROLE_*`` constants). It never changes how a job is executed - every
-        role shares this one queue and one worker - it only keeps the jobs
-        separable in the database and in the logs.
-
-        With *top_logprobs* > 0 the job asks for token log-probabilities and
-        its result is the JSON of the first choice (``message`` and
-        ``logprobs``) instead of the plain text (#297).
+        *role* only keeps jobs separable in the database and logs (#167); with
+        *top_logprobs* > 0 the result is the first choice's JSON with logprobs
+        instead of plain text (#297).
         """
         self._sweep_stuck_jobs()
         job_id = uuid.uuid4().hex
@@ -449,12 +407,8 @@ class LocalLlmJobService:
         return LocalLlmJob(**dict(row))
 
     def recent(self, *, role: str | None = None, limit: int = 20) -> list[LocalLlmJob]:
-        """Most recent jobs, newest first, optionally narrowed to one role.
-
-        The diagnosability half of the role (#167): an operator asking "what
-        did failure analysis ask the local model, and how did those jobs end?"
-        gets an answer without having to filter controller traffic by hand.
-        """
+        """Most recent jobs, newest first, optionally narrowed to one role - the
+        diagnosability half of the role (#167)."""
         sql = f"SELECT {_JOB_COLUMNS} FROM local_llm_jobs"
         params: list[Any] = []
         if role is not None:
@@ -467,13 +421,10 @@ class LocalLlmJobService:
         return [LocalLlmJob(**dict(row)) for row in rows]
 
     def cancel(self, job_id: str, *, reason: str = "cancelled") -> bool:
-        """Cancel a queued or running job. Returns True if it was still open.
-
-        A running job's in-flight HTTP request cannot be torn down from here,
-        but the row becomes terminal immediately, so every waiter is released
-        and the late result is discarded rather than resurrecting the job (see
-        the status-guarded terminal writes in :meth:`_run`).
-        """
+        """Cancel a queued or running job; True if it was still open. A running
+        job's HTTP request cannot be torn down, but the row goes terminal
+        immediately, releasing every waiter; the late result is discarded
+        (status-guarded writes in :meth:`_run`)."""
         with self._lock:
             cursor = self._conn.execute(
                 """
@@ -498,18 +449,10 @@ class LocalLlmJobService:
         return cancelled
 
     def _sweep_stuck_jobs(self, *, force: bool = False) -> int:
-        """Release `running` jobs no live worker can still finish (#167).
-
-        Two ways a claim dies, and a waiter needs both:
-
-        * the owner stopped heartbeating - its process died, so the claim is
-          reclaimed (see :meth:`_reclaim_dead_leases`);
-        * the owner is alive but wedged past its own client watchdog, which a
-          heartbeat cannot detect because the heartbeat is still beating.
-
-        Rate-limited, and never raises - a sweep failure must not break the
-        submit/wait it was called from.
-        """
+        """Release `running` jobs no live worker can finish (#167): the owner
+        stopped heartbeating (reclaimed via :meth:`_reclaim_dead_leases`), or is
+        wedged past its own watchdog, which a heartbeat cannot detect. Rate-
+        limited, and never raises - a sweep failure must not break submit/wait."""
         now = time.monotonic()
         if not force and (now - self._last_stuck_sweep) < _STUCK_SWEEP_INTERVAL_SECONDS:
             return 0
@@ -548,16 +491,11 @@ class LocalLlmJobService:
         return stuck + self._reclaim_dead_leases()
 
     async def wait(self, job_id: str) -> str:
-        """Await one job's result. Never imposes a deadline of its own (#167).
-
-        How long a job may legitimately take is the model's business, not the
-        waiter's: a caller that needs several minutes of local inference must
-        not be cut off by an arbitrary caller-side timeout. Liveness comes
-        from the shared stuck-job sweep below instead, which turns a wedged
-        worker into a terminal job every waiter observes.
-        """
-        # Start tight and back off: a fast local reply should not pay a full
-        # poll interval, a multi-minute one should not poll hundreds of times.
+        """Await one job's result; never imposes a deadline of its own (#167) -
+        liveness comes from the stuck-job sweep, which makes a wedged worker
+        terminal for every waiter."""
+        # Start tight and back off: a fast reply should not pay a full poll
+        # interval, a multi-minute one should not poll hundreds of times.
         delay = min(0.01, self.poll_interval)
         while True:
             job = self.get(job_id)
@@ -584,14 +522,11 @@ class LocalLlmJobService:
         ).isoformat()
 
     def _reclaim_dead_leases(self) -> int:
-        """Release claims whose owner stopped stating liveness.
-
-        A `running` row with an expired (or, for rows written before leases
-        existed, missing) lease belonged to a process that died mid-request:
-        the HTTP call went with it, the job will never finish, and until it is
-        released it holds the single inference slot for everyone. Never
-        touches a claim that is still being refreshed - that one belongs to a
-        live worker, possibly in another process.
+        """Release claims whose owner stopped stating liveness: an expired (or
+        missing) lease on a `running` row means the process died mid-request, the
+        job will never finish, and until released it holds the single slot. Never
+        touches a still-refreshed claim - that belongs to a live worker, possibly
+        in another process.
         """
         try:
             with self._lock:
@@ -615,17 +550,11 @@ class LocalLlmJobService:
             return 0
 
     def _claim_next_job(self) -> str | None:
-        """Claim the single inference slot for the oldest queued job, if free.
-
-        One IMMEDIATE transaction does the whole decision - release dead
-        claims, check that nobody live is running, take the oldest queued job
-        - so two workers in two processes cannot both conclude the slot is
-        theirs. Returns the claimed job id, or None when there is nothing to
-        run or another worker holds the slot.
-        """
-        # An idle worker polls for work another process queued. Checking that
-        # first keeps the common "nothing to do" tick a single read instead of
-        # a write transaction every process fights over.
+        """Claim the single inference slot for the oldest queued job, if free, in
+        one IMMEDIATE transaction, so two workers in two processes cannot both
+        take it."""
+        # Check for queued work first: keeps the common "nothing to do" tick a
+        # single read instead of a write transaction every process fights over.
         try:
             with self._lock:
                 pending = self._conn.execute(
@@ -712,20 +641,16 @@ class LocalLlmJobService:
                 ).rowcount
             return bool(refreshed)
         except sqlite3.Error as exc:
-            # Losing the database is not the same as losing the claim: keep
-            # beating and let the next refresh decide.
+            # Losing the database is not losing the claim: keep beating, let the
+            # next refresh decide.
             _LOGGER.warning("local_llm lease refresh failed job_id=%s reason=%s", job_id, exc)
             return True
 
     def _finalize(self, job_id: str, sql: str, params: tuple[Any, ...]) -> int:
-        """Apply a terminal update for a job the worker just finished.
-
-        Returns the number of rows written (0 when the job already became
-        terminal - cancelled or swept as stuck - while the request was in
-        flight). A shutdown that closes the database under a still-running
-        worker is reported, not raised: the worker thread has nowhere to
-        propagate it to.
-        """
+        """Apply a terminal update; returns rows written (0 if the job already went
+        terminal in flight). A shutdown closing the database under a running
+        worker is reported, not raised - the worker thread has nowhere to
+        propagate to."""
         try:
             with self._lock:
                 updated = self._conn.execute(sql, params).rowcount
@@ -738,12 +663,10 @@ class LocalLlmJobService:
             return 0
 
     def _worker_loop(self) -> None:
-        """Run claimable work, then wait to be woken or for the idle poll.
-
-        The in-process queue is only a wake-up signal now; what may actually
-        run is decided by the claim, so this worker also picks up jobs another
-        process queued and slots another process released.
-        """
+        """Run claimable work, then wait to be woken or for the idle poll; the
+        in-process queue is only a wake-up signal - what may run is decided by
+        the claim, so this worker also picks up jobs queued or released by other
+        processes."""
         while not self._closed.is_set():
             while not self._closed.is_set():
                 job_id = self._claim_next_job()
@@ -779,12 +702,9 @@ class LocalLlmJobService:
         )
 
     async def _within_watchdog(self, completion: Coroutine[Any, Any, str]) -> str:
-        """Await one model call, abandoning it at the watchdog deadline (#236).
-
-        The HTTP client's timeout alone cannot promise this: it limits each
-        read, so a server that keeps trickling bytes would never trip it. On
-        expiry the request is cancelled, which closes its connection.
-        """
+        """Await one model call, abandoning it at the watchdog deadline (#236): the
+        client timeout limits each read, so a trickling server would never trip
+        it. On expiry the request is cancelled, closing its connection."""
         try:
             return await asyncio.wait_for(completion, timeout=self.watchdog_seconds)
         except asyncio.TimeoutError as exc:
@@ -793,12 +713,8 @@ class LocalLlmJobService:
             ) from exc
 
     def _run(self, job_id: str) -> None:
-        """Execute a job this worker has already claimed.
-
-        The claim (status, owner, lease) was taken in :meth:`_claim_next_job`;
-        here the worker only has to keep stating that it is alive and record
-        the outcome under its own ownership.
-        """
+        """Execute a job this worker already claimed: keep stating liveness and
+        record the outcome under own ownership."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT prompt,temperature,max_tokens,response_format,session_id,status,role,system,"
@@ -819,9 +735,9 @@ class LocalLlmJobService:
             job_id, role, session_id, model, max_tokens, prompt_chars,
         )
         started = time.perf_counter()
-        # Liveness is stated, not inferred (D-018): while this request is in
-        # flight the claim is refreshed, so no other process steals the slot -
-        # and if this process dies, the lease lapses and the slot is released.
+        # Liveness is stated, not inferred (D-018): the claim is refreshed while
+        # in flight so no other process steals the slot; if this process dies,
+        # the lease lapses and the slot is released.
         lease = heartbeat.Heartbeat(
             lambda: self._refresh_lease(job_id),
             interval_seconds=max(1, int(self.lease_seconds // 3)),
@@ -833,8 +749,8 @@ class LocalLlmJobService:
                 completion_options["response_format"] = json.loads(
                     str(row["response_format"])
                 )
-            # Only forwarded when a role actually uses a system prompt, so a
-            # client that never needed one keeps its existing call signature.
+            # Only forwarded when a role actually uses a system prompt, so other
+            # clients keep their existing call signature.
             if row["system"]:
                 completion_options["system"] = str(row["system"])
             if row["top_logprobs"]:
@@ -870,9 +786,8 @@ class LocalLlmJobService:
                 diagnostics.get("recent_journal") or diagnostics.get("journalctl_error"),
                 exc_info=True,
             )
-            # Guarded by status *and* ownership: a job cancelled, swept as
-            # stuck, or reclaimed by another worker while this request was in
-            # flight stays terminal as it was recorded.
+            # Guarded by status and ownership: a job cancelled, swept, or
+            # reclaimed in flight stays terminal as recorded.
             self._finalize(
                 job_id,
                 "UPDATE local_llm_jobs SET status = ?, finished_at = ?, error = ?, error_kind = ? "
@@ -908,16 +823,10 @@ class LocalLlmJobService:
             )
 
 
-# ---------------------------------------------------------------------------
-# Process-wide sharing (#167)
-#
-# Nexus must have exactly one local-model execution mechanism: queueing,
-# serialization, liveness and logging live here, and every feature that needs
-# the local model goes through the same worker. Two services against the same
-# database would mean two workers and two concurrent llama-server requests -
-# precisely the race this component exists to prevent - so callers that do not
-# bring their own service acquire the shared one for their database instead.
-# ---------------------------------------------------------------------------
+# Process-wide sharing (#167): exactly one local-model execution mechanism per
+# database - two services would mean two concurrent llama-server requests, the
+# race this component exists to prevent - so callers without their own service
+# acquire the shared one.
 
 _SHARED_LOCK = threading.Lock()
 _SHARED_SERVICES: dict[str, tuple[LocalLlmJobService, int]] = {}
@@ -930,14 +839,10 @@ def acquire_local_llm_job_service(
 ) -> LocalLlmJobService:
     """Return the shared job service for *db_path*, creating it if needed.
 
-    Every acquirer must eventually call :func:`release_local_llm_job_service`;
-    the service is closed once the last one does.
-
-    An explicitly supplied *llama_client* is never silently replaced by
-    another caller's: if the shared service is already running a different
-    client, a private service is returned instead. Production callers pass no
-    client and therefore always share; tests that inject a scripted client
-    keep getting their own isolated worker.
+    Every acquirer must eventually call :func:`release_local_llm_job_service`.
+    An explicitly supplied *llama_client* is never silently replaced: if the
+    shared service already runs a different client, a private service is
+    returned instead (tests inject scripted clients this way).
     """
     key = str(db_path)
     with _SHARED_LOCK:
@@ -954,11 +859,8 @@ def acquire_local_llm_job_service(
 
 
 def release_local_llm_job_service(service: LocalLlmJobService) -> None:
-    """Drop one acquirer's reference; close the service once none are left.
-
-    Safe for a private service too (it is simply closed), so a caller never
-    has to remember which kind :func:`acquire_local_llm_job_service` gave it.
-    """
+    """Drop one acquirer's reference; close the service once none are left. Safe
+    for a private service too (it is simply closed)."""
     with _SHARED_LOCK:
         for key, (shared, refcount) in list(_SHARED_SERVICES.items()):
             if shared is not service:

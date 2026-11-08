@@ -1,38 +1,18 @@
 #!/usr/bin/env python3
-"""Manual #223 check: does the controller reuse a successful github_issue result?
+"""Manual #223 check: does the controller reuse a successful github_issue result? Session
+3e2e565e49134703934e59bd57ad9118 fetched issue #196 successfully and then asked for the identical
+github_issue(196) again - the result was in the prompt but buried in the execution envelope, so a 7B
+model re-requested it. The unit tests script llama-server answers, which proves orchestrator behaviour
+but not what the real model decides; this runs the genuine path (real NexusTaskOrchestrator,
+OperationsRegistry, llama-server) over the same task text and reports whether the signature is back.
 
-Session ``3e2e565e49134703934e59bd57ad9118`` fetched GitHub issue #196
-successfully and then asked for the identical ``github_issue(196)`` operation
-again. The successful observation was in the prompt, but wrapped in the whole
-execution envelope - tool wrapper, grant id, operation schema, nested result -
-so for a 7B local controller the issue content it had already obtained was
-buried in orchestration metadata.
-
-The unit tests script llama-server's answers, which proves what the
-orchestrator does with a given decision but says nothing about what the real
-model decides. This runs the genuine path - real ``NexusTaskOrchestrator``,
-real ``OperationsRegistry``, real llama-server - over the same task text and
-reports whether the failure signature is back.
-
-The failure signature, all of it measured only once the operation has
-succeeded at least once, is:
-
-* ``github_issue`` executed more than once with the same arguments, or
-* the controller requesting that identical operation again after it
-  succeeded (even when the loop guard refuses the repeat), or
-* the task ending because the loop guard stopped it.
-
-Any of those exits 1. A run that never reached a successful
-``github_issue(196)`` at all - llama-server unreachable, GitHub token missing,
-or the controller going straight to a final action - exits 2: it verified
-nothing, and reporting that as a pass would be the same mistake as trusting a
-test that never ran.
-
-This is a real controller turn, so the controller may run read-only operations
-and shell commands exactly as it would for any task. It writes to a scratch
-database (``--db-path``) so production session state is untouched, but the
-repository it inspects is the real one.
-"""
+The failure signature, measured only once the operation has succeeded at least once: github_issue executed
+more than once with the same arguments, the controller re-requesting it after success (even when the loop
+guard refuses), or the task ending because the guard stopped it - any of those exits 1. A run that never
+reached a successful github_issue(196) exits 2: it verified nothing, and reporting that as a pass would be
+trusting a test that never ran. The controller may run read-only operations and shell commands as for any
+task; it writes to a scratch database (--db-path) so production session state is untouched, but inspects the
+real repository."""
 
 from __future__ import annotations
 
@@ -45,14 +25,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-# Support direct execution via /agent/scripts/check_issue_196_controller_progress.py
-# as well as `python -m scripts.check_issue_196_controller_progress` from the repo root.
+# Support direct execution via /agent/scripts/check_issue_196_controller_progress.py as well as
+# `python -m scripts.check_issue_196_controller_progress` from the repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# task_orchestrator first: importing operations_registry before it trips the
-# registry <-> tool_router import cycle when this module is the entry point.
+# task_orchestrator first: importing operations_registry before it trips the registry <-> tool_router
+# import cycle when this module is the entry point.
 from modules.task_orchestrator import ACTION_CLARIFICATION, NexusTaskOrchestrator  # isort: skip
 from modules.operations_registry import OperationsRegistry  # noqa: E402
 from modules.redaction import redact_secrets  # noqa: E402
@@ -64,12 +44,9 @@ LOOP_GUARD_EVENTS = {"duplicate_tool_call", "non_progressing_cycle", "retry_reas
 
 
 def _experiment_service():
-    """Resolves nothing, like a task with no experiment behind it.
-
-    The check is about reusing a tool result, and a service that answered
-    every lookup would let an issue number in the task text masquerade as an
-    experiment id.
-    """
+    """Resolves nothing, like a task with no experiment behind it - the check is about reusing a tool result,
+    and a service that answered every lookup would let an issue number in the task text masquerade as an
+    experiment id."""
     return SimpleNamespace(
         resolve_experiment=lambda experiment_id: (_ for _ in ()).throw(
             KeyError(f"unknown experiment {experiment_id!r}")
@@ -78,13 +55,9 @@ def _experiment_service():
 
 
 def _normalized_args(args: Any) -> str:
-    """A stable signature for "the same call", independent of key order.
-
-    ``{"issue_number": 196}`` and ``{"issue_number": "196"}`` are the same
-    request as far as this check is concerned: the controller asking twice for
-    one issue is the regression whether or not it retyped the number as a
-    string.
-    """
+    """A stable signature for "the same call", independent of key order: ``{"issue_number": 196}`` and
+    ``{"issue_number": "196"}`` are the same request - the controller asking twice for one issue is the
+    regression whether or not it retyped the number as a string."""
     if not isinstance(args, dict):
         return json.dumps(args, sort_keys=True, default=str)
     normalized = {}
@@ -99,12 +72,9 @@ def _normalized_args(args: Any) -> str:
 
 
 def _is_target_operation(operation: str, args: Any, target: "_Target") -> bool:
-    """Is this the call the run is watching?
-
-    Argument matching is a subset test, not equality: a capability may be
-    called with extra defaults the check has no opinion about, and requiring
-    an exact match would quietly stop recognising the call it exists to watch.
-    """
+    """Is this the call the run is watching? Argument matching is a subset test, not equality - a capability
+    may be called with extra defaults the check has no opinion about, and requiring exact equality would stop
+    recognising the call it exists to watch."""
     if operation != target.operation:
         return False
     if not target.expected_args:
@@ -150,13 +120,9 @@ def _operation_succeeded(observation: dict[str, Any]) -> bool:
 
 
 def _requested_operation(decision: dict[str, Any]) -> tuple[str, Any] | None:
-    """The operation a controller decision asks to execute, if any.
-
-    ``call_tool`` names it directly. A ``find_tool`` goal does not, and is not
-    counted here: asking the resolver a question is not the same as calling an
-    operation, and the operation it auto-executes shows up as its own
-    observation.
-    """
+    """The operation a controller decision asks to execute, if any. ``call_tool`` names it directly; a
+    ``find_tool`` goal does not and is not counted - asking the resolver a question is not calling an operation,
+    and the operation it auto-executes shows up as its own observation."""
     action = str(decision.get("action", "")).strip().lower()
     if action != "call_tool":
         return None
@@ -196,12 +162,8 @@ def _describe_observation(observation: dict[str, Any]) -> str:
 
 
 def _print_prompt_observations(prompts: list[dict[str, Any]]) -> None:
-    """What the controller actually read, turn by turn.
-
-    The whole point of #223 is the gap between the stored event and the view
-    the model is given, so a diagnostic that prints only the stored event
-    cannot show the problem.
-    """
+    """What the controller actually read, turn by turn. The point of #223 is the gap between the stored event
+    and the view the model is given, so a diagnostic that prints only the stored event cannot show the problem."""
     for turn, record in enumerate(prompts, start=1):
         section = record.get("observations_section") or "(no observations yet)"
         size = (
@@ -212,10 +174,8 @@ def _print_prompt_observations(prompts: list[dict[str, Any]]) -> None:
         print(f"  turn {turn}: {size}, "
               f"{record['observation_count']} observations, "
               f"omitted {record['omitted']}")
-        # Wrapped, never cut. Cutting at 400 characters hid the one thing this
-        # section exists to show: whether the tool result itself reached the
-        # controller. The canonical run had to be re-read because the
-        # `output_lines` sat past that cut.
+        # Wrapped, never cut: cutting at 400 characters hid whether the tool result itself reached the controller
+        # - the canonical run had to be re-read because `output_lines` sat past that cut.
         for line in redact_secrets(section).splitlines():
             for chunk in textwrap.wrap(
                 line, width=110, subsequent_indent="        ", drop_whitespace=False
@@ -277,14 +237,13 @@ def main() -> int:
     elif args.operation == DEFAULT_OPERATION:
         expected = dict(DEFAULT_EXPECTED_ARGS)
     else:
-        # A substitute capability has no issue number; watching the operation
-        # itself is the whole filter.
+        # A substitute capability has no issue number; watching the operation itself is the whole filter.
         expected = {}
     target = _Target(args.operation, expected)
 
     if args.session_id:
-        # Reading a real session, so the production database is the input and
-        # must not be deleted the way the scratch one below is.
+        # Reading a real session: the production database is the input and must not be deleted the way the
+        # scratch one below is.
         return judge_recorded_session(args, target)
 
     if args.db_path.exists():
@@ -301,10 +260,9 @@ def main() -> int:
         max_steps=args.max_steps,
     )
 
-    # Every decision the model produced, including ones the loop guard then
-    # refused. A repeat that never executes is still the controller failing to
-    # use a result it already has, which is exactly what #223 is about - so a
-    # check that inspected observations alone would miss it.
+    # Every decision the model produced, including ones the loop guard then refused - a repeat that never
+    # executes is still the controller failing to use a result it already has (#223), and a check that inspected
+    # observations alone would miss it.
     decisions: list[dict[str, Any]] = []
     original_parse = orchestrator._parse
 
@@ -372,25 +330,14 @@ def main() -> int:
 
 
 def judge_recorded_session(args, target: "_Target") -> int:
-    """Judge a controller run that already happened, from its journal.
-
-    This is how the canonical #223 scenario gets verified on the VM. The
-    mailbox `command` channel strips every variable whose name contains
-    TOKEN/KEY/SECRET from the child environment - deliberately, so a shell
-    command can never exfiltrate a credential - which is why `github_issue`
-    cannot authenticate when the check drives the controller itself there.
-
-    The `task` channel has no such problem: `modules.mailbox.task_service`
-    builds the orchestrator in-process, inside a service whose unit carries
-    `EnvironmentFile=/etc/agent-lab/agent.env`, so that run reaches GitHub
-    with the real credential and nothing has to be copied anywhere. What is
-    left is to read back what it did, which is what this does.
-
-    Every tool observation is journalled as it happens, loop-guard refusals
-    included, so the record carries what the verdict needs. The one thing it
-    does not carry is a decision the guard refused before execution - which
-    is why the verdict also reads the guard's own refusal events.
-    """
+    """Judge a controller run that already happened, from its journal - how the canonical #223 scenario gets
+    verified on the VM: the mailbox `command` channel strips every TOKEN/KEY/SECRET-named variable from the
+    child environment (deliberately, so a shell command cannot exfiltrate a credential), so github_issue cannot
+    authenticate when the check drives the controller itself there, while the `task` channel builds the
+    orchestrator in-process inside a service whose unit carries ``EnvironmentFile=/etc/agent-lab/agent.env`` and
+    reaches GitHub with the real credential. Every tool observation is journalled as it happens, loop-guard
+    refusals included; the one thing the journal lacks is a decision the guard refused before execution, which is
+    why the verdict also reads the guard refusal events."""
     from modules.nexus_task_store import NexusTaskStore
 
     store = NexusTaskStore(db_path=str(args.db_path))
@@ -413,10 +360,8 @@ def judge_recorded_session(args, target: "_Target") -> int:
     final_reason = ""
     for event in events:
         if event["kind"] == "controller_decision":
-            # What the model chose and why, as it said it. Journalled since
-            # the canonical run, where the tool events showed a controller
-            # asking for a result it already had and nothing about what it
-            # thought it was doing.
+            # What the model chose and why, journalled since the canonical run - the tool events alone showed a
+            # controller asking for a result it already had, with nothing about what it thought it was doing.
             metadata = event["metadata"] or {}
             decisions.append({**metadata, "reason": event["content"]})
             continue
@@ -451,8 +396,8 @@ def judge_recorded_session(args, target: "_Target") -> int:
 
     return report_and_judge(
         observations=observations,
-        # Journalled since the canonical run. Older sessions have none, and
-        # the verdict still works from executions and guard refusals alone.
+        # Journalled since the canonical run; older sessions have none, and the verdict still works from
+        # executions and guard refusals alone.
         decisions=decisions,
         target=target,
         final_action=final_action,
@@ -464,14 +409,11 @@ def judge_recorded_session(args, target: "_Target") -> int:
 
 
 def _describe_budget(plan: Any, *, measured_now: bool) -> list[str]:
-    """The numbers that decide whether a result reaches the controller at all.
-
-    Printed because leaving them out cost real time: the canonical run showed
-    a controller asking again, and the reason - a 150-character observation
-    budget that stubbed a 3005-character result away - was only visible by
-    grepping `controller_prompt_budget` out of the journal. A check about what
-    the controller reads has to show what bounded it.
-    """
+    """The numbers that decide whether a result reaches the controller at all - printed because leaving them
+    out cost real time: the canonical run showed a controller asking again, and the reason (a 150-character
+    observation budget stubbing a 3005-character result away) was only visible by grepping
+    `controller_prompt_budget` out of the journal. A check about what the controller reads has to show what
+    bounded it."""
     where = "measured on this host now" if measured_now else "as the run reported"
     lines = [
         f"budget ({where})",
@@ -504,22 +446,11 @@ def _live_budget() -> Any:
 
 
 def _replay_prompts(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Rebuild the observation section the controller read on each turn.
-
-    Prompts are not journalled, but they are a pure function of the
-    observations so far and the budget, and the observations *are* journalled.
-    Replaying them is the only way this mode can show the thing #223 is about:
-    the gap between what was stored and what the model was given.
-
-    Leaving it out is what made the first canonical run so slow to diagnose -
-    the check reported that the controller had asked again and could not show
-    that the successful result had reached it as a bare stub, with the issue
-    body compacted away.
-
-    The budget is recomputed here rather than read back from the run, so a
-    host under different memory pressure than at the time will reconstruct
-    different prompts. The header says so.
-    """
+    """Rebuild the observation section the controller read on each turn. Prompts are not journalled, but they
+    are a pure function of the observations so far and the budget, and the observations are journalled - replaying
+    is the only way this mode can show the #223 gap between what was stored and what the model was given, and
+    leaving it out is what made the first canonical run so slow to diagnose. The budget is recomputed here rather
+    than read back, so a host under different memory pressure reconstructs different prompts; the header says so."""
     from modules.controller_observations import controller_observation_view
     from modules.prompt_budget import compact_observations, prompt_json
 
@@ -553,15 +484,10 @@ def report_and_judge(
     show_prompts: bool,
     dump_json: bool,
 ) -> int:
-    """Print the trace and return the exit code.
-
-    Shared by both modes. A run driven here has the decisions in hand; a
-    session read back from the journal has only what was durably recorded,
-    and passes an empty ``decisions`` list. The verdict has to hold either
-    way, which is why a repeat is also detected from the executions and the
-    loop guard's own refusals - those are journalled, the model's rejected
-    request is not.
-    """
+    """Print the trace and return the exit code. Shared by both modes: a run driven here has the decisions in
+    hand, a session read from the journal only what was durably recorded (empty ``decisions`` list) - the verdict
+    must hold either way, which is why a repeat is also detected from executions and the loop guard refusals;
+    those are journalled, the model rejected request is not."""
     print("controller decisions")
     for index, decision in enumerate(decisions, start=1):
         action = str(decision.get("action", "?"))
@@ -589,13 +515,11 @@ def report_and_judge(
 
     # --- verdict -----------------------------------------------------------
     executions = []
-    # Position in the whole observation list, kept alongside, so "what came
-    # after the success" can be counted without searching by value.
+    # Position in the whole observation list, kept alongside, so "what came after the success" can be counted
+    # without searching by value.
     execution_positions = []
-    # A loop-guard refusal carries `tool: "operation"` and, since #223, the
-    # operation and args too - but nothing ran. Counting it as an execution
-    # reported "executed 1 more time(s)" for a call the guard had just
-    # refused, which overstates what happened and points at the wrong layer.
+    # A loop-guard refusal carries `tool: "operation"` and, since #223, the operation and args too - but nothing
+    # ran; counting it as an execution overstates what happened and points at the wrong layer.
     refused_repeats: list[dict[str, Any]] = []
     for position, observation in enumerate(observations):
         if observation.get("tool") != "operation":
@@ -611,9 +535,8 @@ def report_and_judge(
         execution_positions.append(position)
     successes = [obs for obs in executions if _operation_succeeded(obs)]
 
-    # Position of the first success within `executions`, so "after it
-    # succeeded" can be measured. Tracked by index rather than by value: two
-    # identical calls produce two equal dicts, and `in` would find the wrong one.
+    # Position of the first success within `executions`, so "after it succeeded" can be measured; tracked by
+    # index rather than value because two identical calls produce equal dicts and `in` would find the wrong one.
     first_success_at = next(
         (index for index, obs in enumerate(executions) if _operation_succeeded(obs)),
         None,
@@ -622,14 +545,10 @@ def report_and_judge(
     repeated_requests: list[dict[str, Any]] = []
     if first_success_at is not None:
         success_signature = _normalized_args(executions[first_success_at].get("args"))
-        # Every matching request up to and including the one that produced the
-        # success is part of getting there - a rejected attempt and its
-        # corrected retry included. Only what comes after is a repeat.
-        #
-        # `first_success_at` counts the target executions before the success,
-        # so that many requests plus the successful one are skipped. Requests
-        # the loop guard refused never became executions, which is why this
-        # counts requests separately rather than trusting the two to align.
+        # Every matching request up to and including the successful one is part of getting there (a rejected attempt
+        # and its corrected retry included); only what comes after is a repeat. `first_success_at` counts target
+        # executions before the success, and refused requests never became executions, so requests are counted
+        # separately rather than trusting the two to align.
         to_skip = first_success_at + 1
         for decision in decisions:
             requested = _requested_operation(decision)
@@ -644,16 +563,11 @@ def report_and_judge(
             if _normalized_args(arguments) == success_signature:
                 repeated_requests.append(decision)
 
-    # Executions *after* the first success, which is the regression. Not
-    # `executions[1:]`: a rejected first attempt followed by a corrected one
-    # that worked is the controller recovering, and calling that a repeat
-    # would fail the very behaviour this check wants.
-    #
-    # Empty while nothing has succeeded. Repeating a call that keeps failing
-    # is a loop, but not this one: there is no result to reuse, so it says
-    # nothing about whether the controller reuses one. That run is
-    # inconclusive, and reporting it as the #223 regression would send the
-    # next reader looking for a prompt bug behind a broken GitHub token.
+    # Executions *after* the first success are the regression - not `executions[1:]`: a rejected first attempt
+    # followed by a corrected one that worked is the controller recovering, and calling that a repeat would fail
+    # the very behaviour this check wants. Empty while nothing has succeeded: repeating a call that keeps failing
+    # is a loop but not this one - there is no result to reuse, and reporting it as the #223 regression would send
+    # the next reader looking for a prompt bug behind a broken GitHub token.
     repeated_executions = executions[first_success_at + 1:] if first_success_at is not None else []
     guard_events = sorted(
         {
@@ -679,9 +593,8 @@ def report_and_judge(
             f"{target} executed {len(repeated_executions)} more time(s) after it succeeded"
         )
     if first_success_at is not None and refused_repeats:
-        # The controller asked again and the guard stopped it. The result was
-        # not re-fetched, but the controller still failed to use what it had -
-        # which is the behaviour #223 is about.
+        # The controller asked again and the guard stopped it - the result was not re-fetched, but the controller still
+        # failed to use what it had, which is the behaviour #223 is about.
         failures.append(
             f"the controller asked for {target} again after it succeeded; "
             f"the loop guard refused it ({len(refused_repeats)}x)"
@@ -709,8 +622,7 @@ def report_and_judge(
             and _is_target_operation(*requested, target)
         ]
         if len(repeats) > 1 or ended_on_guard:
-            # Still worth saying loudly: the controller looping on a failing
-            # call is a real problem, just not the one this check decides.
+            # Still worth saying loudly: looping on a failing call is a real problem, just not the one this check decides.
             print(
                 f"  note: the controller requested {target} "
                 f"{len(repeats)} times"
@@ -724,10 +636,9 @@ def report_and_judge(
             print("  it was executed but did not succeed:")
             for observation in executions:
                 print(f"    {_describe_observation(observation)}")
-            # Naming the wrong cause is worse than naming none. An argument the
-            # capability refused and a credential it never had look nothing
-            # alike in the observation, and a run that said "token" for a
-            # rejected argument sent the next reader to the wrong place.
+            # Naming the wrong cause is worse than naming none: an invalid_tool_request and a credential the run never had
+            # look alike in the observation, and a run that said "token" for a rejected argument sends the next reader to the
+            # wrong place.
             if any(obs.get("error") == "invalid_tool_request" for obs in executions):
                 print("  the arguments were refused, so this is not a credential problem.")
                 print("  a string where an integer was required is the usual cause; check")

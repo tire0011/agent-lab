@@ -1,15 +1,8 @@
-"""Self-initiated work selection for Nexus.
-
-Every existing entry point is reactive: the mailbox timer waits for a human to
-drop a file in the inbox, ``POST /chat`` waits for someone to type, and the
-mailbox task worker only moves tasks a human already approved. Nothing looks at
-Nexus's own state and decides what to work on. This module is that missing step.
-
-It deliberately does *not* add another stage to the lifecycle. It picks exactly
-one piece of work per tick, records why, and hands it to the pipeline that
-already exists. Its first priority is draining work that is finished but not
-integrated - the state Nexus spent five days stuck in - because completing
-started work is worth more than starting new work.
+"""Self-initiated work selection for Nexus: every existing entry point is reactive
+(mailbox inbox, POST /chat, approved tasks), so this tick looks at Nexus's own
+state and picks exactly one piece of work per tick, records why, and hands it to the
+existing pipeline. First priority is draining finished-but-unintegrated work -
+completing started work beats starting new work.
 """
 
 from __future__ import annotations
@@ -37,27 +30,21 @@ from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 
-# Work is selected one item at a time. These are the states that mean some
-# other part of the pipeline still owns the machine.
+# One item at a time: these states mean another part of the pipeline still owns
+# the machine.
 _BUSY_EXPERIMENT_STATUSES = ("queued", "selecting", "implementing", "verifying")
 _BUSY_ADOPTION_STATUSES = ("queued", "adopting")
 _BUSY_APPROVAL_STATUSES = ("queued", "approved", "submitted", "running", "nexus_deciding")
 
-# An adoption in one of these states is not going to move on its own, but the
-# experiment behind it succeeded - that is the integration backlog.
+# An adoption in one of these states will not move on its own, but the experiment
+# behind it succeeded - that is the integration backlog.
 _UNFINISHED_ADOPTION_STATUSES = ("not_started", "needs_review", "interrupted")
 
-# A row in a running state only means work is in flight if it is *recent*. The
-# live database holds an experiment queued since 2026-08-14 and seven mailbox
-# tasks stuck at `running`, the oldest untouched since 2026-08-13 - a busy
-# check that trusted those states would never let the tick run again. Past this
-# window a row is treated as abandoned, not as work in progress.
-#
-# Six hours is chosen to sit well clear of a healthy run: implementation and
-# verification each have their own timeouts (the test timeout alone may reach
-# 30 minutes), and calling a slow but live experiment abandoned would start a
-# second one beside it. Too generous merely delays a tick; too tight corrupts
-# the one-item-at-a-time guarantee.
+# A running-state row only means work in flight if it is *recent* (old stuck rows
+# would otherwise keep the tick busy forever); past this window a row is abandoned,
+# not in progress. Six hours sits well clear of a healthy run - implementation and
+# verification have their own timeouts - because calling a slow but live experiment
+# abandoned would start a second one beside it.
 _DEFAULT_STALE_AFTER_SECONDS = 6 * 60 * 60
 
 KIND_CAPABILITY_RESUME = "capability_resume"
@@ -66,54 +53,52 @@ KIND_INTEGRATION = "integration_backlog"
 _FRESH_ADOPTION = "adoption is not_started"
 # Marks a dispatch that used only the local model; it is not in the budget (#541).
 _LOCAL_ONLY = "local_only"
-# An issue whose last attempt the reviewer blocked: retried at once and free of
-# the daily budget, so review findings go straight back to the coder.
+# An issue whose last attempt the reviewer blocked: retried at once, free of the
+# daily budget, so review findings go straight back to the coder.
 REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findings"
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
 _DEFAULT_DAILY_BUDGET = 5
-# A restart hand-off can fail without replacing the API process.  Retrying on
-# every minute tick adds noise and can contend with recovery work, so failed
-# hand-offs get a fixed backoff before another attempt.
+# A restart hand-off can fail without replacing the API process; retrying every
+# tick would add noise and contend with recovery work, so failed hand-offs get a
+# fixed backoff.
 _SERVICE_RESTART_COOLDOWN = timedelta(minutes=30)
 # Open proposals beyond this many are not added to (#354): they wait for review.
 _MAX_OPEN_PROPOSALS = 3
 
 # A failed issue experiment may be retried; the second failure ends it (#374).
-# needs_review counts too: no human reviews it in autonomous runs, and the
-# gate that stopped it may have been fixed since (#185, #349, #378). A stalled
-# experiment is failed by the stall sweep (#400) and counts through "failed".
+# needs_review counts too (no human reviews it in autonomous runs; the gate that
+# stopped it may since have been fixed, #185/#349/#378), and a stalled experiment
+# counts through "failed" via the stall sweep (#400).
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
-# An open issue that used up its attempts is reported, not dropped silently
-# (#457). It stays unselectable until a human acts, unless only pipeline crashes
-# stopped it (#467): those end with a newer commit on origin/main.
+# An open issue that used up its attempts is reported, not dropped silently (#457);
+# it stays unselectable until a human acts - unless only pipeline crashes stopped
+# it (#467), which end with a newer commit on origin/main.
 DECISION_SKIPPED_ATTEMPTS_EXHAUSTED = "skipped_attempts_exhausted"
 
 # An issue the goal policy rejects is not sent (#408): the experiment would be
 # rejected before any work, at the cost of a tick and a budget slot.
 DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
-# An issue without a valid approval in the registry (modules.issue_approvals)
-# is never dispatched: pending, revoked, content-changed and corrupted records
-# all land here. Approvals come only from the trusted private mailbox.
+# An issue without a valid approval in the registry (modules.issue_approvals) is
+# never dispatched - pending, revoked, content-changed and corrupted records all
+# land here; approvals come only from the trusted private mailbox.
 DECISION_SKIPPED_UNAPPROVED_ISSUE = "skipped_unapproved_issue"
 # The owner paused Nexus: no new work, no adoption, no retries. Experiments
 # already running finish.
 DECISION_PAUSED = "paused"
-# Reasons only _check_goal_policy produces. A rejection with one of them is
-# known in advance from the goal text, so retrying the same text is pointless.
+# Reasons only _check_goal_policy produces; a rejection with one of them is known
+# in advance from the goal text, so retrying the same text is pointless.
 _GOAL_POLICY_REASON_PREFIXES = tuple(
     prefix for prefix, _ in goal_policy._POLICY_RULE_PREFIXES if prefix.startswith("goal ")
 )
 
 
 def _is_provider_overload(status: Any, error: Any) -> bool:
-    """A run that failed because the coding agent's API was overloaded.
-
-    A crash may quote "429" or "rate limit", but it stays a crash: an overload
-    is free of every limit, and a crash loop must not be. Neither is a test
-    failure an overload because the failing test is called test_rate_limit_*.
+    """A run that failed because the coding agent's API was overloaded. A crash may
+    quote "429"/"rate limit" but stays a crash: an overload is free of every limit,
+    a crash loop must not be, and a test named test_rate_limit_* is not an overload.
     """
     from modules.coding_provider import is_provider_overload
 
@@ -126,10 +111,8 @@ def _is_provider_overload(status: Any, error: Any) -> bool:
 
 
 def _is_integration_conflict(adoption_status: Any, adoption_reason: Any) -> bool:
-    """An adoption stopped only because the branch no longer merges into main (#485).
-
-    The newer text lists the files ("Integrationskonflikt: a.py"); older
-    adoptions recorded "Integrationskonflikt beim Cherry-Pick.".
+    """An adoption stopped only because the branch no longer merges into main (#485);
+    the prefix covers both the file-list and the older text.
     """
     if adoption_status not in ("needs_review", "failed"):
         return False
@@ -247,10 +230,9 @@ class NexusInitiativeService:
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
-        # Issue execution authorization: the repository whose issues this
-        # service may execute, checked against the persistent approval
-        # registry (modules.issue_approvals) at candidate scan and again at
-        # the dispatch boundary.
+        # Issue execution authorization: the repository whose issues may execute,
+        # checked against the persistent approval registry (modules.issue_approvals)
+        # at candidate scan and again at the dispatch boundary.
         self._repository = issue_approvals.normalize_repository(
             repository if repository is not None else os.environ.get("GITHUB_REPOSITORY")
         )
@@ -328,12 +310,11 @@ class NexusInitiativeService:
         active = abandoned = 0
         for row in rows:
             keys = row.keys()
-            # The *latest* timestamp on the row, not the first one found. A
-            # running experiment has no `ended_at`, so a first-match rule would
-            # judge it by when it was created and could call a long but healthy
-            # run abandoned - then start work beside it. This is still a
-            # heuristic: without a heartbeat, "recent" is the best available
-            # evidence that something is driving the row.
+            # Use the *latest* timestamp on the row, not the first: a running experiment has
+            # no `ended_at`, so a first-match rule would judge it by creation time and could
+            # call a long but healthy run abandoned, then start work beside it. Still a
+            # heuristic: without a heartbeat, "recent" is the best evidence that something
+            # drives the row.
             stamps = [
                 stamp
                 for column in time_columns
@@ -341,8 +322,8 @@ class NexusInitiativeService:
                 for stamp in (_parse_timestamp(row[column]),)
                 if stamp is not None
             ]
-            # No readable timestamp counts as active: skipping a tick is cheap,
-            # starting work beside a real run is not.
+            # No readable timestamp counts as active: skipping a tick is cheap, starting work
+            # beside a real run is not.
             if not stamps or max(stamps) >= cutoff:
                 active += 1
             else:
@@ -365,11 +346,8 @@ class NexusInitiativeService:
         return None
 
     def abandoned_work(self) -> list[dict[str, Any]]:
-        """Rows left in a running state long enough that nothing is driving them.
-
-        Reported rather than acted on: cleaning them up changes lifecycle state
-        and belongs to the services that own it.
-        """
+        """Rows left running long enough that nothing drives them - reported, not acted
+        on (cleanup changes lifecycle state and belongs to the owning service)."""
         found: list[dict[str, Any]] = []
         for table, statuses, columns in (
             ("experiments", _BUSY_EXPERIMENT_STATUSES, ("ended_at", "created_at")),
@@ -440,9 +418,9 @@ class NexusInitiativeService:
             (_LOCAL_ONLY, since),
         ).fetchone()
         spent -= int(local[0]) if local else 0
-        # Crashes stay in the budget, unlike overloads (#467): an overload was
-        # refused before any work, a crash can come after a paid coding run, and
-        # this budget is the only limit across issues on a broken pipeline.
+        # Crashes stay in the budget, unlike overloads (#467): an overload was refused
+        # before any work, a crash can come after a paid coding run, and this budget is the
+        # only limit across issues on a broken pipeline.
         return max(0, spent - self._overloaded_since(since))
 
     def _fresh_adoptions_since(self, since: str) -> set[str]:
@@ -478,11 +456,9 @@ class NexusInitiativeService:
     # ---- candidate discovery --------------------------------------------
 
     def _integration_candidates(self) -> list[Candidate]:
-        """Experiments that succeeded but were never integrated.
-
-        This is the highest priority on purpose. Work that is already
-        implemented and verified is the cheapest possible progress, and leaving
-        it stranded is what kept Nexus from ever completing a cycle.
+        """Experiments that succeeded but were never integrated - the highest priority on
+        purpose: already-implemented, verified work is the cheapest possible progress, and
+        leaving it stranded is what kept Nexus from completing a cycle.
         """
         placeholders = ",".join("?" for _ in _UNFINISHED_ADOPTION_STATUSES)
         try:
@@ -520,11 +496,9 @@ class NexusInitiativeService:
         return candidates
 
     def _review_may_resume(self, experiment_id: str) -> bool:
-        """Whether a ``needs_review`` adoption could get further now.
-
-        Most of these stop for a reason that does not go away (a denied path,
-        unexpected files). Restarting them every tick changed nothing and used
-        up the daily budget (d5e7de1f, 2026-10-29).
+        """Whether a ``needs_review`` adoption could get further now. Most stop for a
+        reason that does not go away (denied path, unexpected files); restarting them
+        every tick changed nothing and burned the daily budget.
         """
         assess = getattr(self.adoption_service, "assess_failure", None)
         if assess is None:
@@ -570,10 +544,9 @@ class NexusInitiativeService:
                 continue
             raw_title = str(issue.get("title") or f"Issue #{number}")
             raw_body = str(issue.get("body") or "")
-            # A trusted author may edit their issue after approval (typo
-            # fixes must not invalidate it), so the content-hash check only
-            # applies to everyone else. Missing author -> fail closed (hash
-            # check stays active).
+            # A trusted author may edit their issue after approval (typo fixes must not
+            # invalidate it), so the content-hash check applies only to everyone else; a
+            # missing author fails closed (hash check stays active).
             author_login = github_authorization.api_actor_login(issue.get("author"))
             author_trusted = github_authorization.is_trusted_actor(author_login)
             verdict = issue_approvals.check_execution(
@@ -605,10 +578,9 @@ class NexusInitiativeService:
                     REVIEW_RETRY_REASON if int(number) in review_blocked
                     else "approved open issue with no experiment working on it"
                 ),
-                # The raw title/body are the validated snapshot: the dispatch
-                # boundary re-checks them and the worker receives exactly this
-                # content, so an edit between validation and execution cannot
-                # change what runs.
+                # The raw title/body are the validated snapshot: the dispatch boundary re-checks
+                # them and the worker receives exactly this content, so an edit between validation
+                # and execution cannot change what runs.
                 payload={
                     "body": raw_body[:16000],
                     "raw_title": raw_title,
@@ -633,11 +605,9 @@ class NexusInitiativeService:
         return {str(row["source_ref"]) for row in rows}
 
     def _execution_allowed(self, candidate: Candidate) -> issue_approvals.ExecutionVerdict:
-        """The centralized execution boundary check for one issue candidate.
-
-        Re-runs the registry check against the validated snapshot (raw
-        title/body captured when the issue was listed this tick), so a
-        revocation or content change between candidate scan and dispatch
+        """The centralized execution boundary check for one issue candidate, re-run at
+        dispatch against the validated snapshot (raw title/body captured when the issue
+        was listed this tick), so a revocation or content change between scan and dispatch
         cannot slip through.
         """
         return issue_approvals.check_execution(
@@ -651,12 +621,10 @@ class NexusInitiativeService:
         )
 
     def enforce_issue_approvals(self) -> list[str]:
-        """Cancel running experiments whose issue approval was revoked/rejected.
-
-        Safe cancellation: only an explicit ``revoked``/``rejected`` record
-        stops running work. A missing record (pending) never does, so legacy
-        in-flight experiments and retries keep working; a content change only
-        blocks new starts. Returns the cancelled experiment ids.
+        """Cancel running experiments whose issue approval was revoked/rejected. Only an
+        explicit revoked/rejected record stops running work - a missing (pending) record
+        never does, so legacy in-flight work keeps running; a content change only blocks
+        new starts. Returns the cancelled experiment ids.
         """
         if not self._repository:
             return []
@@ -750,11 +718,9 @@ class NexusInitiativeService:
         *,
         record: bool,
     ) -> bool:
-        """Run the experiment's goal policy on this issue before it is sent (#408).
-
-        The checked text is the issue source the controller builds from the
-        same title and body. A skip is recorded once per issue text and policy
-        version; while neither changes, the issue is not judged again.
+        """Run the experiment's goal policy on this issue before it is sent (#408), on
+        the same title/body the controller builds the source from; a skip is recorded once
+        per issue text and policy version.
         """
         goal = issue_source(
             int(candidate.ref), title=candidate.title, body=str(candidate.payload.get("body") or "")
@@ -802,11 +768,9 @@ class NexusInitiativeService:
         *,
         record: bool,
     ) -> None:
-        """Show this issue to the planner, and report the stop once (#457).
-
-        One log entry per issue and set of experiment IDs. The comment is
-        tracked in that entry: GitHub may be down when the entry is written,
-        and without this a failed comment would never be posted.
+        """Show this issue to the planner, and report the stop once (#457) - one log entry
+        per issue and experiment-ID set, tracked so a failed GitHub comment is retried on a
+        later tick instead of never posted.
         """
         ref = str(issue["number"])
         title = str(issue.get("title") or f"Issue #{ref}")[:200]
@@ -861,21 +825,13 @@ class NexusInitiativeService:
         )
 
     def _issue_attempts(self) -> tuple[set[int], dict[int, dict[str, Any]]]:
-        """Issues not to start again (#374), and those among them out of attempts.
-
-        An issue is free again after a failed experiment, up to
-        ``_MAX_ISSUE_ATTEMPTS`` failed attempts. A running or succeeded
-        experiment, or a link without a known experiment, keeps it blocked,
-        and such an issue is not reported as out of attempts (#457): its work
-        has not stopped.
-
-        A pipeline crash is not an attempt (#467). ``_MAX_ISSUE_ATTEMPTS``
-        crashes block the issue until origin/main has a commit newer than the
-        last crash, so a broken pipeline gets one more run per commit.
-
-        The newest integration-conflict stop of an issue is not an attempt
-        (#485): its retry merges current main first. An older conflict stop
-        counts, so a retry that conflicts again uses up the attempts.
+        """Issues not to start again (#374), and which of them are out of attempts. Free
+        again after a failed experiment, up to ``_MAX_ISSUE_ATTEMPTS`` failures; a
+        running/succeeded experiment or a link without one keeps it blocked (and is not
+        reported as out of attempts, #457). A pipeline crash is not an attempt (#467):
+        crashes block until origin/main is newer than the last crash. The newest
+        integration-conflict stop is not an attempt either (#485) - its retry merges main
+        first; an older conflict stop counts.
         """
         # issue -> experiment -> (when, why it failed)
         failed: dict[int, dict[str, tuple[str, str]]] = {}
@@ -904,12 +860,12 @@ class NexusInitiativeService:
                     number = int(row["issue_number"])
                 except (TypeError, ValueError):
                     continue
-                # ensure_for_source records the source before any experiment
-                # exists (#464): a link without an experiment is no work.
+                # ensure_for_source records the source before any experiment exists (#464): a link
+                # without an experiment is no work.
                 if row["experiment_id"] is None:
                     continue
-                # A goal-policy rejection is neither an attempt nor a block
-                # (#408): the preflight in _issue_candidates judges the text.
+                # A goal-policy rejection is neither an attempt nor a block (#408): the preflight in
+                # _issue_candidates judges the text.
                 if _is_goal_policy_rejection(row["status"], row["error"]):
                     continue
                 # An overloaded provider says nothing about the issue: not an attempt.
@@ -921,8 +877,8 @@ class NexusInitiativeService:
                         str(row["error"]),
                     )
                     continue
-                # A review that blocked the merge (#396) fails the adoption of
-                # a succeeded experiment: that is a failed attempt too.
+                # A review that blocked the merge (#396) fails the adoption of a succeeded
+                # experiment - that is a failed attempt too.
                 merge_stopped = self._merge_stopped(row)
                 if row["status"] in _RETRYABLE_EXPERIMENT_STATUSES or merge_stopped:
                     first, second = row["adoption_reason"], row["error"]
@@ -978,10 +934,9 @@ class NexusInitiativeService:
             return None
 
     def _merge_stopped(self, row: sqlite3.Row) -> bool:
-        """The experiment succeeded but its merge stopped for good.
-
-        A ``needs_review`` that cannot resume is such a stop too: the issue
-        gets another attempt with the reason, instead of waiting for a human.
+        """The experiment succeeded but its merge stopped for good; a ``needs_review`` that
+        cannot resume is such a stop too - the issue gets another attempt with the reason
+        instead of waiting for a human.
         """
         status = row["adoption_status"]
         if status == "failed":
@@ -1089,12 +1044,9 @@ class NexusInitiativeService:
         return decision
 
     def candidates(self, *, record_skips: bool = True) -> list[Candidate]:
-        """All *dispatchable* work, best first.
-
-        Work whose dispatcher is not configured is left out rather than listed:
-        a candidate that cannot be started is not a candidate, and reporting it
-        would misrepresent both the backlog size and what the next tick will do.
-        ``record_skips=False`` judges issues without writing skips to history.
+        """All *dispatchable* work, best first. Work whose dispatcher is not configured is
+        left out rather than listed - a candidate that cannot start is not a candidate.
+        ``record_skips=False`` judges issues without writing skips.
         """
         found = list(self._integration_candidates()) if self.adoption_service is not None else []
         if self.controller is not None:
@@ -1103,8 +1055,8 @@ class NexusInitiativeService:
             if retries:
                 # Review findings go straight back to the coder, before new work.
                 issues = retries
-            # Integration work is dispatched first; asking the planner then
-            # would be a paid call whose answer is thrown away.
+            # Integration work is dispatched first; asking the planner then would be a paid call
+            # whose answer is thrown away.
             elif self._planner is not None and not found:
                 issues = self._planned_issue(issues)
             found.extend(issues)
@@ -1112,11 +1064,10 @@ class NexusInitiativeService:
         return found
 
     def _recent_experiments(self, limit: int = 10) -> list[dict[str, str]]:
-        """What Nexus tried lately and how it ended, for its own ideas.
-
-        Each entry carries the newest adoption outcome too (#439): a
-        ``succeeded`` experiment whose merge a review blocked is not done.
-        Without an ``experiment_adoptions`` table only the old fields come back.
+        """What Nexus tried lately and how it ended, for its own ideas; each entry carries
+        the newest adoption outcome too (#439) - a ``succeeded`` experiment whose merge a
+        review blocked is not done. Without the adoption table only the old fields come
+        back.
         """
         with_adoption = True
         try:
@@ -1155,10 +1106,8 @@ class NexusInitiativeService:
         return recent
 
     def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:
-        """The one issue the planner picks as next, or none (#354).
-
-        No plan means no issue work this tick: taking issues in list order
-        is what the planning step replaces.
+        """The one issue the planner picks as next, or none (#354) - no plan means no issue
+        work this tick; the planning step replaces taking issues in list order.
         """
         if not issues:
             return []
@@ -1192,10 +1141,8 @@ class NexusInitiativeService:
             return []
 
     def _proposal_slot_free(self) -> bool:
-        """Fewer than three proposals are open; unknown counts as full.
-
-        The issue list is capped, so it can miss older proposals: the count
-        comes from its own exhaustive query when one is configured.
+        """Fewer than three proposals are open; unknown counts as full (the capped issue
+        list can miss older proposals, so the count comes from its own query).
         """
         if self._proposal_counter is None:
             return self._open_proposals < _MAX_OPEN_PROPOSALS
@@ -1208,12 +1155,10 @@ class NexusInitiativeService:
     # ---- the tick --------------------------------------------------------
 
     def _sweep_stalled_experiments(self) -> None:
-        """Best-effort stall recovery before initiative gates are evaluated.
-
-        In particular this must precede ``busy_reason`` and the daily budget:
-        the stale experiment is exactly what can otherwise keep both gates
-        closed indefinitely.  Older/lightweight experiment-service doubles do
-        not necessarily expose the sweep yet, so keep that compatibility.
+        """Best-effort stall recovery before the initiative gates are evaluated - it must
+        precede ``busy_reason`` and the daily budget, which a stale experiment would
+        otherwise keep closed indefinitely. Keeps compatibility with doubles that do not
+        expose the sweep yet.
         """
         sweep = getattr(self.experiment_service, "sweep_stalled_experiments", None)
         if not callable(sweep):
@@ -1258,8 +1203,8 @@ class NexusInitiativeService:
             return decision
 
         if self.daily_budget and self._spent_today() >= self.daily_budget:
-            # Verified work is still adopted, and review findings still go back
-            # to the coder, when the budget for new work is used up (#538).
+            # Verified work is still adopted, and review findings still go back to the coder, when
+            # the budget for new work is used up (#538).
             found = [
                 c for c in (self._integration_candidates() if self.adoption_service is not None else [])
                 if _FRESH_ADOPTION in c.reason and not self._adoption_dispatched_before(c.ref)
@@ -1282,9 +1227,8 @@ class NexusInitiativeService:
             )
 
         chosen = found[0]
-        # Centralized execution boundary: even though candidates were checked
-        # when listed, re-verify at dispatch time so nothing unapproved is
-        # ever handed to the controller.
+        # Centralized execution boundary: re-verify at dispatch time so nothing unapproved is
+        # ever handed to the controller, even though candidates were checked when listed.
         if chosen.kind == KIND_ISSUE:
             verdict = self._execution_allowed(chosen)
             if not verdict.allowed:
@@ -1304,8 +1248,8 @@ class NexusInitiativeService:
         decision = InitiativeDecision(
             "dispatched", candidate=chosen, considered=found[:10], tick_id=tick_id
         )
-        # Persist the intent *before* acting, so a crash mid-dispatch leaves a
-        # record of what Nexus was trying to do rather than a silent gap.
+        # Persist the intent *before* acting, so a crash mid-dispatch leaves a record of what
+        # Nexus was trying to do rather than a silent gap.
         self._record(decision)
         dispatched_at = _utcnow().isoformat()
         try:
@@ -1324,10 +1268,9 @@ class NexusInitiativeService:
         return decision
 
     def _dispatch_was_paid(self, since: str) -> bool:
-        """Whether this tick used a paid model (#541); unknown counts as paid.
-
-        Paid: the planner (Claude/Azure), an Azure-driven controller, a
-        delegation to anything but the local worker, or a coding experiment.
+        """Whether this tick used a paid model (#541); unknown counts as paid. Paid: the
+        planner (Claude/Azure), an Azure-driven controller, a delegation to anything but
+        the local worker, or a coding experiment.
         """
         if self._planner_called:
             return True
@@ -1405,10 +1348,9 @@ class NexusInitiativeService:
         return failed_at is not None and failed_at > _utcnow() - _SERVICE_RESTART_COOLDOWN
 
     def _earlier_attempts(self, issue_number: int) -> str:
-        """How earlier experiments for this issue ended, for the retry (#374).
-
-        A review that blocked the merge (#396) explains exactly what was
-        wrong; without it the next attempt would make the same mistake.
+        """How earlier experiments for this issue ended, for the retry (#374); a review
+        that blocked the merge (#396) says exactly what was wrong, so the next attempt does
+        not repeat it.
         """
         from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING
 
@@ -1465,9 +1407,8 @@ class NexusInitiativeService:
         raise RuntimeError(f"unknown candidate kind {candidate.kind!r}")
 
     def _announce_plan(self, candidate: Candidate) -> None:
-        """Say on GitHub why this issue is next, and open a suggested one (#354).
-
-        Best effort: a failed comment must not stop the work itself.
+        """Say on GitHub why this issue is next, and open a suggested one (#354); best
+        effort - a failed comment must not stop the work itself.
         """
         if not candidate.payload.get("planned"):
             return

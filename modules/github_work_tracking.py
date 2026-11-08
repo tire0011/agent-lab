@@ -37,13 +37,11 @@ _MAX_CI_FAILED_TEST_LINES = 30
 _MAX_CI_FAILURE_LINE_CHARS = 200
 _CI_FAILED_CONCLUSIONS = ("failure", "timed_out")
 _CI_JOB_LOG_PATH_RE = re.compile(r"/actions/jobs/\d+/logs$")
-# Every line of a job log starts with its own timestamp. Dropping it keeps the
-# detail readable and keeps two identical failures from fingerprinting apart.
+# Drop the per-line timestamp so identical failures fingerprint together.
 _CI_LOG_PREFIX_RE = re.compile(r"^\ufeff?(?:\d{4}-\d{2}-\d{2}T[\d:.]+Z ?)?")
 _CI_LOG_COLOR_RE = re.compile(r"\x1b\[[0-9;]*m")
-# CI runs pytest (scripts/run_tests_ci.py), the local fallback runs unittest.
-# Each form is anchored to the shape of a test id, so that a line such as pip's
-# "ERROR: Could not find a version" or a log record is not taken for a test.
+# Anchored to test-id shapes (pytest or unittest), so pip's "ERROR: Could not
+# find a version" or a log record is not taken for a test.
 _CI_FAILED_TEST_RE = re.compile(
     r"^(?:"
     r"(?:FAIL|ERROR): (?P<unittest>\S+(?: \([\w.]+\))?)"
@@ -52,12 +50,9 @@ _CI_FAILED_TEST_RE = re.compile(
     r")$"
 )
 
-# The opening sentence of every lifecycle-readiness refusal. Exported so a
-# consumer that has only a *persisted* refusal text - written before the
-# blocker was recorded in a machine-readable column (#171) - can still
-# recognize it as this one condition instead of guessing at keywords. It
-# survives redaction (it names no secret and no path), unlike the
-# "Configure GITHUB_TOKEN/..." sentence that follows it.
+# Opening sentence of every lifecycle-readiness refusal. Exported so a persisted
+# refusal text (pre-#171) is still recognized; survives redaction (names no
+# secret or path), unlike the "Configure GITHUB_TOKEN/..." sentence after it.
 LIFECYCLE_READINESS_MESSAGE = (
     "GitHub lifecycle is required for Nexus implementation work."
 )
@@ -78,11 +73,9 @@ def _normalise_title(text: str) -> str:
 
 
 def _issue_commit_title(issue_title: str, issue_number: int, *, max_len: int = _MAX_COMMIT_TITLE_CHARS) -> str:
-    """Return ``<issue title> (#N)`` without a ``WIP:`` prefix, at most ``max_len`` chars (#423).
-
-    The planner reads main's ``git log`` to see which issues already landed;
-    a squash title naming only the experiment id cannot be linked back.
-    """
+    """Return ``<issue title> (#N)`` without a ``WIP:`` prefix, at most ``max_len``
+    chars (#423) - a squash title naming only the experiment id cannot be linked
+    back to the issue in main's ``git log``."""
     suffix = f" (#{issue_number})"
     title = " ".join((issue_title or "").split())
     while re.match(r"(?i)^wip:\s*", title):
@@ -114,8 +107,8 @@ def failing_test_names(text: str | None, *, limit: int | None = None) -> list[st
 def _ci_failure_detail_text(job: str, step: str | None, log: str) -> str:
     """Job, step, failing tests and log tail, redacted and within the cap.
 
-    Redaction runs over the whole log first: a cut made earlier could split a
-    secret into a piece the patterns no longer recognize.
+    Redact the whole log first: an earlier cut could split a secret into a
+    piece the patterns no longer recognize.
     """
     lines = [
         _CI_LOG_COLOR_RE.sub("", _CI_LOG_PREFIX_RE.sub("", line))
@@ -371,14 +364,10 @@ class GitHubWorkTrackingService:
                 self._conn.execute(
                     "ALTER TABLE github_experiment_links ADD COLUMN checkpoint_sha TEXT"
                 )
-            # Durable record of authoritative CI verdicts (Issue #138).
-            # Once Nexus has accepted a completed GitHub Actions conclusion
-            # for an exact commit, that is a lifecycle fact. Re-deriving it
-            # needs live credentials, so a restart into a context without a
-            # token made already-accepted evidence disappear and blocked
-            # the #136 retry. Keyed by commit SHA because that is what the
-            # evidence is *about*; a verdict is never reused for any other
-            # commit. No token or secret is stored here.
+            # Durable record of authoritative CI verdicts, keyed by exact commit
+            # SHA (#138): re-deriving needs live credentials, and a restart without
+            # a token must not lose accepted evidence (#136). A verdict is never
+            # reused for another commit. No token or secret is stored here.
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS github_ci_verifications (
@@ -419,15 +408,14 @@ class GitHubWorkTrackingService:
         title = (getattr(source, "title", None) or "").strip()
         content = (getattr(source, "content", None) or "").strip()
 
-        # The body is the goal; put it first so its standard ``GitHub Issue
-        # #N:`` heading remains the first non-empty line even when the source
-        # has a generic title such as "Nexus controller task".
+        # Body first, so its ``GitHub Issue #N:`` heading stays the first
+        # non-empty line even with a generic source title.
         directives = parse_work_directives(f"{content}\n{title}")
 
         persisted = self._find_by_source(source_type, source_id) if source_id else None
         if persisted is not None:
-            # A link from an earlier run is no licence to re-create a branch
-            # that has since been deleted: the task's own constraint decides.
+            # An earlier link is no licence to re-create a since-deleted branch;
+            # the task's own constraint decides.
             self._require_reusable_branch(persisted.branch_name, directives)
             self._ensure_branch(persisted.branch_name)
             return persisted
@@ -436,9 +424,8 @@ class GitHubWorkTrackingService:
         if source_type in {"issue", "github_issue"} and source_id and source_id.isdigit():
             issue = self._reuse_issue(int(source_id))
         elif directives.issue_number is not None:
-            # Issue #184: the task names the Issue to work on, so that Issue
-            # *is* the work-tracking record. Opening a second one here is how
-            # #181 was created alongside #180.
+            # The task names its Issue (#184), so that Issue is the work record;
+            # opening a second one created the #181/#180 pair.
             if directives.header_issue_number == directives.issue_number:
                 logger.info(
                     "reusing GitHub issue #%s from goal header",
@@ -446,8 +433,8 @@ class GitHubWorkTrackingService:
                 )
             issue = self._reuse_requested_issue(directives.issue_number)
         elif directives.forbid_new_issue:
-            # Explicitly told not to create one, and no single Issue to reuse:
-            # stop and say so instead of silently creating a replacement.
+            # Told not to create one and no single Issue to reuse: stop instead
+            # of silently creating a replacement.
             raise GitHubWorkTrackingError(self._unusable_reuse_message(directives))
         else:
             issue_title = self._issue_title(title, content)
@@ -471,11 +458,9 @@ class GitHubWorkTrackingService:
         return ref
 
     def _require_reusable_branch(self, branch_name: str, directives: WorkDirectives) -> None:
-        """Refuse to *create* a branch the task said to reuse or not to add.
-
-        Issue #184: honouring "use branch X" by creating X when it is missing
-        is the same silent substitution as opening a duplicate Issue - the
-        task ends up on a branch nobody asked for. Branch reuse fails closed.
+        """Refuse to *create* a branch the task said to reuse or not to add:
+        creating a missing "use branch X" is the same silent substitution as a
+        duplicate Issue (#184). Branch reuse fails closed.
         """
         if directives.branch_name is None and not directives.forbid_new_branch:
             return
@@ -662,8 +647,8 @@ class GitHubWorkTrackingService:
 
         remote_sha = self._remote_branch_sha(ref.branch_name)
         worktree_head = self._git(["rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
-        # A resume that merged main (#486) leaves its work committed on top
-        # of the Issue branch; that HEAD is what must be published.
+        # A resume that merged main (#486) leaves work committed on the Issue
+        # branch; that HEAD is what must be published.
         head_ahead = worktree_head != remote_sha and self._git(
             ["merge-base", "--is-ancestor", remote_sha, worktree_head],
             cwd=worktree_path,
@@ -753,10 +738,9 @@ class GitHubWorkTrackingService:
     def experiment_base_sha(self, experiment_id: str) -> str:
         """Fetch and return the issue branch commit an experiment must continue.
 
-        A later experiment for the same issue must inherit work already
-        checkpointed by an earlier experiment.  Fetching by branch also makes
-        the returned GitHub SHA available in a fresh deployment checkout's
-        object database without creating or moving a local tracking branch.
+        A later experiment for the same issue inherits earlier checkpointed work;
+        fetching by branch also puts the GitHub SHA in a fresh checkout's object
+        database without a local tracking branch.
         """
         ref = self.ensure_for_experiment(experiment_id)
         remote_sha = self._remote_branch_sha(ref.branch_name)
@@ -801,9 +785,8 @@ class GitHubWorkTrackingService:
             {"body": body[:64000]},
         )
 
-    # Only a completed run carries a verdict worth keeping; "unavailable"
-    # says nothing about the commit and must never be cached, or a
-    # temporary outage would masquerade as evidence.
+    # Only a completed run carries a verdict; "unavailable" must never be cached,
+    # or a temporary outage would masquerade as evidence.
     _AUTHORITATIVE_CI_STATUSES = ("passed", "failed")
 
     def record_ci_verification(
@@ -816,16 +799,10 @@ class GitHubWorkTrackingService:
     ) -> bool:
         """Persist an authoritative CI verdict for its exact commit (#138).
 
-        ``base_sha`` is the target-branch commit the verified checkpoint
-        was built on. It is stored because a verdict is only authoritative
-        for adoption while the integration base is unchanged (#134): the
-        same checkpoint cherry-picked onto a moved base produces a tree CI
-        never saw. Without it a reader cannot tell the two apart.
-
-        Returns whether anything was stored. The most recent authoritative
-        observation for a commit wins: a re-run that flips the conclusion
-        overwrites the previous record, which is what makes the precedence
-        deterministic without a live lookup at read time.
+        ``base_sha`` (the target-branch commit the checkpoint was built on) is
+        stored because a verdict is only authoritative while the integration
+        base is unchanged (#134): the same checkpoint on a moved base is a tree
+        CI never saw. The most recent authoritative observation wins.
         """
         commit_sha = (verification.commit_sha or "").strip()
         if not commit_sha or verification.status not in self._AUTHORITATIVE_CI_STATUSES:
@@ -865,15 +842,10 @@ class GitHubWorkTrackingService:
     def recorded_ci_details(self, commit_sha: str) -> dict[str, Any] | None:
         """The stored row for this commit as plain fields, ignoring base validity.
 
-        Separate from :meth:`recorded_ci_for` on purpose: that method
-        answers "may this verdict be used", and deliberately returns
-        ``None`` both when nothing was ever recorded and when what was
-        recorded no longer applies to the current base. Diagnosis needs to
-        tell those apart (Issue #141), and needs the row's own base and
-        timestamp to say *why*. This never decides anything - callers must
-        still go through ``recorded_ci_for`` for the verdict itself.
-
-        The table holds no credentials, so every field here is safe to log.
+        Separate from :meth:`recorded_ci_for`, which answers "may this verdict
+        be used": diagnosis must tell "never recorded" apart from "recorded but
+        stale" (#141), and never decides anything itself. The table holds no
+        credentials, so every field here is safe to log.
         """
         sha = (commit_sha or "").strip()
         if not sha:
@@ -899,20 +871,13 @@ class GitHubWorkTrackingService:
     def recorded_ci_for(
         self, commit_sha: str, *, base_sha: str | None = None
     ) -> GitHubCIVerification | None:
-        """The stored verdict for exactly this commit, or ``None``.
+        """The stored verdict for exactly this commit, or ``None`` - a pure local
+        read that works after a restart and without credentials; the exact-match
+        lookup is what enforces "a verdict for another commit is never reused".
 
-        A pure local read: it works after a restart and without any
-        GitHub credentials, which is the whole point of the store. The
-        exact-match lookup is also what enforces "a success for another
-        commit is never reused" - there is simply no row to find.
-
-        ``base_sha`` is the integration base the caller is about to use.
-        When given, a verdict is only returned if it was recorded against
-        that same base, which carries #134's rule into the durable store:
-        a checkpoint verified on top of ``A`` says nothing about the tree
-        produced by cherry-picking it onto ``B``. A row with no recorded
-        base predates this and cannot be shown to satisfy the rule, so it
-        is not reused either - the caller falls back to live verification.
+        With ``base_sha``, a verdict is only returned if recorded against that
+        same base (#134): a checkpoint verified on ``A`` says nothing about the
+        tree cherry-picked onto ``B``. A row with no recorded base is not reused.
         """
         sha = (commit_sha or "").strip()
         if not sha:
@@ -952,15 +917,9 @@ class GitHubWorkTrackingService:
         completion_timeout_seconds: float = _DEFAULT_CI_COMPLETION_TIMEOUT_SECONDS,
         poll_interval_seconds: float = _DEFAULT_CI_POLL_INTERVAL_SECONDS,
     ) -> GitHubCIVerification:
-        """Return authoritative CI for the exact checkpoint commit SHA.
-
-        Whether GitHub Actions verified this exact SHA is the only
-        question this method answers (#210): it does not require the
-        checkpoint's direct parent to match the current target branch, and
-        it accepts both `push` and `pull_request` runs as authoritative.
-        Base/target compatibility is a separate concern for the
-        integration/adoption step, not a precondition for recognizing CI
-        here.
+        """Return authoritative CI for the exact checkpoint commit SHA (#210):
+        both ``push`` and ``pull_request`` runs count; base/target compatibility
+        is the adoption step's concern, not a precondition here.
         """
         try:
             ref = self.ensure_for_experiment(experiment_id)
@@ -979,18 +938,11 @@ class GitHubWorkTrackingService:
                 reason="experiment checkpoint SHA is missing",
             )
 
-        # The base persisted alongside a CI verdict must be the value
-        # adoption will later compare against - the target branch's own
-        # head SHA - not the checkpoint commit's direct git parent. A
-        # repair checkpoint's parent is the previous checkpoint commit,
-        # not `main` (#210); persisting that as `base_sha` would make
-        # `recorded_ci_for(checkpoint_sha, base_sha=integration_base)`
-        # reject a perfectly reusable verdict after every restart, even
-        # when `main` never moved. Recognizing checkpoint CI itself must
-        # never depend on this lookup succeeding or matching anything, so
-        # a failure here only means the verdict is persisted without a
-        # base (and so is not reused from the store later) - it never
-        # blocks the live CI check below.
+        # Persist the target branch's own head SHA as the base - not the
+        # checkpoint's git parent (#210): a repair checkpoint's parent is the
+        # previous checkpoint, which would reject a reusable verdict after every
+        # restart. A lookup failure here only means the verdict is persisted
+        # without a base; it never blocks the live CI check below.
         integration_base = ""
         try:
             target = self._request(
@@ -1066,10 +1018,8 @@ class GitHubWorkTrackingService:
                     reason=f"GitHub Actions lookup failed: {str(exc)[:1000]}",
                 )
 
-            # Authoritative CI for the exact checkpoint SHA is accepted
-            # regardless of what triggered the run: a `pull_request` run
-            # (the common case once the checkpoint lives on a PR branch,
-            # #210) is just as authoritative as a `push` run.
+            # Exact-SHA CI is accepted regardless of trigger: a `pull_request`
+            # run (#210) is as authoritative as a `push` run.
             runs = [
                 run
                 for run in (response.get("workflow_runs") or [])
@@ -1108,23 +1058,15 @@ class GitHubWorkTrackingService:
                         reason=reason,
                         failure_detail=failure_detail,
                     )
-                    # Persist here, at the single point that knows the
-                    # verdict is authoritative and which commit it is for,
-                    # so every caller populates the store - including the
-                    # verification path, which is where the evidence in
-                    # #138's reproduction was first seen and then lost.
-                    # Only a verdict for the SHA we actually asked about is
-                    # kept; a run reported for some other commit is not
-                    # evidence for this one.
+                    # Persist at the single point that knows the verdict is
+                    # authoritative, so every caller populates the store (#138).
+                    # Only a verdict for the exact SHA asked about is evidence.
                     if run_sha == sha:
                         try:
-                            # `integration_base` is the target branch's own
-                            # head SHA at verification time (best-effort;
-                            # empty when it could not be resolved). Storing
-                            # it - not the checkpoint's git parent - is what
-                            # lets a later, credential-less reader decide
-                            # whether this verdict still applies to the
-                            # base it is about to integrate onto.
+                            # `integration_base` is the target branch's head SHA
+                            # (best-effort), not the checkpoint's git parent, so a
+                            # later credential-less reader can decide whether the
+                            # verdict still applies to the base it will integrate onto.
                             self.record_ci_verification(
                                 verification,
                                 experiment_id=experiment_id,
@@ -1156,8 +1098,7 @@ class GitHubWorkTrackingService:
     def _ci_failure_detail(self, run_id: Any) -> str | None:
         """What failed in a red run, or ``None`` if GitHub would not say.
 
-        Best effort: the verdict is already settled, so nothing that goes wrong
-        here, not even a malformed response, may change it.
+        Best effort: the verdict is already settled, so nothing here may change it.
         """
         try:
             response = self._request(
@@ -1250,13 +1191,10 @@ class GitHubWorkTrackingService:
     def merged_commit_sha(self, ref: GitHubWorkRef) -> str | None:
         """The merge commit of *ref*'s pull request, or ``None`` if unmerged.
 
-        GitHub itself is the durable record of whether a merge happened, so
-        this is the evidence a restarted adoption uses to tell "the merge
-        never ran" apart from "the merge succeeded and the process died
-        before it could persist that". Returns ``None`` when there is no
-        pull request yet or it is not merged; a lookup failure propagates
-        as ``GitHubWorkTrackingError`` rather than being reported as "not
-        merged", since guessing here could cause a duplicate merge.
+        GitHub is the durable record of whether a merge happened, which is how a
+        restarted adoption tells "never ran" from "ran and died before persisting".
+        A lookup failure propagates as ``GitHubWorkTrackingError`` - guessing here
+        could cause a duplicate merge.
         """
         if ref.pr_number is None:
             return None
@@ -1268,9 +1206,8 @@ class GitHubWorkTrackingService:
     def merge_refusal(self, ref: GitHubWorkRef) -> str | None:
         """Why this pull request must stay unmerged, if a task forbids it (#185).
 
-        A retry rebinds the task to a new experiment, so the task is found
-        through its source and through the pull request as well. The body is
-        read too: a follow-up may have added the instruction after intake.
+        A retry rebinds the task, so it is found via source and via the PR; the
+        body is read too - a follow-up may have added the instruction later.
         """
         try:
             rows = self._conn.execute(
@@ -1285,8 +1222,8 @@ class GitHubWorkTrackingService:
                 (ref.experiment_id, ref.source_id, ref.source_type, ref.pr_number, ref.pr_number, ref.pr_number),
             ).fetchall()
         except sqlite3.OperationalError as exc:
-            # Only a database that never hosted mailbox tasks has no
-            # constraint; anything else must stop the merge.
+            # Only a database that never hosted mailbox tasks lacks the table;
+            # anything else must stop the merge.
             if "no such table: mailbox_task_approvals" not in str(exc):
                 raise
             return None
@@ -1323,25 +1260,24 @@ class GitHubWorkTrackingService:
         if ref.pr_number is None:
             raise GitHubWorkTrackingError("cannot merge work without a pull request")
 
-        # A pull request that GitHub already reports as merged must never be
-        # merged a second time: after a restart mid-adoption the merge may
-        # already have happened, and re-issuing it would either fail the
-        # whole adoption or (worse) land the change twice.
+        # A PR GitHub already reports as merged must never be merged again:
+        # after a restart mid-adoption it may already have landed, and re-issuing
+        # could land the change twice.
         already_merged = self.merged_commit_sha(ref)
         if already_merged is not None:
             self._close_completed_issue(ref)
             return already_merged
 
-        # The one gate in front of the merge call, so that no caller - neither
-        # green CI, nor a restart, nor a retry - can get around the task (#185).
+        # The one gate in front of the merge call, so no caller - green CI,
+        # restart, or retry - can get around the task's refusal (#185).
         refusal = self.refuse_merge(ref)
         if refusal is not None:
             raise MergeForbiddenError(refusal)
 
         payload: dict[str, Any] = {"merge_method": "squash"}
         if ref.issue_number:
-            # Without an explicit title GitHub reuses a single commit's
-            # message, so main would only show the experiment id (#423).
+            # Without an explicit title GitHub reuses the commit message, so
+            # main would only show the experiment id (#423).
             payload["commit_title"] = _issue_commit_title(ref.issue_title, ref.issue_number)
             payload["commit_message"] = "\n\n".join(
                 part
@@ -1370,7 +1306,7 @@ class GitHubWorkTrackingService:
             self._request("PATCH", path, {"state": "closed", "state_reason": "completed"})
         except GitHubWorkTrackingError:
             # The merge's "Fixes #N" can close the issue first; GitHub then
-            # answers 422 "closed by another request". Closed is closed.
+            # answers 422. Closed is closed.
             if str((self._request("GET", path) or {}).get("state")) != "closed":
                 raise
 
@@ -1505,8 +1441,8 @@ class GitHubWorkTrackingService:
                 {"ref": f"refs/heads/{branch_name}", "sha": sha},
             )
         except GitHubWorkTrackingError as exc:
-            # The branch exists (a retry, #374, or a lookup that missed it):
-            # that is the state this method ensures, not a failure.
+            # Branch exists (a retry, #374, or a missed lookup): that is the
+            # state this method ensures, not a failure.
             if "HTTP 422" not in str(exc) or "Reference already exists" not in str(exc):
                 raise
 

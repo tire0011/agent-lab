@@ -1,44 +1,20 @@
-"""Non-interactive Claude Code worker for controlled coding tasks.
+"""Non-interactive Claude Code worker for controlled coding tasks, returning the
+same :class:`~modules.coding_worker.WorkerResult` as the Codex worker so both are
+interchangeable.
 
-Executes the ``claude`` CLI in print mode as a subprocess (never via
-``shell=True``) and returns the same :class:`~modules.coding_worker.WorkerResult`
-as ``modules.codex_worker.CodexWorker``, so both agents are interchangeable for
-``CodexTaskService`` and for the implementation phase of ``ExperimentService``.
+The ``claude`` CLI always runs with ``--print --no-session-persistence
+--permission-prompts none``: nothing may block on a human, and whatever is not
+pre-approved is denied. The task goes to the child's stdin, not argv (prompts
+exceed comfortable argument size, and stdin cannot be mistaken for a flag).
+Sandbox capability is enforced by the tool set, not prompts: read-only gets only
+``Read/Glob/Grep``; workspace-write pre-approves edits inside the working
+directory (anything outside it would prompt and be denied); danger-full-access
+needs the explicit bypass flag, never a default.
 
-The process is always started with:
-
-  --print                    non-interactive; print the result and exit
-  --output-format json       one structured JSON result object on stdout
-  --no-session-persistence   no session files left behind (Codex: --ephemeral)
-  --permission-prompts none  nothing may wait for a human: anything that would
-                             prompt is denied automatically
-
-The task itself is written to the child's **stdin**, not passed as an argv
-element: prompts here routinely exceed a comfortable argument size, and stdin
-cannot be mistaken for a flag.
-
-Capability per sandbox mode is enforced by the *tool set*, not by prompts,
-because a non-interactive run has nobody to answer a prompt:
-
-  read-only           only ``Read``/``Glob``/``Grep`` exist, so there is no
-                      tool that could modify the working directory
-  workspace-write     read, edit, write and shell tools are pre-approved; the
-                      file tools stay inside the working directory (the
-                      experiment worktree), and anything reaching outside it
-                      would prompt and is therefore denied
-  danger-full-access  only with the explicit bypass flag; never a default
-
-Security constraints enforced here:
-  - Working directory must be absolute and exist.
-  - No shell=True, no shell-composed command strings.
-  - Outputs are capped at max_output_bytes; truncation is flagged in result.
-  - Only the variables Claude needs are passed on; AGENT_API_KEY and other
-    application secrets are never exposed to the subprocess.
-
-Requires a ``claude`` CLI that understands ``--permission-prompts`` and
-``--tools`` (Claude Code 2.x). ``python3 -m modules.claude_worker --help``
-runs a one-off task and prints the parsed result, which is the quickest way
-to verify the installed CLI on the VM.
+Security constraints: working directory must be absolute and exist; no
+``shell=True`` or shell-composed commands; outputs capped at max_output_bytes
+with truncation flagged; only the variables the CLI needs are passed on -
+AGENT_API_KEY and other application secrets are never exposed to the subprocess.
 """
 
 from __future__ import annotations
@@ -70,12 +46,8 @@ PROVIDER = "claude"
 
 
 def _default_claude_bin() -> str:
-    """Path to the ``claude`` executable.
-
-    ``AGENT_CLAUDE_BIN`` wins; otherwise the CLI is looked up on ``PATH``
-    (it is installed per-user on the VM, so there is no single fixed
-    location), falling back to the agent user's local bin directory.
-    """
+    """Path to the ``claude`` executable: ``AGENT_CLAUDE_BIN``, then ``PATH``,
+    then the agent user's local bin directory."""
     configured = os.environ.get("AGENT_CLAUDE_BIN")
     if configured:
         return configured
@@ -85,24 +57,19 @@ def _default_claude_bin() -> str:
     return "/home/agent/.local/bin/claude"
 
 
-_DEFAULT_MAX_OUTPUT_BYTES: int = 64 * 1024  # 64 KB
+_DEFAULT_MAX_OUTPUT_BYTES: int = 64 * 1024
 _DEFAULT_TIMEOUT_SECONDS: int = 120
 _DEFAULT_SANDBOX: str = "read-only"
 
-# Tool sets per sandbox mode. These are Claude Code's built-in tool names;
-# a tool that is not listed does not exist for that run at all.
+# Tool sets per sandbox mode: a tool not listed does not exist for that run at all.
 _READ_ONLY_TOOLS = "Read,Glob,Grep"
 _WORKSPACE_WRITE_TOOLS = "Read,Glob,Grep,Edit,Write,Bash,TodoWrite"
 
 
 def _parse_result(stdout: str) -> dict[str, Any] | None:
-    """Return the CLI's final ``result`` object, or ``None`` if absent.
-
-    Accepts both output shapes: ``--output-format json`` (a single object)
-    and ``--output-format stream-json`` (one JSON object per line, of which
-    the last ``type == "result"`` event is the final one). Unparseable lines
-    are ignored, exactly like the Codex event-stream parser.
-    """
+    """Return the CLI's final ``result`` object, or ``None`` if absent. Accepts
+    both output shapes (single JSON object, or stream-json where the last
+    ``type == "result"`` event wins); unparseable lines are ignored."""
     text = stdout.strip()
     if not text:
         return None
@@ -129,13 +96,9 @@ def _parse_result(stdout: str) -> dict[str, Any] | None:
 
 
 def _usage_from_result(result: dict[str, Any]) -> dict[str, int] | None:
-    """Flatten Claude's usage block to the ``{name: int}`` shape.
-
-    Only scalar token counters are kept (``input_tokens``,
-    ``output_tokens``, the cache counters); nested breakdowns and
-    non-numeric entries are dropped, matching the Codex worker's usage
-    shape so cost/usage reporting stays provider-independent.
-    """
+    """Flatten Claude's usage block to the ``{name: int}`` shape: only scalar token
+    counters are kept, matching the Codex worker's shape so cost reporting stays
+    provider-independent."""
     raw = result.get("usage")
     if not isinstance(raw, dict):
         return None
@@ -158,20 +121,9 @@ def _model_from_result(result: dict[str, Any]) -> str:
 class ClaudeWorker:
     """Runs a coding task non-interactively via the ``claude`` CLI.
 
-    Parameters
-    ----------
-    claude_bin:
-        Path to the ``claude`` executable. Defaults to ``AGENT_CLAUDE_BIN``,
-        then to whatever ``claude`` resolves to on ``PATH``.
-    max_output_bytes:
-        Maximum bytes kept from stdout/stderr individually.
-        Output beyond this is truncated and flagged in the result.
-    db_path:
-        Optional path to the SQLite run store for audit entries.
-        Pass ``None`` to skip audit logging.
-    model:
-        Optional model override (``AGENT_CLAUDE_MODEL`` by default). When
-        unset, the CLI's own configured model is used.
+    claude_bin defaults to ``AGENT_CLAUDE_BIN``/``PATH``; max_output_bytes caps
+    stdout/stderr (truncation flagged); db_path ``None`` skips audit logging;
+    model defaults to ``AGENT_CLAUDE_MODEL`` or the CLI's own.
     """
 
     #: Provider name recorded on every result this worker produces.
@@ -203,9 +155,7 @@ class ClaudeWorker:
         self._db_path = db_path
         self.model = model or os.environ.get("AGENT_CLAUDE_MODEL") or None
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -221,42 +171,14 @@ class ClaudeWorker:
         on_process: Any | None = None,
         extra_args: list[str] | None = None,
     ) -> WorkerResult:
-        """Execute *task* non-interactively via the ``claude`` CLI.
+        """Execute *task* non-interactively via the ``claude`` CLI; signature
+        mirrors ``CodexWorker.run`` so the two workers are swappable.
 
-        The signature mirrors ``CodexWorker.run`` so the two workers can be
-        swapped without the caller knowing which agent it got.
-
-        Parameters
-        ----------
-        task:
-            Natural-language coding task. Must be non-empty. Passed to the
-            CLI on stdin.
-        working_dir:
-            Absolute path to the working directory. Must exist. It is the
-            child's ``cwd`` and, for file tools, its confinement boundary.
-        sandbox:
-            One of ``read-only``, ``workspace-write``, ``danger-full-access``.
-            Defaults to ``read-only``. See the module docstring for how each
-            mode is enforced.
-        timeout_seconds:
-            Hard wall-clock timeout. The process is killed on expiry and the
-            result carries ``timed_out=True``.
-        output_schema:
-            Optional JSON Schema (as a plain dict) describing the shape of
-            the model's final response, passed via ``--json-schema``. Unlike
-            Codex, the CLI takes the schema inline, so no temporary file is
-            created. Defaults to ``None`` (free-form response).
-        skip_git_repo_check:
-            Accepted for signature compatibility with ``CodexWorker`` and
-            ignored: the Claude CLI does not require the working directory
-            to be a git repository, so there is no check to skip.
-        experiment_logger:
-            Optional ``modules.central_logging.ExperimentLogger`` (duck typed
-            to avoid a hard import) used to record this call's start/outcome
-            in the owning experiment's structured JSONL log.
-        phase:
-            Label used in log entries when *experiment_logger* is given
-            (e.g. ``"implementation"``, ``"research"``).
+        task goes to the CLI on stdin and must be non-empty; working_dir must be
+        absolute and existing (the child's cwd and confinement boundary);
+        sandbox defaults to ``read-only`` (see the module docstring); the process
+        is killed at timeout_seconds with ``timed_out=True`` in the result;
+        output_schema is passed inline via ``--json-schema`` (no temp file).
         """
         timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -365,9 +287,7 @@ class ClaudeWorker:
                     thread_id=result.thread_id or "",
                 )
 
-    # ------------------------------------------------------------------
     # Command construction (no shell=True, no string composition)
-    # ------------------------------------------------------------------
 
     def _build_command(
         self,
@@ -390,9 +310,8 @@ class ClaudeWorker:
             # No tool that could write or execute anything exists for this run.
             cmd += ["--tools", _READ_ONLY_TOOLS]
         elif sandbox == "workspace-write":
-            # Edits and commands are pre-approved (the run happens in a
-            # throwaway worktree); file tools stay inside the working
-            # directory, and a path outside it would prompt and be denied.
+            # Edits pre-approved in a throwaway worktree; file tools stay inside
+            # the working directory - a path outside it would prompt and be denied.
             cmd += [
                 "--permission-mode", "acceptEdits",
                 "--tools", _WORKSPACE_WRITE_TOOLS,
@@ -407,9 +326,7 @@ class ClaudeWorker:
             cmd += ["--json-schema", json.dumps(output_schema)]
         return cmd
 
-    # ------------------------------------------------------------------
     # Process execution
-    # ------------------------------------------------------------------
 
     def _execute(
         self,
@@ -531,16 +448,11 @@ class ClaudeWorker:
 
     @classmethod
     def _safe_env(cls) -> dict[str, str]:
-        """Minimal env passed to the claude subprocess.
-
-        Passes only variables the CLI requires to function. Never exposes
-        AGENT_API_KEY or other application secrets.
-        """
+        """Minimal env for the claude subprocess; never exposes AGENT_API_KEY or
+        other application secrets."""
         return filtered_env(cls._EXTRA_ENV_KEYS)
 
-    # ------------------------------------------------------------------
     # Audit logging
-    # ------------------------------------------------------------------
 
     def _audit(self, result: WorkerResult, timestamp: str) -> None:
         if self._db_path is None:
@@ -581,9 +493,7 @@ def _decoded(stream: bytes | str | None) -> str:
     return stream or ""
 
 
-# ---------------------------------------------------------------------------
 # CLI entry point for manual smoke-testing
-# ---------------------------------------------------------------------------
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
