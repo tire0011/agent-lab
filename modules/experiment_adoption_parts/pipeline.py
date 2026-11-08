@@ -617,6 +617,12 @@ class PipelineMixin:
                 diagnostic_worktree_path=None,
                 updated_at=_utcnow_iso(),
             )
+            self._report_issue_progress(
+                experiment_id,
+                "completed",
+                f"Merged into {_DEFAULT_TARGET_BRANCH}"
+                + (f" as {published_sha[:12]}." if published_sha else "."),
+            )
             return self.get(experiment_id)
         except ExperimentAdoptionError as exc:
             return self._finish_failure(experiment_id, reason=str(exc), elog=elog)

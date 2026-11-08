@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import uuid
 
@@ -27,8 +28,10 @@ from ..models import (
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
+    STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_REJECTED,
+    STATUS_SUCCEEDED,
     STATUS_TIMED_OUT,
     STATUS_VERIFYING,
 )
@@ -38,6 +41,38 @@ from ..prompts import (
     _build_repair_implementation_prompt,
 )
 from ..text_utils import _truncate_text, _utcnow_iso
+from modules.redaction import sanitized_reason
+
+
+def _report_issue_progress(
+    github_work_tracking: Any | None,
+    experiment_id: str,
+    state: str,
+    detail: str | None = None,
+) -> None:
+    """Best-effort Issue progress comment; reporting never affects the run."""
+    post = getattr(github_work_tracking, "post_progress", None)
+    if post is None:
+        return
+    try:
+        post(experiment_id, state, detail=detail)
+    except Exception:  # noqa: BLE001 - lifecycle reporting is informational
+        return
+
+
+def _final_issue_progress(experiment: Experiment) -> tuple[tuple[str, str | None], ...]:
+    """Map a terminal experiment result to concise Issue lifecycle outcomes."""
+    if experiment.status == STATUS_SUCCEEDED:
+        match = re.search(r"\b\d+ (?:passed|failed)\b[^\n=]*", experiment.test_output or "")
+        detail = f"Tests: {match.group(0).strip()}." if match else None
+        return (("verification_passed", detail), ("completed", None))
+    reason = sanitized_reason(experiment.error)
+    detail = f"Reason: {reason}" if reason else None
+    if experiment.status == STATUS_NEEDS_REVIEW:
+        return (("needs_review", detail),)
+    if experiment.status in {STATUS_FAILED, STATUS_TIMED_OUT, STATUS_REJECTED}:
+        return (("failed", detail),)
+    return ()
 
 
 class ImplementationMixin:
@@ -75,8 +110,10 @@ class ImplementationMixin:
                 f"{current.status!r} (only {STATUS_QUEUED!r} experiments can run)"
             )
 
+        _report_issue_progress(github_work_tracking, experiment_id, "started")
+        _report_issue_progress(github_work_tracking, experiment_id, "implementing")
         try:
-            return self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
+            result = self._run_pipeline(experiment_id, github_work_tracking=github_work_tracking)
         except Exception as exc:  # noqa: BLE001 - must never leave an active status
             elog.error(
                 "pipeline", "unhandled_exception",
@@ -89,7 +126,10 @@ class ImplementationMixin:
                 ended_at=_utcnow_iso(),
                 error=f"{PIPELINE_CRASH_ERROR_PREFIX}{exc}",
             )
-            return self.get_experiment(experiment_id)
+            result = self.get_experiment(experiment_id)
+        for state, detail in _final_issue_progress(result):
+            _report_issue_progress(github_work_tracking, experiment_id, state, detail)
+        return result
 
 
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
@@ -343,6 +383,7 @@ class ImplementationMixin:
             implementation_runtime_ms=implementation_result.runtime_ms,
             implementation_usage_json=implementation_usage_json,
         )
+        _report_issue_progress(github_work_tracking, experiment_id, "verifying")
 
         if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
@@ -513,4 +554,3 @@ class ImplementationMixin:
                 "Could not publish interrupted implementation checkpoint", exc=exc,
             )
             return f"; GitHub checkpoint failed: {str(exc)[:1000]}"
-

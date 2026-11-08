@@ -89,4 +89,3 @@ class ExperimentAdoptionService(
     Adoption publishes only through the mandatory GitHub lifecycle (Issue-linked
     branch, PR, verified draft, merge); direct pushes to main are not allowed.
     """
-

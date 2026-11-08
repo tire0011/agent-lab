@@ -124,7 +124,7 @@ from .service_parts.core import (
 )
 from .service_parts.records import RecordsMixin
 from .service_parts.diagnostics import DiagnosticsMixin
-from .service_parts.implementation import ImplementationMixin
+from .service_parts.implementation import ImplementationMixin, _final_issue_progress
 from .service_parts.verification import VerificationMixin
 from .service_parts.stall import StallSweepMixin
 from .service_parts.cleanup import CleanupMixin
@@ -144,4 +144,3 @@ class ExperimentService(
     a persistent rotation (``modules.coding_provider``) unless a worker/factory is
     injected, and recorded on the experiment as ``implementation_provider``.
     """
-

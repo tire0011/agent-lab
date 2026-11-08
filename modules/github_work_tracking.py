@@ -62,6 +62,20 @@ LIFECYCLE_READINESS_MESSAGE = (
     "GitHub lifecycle is required for Nexus implementation work."
 )
 
+# Issue #43: the meaningful lifecycle points reported on the tracking Issue.
+# Each is posted at most once per experiment, so polling, restarts and
+# repeated finishes of an unchanged state never add a second comment.
+_PROGRESS_MESSAGES = {
+    "started": "started: analyzing the requested change.",
+    "implementing": "implementing on its experiment branch.",
+    "verifying": "verifying the change (tests and quality gate).",
+    "verification_passed": "verification passed.",
+    "needs_review": "requires review.",
+    "completed": "completed.",
+    "failed": "failed.",
+}
+_MAX_PROGRESS_DETAIL_CHARS = 500
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -409,6 +423,17 @@ class GitHubWorkTrackingService:
                 self._conn.execute(
                     "ALTER TABLE github_ci_verifications ADD COLUMN base_sha TEXT"
                 )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS github_issue_progress (
+                    experiment_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    posted_at TEXT NOT NULL,
+                    PRIMARY KEY (experiment_id, state)
+                )
+                """
+            )
 
     def ensure_for_source(self, source) -> GitHubWorkRef:
         self.require_lifecycle_ready()
@@ -1363,6 +1388,52 @@ class GitHubWorkTrackingService:
     def comment(self, number: int, body: str) -> None:
         """Comment on an issue or pull request (#396: review results)."""
         self._request("POST", f"/repos/{self.repository}/issues/{number}/comments", {"body": body[:60000]})
+
+    def post_progress(self, experiment_id: str, state: str, *, detail: str | None = None) -> bool:
+        """Comment one lifecycle state on the experiment's Issue (#43).
+
+        Only experiments linked to an Issue are reported, and each state at
+        most once: the claim row is written before the comment and removed
+        again if posting fails, so a later attempt may retry. Informational
+        only - it never raises into the lifecycle it reports on.
+        """
+        message = _PROGRESS_MESSAGES.get(state)
+        if message is None or not experiment_id or not self.configured:
+            return False
+        try:
+            ref = self.for_experiment(experiment_id)
+            if ref is None or not ref.issue_number:
+                return False
+            with self._conn:
+                claimed = self._conn.execute(
+                    "INSERT OR IGNORE INTO github_issue_progress "
+                    "(experiment_id, state, issue_number, posted_at) VALUES (?, ?, ?, ?)",
+                    (experiment_id, state, ref.issue_number, _utcnow_iso()),
+                ).rowcount
+            if not claimed:
+                return False
+            lines = [f"Nexus experiment {experiment_id} {message}"]
+            lines.append(f"Branch: `{ref.branch_name}`")
+            if ref.pr_number:
+                lines.append(f"Pull request: #{ref.pr_number}")
+            if detail and detail.strip():
+                text = " ".join(detail.split())
+                if len(text) > _MAX_PROGRESS_DETAIL_CHARS:
+                    text = text[: _MAX_PROGRESS_DETAIL_CHARS - 3] + "..."
+                lines.append(text)
+            try:
+                self.comment(ref.issue_number, "\n\n".join(lines))
+            except Exception:
+                with self._conn:
+                    self._conn.execute(
+                        "DELETE FROM github_issue_progress WHERE experiment_id = ? AND state = ?",
+                        (experiment_id, state),
+                    )
+                raise
+            return True
+        except Exception as exc:  # noqa: BLE001 - progress comments are informational
+            logger.warning("could not post %s progress for experiment %s: %s", state, experiment_id, exc)
+            return False
 
     def _close_completed_issue(self, ref: GitHubWorkRef) -> None:
         path = f"/repos/{self.repository}/issues/{ref.issue_number}"

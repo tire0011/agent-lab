@@ -28,12 +28,21 @@ class FakeGitHub:
         self.commit_parents = {}
         self.pulls = []
         self.workflow_runs = []
+        self.comments = []
+        self.fail_comments = False
         self.jobs = []
         self.job_log = ""
         self.calls = []
 
     def __call__(self, method, path, payload):
         self.calls.append((method, path, payload))
+
+        if method == "POST" and path.endswith("/comments"):
+            if self.fail_comments:
+                raise GitHubWorkTrackingError("GitHub HTTP 502: bad gateway")
+            number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+            self.comments.append((number, payload["body"]))
+            return {"id": len(self.comments)}
 
         if method == "GET" and path.startswith("/repos/tire0011/agent-lab/issues/"):
             number = int(path.rsplit("/", 1)[1])
@@ -456,6 +465,56 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertIn("python -m unittest", body)
         self.assertIn("Exit code: `1`", body)
         self.assertIn("FAILED test_example", body)
+
+    def test_issue_progress_comments_once_per_state_with_id_and_pr(self):
+        source = SimpleNamespace(
+            source_type="issue",
+            source_id="42",
+            title="GitHub lifecycle",
+            content="GitHub Issue #42: GitHub lifecycle",
+        )
+        ref = self.service.bind_experiment(self.service.ensure_for_source(source), "exp-progress")
+
+        self.assertTrue(self.service.post_progress("exp-progress", "started"))
+        self.assertFalse(self.service.post_progress("exp-progress", "started"))
+        self.service.ensure_pull_request(ref, title="WIP", body="pending", draft=True)
+        self.fake.fail_comments = True
+        self.assertFalse(
+            self.service.post_progress("exp-progress", "needs_review", detail="Reason: gate unsure")
+        )
+        self.fake.fail_comments = False
+        self.assertTrue(
+            self.service.post_progress("exp-progress", "needs_review", detail="Reason: gate unsure")
+        )
+        self.assertFalse(self.service.post_progress("exp-progress", "needs_review"))
+        self.assertFalse(self.service.post_progress("unlinked-exp", "started"))
+
+        self.assertEqual([number for number, _ in self.fake.comments], [42, 42])
+        started, review = (body for _, body in self.fake.comments)
+        self.assertIn("Nexus experiment exp-progress started", started)
+        self.assertIn(ref.branch_name, started)
+        self.assertIn("Nexus experiment exp-progress requires review.", review)
+        self.assertIn(f"Pull request: #{ref.pr_number}", review)
+        self.assertIn("Reason: gate unsure", review)
+
+    def test_finished_pipeline_maps_to_issue_progress_outcome(self):
+        from modules.experiment_service.service import _final_issue_progress
+
+        def outcome(status, **fields):
+            return _final_issue_progress(
+                SimpleNamespace(**{"status": status, "test_output": None, "error": None, **fields})
+            )
+
+        self.assertEqual(
+            outcome("succeeded", test_output="===== 18 passed in 0.4s ====="),
+            (
+                ("verification_passed", "Tests: 18 passed in 0.4s."),
+                ("completed", None),
+            ),
+        )
+        self.assertEqual(outcome("needs_review", error="gate unsure"), (("needs_review", "Reason: gate unsure"),))
+        self.assertEqual(outcome("timed_out", error="watchdog"), (("failed", "Reason: watchdog"),))
+        self.assertEqual(outcome("cancelled"), ())
 
     def _bind_checkpoint(self, sha: str = "checkpoint-sha"):
         ref = self.service.bind_experiment(
