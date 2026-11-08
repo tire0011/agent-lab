@@ -23,6 +23,9 @@ from api import (
     get_operations_executor,
     get_operations_service,
 )
+from fastapi import HTTPException
+from modules.operations_registry import OperationValidationError
+import api
 
 registry_router = APIRouter(dependency_overrides_provider=app)
 chains_router = APIRouter(dependency_overrides_provider=app)
@@ -38,7 +41,7 @@ def get_operations_catalog(
     x_api_key: str | None = Header(default=None),
     operations_service: OperationsRegistry = Depends(get_operations_service),
 ) -> OperationsCatalogResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     operations = [OperationCatalogEntry(**entry.to_dict()) for entry in operations_service.catalog()]
     return OperationsCatalogResponse(count=len(operations), operations=operations)
 
@@ -49,7 +52,7 @@ def execute_operation(
     x_api_key: str | None = Header(default=None),
     operations_service: OperationsRegistry = Depends(get_operations_service),
 ) -> OperationsExecuteResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         result = operations_service.execute(
             request.operation,
@@ -70,7 +73,7 @@ def start_operation_chain(
     x_api_key: str | None = Header(default=None),
     service: OperationChainService = Depends(get_operation_chain_service),
 ) -> OperationChainResult:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         result = service.start_chain(request)
         return result
@@ -84,7 +87,7 @@ def get_operation_chain(
     x_api_key: str | None = Header(default=None),
     service: OperationChainService = Depends(get_operation_chain_service),
 ) -> OperationChainResult:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = service.get_chain(request_id)
     if not result:
         raise HTTPException(status_code=404, detail="Chain not found")
@@ -97,7 +100,7 @@ def list_operation_chains(
     x_api_key: str | None = Header(default=None),
     service: OperationChainService = Depends(get_operation_chain_service),
 ) -> list[OperationChainResult]:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     return service.list_chains(limit=limit)
 
 
@@ -121,7 +124,7 @@ async def operations_git_pull(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("git/pull", {})
     return _op_response(result, "git/pull")
 
@@ -131,7 +134,7 @@ async def operations_git_status(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("git/status", {})
     return _op_response(result, "git/status")
 
@@ -142,7 +145,7 @@ async def operations_git_commit_push(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute(
         "git/commit-and-push",
         {"message": request.message, "files": request.files},
@@ -157,7 +160,7 @@ async def operations_services_restart(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("services/restart", {"service": request.service})
     return _op_response(result, "services/restart")
 
@@ -167,7 +170,7 @@ async def operations_services_status(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("services/status", {})
     return _op_response(result, "services/status")
 
@@ -177,7 +180,7 @@ async def operations_llama_reload_model(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("services/llama/reload-model", {})
     return _op_response(result, "services/llama/reload-model")
 
@@ -190,7 +193,7 @@ async def operations_logs_tail(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("logs/tail", {"service": service, "lines": lines})
     return _op_response(result, "logs/tail")
 
@@ -202,7 +205,7 @@ async def operations_logs_errors(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute(
         "logs/errors", {"service": service, "since_minutes": since_minutes}
     )
@@ -215,7 +218,7 @@ async def operations_healing_fix_locks(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("healing/fix-locks", {})
     return _op_response(result, "healing/fix-locks")
 
@@ -225,7 +228,7 @@ async def operations_healing_cleanup_temps(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("healing/cleanup-temps", {})
     return _op_response(result, "healing/cleanup-temps")
 
@@ -235,7 +238,7 @@ async def operations_healing_diagnose(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("healing/diagnose", {})
     return _op_response(result, "healing/diagnose")
 
@@ -246,7 +249,7 @@ async def operations_models_status(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("models/status", {})
     return _op_response(result, "models/status")
 
@@ -257,7 +260,7 @@ async def operations_models_test(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute(
         "models/test", {"model": request.model, "prompt": request.prompt}
     )
@@ -270,7 +273,7 @@ async def operations_context_env(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute("context/env", {})
     return _op_response(result, "context/env")
 
@@ -281,7 +284,7 @@ async def operations_context_set_config(
     x_api_key: str | None = Header(default=None),
     executor: OperationsExecutor = Depends(get_operations_executor),
 ) -> OperationResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     result = await executor.execute(
         "context/set-config", {"key": request.key, "value": request.value}
     )

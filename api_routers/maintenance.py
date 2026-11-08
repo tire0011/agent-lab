@@ -8,6 +8,12 @@ from models import (
 from modules.maintenance_service import MaintenanceService
 
 from api import app, get_maintenance_service
+from fastapi import HTTPException
+from modules.maintenance_service import MaintenanceAuthError
+from modules.maintenance_service import MaintenanceDisabledError
+from modules.maintenance_service import MaintenanceOperationError
+import api
+import os
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -24,7 +30,7 @@ def get_maintenance_status(
     service: MaintenanceService = Depends(get_maintenance_service),
 ) -> MaintenanceStatusResponse:
     """Return whether the maintenance service is currently enabled."""
-    if x_api_key != API_KEY:
+    if x_api_key != api.API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     expiry = os.environ.get("MAINTENANCE_EXPIRY") or None
     return MaintenanceStatusResponse(
@@ -46,7 +52,7 @@ def maintenance_execute(
     ``run_tests``) return a ``task_id`` pollable via ``router_task_status`` /
     ``test_task_status``.
     """
-    if x_api_key != API_KEY:
+    if x_api_key != api.API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         result = service.execute(body.operation, x_maintenance_token, body.args)
@@ -65,7 +71,7 @@ def get_maintenance_audit(
     service: MaintenanceService = Depends(get_maintenance_service),
 ) -> MaintenanceAuditResponse:
     """Return the in-memory maintenance audit log."""
-    if x_api_key != API_KEY:
+    if x_api_key != api.API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     entries = service.audit_log
     return MaintenanceAuditResponse(

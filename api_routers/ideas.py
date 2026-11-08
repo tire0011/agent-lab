@@ -2,6 +2,11 @@ from fastapi import APIRouter, Header
 from models import Idea, IdeaCreateRequest, IdeasResponse
 
 from api import app
+from data_sources import InvalidIdeaTextError
+from data_sources import add_idea
+from data_sources import list_ideas
+from fastapi import HTTPException
+import api
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -17,7 +22,7 @@ def create_idea(
     request: IdeaCreateRequest,
     x_api_key: str | None = Header(default=None),
 ) -> Idea:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
 
     try:
         return add_idea(request.text)

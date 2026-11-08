@@ -708,9 +708,7 @@ def get_nexus_diagnostics() -> Iterator[nexus_diagnostics_module.NexusDiagnostic
 # are included in the exact order the routes were registered on app before
 # the split, so path matching (fixed paths before /{...} paths) is unchanged.
 
-import types
-
-from fastapi.routing import APIRoute, APIRouter
+from fastapi.routing import APIRouter
 
 from api_routers import (
     activity,
@@ -727,49 +725,6 @@ from api_routers import health as health_routes
 from api_routers import ideas as ideas_routes
 from api_routers import status as status_routes
 
-
-def _bind_to_api_namespace(module) -> None:
-    """Rebind the functions *module* defines to this module's globals.
-
-    The moved endpoints and helpers must resolve their names here at call
-    time, exactly as when they were defined in api.py: tests patch
-    ``api.<name>`` (``api._start_mailbox_webhook_poll``, ``api.API_KEY``,
-    ``api._OUTBOX_DIR``, ``api._resolve_*_service``, ...) and expect the
-    routes to honour the patch.
-    """
-    for name, value in list(vars(module).items()):
-        if isinstance(value, types.FunctionType) and value.__module__ == module.__name__:
-            rebound = types.FunctionType(
-                value.__code__, globals(), name, value.__defaults__, value.__closure__
-            )
-            rebound.__kwdefaults__ = value.__kwdefaults__
-            rebound.__annotations__ = value.__annotations__
-            rebound.__dict__.update(value.__dict__)
-            setattr(module, name, rebound)
-    for router in vars(module).values():
-        if isinstance(router, APIRouter):
-            for route in router.routes:
-                if isinstance(route, APIRoute) and route.endpoint.__module__ == module.__name__:
-                    rebound = getattr(module, route.endpoint.__name__)
-                    route.endpoint = rebound
-                    route.dependant.call = rebound
-
-
-for _router_module in (
-    activity,
-    chat_routes,
-    codex,
-    diagnostics,
-    experiments,
-    health_routes,
-    ideas_routes,
-    logs,
-    mailbox,
-    maintenance,
-    operations,
-    status_routes,
-):
-    _bind_to_api_namespace(_router_module)
 
 from api_routers.activity import (  # noqa: E402
     ACTIVITY_DEFAULT_LIMIT,

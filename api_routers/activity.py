@@ -3,6 +3,10 @@ from models import DiagnosticActivityResponse, PublicActivityResponse
 from modules.experiment_service import ExperimentService
 
 from api import LIMIT_MIN, app, get_experiment_service
+from modules import redaction
+from modules.experiment_service import ExperimentNotFoundError
+from modules.mailbox.task_service import ApprovalNotFoundError
+import api
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -35,15 +39,15 @@ def list_public_activity(
         status = entry.get("to_status") or experiment.status
         result.append({
             "timestamp": entry["timestamp"],
-            "phase": _public_phase(status),
+            "phase": api._public_phase(status),
             "status": status,
-            "message": f"Experiment phase is {_public_phase(status)}.",
-            "mailbox_task_id": _mailbox_task_id(service, experiment.id),
+            "message": f"Experiment phase is {api._public_phase(status)}.",
+            "mailbox_task_id": api._mailbox_task_id(service, experiment.id),
             "experiment_id": experiment.id,
-            "failure_reason": _failure_reason(experiment) if status in _PUBLIC_PHASES and _public_phase(status) in {"failed", "needs_review"} else None,
+            "failure_reason": api._failure_reason(experiment) if status in api._PUBLIC_PHASES and api._public_phase(status) in {"failed", "needs_review"} else None,
             "test_exit_code": experiment.test_exit_code,
-            "changed_files": _changed_file_names(experiment.git_status),
-            "test_summary": _test_summary(experiment),
+            "changed_files": api._changed_file_names(experiment.git_status),
+            "test_summary": api._test_summary(experiment),
         })
     return PublicActivityResponse(count=len(result), activity=result)
 
@@ -56,9 +60,9 @@ def list_activity(
     mailbox_task_id: str | None = Query(default=None),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> DiagnosticActivityResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     if mailbox_task_id:
-        approval_service = _resolve_mailbox_task_service()
+        approval_service = api._resolve_mailbox_task_service()
         try:
             approval = approval_service.get(mailbox_task_id)
         except ApprovalNotFoundError:
@@ -75,13 +79,13 @@ def list_activity(
         diagnostics.append({
             **entry,
             "message": None,
-            "mailbox_task_id": _mailbox_task_id(service, experiment.id),
-            "phase": _public_phase(entry.get("to_status") or experiment.status),
+            "mailbox_task_id": api._mailbox_task_id(service, experiment.id),
+            "phase": api._public_phase(entry.get("to_status") or experiment.status),
             "policy_rule": experiment.policy_rule,
             "rejection_reason": _sanitized_rejection_reason(experiment.error),
             "test_command": experiment.test_command,
             "test_exit_code": experiment.test_exit_code,
-            "changed_files": _changed_file_names(experiment.git_status),
+            "changed_files": api._changed_file_names(experiment.git_status),
             "test_output_lines": _diagnostic_lines(experiment.test_output),
         })
     return DiagnosticActivityResponse(count=len(diagnostics), activity=diagnostics)

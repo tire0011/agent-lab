@@ -9,6 +9,12 @@ from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import ExperimentService
 
 from api import LIMIT_MIN, app, get_experiment_adoption_service, get_experiment_service
+from fastapi import HTTPException
+from modules import redaction
+from modules.experiment_adoption_service import ExperimentAdoptionError
+from modules.experiment_service import ExperimentNotCancellableError
+from modules.experiment_service import ExperimentNotFoundError
+import api
 
 router = APIRouter(dependency_overrides_provider=app)
 adoption_router = APIRouter(dependency_overrides_provider=app)
@@ -29,7 +35,7 @@ def list_experiments(
     limit: int = Query(default=EXPERIMENTS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENTS_MAX_LIMIT),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentsResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     experiments = service.list_experiments(limit=limit)
     return ExperimentsResponse(
         count=len(experiments),
@@ -43,12 +49,12 @@ def get_experiment(
     x_api_key: str | None = Header(default=None),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentDetail:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         experiment = service.resolve_experiment(experiment_id)
     except ExperimentNotFoundError:
         raise HTTPException(status_code=404, detail="experiment not found")
-    adoption_service = _resolve_experiment_adoption_service()
+    adoption_service = api._resolve_experiment_adoption_service()
     adoption = adoption_service.get(experiment.id)
     payload = experiment.to_dict()
     if experiment.test_exit_code not in (None, 0):
@@ -65,7 +71,7 @@ def cancel_experiment(
     x_cancelled_by: str | None = Header(default=None),
     service: ExperimentService = Depends(get_experiment_service),
 ) -> ExperimentDetail:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         experiment = service.cancel_experiment(experiment_id, x_cancelled_by or "api")
     except ExperimentNotFoundError:
@@ -82,7 +88,7 @@ def adopt_experiment(
     service: ExperimentService = Depends(get_experiment_service),
     adoption_service: ExperimentAdoptionService = Depends(get_experiment_adoption_service),
 ) -> ExperimentAdoptionStatus:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         experiment = service.resolve_experiment(experiment_id)
     except ExperimentNotFoundError:
@@ -101,7 +107,7 @@ def get_experiment_adoption(
     service: ExperimentService = Depends(get_experiment_service),
     adoption_service: ExperimentAdoptionService = Depends(get_experiment_adoption_service),
 ) -> ExperimentAdoptionStatus:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         experiment = service.resolve_experiment(experiment_id)
     except ExperimentNotFoundError:
@@ -136,14 +142,14 @@ def _public_experiment(experiment, mailbox_task_id: str | None) -> PublicExperim
     return PublicExperimentSummary(
         id=experiment.id,
         mailbox_task_id=mailbox_task_id,
-        phase=_public_phase(experiment.status),
+        phase=api._public_phase(experiment.status),
         status=experiment.status,
         created_at=experiment.created_at,
         ended_at=experiment.ended_at,
-        failure_reason=_failure_reason(experiment),
+        failure_reason=api._failure_reason(experiment),
         test_exit_code=experiment.test_exit_code,
-        changed_files=_changed_file_names(experiment.git_status),
-        test_summary=_test_summary(experiment),
+        changed_files=api._changed_file_names(experiment.git_status),
+        test_summary=api._test_summary(experiment),
         usage=_public_experiment_usage(experiment),
     )
 
@@ -157,4 +163,4 @@ def get_public_experiment(
         experiment = service.resolve_public_experiment(experiment_id)
     except ExperimentNotFoundError:
         raise HTTPException(status_code=404, detail="experiment not found")
-    return _public_experiment(experiment, _mailbox_task_id(service, experiment.id))
+    return _public_experiment(experiment, api._mailbox_task_id(service, experiment.id))

@@ -2,6 +2,10 @@ from fastapi import APIRouter, Header
 from models import ChatJobResponse, ChatRequest
 
 from api import app
+from fastapi import HTTPException
+from modules.nexus_chat_jobs import STATUS_FAILED
+from modules.nexus_chat_jobs import STATUS_SUCCEEDED
+import api
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -11,8 +15,8 @@ def chat(
     request: ChatRequest,
     x_api_key: str | None = Header(default=None),
 ) -> ChatJobResponse:
-    authorize(x_api_key)
-    service = _resolve_nexus_chat_job_service()
+    api.authorize(x_api_key)
+    service = api._resolve_nexus_chat_job_service()
     try:
         job = service.submit(request.message, session_id=request.session_id)
     except ValueError as exc:
@@ -25,8 +29,8 @@ def get_chat_job(
     job_id: str,
     x_api_key: str | None = Header(default=None),
 ) -> ChatJobResponse:
-    authorize(x_api_key)
-    service = _resolve_nexus_chat_job_service()
+    api.authorize(x_api_key)
+    service = api._resolve_nexus_chat_job_service()
     job = service.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="chat job not found")

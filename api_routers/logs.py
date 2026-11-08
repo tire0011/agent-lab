@@ -11,6 +11,12 @@ from modules.experiment_service import ExperimentService
 from modules.log_reader import LogReader
 
 from api import LIMIT_MIN, app, get_experiment_service, get_log_reader
+from fastapi import HTTPException
+from modules import central_logging as central_logging_module
+from modules import log_trace as log_trace_module
+from modules.experiment_service import ExperimentNotFoundError
+from modules.redaction import sanitized_reason as _sanitized_reason
+import api
 
 router = APIRouter(dependency_overrides_provider=app)
 public_router = APIRouter(dependency_overrides_provider=app)
@@ -73,7 +79,7 @@ def get_experiment_logs(
     approval through research, implementation, verification, cleanup - from the
     durable JSONL log, merged with its mailbox task's pre-experiment entries.
     """
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         experiment = service.resolve_experiment(experiment_id)
     except ExperimentNotFoundError:
@@ -82,7 +88,7 @@ def get_experiment_logs(
     if level is not None and level.upper() not in _LOG_LEVELS:
         raise HTTPException(status_code=400, detail="invalid level filter")
 
-    mailbox_task_id = _mailbox_task_id(service, experiment.id)
+    mailbox_task_id = api._mailbox_task_id(service, experiment.id)
     try:
         # Fetch one extra entry to detect whether an older page remains.
         raw_entries = central_logging_module.read_experiment_logs(
@@ -91,7 +97,7 @@ def get_experiment_logs(
             limit=limit + 1, before=cursor,
         )
     except OSError as exc:
-        _logger.error("experiment log read failed: %s", _sanitized_reason(str(exc)))
+        api._logger.error("experiment log read failed: %s", _sanitized_reason(str(exc)))
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
@@ -154,7 +160,7 @@ async def get_unified_logs(
     if resolved_experiment_id and not resolved_mailbox_task_id:
         # Correlate the experiment with its mailbox task log automatically, same as the
         # single-experiment endpoint.
-        resolved_mailbox_task_id = _mailbox_task_id(service, resolved_experiment_id)
+        resolved_mailbox_task_id = api._mailbox_task_id(service, resolved_experiment_id)
 
     try:
         # Fetch one extra entry to detect an older page; still a correct upper bound after
@@ -173,7 +179,7 @@ async def get_unified_logs(
             before=cursor,
         )
     except OSError as exc:
-        _logger.error("unified log read failed: %s", _sanitized_reason(str(exc)))
+        api._logger.error("unified log read failed: %s", _sanitized_reason(str(exc)))
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries = scan.entries
@@ -259,7 +265,7 @@ def get_log_trace(
             service.experiment_log_dir, reference, limit=limit,
         )
     except OSError as exc:
-        _logger.error("log trace read failed: %s", _sanitized_reason(str(exc)))
+        api._logger.error("log trace read failed: %s", _sanitized_reason(str(exc)))
         raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
 
     raw_entries = _apply_log_source(trace.entries)

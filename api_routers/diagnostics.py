@@ -33,6 +33,14 @@ from api import (
     get_nexus_diagnostics,
     get_nexus_task_store,
 )
+from datetime import datetime
+from datetime import timezone
+from fastapi import HTTPException
+from modules import redaction
+from modules.run_store import calculate_estimated_cost
+from modules.run_store import get_applicable_price
+import api
+import os
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -131,8 +139,8 @@ def _diagnostic_experiment(service: ExperimentService, experiment) -> PublicDiag
     usage = _aggregate_usage(experiment)
     return PublicDiagnosticExperiment(
         id=experiment.id,
-        mailbox_task_id=_mailbox_task_id(service, experiment.id),
-        phase=_public_phase(experiment.status),
+        mailbox_task_id=api._mailbox_task_id(service, experiment.id),
+        phase=api._public_phase(experiment.status),
         status=experiment.status,
         created_at=experiment.created_at,
         ended_at=experiment.ended_at,
@@ -141,8 +149,8 @@ def _diagnostic_experiment(service: ExperimentService, experiment) -> PublicDiag
         policy_rule=experiment.policy_rule,
         test_command=redaction.test_command_name(experiment.test_command),
         test_exit_code=experiment.test_exit_code,
-        failure_summary=_failure_reason(experiment),
-        changed_files=_changed_file_names(experiment.git_status),
+        failure_summary=api._failure_reason(experiment),
+        changed_files=api._changed_file_names(experiment.git_status),
         diagnostic_messages=diagnostic_messages[:20],
         usage=usage,
         estimated_cost=_estimated_cost(usage),
@@ -178,18 +186,18 @@ def get_public_diagnostics(
     except Exception:
         mailbox_status = PublicDiagnosticMailboxStatus(status="unavailable", pending_count=0, latest_tasks=[])
 
-    checkout_revision = _read_git_revision()
+    checkout_revision = api._read_git_revision()
     return PublicDiagnosticsResponse(
         service=PublicDiagnosticServiceStatus(
             status="ok",
-            git_revision=_STARTUP_REVISION,
+            git_revision=api._STARTUP_REVISION,
             checkout_revision=checkout_revision,
-            stale=_revisions_differ(_STARTUP_REVISION, checkout_revision),
-            deployment_time=_deployment_time(),
+            stale=api._revisions_differ(api._STARTUP_REVISION, checkout_revision),
+            deployment_time=api._deployment_time(),
         ),
         mailbox=mailbox_status,
         experiments=diagnostic_experiments,
-        problems=list_problems(),
+        problems=api.list_problems(),
     )
 
 
@@ -214,9 +222,9 @@ def get_nexus_liveness(
     suspect session without changing its state. ``stale_after_seconds`` is clamped
     to the reaper's safe floor, so no query can make live work look dead (#162).
     """
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     snapshot = store.liveness(
-        stale_after_seconds if stale_after_seconds else _STALE_HEARTBEAT_SECONDS
+        stale_after_seconds if stale_after_seconds else api._STALE_HEARTBEAT_SECONDS
     )
     return NexusLivenessResponse(
         **{**snapshot, "claims": [NexusSessionClaim(**c) for c in snapshot["claims"]]}
@@ -255,7 +263,7 @@ async def get_diagnostic_service_logs(
     anything unrecognized is validated as a unit name before use, so no caller can
     smuggle a shell fragment through this route.
     """
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     diagnostics.log_reader = log_reader
     try:
         result = await diagnostics.service_logs(
@@ -284,7 +292,7 @@ def get_diagnostic_last_failure(
     Stalled counts: a process that died mid-run never wrote a ``failed`` row, so
     searching explicit failures alone would miss exactly this case (#186/#187).
     """
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         return _diagnostic_report_response(diagnostics.last_failure(lines=lines, scan=scan))
     except nexus_diagnostics_module.DiagnosticsError as exc:
@@ -302,7 +310,7 @@ def get_diagnostic_llm_job(
 
     Plain ``key: value`` lines, the same the ``nexus_llm_job`` operation returns.
     """
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         job = diagnostics.llm_job(job_id)
     except nexus_diagnostics_module.DiagnosticsError as exc:
@@ -322,7 +330,7 @@ def get_diagnostic_status(
     issue or PR number (``188``, ``#188``, ``PR #195``), inbox filename, or a
     unique prefix of any id.
     """
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         return _diagnostic_report_response(diagnostics.status_report(reference))
     except nexus_diagnostics_module.DiagnosticsError as exc:
@@ -344,7 +352,7 @@ def get_diagnostic_logs(
     ``/diagnostics/logs/last-failure`` routes on purpose: a ``:path`` parameter
     would otherwise swallow both.
     """
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         return _diagnostic_report_response(diagnostics.diagnose(reference, lines=lines))
     except nexus_diagnostics_module.DiagnosticsError as exc:
@@ -359,7 +367,7 @@ def list_failure_analyses(
     subject_id: str | None = Query(default=None),
     service: FailureAnalysisService = Depends(get_failure_analysis_service),
 ) -> FailureAnalysesResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     entries = service.list_recent(limit=limit, subject_type=subject_type, subject_id=subject_id)
     return FailureAnalysesResponse(count=len(entries), analyses=entries)
 
@@ -370,7 +378,7 @@ def get_failure_analysis(
     x_api_key: str | None = Header(default=None),
     service: FailureAnalysisService = Depends(get_failure_analysis_service),
 ) -> FailureAnalysisEntry:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     entry = service.get(analysis_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="failure analysis not found")
@@ -383,7 +391,7 @@ def trigger_failure_analysis(
     x_api_key: str | None = Header(default=None),
     service: FailureAnalysisService = Depends(get_failure_analysis_service),
 ) -> FailureAnalysisEntry:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     if not request.experiment_id and not request.mailbox_task_id:
         raise HTTPException(
             status_code=400, detail="experiment_id or mailbox_task_id is required"

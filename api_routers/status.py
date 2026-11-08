@@ -4,6 +4,9 @@ from fastapi import APIRouter, Query
 from models import ProblemsResponse, StatusResponse
 
 from api import app
+from models import Problem
+import api
+import chat as chat_module
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -18,5 +21,5 @@ def problems(
     limit: int = Query(default=20, ge=1, le=200),
     since: datetime | None = Query(default=None),
 ) -> ProblemsResponse:
-    found: list[Problem] = list_problems(limit=limit, since=since)
+    found: list[Problem] = api.list_problems(limit=limit, since=since)
     return ProblemsResponse(count=len(found), problems=found)

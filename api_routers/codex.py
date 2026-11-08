@@ -8,6 +8,10 @@ from models import (
 from modules.codex_task_service import CodexTaskService
 
 from api import LIMIT_MIN, app, get_codex_service
+from fastapi import HTTPException
+from modules.codex_task_service import TaskNotFoundError
+from modules.codex_task_service import TaskNotRunnableError
+import api
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -31,7 +35,7 @@ def create_codex_task(
     x_api_key: str | None = Header(default=None),
     service: CodexTaskService = Depends(get_codex_service),
 ) -> CodexTaskResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
 
     prompt = request.prompt.strip()
     if not prompt:
@@ -64,7 +68,7 @@ def list_codex_tasks(
     limit: int = Query(default=CODEX_LIST_DEFAULT_LIMIT, ge=LIMIT_MIN, le=CODEX_LIST_MAX_LIMIT),
     service: CodexTaskService = Depends(get_codex_service),
 ) -> CodexTaskListResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
 
     tasks = service.list_tasks(limit=limit)
     return CodexTaskListResponse(
@@ -85,7 +89,7 @@ def get_codex_task(
     x_api_key: str | None = Header(default=None),
     service: CodexTaskService = Depends(get_codex_service),
 ) -> CodexTaskResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
 
     try:
         task = service.get_task(task_id)
@@ -100,7 +104,7 @@ def run_codex_task(
     x_api_key: str | None = Header(default=None),
     service: CodexTaskService = Depends(get_codex_service),
 ) -> CodexTaskResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
 
     try:
         task = service.run_task(task_id)

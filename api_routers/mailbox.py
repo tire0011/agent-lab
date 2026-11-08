@@ -12,6 +12,18 @@ from modules.experiment_service import ExperimentService
 from modules.mailbox.task_service import MailboxTaskService
 
 from api import LIMIT_MIN, app, get_experiment_service, get_mailbox_task_service
+from fastapi import HTTPException
+from modules import mailbox as mailbox_module
+from modules import redaction
+from modules.mailbox.github_webhook import expected_repository
+from modules.mailbox.github_webhook import has_inbox_changes
+from modules.mailbox.github_webhook import is_ping_event
+from modules.mailbox.github_webhook import repository_matches
+from modules.mailbox.github_webhook import verify_signature
+from modules.mailbox.task_service import ApprovalNotFoundError
+import api
+import json
+import os
 
 router = APIRouter(dependency_overrides_provider=app)
 
@@ -32,7 +44,7 @@ def list_mailbox_tasks(
     limit: int = Query(default=MAILBOX_TASKS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=MAILBOX_TASKS_MAX_LIMIT),
     service: MailboxTaskService = Depends(get_mailbox_task_service),
 ) -> MailboxTaskApprovalsResponse:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     tasks = service.list_recent(limit=limit)
     return MailboxTaskApprovalsResponse(
         count=len(tasks),
@@ -46,7 +58,7 @@ def get_mailbox_task(
     x_api_key: str | None = Header(default=None),
     service: MailboxTaskService = Depends(get_mailbox_task_service),
 ) -> MailboxTaskApproval:
-    authorize(x_api_key)
+    api.authorize(x_api_key)
     try:
         approval = service.get(approval_id)
     except ApprovalNotFoundError:
@@ -60,9 +72,9 @@ async def mailbox_github_webhook(
     x_hub_signature_256: str | None = Header(default=None),
     x_github_event: str | None = Header(default=None),
 ) -> JSONResponse:
-    secret = os.environ.get(GITHUB_WEBHOOK_SECRET_ENV)
+    secret = os.environ.get(api.GITHUB_WEBHOOK_SECRET_ENV)
     if not secret:
-        _logger.error("mailbox_webhook failed reason=missing_secret")
+        api._logger.error("mailbox_webhook failed reason=missing_secret")
         raise HTTPException(status_code=503, detail="webhook not configured")
 
     raw_body = await request.body()
@@ -71,33 +83,33 @@ async def mailbox_github_webhook(
         raw_body=raw_body,
         signature_header=x_hub_signature_256,
     ):
-        _logger.warning("mailbox_webhook rejected reason=invalid_signature")
+        api._logger.warning("mailbox_webhook rejected reason=invalid_signature")
         raise HTTPException(status_code=401, detail="invalid signature")
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        _logger.warning("mailbox_webhook rejected reason=invalid_json")
+        api._logger.warning("mailbox_webhook rejected reason=invalid_json")
         raise HTTPException(status_code=400, detail="invalid json")
 
     if is_ping_event(x_github_event):
-        _logger.info("mailbox_webhook ignored reason=ping")
+        api._logger.info("mailbox_webhook ignored reason=ping")
         return JSONResponse(status_code=200, content={"status": "pong"})
 
     if (x_github_event or "").strip().lower() != "push":
-        _logger.info("mailbox_webhook ignored reason=event")
+        api._logger.info("mailbox_webhook ignored reason=event")
         return JSONResponse(status_code=200, content={"status": "ignored"})
 
     if not isinstance(payload, dict) or not has_inbox_changes(payload):
-        _logger.info("mailbox_webhook ignored reason=no_inbox_changes")
+        api._logger.info("mailbox_webhook ignored reason=no_inbox_changes")
         return JSONResponse(status_code=200, content={"status": "ignored"})
 
     if not repository_matches(payload, expected_repository()):
-        _logger.warning("mailbox_webhook ignored reason=unexpected_repository")
+        api._logger.warning("mailbox_webhook ignored reason=unexpected_repository")
         return JSONResponse(status_code=202, content={"status": "ignored"})
 
-    _start_mailbox_webhook_poll()
-    _logger.info("mailbox_webhook accepted reason=inbox_change")
+    api._start_mailbox_webhook_poll()
+    api._logger.info("mailbox_webhook accepted reason=inbox_change")
     return JSONResponse(status_code=202, content={"status": "accepted"})
 
 
@@ -164,7 +176,7 @@ def _inbox_entries(service: ExperimentService, limit: int) -> list[MailboxMessag
 
 
 def _outbox_entries(limit: int) -> list[MailboxMessageEntry]:
-    files = mailbox_module.list_outbox_files(_OUTBOX_DIR, limit=limit)
+    files = mailbox_module.list_outbox_files(api._OUTBOX_DIR, limit=limit)
     entries = []
     for item in files:
         meta = item.get("meta") or {}
