@@ -229,7 +229,26 @@ signature stay the same.
 - Table: `mailbox_task_approvals` in SQLite (name kept from the removed approval step, #264)
 - State machine: `queued → submitted → running → succeeded / failed / needs_review`
 - No approval step: a queued task is handed to the local Nexus controller, which chooses the action
-- For `new_experiment`, `ExperimentService.create_experiment` + `run_experiment` run in a daemon thread
+- `new_experiment` is a tool Nexus executes itself (`modules/nexus_experiment_tool.py`, #263):
+  GitHub work tracking, `create_experiment` with the goal plus Nexus' handover (briefing,
+  delegate findings, earlier attempts), the session parked as `waiting_for_experiment`
+  (no claim, no local-model use), `run_experiment` in a daemon thread, then the same
+  session resumes with a `new_experiment` observation (status, PR number, failure reason).
+  The mailbox, `NexusControllerService` and the chat only configure the tool (thread
+  starter, linking the experiment to their record, continuation) and report its
+  `ExperimentLaunch`; none of them creates experiments.
+- Failure-safe launch: once created, an experiment Nexus cannot bind, link, park on or
+  start is moved to `failed` with a reason (`fail_unfinished_experiment`), so it never
+  stays active and blocks the issue. A crashing runner fails the experiment before the
+  session resumes.
+- Durable resume: the waiting session is a task-store row. `experiment_wait.
+  resume_finished_experiments` finds sessions whose experiment ended unnoticed (restart,
+  failed callback); each owner resumes only its own source types - the mailbox worker
+  `task`, and the API's `ExperimentResumeWorker` (startup + every 30 s) `chat` and the
+  controller's issue/idea/discussion sessions.
+- Every repository code change, small ones included, goes through `new_experiment`;
+  `command` refuses Git commits, branch creation, patches and merges in the live checkout
+  and stays available for machine work and reading.
 - `MailboxTaskWorker` daemon polls every 10 s (`submit_queued` + `poll_running`)
 - Legacy `pending_approval`/`rejected` rows stay readable and are never run; `approved` rows were migrated to `queued`
 - Terminal states write outbox files; `failed`/`needs_review` also write a problem JSON to `state/runs/`

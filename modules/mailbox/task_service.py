@@ -23,9 +23,16 @@ from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
-from modules.experiment_handover import with_handover
-from modules.experiment_service import ExperimentAlreadyActiveError
-from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
+from modules.experiment_wait import (
+    MAILBOX_SOURCE_TYPES,
+    resume_finished_experiments,
+    resume_with_new_orchestrator,
+)
+from modules.nexus_experiment_tool import (
+    LAUNCH_ALREADY_ACTIVE,
+    LAUNCH_NOT_LINKED,
+    NexusExperimentTool,
+)
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
@@ -448,6 +455,8 @@ class MailboxTaskService:
                 operations_registry=self.operations_registry,
                 experiment_service=self.experiment_service,
             )
+            # Nexus runs new_experiment itself; the mailbox only says how (#263).
+            orchestrator.experiment_tool = self._experiment_tool(approval.id)
             decision: TaskDecision = orchestrator.run(
                 current_input,
                 source_type="task",
@@ -492,12 +501,12 @@ class MailboxTaskService:
             ACTION_CLARIFICATION,
             ACTION_COMMAND,
             ACTION_MISSING_CAPABILITY,
-            ACTION_NEW_EXPERIMENT,
             ACTION_RESUME_EXPERIMENT,
         )
 
-        if decision.action == ACTION_NEW_EXPERIMENT:
-            self._start_new_experiment(approval, decision)
+        launch = getattr(decision, "experiment_launch", None)
+        if launch is not None:
+            self._report_launch(approval, launch)
         elif decision.action == ACTION_RESUME_EXPERIMENT:
             self._resume_existing_experiment(approval, decision)
         elif decision.action == ACTION_COMMAND:
@@ -526,115 +535,67 @@ class MailboxTaskService:
                 error=decision.reason,
             )
 
-    def _start_new_experiment(
-        self, approval: MailboxTaskApproval, decision: TaskDecision | None = None
-    ) -> dict[str, str] | None:
-        # Re-read task_body so clarification follow-ups accumulated by
-        # continue_discussion are included in the implementation goal.
-        current_approval = self.get(approval.id)
-        task_log = self._task_logger(approval.id)
-        task_log.info("queued", "github_work_tracking_started", "starting GitHub work tracking")
-        try:
-            work_ref = self.github_work_tracking.ensure_for_source(
-                SimpleNamespace(
-                    source_type="task",
-                    source_id=approval.id,
-                    title=f"Mailbox task {approval.id[:8]}",
-                    content=current_approval.task_body,
-                )
-            )
-        except GitHubWorkTrackingError as exc:
-            task_log.error(
-                "queued", "github_work_tracking_failed",
-                "GitHub lifecycle blocked before implementation start", exc=exc,
-            )
-            self._complete_without_experiment(
-                approval,
-                _STATUS_NEEDS_REVIEW,
-                f"GitHub lifecycle blocked before implementation start: {exc}",
-                error=str(exc),
-            )
-            return
-        # Issue #184: make the chosen Issue visible at the moment it is
-        # chosen, so "did Nexus reuse #180 or open a duplicate?" is an
-        # answerable question rather than an inference from GitHub state.
-        task_log.info(
-            "queued", "github_work_tracking_linked",
-            f"work tracked on GitHub issue #{work_ref.issue_number}",
-            issue_number=work_ref.issue_number,
-            branch_name=work_ref.branch_name,
+    def _experiment_tool(self, approval_id: str) -> NexusExperimentTool:
+        """Nexus' new_experiment tool, configured for one mailbox task (#263)."""
+        task_log = self._task_logger(approval_id)
+
+        def log_event(kind: str, message: str, fields: dict[str, Any]) -> None:
+            if kind == "github_work_tracking_failed":
+                task_log.error("queued", kind, message, **fields)
+            else:
+                task_log.info("queued", kind, message, **fields)
+
+        return NexusExperimentTool(
+            self.experiment_service,
+            self.github_work_tracking,
+            background=self._start_thread,
+            on_created=lambda experiment, _decision: self._link_experiment(
+                approval_id, experiment.id
+            ),
+            on_finished=self._after_experiment,
+            on_event=log_event,
+            # The task text exactly as it arrived; the handover is appended.
+            goal_for=lambda _store, _session, fallback: (
+                self.get(approval_id).task_body or fallback
+            ),
+            max_experiments=_MAX_EXPERIMENTS_PER_TASK,
         )
+
+    def _link_experiment(self, approval_id: str, experiment_id: str) -> bool:
+        """Record Nexus' new experiment on its task before the experiment runs.
+
+        Only a task still waiting for Nexus - queued, or deciding after a failed
+        experiment - takes it; anything else lost a race and the experiment is
+        not started.
+        """
         with self._lock:
-            current = self._conn.execute(
-                "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
-            ).fetchone()
-            if current is None or current["status"] != _STATUS_QUEUED:
-                return
-            # What Nexus already learned travels with the task (#263).
-            try:
-                experiment = self.experiment_service.create_experiment(
-                    with_handover(
-                        current_approval.task_body,
-                        decision.experiment_handover if decision is not None else None,
-                    ),
-                    complexity=decision.complexity if decision is not None else None,
-                    source_type="task",
-                    source_id=approval.id,
-                )
-            except ExperimentAlreadyActiveError as exc:
-                task_log.info(
-                    "queued", "already_active",
-                    "mailbox task matched an active experiment",
-                    experiment_id=exc.experiment_id,
-                    experiment_status=exc.status,
-                )
-                self._complete_without_experiment(
-                    approval,
-                    _STATUS_NEEDS_REVIEW,
-                    (
-                        "already_active: an experiment for this GitHub issue is "
-                        f"already active (experiment_id={exc.experiment_id}, "
-                        f"status={exc.status})"
-                    ),
-                )
-                return {
-                    "status": "already_active",
-                    "experiment_id": exc.experiment_id,
-                    "experiment_status": exc.status,
-                }
-            work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
-                   WHERE id=? AND status=?""",
-                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_QUEUED),
+                   WHERE id=? AND status IN (?, ?)""",
+                (_STATUS_SUBMITTED, experiment_id, _now_iso(), approval_id,
+                 _STATUS_QUEUED, _STATUS_NEXUS_DECIDING),
             ).rowcount
             self._conn.commit()
         if not updated:
-            logger.warning("mailbox_task: lost race after creating experiment %s", experiment.id)
+            logger.warning("mailbox_task: lost race after creating experiment %s", experiment_id)
+        return bool(updated)
+
+    def _report_launch(self, approval: MailboxTaskApproval, launch: Any) -> None:
+        """Close a task whose experiment Nexus could not start; a started one runs."""
+        if launch.started or launch.status == LAUNCH_NOT_LINKED:
             return
-        # Correlating event: this is the moment the pre-experiment task
-        # log and the experiment's own log become joinable, so the
-        # unified feed can follow one task from mailbox intake through to
-        # this new experiment id.
-        task_log.info(
-            "queued", "experiment_created", "experiment created for mailbox task",
-            experiment_id=experiment.id,
-        )
-        # Nexus pauses on the experiment and continues the moment it ends (#263).
-        if decision is not None and decision.session_id:
-            self._with_task_store(
-                lambda store: store.wait_for_experiment(decision.session_id, experiment.id)
+        if launch.status == LAUNCH_ALREADY_ACTIVE:
+            self._complete_without_experiment(
+                approval,
+                _STATUS_NEEDS_REVIEW,
+                f"already_active: {launch.reason}",
             )
-        self._start_thread(
-            experiment.id,
-            lambda: run_then_resume(
-                lambda: self.experiment_service.run_experiment(
-                    experiment.id,
-                    github_work_tracking=self.github_work_tracking,
-                ),
-                lambda: self._after_experiment(experiment.id),
-                experiment.id,
-            ),
+            return
+        self._complete_without_experiment(
+            approval,
+            _STATUS_NEEDS_REVIEW,
+            launch.reason or f"Nexus could not start an experiment: {launch.status}",
+            error=launch.reason,
         )
 
     def _with_task_store(self, action: Any) -> Any:
@@ -660,20 +621,16 @@ class MailboxTaskService:
         """
         if self.experiment_service is None:
             return
-        waiting = self._with_task_store(lambda store: store.sessions_waiting_for_experiments())
-        for session in waiting:
-            experiment_id = session.waiting_experiment_id
-            if not experiment_id:
-                continue
-            try:
-                experiment = self.experiment_service.get_experiment(experiment_id)
-                if experiment.status not in _EXP_TERMINAL:
-                    continue
-                self._after_experiment(experiment_id)
-            except Exception:
-                logger.exception(
-                    "mailbox_task: resume after experiment %s failed", experiment_id
-                )
+        # Only the mailbox's own sessions: chat and controller sessions resume
+        # through their own services (``experiment_wait``).
+        self._with_task_store(
+            lambda store: resume_finished_experiments(
+                store,
+                self.experiment_service,
+                self._after_experiment,
+                source_types=MAILBOX_SOURCE_TYPES,
+            )
+        )
 
     def _after_experiment(self, experiment_id: str) -> None:
         """Continue the Nexus session, then carry out what it decided (#263 step 4).
@@ -687,11 +644,19 @@ class MailboxTaskService:
         experiment = self.experiment_service.get_experiment(experiment_id)
         claimed = experiment.status in _EXP_FAILED_TERMINAL and self._claim_decision(experiment_id)
         try:
+            approval = self._approval_for_experiment(experiment_id)
             decisions = resume_with_new_orchestrator(
                 self._orchestrator_factory,
                 self.experiment_service,
                 self.github_work_tracking,
                 experiment_id,
+                # Only a task waiting on Nexus' decision may get another
+                # experiment; after a success the ordinary path finishes it.
+                experiment_tool=(
+                    self._experiment_tool(approval.id)
+                    if claimed and approval is not None
+                    else None
+                ),
                 operations_registry=self.operations_registry,
             )
         except BaseException:
@@ -704,8 +669,12 @@ class MailboxTaskService:
             # Nobody resumed the session here; the ordinary path takes over.
             self._release_decision(experiment_id)
             return
+        if approval is None:
+            return
+        # Re-read by task id: a retry Nexus started already points the task at
+        # its new experiment.
         self._continue_after_failed_experiment(
-            self._approval_for_experiment(experiment_id), experiment, decisions[0]
+            self.get(approval.id), experiment, decisions[0]
         )
 
     def _claim_decision(self, experiment_id: str) -> bool:
@@ -757,49 +726,33 @@ class MailboxTaskService:
         experiment: Any,
         decision: TaskDecision,
     ) -> None:
+        """Carry out Nexus' decision after a failed experiment.
+
+        A retry is Nexus' own ``new_experiment``: its tool already linked and
+        started the next experiment, bounded by the per-task limit. Anything
+        else ends the task with Nexus' own words.
+        """
         from modules.task_orchestrator import (
             ACTION_ANSWER,
             ACTION_CLARIFICATION,
             ACTION_MISSING_CAPABILITY,
-            ACTION_NEW_EXPERIMENT,
         )
 
+        launch = getattr(decision, "experiment_launch", None)
+        if launch is not None and launch.started:
+            self._task_logger(approval.id).info(
+                "queued", "experiment_retry",
+                "Nexus started another experiment after a failed one",
+                previous_experiment_id=experiment.id,
+                experiment_id=launch.experiment_id,
+            )
+            return
         status = (
             _STATUS_NEEDS_REVIEW if experiment.status == "needs_review" else _STATUS_FAILED
         )
-        attempts = len(
-            self._with_task_store(
-                lambda store: store.recent_events(
-                    decision.session_id or "",
-                    role="tool",
-                    kind=ACTION_NEW_EXPERIMENT,
-                    limit=_MAX_EXPERIMENTS_PER_TASK + 1,
-                )
-            )
-        )
-        if decision.action == ACTION_NEW_EXPERIMENT and attempts < _MAX_EXPERIMENTS_PER_TASK:
-            self._task_logger(approval.id).info(
-                "queued", "experiment_retry",
-                f"Nexus starts experiment {attempts + 1} of {_MAX_EXPERIMENTS_PER_TASK} "
-                "after a failed one",
-                previous_experiment_id=experiment.id,
-            )
-            with self._lock:
-                updated = self._conn.execute(
-                    """UPDATE mailbox_task_approvals SET status=?, updated_at=?
-                       WHERE id=? AND status=?""",
-                    (_STATUS_QUEUED, _now_iso(), approval.id, _STATUS_NEXUS_DECIDING),
-                ).rowcount
-                self._conn.commit()
-            if updated:
-                self._start_new_experiment(self.get(approval.id), decision)
-            return
         note = None
-        if decision.action == ACTION_NEW_EXPERIMENT:
-            note = (
-                f"Nexus wanted another experiment; the limit of "
-                f"{_MAX_EXPERIMENTS_PER_TASK} experiments per task is reached."
-            )
+        if launch is not None:
+            note = launch.reason or launch.status
         elif decision.action in (ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY):
             note = decision.message or decision.reason or None
         self._transition_terminal(approval, status, experiment, nexus_note=note)

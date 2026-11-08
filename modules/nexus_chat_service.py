@@ -4,15 +4,19 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Callable
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
-from modules.experiment_handover import with_handover
-from modules.experiment_service import ExperimentAlreadyActiveError
-from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
+from modules.experiment_wait import (
+    CHAT_SOURCE_TYPES,
+    resume_finished_experiments,
+    resume_with_new_orchestrator,
+)
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
+from modules.nexus_experiment_tool import LAUNCH_ALREADY_ACTIVE, NexusExperimentTool
+from modules.nexus_task_store import NexusTaskStore
+from modules.run_store import DEFAULT_DB_PATH
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
@@ -22,7 +26,6 @@ from modules.task_orchestrator import (
     ACTION_RESUME_EXPERIMENT,
     TOOL_PYTHON_RUN,
     NexusTaskOrchestrator,
-    TaskDecision,
     TaskOrchestratorError,
 )
 
@@ -102,14 +105,26 @@ class _ChatOrchestrator(NexusTaskOrchestrator):
         compact.reverse()
         return compact
 
-    def _prompt(self, session: Any, current_input: str, history: list[dict[str, Any]], observations: list[dict[str, Any]]) -> str:
+    def _prompt(
+        self,
+        session: Any,
+        current_input: str,
+        history: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        *,
+        capabilities_json: str | None = None,  # noqa: ARG002 - the chat renders its own compact list
+    ) -> str:
         import json
         final_actions = [ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
         policy = "Discussion only: use read-only tools when needed; do not mutate."
         tool_names = ["operation", "memory_search", "delegate"]
         if self.allow_mutation:
             final_actions = [ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, ACTION_ANSWER, ACTION_CLARIFICATION, ACTION_MISSING_CAPABILITY]
-            policy = "Execution explicitly requested: mutating command/experiment actions are allowed when useful."
+            policy = (
+                "Execution explicitly requested: every repository code change, including "
+                "a small edit, must use new_experiment. command and python_run are only for "
+                "reading or machine work and must not change the live repository."
+            )
             tool_names = [*tool_names, ACTION_COMMAND, TOOL_PYTHON_RUN]
         return "\n".join([
             "You are Nexus, the persistent local chat controller. Be concise and solve the current turn with the cheapest capable path.",
@@ -180,6 +195,9 @@ class NexusChatService:
             experiment_service=self.experiment_service,
             allow_mutation=allow_mutation,
         )
+        if allow_mutation:
+            # Nexus runs new_experiment itself; the chat only says how (#263).
+            orchestrator.experiment_tool = self._experiment_tool()
         try:
             if session_id:
                 if task_log is None:
@@ -211,58 +229,24 @@ class NexusChatService:
                     status="discussion",
                 )
 
-            if decision.action == ACTION_NEW_EXPERIMENT:
-                goal = self._implementation_goal(orchestrator, decision, text)
-                # What Nexus already learned travels with the conversation (#263).
-                goal = with_handover(goal, decision.experiment_handover)
-                work_ref = self.github_work_tracking.ensure_for_source(
-                    SimpleNamespace(
-                        source_type="chat",
-                        source_id=decision.session_id,
-                        title="Nexus chat",
-                        content=goal,
+            launch = getattr(decision, "experiment_launch", None)
+            if launch is not None:
+                # Nexus already ran its new_experiment tool; report what it did.
+                if launch.started:
+                    reply = decision.message or "Ich habe die vereinbarte Änderung als Experiment gestartet."
+                elif launch.status == LAUNCH_ALREADY_ACTIVE:
+                    reply = (
+                        "Für dieses GitHub-Issue läuft bereits ein Experiment "
+                        f"({launch.experiment_id}, Status: {launch.experiment_status})."
                     )
-                )
-                try:
-                    experiment = self.experiment_service.create_experiment(goal)
-                except ExperimentAlreadyActiveError as exc:
-                    return NexusChatResult(
-                        reply=(
-                            "Für dieses GitHub-Issue läuft bereits ein Experiment "
-                            f"({exc.experiment_id}, Status: {exc.status})."
-                        ),
-                        session_id=decision.session_id,
-                        action=decision.action,
-                        experiment_id=exc.experiment_id,
-                        status="already_active",
-                    )
-                self.github_work_tracking.bind_experiment(work_ref, experiment.id)
-                # Nexus pauses on the experiment and continues the moment it ends (#263).
-                orchestrator.task_store.wait_for_experiment(decision.session_id, experiment.id)
-                self.background_starter(
-                    experiment.id,
-                    lambda: run_then_resume(
-                        lambda: self.experiment_service.run_experiment(
-                            experiment.id,
-                            github_work_tracking=self.github_work_tracking,
-                        ),
-                        lambda: resume_with_new_orchestrator(
-                            self.orchestrator_factory,
-                            self.experiment_service,
-                            self.github_work_tracking,
-                            experiment.id,
-                            operations_registry=self.operations_registry,
-                            allow_mutation=False,
-                        ),
-                        experiment.id,
-                    ),
-                )
+                else:
+                    reply = f"Das Experiment wurde nicht gestartet: {launch.reason or launch.status}"
                 return NexusChatResult(
-                    reply=decision.message or "Ich habe die vereinbarte Änderung als Experiment gestartet.",
+                    reply=reply,
                     session_id=decision.session_id,
                     action=decision.action,
-                    experiment_id=experiment.id,
-                    status="submitted",
+                    experiment_id=launch.experiment_id,
+                    status=launch.status,
                 )
 
             if decision.action == ACTION_RESUME_EXPERIMENT:
@@ -298,8 +282,51 @@ class NexusChatService:
             if close:
                 close()
 
-    def _implementation_goal(self, orchestrator: NexusTaskOrchestrator, decision: TaskDecision, current_input: str) -> str:
-        history = orchestrator.task_store.history(decision.session_id, limit=18, max_chars=9000)
+    def _experiment_tool(self) -> NexusExperimentTool:
+        return NexusExperimentTool(
+            self.experiment_service,
+            self.github_work_tracking,
+            background=self.background_starter,
+            on_finished=self._resume_after_experiment,
+            goal_for=self._implementation_goal,
+        )
+
+    def _resume_after_experiment(self, experiment_id: str) -> list[Any]:
+        """Continue the chat session parked on *experiment_id* with its result."""
+        return resume_with_new_orchestrator(
+            self.orchestrator_factory,
+            self.experiment_service,
+            self.github_work_tracking,
+            experiment_id,
+            operations_registry=self.operations_registry,
+            allow_mutation=False,
+        )
+
+    def resume_finished_experiments(self, task_store: NexusTaskStore | None = None) -> list[str]:
+        """Durable half of the pause for chat sessions (#263).
+
+        The experiment thread resumes its chat session when it ends; after a
+        restart, or when that callback failed, this finds the parked session
+        in the task store and resumes it. Returns the experiment ids resumed.
+        """
+        store = task_store or NexusTaskStore(
+            db_path=str(getattr(self.operations_registry, "db_path", DEFAULT_DB_PATH))
+        )
+        try:
+            return resume_finished_experiments(
+                store,
+                self.experiment_service,
+                self._resume_after_experiment,
+                source_types=CHAT_SOURCE_TYPES,
+            )
+        finally:
+            if task_store is None:
+                store.close()
+
+    @staticmethod
+    def _implementation_goal(task_store: Any, session: Any, current_input: str) -> str:
+        """The chat's task for an experiment: the agreed change in its conversation."""
+        history = task_store.history(session.id, limit=18, max_chars=9000)
         conversation: list[str] = []
         for event in history:
             role = str(event.get("role", ""))

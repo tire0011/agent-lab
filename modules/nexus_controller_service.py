@@ -6,17 +6,25 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-from modules.experiment_handover import with_handover
-from modules.experiment_service import ExperimentAlreadyActiveError
-from modules.experiment_wait import resume_after_experiment, run_then_resume
+from modules.experiment_wait import (
+    CONTROLLER_EXCLUDED_SOURCE_TYPES,
+    resume_after_experiment,
+    resume_finished_experiments,
+)
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.mailbox.development import process_command
-from modules.nexus_sources import NexusSource, idea_source, issue_source, task_source
+from modules.nexus_experiment_tool import (
+    GOAL_CHAR_CAP,
+    GOAL_TITLE_CAP,
+    GOAL_TRUNCATION_MARKER,
+    NexusExperimentTool,
+    session_goal,
+)
+from modules.nexus_sources import NexusSource, idea_source, issue_source
 from modules.run_store import DEFAULT_DB_PATH
 from modules.task_orchestrator import (
     ACTION_COMMAND,
-    ACTION_NEW_EXPERIMENT,
     ACTION_RESUME_EXPERIMENT,
     NexusTaskOrchestrator,
     TaskDecision,
@@ -26,45 +34,23 @@ from modules.task_orchestrator import (
 # the initiative tick must wait for them before it exits (#358).
 EXPERIMENT_THREAD_PREFIX = "nexus-controller-exp-"
 
-GOAL_CHAR_CAP = 24000
-GOAL_TITLE_CAP = 200
-GOAL_TRUNCATION_MARKER = "\n\n[... earlier text truncated ...]\n\n"
-
-
-def _normalise_input(text: str) -> str:
-    return " ".join(text.split())
-
-
-def _drop_repeated_inputs(inputs: list[str]) -> list[str]:
-    """Drop inputs whose normalised text a later input equals or starts with."""
-    normalised = [_normalise_input(item) for item in inputs]
-    return [
-        item
-        for index, item in enumerate(inputs)
-        if not any(
-            later.startswith(normalised[index]) for later in normalised[index + 1:]
-        )
-    ]
-
-
-def _keep_title_and_tail(goal: str, first_input: str) -> str:
-    """Cut an over-long goal from the front: the newest text is at the end."""
-    title = first_input.splitlines()[0][:GOAL_TITLE_CAP]
-    head = title + GOAL_TRUNCATION_MARKER
-    return head + goal[-(GOAL_CHAR_CAP - len(head)):]
+__all__ = [
+    "EXPERIMENT_THREAD_PREFIX",
+    "GOAL_CHAR_CAP",
+    "GOAL_TITLE_CAP",
+    "GOAL_TRUNCATION_MARKER",
+    "NexusControllerService",
+]
 
 
 class NexusControllerService:
     """Feed heterogeneous work into one persistent local-LLM controller.
 
-    The orchestrator chooses the action; this service executes the selected
-    primitive. Tool calls performed during reasoning still happen inside the
-    orchestrator and always return control to the local model first.
-
-    GitHub work tracking is the mandatory outer lifecycle: a
-    durable Issue and human-readable remote branch are resolved/created before
-    a new implementation experiment starts. The isolated experiment worktree
-    remains an internal execution detail.
+    The orchestrator chooses the action and executes ``new_experiment``
+    itself through its experiment tool (#263): GitHub work tracking, the
+    experiment with the handover, the pause and the resume. This service only
+    configures that tool - experiment threads, continuation after the result -
+    and carries out the remaining primitives (resume, command).
     """
 
     def __init__(
@@ -80,6 +66,13 @@ class NexusControllerService:
             db_path=str(db_path),
             repo_root=str(self.repo_root),
         )
+        if getattr(self.orchestrator, "experiment_tool", None) is None:
+            self.orchestrator.experiment_tool = NexusExperimentTool(
+                self.experiment_service,
+                self.github_work_tracking,
+                background=self._start_experiment_thread,
+                on_finished=self._resume_after_experiment,
+            )
 
     @property
     def experiment_service(self):
@@ -96,7 +89,7 @@ class NexusControllerService:
             source_id=source.source_id,
             title=source.title,
         )
-        execution_result = self._execute(decision, source.content, source=source)
+        execution_result = self._execute(decision)
         return execution_result or decision
 
     def handle_idea(self, idea_id: str) -> TaskDecision | dict[str, str]:
@@ -123,9 +116,7 @@ class NexusControllerService:
 
     def reply(self, session_id: str, message: str) -> TaskDecision | dict[str, str]:
         decision = self.orchestrator.continue_session(session_id, message)
-        execution_result = self._execute(
-            decision, self._execution_goal(session_id, message)
-        )
+        execution_result = self._execute(decision)
         return execution_result or decision
 
     def resume_available_capabilities(self, *, limit: int = 1) -> list[TaskDecision]:
@@ -136,10 +127,7 @@ class NexusControllerService:
             if not decision.session_id:
                 continue
             try:
-                self._execute(
-                    decision,
-                    self._execution_goal(decision.session_id, ""),
-                )
+                self._execute(decision)
             except Exception as exc:
                 self._record_execution(
                     decision,
@@ -161,6 +149,21 @@ class NexusControllerService:
             )
         )
 
+    def resume_finished_experiments(self) -> list[str]:
+        """Durable half of the pause for controller sessions (#263).
+
+        Experiment threads resume their session when they end; a restart or a
+        failed callback loses that moment. This finds the parked issue, idea
+        and discussion sessions in the task store and resumes them. Mailbox
+        and chat sessions are left to their own services.
+        """
+        return resume_finished_experiments(
+            self.orchestrator.task_store,
+            self.experiment_service,
+            self._resume_after_experiment,
+            exclude_source_types=CONTROLLER_EXCLUDED_SOURCE_TYPES,
+        )
+
     def _continue_after_experiment(self, decisions: list[TaskDecision]) -> list[TaskDecision]:
         """Carry out what Nexus decided after seeing its experiment's result."""
         completed: list[TaskDecision] = []
@@ -168,7 +171,7 @@ class NexusControllerService:
             if not decision.session_id:
                 continue
             try:
-                self._execute(decision, self._execution_goal(decision.session_id, ""))
+                self._execute(decision)
             except Exception as exc:
                 self._record_execution(
                     decision,
@@ -181,113 +184,16 @@ class NexusControllerService:
         return completed
 
     def _execution_goal(self, session_id: str, fallback: str) -> str:
-        """Reconstruct the user-visible task across clarification replies.
+        """The user-visible task across clarification replies (see ``session_goal``)."""
+        return session_goal(self.orchestrator.task_store, session_id, fallback)
 
-        Tool observations remain available to the controller through persistent
-        history/memory but are not copied verbatim into an implementation goal.
-        """
-        try:
-            stored_inputs = self.orchestrator.task_store.user_inputs(session_id)
-        except Exception:
-            return fallback
-        user_inputs = [
-            str(content).strip()
-            for content in stored_inputs
-        ]
-        user_inputs = [item for item in user_inputs if item]
-        if not user_inputs:
-            return fallback
-        # #495: a retried issue stores the whole body again, so an input that a
-        # later input repeats (or starts with) adds nothing but tokens.
-        kept = _drop_repeated_inputs(user_inputs)
-        dropped = len(user_inputs) - len(kept)
-        goal = "\n\nUser follow-up:\n".join(kept)
-        if len(goal) <= GOAL_CHAR_CAP:
-            return goal
-        try:
-            self.orchestrator.task_store.append_event(
-                session_id,
-                role="tool",
-                kind="goal_truncated",
-                content=(
-                    f"Execution goal truncated from {len(goal)} to {GOAL_CHAR_CAP} "
-                    f"characters; {dropped} duplicate input(s) dropped."
-                ),
-            )
-        except Exception:
-            pass
-        return _keep_title_and_tail(goal, kept[0])
-
-    def _execute(
-        self,
-        decision: TaskDecision,
-        source_content: str,
-        *,
-        source: NexusSource | None = None,
-    ) -> dict[str, str] | None:
-        if decision.action == ACTION_NEW_EXPERIMENT:
-            lifecycle_source = source or task_source(
-                source_content,
-                source_id=decision.session_id,
-                title="Nexus controller task",
-            )
-            try:
-                work_ref = self.github_work_tracking.ensure_for_source(lifecycle_source)
-            except GitHubWorkTrackingError as exc:
-                self._record_execution(
-                    decision, "github_work_tracking_unavailable", str(exc)
-                )
-                raise
-
-            try:
-                experiment = self.experiment_service.create_experiment(
-                    with_handover(source_content, decision.experiment_handover),
-                    complexity=decision.complexity,
-                    source_type=lifecycle_source.source_type,
-                    source_id=lifecycle_source.source_id,
-                )
-            except ExperimentAlreadyActiveError as exc:
-                self._record_execution(
-                    decision,
-                    "already_active",
-                    f"experiment_id={exc.experiment_id} status={exc.status}",
-                )
-                return {
-                    "status": "already_active",
-                    "experiment_id": exc.experiment_id,
-                    "experiment_status": exc.status,
-                }
-            work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
-            self._record_execution(
-                decision,
-                "github_work_linked",
-                (
-                    f"issue=#{work_ref.issue_number} "
-                    f"branch={work_ref.branch_name} experiment_id={experiment.id}"
-                ),
-            )
-            self._record_execution(
-                decision,
-                "experiment_started",
-                f"experiment_id={experiment.id}",
-            )
-            # Nexus pauses on the experiment and continues the moment it ends (#263).
-            if decision.session_id:
-                self.orchestrator.task_store.wait_for_experiment(
-                    decision.session_id, experiment.id
-                )
-            self._start_experiment_thread(
-                experiment.id,
-                lambda: run_then_resume(
-                    lambda: self.experiment_service.run_experiment(
-                        experiment.id,
-                        github_work_tracking=self.github_work_tracking,
-                    ),
-                    lambda: self._resume_after_experiment(experiment.id),
-                    experiment.id,
-                ),
-            )
-            return
+    def _execute(self, decision: TaskDecision) -> dict[str, str] | None:
+        launch = getattr(decision, "experiment_launch", None)
+        if launch is not None:
+            # Nexus already ran its new_experiment tool; report what it did.
+            kind = "experiment_started" if launch.started else f"experiment_{launch.status}"
+            self._record_execution(decision, kind, str(launch.as_dict()))
+            return None if launch.started else launch.as_dict()
 
         if decision.action == ACTION_RESUME_EXPERIMENT:
             if not decision.experiment_id:

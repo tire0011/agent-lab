@@ -47,6 +47,7 @@ from modules.task_orchestrator_parts.core import (
     TaskOrchestratorError,
     _DECISION_FIELDS,
     _GITHUB_WRITE_COMMAND,
+    _live_checkout_git_write,
     _KNOWLEDGE_LOOKUP_REASON,
     _PROVIDER_FALLBACKS,
 )
@@ -84,6 +85,20 @@ class ExecutionMixin:
             command = str(decision.get("command", "")).strip()
             if not command:
                 raise TaskOrchestratorError("command tool requires command")
+            if _live_checkout_git_write(
+                command, str(getattr(self.operations_registry, "repo_root", "/agent"))
+            ):
+                return {
+                    "tool": ACTION_COMMAND,
+                    "command": command,
+                    "error": "repository_write_refused",
+                    "reason": (
+                        "Git commits, branch creation, patches and merges in the live "
+                        "checkout are not run from the controller. Use new_experiment "
+                        "for every repository code change, small ones included. command "
+                        "stays available for machine work and for reading."
+                    ),
+                }
             if _GITHUB_WRITE_COMMAND.search(command):
                 return {
                     "tool": ACTION_COMMAND,

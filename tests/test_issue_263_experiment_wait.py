@@ -125,9 +125,15 @@ class RunThenResumeTests(unittest.TestCase):
         def run():
             raise RuntimeError("pipeline crashed")
 
-        with self.assertRaises(RuntimeError):
-            run_then_resume(run, resume, "exp-1")
+        order = []
+        resume.side_effect = lambda: order.append("resume")
+        # The crash ends the experiment with a reason first, then the session
+        # resumes; it is recorded, not re-raised into the thread.
+        run_then_resume(run, resume, "exp-1", fail=lambda reason: order.append(reason))
         resume.assert_called_once()
+        self.assertEqual(len(order), 2)
+        self.assertIn("RuntimeError: pipeline crashed", order[0])
+        self.assertEqual(order[1], "resume")
 
     def test_a_failing_resume_is_logged_not_raised(self):
         resume = MagicMock(side_effect=RuntimeError("llm down"))
