@@ -78,27 +78,69 @@ class ParseIssueDraftTests(unittest.TestCase):
 
 
 class TaskIssuePlannerTests(unittest.TestCase):
-    def test_next_provider_is_used_when_the_first_fails(self):
+    def test_raising_provider_is_not_followed_by_another_call(self):
+        first = MagicMock(side_effect=RuntimeError("cli missing"))
+        second = MagicMock(return_value=_answer())
+
+        draft = TaskIssuePlanner({"claude": first, "codex": second}).draft("update ubuntu", "facts")
+
+        self.assertIsNone(draft)
+        first.assert_called_once()
+        second.assert_not_called()
+
+    def test_unusable_answer_is_not_followed_by_another_call(self):
+        for bad in ("nonsense", "", None, _answer(plan=[]), _answer(title="")):
+            with self.subTest(answer=bad):
+                first = MagicMock(return_value=bad)
+                second = MagicMock(return_value=_answer())
+
+                draft = TaskIssuePlanner({"claude": first, "codex": second}).draft("update ubuntu")
+
+                self.assertIsNone(draft)
+                first.assert_called_once()
+                second.assert_not_called()
+
+    def test_failed_planner_call_falls_back_to_placeholder_issue(self):
+        tracking = SimpleNamespace(configured=True, open_planned_issue=MagicMock(return_value={"number": 9}))
+        first = MagicMock(side_effect=RuntimeError("down"))
+        second = MagicMock(return_value=_answer())
+
+        number, draft = open_machine_issue(
+            tracking, TaskIssuePlanner({"claude": first, "codex": second}),
+            task="update ubuntu", facts="", command="sudo apt-get upgrade -y",
+            placeholder_title="Mailbox task abc",
+        )
+
+        self.assertEqual(number, 9)
+        self.assertIsNone(draft)
+        self.assertEqual(tracking.open_planned_issue.call_args.args[0].title, "Mailbox task abc")
+        first.assert_called_once()
+        second.assert_not_called()
+
+    def test_valid_answer_from_the_selected_provider_creates_draft(self):
+        first = MagicMock(return_value=_answer())
+        second = MagicMock(return_value=_answer())
+
+        draft = TaskIssuePlanner({"claude": first, "codex": second}).draft("task")
+
+        self.assertEqual(draft.planner, "claude")
+        self.assertEqual(draft.title, "Update Ubuntu packages on the VM")
+        first.assert_called_once()
+        second.assert_not_called()
+
+    def test_default_runners_put_the_pinned_provider_first(self):
         calls = []
 
-        def broken(prompt):
-            calls.append("claude")
-            raise RuntimeError("cli missing")
+        def fake_run_cli(provider, prompt, working_dir):
+            calls.append(provider)
+            raise RuntimeError("down")
 
-        def codex(prompt):
-            calls.append("codex")
-            return _answer()
+        with patch("modules.coding_provider.available_providers", return_value=["claude", "codex"]), \
+                patch("modules.coding_provider.pinned_provider", return_value="codex"), \
+                patch("modules.task_issue_planner._run_cli", side_effect=fake_run_cli):
+            self.assertIsNone(TaskIssuePlanner().draft("update ubuntu"))
 
-        draft = TaskIssuePlanner({"claude": broken, "codex": codex}).draft("update ubuntu", "facts")
-
-        self.assertEqual(calls, ["claude", "codex"])
-        self.assertEqual(draft.planner, "codex")
-
-    def test_stops_after_the_first_usable_issue(self):
-        second = MagicMock()
-        draft = TaskIssuePlanner({"claude": lambda p: _answer(), "codex": second}).draft("task")
-        self.assertEqual(draft.planner, "claude")
-        second.assert_not_called()
+        self.assertEqual(calls, ["codex"])
 
     def test_no_external_provider_means_placeholder(self):
         self.assertIsNone(TaskIssuePlanner({}).draft("update ubuntu"))

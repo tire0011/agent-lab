@@ -8,9 +8,11 @@ already collected into a proper issue: title, goal, current state, plan and
 acceptance criteria. That issue replaces the ``Mailbox task <id>``
 placeholder, so every change hangs on an issue a strong model wrote.
 
-Questions and read-only lookups never reach the planner. When no external
-provider is available or none returns a usable issue, the caller falls back
-to the placeholder issue: planning is an improvement, never a blocker.
+Questions and read-only lookups never reach the planner. A task costs at
+most one planner call, to the first eligible external provider. When no
+provider is available, or that one call fails or gives no usable issue, the
+caller falls back to the placeholder issue: planning is an improvement,
+never a blocker.
 """
 
 from __future__ import annotations
@@ -152,7 +154,11 @@ def _run_cli(provider: str, prompt: str, working_dir: str) -> str:
 
 
 def _default_runners(working_dir: str) -> dict[str, Callable[[str], str]]:
-    """The external providers whose CLI is installed and allowed, in order."""
+    """The external providers whose CLI is installed and allowed, in order.
+
+    The pinned provider comes first; ``TaskIssuePlanner`` only ever calls
+    the first entry.
+    """
     from modules.coding_provider import available_providers, pinned_provider
 
     providers = available_providers()
@@ -170,10 +176,15 @@ def planner_enabled() -> bool:
 class TaskIssuePlanner:
     """Ask one external planner to write the issue for a free-form task.
 
-    *runners* map a provider name to ``prompt -> raw answer``; the default is
-    the installed Claude/Codex CLIs in read-only mode. The local model is never
-    a runner: the planner role is always external. Providers are tried in
-    order until one gives a usable issue, so a task costs one successful call.
+    *runners* map a provider name to ``prompt -> raw answer``, in preference
+    order; the default is the installed Claude/Codex CLIs in read-only mode,
+    the pinned provider first. The local model is never a runner: the planner
+    role is always external.
+
+    Budget: exactly one planner call per task. Only the first eligible
+    provider is selected and invoked once. If it raises or its answer is not
+    a usable issue, ``draft`` returns ``None`` right away and the caller uses
+    the placeholder issue; no other provider is ever tried.
     """
 
     def __init__(
@@ -194,18 +205,20 @@ class TaskIssuePlanner:
         if not runners:
             logger.info("task planner: no external provider available; using the placeholder issue")
             return None
+        name, runner = next(iter(runners.items()))
         prompt = planner_prompt(task, facts, work=work, command=command)
-        for name, runner in runners.items():
-            try:
-                raw = runner(prompt)
-            except Exception as exc:  # noqa: BLE001 - try the next provider
-                logger.warning("task planner: %s failed: %s", name, exc)
-                continue
-            draft = parse_issue_draft(raw, task, planner=name)
-            if draft is not None:
-                return draft
-            logger.warning("task planner: %s gave no usable issue: %r", name, (raw or "")[:300])
-        return None
+        try:
+            raw = runner(prompt)
+        except Exception as exc:  # noqa: BLE001 - one call only; fall back to the placeholder
+            logger.warning("task planner: %s failed: %s; using the placeholder issue", name, exc)
+            return None
+        draft = parse_issue_draft(raw, task, planner=name)
+        if draft is None:
+            logger.warning(
+                "task planner: %s gave no usable issue; using the placeholder issue: %r",
+                name, (raw or "")[:300],
+            )
+        return draft
 
 
 class LazyIssueDraft:
