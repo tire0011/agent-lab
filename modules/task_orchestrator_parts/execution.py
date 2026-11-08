@@ -685,5 +685,17 @@ class ExecutionMixin:
                 encoding="utf-8",
             )
         except OSError:
-            return
+            pass
+        # Tell the owner, not just a file on the VM (#592).
+        try:
+            self.operations_registry.execute(
+                "request_from_owner",
+                {
+                    "title": (decision.message or decision.reason or "missing capability").splitlines()[0][:150],
+                    "body": f"## Need\n\n{decision.message[:3000]}\n\n## Why\n\n{decision.reason[:1000]}"
+                    f"\n\n## Task\n\n{task[:2000]}",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("missing_capability: could not open the need issue", exc_info=True)
 
