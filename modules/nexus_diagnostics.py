@@ -8,58 +8,21 @@ Read-only by construction: the database is opened with ``mode=ro`` and
 ``PRAGMA query_only``; nothing here creates the file, migrates, reaps or
 retries. That makes it safe to expose through the mailbox and chat.
 
-<<<<<<< HEAD
-Extending the heartbeat contract
---------------------------------
-#162 gave *controller sessions* an explicit heartbeat, which is what makes
-"is this still running?" answerable rather than guessable. Mailbox tasks and
-experiments never got one: they are driven through several processes and
-phases, and no single owner is alive for the whole span, so there is nothing
-to beat. Their liveness question is just as real, though - a task that stops
-midway looks exactly like a slow one from the outside.
-
-So the heartbeat contract is *extended* rather than duplicated. A subject's
-liveness is derived from its **last progress signal**, which is the newest of:
-
-* the heartbeat of a controller session claiming it, when one exists (the
-  strongest signal - an explicit "I am alive"),
-* the newest structured log entry written under any of its correlation ids
-  (a witnessed side effect: weaker than a heartbeat, because a live worker
-  can be quiet, but far stronger than nothing),
-* the row's own ``updated_at`` (the weakest: "something changed then").
-
-The staleness rule is then exactly the one :mod:`modules.heartbeat` already
-defines, applied to that signal - including its clamped floor, so no caller
-can pick a timeout that makes healthy work look dead. Which of the three
-sources answered is reported alongside the verdict, because "interrupted, and
-the last thing we saw was a log line 40 minutes ago" and "interrupted, and a
-worker's heartbeat stopped 40 minutes ago" are different facts about how much
-we know.
-
-Classifying the outcome (#163)
-------------------------------
-On top of that progress verdict every subject carries an ``outcome``: what
-actually happened, decided by :func:`classify_outcome` from the durable
-terminal record (status, the claim's ``terminal_reason``, a recorded error or
-restart marker) and the heartbeat, never from ``updated_at`` alone. It tells
-a clean finish from work that simply went quiet, reports the last healthy
-heartbeat and the last meaningful event, and says ``unknown`` - with the
-missing evidence named - whenever the record is too thin or contradicts
-itself. It also carries a retry *hint*; nothing here retries.
-
-A task or experiment usually has no claim of its own, so the controller session
-driving it speaks for it while it is still working: that session's heartbeat
-and its durable reconciliation to ``abandoned`` are this work's liveness
-evidence, however the session is linked. Once the subject itself has reached a
-terminal state its own record decides; a session ending then is not the work
-ending.
-=======
 Liveness extends the heartbeat contract of #162 to subjects without a
 heartbeat: the last progress signal is the newest of a claiming controller's
 heartbeat, the newest structured log entry, and the row's ``updated_at``.
 :mod:`modules.heartbeat`'s staleness rule (with its clamped floor) applies,
 and the signal that answered is reported with the verdict.
->>>>>>> 52a4b01578b1b5a7d958d8a7181e3b69d18b2849
+
+Every subject also carries an ``outcome`` (#163) from :func:`classify_outcome`:
+what happened, decided from the durable terminal record (status, the claim's
+``terminal_reason``, a recorded error or restart marker) and the heartbeat,
+never from ``updated_at`` alone. Thin or contradictory evidence yields
+``unknown`` with the missing evidence named. A task or experiment without its
+own claim is spoken for by the controller session driving it while it is still
+working - that session's heartbeat and its reconciliation to ``abandoned`` are
+the work's liveness evidence. Once the subject is terminal, its own record
+decides.
 """
 
 from __future__ import annotations
@@ -1412,23 +1375,14 @@ class NexusDiagnostics:
             if not state.last_error:
                 state.last_error = _text(_column(row, "reason"), _MAX_ERROR_CHARS)
 
-<<<<<<< HEAD
     def _session_for(
         self, subject_id: str, experiment_id: Any, *, task_id: str | None = None
     ) -> sqlite3.Row | None:
-        """The controller session driving this work, when one claimed it.
+        """The controller session driving this work, if any; the strongest progress signal.
 
-        Preferred over every other progress signal because it is the only
-        one that means "a worker said it was alive" rather than "something
-        happened". An experiment is rarely a session's source: the session
-        belongs to the task that started it, or waits on it by id, so both
-        links are followed and the same work finds the same session from
-        either side.
+        Followed via the subject's id, its experiment and its task, so the same
+        work finds the same session from either side.
         """
-=======
-    def _session_for(self, subject_id: str, experiment_id: Any) -> sqlite3.Row | None:
-        """The controller session driving this work, if any; the strongest progress signal."""
->>>>>>> 52a4b01578b1b5a7d958d8a7181e3b69d18b2849
         candidates = [subject_id]
         for linked in (experiment_id, task_id):
             if linked and str(linked) not in candidates:
@@ -1580,24 +1534,15 @@ class NexusDiagnostics:
             entries = entries[-limit:]
         return entries, sources, truncated
 
-<<<<<<< HEAD
     def _recent_log_entries(
         self, correlation_ids: dict[str, str], *, per_file: int = 20
     ) -> list[dict[str, Any]]:
-        """The tail of each of a subject's log files, for liveness and last step.
+        """Tail entries of a subject's log files, for liveness and the last step.
 
-        Only the tail is read: this runs on every status call, including the
-        scan behind ``last-failure``, and the newest entries are by
-        construction at the end. A few entries rather than one, because the
-        newest is often a liveness tick and the last *meaningful* step sits
-        just before it.
+        A few per file: the newest is often a liveness tick, the last
+        meaningful step sits just before it.
         """
         entries: list[dict[str, Any]] = []
-=======
-    def _last_log_timestamp(self, correlation_ids: dict[str, str]) -> str | None:
-        """Newest log timestamp across a subject's files, read from the tail only."""
-        newest: str | None = None
->>>>>>> 52a4b01578b1b5a7d958d8a7181e3b69d18b2849
         for path in self._log_paths(correlation_ids):
             try:
                 found = central_logging.read_log_entries(

@@ -1269,8 +1269,6 @@ class NexusInitiativeService:
             ))
         return decision
 
-<<<<<<< HEAD
-=======
     def _dispatch_was_paid(self, since: str) -> bool:
         """Whether this tick used a paid model (#541); unknown counts as paid.
 
@@ -1352,7 +1350,6 @@ class NexusInitiativeService:
         failed_at = _parse_timestamp(row["created_at"]) if row is not None else None
         return failed_at is not None and failed_at > _utcnow() - _SERVICE_RESTART_COOLDOWN
 
->>>>>>> 52a4b01578b1b5a7d958d8a7181e3b69d18b2849
     def _earlier_attempts(self, issue_number: int) -> str:
         """How earlier experiments for this issue ended, for the retry (#374).
 
@@ -1364,11 +1361,7 @@ class NexusInitiativeService:
         try:
             rows = self._conn.execute(
                 """
-<<<<<<< HEAD
-                SELECT e.id AS id, e.status AS status, e.error AS error,
-=======
                 SELECT e.id AS id, e.id AS experiment_id, e.status AS status, e.error AS error,
->>>>>>> 52a4b01578b1b5a7d958d8a7181e3b69d18b2849
                        a.status AS adoption_status, a.reason AS adoption_reason
                 FROM github_experiment_links l
                 JOIN experiments e ON e.id = l.experiment_id
@@ -1382,14 +1375,10 @@ class NexusInitiativeService:
             return ""
         lines = []
         for row in rows:
-<<<<<<< HEAD
-            if row["adoption_status"] == "failed":
-=======
             # Its reason quotes the rejected text, which would reject the retry.
             if _is_goal_policy_rejection(row["status"], row["error"]):
                 continue
             if self._merge_stopped(row):
->>>>>>> 52a4b01578b1b5a7d958d8a7181e3b69d18b2849
                 outcome = f"merge stopped: {row['adoption_reason'] or ''}"
             elif row["status"] in _RETRYABLE_EXPERIMENT_STATUSES:
                 outcome = f"{row['status']}: {row['error'] or ''}"

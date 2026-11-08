@@ -226,10 +226,7 @@ def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
 
     task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
-<<<<<<< HEAD
-=======
     task = _change_section(task)
->>>>>>> 52a4b01578b1b5a7d958d8a7181e3b69d18b2849
     found: list[str] = []
     for match in _GOAL_PATH_RE.finditer(task):
         path = match.group(0)
