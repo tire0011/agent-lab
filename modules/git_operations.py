@@ -1,7 +1,6 @@
-"""Git wrapper for the operations API.
-
-Repository paths are caller-selected.  All output is redacted before being returned so repository URLs,
-absolute paths and any accidental credential exposure are stripped.
+"""Git wrapper for the operations API. Repository paths are caller-selected; all
+output is redacted before being returned so repository URLs, absolute paths and
+any accidental credential exposure are stripped.
 """
 
 from __future__ import annotations

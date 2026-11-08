@@ -22,12 +22,7 @@ _PERMANENT_SKIP_MARKERS = ("max retries",)
 
 
 def _is_permanent_skip(reason: str | None) -> bool:
-    """Whether a skip reason will still hold on every future poll.
-
-    A message whose retries are exhausted is skipped forever; one skipped
-    because it is already done disappears as soon as its inbox file is
-    cleaned up. Only the first kind needs to stop being re-announced.
-    """
+    """Whether a skip reason holds on every future poll (exhausted retries do; already-done does not)."""
     text = (reason or "").lower()
     return any(marker in text for marker in _PERMANENT_SKIP_MARKERS)
 
@@ -37,14 +32,12 @@ def _resolve_repo_paths(
     mailbox_repo_path_arg: str | None,
     repo_path_arg: str | None,
 ) -> tuple[Path, Path]:
-    """Resolve code and mailbox repository paths from CLI arguments and env vars.
+    """Resolve the code and mailbox repository paths from CLI flags and env vars.
 
-    Priority: explicit flags > ``--repo-path`` alias > environment variables.
-    The code repository defaults to ``/agent``; the mailbox repository must be
-    explicit. Raises :exc:`ValueError` if ``--repo-path`` is
-    combined with ``--code-repo-path`` or ``--mailbox-repo-path``.
-
-    Returns ``(code_repo_path, mailbox_repo_path)``.
+    Explicit flags win over ``--repo-path`` and env vars; the code repo
+    defaults to ``/agent``, the mailbox repo must be given. ``--repo-path``
+    with either explicit flag raises :exc:`ValueError`. Returns
+    ``(code_repo_path, mailbox_repo_path)``.
     """
     explicit_alias = repo_path_arg is not None
     explicit_code = code_repo_path_arg is not None
@@ -142,11 +135,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if result.status == "busy":
-        # Lock contention is the timer doing its job, not a failure: the
-        # processor that holds the lock rescans the inbox before exiting, so
-        # this invocation has nothing to do.  Exiting non-zero here made
-        # systemd report "Failed to start Nexus mailbox processor" for a
-        # perfectly healthy mailbox.
+        # A held lock is the timer doing its job (the holder rescans before
+        # exiting), so this is not a failure.
         logger.info("Mailbox poll skipped: another processor is already running")
         return 0
     if result.status == "dirty_worktree":
@@ -156,10 +146,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("git pull --ff-only failed; refusing mailbox processing")
         return 1
     if result.status == "sync_failed":
-        # Reported below rather than here: a sync that failed partway through
-        # the drain still leaves completed messages worth logging.  Unlike a
-        # held lock, this one is a real fault - the mailbox checkout is out of
-        # step with its remote, so messages are not being delivered.
+        # Reported below: completed messages are still worth logging. Unlike a
+        # held lock this is a real fault (checkout out of step with its remote).
         logger.error("Mailbox sync with the remote failed; remaining work is left for the next run")
     if result.status == "error":
         logger.error("Mailbox processing failed: %s", sanitized_reason(result.error) or "unknown")
@@ -171,12 +159,8 @@ def main(argv: list[str] | None = None) -> int:
         if status == "done":
             logger.info("done: %s -> %s", file_, r.get("outbox", ""))
         elif status == "skipped":
-            # A message skipped for a permanent reason is skipped again on
-            # every future poll, so announcing it at INFO each time floods
-            # the feed and pushes real events out of the default window
-            # (see PROJECT_HISTORY lesson 37: keep success quiet, keep the
-            # detail available on demand). The count still appears in the
-            # summary below, and the per-file detail stays at DEBUG.
+            # Permanently skipped messages are logged at DEBUG; INFO each poll
+            # would flood the feed. The count stays in the summary.
             level = logging.DEBUG if _is_permanent_skip(r.get("reason")) else logging.INFO
             logger.log(level, "skipped: %s (%s)", file_, r.get("reason", ""))
         else:

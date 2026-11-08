@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class HealthResponse(BaseModel):
     status: str
     version: str
+    git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
 
 
 class StatusResponse(BaseModel):
@@ -24,9 +27,12 @@ class StatusResponse(BaseModel):
 class Problem(BaseModel):
     id: str
     source: str
+    issue_number: int | None = None
     summary: str
     detail: str
     timestamp: str
+    failure_phase: str | None = None
+    failure_type: str | None = None
 
 
 class ProblemsResponse(BaseModel):
@@ -55,15 +61,6 @@ class ChatRequest(BaseModel):
     session_id: str | None = Field(default=None, max_length=120)
 
 
-class ChatResponse(BaseModel):
-    reply: str
-    intent: str
-    session_id: str
-    action: str
-    experiment_id: str | None = None
-    status: str
-
-
 class ChatJobResponse(BaseModel):
     job_id: str
     status: str
@@ -75,14 +72,9 @@ class ChatJobResponse(BaseModel):
     error: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Codex task models
-#
-# ``working_dir`` and ``sandbox`` are never accepted from the client: they
-# are fixed server-side (see api.py) to keep Codex task execution read-only
-# and confined to the repository root. ``timeout_seconds`` may only be
-# lowered by the client; the upper bound is enforced by ``le=`` below.
-# ---------------------------------------------------------------------------
+# Codex task models. ``working_dir`` and ``sandbox`` are never accepted from
+# the client (fixed server-side: read-only, repository root);
+# ``timeout_seconds`` can only be lowered, bounded by ``le=``.
 
 
 class CodexTaskCreateRequest(BaseModel):
@@ -158,6 +150,7 @@ class MailboxTaskApproval(BaseModel):
     outbox_file: str | None = None
     result_summary: str | None = None
     error: str | None = None
+    idempotency_key: str | None = None
     created_at: str
     updated_at: str
 
@@ -165,10 +158,6 @@ class MailboxTaskApproval(BaseModel):
 class MailboxTaskApprovalsResponse(BaseModel):
     count: int
     tasks: list[MailboxTaskApproval]
-
-
-class MailboxTaskRejectRequest(BaseModel):
-    reason: str = Field(min_length=1, max_length=500)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +270,7 @@ class ExperimentSummary(BaseModel):
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
     implementation_provider: str | None = None
+    complexity: str | None = None
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
@@ -301,6 +291,7 @@ class ExperimentDetail(BaseModel):
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
     implementation_provider: str | None = None
+    complexity: str | None = None
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
@@ -363,11 +354,6 @@ class ActivityEntry(BaseModel):
     message: str | None = None
 
 
-class ActivityResponse(BaseModel):
-    count: int
-    activity: list[ActivityEntry]
-
-
 class DiagnosticActivityEntry(ActivityEntry):
     mailbox_task_id: str | None = None
     phase: str | None = None
@@ -423,14 +409,9 @@ class PublicExperimentSummary(BaseModel):
     usage: PublicExperimentUsage | None = None
 
 
-# ---------------------------------------------------------------------------
-# Public diagnostics model (GET /diagnostics/public)
-#
-# Every field here is drawn from an explicit allowlist assembled in api.py;
-# nothing is derived from a generic ``to_dict()``/``model_dump()`` call, so
-# adding a new internal field to ``Experiment`` or ``MailboxTaskApproval``
-# can never silently widen this public response.
-# ---------------------------------------------------------------------------
+# Public diagnostics (GET /diagnostics/public): every field comes from an
+# explicit allowlist, never a generic ``to_dict()``/``model_dump()``, so a new
+# internal field can never widen this public response.
 
 
 class DiagnosticLifecyclePhase(BaseModel):
@@ -469,6 +450,8 @@ class PublicDiagnosticExperiment(BaseModel):
 class PublicDiagnosticServiceStatus(BaseModel):
     status: str
     git_revision: str | None = None
+    checkout_revision: str | None = None
+    stale: bool = False
     deployment_time: str | None = None
 
 
@@ -485,15 +468,9 @@ class PublicDiagnosticsResponse(BaseModel):
     problems: list[Problem] = Field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Mailbox inbox/outbox listing (public, sanitized).
-#
-# Every field is drawn from an explicit allowlist assembled in api.py.
-# ``preview`` is always short and redacted; full prompts, task bodies,
-# absolute file paths, and unfiltered file/command output are never
-# included here (see the "Aufträge"/task-approval and "Logs" endpoints for
-# authenticated, more detailed views).
-# ---------------------------------------------------------------------------
+# Mailbox inbox/outbox listing (public, sanitized): explicit allowlist only;
+# ``preview`` is short and redacted, and full prompts, task bodies, absolute
+# paths and raw output are never included.
 
 
 class MailboxMessageEntry(BaseModel):
@@ -551,13 +528,9 @@ class ExperimentLogsResponse(BaseModel):
 
 
 class UnifiedLogsResponse(BaseModel):
-    """One chronological Nexus log timeline: structured JSONL entries
-    (experiments, mailbox tasks, chat jobs, system) merged with the
-    ``agent-api``/``nexus-mailbox``/``llama-server`` systemd journals.
-
-    Backs the Logs tab's default view; entries use the same explicit
-    allowlist as ``ExperimentLogsResponse``, plus ``source``.
-    """
+    """One chronological timeline: structured JSONL entries merged with the
+    agent-api/nexus-mailbox/llama-server journals, using the same allowlist as
+    ``ExperimentLogsResponse`` plus ``source``."""
 
     count: int
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
@@ -569,36 +542,11 @@ class UnifiedLogsResponse(BaseModel):
     truncated: bool = False
 
 
-class PublicLogEntry(BaseModel):
-    """One structured log line, safe for the unauthenticated Logs tab.
-
-    A strict subset of ``ExperimentLogEntry``'s allowlist: never includes
-    command/cwd/stdout/stderr/exception/stacktrace/job_id/session_id, since
-    those may carry internal detail not meant for an unauthenticated
-    caller. ``message`` is still the write- and read-path redacted text
-    (see ``modules.redaction``), matching what ``/diagnostics/public``
-    already exposes via ``diagnostic_messages``/``failure_summary``.
-    """
-
-    timestamp: str
-    level: str
-    phase: str
-    event: str
-    message: str | None = None
-    experiment_id: str | None = None
-    mailbox_task_id: str | None = None
-    truncated: bool | None = None
-    source: str = "experiment"
-
-
 class LogTraceResponse(BaseModel):
     """Everything Nexus did for one order, reconstructed from its logs.
 
-    ``reference`` echoes what was asked for; ``correlation_ids`` reports
-    which experiment/mailbox-task/session/job ids that reference turned
-    out to span, so an operator can see *why* these entries belong
-    together. ``summary`` is derived from ``entries`` alone, so it can
-    never contradict the timeline beneath it.
+    ``correlation_ids`` shows which ids the reference spans; ``summary`` is
+    derived from ``entries`` alone, so it cannot contradict them.
     """
 
     reference: str
@@ -608,19 +556,6 @@ class LogTraceResponse(BaseModel):
     count: int = 0
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
     truncated: bool = False
-
-
-class PublicUnifiedLogsResponse(BaseModel):
-    """Public, unauthenticated equivalent of ``UnifiedLogsResponse``.
-
-    Backs the Logs tab's default view when no API key has been entered,
-    so the fallback is the same central multi-source feed (experiments,
-    mailbox tasks, system) rather than only per-experiment diagnostics.
-    """
-
-    count: int
-    entries: list[PublicLogEntry] = Field(default_factory=list)
-    next_cursor: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -638,13 +573,6 @@ class OperationChainRequest(BaseModel):
     steps: list[OperationChainStep] = Field(..., min_items=1, max_items=10)
     stop_on_error: bool = False
     request_id: str | None = None
-
-    @staticmethod
-    def validate_unique_ids(v: list[OperationChainStep]) -> list[OperationChainStep]:
-        ids = [s.id for s in v]
-        if len(ids) != len(set(ids)):
-            raise ValueError("duplicate step IDs")
-        return v
 
 
 class OperationChainStepResult(BaseModel):
@@ -790,13 +718,7 @@ class NexusSessionClaim(BaseModel):
 
 
 class NexusLivenessResponse(BaseModel):
-    """Heartbeat/liveness state, so "is this still running?" is answerable.
-
-    ``unclaimed_working_sessions`` counts rows in a working status that carry
-    no heartbeat at all - pre-heartbeat rows, or a caller that never claimed
-    its work. They are reported rather than hidden: that gap is precisely what
-    heartbeats exist to close.
-    """
+    """Heartbeat/liveness state; ``unclaimed_working_sessions`` counts working rows with no heartbeat."""
 
     generated_at: str
     stale_after_seconds: int
@@ -810,12 +732,10 @@ class NexusLivenessResponse(BaseModel):
 
 
 class DiagnosticProgress(BaseModel):
-    """Is this work still running, was it interrupted, or did it finish? (#188)
+    """Running, interrupted or finished? (#188)
 
-    ``source`` names the signal ``last_progress_at`` came from - a controller
-    heartbeat, a structured log entry, or the row's own ``updated_at`` - so a
-    caller can tell an explicit "I am alive" from a merely witnessed side
-    effect. See ``modules.nexus_diagnostics``.
+    ``source`` names where ``last_progress_at`` came from: a controller
+    heartbeat, a log entry, or the row's ``updated_at``.
     """
 
     state: str
@@ -850,12 +770,7 @@ class DiagnosticOutcome(BaseModel):
 
 
 class DiagnosticLifecycle(BaseModel):
-    """One unit of work's lifecycle state, joined across every subsystem.
-
-    Deliberately flat and stably named: a caller answering "where did this
-    stop?" should never need to know which of the mailbox, experiment,
-    adoption, GitHub-link or controller-session tables an answer came out of.
-    """
+    """One unit of work's lifecycle state, flat and stably named across subsystems."""
 
     subject_type: str
     subject_id: str
@@ -904,12 +819,7 @@ class DiagnosticReportResponse(BaseModel):
 
 
 class DiagnosticServiceLogsResponse(BaseModel):
-    """``nexus logs service <name>``: a bounded journal slice.
-
-    ``error`` is populated rather than raised when the journal cannot be read
-    (no systemd, unknown unit, a timeout): an unreadable journal is itself a
-    finding, and which unit was consulted over what window still stands.
-    """
+    """``nexus logs service <name>``: a bounded journal slice; read errors go into ``error``."""
 
     generated_at: str
     service: str

@@ -30,6 +30,10 @@ from modules.outbox_pr_notifier import (
 )
 
 
+def _status_of(notifier, message_id):
+    row = notifier._row(message_id)
+    return dict(row) if row is not None else None
+
 def _not_found() -> RuntimeError:
     from modules.outbox_pr_notifier import OutboxPRNotifyError
 
@@ -199,7 +203,7 @@ class OutboxPRNotifierTests(unittest.TestCase):
         self.assertIn("2026-09-21T10:00:00Z", body)
         self.assertTrue(github.comments[0]["path"].endswith("/issues/194/comments"))
 
-        status = notifier.status_of("msg-1")
+        status = _status_of(notifier, "msg-1")
         self.assertEqual(status["status"], STATUS_DELIVERED)
         self.assertEqual(status["pr_number"], 194)
         self.assertIsNotNone(status["comment_id"])
@@ -219,7 +223,7 @@ class OutboxPRNotifierTests(unittest.TestCase):
         notifier = self._notifier(github)
 
         self.assertFalse(notifier.notify("msg-1", "hello"))
-        pending = notifier.status_of("msg-1")
+        pending = _status_of(notifier, "msg-1")
         self.assertEqual(pending["status"], STATUS_PENDING)
         self.assertEqual(pending["attempts"], 1)
         self.assertIn("502", pending["last_error"])
@@ -231,7 +235,7 @@ class OutboxPRNotifierTests(unittest.TestCase):
         self.clock.now += 60.0
         self.assertEqual(notifier.deliver_pending(), 1)
         self.assertEqual(len(github.comments), 1)
-        self.assertEqual(notifier.status_of("msg-1")["status"], STATUS_DELIVERED)
+        self.assertEqual(_status_of(notifier, "msg-1")["status"], STATUS_DELIVERED)
 
     def test_retries_are_bounded(self) -> None:
         github = _FakeGitHub(fail_comments=99)
@@ -242,7 +246,7 @@ class OutboxPRNotifierTests(unittest.TestCase):
             self.clock.now += 10_000.0
             notifier.deliver_pending()
 
-        status = notifier.status_of("msg-1")
+        status = _status_of(notifier, "msg-1")
         self.assertEqual(status["status"], STATUS_FAILED)
         self.assertEqual(status["attempts"], 3)
 
@@ -267,7 +271,7 @@ class OutboxPRNotifierTests(unittest.TestCase):
         created = [p for m, p, _ in github.calls if m == "POST" and p.endswith("/git/refs")]
         self.assertEqual(len(created), 1)
         self.assertTrue(github.branch_exists)
-        self.assertEqual(notifier.status_of("msg-1")["pr_number"], 194)
+        self.assertEqual(_status_of(notifier, "msg-1")["pr_number"], 194)
 
     def test_unavailable_pr_falls_back_to_a_new_channel(self) -> None:
         github = _FakeGitHub(pr_missing=True, branch_exists=False)
@@ -277,7 +281,7 @@ class OutboxPRNotifierTests(unittest.TestCase):
             self.assertTrue(notifier.notify("msg-1", "hello"))
 
         self.assertEqual(len(github.created_pulls), 1)
-        self.assertEqual(notifier.status_of("msg-1")["pr_number"], 900)
+        self.assertEqual(_status_of(notifier, "msg-1")["pr_number"], 900)
         self.assertTrue(any("CHANNEL CHANGED" in line for line in logs.output))
         self.assertTrue(any("#900" in line for line in logs.output))
 
@@ -337,7 +341,7 @@ class OutboxPRNotifierTests(unittest.TestCase):
 
         self.assertFalse(notifier.configured)
         self.assertFalse(notifier.notify("msg-1", "hello"))
-        self.assertEqual(notifier.status_of("msg-1")["status"], STATUS_PENDING)
+        self.assertEqual(_status_of(notifier, "msg-1")["status"], STATUS_PENDING)
 
 
 class CommentBodyTests(unittest.TestCase):

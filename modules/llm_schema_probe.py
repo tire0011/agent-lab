@@ -1,23 +1,10 @@
 """Does the local model server actually apply the JSON schemas Nexus sends?
 
-Nexus constrains three roles with a JSON schema - the tool resolver, the
-controller's own decision, and failure analysis' tool decision - and every one
-of them trusts the server to enforce it. For a long time none of them were
-enforced: the schema was sent one level above where llama-server and Azure
-OpenAI read it, so each declared enum was only a suggestion. The tool resolver,
-restricted on paper to four ``status`` values, answered with a fifth inside
-Markdown fences and had its otherwise correct selection discarded (#218).
-
-What makes that worth a standing check rather than a one-off fix is the failure
-mode. An ignored schema is invisible: it looks exactly like a model that
-happens to comply, and nothing fails until one stops complying - at which point
-it surfaces somewhere else entirely, as a tool that "cannot be found".
-
-The method leaves no room for a lucky guess. The schema permits ``status`` to
-be exactly ``found``; the prompt asks for ``banana``. A constrained decoder
-cannot emit banana however it is asked, so one answer settles it - and the
-control request, sent with no schema at all, has to come back with banana or
-the probe itself is proving nothing.
+An ignored schema is invisible - it looks like a compliant model until one is not
+(#218: a tool resolver constrained to four ``status`` values answered with a fifth).
+The probe leaves no room for a lucky guess: the schema permits only ``found`` while
+the prompt asks for ``banana``, so a constrained decoder cannot comply - and the
+schema-less control request must return ``banana``, or the probe proves nothing.
 """
 
 from __future__ import annotations
@@ -51,15 +38,14 @@ NOT_ENFORCED = "NOT ENFORCED"
 REJECTED = "REJECTED"
 ERROR = "ERROR"
 
-# Ordered: the shape Nexus uses first, the control last. The two in between are
-# only interesting once the first has failed, which is why `nexus_only` drops
-# them - each one costs a full model call.
+# Ordered: Nexus's shape first, the control last; the two in between only matter
+# once the first has failed, so `nexus_only` drops them (each costs a model call).
 SHAPES: list[tuple[str, dict[str, Any] | None]] = [
     ("nexus", NEXUS_SHAPE),
     (
         "openai_legacy",
-        # The shape that was wrong: schema one level too high. Kept so a future
-        # run can show which of the two a new server prefers.
+        # The shape that was wrong (schema one level too high), kept so a future run
+        # can show which of the two a new server prefers.
         {"type": "json_schema", "schema": PROBE_SCHEMA},
     ),
     ("llama_cpp_native", {"type": "json_object", "schema": PROBE_SCHEMA}),
@@ -75,12 +61,9 @@ SHAPE_LABELS = {
 
 
 def classify(content: str) -> tuple[str, str]:
-    """Whether one answer could only have come from a constrained decoder.
-
-    Anything other than ``found`` - including an answer that is not JSON at
-    all - is proof the constraint was not applied, because the prompt asked for
-    something the schema forbids.
-    """
+    """Whether one answer could only have come from a constrained decoder: anything
+    other than ``found`` (including non-JSON) proves the constraint was not applied,
+    since the prompt asked for something the schema forbids."""
     detail = content.strip().replace("\n", " ")[:160]
     try:
         parsed = json.loads(content)
@@ -121,8 +104,8 @@ def ask(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read(8000).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        # A server that refuses the shape is not enforcing it either, but it
-        # fails loudly, which is a different thing to report.
+        # A server that refuses the shape is not enforcing it either, but fails
+        # loudly - a different thing to report.
         return REJECTED, f"HTTP {exc.code}: {exc.read(200).decode('utf-8', errors='replace')}"
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return ERROR, f"request failed: {exc}"
@@ -140,12 +123,8 @@ def probe(
     timeout: float = 180.0,
     nexus_only: bool = False,
 ) -> list[tuple[str, str, str]]:
-    """Each request shape, as ``(key, verdict, detail)``.
-
-    ``nexus_only`` keeps the shape Nexus uses and the control, which is the
-    smallest pair that can answer "is my schema being applied right now" - two
-    model calls instead of four.
-    """
+    """Each request shape as ``(key, verdict, detail)``; ``nexus_only`` keeps Nexus's
+    shape plus the control - two model calls instead of four."""
     wanted = {"nexus", "control"} if nexus_only else None
     return [
         (key, *ask(base_url, model, shape, timeout))
@@ -162,9 +141,8 @@ def verdict(results: list[tuple[str, str, str]]) -> tuple[bool, list[str]]:
     lines: list[str] = []
 
     if nexus == ERROR or control == ERROR:
-        # Unreachable is not the same claim as unenforced, and saying the
-        # second when the first is true is exactly the misdiagnosis this whole
-        # probe exists because of.
+        # Unreachable is not the same claim as unenforced; saying the second when the
+        # first is true is exactly the misdiagnosis this probe exists because of.
         failed = next(
             (text for _, outcome, text in results if outcome == ERROR), "unknown"
         )
@@ -175,8 +153,7 @@ def verdict(results: list[tuple[str, str, str]]) -> tuple[bool, list[str]]:
         return False, lines
 
     if control == ENFORCED:
-        # Then "found" proves nothing: the model returns it unprompted, and a
-        # pass would be luck rather than evidence.
+        # Then "found" proves nothing: returned unprompted, a pass would be luck.
         lines.append(
             "INCONCLUSIVE: the control request, sent with no schema at all, still "
             "returned the constrained value - this probe cannot tell enforcement "

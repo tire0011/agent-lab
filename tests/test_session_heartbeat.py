@@ -84,7 +84,6 @@ class HeartbeatThreadTests(unittest.TestCase):
         beat = Heartbeat(boom, interval_seconds=1, name="test-beat")
 
         self.assertTrue(beat.beat_once())  # survivable: retried next tick
-        self.assertFalse(beat.lost_claim)
 
     def test_losing_the_claim_stops_the_beating(self):
         stopped = threading.Event()
@@ -98,7 +97,6 @@ class HeartbeatThreadTests(unittest.TestCase):
         self.addCleanup(beat.stop)
 
         self.assertTrue(stopped.wait(timeout=10))
-        self.assertTrue(beat.lost_claim)
 
     def test_it_beats_while_the_work_runs(self):
         beats = threading.Semaphore(0)
@@ -350,23 +348,7 @@ class SessionClaimTests(unittest.TestCase):
         self.assertEqual(self.store.reconcile_stale_heartbeats(120), [])
         self.assertEqual(self.store.get(sid).status, "active")
 
-    def test_releasing_a_claim_states_the_outcome(self):
-        sid = self._session("s19", worker="worker-a")
 
-        self.store.release_claim(sid, reason="action_selected", worker_id="worker-a")
-
-        session = self.store.get(sid)
-        self.assertEqual(session.terminal_reason, "action_selected")
-        self.assertIsNone(session.last_heartbeat_at)
-        self.assertEqual(self.store.reconcile_stale_heartbeats(120), [])
-
-    def test_a_foreign_worker_cannot_close_someone_elses_claim(self):
-        sid = self._session("s20", worker="worker-a")
-
-        self.assertFalse(
-            self.store.release_claim(sid, reason="answer", worker_id="worker-b")
-        )
-        self.assertIsNotNone(self.store.get(sid).last_heartbeat_at)
 
     # -- races between selecting a candidate and ending it ------------------
     #

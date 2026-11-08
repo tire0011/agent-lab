@@ -66,6 +66,34 @@ class DelegationResult:
         }
 
 
+FREE_TIER = "free_tier"
+MODEL_PREFIX = "model:"
+
+
+def _registry_catalog() -> list[dict[str, Any]]:
+    """Registry models as delegates: ``free_tier`` plus one entry per model (#552)."""
+    from modules import model_registry
+
+    available = [m for m in model_registry.load_models() if m.available]
+    entries: list[dict[str, Any]] = []
+    if any(m.cost == "free" for m in available):
+        entries.append({
+            "provider": FREE_TIER,
+            "description": "Ask the free external models in turn (rate-limited, no budget cost); "
+                           "use before paid providers.",
+            "writes_repo": False,
+            "cost": "free",
+        })
+    for m in available:
+        entries.append({
+            "provider": MODEL_PREFIX + m.id,
+            "description": m.description or m.model,
+            "writes_repo": False,
+            "cost": m.cost,
+        })
+    return entries
+
+
 class NexusDelegationService:
     """Expose available LLMs as tools rather than as top-level control flow."""
 
@@ -132,6 +160,7 @@ class NexusDelegationService:
                     "cost": "paid",
                 }
             )
+        providers.extend(_registry_catalog())
         return providers
 
     async def delegate(self, provider: str, task: str, *, context: str = "") -> DelegationResult:
@@ -144,7 +173,32 @@ class NexusDelegationService:
             return await self._cli_agent(PROVIDER_CLAUDE, "claude_readonly", task, context)
         if provider == "azure_openai":
             return await self._azure(task, context)
+        if provider == FREE_TIER or provider.startswith(MODEL_PREFIX):
+            return await self._registry(provider, task, context)
         return DelegationResult(provider, False, f"Unknown delegation provider: {provider}", {})
+
+    async def _registry(self, provider: str, task: str, context: str) -> DelegationResult:
+        """A model from config/models.json (#552); ``free_tier`` tries the free ones in order."""
+        from modules import model_registry
+
+        prompt = (
+            "You are a bounded worker consulted by the Nexus controller. "
+            "Solve or analyse the sub-problem below. Return concise findings and a "
+            f"recommended next step.\n\nSUB-PROBLEM:\n{task[:12000]}\n\nCONTEXT:\n{context[:6000]}"
+            if context else task[:16000]
+        )
+        if provider == FREE_TIER:
+            result = await asyncio.to_thread(model_registry.chat_first, prompt, max_cost="free")
+        else:
+            wanted = provider[len(MODEL_PREFIX):]
+            spec = next((m for m in model_registry.load_models() if m.id == wanted and m.available), None)
+            if spec is None:
+                return DelegationResult(provider, False, "", {"error": "not_configured"})
+            result = await asyncio.to_thread(model_registry.chat, spec, prompt)
+        metadata = {"model": result.model_id, "cost": result.cost}
+        if not result.success:
+            metadata["error"] = result.error
+        return DelegationResult(provider, result.success, result.content, metadata)
 
     async def _local(self, task: str, context: str) -> DelegationResult:
         prompt = (

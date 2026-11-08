@@ -1,57 +1,18 @@
-"""Gated remote-maintenance service for Nexus.
+"""Gated remote-maintenance service for Nexus: a fixed set of named operations (no
+arbitrary shell execution) for remote VM inspection/control while the maintenance
+window is open. **Disabled by default** - ``MAINTENANCE_ENABLED=true`` enables it;
+every operation additionally requires both the regular ``AGENT_API_KEY`` header and
+``MAINTENANCE_TOKEN`` in ``X-Maintenance-Token``; ``MAINTENANCE_EXPIRY`` (UTC ISO-8601)
+auto-disables it once passed.
 
-Provides a fixed set of named operations (no arbitrary shell execution) that
-allow remote clients to inspect and control the VM while the maintenance window
-is open.  The service is **disabled by default** and must be explicitly enabled
-via environment variables before any endpoint is accessible.
-
-Configuration (env vars)
-------------------------
-MAINTENANCE_ENABLED
-    Set to ``"true"`` (case-insensitive) to enable the maintenance service.
-    Any other value, or absent, means all operations return 403.
-
-MAINTENANCE_TOKEN
-    Required second authentication token.  All maintenance endpoints require
-    *both* the regular ``AGENT_API_KEY`` header *and* this token in the
-    ``X-Maintenance-Token`` header.
-
-MAINTENANCE_EXPIRY
-    Optional UTC datetime (ISO-8601, e.g. ``2026-08-20T22:00:00Z``).
-    If set and the current UTC time is past this value the service auto-disables.
-
-Allowed operations
-------------------
-- git_pull                  — git pull origin HEAD
-- git_status                — git status --short
-- git_log                   — git log --oneline -N (N via ``lines`` param, max 50)
-- run_router_test           — start agent.py --use-router <prompt> in background
-- router_task_status        — status of a background router task by id
-- router_task_result        — result of a background router task by id
-- run_tests                 — run the repo test command in background
-- test_task_status          — status of a background test task by id
-- test_task_result          — result of a background test task by id
-- local_model_status        — HEAD /v1/models against the local llama-server
-- local_model_test          — POST /v1/chat/completions with a short ping prompt
-- service_status            — systemctl is-active for a named unit
-- service_restart           — systemctl restart for a named unit
-- service_logs              — journalctl tail for a named unit
-- process_status            — ps filtered for known Nexus/llama process names
-
-Safety guarantees
------------------
-- Only the operations listed above are accepted; no arbitrary command strings.
-- Service names are **not** restricted to an allowlist: Nexus must be able to
-  operate its own units as they are added, so any non-empty unit name is
-  accepted. ``service_restart`` therefore runs ``sudo systemctl restart`` on
-  whatever unit is named. The protection for that is the gate around the whole
-  service - disabled by default, two separate tokens, and an optional expiry -
-  not a list of names.
-- All outputs are bounded/truncated.
-- Every operation call is written to an in-memory audit log accessible via
-  :meth:`MaintenanceService.audit_log`.
-- Background tasks time out after their per-operation timeout.
-- Sensitive strings (API keys, tokens) are redacted from outputs.
+Safety guarantees: only a fixed set of named operations is accepted (see the
+dispatcher; no arbitrary command strings); unit names are not allowlisted (Nexus
+must operate its own units,
+so ``service_restart`` runs ``sudo systemctl restart`` on any named unit - the
+protection is the gate around the whole service: disabled by default, two tokens,
+optional expiry); all outputs are bounded/truncated; every call is written to the
+in-memory audit log; background tasks time out per operation; API keys/tokens are
+redacted from outputs.
 """
 
 from __future__ import annotations
@@ -75,7 +36,7 @@ except ImportError:  # pragma: no cover
     _HTTPX_AVAILABLE = False
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# Constants
 
 _MAX_LOG_LINES = 200
 _MAX_OUTPUT_CHARS = 8000
@@ -108,7 +69,7 @@ _REDACT_PATTERNS = [
 ]
 
 
-# ── Background task tracking ──────────────────────────────────────────────────
+# Background task tracking
 
 @dataclass
 class BackgroundTask:
@@ -122,7 +83,7 @@ class BackgroundTask:
     _thread: threading.Thread | None = field(default=None, repr=False, compare=False)
 
 
-# ── Audit entry ───────────────────────────────────────────────────────────────
+# Audit entry
 
 @dataclass
 class AuditEntry:
@@ -132,7 +93,7 @@ class AuditEntry:
     outcome: str          # ok | error | forbidden | expired
 
 
-# ── MaintenanceService ────────────────────────────────────────────────────────
+# MaintenanceService
 
 class MaintenanceDisabledError(Exception):
     """Raised when the maintenance service is not enabled or has expired."""
@@ -186,7 +147,7 @@ class MaintenanceService:
         self._audit: list[AuditEntry] = []
         self._lock = threading.Lock()
 
-    # ── Auth / gating ─────────────────────────────────────────────────────────
+    # Auth / gating
 
     @staticmethod
     def is_enabled() -> bool:
@@ -213,7 +174,7 @@ class MaintenanceService:
         if token != expected:
             raise MaintenanceAuthError("invalid maintenance token")
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    # Public entry point
 
     def execute(
         self,
@@ -249,7 +210,7 @@ class MaintenanceService:
         with self._lock:
             return list(self._audit)
 
-    # ── Dispatcher ────────────────────────────────────────────────────────────
+    # Dispatcher
 
     def _dispatch(self, operation: str, args: dict[str, Any]) -> dict[str, Any]:
         dispatch: dict[str, Any] = {
@@ -273,7 +234,7 @@ class MaintenanceService:
             raise MaintenanceOperationError(f"unknown operation: {operation!r}")
         return dispatch[operation](args)
 
-    # ── Git operations ────────────────────────────────────────────────────────
+    # Git operations
 
     def _op_git_pull(self, args: dict[str, Any]) -> dict[str, Any]:
         result = self._run(
@@ -301,7 +262,7 @@ class MaintenanceService:
         )
         return {"output": result}
 
-    # ── Background task operations ────────────────────────────────────────────
+    # Background task operations
 
     def _op_run_router_test(self, args: dict[str, Any]) -> dict[str, Any]:
         prompt = str(args.get("prompt", "")).strip()
@@ -346,7 +307,7 @@ class MaintenanceService:
             "error": task.error,
         }
 
-    # ── Local model operations ────────────────────────────────────────────────
+    # Local model operations
 
     def _op_local_model_status(self, args: dict[str, Any]) -> dict[str, Any]:
         if not _HTTPX_AVAILABLE:
@@ -387,7 +348,7 @@ class MaintenanceService:
         except Exception as exc:  # noqa: BLE001
             return {"status": "unreachable", "error": str(exc)}
 
-    # ── Service operations ────────────────────────────────────────────────────
+    # Service operations
 
     def _op_service_status(self, args: dict[str, Any]) -> dict[str, Any]:
         service = self._validate_service(args.get("service"))
@@ -419,7 +380,7 @@ class MaintenanceService:
         )
         return {"service": service, "lines": lines, "output": result}
 
-    # ── Process status ────────────────────────────────────────────────────────
+    # Process status
 
     def _op_process_status(self, args: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -435,7 +396,7 @@ class MaintenanceService:
             output = f"ps error: {exc}"
         return {"output": _redact(output)}
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # Internal helpers
 
     def _run(
         self,
@@ -515,23 +476,6 @@ class MaintenanceService:
         t.start()
         return task_id
 
-    def wait_for_task(self, task_id: str, *, timeout: float = 10.0) -> bool:
-        """Block until that background task's worker thread has finished.
-
-        Returns True once it is done, False if still running at *timeout*.
-        ``execute`` returns as soon as the task is queued, so without this a
-        caller wanting the outcome can only sleep for a guessed duration -
-        which is a guess that gets slower and less reliable the busier the
-        host is.
-        """
-        task = self._get_task(task_id)
-        with self._lock:
-            thread = task._thread
-        if thread is None:
-            return True
-        thread.join(timeout=timeout)
-        return not thread.is_alive()
-
     def _get_task(self, task_id: str) -> BackgroundTask:
         with self._lock:
             task = self._tasks.get(task_id)
@@ -555,7 +499,7 @@ class MaintenanceService:
                 self._audit = self._audit[-_MAX_AUDIT_ENTRIES:]
 
 
-# ── Redaction helper ──────────────────────────────────────────────────────────
+# Redaction helper
 
 def _redact(text: str) -> str:
     """Replace known sensitive patterns with [REDACTED]."""

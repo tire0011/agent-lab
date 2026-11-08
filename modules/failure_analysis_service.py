@@ -1,51 +1,20 @@
 """Reusable LLM-powered failure-analysis service for Nexus (#145).
 
-Anywhere in Nexus something fails, stalls, retries repeatedly, or lands in
-``needs_review``, a caller can hand this service a normalized failure +
-evidence bundle and get back a structured diagnosis: the current blocker,
-likely root causes (each tied to the evidence that supports it), missing
-information, recommended next checks/actions, and whether the problem looks
-self-recoverable or should escalate to a human/external model.
+Any caller with a failure (failed/stalled/repeatedly-retried work, ``needs_review``)
+hands over a normalized failure + evidence bundle and gets back a structured diagnosis.
 
-Design points (see the issue for the full spec):
-
-* **Never breaks the lifecycle it describes.** :meth:`FailureAnalysisService.analyze`
-  never raises; any internal failure degrades to a persisted
-  ``analysis_unavailable`` record instead (see ``_UNAVAILABLE_CATEGORY``).
-* **Bounded, relevance-filtered context.** Callers never hand the model raw
-  full logs; :func:`evidence_from_log_entries` picks a small, relevant slice
-  and every field is length-capped.
-* **One local-model execution path.** Local inference is submitted to the
-  shared :class:`~modules.local_llm_jobs.LocalLlmJobService` under the
-  ``failure_analysis`` role (#167), never as a second direct HTTP request to
-  llama-server: queueing, serialization, liveness, cancellation, stuck-job
-  handling and job observability all belong to that one component. The
-  provider is not hard-coded into the analysis shape, so a future
-  external-model fallback can be added without changing callers.
-* **No analysis-side deadline.** A valid diagnosis on the deployed local
-  model may legitimately need minutes; the shared job service's liveness
-  handling decides when inference is genuinely stuck, not a fixed
-  failure-analysis timeout.
-* **No secrets in the prompt or the stored result.** Every piece of text
-  that reaches the model or the database goes through
-  ``modules.redaction.redact`` first.
-* **Diagnosis may check, not only read (#172).** When the service is given
-  the shared :class:`~modules.nexus_tool_router.NexusToolRouter`, a bounded
-  evidence-gathering phase runs before the diagnosis itself: the same
-  ``find_tool``/``call_tool`` mechanism the persistent controller uses, on
-  the same read-only ``OperationsRegistry`` catalog, with the same schema
-  validation, redaction and audit logging. This exists because a persisted
-  failure reason is a claim about the past: "GITHUB_TOKEN is unavailable"
-  can be false by the time it is diagnosed, and only current evidence can
-  say so. The phase is read-only by construction, strictly bounded, and
-  entirely optional - without a router the service behaves exactly as it
-  did before.
-* **Reusable, not finalization-only.** :meth:`analyze` takes a generic
-  ``subject_type``/``subject_id`` plus a caller-supplied evidence bundle;
-  :meth:`analyze_from_logs` is a convenience helper for the common case of
-  diagnosing from an experiment's/mailbox task's structured JSONL logs, but
-  callers that have their own evidence are not forced to know about
-  ``central_logging`` at all.
+Design points:
+* **Never breaks the lifecycle it describes**: :meth:`FailureAnalysisService.analyze`
+  never raises; internal failures degrade to a persisted ``analysis_unavailable`` record.
+* **Bounded, relevance-filtered, redacted context** - never raw full logs, and no
+  secrets in the prompt or the stored result (``modules.redaction.redact`` first).
+* **One local-model execution path**: inference is submitted to the shared
+  ``LocalLlmJobService`` under the ``failure_analysis`` role (#167), never as a second
+  direct request to llama-server; no analysis-side deadline - the job service decides
+  when inference is genuinely stuck.
+* **Diagnosis may check, not only read (#172)**: with the shared ``NexusToolRouter``,
+  a bounded read-only evidence-gathering phase runs first - a persisted failure reason is
+  a claim about the past and only current evidence can confirm it.
 """
 
 from __future__ import annotations
@@ -96,10 +65,8 @@ logger = logging.getLogger(__name__)
 
 CATEGORY_UNAVAILABLE = "analysis_unavailable"
 
-# Bounds on the diagnostic context handed to the model. Generous enough to
-# be diagnostically useful, small enough that a single analysis call cannot
-# balloon into "dump the whole log file" (the issue explicitly calls this
-# out: "Do not dump the complete log/history/context into the model").
+# Bounds on the diagnostic context handed to the model: useful, but never "dump the
+# whole log file" into one analysis call.
 _MAX_EVIDENCE_ITEMS = 40
 _MAX_EVIDENCE_EXTRA_FIELDS = 8
 _MAX_EVIDENCE_FIELD_CHARS = 300
@@ -113,15 +80,14 @@ _MAX_LIST_ITEMS = 8
 _MAX_ROOT_CAUSES = 5
 _MAX_EVIDENCE_REFS_PER_CAUSE = 6
 
-# Below this confidence the analysis is treated as too uncertain to trust
-# on its own, regardless of what the model itself claimed.
+# Below this confidence the analysis is too uncertain to trust on its own,
+# regardless of what the model itself claimed.
 _LOW_CONFIDENCE_ESCALATION_THRESHOLD = 0.35
 
 _DEFAULT_MAX_TOKENS = 900
 
-# Bounds on the optional evidence-gathering phase (#172). Diagnosis is
-# allowed to check a claim, not to go exploring: a couple of lookups, a
-# couple of calls, small results.
+# Bounds on the optional evidence-gathering phase (#172): diagnosis may check a
+# claim, not go exploring - a couple of lookups, a couple of calls, small results.
 _DEFAULT_MAX_TOOL_STEPS = 4
 _MAX_TOOL_DECISION_TOKENS = 300
 _MAX_TOOL_OUTPUT_LINES = 12
@@ -129,28 +95,24 @@ _MAX_TOOL_OUTPUT_LINE_CHARS = 200
 _MAX_TOOL_REASON_CHARS = 200
 _MAX_TOOL_GOAL_CHARS = 200
 
-# Re-entrancy guard (#167). Diagnosing a failure must never become the next
-# failure to diagnose: if anything on the analysis path ever asked for an
-# analysis again, this stops the recursion at the first nested call instead
-# of queueing a second local-model job and persisting a second record.
+# Re-entrancy guard (#167): diagnosing a failure must never become the next failure to
+# diagnose - stop the recursion at the first nested call instead of queueing a second
+# job and persisting a second record.
 _ANALYSIS_IN_PROGRESS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "failure_analysis_in_progress", default=False
 )
 
-# Fields every structured log entry (see modules.central_logging) carries
-# that are either redundant with the compact rendering below or too
-# large/noisy to hand to the model (raw stdout/stderr, stack traces, the
-# internal pagination keys).
+# Log-entry fields that are redundant with the compact rendering or too large/noisy for
+# the model (raw stdout/stderr, stack traces, internal pagination keys).
 _EVIDENCE_EXCLUDED_KEYS = frozenset({
     "logger", "message", "_source", "_rseq", "truncated",
     "stacktrace", "stdout", "stderr", "command", "cwd",
     "experiment_id", "mailbox_task_id", "job_id", "session_id",
 })
 
-# A log entry is "relevant" for diagnosis when it is a warning/error, or its
-# event name looks like a decision/evidence/failure point. Everything else
-# (routine INFO progress notes) is dropped before anything reaches the
-# model, unless nothing at all matches - see evidence_from_log_entries.
+# A log entry is relevant when it is a warning/error or a decision/evidence/failure
+# event; routine INFO progress is dropped unless nothing at all matches (see
+# evidence_from_log_entries).
 _RELEVANT_EVENT_KEYWORDS = (
     "evidence", "assess", "block", "reject", "fail", "error",
     "review", "escalat", "loop", "timeout", "interrupt", "stale",
@@ -254,11 +216,7 @@ def _bounded_list(values: Any, *, max_items: int = _MAX_LIST_ITEMS, max_chars: i
     return result
 
 
-# ---------------------------------------------------------------------------
-# Evidence collection: bounded, relevance-filtered context from structured
-# logs. Reusable independently of the analyzer itself - a caller that
-# already has its own evidence never has to touch this.
-# ---------------------------------------------------------------------------
+# Evidence collection: bounded, relevance-filtered context from structured logs.
 
 
 def _entry_is_relevant(entry: dict[str, Any]) -> bool:
@@ -297,13 +255,9 @@ def evidence_from_log_entries(
 ) -> list[dict[str, Any]]:
     """Bounded, relevance-filtered, redacted evidence from raw log entries.
 
-    Prefers warning/error and decision-shaped events (CI evidence, stale
-    assessments, blocks/rejections, loops, escalations, ...) over routine
-    INFO progress notes; falls back to the most recent entries verbatim
-    when nothing matches, so a caller never gets an empty bundle just
-    because a failure produced only INFO-level events. Chronological order
-    is preserved (oldest of the kept entries first) and only the most
-    recent *max_items* are kept.
+    Prefers warning/error and decision-shaped events over routine INFO progress notes;
+    falls back to the most recent entries when nothing matches, so a failure never
+    yields an empty bundle. Chronological order, newest *max_items* kept.
     """
     relevant = [entry for entry in entries if _entry_is_relevant(entry)]
     source = relevant if relevant else list(entries)
@@ -312,11 +266,9 @@ def evidence_from_log_entries(
 
 
 def render_evidence_line(index: int, entry: dict[str, Any]) -> str:
-    """One evidence bundle entry as a single ``[E<n>] event key=value ...`` line.
-
-    Matches the compact event-line shape structured logging already writes
-    (see the issue: ``ci_evidence_rejected rejection_reason=target_base_moved``),
-    so the model sees evidence in the same vocabulary Nexus's own logs use.
+    """One evidence bundle entry as a single ``[E<n>] event key=value ...`` line,
+    matching the compact event-line shape structured logging already writes, so the
+    model sees evidence in the same vocabulary Nexus's own logs use.
     """
     event = str(entry.get("event") or "event")
     parts = [f"[E{index}]", event]
@@ -327,9 +279,6 @@ def render_evidence_line(index: int, entry: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Prompt construction
-# ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
     "You are Nexus's failure-diagnosis assistant. You look at a failed, "
@@ -345,8 +294,8 @@ _SYSTEM_PROMPT = (
     "most often stale persisted state rather than the condition it names."
 )
 
-# The evidence-gathering role. Deliberately narrower than the diagnosis role:
-# it decides what to look up, never what the failure means.
+# The evidence-gathering role. Deliberately narrower than the diagnosis role: it decides
+# what to look up, never what the failure means.
 _TOOL_SYSTEM_PROMPT = (
     "You are Nexus's failure-diagnosis assistant in evidence-gathering mode. "
     "You do not diagnose yet. You decide whether a claim in the recorded "
@@ -400,11 +349,9 @@ confident diagnosis, say so via a low confidence value and a non-empty
 
 
 def render_tool_line(index: int, observation: dict[str, Any]) -> str:
-    """One gathered tool result as a single ``[T<n>] ...`` line.
-
-    Deliberately the same shape as :func:`render_evidence_line`, so current
-    evidence and logged evidence read as one vocabulary in the prompt and can
-    be cited the same way.
+    """One gathered tool result as a single ``[T<n>] ...`` line - same shape as
+    :func:`render_evidence_line`, so current and logged evidence read as one vocabulary
+    and can be cited the same way.
     """
     parts = [f"[T{index}]", str(observation.get("action") or "tool")]
     for key in (
@@ -487,11 +434,9 @@ def _with_lifecycle_context(
 ) -> dict[str, Any] | str:
     """Fold the lifecycle facts into the failure the model is asked about.
 
-    Rendered as ordinary ``key=value`` lines alongside the caller's own
-    failure detail, because that is the shape :func:`_build_prompt` already
-    gives a dict failure - the model reads one description of the situation,
-    not two. A caller's own value always wins: it describes the failure that
-    prompted the analysis, while these are context around it.
+    Rendered as ordinary ``key=value`` lines like ``_build_prompt`` gives a dict failure,
+    so the model reads one description of the situation. A caller's own value always
+    wins - it describes the failure that prompted the analysis.
     """
     if state is None:
         return failure
@@ -584,11 +529,9 @@ def _build_prompt(
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Result coercion: the model's JSON is untrusted input. Every field is
-# defensively coerced/bounded; a malformed or missing field degrades to a
-# sensible default rather than raising.
-# ---------------------------------------------------------------------------
+# Result coercion: the model's JSON is untrusted input. Every field is defensively
+# coerced/bounded; a malformed or missing field degrades to a sensible default rather
+# than raising.
 
 
 def _coerce_confidence(value: Any) -> float:
@@ -723,10 +666,8 @@ def _yesno(value: bool) -> str:
 def render_outbox_content(analysis: FailureAnalysis) -> str:
     """Concise, user-visible mailbox outbox notification for one analysis (#148).
 
-    Every field pulled in here already went through ``redact``/``_bounded``
-    when the analysis was coerced from the model's output (or, for an
-    unavailable analysis, when the escalation reason was captured) - so no
-    additional redaction is needed at render time.
+    Every field pulled in was already redacted/bounded when the analysis was coerced from
+    the model's output, so no additional redaction is needed at render time.
     """
     front_matter = (
         "---\n"
@@ -779,14 +720,9 @@ def render_outbox_content(analysis: FailureAnalysis) -> str:
 class FailureAnalysisService:
     """Reusable failure-analysis entry point, backed by the local Nexus LLM.
 
-    Usable from anywhere a failure needs interpreting: task finalization
-    landing in ``needs_review``, a failed/interrupted mailbox task, a
-    repeated repair-loop, a tool-call failure, malformed LLM/tool output, a
-    missing capability, or a manual/debug request to analyze a specific
-    Nexus failure. Callers are never required to know about SQLite,
-    ``central_logging``, or the LLM client - only :meth:`analyze` (generic
-    evidence bundle) or :meth:`analyze_from_logs` (structured-log-backed
-    convenience wrapper).
+    Callers never need to know about SQLite, ``central_logging`` or the LLM client - use
+    :meth:`analyze` (generic evidence bundle) or :meth:`analyze_from_logs` (structured-
+    log-backed wrapper).
     """
 
     def __init__(
@@ -808,17 +744,11 @@ class FailureAnalysisService:
     ) -> None:
         """Build an analyzer bound to the shared local-LLM job service (#167).
 
-        *job_service* injects an existing :class:`LocalLlmJobService`;
-        *llama_client* injects the inference client a private job service
-        should drive. With neither, the process-wide shared service for
-        *db_path* is acquired, which is what puts failure-analysis jobs on the
-        same queue and worker as controller jobs.
-
-        *analysis_timeout_seconds* is accepted but ignored: a valid diagnosis
-        on the deployed local model may legitimately take minutes, and the
-        60s deadline this used to install is exactly what turned a healthy
-        slow analysis into ``analysis_unavailable`` (#167). Liveness is the
-        shared job service's job now.
+        With neither *job_service* nor *llama_client*, the process-wide shared service for
+        *db_path* is acquired, putting failure-analysis jobs on the same queue/worker as
+        controller jobs. *analysis_timeout_seconds* is accepted but ignored: a valid
+        diagnosis may take minutes, and the old 60s deadline turned healthy slow analyses
+        into ``analysis_unavailable`` (#167) - liveness is the job service's job now.
         """
         self.db_path = db_path
         if analysis_timeout_seconds is not None:
@@ -830,11 +760,8 @@ class FailureAnalysisService:
         self._log_dir = Path(log_dir)
         self._max_tool_steps = max(0, min(int(max_tool_steps), 8))
 
-        # Outbox publishing (#148) is optional: a caller that never supplies
-        # mailbox_config (or outbox_dir + repo_root) still gets a fully
-        # working analyzer - it just never emits an outbox notification for
-        # its analyses. This keeps every existing construction site (tests,
-        # the manual/API entry points) working unchanged.
+        # Outbox publishing (#148) is optional: without mailbox_config the analyzer just never
+        # emits a notification, keeping every existing construction site working.
         if mailbox_config is not None:
             self._outbox_dir: Path | None = Path(mailbox_config.outbox_dir)
             self._repo_root: Path | None = Path(mailbox_config.mailbox_repo_path)
@@ -848,32 +775,23 @@ class FailureAnalysisService:
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
-        # Schema ownership (#148): the failure_analyses table + its additive
-        # outbox/correlation columns are created centrally by
-        # modules.run_store.schema.init_db() (called just above), the same
-        # place operation_chains/mailbox_task_approvals are created. That
-        # guarantees the table exists before any caller touches it -
-        # including FailureAnalysisOutboxPublisher, which never constructs
-        # a FailureAnalysisService and would otherwise be able to run its
-        # first query against a database where the table was never made.
+        # Schema ownership (#148): the failure_analyses table is created centrally by
+        # modules.run_store.schema.init_db(), the same place the other tables are created, so
+        # it exists before any caller - including FailureAnalysisOutboxPublisher - queries it.
 
-        # Inference wiring last: an unusable database must fail construction
-        # before a job worker is started for it.
+        # Inference wiring last: an unusable database must fail construction before a job
+        # worker is started for it.
         self._jobs = job_service or acquire_local_llm_job_service(
             db_path=db_path, llama_client=llama_client
         )
         self._owns_jobs = job_service is None
-        # Kept for provider/model reporting only (the analysis record, logs and
-        # observability all name the model). Production inference never calls
-        # this client directly - it goes through self._jobs.
+        # Kept for provider/model reporting only; production inference goes through self._jobs,
+        # never this client directly.
         self._client = getattr(self._jobs, "llama", None)
 
-        # Optional tool access (#172). Supplied either as a ready router or as
-        # the operations registry to build one from; without either, the
-        # evidence-gathering phase is simply never entered and this service
-        # behaves exactly as it did before. Building the router cannot be
-        # allowed to fail construction: an analyzer that can still read
-        # evidence is worth more than no analyzer at all.
+        # Optional tool access (#172): a ready router or a registry to build one from; without
+        # either the gathering phase is never entered. Building the router must not fail
+        # construction - an analyzer that can still read logs is worth more than none.
         self._tool_router: NexusToolRouter | None = tool_router
         if self._tool_router is None and operations_registry is not None:
             try:
@@ -891,19 +809,16 @@ class FailureAnalysisService:
                     exc_info=True,
                 )
                 self._tool_router = None
-        # The controller's duplicate/looping protections, reused rather than
-        # re-invented: the analysis id is the session, so one analysis's
-        # bounded budget can never be spent by another's.
+        # Reuse the controller's duplicate/looping protections: the analysis id is the session,
+        # so one analysis's bounded budget is never spent by another's.
         self._tool_guard: PersistentToolLoopGuard | None = None
         if self._tool_router is not None and self._max_tool_steps > 0:
             try:
                 self._tool_guard = PersistentToolLoopGuard(
                     db_path=db_path,
                     max_total_steps=self._max_tool_steps,
-                    # 2 would make the *first* repeat terminal, ending the
-                    # whole gathering phase on one wasted call. A repeat costs
-                    # that call; the phase ends when the model keeps repeating
-                    # (#175).
+                    # 2 would make the *first* repeat terminal; a repeat just costs that call, and the phase
+                    # ends when the model keeps repeating (#175).
                     max_identical_calls=3,
                     max_non_progressing_cycles=2,
                 )
@@ -923,9 +838,6 @@ class FailureAnalysisService:
         if self._owns_jobs:
             release_local_llm_job_service(self._jobs)
 
-    # ------------------------------------------------------------------
-    # Public entry points
-    # ------------------------------------------------------------------
 
     def analyze(
         self,
@@ -941,14 +853,9 @@ class FailureAnalysisService:
     ) -> FailureAnalysis:
         """Sync entry point for callers with no event loop of their own.
 
-        Wraps :meth:`analyze_async` in ``asyncio.run`` - the same pattern
-        :class:`~modules.task_orchestrator.NexusTaskOrchestrator` uses for
-        its own sync ``run()``. Do **not** call this from inside a running
-        event loop (``asyncio.run`` raises ``RuntimeError`` there); an
-        async caller should await :meth:`analyze_async` directly instead,
-        which is exactly what makes this service reusable from a future
-        async orchestrator/tool-call path, not just today's sync mailbox
-        workers and sync FastAPI endpoints.
+        Wraps :meth:`analyze_async` in ``asyncio.run``. Do **not** call this from inside a
+        running event loop (``asyncio.run`` raises ``RuntimeError`` there) - await
+        :meth:`analyze_async` directly instead.
         """
         return asyncio.run(
             self.analyze_async(
@@ -977,25 +884,16 @@ class FailureAnalysisService:
     ) -> FailureAnalysis:
         """Best-effort structured diagnosis of *failure*. Never raises.
 
-        The core async entry point - awaitable directly from any async
-        caller, so it works whether or not an event loop is already
-        running. *evidence* should already be bounded/relevant (see
-        :func:`evidence_from_log_entries`); this method bounds it again
-        defensively regardless of what the caller passed.
-
-        *experiment_id*/*mailbox_task_id* correlate the analysis with the
-        mailbox task / experiment lifecycle that triggered it (#148, both
-        optional - plenty of callers diagnose something with no mailbox
-        context at all). When at least one is supplied, a concise outbox
-        notification is published in addition to the full structured
-        record persisted below.
+        *evidence* should already be bounded/relevant (see :func:`evidence_from_log_entries`);
+        it is bounded again defensively here. *experiment_id*/*mailbox_task_id* correlate the
+        analysis with the lifecycle that triggered it (#148, both optional); when at least one
+        is supplied, a concise outbox notification is published in addition to the persisted
+        record.
         """
         analysis_id = uuid.uuid4().hex
         if _ANALYSIS_IN_PROGRESS.get():
-            # Bounded and explicit (#167): one analysis per failure. A nested
-            # request is refused before any job is queued and before anything
-            # is persisted, so a failing analysis can never fan out into more
-            # analyses or more durable records.
+            # Re-entrancy (#167): one analysis per failure - a nested request is refused before any
+            # job is queued or record persisted, so a failing analysis cannot fan out.
             logger.warning(
                 "failure_analysis: refusing nested analysis for %s/%s",
                 subject_type, subject_id,
@@ -1040,10 +938,8 @@ class FailureAnalysisService:
             _ANALYSIS_IN_PROGRESS.reset(guard_token)
         persisted = self._persist(analysis)
         self._log(analysis, elog)
-        # Only publish an outbox notification once the durable record it
-        # points back to actually exists (#148 review): otherwise a DB
-        # write failure could still leave an untracked outbox file with no
-        # corresponding failure_analyses row to publish/track it from.
+        # Publish the outbox notification only once the durable record it points back to exists
+        # (#148 review) - otherwise a DB write failure could leave an untracked orphan file.
         if persisted:
             self._publish_outbox(analysis)
         return analysis
@@ -1089,23 +985,13 @@ class FailureAnalysisService:
     ) -> FailureAnalysis:
         """Convenience wrapper: build the evidence bundle from structured logs.
 
-        Both halves come from the shared diagnostic backend (#188) rather than
-        from a log lookup of this module's own. That backend merges the
-        experiment's JSONL log with its correlated pre-experiment mailbox task
-        log - the same merge the Logs API and the ``nexus logs`` commands use,
-        so the bundle covers the whole task path (mailbox intake through
-        adoption/finalization) and an operator running ``nexus logs`` on the
-        same task sees exactly the facts this diagnosis saw.
-
-        It also answers the question logs alone cannot: *was this interrupted,
-        is it still running, or did it finish?* A task whose worker died
-        mid-run leaves a log that simply stops, which reads identically to one
-        that is still going; the lifecycle row plus the heartbeat/progress
-        signal is what separates the two, and saying "interrupted" instead of
-        "ran out of log" is most of a diagnosis.
-
-        Best-effort throughout: an unresolvable subject or an unreadable log
-        directory costs the extra context, never the analysis.
+        Both halves come from the shared diagnostic backend (#188), merging the experiment
+        JSONL log with its correlated mailbox task log - the same merge the Logs API uses,
+        so the bundle covers the whole task path. It also answers what logs alone cannot:
+        was this interrupted, still running, or finished - a log that simply stops reads
+        the same as one still going, and only the lifecycle row + heartbeat separates them.
+        Best-effort: an unresolvable subject or unreadable log costs the extra context,
+        never the analysis.
         """
         state, entries = self._diagnostic_evidence(
             experiment_id=experiment_id, mailbox_task_id=mailbox_task_id
@@ -1146,9 +1032,6 @@ class FailureAnalysisService:
         finally:
             diagnostics.close()
 
-    # ------------------------------------------------------------------
-    # Current-evidence gathering through the shared tool router (#172)
-    # ------------------------------------------------------------------
 
     async def _tool_schema_completion(
         self,
@@ -1160,12 +1043,9 @@ class FailureAnalysisService:
         role: str = "tool_resolver",
         task_logger: Any | None = None,
     ) -> tuple[str, str]:
-        """The router's inference path for this role: the shared job queue.
-
-        Failure analysis has no memory budget plan and no external fallback of
-        its own - it queues on the same local-LLM job service every other role
-        uses (#167), under its own role label so the resolver calls a diagnosis
-        made stay attributable.
+        """The router's inference path for this role: the shared job queue (#167),
+        under this role's own label so resolver calls stay attributable. No memory budget
+        and no external fallback of its own.
         """
         del task_logger
         job_id = self._jobs.submit(
@@ -1192,10 +1072,9 @@ class FailureAnalysisService:
     ) -> dict[str, Any]:
         """One tool result, bounded and redacted, ready for the model context.
 
-        Nothing from a tool reaches a prompt, a log, the persisted analysis or
-        the outbox except through here: every value is coerced to text,
-        redacted and length-capped, and the raw registry payload is dropped
-        rather than carried along.
+        Nothing from a tool reaches a prompt, a log, the persisted analysis or the outbox
+        except through here: every value is coerced to text, redacted and length-capped,
+        and the raw registry payload is dropped.
         """
         observation: dict[str, Any] = {
             "step": step,
@@ -1216,10 +1095,8 @@ class FailureAnalysisService:
                     raw.get("reason") or reason, _MAX_TOOL_REASON_CHARS
                 )
             elif raw.get("resolved_arguments") is None:
-                # Resolved, but its arguments could not be tied to the goal, so
-                # it was not executed. Say why: without it the next step only
-                # sees a lookup that led nowhere and no reason to call the tool
-                # itself (#177 review).
+                # Resolved, but its arguments could not be tied to the goal, so it was not executed -
+                # say why, or the next step sees a lookup that led nowhere with no reason (#177 review).
                 observation["reason"] = _bounded(
                     "not executed - "
                     + str(raw.get("arguments_binding_reason") or "arguments unresolved")
@@ -1255,11 +1132,9 @@ class FailureAnalysisService:
     def _tool_evidence_note(self, observations: list[dict[str, Any]]) -> str | None:
         """What the diagnosis should say about evidence it could not get.
 
-        Silence here is what produced the failure mode in #172: an analysis
-        that never checked anything read exactly like one that checked and
-        found nothing. Naming the gap - no tool access at all, or no capability
-        for what was asked - keeps "I could not verify this" a stated finding
-        rather than an unstated assumption.
+        Silence here is the #172 failure mode: an analysis that never checked read exactly
+        like one that checked and found nothing. Naming the gap keeps "I could not verify
+        this" a stated finding rather than an unstated assumption.
         """
         if self._tool_router is None or self._max_tool_steps <= 0:
             return (
@@ -1301,9 +1176,8 @@ class FailureAnalysisService:
     ) -> list[dict[str, Any]]:
         """Bounded, read-only current evidence for this failure. Never raises.
 
-        Returns the gathered observations in order. An empty list means the
-        phase was skipped or produced nothing - which is a valid outcome, not
-        an error: the diagnosis below then proceeds on logged evidence alone
+        Returns the gathered observations in order; an empty list is a valid outcome (phase
+        skipped or nothing produced) - the diagnosis then proceeds on logged evidence alone
         and says what it could not check.
         """
         router = self._tool_router
@@ -1345,18 +1219,16 @@ class FailureAnalysisService:
         evidence_lines: list[str],
         observations: list[dict[str, Any]],
     ) -> None:
-        """The bounded gathering loop itself, appending into *observations*.
+        """The bounded gathering loop, appending into *observations*.
 
-        Split out so partial progress survives: whatever was already gathered
-        when something unexpected goes wrong is still evidence, and the caller
-        keeps it instead of discarding the whole phase.
+        Split out so partial progress survives an unexpected error: whatever was already
+        gathered is still evidence.
         """
         router = self._tool_router
         guard = self._tool_guard
         assert router is not None and guard is not None
-        # One state token per analysis: the failure being diagnosed does not
-        # change while it is diagnosed, so every lookup in this run shares a
-        # budget and a repeat really is a repeat.
+        # One state token per analysis: the failure being diagnosed does not change while it is
+        # diagnosed, so every lookup shares a budget and a repeat really is a repeat.
         state_token = f"analysis:{analysis_id}"
         for step in range(1, self._max_tool_steps + 1):
             within_budget, _ = guard.claim_step(analysis_id, state_token)
@@ -1401,9 +1273,8 @@ class FailureAnalysisService:
             action = str(decision.get("action", "")).strip().lower()
             reason = str(decision.get("reason", ""))
             if action not in (TOOL_FIND_TOOL, ACTION_CALL_TOOL):
-                # "done", or anything else: the model has nothing more to look
-                # up. Either way this phase is over - it is not the place to
-                # argue with the model about its own vocabulary.
+                # "done", or anything else: the phase is over - not the place to argue with the model
+                # about its own vocabulary.
                 break
 
             if action == TOOL_FIND_TOOL:
@@ -1426,12 +1297,9 @@ class FailureAnalysisService:
                 )
                 if check.stop:
                     break
-                # A silent `continue` left the model no way to learn that the
-                # call was refused: the next prompt looked exactly like the
-                # last one, so it repeated the same call and spent the budget
-                # on nothing. The refusal is an observation about the
-                # diagnosis attempt, the same way an invalid tool request is
-                # (#175).
+                # A silent continue left the model no way to learn a call was refused, so it repeated the
+                # same call and spent the budget on nothing; the refusal is an observation about the
+                # diagnosis attempt, like an invalid tool request (#175).
                 observations.append(
                     self._bounded_tool_observation(
                         step,
@@ -1468,9 +1336,8 @@ class FailureAnalysisService:
                         }
                     )
             except ToolRouterError as exc:
-                # A bad tool request is evidence about the diagnosis attempt,
-                # not a failure of it: record it and let the model try
-                # something else within the same budget.
+                # A bad tool request is evidence about the diagnosis attempt, not a failure of it: record
+                # it and let the model try something else within the same budget.
                 result = {
                     "operation": arguments.get("tool", ""),
                     "error": "invalid_tool_request",
@@ -1508,34 +1375,18 @@ class FailureAnalysisService:
     def _directly_executable_operation(
         result: dict[str, Any],
     ) -> tuple[str, dict[str, Any]] | None:
-        """The operation and arguments a resolved ``find_tool`` may run with.
+        """The operation and arguments a resolved ``find_tool`` may run with, or ``None``
+        for the ordinary bounded decision flow.
 
-        ``None`` means no direct execution: the ordinary bounded decision flow
-        applies instead.
-
-        Asking the local model to confirm "now call the tool you just asked
-        for" is not a decision, it is a formality - and an expensive one: each
-        controller-style decision costs many minutes on the 7B model, and in
-        analysis ``878e8008`` the model answered the formality by repeating its
-        ``find_tool`` instead of issuing ``call_tool``. The guard refused the
-        duplicate, gathering ended with one observation and no diagnostic
-        operation ever ran, and the diagnosis fell back on the stale token
-        hypothesis (#177).
-
-        Executing it instead is deterministic: the resolver returned exactly
-        one operation, the grant for it is already recorded, and
-        :meth:`NexusToolRouter.execute_operation` independently refuses
-        anything outside the read-only set. This returns ``None`` whenever that
-        determinism does not hold - a resolution that found nothing, or a spec
-        that does not *state* it is read-only.
-
-        Arguments are not this method's judgement call. The router binds them
-        against the goal and refuses to bind whatever it cannot tie back to
-        it, so ``resolved_arguments`` is either the values the goal actually
-        named or ``None``. Treating ``None`` as "run it with the defaults" is
-        the one reading that must never happen: it is how a goal naming
-        ``llama-server`` would have been answered with ``agent-api`` (#177
-        review).
+        Direct execution is deterministic - the resolver returned exactly one operation,
+        the grant is recorded, and ``execute_operation`` independently refuses anything
+        outside the read-only set - and skips an expensive model formality that once made
+        the model repeat find_tool instead (#177). Returns ``None`` whenever that
+        determinism does not hold, or when the spec does not *state* read-only: a missing
+        ``mutates_state`` field is not a "no", and inferring one is how a mutating operation
+        becomes auto-executable. ``resolved_arguments`` is ``None`` when the router could
+        not tie a value back to the goal, and that must never be read as "run with the
+        defaults" (#177 review).
         """
         if str(result.get("status") or "") != "found":
             return None
@@ -1543,8 +1394,8 @@ class FailureAnalysisService:
         if not operation:
             return None
         spec = result.get("operation")
-        # Read-only must be stated. A missing field is not a "no", and
-        # inferring one is how a mutating operation becomes auto-executable.
+        # Read-only must be stated: a missing field is not a "no", and inferring one is how a
+        # mutating operation becomes auto-executable.
         if not isinstance(spec, dict) or spec.get("mutates_state") is not False:
             return None
         arguments = result.get("resolved_arguments")
@@ -1564,17 +1415,16 @@ class FailureAnalysisService:
     ) -> dict[str, Any] | None:
         """Run an already-resolved read-only operation through the normal path.
 
-        Deliberately the same ``guard.check`` -> ``execute_operation`` ->
-        ``record_result`` sequence an explicit ``call_tool`` takes, so the loop
-        guard, the grant rule, the registry's validation and its audit record
-        all still apply. Only the LLM decision in front of it is skipped.
+        Deliberately the same ``guard.check`` -> ``execute_operation`` -> ``record_result``
+        sequence an explicit ``call_tool`` takes, so the loop guard, grant rule, registry
+        validation and audit record all still apply - only the LLM decision is skipped.
         """
         router = self._tool_router
         guard = self._tool_guard
         if router is None or guard is None:
             return None
-        # The signature carries the arguments, so the same operation asked for
-        # with different values is a different call, not a refused repeat.
+        # The signature carries the arguments: the same operation with different values is a
+        # different call, not a refused repeat.
         check = guard.check(
             analysis_id,
             ACTION_CALL_TOOL,
@@ -1615,9 +1465,6 @@ class FailureAnalysisService:
         )
         return self._bounded_tool_observation(step, ACTION_CALL_TOOL, result, reason)
 
-    # ------------------------------------------------------------------
-    # Core analysis
-    # ------------------------------------------------------------------
 
     async def _analyze(
         self,
@@ -1649,9 +1496,8 @@ class FailureAnalysisService:
         failure_text = _bounded(failure_text, _MAX_FAILURE_TEXT_CHARS) or "(no failure detail supplied)"
         bounded_goal = _bounded(goal, _MAX_GOAL_CHARS) if goal else None
 
-        # Check the claims before interpreting them (#172). Read-only,
-        # bounded, and optional: without a tool router this returns nothing
-        # and the diagnosis below is exactly the one it always was.
+        # Check the claims before interpreting them (#172): read-only, bounded, optional - without
+        # a router this returns nothing and the diagnosis is exactly what it always was.
         tool_observations = await self._gather_tool_evidence(
             analysis_id=analysis_id,
             subject_type=subject_type,
@@ -1676,10 +1522,9 @@ class FailureAnalysisService:
         )
 
         model_name = getattr(self._client, "model", None)
-        # Local inference goes through the shared job service (#167): one
-        # queue, one worker, one set of job semantics for controller and
-        # failure-analysis work alike. No deadline is imposed here - the job
-        # service decides when a job is genuinely stuck.
+        # Local inference goes through the shared job service (#167): one queue, one worker for
+        # controller and analysis work alike; no deadline here - the job service decides when a
+        # job is genuinely stuck.
         job_id = self._jobs.submit(
             prompt,
             temperature=0.0,
@@ -1696,9 +1541,8 @@ class FailureAnalysisService:
         try:
             raw = await self._jobs.wait(job_id)
         except LocalLlmJobError as exc:
-            # Job failure, cancellation and stuck-job detection all land here
-            # and all produce the same durable analysis_unavailable record.
-            # Nothing re-triggers an analysis: the original lifecycle failure
+            # Job failure, cancellation and stuck-job detection all land here as the same durable
+            # analysis_unavailable record; nothing re-triggers an analysis - the original failure
             # keeps whatever result it already had.
             logger.warning(
                 "failure_analysis: local LLM job did not produce a result job_id=%s "
@@ -1723,8 +1567,7 @@ class FailureAnalysisService:
         try:
             data = extract_json(raw)
         except LlamaCppClientError as exc:
-            # Malformed model output must degrade gracefully, not cascade
-            # into a TaskOrchestratorError-style failure of the caller.
+            # Malformed model output degrades gracefully; it must not cascade into a caller failure.
             return _unavailable_analysis(
                 analysis_id=analysis_id,
                 subject_type=subject_type,
@@ -1759,18 +1602,13 @@ class FailureAnalysisService:
             mailbox_task_id=mailbox_task_id,
         )
 
-    # ------------------------------------------------------------------
-    # Persistence / visibility
-    # ------------------------------------------------------------------
 
     def _persist(self, analysis: FailureAnalysis) -> bool:
-        """Durably store *analysis*. Returns True on success.
+        """Durably store *analysis*. Returns True on success, never raises.
 
-        Never raises - a persistence failure must not break the caller -
-        but the caller (analyze_async) uses the return value to decide
-        whether it is safe to publish an outbox notification: an outbox
-        message that outlives its own DB row would be an untracked orphan
-        with no publish-lifecycle record behind it (#148 review).
+        The caller uses the return value before publishing an outbox notification: a message
+        that outlives its own DB row would be an untracked orphan with no publish-lifecycle
+        record behind it (#148 review).
         """
         try:
             with self._conn:
@@ -1829,19 +1667,13 @@ class FailureAnalysisService:
         except Exception:  # noqa: BLE001 - logging must never break the caller
             logger.warning("failure_analysis: could not write elog entry", exc_info=True)
 
-    # ------------------------------------------------------------------
-    # Mailbox outbox publishing (#148)
-    # ------------------------------------------------------------------
 
     def _publish_outbox(self, analysis: FailureAnalysis) -> None:
         """Best-effort: publish one outbox notification for *analysis*.
 
-        Never raises and never touches the analysis record's own columns -
-        a publish failure here must not alter the underlying diagnosis or
-        the lifecycle state it describes. Skipped entirely when this
-        service was constructed without outbox configuration, or when the
-        analysis has no mailbox task / experiment correlation at all (a
-        manual/API-only analysis has nothing to notify).
+        Never raises and never touches the analysis record's own columns - a publish failure
+        must not alter the diagnosis or the lifecycle state it describes. Skipped without
+        outbox configuration or without a mailbox/experiment correlation.
         """
         if self._outbox_dir is None or self._repo_root is None:
             return
@@ -1907,11 +1739,6 @@ class FailureAnalysisService:
         params.append(limit)
         rows = self._conn.execute(query, params).fetchall()
         return [_json_loads(row["analysis_json"]) for row in rows]
-
-    def latest_for_subject(self, subject_type: str, subject_id: str) -> dict[str, Any] | None:
-        results = self.list_recent(limit=1, subject_type=subject_type, subject_id=subject_id)
-        return results[0] if results else None
-
 
 def _json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)

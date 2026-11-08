@@ -6,10 +6,16 @@ import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
+from urllib.request import Request
 
-from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
+from modules.github_work_tracking import (
+    _CrossHostRedirectDropsToken,
+    GitHubWorkTrackingError,
+    GitHubWorkTrackingService,
+    failing_test_names,
+)
 
 
 class FakeGitHub:
@@ -22,10 +28,21 @@ class FakeGitHub:
         self.commit_parents = {}
         self.pulls = []
         self.workflow_runs = []
+        self.comments = []
+        self.fail_comments = False
+        self.jobs = []
+        self.job_log = ""
         self.calls = []
 
     def __call__(self, method, path, payload):
         self.calls.append((method, path, payload))
+
+        if method == "POST" and path.endswith("/comments"):
+            if self.fail_comments:
+                raise GitHubWorkTrackingError("GitHub HTTP 502: bad gateway")
+            number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+            self.comments.append((number, payload["body"]))
+            return {"id": len(self.comments)}
 
         if method == "GET" and path.startswith("/repos/tire0011/agent-lab/issues/"):
             number = int(path.rsplit("/", 1)[1])
@@ -72,6 +89,16 @@ class FakeGitHub:
 
         if method == "GET" and "/actions/workflows/" in path:
             return {"workflow_runs": [dict(run) for run in self.workflow_runs]}
+
+        if method == "GET" and path.endswith("/jobs"):
+            if isinstance(self.jobs, Exception):
+                raise self.jobs
+            return {"jobs": self.jobs}
+
+        if method == "GET" and path.endswith("/logs"):
+            if isinstance(self.job_log, Exception):
+                raise self.job_log
+            return self.job_log
 
         if method == "POST" and path == "/repos/tire0011/agent-lab/pulls":
             pr = {
@@ -341,6 +368,27 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertIn(ref.branch_name, self.fake.refs)
         self.assertTrue(any(call[0:2] == ("POST", "/repos/tire0011/agent-lab/issues") for call in self.fake.calls))
 
+    def test_controller_task_reuses_issue_from_goal_header(self):
+        self.fake.issues[220] = {
+            "number": 220,
+            "title": "Mailbox: accept all commands",
+            "state": "open",
+        }
+        source = SimpleNamespace(
+            source_type="task",
+            source_id="controller-220",
+            title="Nexus controller task",
+            content="GitHub Issue #220: Mailbox: accept all commands\n\nDetails.",
+        )
+
+        with patch.object(self.service, "_reuse_issue", wraps=self.service._reuse_issue) as reuse, \
+             patch.object(self.service, "_create_issue", wraps=self.service._create_issue) as create:
+            ref = self.service.ensure_for_source(source)
+
+        self.assertEqual(ref.issue_number, 220)
+        reuse.assert_called_once_with(220)
+        create.assert_not_called()
+
     def test_pr_merge_closes_issue_and_keeps_experiment_link(self):
         source = SimpleNamespace(
             source_type="issue",
@@ -362,6 +410,30 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         stored = self.service.for_experiment("exp-merge")
         self.assertEqual(stored.pr_number, 100)
         self.assertEqual(stored.branch_name, "nexus/42-github-lifecycle")
+
+    def test_issue_closed_by_the_merge_itself_is_not_an_error(self):
+        source = SimpleNamespace(
+            source_type="issue",
+            source_id="42",
+            title="GitHub lifecycle",
+            content="GitHub Issue #42: GitHub lifecycle",
+        )
+        ref = self.service.bind_experiment(self.service.ensure_for_source(source), "exp-raced")
+        ref = self.service.ensure_pull_request(ref, title="Implement", body="Fixes #42")
+        fake = self.fake
+        original = fake.__call__
+
+        def racing(method, path, payload=None):
+            # "Fixes #42" closed the issue first; GitHub refuses the second close.
+            if method == "PATCH" and path.endswith("/issues/42") and (payload or {}).get("state") == "closed":
+                fake.issues[42]["state"] = "closed"
+                raise GitHubWorkTrackingError(
+                    'GitHub HTTP 422: {"message":"This issue was closed by another request."}'
+                )
+            return original(method, path, payload)
+
+        self.service._request = racing
+        self.assertEqual(self.service.merge_and_complete(ref, expected_head_sha="head-sha"), "merged-sha")
 
     def test_failed_verification_is_written_to_existing_draft_pr(self):
         source = SimpleNamespace(
@@ -393,6 +465,56 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertIn("python -m unittest", body)
         self.assertIn("Exit code: `1`", body)
         self.assertIn("FAILED test_example", body)
+
+    def test_issue_progress_comments_once_per_state_with_id_and_pr(self):
+        source = SimpleNamespace(
+            source_type="issue",
+            source_id="42",
+            title="GitHub lifecycle",
+            content="GitHub Issue #42: GitHub lifecycle",
+        )
+        ref = self.service.bind_experiment(self.service.ensure_for_source(source), "exp-progress")
+
+        self.assertTrue(self.service.post_progress("exp-progress", "started"))
+        self.assertFalse(self.service.post_progress("exp-progress", "started"))
+        self.service.ensure_pull_request(ref, title="WIP", body="pending", draft=True)
+        self.fake.fail_comments = True
+        self.assertFalse(
+            self.service.post_progress("exp-progress", "needs_review", detail="Reason: gate unsure")
+        )
+        self.fake.fail_comments = False
+        self.assertTrue(
+            self.service.post_progress("exp-progress", "needs_review", detail="Reason: gate unsure")
+        )
+        self.assertFalse(self.service.post_progress("exp-progress", "needs_review"))
+        self.assertFalse(self.service.post_progress("unlinked-exp", "started"))
+
+        self.assertEqual([number for number, _ in self.fake.comments], [42, 42])
+        started, review = (body for _, body in self.fake.comments)
+        self.assertIn("Nexus experiment exp-progress started", started)
+        self.assertIn(ref.branch_name, started)
+        self.assertIn("Nexus experiment exp-progress requires review.", review)
+        self.assertIn(f"Pull request: #{ref.pr_number}", review)
+        self.assertIn("Reason: gate unsure", review)
+
+    def test_finished_pipeline_maps_to_issue_progress_outcome(self):
+        from modules.experiment_service.service import _final_issue_progress
+
+        def outcome(status, **fields):
+            return _final_issue_progress(
+                SimpleNamespace(**{"status": status, "test_output": None, "error": None, **fields})
+            )
+
+        self.assertEqual(
+            outcome("succeeded", test_output="===== 18 passed in 0.4s ====="),
+            (
+                ("verification_passed", "Tests: 18 passed in 0.4s."),
+                ("completed", None),
+            ),
+        )
+        self.assertEqual(outcome("needs_review", error="gate unsure"), (("needs_review", "Reason: gate unsure"),))
+        self.assertEqual(outcome("timed_out", error="watchdog"), (("failed", "Reason: watchdog"),))
+        self.assertEqual(outcome("cancelled"), ())
 
     def _bind_checkpoint(self, sha: str = "checkpoint-sha"):
         ref = self.service.bind_experiment(
@@ -594,6 +716,236 @@ class GitHubWorkTrackingTests(unittest.TestCase):
 
         self.assertEqual(result.status, "unavailable")
         self.assertIn("no matching", result.reason)
+
+
+
+_PYTEST_LOG = "\n".join(
+    [
+        "2026-11-01T08:25:01.1234567Z ##[group]Run python scripts/run_tests_ci.py",
+        "2026-11-01T08:25:30.1234567Z tests/test_a.py:12: in test_one",
+        "2026-11-01T08:25:31.1234567Z =========== short test summary info ===========",
+        "2026-11-01T08:25:31.2234567Z FAILED tests/test_a.py::ATest::test_one - AssertionError: 1 != 2",
+        "2026-11-01T08:25:31.3234567Z ERROR: Could not find a version that satisfies pkg",
+        "2026-11-01T08:25:32.1234567Z 1 failed, 200 passed in 72.91s",
+        "2026-11-01T08:25:32.2234567Z ##[error]Process completed with exit code 1.",
+        "2026-11-01T08:25:33.1234567Z Post job cleanup.",
+    ]
+)
+
+
+class FailureDetailTests(unittest.TestCase):
+    """What a red run says about itself reaches the verdict (#472)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.fake = FakeGitHub()
+        self.fake.jobs = [
+            {
+                "id": 7,
+                "name": "lint",
+                "conclusion": "success",
+                "steps": [{"name": "Lint", "conclusion": "success"}],
+            },
+            {
+                "id": 8,
+                "name": "unittest",
+                "conclusion": "failure",
+                "steps": [
+                    {"name": "Checkout", "conclusion": "success"},
+                    {"name": "Run tests", "conclusion": "failure"},
+                ],
+            },
+        ]
+        self.fake.job_log = _PYTEST_LOG
+        self.service = GitHubWorkTrackingService(
+            db_path=str(Path(self.temp_dir.name) / "agent.db"),
+            repo_root=self.temp_dir.name,
+            repository="tire0011/agent-lab",
+            transport=self.fake,
+        )
+        self.addCleanup(self.service.close)
+
+    def _run(self, conclusion="failure"):
+        self.fake.workflow_runs = [
+            {
+                "id": 55,
+                "run_attempt": 1,
+                "head_sha": "a" * 40,
+                "event": "push",
+                "status": "completed",
+                "conclusion": conclusion,
+            }
+        ]
+        return self.service.wait_for_commit_ci(
+            "a" * 40, experiment_id="exp-1", poll_interval_seconds=0.01
+        )
+
+    def test_a_failed_run_names_the_step_and_the_tests(self):
+        result = self._run()
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("Failed job: unittest", result.failure_detail)
+        self.assertIn("Failed step: Run tests", result.failure_detail)
+        self.assertIn("FAILED tests/test_a.py::ATest::test_one", result.failure_detail)
+        self.assertIn("1 failed, 200 passed", result.failure_detail)
+        self.assertEqual(
+            [call[1] for call in self.fake.calls[-2:]],
+            [
+                "/repos/tire0011/agent-lab/actions/runs/55/jobs",
+                "/repos/tire0011/agent-lab/actions/jobs/8/logs",
+            ],
+        )
+
+    def test_the_log_tail_drops_timestamps_and_post_job_cleanup(self):
+        detail = self._run().failure_detail
+
+        self.assertNotIn("2026-11-01T", detail)
+        self.assertNotIn("Post job cleanup", detail)
+
+    def test_unittest_output_is_recognized_too(self):
+        self.fake.job_log = (
+            "FAIL: test_two (tests.test_b.BTest.test_two)\n"
+            "ERROR: tests.test_c (unittest.loader._FailedTest.tests.test_c)\n"
+        )
+
+        self.assertEqual(
+            failing_test_names(self._run().failure_detail),
+            [
+                "test_two (tests.test_b.BTest.test_two)",
+                "tests.test_c (unittest.loader._FailedTest.tests.test_c)",
+            ],
+        )
+
+    def test_a_pytest_collection_error_names_the_broken_file(self):
+        self.assertEqual(
+            failing_test_names("____ ERROR collecting tests/test_d.py ____\n"),
+            ["tests/test_d.py"],
+        )
+
+    def test_a_line_that_only_looks_like_a_failure_names_no_test(self):
+        self.assertEqual(
+            failing_test_names(
+                "ERROR: Could not find a version that satisfies pkg\n"
+                "ERROR:root:log record\n"
+                "ERROR while reading config\n"
+            ),
+            [],
+        )
+
+    def test_a_failed_lookup_keeps_the_verdict(self):
+        for broken in ("jobs", "job_log"):
+            with self.subTest(broken=broken):
+                self.setUp()
+                setattr(self.fake, broken, GitHubWorkTrackingError("GitHub HTTP 404"))
+
+                result = self._run()
+
+                self.assertEqual(result.status, "failed")
+                self.assertIsNone(result.failure_detail)
+
+    def test_a_malformed_response_keeps_the_verdict(self):
+        for jobs in ([], [{"conclusion": "failure"}], ["not a job"]):
+            with self.subTest(jobs=jobs):
+                self.setUp()
+                self.fake.jobs = jobs
+
+                result = self._run()
+
+                self.assertEqual(result.status, "failed")
+                self.assertIsNone(result.failure_detail)
+
+    def test_an_oversized_log_is_capped_and_keeps_the_test_names(self):
+        filler = "\n".join(f"line {index} " + "x" * 500 for index in range(5000))
+        self.fake.job_log = f"FAILED tests/test_a.py::test_one - boom\n{filler}\n"
+
+        detail = self._run().failure_detail
+
+        self.assertLessEqual(len(detail), 8000)
+        self.assertIn("tests/test_a.py::test_one", detail)
+        self.assertIn("line 4999", detail)
+
+    def test_many_failing_tests_still_fit_the_cap(self):
+        self.fake.job_log = "\n".join(
+            f"FAILED tests/test_a.py::test_{index}_{'y' * 400}" for index in range(500)
+        )
+
+        self.assertLessEqual(len(self._run().failure_detail), 8000)
+
+    def test_a_secret_in_the_log_is_redacted(self):
+        token = "ghp_" + "a1b2c3d4" * 5
+        self.fake.job_log = (
+            f"FAILED tests/test_a.py::test_one - bad {token}\n"
+            "api_key=abcdefgh12345678\n"
+            "##[error]Process completed with exit code 1.\n"
+        )
+
+        detail = self._run().failure_detail
+
+        self.assertNotIn(token, detail)
+        self.assertNotIn("abcdefgh12345678", detail)
+        self.assertIn("[REDACTED]", detail)
+
+    def test_a_secret_is_not_kept_by_cutting_it_in_half(self):
+        token = "ghp_" + "a1b2c3d4" * 5
+        self.fake.job_log = f"{token}\n" + "x" * 20000
+
+        self.assertNotIn(token[:12], self._run().failure_detail)
+
+    def test_a_passed_run_makes_no_extra_request(self):
+        result = self._run(conclusion="success")
+
+        self.assertEqual(result.status, "passed")
+        self.assertIsNone(result.failure_detail)
+        self.assertEqual(
+            [call for call in self.fake.calls if "/jobs" in call[1]], []
+        )
+
+
+class JobLogRequestTests(unittest.TestCase):
+    def _service(self, directory):
+        return GitHubWorkTrackingService(
+            db_path=str(Path(directory) / "agent.db"),
+            repo_root=directory,
+            repository="tire0011/agent-lab",
+            token="test-token",
+        )
+
+    def test_a_job_log_comes_back_as_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._service(directory)
+            self.addCleanup(service.close)
+            response = MagicMock()
+            response.__enter__.return_value.read.return_value = b"plain \xff log"
+
+            with patch("modules.github_work_tracking._GITHUB_OPENER.open", return_value=response):
+                log = service._request("GET", "/repos/o/r/actions/jobs/8/logs")
+
+        self.assertIn("plain", log)
+
+    def test_the_token_does_not_follow_a_redirect_to_another_host(self):
+        request = Request(
+            "https://api.github.com/repos/o/r/actions/jobs/8/logs",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+        redirected = _CrossHostRedirectDropsToken().redirect_request(
+            request, None, 302, "Found", {}, "https://logs.blob.core.windows.net/x?sig=y"
+        )
+
+        self.assertFalse(redirected.has_header("Authorization"))
+
+    def test_the_token_follows_a_redirect_inside_github(self):
+        request = Request(
+            "https://api.github.com/repos/o/r/actions/runs/1/jobs",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+        redirected = _CrossHostRedirectDropsToken().redirect_request(
+            request, None, 301, "Moved", {}, "https://api.github.com/repositories/9/actions/runs/1/jobs"
+        )
+
+        self.assertTrue(redirected.has_header("Authorization"))
 
 
 if __name__ == "__main__":

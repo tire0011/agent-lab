@@ -1,35 +1,19 @@
 """Which external coding agent runs the next task.
 
-Nexus has more than one CLI agent available (Codex and Claude Code). Neither
-is preferred: providers are selected in a durable round-robin, so consecutive
-units of work use different agents and both accumulate comparable runs in the
-same store.  The last selection is stored in SQLite and therefore survives a
-service or host restart.
-
-The rotation is narrowed before selection:
-
-  1. ``AGENT_CODING_PROVIDER`` pins one provider (debugging, or standing down
-     an agent during an incident). An unknown value is ignored rather than
-     breaking task execution.
-  2. ``AGENT_CODING_PROVIDERS`` is the allow list (default: all known
-     providers).
-  3. Providers whose CLI is not installed on this machine are dropped, so a
-     half-provisioned VM never selects an agent it cannot run.
-
-If that leaves nothing (no CLI installed at all), the first allowed provider
-is returned anyway: the resulting run then fails with the worker's ordinary
-"binary not found" error, which is the same behaviour as before this module
-existed — an honest failure beats a silent no-op.
-
-Callers that only need "a worker" use :func:`build_random_worker` or
-:func:`random_worker_factory` (legacy names); the provider that was selected is
-reported on every ``WorkerResult.provider``.
+Providers (Codex, Claude Code) are selected in a durable SQLite-backed
+round-robin that survives restarts, so consecutive units of work use different
+agents. Before rotating, the selection is narrowed: ``AGENT_CODING_PROVIDER``
+pins one (unknown values ignored), ``AGENT_CODING_PROVIDERS`` is the allow list,
+and providers whose CLI is not installed are dropped. If nothing is installed,
+the first allowed provider is still returned - the run then fails with the
+ordinary "binary not found" error, an honest failure over a silent no-op.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -39,11 +23,13 @@ from modules.claude_worker import PROVIDER as PROVIDER_CLAUDE
 from modules.claude_worker import _default_claude_bin
 from modules.codex_worker import _DEFAULT_CODEX_BIN, CodexWorker
 from modules.codex_worker import PROVIDER as PROVIDER_CODEX
+from modules.local_coding_worker import LocalCodingWorker, PROVIDER as PROVIDER_LOCAL
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger("modules.coding_provider")
 
 KNOWN_PROVIDERS: tuple[str, ...] = (PROVIDER_CODEX, PROVIDER_CLAUDE)
+EXTERNAL_PROVIDERS: tuple[str, ...] = KNOWN_PROVIDERS
 
 ENV_PROVIDER_PIN = "AGENT_CODING_PROVIDER"
 ENV_PROVIDER_ALLOW_LIST = "AGENT_CODING_PROVIDERS"
@@ -80,22 +66,19 @@ def is_available(provider: str) -> bool:
 
 
 def allowed_providers() -> list[str]:
-    """Providers permitted by configuration, in a stable order.
-
-    Unknown entries in ``AGENT_CODING_PROVIDERS`` are dropped with a warning;
-    an empty or entirely unknown list falls back to all known providers, so a
-    typo cannot leave the system unable to run any task at all.
-    """
+    """Providers permitted by configuration, in a stable order; an empty or
+    entirely unknown allow list falls back to all known providers, so a typo
+    cannot make the system unable to run any task."""
     raw = os.environ.get(ENV_PROVIDER_ALLOW_LIST, "")
     if not raw.strip():
-        return list(KNOWN_PROVIDERS)
+        return list(EXTERNAL_PROVIDERS)
 
     allowed: list[str] = []
     for entry in raw.split(","):
         provider = _normalize(entry)
         if not provider:
             continue
-        if provider not in KNOWN_PROVIDERS:
+        if provider not in EXTERNAL_PROVIDERS:
             logger.warning(
                 "ignoring unknown provider %r in %s", provider, ENV_PROVIDER_ALLOW_LIST
             )
@@ -106,9 +89,9 @@ def allowed_providers() -> list[str]:
     if not allowed:
         logger.warning(
             "%s contained no known provider; falling back to %s",
-            ENV_PROVIDER_ALLOW_LIST, ", ".join(KNOWN_PROVIDERS),
+            ENV_PROVIDER_ALLOW_LIST, ", ".join(EXTERNAL_PROVIDERS),
         )
-        return list(KNOWN_PROVIDERS)
+        return list(EXTERNAL_PROVIDERS)
     return allowed
 
 
@@ -123,7 +106,7 @@ def pinned_provider() -> str | None:
     if not raw.strip():
         return None
     provider = _normalize(raw)
-    if provider not in KNOWN_PROVIDERS:
+    if provider not in EXTERNAL_PROVIDERS:
         logger.warning(
             "ignoring unknown provider %r in %s; using provider rotation instead",
             provider, ENV_PROVIDER_PIN,
@@ -135,13 +118,9 @@ def pinned_provider() -> str | None:
 def choose_provider(
     rng: Any | None = None, *, db_path: str = DEFAULT_DB_PATH
 ) -> str:
-    """Select the next provider in a persistent, concurrency-safe rotation.
-
-    ``rng`` remains as a compatibility argument for existing callers but is
-    intentionally unused: selection is deterministic now. Pins bypass the
-    rotation and do not advance it. The allow list and installed-CLI filter
-    are applied before rotating.
-    """
+    """Select the next provider in a persistent, concurrency-safe rotation. ``rng``
+    is an unused compatibility argument; pins bypass the rotation; the allow list
+    and installed-CLI filter apply first."""
     pinned = pinned_provider()
     if pinned is not None:
         return pinned
@@ -155,10 +134,8 @@ def choose_provider(
         )
         candidates = [fallback]
 
-    # BEGIN IMMEDIATE makes read-next-write one atomic operation across API,
-    # mailbox, and experiment processes sharing the database. Without it two
-    # simultaneous tasks could both observe the same cursor and pick the same
-    # provider.
+    # BEGIN IMMEDIATE makes read-next-write atomic across the processes sharing
+    # the database, so two simultaneous tasks cannot pick the same provider.
     conn = init_db(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -170,8 +147,8 @@ def choose_provider(
         if last in candidates:
             selected = candidates[(candidates.index(last) + 1) % len(candidates)]
         else:
-            # Stable order gives a deterministic first selection and also
-            # handles a previously selected provider being disallowed.
+            # Stable order: deterministic first selection, and a previously
+            # selected but now-disallowed provider falls back safely.
             selected = candidates[0]
         conn.execute(
             """
@@ -191,30 +168,47 @@ def choose_provider(
         conn.close()
 
 
-def provider_of(worker: Any, default: str | None = None) -> str | None:
-    """The provider name *worker* reports, or *default*.
+# A provider's usage limit (e.g. Claude's weekly limit) counts as overload: the
+# other agent takes over and the attempt does not count.
+_OVERLOAD_RE = re.compile(
+    r"\b(?:529|429)\b|overloaded|rate[ _-]?limit|usage[ _-]?limit|limit (?:reached|exceeded)",
+    re.IGNORECASE,
+)
 
-    Anything that is not a known provider name — a test double's auto-created
-    attribute, a worker predating the ``provider`` attribute — yields
-    *default* rather than a value that would be stored or bound to SQL.
-    """
+
+def is_provider_overload(error: Any) -> bool:
+    """The provider was busy, not the work wrong ("API Error: 529 Overloaded")."""
+    return bool(_OVERLOAD_RE.search(str(error or "")))
+
+
+def other_provider(provider: str | None) -> str | None:
+    """Another allowed provider with an installed CLI, for when *provider* is overloaded."""
+    for candidate in allowed_providers():
+        if candidate != provider and is_available(candidate):
+            return candidate
+    return None
+
+
+def provider_of(worker: Any, default: str | None = None) -> str | None:
+    """The provider name *worker* reports, or *default*; anything not a known
+    provider name (test doubles, workers predating the attribute) yields
+    *default* rather than a value that would be stored or bound to SQL."""
     provider = getattr(worker, "provider", None)
-    if isinstance(provider, str) and provider in KNOWN_PROVIDERS:
+    if isinstance(provider, str) and provider in (*KNOWN_PROVIDERS, PROVIDER_LOCAL):
         return provider
     return default
 
 
 def build_worker(provider: str, *, db_path: str | None = None, **kwargs: Any) -> Any:
-    """Construct the worker for *provider*.
-
-    Extra keyword arguments are passed through to the worker class, so a
-    caller can still override e.g. ``max_output_bytes`` or the Claude model.
-    """
+    """Construct the worker for *provider*; extra kwargs pass through to the
+    worker class (e.g. max_output_bytes, the Claude model)."""
     provider = _normalize(provider)
     if provider == PROVIDER_CODEX:
         return CodexWorker(db_path=db_path, **kwargs)
     if provider == PROVIDER_CLAUDE:
         return ClaudeWorker(db_path=db_path, **kwargs)
+    if provider == PROVIDER_LOCAL:
+        return LocalCodingWorker(**kwargs)
     raise UnknownProviderError(
         f"unknown coding provider {provider!r}; known: {KNOWN_PROVIDERS}"
     )
@@ -235,17 +229,11 @@ def random_worker_factory(
     sticky: bool = True,
     **kwargs: Any,
 ) -> Callable[..., Any]:
-    """A ``(working_dir) -> worker`` factory that selects a provider per call.
-
-    Matches the factory signature ``ExperimentService`` expects. The working
-    directory is not used to confine the worker — that is the worker's own job
-    (sandbox mode plus the subprocess ``cwd``) — but it does identify the
-    piece of work: with *sticky* (the default) the first selection for a given
-    working directory is reused for every later call with the same one, so an
-    experiment and its repair attempts run on one agent while different
-    experiments still select independently. Pass ``sticky=False`` for an
-    independent selection on every call.
-    """
+    """A ``(working_dir) -> worker`` factory matching ``ExperimentService``. The
+    working directory does not confine the worker (sandbox + cwd do) but
+    identifies the piece of work: with *sticky* (default) one selection per
+    working directory is reused, so an experiment and its repair attempts share
+    one agent; ``sticky=False`` selects independently per call."""
     drawn: dict[str, str] = {}
 
     def factory(working_dir: Any = None, *_args: Any, **_kwargs: Any) -> Any:

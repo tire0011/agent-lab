@@ -9,7 +9,6 @@ from modules.llama_cpp_client import (
     LlamaCppClient,
     LlamaCppClientError,
     _DEFAULT_BASE_URL,
-    _DEFAULT_MODEL_NAME,
 )
 
 
@@ -19,7 +18,9 @@ def make_client(base_url: str = "http://localhost:8080/v1") -> LlamaCppClient:
 
 # ── Default configuration ─────────────────────────────────────────────────────
 
-def test_default_base_url():
+def test_default_base_url(monkeypatch):
+    monkeypatch.delenv("LOCAL_MODEL_URL")
+    monkeypatch.delenv("LLAMA_CPP_BASE_URL")
     client = LlamaCppClient()
     assert client.base_url == _DEFAULT_BASE_URL.rstrip("/")
 
@@ -30,10 +31,6 @@ def test_default_model_name_is_qwen():
     assert "qwen" in client.model.lower()
     assert "llama" not in client.model.lower()
     assert "2-13b" not in client.model.lower()
-
-
-def test_default_model_name_constant():
-    assert _DEFAULT_MODEL_NAME == "qwen2.5-coder-7b-instruct"
 
 
 def test_local_model_url_env_var(monkeypatch):
@@ -241,4 +238,3 @@ async def test_is_available_false_on_connection_error():
 
         client = make_client()
         assert await client.is_available() is False
-

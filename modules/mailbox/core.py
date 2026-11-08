@@ -1,8 +1,5 @@
-"""Core mailbox parsing, validation, persistence, and git helpers.
-
-This module holds the low-level mailbox primitives that were previously embedded
-in modules/mailbox.py. The higher-level inbox/outbox processing remains in
-mailbox_processing.py to keep the responsibilities separated.
+"""Core mailbox parsing, validation, persistence, and git helpers - the low-level
+primitives; higher-level inbox/outbox processing lives in processing.py.
 """
 
 from __future__ import annotations
@@ -20,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from modules.redaction import redact_outbound
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
@@ -32,13 +31,20 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 logger = logging.getLogger(__name__)
 
-MAX_FILE_SIZE = 65536  # 64 KB
+MAX_FILE_SIZE = 65536
 MAX_RETRY = 3
 STATUS_DONE = "done"
 STATUS_DONE_PENDING_COMMIT = "done_pending_commit"
 STATUS_DEFERRED = "deferred"
 _DEFERRED_PROCESSING = object()
-SUPPORTED_TYPES = {"idea", "task", "question", "context", "operation_chain", "refresh"}
+SUPPORTED_TYPES = {
+    "idea", "task", "question", "context", "operation_chain", "refresh", "setting",
+    # Structured issue authorization from the trusted mailbox; see
+    # modules.issue_approvals and _process_issue_approval.
+    "issue_approval",
+}
+#: Trusted shell command message, registered by ``development.install``.
+COMMAND_TYPE = "command"
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
     re.compile(r"AZURE_[A-Z_]+\s*=\s*\S"),
@@ -171,10 +177,21 @@ class MailboxMessage:
 
         text = raw.decode("utf-8", errors="replace")
 
-        if _has_secret(text):
-            raise ValueError("Potential secret detected in message content")
+        try:
+            meta, body = parse_front_matter(text)
+            parse_error: ValueError | None = None
+        except ValueError as exc:
+            meta, body, parse_error = {}, "", exc
 
-        meta, body = parse_front_matter(text)
+        # A command may name a credential (`curl -H "x-api-key: ..."` is how a
+        # diagnostic reaches the local API), so command input is not screened
+        # (#220); protection is on the outbound side - every command result is
+        # redacted before the outbox (``redact_outbound``). Every other message
+        # type is still rejected because its text is stored/forwarded as is.
+        if meta.get("type", "").strip() != COMMAND_TYPE and _has_secret(text):
+            raise ValueError("Potential secret detected in message content")
+        if parse_error is not None:
+            raise parse_error
 
         msg_type = meta.get("type", "").strip()
         created_by = meta.get("created_by", "").strip()
@@ -390,7 +407,13 @@ def _build_outbox_content(
     if idea_id:
         lines.append(f"idea_id: {idea_id}")
     lines += ["---", "", "## Result", "", result_body]
-    return "\n".join(lines) + "\n"
+    content = "\n".join(lines) + "\n"
+    if msg.msg_type == COMMAND_TYPE:
+        # Last stop before the outbox write: redact the whole document, not only
+        # the stdout/stderr already masked, so no command-produced field can
+        # carry a credential (#220).
+        content = redact_outbound(content)
+    return content
 
 
 class MailboxLock:

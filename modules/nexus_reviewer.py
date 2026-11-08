@@ -46,7 +46,7 @@ class ReviewResult:
         return self.verdict == VERDICT_BLOCK
 
 
-def review_prompt(goal: str, diff: str, *, can_read_files: bool) -> str:
+def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: str = "") -> str:
     look = (
         "You are in the repository with the change applied and may read any file "
         "to check the change in context.\n\n"
@@ -62,7 +62,17 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool) -> str:
         "Answer with exactly one JSON object and nothing else:\n"
         '{"verdict": "approve" or "block", "summary": "<two or three sentences: '
         'what the change does and, if blocked, exactly what is wrong>"}\n\n'
-        f"TASK:\n{goal[:8000]}\n\nDIFF:\n{diff[:_DIFF_CHARS]}"
+        + (
+            "QUALITY GATE FINDINGS: a deterministic check that reads file paths "
+            "out of the task text flagged this change: "
+            f"{gate_findings[:2000]}\n"
+            "Decide whether this is a real gap (the task needs that file or "
+            "change and it is missing: block and say exactly what to add) or a "
+            "false alarm (an example path, a file the task only mentions, or a "
+            "task that asks for tests only: approve and say why).\n\n"
+            if gate_findings else ""
+        )
+        + f"TASK:\n{goal[:8000]}\n\nDIFF:\n{diff[:_DIFF_CHARS]}"
     )
 
 
@@ -117,14 +127,19 @@ class NexusReviewer:
         start = (REVIEWERS.index(row[0]) + 1) % len(REVIEWERS) if row and row[0] in REVIEWERS else 0
         return [REVIEWERS[(start + i) % len(REVIEWERS)] for i in range(len(REVIEWERS))]
 
-    def review(self, *, experiment_id: str, goal: str, worktree_path: str, base_sha: str) -> ReviewResult:
+    def review(
+        self, *, experiment_id: str, goal: str, worktree_path: str, base_sha: str,
+        gate_findings: str = "",
+    ) -> ReviewResult:
         diff = _diff(worktree_path, base_sha)
         result = None
         for name in self._order():
             runner = self._runners.get(name)
             if runner is None:
                 continue
-            prompt = review_prompt(goal, diff, can_read_files=name != "azure")
+            prompt = review_prompt(
+                goal, diff, can_read_files=name != "azure", gate_findings=gate_findings
+            )
             try:
                 parsed = parse_review(runner(prompt, worktree_path))
             except Exception as exc:  # noqa: BLE001 - try the next reviewer

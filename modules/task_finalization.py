@@ -21,6 +21,7 @@ from modules.experiment_adoption_service import (
     STATUS_FAILED,
     STATUS_INTERRUPTED,
     STATUS_NEEDS_REVIEW,
+    STATUS_READY_FOR_REVIEW,
     STATUS_NOT_STARTED,
     STATUS_QUEUED,
     ExperimentAdoptionError,
@@ -41,11 +42,11 @@ PHASE_RESTART_REQUESTED = "restart_requested"
 PHASE_VALIDATING_LIVE = "validating_live"
 PHASE_SUCCEEDED = "succeeded"
 PHASE_NEEDS_REVIEW = "needs_review"
+PHASE_READY_FOR_REVIEW = "ready_for_review"
 
-# Prefix of the error a finalization attempt records when adoption could
-# not even be started. It is a shared constant because the needs_review
-# requeue (#171) reads it back: a requeue that never started is not a new
-# situation, so it must spend the ordinary budget instead of renewing it.
+# Prefix of the error recorded when adoption could not even start. The
+# needs_review requeue (#171) reads it back: such a requeue spends the
+# ordinary budget instead of renewing it.
 _START_FAILURE_PREFIX = "could not start adoption: "
 
 _DEFAULT_MAX_RETRIES = 2
@@ -57,7 +58,7 @@ _DEFAULT_RESTART_TIMEOUT_SECONDS = 600
 # one that works may stop this very process before it returns.
 _RESTART_FAILURE_WINDOW_SECONDS = 5
 _ACTIVE_APPROVAL_STATUSES = {
-    "pending_approval", "approved", "submitted", "running", "nexus_deciding",
+    "queued", "pending_approval", "approved", "submitted", "running", "nexus_deciding",
 }
 # Restarted after an adopted change. scripts/setup-nexus-permissions.sh grants
 # the service user exactly the transient-unit command assembled below.
@@ -94,10 +95,9 @@ class LiveHealthUnavailableError(RuntimeError):
 class TaskFinalizationCoordinator:
     """Continue a verified development task until the merged code is live.
 
-    Experiment verification remains evidence only. The existing adoption
-    service owns PR finalization/merge and repository adoption; this class
-    persists the late task lifecycle around it and resumes after process
-    restarts, including the intentional service restart during deployment.
+    The adoption service owns PR finalization and merge; this class persists
+    the task lifecycle around it and resumes after restarts, including the
+    deliberate restart during deployment.
     """
 
     def __init__(
@@ -165,13 +165,18 @@ class TaskFinalizationCoordinator:
                 """
             )
 
-    def get_phase(self, approval_id: str) -> str | None:
-        state = self._get(approval_id)
-        return state.phase if state is not None else None
-
     def advance(self, approval: Any, experiment: Any) -> FinalizationResult:
         state = self._get_or_create(str(approval.id), str(experiment.id))
         adoption = self.adoption_service.get(str(experiment.id))
+
+        if adoption.status == STATUS_READY_FOR_REVIEW:
+            state.phase = PHASE_READY_FOR_REVIEW
+            self._save(state)
+            return FinalizationResult(
+                PHASE_READY_FOR_REVIEW,
+                state.phase,
+                f"pull request open, not merged: {getattr(adoption, 'reason', None) or 'the task forbids the merge'}",
+            )
 
         superseded: Any | None = None
         review_retry: Any | None = None
@@ -183,11 +188,9 @@ class TaskFinalizationCoordinator:
                     f"{getattr(adoption, 'reason', None) or 'unknown reason'}"
                 )
                 if self._requeue_never_started(state):
-                    # Keep the recorded start failure at the front: it is
-                    # both the more useful diagnosis and the marker that
-                    # says this requeue budget is spent. Replacing it with
-                    # the review text would renew the budget on the next
-                    # attempt and restart the very loop it bounds.
+                    # Keep the recorded start failure first: it marks this
+                    # requeue budget as spent; replacing it would renew the
+                    # budget and restart the loop it bounds.
                     summary = f"{state.last_error} (requeue stopped; {summary})"
                 return self._needs_review(state, summary)
 
@@ -196,15 +199,10 @@ class TaskFinalizationCoordinator:
             or review_retry is not None
         ):
             if review_retry is not None:
-                # The blocker that parked this adoption is gone, so this is a
-                # new situation and not another attempt against the same
-                # evidence: the finalization budget starts over, exactly as
-                # it does for a superseded failure. The adoption service's
-                # own evidence budget then bounds how often a cleared
-                # blocker may reopen the same record - but only once the
-                # restart actually reaches it, so a requeue that never got
-                # that far keeps spending this budget instead of renewing
-                # it (see `_review_blocker_cleared`).
+                # The blocker is gone, so this is a new situation and the
+                # finalization budget starts over. The adoption service's
+                # evidence budget then bounds reopenings, but only once the
+                # restart reaches it (see `_review_blocker_cleared`).
                 superseded = review_retry
                 if self._requeue_never_started(state):
                     state.retry_count += 1
@@ -213,15 +211,10 @@ class TaskFinalizationCoordinator:
                 self._save(state)
             elif adoption.status in {STATUS_FAILED, STATUS_INTERRUPTED}:
                 if state.retry_count >= self.max_retries:
-                    # The retry budget counts attempts made against the same
-                    # evidence, so an exhausted budget only means "nothing
-                    # new has happened". When current evidence has actually
-                    # superseded the recorded failure (Issue #136) - most
-                    # concretely a lifecycle fix like #134 landing after the
-                    # failure was written - that is a genuinely new
-                    # situation and earns a fresh budget. Without this an
-                    # obsolete row stays terminal forever and the lifecycle
-                    # fix never reaches the experiments it was written for.
+                    # An exhausted retry budget only means "nothing new". When
+                    # current evidence superseded the recorded failure (#136,
+                    # e.g. a lifecycle fix landed later) the row earns a fresh
+                    # budget; otherwise an obsolete row stays terminal forever.
                     assessment = self._failure_assessment(experiment)
                     superseded = (
                         assessment if getattr(assessment, "retryable", False) else None
@@ -260,18 +253,13 @@ class TaskFinalizationCoordinator:
                 state.retry_count += 1
                 self._save(state)
             try:
-                # A previous adoption may already have committed the exact
-                # source diff that was verified. For the moved-base fallback,
-                # restore that trusted commit to its original verified diff
-                # shape before the ordinary adoption guard runs. This keeps
-                # verified-source integrity separate from the later
-                # current-base integration candidate (#149).
+                # For the moved-base fallback, restore an already committed,
+                # verified source diff to its original shape before the
+                # ordinary adoption guard runs (#149).
                 self._prepare_integration_fallback_source(experiment, superseded)
-                # Passing the assessment back is what tells the adoption
-                # service to spend one unit of the evidence budget. An
-                # ordinary retry leaves `superseded` None and so does not
-                # consume it - otherwise ordinary retries could exhaust the
-                # budget before any evidence changed.
+                # Passing the assessment tells the adoption service to spend one
+                # unit of the evidence budget; ordinary retries (superseded None)
+                # do not, or they could exhaust it before any evidence changed.
                 adoption = self.adoption_service.start_adoption(
                     str(experiment.id), superseded=superseded
                 )
@@ -397,24 +385,15 @@ class TaskFinalizationCoordinator:
     ) -> Any | None:
         """The assessment that reopens a persisted ``needs_review``, or None (#171).
 
-        A ``needs_review`` used to be terminal here without ever being
-        re-examined, so a review caused by a *transient* blocker - the
-        GitHub lifecycle being unconfigured in #115/PR #116 - kept
-        returning its recorded reason long after the VM was fixed and the
-        service restarted. That reads like a current readiness verdict
-        while no readiness check has happened at all.
-
-        The re-evaluation is the adoption service's own stale-adoption
-        assessment, so genuinely manual reviews stay terminal, the same
-        bounded evidence budget applies, and the same record is reused
-        rather than a second adoption being created.
+        A review caused by a transient blocker must not stay terminal after the
+        blocker is gone. The re-evaluation is the adoption service's own
+        stale-adoption assessment, so manual reviews stay terminal, the same
+        evidence budget applies, and the same record is reused.
         """
         assessment = self._failure_assessment(experiment)
         reason = getattr(adoption, "reason", None) or "unknown reason"
-        # A cleared blocker that keeps failing to restart adoption is not
-        # new evidence, however often it is re-checked. Without this bound
-        # the same requeue would be attempted on every tick forever and a
-        # permanent obstacle would stay hidden behind a "retrying" status.
+        # A cleared blocker that keeps failing to restart adoption is not new
+        # evidence; without this bound the requeue would repeat every tick.
         exhausted = (
             self._requeue_never_started(state) and state.retry_count >= self.max_retries
         )
@@ -456,15 +435,12 @@ class TaskFinalizationCoordinator:
         return assessment
 
     def _failure_assessment(self, experiment: Any) -> Any | None:
-        """Return the adoption verdict, promoting persisted green CI to integration fallback.
+        """The adoption verdict; persisted green CI reopens the integration fallback.
 
-        ``ExperimentAdoptionService.assess_failure`` remains the single owner of CI
-        authority and base validation. If it rejects a previously persisted green
-        exact-checkpoint verdict as ``no_ci_evidence``, finalization does not repeat
-        the base comparison. It only observes that durable green evidence exists and
-        reopens the existing adoption for the pipeline's current-base integration
-        fallback. A real test verdict or exhausted stale-retry budget is returned by
-        the adoption service with a different category and is never overridden.
+        ``ExperimentAdoptionService.assess_failure`` owns CI authority. When it
+        rejects a persisted green exact-checkpoint verdict as ``no_ci_evidence``,
+        the existing adoption is reopened for the current-base integration
+        fallback. A real test verdict or an exhausted budget is never overridden.
         """
         assess = getattr(self.adoption_service, "assess_failure", None)
         if assess is None:
@@ -527,15 +503,12 @@ class TaskFinalizationCoordinator:
         return promoted
 
     def _prepare_integration_fallback_source(self, experiment: Any, assessment: Any | None) -> None:
-        """Restore a previously committed verified source diff for a moved-base retry.
+        """Restore a committed verified source diff for a moved-base retry.
 
-        The first adoption attempt may have committed the experiment worktree before
-        failing later in integration. The experiment record still stores the verified
-        *pre-commit* git status/stat, so blindly applying the normal start guard to the
-        now-clean worktree incorrectly reports checkpoint tampering. For the explicit
-        moved-base fallback only, prove that the persisted source commit is exactly the
-        verified diff, prove the worktree itself has not changed, then restore that diff
-        shape so the existing adoption guard can independently validate it again.
+        An earlier attempt may have committed the worktree, so the stored
+        pre-commit status no longer matches. For the moved-base fallback only,
+        prove the commit is exactly the verified diff and the worktree is
+        unchanged, then restore that diff so the adoption guard validates it again.
         """
         if getattr(assessment, "category", None) != "integration_fallback_required":
             return
@@ -615,10 +588,8 @@ class TaskFinalizationCoordinator:
         if reset.returncode != 0:
             reject("verified source commit could not be restored to its pre-commit diff")
 
-        # The normal adoption guard runs immediately after this helper and
-        # captures the restored worktree with its own scratch index. It is the
-        # authoritative second check (including untracked/new files), so do not
-        # duplicate that snapshot logic here with subtly different git semantics.
+        # The adoption guard right after this re-checks the restored worktree
+        # (including untracked files); do not duplicate that logic here.
 
     def _retry_or_review(
         self,
@@ -807,12 +778,10 @@ class TaskFinalizationCoordinator:
     def _restart_services(services: list[str]) -> None:
         if not services:
             return
-        # The service user may restart the units only through the sudoers rule
-        # from scripts/setup-nexus-permissions.sh; -n fails instead of prompting.
-        # A systemctl process launched directly by agent-api remains in that
-        # service's cgroup and is killed during its own restart, even with
-        # --no-block. Hand the delayed restart to a transient systemd unit so
-        # it survives agent-api's teardown and is collected afterwards (#280).
+        # Restarts go through the sudoers rule from
+        # scripts/setup-nexus-permissions.sh (-n fails instead of prompting).
+        # A transient systemd unit runs the delayed restart, so it survives
+        # agent-api's own teardown (#280).
         command = [
             "sudo",
             "-n",

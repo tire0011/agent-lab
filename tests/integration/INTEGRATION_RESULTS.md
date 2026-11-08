@@ -1,7 +1,7 @@
 # Integration Test Results (Live API)
 
 Date: 2026-08-11
-Target: `https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com`
+Target: `https://<vm-host>`
 Execution mode: non-admin, no secrets, read-only endpoint checks
 
 ## Endpoint discovery

@@ -13,8 +13,7 @@ state/experiment-logs/*.lock
 # written next to the experiment logs but never part of the repository.
 state/experiment-logs/test-runs/
 # Structured requirements written by a missing_capability decision. Runtime
-# output of whichever controller turn produced it - including a local
-# scripts/check_issue_218_find_tool.py run - never repository content.
+# output of whichever controller turn produced it - never repository content.
 state/requirements/*.json
 # A MagicMock used as a path turns into a real file named after it (#279).
 MagicMock/

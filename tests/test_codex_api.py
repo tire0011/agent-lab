@@ -283,7 +283,12 @@ class ExistingEndpointsStillWorkTests(CodexApiTestCase):
     def test_health_still_reachable(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok", "version": "0.2.0"})
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["version"], "0.2.0")
+        self.assertIn("git_revision", body)
+        self.assertIn("checkout_revision", body)
+        self.assertIn("stale", body)
 
     def test_secure_health_still_enforces_auth(self):
         response = self.client.get("/secure-health")

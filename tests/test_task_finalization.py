@@ -26,6 +26,10 @@ from modules.task_finalization import (
 )
 
 
+def _phase_of(coordinator, approval_id):
+    state = coordinator._get(approval_id)
+    return state.phase if state is not None else None
+
 class _FakeAdoptionService:
     def __init__(self, adoption, *, assessment=None):
         self.adoption = adoption
@@ -120,7 +124,7 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.status, "running")
         self.assertEqual(result.phase, PHASE_MERGING)
         self.assertEqual(fake.starts, 1)
-        self.assertEqual(coordinator.get_phase(self.approval.id), PHASE_MERGING)
+        self.assertEqual(_phase_of(coordinator, self.approval.id), PHASE_MERGING)
 
     def test_adopted_change_requests_restart_before_live_success(self):
         restart_calls = []
@@ -278,7 +282,7 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(result.phase, PHASE_SUCCEEDED)
         self.assertEqual(live_calls, [(self.approval.id, self.experiment.id)])
-        self.assertEqual(resumed.get_phase(self.approval.id), PHASE_SUCCEEDED)
+        self.assertEqual(_phase_of(resumed, self.approval.id), PHASE_SUCCEEDED)
 
     def test_unreachable_health_after_restart_waits_without_spending_a_retry(self):
         adoption = SimpleNamespace(
@@ -413,8 +417,8 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         self.assertEqual(rebound.merge_commit, "existing-merge")
         self.assertEqual(rebound.live_validation_json, '{"previous": true}')
         self.assertIsNone(rebound.last_error)
-        self.assertIsNone(coordinator.get_phase(self.approval.id))
-        self.assertEqual(coordinator.get_phase("approval-2"), PHASE_RESTART_REQUESTED)
+        self.assertIsNone(_phase_of(coordinator, self.approval.id))
+        self.assertEqual(_phase_of(coordinator, "approval-2"), PHASE_RESTART_REQUESTED)
         count = coordinator._conn.execute(
             "SELECT COUNT(*) FROM task_finalizations WHERE experiment_id=?",
             (self.experiment.id,),
@@ -498,8 +502,8 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "already owned by an active approval"):
             coordinator._get_or_create("approval-2", self.experiment.id)
 
-        self.assertEqual(coordinator.get_phase(self.approval.id), PHASE_MERGING)
-        self.assertIsNone(coordinator.get_phase("approval-2"))
+        self.assertEqual(_phase_of(coordinator, self.approval.id), PHASE_MERGING)
+        self.assertIsNone(_phase_of(coordinator, "approval-2"))
 
     def test_terminal_previous_approval_allows_rebind(self):
         adoption = SimpleNamespace(
@@ -538,7 +542,7 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ownership changed"):
             coordinator._save(stale)
 
-        self.assertEqual(coordinator.get_phase("approval-2"), "verified")
+        self.assertEqual(_phase_of(coordinator, "approval-2"), "verified")
 
     def test_new_approval_continues_from_restart_phase_through_live_validation(self):
         adoption = SimpleNamespace(
@@ -577,7 +581,7 @@ class TaskFinalizationCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.phase, PHASE_SUCCEEDED)
         self.assertEqual(restart_calls, [])
         self.assertEqual(live_calls, [("approval-2", self.experiment.id)])
-        self.assertEqual(resumed.get_phase("approval-2"), PHASE_SUCCEEDED)
+        self.assertEqual(_phase_of(resumed, "approval-2"), PHASE_SUCCEEDED)
 
 
 class FinalizingMailboxTaskServiceTests(unittest.TestCase):
@@ -615,7 +619,7 @@ class FinalizingMailboxTaskServiceTests(unittest.TestCase):
                VALUES (?, ?, ?, ?, ?, ?)""",
             ("/tmp/task.md", "abc", "task", "tester", "done", "2026-09-05T00:00:00Z"),
         )
-        approval = service.create_approval(
+        approval = service.create_task(
             message.lastrowid,
             "Add --version and /health version",
             "tester",

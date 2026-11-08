@@ -1,23 +1,13 @@
 """Read-only adapters over existing data sources.
 
-No new persistent storage is introduced here. Problems and ideas are derived
-from files that already exist in the repository/runtime state:
+- Problems: failed/rejected experiments plus legacy error entries in
+  state/runs/*.json.
+- Ideas: entries under "## Ideas" in IDEAS.md, with an optional trailing
+  `` `state` `` marker (default "new").
 
-- Problems: error entries already logged by agent.py under state/runs/*.json
-  (any run whose "response" starts with "ERROR:").
-- Ideas: entries under "## Ideas" in IDEAS.md, each an open-ended thought
-  rather than a task; an optional trailing `` `state` `` marker (one of
-  new/exploring/selected/tested/adopted/rejected) is parsed if present and
-  defaults to "new" otherwise. Ideas are never a fixed roadmap or priority
-  list.
-
-``add_idea`` is the one write path in this module: it appends a new,
-sanitized, state-``new`` idea under a fixed "### Inbox" subsection at the
-end of "## Ideas", guarded by an exclusive file lock so concurrent
-appends cannot interleave and corrupt IDEAS.md.
-
-Both /problems and /ideas as well as the chat endpoint call these same
-functions, so structured endpoints and chat answers never diverge.
+``add_idea`` is the one write path: it appends a sanitized idea under
+"### Inbox", guarded by an exclusive file lock. The endpoints and the chat use
+these same functions, so their answers never diverge.
 """
 
 from __future__ import annotations
@@ -26,14 +16,18 @@ import fcntl
 import json
 import os
 import re
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from models import Idea, Problem
+from modules.run_store import DEFAULT_DB_PATH
 
 REPO_ROOT = Path(__file__).resolve().parent
 
 RUNS_DIR = Path(os.environ.get("AGENT_RUNS_DIR", str(REPO_ROOT / "state" / "runs")))
 IDEAS_PATH = Path(os.environ.get("AGENT_IDEAS_PATH", str(REPO_ROOT / "IDEAS.md")))
+EXPERIMENT_DB_PATH = Path(DEFAULT_DB_PATH)
 
 _IDEA_ITEM_RE = re.compile(
     r"^-\s+(?P<text>.+?)(?:\s+`(?P<state>new|exploring|selected|tested|adopted|rejected)`)?$",
@@ -56,22 +50,106 @@ class InvalidIdeaTextError(ValueError):
     """Raised when submitted idea text fails validation/sanitization."""
 
 
-def list_problems() -> list[Problem]:
-    """Return currently known problems derived from failed run logs.
+_PROBLEM_EXPERIMENT_STATUSES = frozenset(
+    {"failed", "timed_out", "rejected", "needs_review"}
+)
+_ISSUE_GOAL_RE = re.compile(r"^GitHub Issue #(\d+):")
 
-    Read errors (missing directory, unreadable/corrupt files) are treated as
-    "no problems found" rather than raised, since this is a best-effort,
-    read-only view over operational logs.
-    """
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip() or value == "unknown":
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _experiment_problems(db_path: Path) -> list[Problem]:
+    """Read problem experiments without creating or migrating the store."""
+    if not db_path.is_file():
+        return []
+    try:
+        uri = f"file:{db_path.resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(experiments)").fetchall()
+            }
+            required = {"id", "goal", "status", "created_at", "ended_at", "error"}
+            if not required.issubset(columns):
+                return []
+            optional = [name for name in ("failure_phase", "failure_type") if name in columns]
+            selected = [*sorted(required), *optional]
+            rows = conn.execute(
+                f"SELECT {', '.join(selected)} FROM experiments "
+                "ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+
+    later_success_by_issue: set[int] = set()
     problems: list[Problem] = []
+    for row in rows:
+        match = _ISSUE_GOAL_RE.match(row["goal"] or "")
+        issue_number = int(match.group(1)) if match else None
+        if row["status"] == "succeeded":
+            if issue_number is not None:
+                later_success_by_issue.add(issue_number)
+            continue
+        if row["status"] not in _PROBLEM_EXPERIMENT_STATUSES:
+            continue
+        if issue_number is not None and issue_number in later_success_by_issue:
+            continue
+        detail = (row["error"] or "").strip()
+        timestamp = row["ended_at"] or row["created_at"] or "unknown"
+        problems.append(
+            Problem(
+                id=row["id"],
+                source="experiment",
+                issue_number=issue_number,
+                summary=detail[:200] if detail else "Unknown error",
+                detail=detail,
+                timestamp=timestamp,
+                failure_phase=row["failure_phase"] if "failure_phase" in row.keys() else None,
+                failure_type=row["failure_type"] if "failure_type" in row.keys() else None,
+            )
+        )
+    return problems
+
+
+def list_problems(
+    limit: int = 20,
+    since: str | datetime | None = None,
+    *,
+    experiment_db_path: str | Path | None = None,
+) -> list[Problem]:
+    """Recent experiment and legacy run-log problems, newest first; read errors mean none found."""
+    if limit <= 0:
+        return []
+    since_timestamp = _parse_timestamp(
+        since.isoformat() if isinstance(since, datetime) else since
+    )
+    if since is not None and since_timestamp is None:
+        raise ValueError("since must be an ISO timestamp")
+
+    db_path = (
+        Path(experiment_db_path)
+        if experiment_db_path is not None
+        else EXPERIMENT_DB_PATH
+    )
+    problems: list[Problem] = _experiment_problems(db_path)
 
     if not RUNS_DIR.exists() or not RUNS_DIR.is_dir():
-        return problems
-
-    try:
-        run_files = sorted(RUNS_DIR.glob("*.json"))
-    except OSError:
-        return problems
+        run_files: list[Path] = []
+    else:
+        try:
+            run_files = list(RUNS_DIR.glob("*.json"))
+        except OSError:
+            run_files = []
 
     for run_file in run_files:
         try:
@@ -97,20 +175,26 @@ def list_problems() -> list[Problem]:
             )
         )
 
-    return problems
+    problems.sort(
+        key=lambda problem: _parse_timestamp(problem.timestamp)
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    if since_timestamp is not None:
+        problems = [
+            problem
+            for problem in problems
+            if (timestamp := _parse_timestamp(problem.timestamp)) is not None
+            and timestamp >= since_timestamp
+        ]
+    return problems[:limit]
 
 
 def list_ideas() -> list[Idea]:
-    """Return ideas parsed from the "## Ideas" section of IDEAS.md.
+    """Ideas from the "## Ideas" section of IDEAS.md.
 
-    Only list items inside the "## Ideas" section are returned (the
-    surrounding intro/states/unknowns sections are prose, not ideas).
-    "###" headings within that section become the ``section`` field. Each
-    item may end with a trailing `` `state` `` marker (one of new,
-    exploring, selected, tested, adopted, rejected); items without one
-    default to "new". Missing or unreadable file yields an empty list
-    rather than an error, matching the read-only, best-effort contract of
-    this adapter.
+    "###" headings become ``section``; a trailing `` `state` `` marker is
+    parsed (default "new"). A missing or unreadable file gives an empty list.
     """
     try:
         text = IDEAS_PATH.read_text(encoding="utf-8")
@@ -175,12 +259,9 @@ def _parse_ideas(text: str) -> list[Idea]:
 def _sanitize_idea_text(raw: str) -> str:
     """Validate and normalize idea text before it is written to IDEAS.md.
 
-    Collapses internal whitespace/newlines to single spaces (so an idea is
-    always exactly one Markdown list item, never a stray heading or a
-    multi-line block) and strips backticks (so a submitted idea can never
-    forge a trailing `` `state` `` marker or break the surrounding
-    Markdown code span). Raises ``InvalidIdeaTextError`` for empty,
-    whitespace-only, or too-long input.
+    Whitespace collapses to single spaces (one list item, never a heading) and
+    backticks are stripped (no forged state marker). Raises
+    ``InvalidIdeaTextError`` for empty or too-long input.
     """
     normalized = " ".join(raw.split())
     normalized = normalized.replace("`", "'")
@@ -200,17 +281,11 @@ def _sanitize_idea_text(raw: str) -> str:
 
 
 def add_idea(raw_text: str) -> Idea:
-    """Append a new idea (state ``new``) to the "## Ideas" / "### Inbox"
-    section of IDEAS.md and return it.
+    """Append a new idea (state ``new``) under "## Ideas" / "### Inbox" and return it.
 
-    Uses an exclusive advisory file lock (``fcntl.flock``) around the
-    read-modify-write so concurrent requests append one at a time instead
-    of racing and corrupting the file. Text is sanitized first so a
-    submitted idea can never inject a fake heading, state marker, or
-    multi-line content into the document. The returned ``Idea`` is parsed
-    from the content this call just wrote (still under the lock), never
-    from a fresh disk read, so a concurrent writer appending immediately
-    afterwards cannot make this call report the wrong idea.
+    The read-modify-write runs under an exclusive ``fcntl.flock``; the text is
+    sanitized first, so no heading, state marker or multi-line content can be
+    injected. The result is parsed from what this call wrote, under the lock.
     """
     text = _sanitize_idea_text(raw_text)
 
@@ -234,10 +309,8 @@ def add_idea(raw_text: str) -> Idea:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
     if not ideas or ideas[-1].text != text:
-        # Should be unreachable given the insert logic below always adds
-        # the new idea at the end of the "## Ideas" section (i.e. last in
-        # document order); guard defensively rather than silently
-        # returning a mismatched idea.
+        # Unreachable (the new idea is always last); guard rather than return a
+        # mismatched idea.
         raise RuntimeError("failed to append idea to IDEAS.md")
     return ideas[-1]
 

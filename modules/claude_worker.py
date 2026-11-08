@@ -58,6 +58,7 @@ from modules.coding_worker import (
     WorkerConfigError,
     WorkerResult,
     filtered_env,
+    progress_heartbeat,
     run_watched,
     truncate_output,
     validate_worker_config,
@@ -287,7 +288,10 @@ class ClaudeWorker:
                 timeout_seconds=timeout_seconds,
             )
 
-        result = self._execute(cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process)
+        result = self._execute(
+            cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process,
+            on_heartbeat=progress_heartbeat(experiment_logger, phase, "Claude"),
+        )
 
         if experiment_logger is not None:
             self._log_result(experiment_logger, phase, cmd, working_dir, result)
@@ -416,6 +420,7 @@ class ClaudeWorker:
         sandbox: str,
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        on_heartbeat: Any | None = None,
     ) -> WorkerResult:
         timed_out = False
         proc_error: str | None = None
@@ -430,6 +435,7 @@ class ClaudeWorker:
                     cmd, cwd=working_dir, env=self._safe_env(), input_text=task,
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
                     on_process=on_process,
+                    on_heartbeat=on_heartbeat,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:

@@ -558,6 +558,17 @@ Decision log for architecture and operating choices.
   longer than the stale timeout. The fix there is a per-phase timeout, not
   dropping the derivation.
 
+### D-027: An explicit "do not merge" stops every merge at one gate
+
+- Status: Accepted
+- Decision: A task's no-merge instruction is stored on its approval, and
+  `GitHubWorkTrackingService.merge_and_complete` refuses and audits the merge
+  for the experiment, the task and the pull request. Adoption and task end at
+  `ready_for_review`, which Nexus neither retries nor resumes. Only a human
+  merges such a pull request (#185).
+- Why: Green CI merged PR #182 although its task said not to. The detection is
+  broad on purpose: a wrong match costs a review, a missed one is irreversible.
+
 ### D-024: The mailbox inbox is the queue, and lock contention is not a failure
 
 - Status: Accepted
@@ -596,6 +607,73 @@ Decision log for architecture and operating choices.
 - Evidence: `tests/test_mailbox_drain.py`.
 - Revisit if: a single message's processing routinely outruns the timer period.
   The fix there is bounding per-message work, not removing the drain.
+
+### D-025: The experiment benchmark measures at the worker and stores outside production
+
+- Status: Accepted
+- Decision: `benchmarks/tasks/*.md` are merged issues pinned to the commit they
+  started from, scored by tests, expected files and the evaluation verdict. Runs
+  go to a separate `benchmark.db`; usage is counted around the worker.
+- Why: in the production database adoption, the planner and `problems` would act
+  on benchmark experiments. `implementation_usage` keeps only the first call, so
+  a model that needs repairs would look cheaper than one that does not.
+- Evidence: `tests/test_benchmark.py`.
+- Revisit if: the task set stops representing what `new_experiment` is asked to do.
+
+### D-026: The tool-router MCP server is never the controller
+
+- Status: Accepted
+- Decision: `modules/tool_router_mcp.py` runs `NexusToolRouter` with
+  `controller=False`, and its grants live in memory for one stdio process.
+- Why: `service_restart` and `machine_reboot` are `controller_allowed` for the
+  controller's own session. A local MCP client exists to test the router
+  contract and must not inherit restart rights through it.
+- Evidence: `tests/test_issue_118_tool_router_mcp.py`.
+- Revisit if: an external client needs a mutating operation; that needs its own
+  authorization rule, not the controller flag.
+
+### D-027: The prompt budget is the context window; host memory is a signal
+
+- Status: Accepted (#230)
+- Decision: `compute_budget` bounds the whole rendered prompt by the context
+  window minus reserved output. The never-compacted sections (rules, capability
+  catalog, framing) are measured with `len()` of the rendered empty prompt and
+  subtracted as-is; the remainder goes to the current input (capped at 20 %),
+  observations, and history (10 % floor plus whatever observations leave).
+  `_build_prompt` checks the rendered length and trims observations, then
+  history, until it fits. If the fixed sections leave under 2000 characters,
+  the turn fails with `prompt budget exhausted` instead of running blind.
+  `low_memory`, `safe_local_budget_chars` and `memory_budget_chars` are
+  logged and never shrink a section or gate a local call.
+- Why: the old fixed shares (instructions 12 %, tool schema 18 %, ...) covered
+  sections that were never compacted. A 500-char "budget" sat next to a
+  9946-char prompt, and the only real effect was 150 characters for
+  observations. On the VM a full-context prompt costs ~109 MB RSS more than a
+  tiny one, once, bounded by `n_ctx`. That is not worth blinding the controller.
+- Evidence: `tests/test_issue_230_prompt_budget.py`, `tests/test_prompt_budget.py`,
+  `tests/test_task_orchestrator.py`
+  (`test_measured_memory_pressure_still_sends_a_full_prompt_to_the_local_model`).
+- Revisit if: a host shows real OOM kills from prompt size (not model load), or
+  `CHARS_PER_TOKEN = 4` proves too optimistic for the prompt's JSON.
+
+### D-028: The event journal is not memory
+
+- Status: Accepted
+- Decision: `nexus_task_events` stays the complete event journal; every event
+  is still written. `memory_search` returns only knowledge: `knowledge` rows,
+  project documents, and journal events accepted by
+  `is_memory_eligible_event()` in `modules/nexus_memory.py`. Orchestration
+  bookkeeping (`ORCHESTRATION_EVENT_KINDS`, including `memory_search` itself)
+  is never returned as memory.
+- Why: one table served as both audit log and knowledge source. A stored
+  `memory_search` result was indexed by the next search, so results nested
+  earlier searches and pulled in unrelated issues (#238, #248).
+- Evidence: `tests/test_nexus_memory.py`
+  (`test_later_search_cannot_return_an_earlier_stored_search_result`,
+  `test_journal_keeps_bookkeeping_events_that_memory_skips`).
+- Revisit if: a dedicated MemoryStore with explicit knowledge promotion is
+  built. It replaces `is_memory_eligible_event()`; the `memory_search` tool
+  surface stays the same.
 
 ## Under evaluation
 

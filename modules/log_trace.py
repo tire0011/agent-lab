@@ -1,21 +1,10 @@
-"""Reconstruct what Nexus did with one order, from its logs alone.
-
-The unified feed (``GET /logs``) answers "what happened recently". This
-module answers the other operator question: *"Nexus was given this - what
-did it actually do?"*.
-
-The hard part is that one order changes identity as it moves through the
-system: a mailbox message is first known only by a transient id derived
-from its inbox filename, then gains a mailbox task/approval id, then an
-experiment id, then controller session and chat job ids. An operator
-almost never knows the id that a given phase was logged under - they know
-the inbox filename, or an experiment id, or a fragment of an error.
-
-So resolution is deliberately forgiving and iterative: take whatever
-reference is given, find any entries it plausibly identifies, read the
-correlation ids off those entries, and pull in everything sharing them -
-repeating until no new ids appear. The result is the whole causal chain,
-reachable from any one point in it.
+"""Reconstruct what Nexus did with one order, from its logs alone. The unified feed
+(GET /logs) answers "what happened recently"; this answers "Nexus was given this -
+what did it actually do?". One order changes identity as it moves through the
+system (inbox filename -> mailbox task id -> experiment id -> session/job ids), so
+resolution is forgiving and iterative: find entries the reference plausibly
+identifies, read their correlation ids, pull in everything sharing them, repeat
+until no new ids appear - the whole causal chain from any one point.
 """
 
 from __future__ import annotations
@@ -31,9 +20,9 @@ from modules import central_logging
 # reproducible reporting of what a reference resolved to.
 _CORRELATION_FIELDS = ("experiment_id", "mailbox_task_id", "session_id", "job_id")
 
-# How many discover-and-expand rounds to run. Two is enough for the real
-# chains (filename -> task -> experiment -> session/job); the bound stops
-# a pathological log from turning one request into an unbounded scan.
+# Discover-and-expand round bound: two suffice for real chains (filename -> task ->
+# experiment -> session/job); the bound stops a pathological log from turning one
+# request into an unbounded scan.
 DEFAULT_MAX_EXPAND_ROUNDS = 3
 
 _SAFE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9_./-]{1,256}$")
@@ -54,13 +43,9 @@ class TraceResult:
 
 
 def mailbox_task_ids_for_reference(reference: str) -> list[str]:
-    """Candidate transient mailbox task ids for an inbox filename.
-
-    The id is a digest of the message's path *relative to the mailbox
-    repository* (e.g. ``inbox/2026...-refresh-nexus-claude.md``), but an
-    operator normally has just the bare filename to hand, so both spellings
-    are offered.
-    """
+    """Candidate transient mailbox task ids for an inbox filename: the id digests
+    the path relative to the mailbox repo, but an operator usually has only the
+    bare filename, so both spellings are offered."""
     from modules.mailbox.processing import transient_mailbox_task_id
 
     reference = reference.strip().strip("/")
@@ -96,14 +81,10 @@ def resolve_trace(
     limit: int | None = None,
     max_expand_rounds: int = DEFAULT_MAX_EXPAND_ROUNDS,
 ) -> TraceResult:
-    """Build the complete timeline for the order named by *reference*.
-
-    *reference* may be an experiment id, a mailbox task id, a controller
-    session or chat job id, an inbox message filename, or any distinctive
-    fragment (an error phrase, part of a command). Anything unrecognized
-    falls back to a full-history search rather than a 404, since a partial
-    id an operator half-remembers is still a useful way in.
-    """
+    """Build the complete timeline for the order named by *reference* (an experiment,
+    mailbox task, session or chat job id, an inbox filename, or any distinctive
+    fragment); anything unrecognized falls back to a full-history search rather
+    than a 404 - a half-remembered id is still a useful way in."""
     result = TraceResult(reference=reference)
     reference = (reference or "").strip()
     if not reference:
@@ -112,9 +93,8 @@ def resolve_trace(
     seeds: list[dict[str, Any]] = []
     truncated = False
 
-    # 1) Treat the reference as a correlation id in its own right, and -
-    #    if it looks like an inbox filename - as the message whose
-    #    transient task id we can derive.
+    # 1) Reference as a correlation id; if it looks like an inbox filename, also as
+    #    the message whose transient task id we can derive.
     known: dict[str, set[str]] = {name: set() for name in _CORRELATION_FIELDS}
     if _SAFE_REFERENCE_RE.fullmatch(reference):
         known["experiment_id"].add(reference)
@@ -128,8 +108,7 @@ def resolve_trace(
     seeds.extend(seed_scan.entries)
     truncated = truncated or seed_scan.truncated
 
-    # 2) Nothing matched an id, so fall back to searching the text of the
-    #    whole retained history for the reference.
+    # 2) Nothing matched an id: search the whole retained history's text.
     if not seeds:
         search_scan = central_logging.scan_log_entries(log_dir, search=reference)
         seeds.extend(search_scan.entries)
@@ -139,8 +118,8 @@ def resolve_trace(
         result.truncated = truncated
         return result
 
-    # 3) Expand: read the correlation ids off whatever was found and pull
-    #    in every entry sharing them, until no new id appears.
+    # 3) Expand: pull in every entry sharing a discovered correlation id, until no
+    #    new id appears.
     collected: dict[tuple, dict[str, Any]] = {_entry_key(e): e for e in seeds}
     discovered = _collect_ids(seeds)
     for _ in range(max_expand_rounds):
@@ -169,17 +148,12 @@ def resolve_trace(
 def _scan_for_ids(
     log_dir: str | Path, ids: dict[str, set[str]]
 ) -> central_logging.LogScanResult:
-    """Every entry carrying any of *ids*, merged across correlation fields.
-
-    Each distinct id is looked up with a full-history *search* and then
-    narrowed to an exact field match, rather than with the dedicated
-    id filters. Two reasons: the ``experiment_id`` filter reads only that
-    experiment's own file, so it would miss entries recorded under a
-    different file that nonetheless carry the id (mailbox intake logs the
-    experiment id as soon as it exists) - which is exactly the link a
-    trace must not lose; and the other filters keep the newest-tail
-    shortcut, so an older correlated entry would silently drop out.
-    """
+    """Every entry carrying any of *ids*, merged across correlation fields. Each id
+    is looked up with a full-history *search* then narrowed to an exact field match,
+    not via the dedicated id filters: the experiment_id filter reads only that
+    experiment's own file and would miss entries logged under another file that
+    carry the id (the link a trace must not lose), and the other filters keep the
+    newest-tail shortcut, which would drop older correlated entries."""
     wanted_by_value: dict[str, set[str]] = {}
     for field_name, values in ids.items():
         for value in values:
@@ -201,12 +175,8 @@ def _scan_for_ids(
 
 
 def summarize(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compact "what happened" header for a trace.
-
-    Deliberately derived from the entries themselves rather than from any
-    status table, so the summary can never disagree with the timeline
-    printed underneath it.
-    """
+    """Compact "what happened" header for a trace, derived from the entries themselves
+    (not any status table), so it can never disagree with the timeline below it."""
     if not entries:
         return {
             "entry_count": 0,
