@@ -22,16 +22,13 @@ def resume_experiment(
     *,
     github_work_tracking=None,
 ):
-    """Continue a persisted experiment from a safe, explicit lifecycle stage.
-
-    - queued: start the normal pipeline using the SAME experiment id;
-    - verifying/timed_out/needs_review: reuse the existing worktree and rerun
-      verification without invoking implementation; with GitHub work
-      tracking, today's main is merged in first (#486);
-    - succeeded: already complete, return unchanged;
-    - selecting/implementing/failed/rejected: refuse to guess a recovery stage.
-
-    The helper never creates an experiment or a second worktree itself.
+    """Continue a persisted experiment from a safe, explicit lifecycle stage:
+    queued starts the normal pipeline with the SAME experiment id;
+    verifying/timed_out/needs_review reuse the existing worktree and rerun
+    verification (with GitHub work tracking, today's main is merged in first,
+    #486); succeeded returns unchanged; selecting/implementing/failed/rejected
+    are refused - no guessed recovery stage. Never creates an experiment or a
+    second worktree itself.
     """
     experiment = experiment_service.resolve_experiment(experiment_id)
 
@@ -87,17 +84,12 @@ def resume_experiment(
 def _merge_current_main_for_resume(
     experiment_service, experiment, github_work_tracking, elog
 ) -> None:
-    """Bring today's main into a resumed worktree before it is verified (#486).
-
-    Without this, a resume re-verifies the tree it was built on, and a green
-    result says nothing about the main it will be adopted into. Unlike
-    ``_merge_current_main`` no coding agent runs afterwards, so a conflict is
-    never left as markers: the merge is aborted, the worktree is put back as
-    it was, and the resume is refused so a new experiment resolves it.
-
-    The worktree's own changes are published as a checkpoint first and HEAD
-    moved onto it, so the merge cannot touch or lose them, and the merged
-    HEAD descends from the Issue branch for the next checkpoint to push.
+    """Bring today's main into a resumed worktree before it is verified (#486) -
+    otherwise a green resume says nothing about the main it will be adopted into.
+    Unlike ``_merge_current_main`` no coding agent runs afterwards, so a conflict
+    is never left as markers: the merge is aborted, the worktree restored, and the
+    resume refused (a new experiment resolves it). The worktree's own changes are
+    published as a checkpoint first, so the merge cannot touch or lose them.
     """
     worktree_path = experiment.worktree_path
 

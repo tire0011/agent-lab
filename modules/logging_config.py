@@ -18,11 +18,10 @@ DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _HANDLER_MARKER = "_nexus_central_handler"
 _APPLICATION_LOGGERS = ("api", "mailbox_processor", "modules", "nexus")
 
-# Loggers whose records belong to a known subsystem. Without this the phase
-# fell back to the logger's last name segment - "mailbox_processor",
-# "poll_runner", "processing" - none of which any reader recognizes, so
-# mailbox activity was classified as `source: experiment` and the Logs
-# tab's "mailbox" filter hid exactly the lines it should show.
+# Loggers whose records belong to a known subsystem. Without this the phase fell
+# back to the logger's last name segment, so mailbox activity was classified as
+# `source: experiment` and the Logs tab's "mailbox" filter hid the lines it should
+# show.
 _LOGGER_PHASE_PREFIXES = (
     ("mailbox_processor", "mailbox"),
     ("modules.mailbox", "mailbox"),
@@ -110,11 +109,9 @@ class StructuredJsonlHandler(logging.Handler):
                 value = getattr(record, field, None)
                 if value is not None and value != "":
                     extra[field] = str(value) if field in _STRING_EXTRA_FIELDS else value
-            # `source` is reserved by the unified Logs API for the coarse
-            # mailbox/controller/system classification and is overwritten on
-            # read.  Failure-analysis events use it internally for lifecycle
-            # origin (e.g. recovery), so preserve that value under a name the
-            # Logs API will not replace.
+            # `source` is reserved by the unified Logs API for the coarse classification
+            # and overwritten on read; failure-analysis events use it internally for
+            # lifecycle origin (e.g. recovery), so preserve that value under another name.
             lifecycle_source = getattr(record, "source", None)
             if lifecycle_source is not None and lifecycle_source != "":
                 extra["lifecycle_source"] = lifecycle_source
@@ -128,8 +125,8 @@ class StructuredJsonlHandler(logging.Handler):
             else:
                 self._structured.info(phase, event, record.getMessage(), **extra)
         except Exception:
-            # Logging must never fail the application or echo an unsafe raw
-            # record while reporting a secondary logging error.
+            # Logging must never fail the application or echo an unsafe raw record
+            # while reporting a secondary logging error.
             return
 
 

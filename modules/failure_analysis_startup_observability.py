@@ -1,10 +1,7 @@
-"""Startup-time status logging for failure-analysis observability (#151).
-
-The mailbox package is imported before Nexus configures its central logging
-handlers.  Patch the service constructor during import, then emit the feature
-status when the mailbox service is actually created (after configure_logging in
-both API and mailbox entry points).  No FailureAnalysisService or LLM client is
-constructed here.
+"""Startup-time status logging for failure-analysis observability (#151): the
+mailbox package is imported before central logging is configured, so the service
+constructor is patched during import and the feature status is emitted when the
+mailbox service is actually created. No service or LLM client is constructed here.
 """
 
 from __future__ import annotations

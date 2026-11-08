@@ -1,9 +1,6 @@
-"""Controlled, single-run self-development experiment service.
-
-This package preserves the historical ``modules.experiment_service``
-import surface while splitting the implementation into focused
-submodules grouped by responsibility. ``ExperimentService`` still
-orchestrates exactly one bounded self-improvement attempt end to end.
+"""Controlled, single-run self-development experiment service: this package keeps
+the historical ``modules.experiment_service`` import surface, split into focused
+submodules. ``ExperimentService`` orchestrates one bounded attempt end to end.
 """
 
 import __future__

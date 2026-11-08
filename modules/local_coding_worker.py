@@ -1,18 +1,11 @@
-"""One-shot local-model coding worker for small experiments.
-
-The prompt is built to fit the model's context window (#569). The first
-local run sent 8329 tokens to a server with ``n_ctx`` 8192 and got HTTP 400,
-so the window is now read from the server at the start of every run
-(``GET /props``; fallback ``LOCAL_MODEL_CONTEXT``, then 8192) and the prompt
-is measured with the server's own tokenizer (``POST /tokenize``; fallback a
-safe bytes-per-token estimate). The room is filled by priority:
-
-1. the instructions and the goal (never cut);
-2. the files the goal names, cut to their relevant parts;
-3. the Nexus handover, cut from the end.
-
-When the first two do not fit, the model is not called: the run ends with
-``context_too_small`` and the experiment hands the task to an external agent.
+"""One-shot local-model coding worker for small experiments. The prompt is fitted
+into the model's context window (#569): the window is read from the server per run
+(``GET /props``; fallback ``LOCAL_MODEL_CONTEXT`` then 8192) and the prompt measured
+with the server's tokenizer (``POST /tokenize``; fallback a safe bytes-per-token
+estimate). Room is filled by priority: instructions+goal (never cut), then the
+named files, then the handover cut from the end. When the first two do not fit, the
+model is not called: the run ends ``context_too_small`` and the experiment hands
+the task to an external agent.
 """
 
 from __future__ import annotations
@@ -41,8 +34,8 @@ DEFAULT_CONTEXT_TOKENS = 8192
 # Head-room for the chat template and tokenizer differences between the
 # separately counted sections and the rendered request.
 CONTEXT_MARGIN_TOKENS = 256
-# Fallback when /tokenize is unavailable: code and English average ~4
-# bytes per token; 3 over-counts on purpose so an estimate never overflows.
+# /tokenize fallback: code/English average ~4 bytes per token; 3 over-counts on
+# purpose so an estimate never overflows the window.
 SAFE_BYTES_PER_TOKEN = 3
 _MAX_FILES = 8
 _MAX_FILE_BYTES = 16 * 1024
@@ -64,9 +57,7 @@ class ContextTooSmallError(RuntimeError):
     """The instructions, the goal and the named files do not fit the context."""
 
 
-# ---------------------------------------------------------------------------
 # Splitting the task and reading the named files
-# ---------------------------------------------------------------------------
 
 def split_handover(task: str) -> tuple[str, str]:
     """``(task without handover, handover)``; the handover is the cuttable part."""
@@ -159,9 +150,7 @@ def _extract_diff(text: str) -> str:
     return candidate[min(starts):].strip() + "\n" if starts else ""
 
 
-# ---------------------------------------------------------------------------
 # Context size and token counting
-# ---------------------------------------------------------------------------
 
 def _env_context() -> int | None:
     try:

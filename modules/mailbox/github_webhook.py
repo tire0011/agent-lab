@@ -8,8 +8,8 @@ from typing import Any
 
 _SIG_PREFIX = "sha256="
 _INBOX_PREFIX = "inbox/"
-# Optional ``owner/repo`` the webhook is configured for; when set, payloads
-# from any other repository are ignored even with a valid signature.
+# Optional ``owner/repo`` the webhook is configured for; when set, payloads from
+# any other repository are ignored even with a valid signature.
 _REPO_ENV = "AGENT_MAILBOX_REPO"
 
 
@@ -33,12 +33,9 @@ def expected_repository() -> str | None:
 
 
 def repository_matches(payload: Any, expected: str | None) -> bool:
-    """True when *payload* comes from *expected* (or none is configured).
-
-    The HMAC signature proves GitHub delivered the payload with the configured
-    secret; it says nothing about which repository the push targeted. This
-    check closes that gap when ``AGENT_MAILBOX_REPO`` is set.
-    """
+    """True when *payload* comes from *expected* (or none is configured). The HMAC
+    signature proves delivery with the configured secret, not the target repo; this
+    check closes that gap when ``AGENT_MAILBOX_REPO`` is set."""
     if not expected:
         return True
     repository = payload.get("repository") if isinstance(payload, Mapping) else None

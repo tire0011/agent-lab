@@ -1,17 +1,9 @@
-"""Retention for the Git-backed mailbox: prune what is finished.
-
-The mailbox is a queue, but nothing ever drained it: outbox responses
-accumulated indefinitely, and an inbox message that exhausted its retries
-stayed on disk forever, re-read and re-skipped on every single poll
-without anyone being told (Issue #129).
-
-Pruning lives here - inside the process that owns the mailbox SQLite
-state - rather than in an external cron job or a `git rm` script, because
-deciding what is safe to delete requires that state. An outbox file whose
-record has not finished publishing is still *needed*: the publishers and
-``MailboxProcessor.retry_pending_git_commits()`` re-read it to finish the
-commit/push. Deleting it would strand that record permanently, and a
-git-side script could not even see the problem.
+"""Retention for the Git-backed mailbox: prune what is finished (#129). Pruning
+lives inside the process that owns the mailbox SQLite state, not in an external cron
+or `git rm` script, because deciding what is safe to delete requires that state: an
+outbox file whose record has not finished publishing is still *needed* by the
+publishers and ``retry_pending_git_commits()`` - deleting it would strand that
+record permanently.
 """
 
 from __future__ import annotations
@@ -30,9 +22,8 @@ logger = logging.getLogger(__name__)
 ENV_RETENTION_DAYS = "NEXUS_MAILBOX_RETENTION_DAYS"
 DEFAULT_RETENTION_DAYS = 5
 
-# Upper bound on one poll's deletions, so a first run against a long
-# backlog still produces a reviewable commit instead of an enormous one.
-# Whatever is left over is picked up by the next poll.
+# Upper bound on one poll's deletions, so a first run against a long backlog still
+# produces a reviewable commit; the rest is picked up by the next poll.
 MAX_DELETIONS_PER_POLL = 500
 
 # Outbox names are built by ``_outbox_filename`` and always start with a
@@ -41,12 +32,9 @@ _TIMESTAMP_PREFIX_LENGTH = 14
 
 
 def retention_days(raw: str | None = None) -> int:
-    """Configured retention window in days; ``0`` disables pruning.
-
-    Anything unparsable or negative is treated as ``0`` (disabled) rather
-    than falling back to the default: a typo in the environment must not
-    silently start deleting messages.
-    """
+    """Configured retention window in days; ``0`` disables pruning. Unparsable or
+    negative values are treated as ``0``, not the default: a typo in the environment
+    must not silently start deleting messages."""
     value = raw if raw is not None else os.environ.get(ENV_RETENTION_DAYS)
     if value is None or not str(value).strip():
         return DEFAULT_RETENTION_DAYS
@@ -84,12 +72,9 @@ class PruneResult:
 
 
 def message_timestamp(name: str) -> datetime | None:
-    """Parse an outbox filename's leading ``YYYYMMDDHHMMSS`` stamp.
-
-    Returns ``None`` for anything that does not carry one, which callers
-    treat as "do not touch": an unrecognized file is never old enough to
-    delete, because its age cannot be established.
-    """
+    """Parse an outbox filename's leading ``YYYYMMDDHHMMSS`` stamp; ``None`` when
+    absent, which callers treat as "do not touch" - an unrecognized file's age
+    cannot be established, so it is never old enough to delete."""
     prefix = name[:_TIMESTAMP_PREFIX_LENGTH]
     if len(prefix) < _TIMESTAMP_PREFIX_LENGTH or not prefix.isdigit():
         return None
@@ -107,17 +92,10 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 def protected_outbox_names(conn: sqlite3.Connection) -> set[str]:
-    """Outbox files that are still needed and must never be pruned.
-
-    Three producers write to the outbox, each with its own record of
-    whether publication finished:
-
-    * ``mailbox_messages`` - anything not yet ``done`` still needs its file
-      for ``retry_pending_git_commits()`` to finalize the commit.
-    * ``operation_chains`` and ``mailbox_task_approvals`` - any
-      ``publish_status`` other than ``pushed`` means a publisher will
-      re-read the file to finish writing, committing or pushing it.
-    """
+    """Outbox files that are still needed and must never be pruned: ``mailbox_messages``
+    rows not yet ``done`` (``retry_pending_git_commits()`` re-reads their file), and
+    ``operation_chains``/``mailbox_task_approvals`` rows whose ``publish_status`` is
+    not ``pushed``."""
     protected: set[str] = set()
 
     if _table_exists(conn, "mailbox_messages"):
@@ -137,8 +115,8 @@ def protected_outbox_names(conn: sqlite3.Connection) -> set[str]:
                 "WHERE outbox_file IS NOT NULL AND publish_status != 'pushed'"
             ).fetchall()
         except sqlite3.OperationalError:
-            # An older schema without publish tracking: protect everything
-            # this table references rather than guessing it is finished.
+            # Older schema without publish tracking: protect everything this table
+            # references rather than guessing it is finished.
             rows = conn.execute(
                 f"SELECT outbox_file FROM {table} WHERE outbox_file IS NOT NULL"  # noqa: S608
             ).fetchall()
@@ -148,12 +126,9 @@ def protected_outbox_names(conn: sqlite3.Connection) -> set[str]:
 
 
 def exhausted_inbox_paths(conn: sqlite3.Connection) -> list[Path]:
-    """Inbox messages that can no longer make progress.
-
-    A message that reached ``MAX_RETRY`` is terminal: every later poll
-    re-reads and re-skips it forever. Those are returned so the caller can
-    log why and remove them from the queue.
-    """
+    """Inbox messages that can no longer make progress: a message at ``MAX_RETRY`` is
+    terminal and would be re-read and re-skipped on every poll forever, so they are
+    returned for the caller to log and remove from the queue."""
     if not _table_exists(conn, "mailbox_messages"):
         return []
     rows = conn.execute(
@@ -173,11 +148,8 @@ def plan_prune(
     now: datetime | None = None,
     max_deletions: int = MAX_DELETIONS_PER_POLL,
 ) -> PruneResult:
-    """Decide what to delete, without touching the filesystem.
-
-    Kept separate from the deletion itself so the policy is testable on
-    its own, and so a caller can log exactly what is about to go.
-    """
+    """Decide what to delete, without touching the filesystem - kept separate so the
+    policy is testable on its own and the caller can log exactly what will go."""
     if days <= 0:
         return PruneResult()
 
@@ -206,8 +178,8 @@ def plan_prune(
     budget = max(0, max_deletions)
     if len(stale_outbox) + len(stale_inbox) > budget:
         truncated = True
-        # Inbox messages come first: they are actively re-processed on
-        # every poll, so draining them matters more than reclaiming space.
+        # Inbox messages come first: they are re-processed on every poll, so draining
+        # them matters more than reclaiming space.
         keep_inbox = stale_inbox[:budget]
         stale_outbox = stale_outbox[: max(0, budget - len(keep_inbox))]
         stale_inbox = keep_inbox

@@ -1,12 +1,8 @@
-"""One interface for chat models from any OpenAI-compatible provider (#552).
-
-The models live in ``config/models.json`` (or the file named by
-``NEXUS_MODELS_FILE``): adding a provider is a new entry, not new code.
-Every provider is reached through the same ``/chat/completions`` call.
-A model is available when its API key is set in the environment; keys are
-read from the environment only and never logged. An optional per-entry
-``headers`` object adds provider-required headers. A 2xx answer that is not
-JSON is reported as ``non_json_response``, not as a success.
+"""One interface for chat models from any OpenAI-compatible provider (#552): models
+live in ``config/models.json`` (or ``NEXUS_MODELS_FILE``) - a new provider is a new
+entry, not new code - all reached via ``/chat/completions``. A model is available
+when its API key is in the environment; keys are read from the environment only and
+never logged. A 2xx non-JSON answer is ``non_json_response``, not a success.
 """
 
 from __future__ import annotations

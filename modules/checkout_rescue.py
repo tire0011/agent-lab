@@ -1,36 +1,13 @@
 """Self-healing preparation of a deployment checkout before a refresh.
 
-The live Nexus checkout at ``/agent`` is deployable state, not a workspace.
-A refresh used to abort whenever that checkout was dirty - in the case that
-motivated this module the only blocker was one *generated* runtime file
-(``communication/outbox/20260914170857-failure-analysis-7a2bc0c1.md``) that
-nobody wanted to keep in the repository anyway, while the checkout itself was
-nine commits behind ``origin/main``.  Refusing to deploy over a stale artifact
-is the wrong trade: the deployment stalls and the artifact still has to be
-removed by hand.
+Work (tracked/staged changes and unrecognized untracked files) is committed onto
+a rescue branch ``nexus/rescue/<timestamp>-<head>``; recognizable runtime
+artifacts are archived outside the repository. Anything unrecognized counts as
+work, because preserving junk is cheap and deleting something that matters is not.
 
-This module makes that state recoverable without losing anything:
-
-* **Work** - tracked modifications, staged changes and untracked files that
-  are not recognizable runtime output - is committed onto a dedicated rescue
-  branch ``nexus/rescue/<timestamp>-<short-head>``.  It stays in the
-  repository, reachable by name, and is never reset away.
-* **Runtime artifacts** - outbox/inbox drops, logs, caches, databases and
-  temporary files - are moved into an archive *outside* the repository
-  (default ``/var/lib/nexus/runtime-archive/<timestamp>/``) so they never
-  become a code commit.
-* Anything unrecognized is treated as work, because preserving a file that
-  turns out to be junk is cheap and deleting a file that turns out to matter
-  is not.
-
-Safety contract
----------------
-- No ``git reset --hard``, no force checkout, no force push, no silent delete.
-- Archiving rolls back on failure, so a failed rescue leaves the checkout
-  exactly as it was and the caller aborts the refresh before touching ``main``.
-- Repeating a rescue is a no-op: a clean checkout needs none, and an artifact
-  whose content is already in the archive is deduplicated instead of copied
-  a second time.
+Safety contract: no ``git reset --hard``, no force checkout/push, no silent
+delete; archiving rolls back on failure, so a failed rescue leaves the checkout
+exactly as it was; repeating a rescue is a no-op (the archive is deduplicated).
 """
 
 from __future__ import annotations
@@ -58,35 +35,29 @@ EXTRA_ARTIFACT_PATTERNS_ENV = "NEXUS_RUNTIME_ARTIFACT_PATTERNS"
 _ARCHIVE_INDEX_NAME = "archive-index.json"
 _GIT_TIMEOUT = 60
 
-#: Untracked paths matching one of these are Nexus runtime output and are
-#: archived outside the repository instead of committed.  Matching is
-#: :func:`fnmatch.fnmatch` against the repository-relative POSIX path, where
-#: ``*`` also crosses directory separators - ``state/*`` therefore covers
-#: ``state/experiment-logs/x.jsonl`` as well.
+#: Untracked paths matching one of these are Nexus runtime output, archived
+#: outside the repository instead of committed. Matching is fnmatch against the
+#: repository-relative POSIX path, where ``*`` also crosses separators.
 RUNTIME_ARTIFACT_PATTERNS: tuple[str, ...] = (
     # Legacy in-repository mailbox drops; the mailbox lives in its own repo now.
     "communication/outbox/*",
     "communication/inbox/*",
-    # Runtime state: run records, databases, locks, experiment logs. Scoped to
-    # the state directory on purpose - a `.lock` or `.jsonl` file elsewhere is
-    # as likely to be source (a dependency lockfile, a fixture) as output.
+    # Runtime state, scoped to state/ on purpose: a `.lock`/`.jsonl` elsewhere is
+    # as likely to be source (lockfile, fixture) as output.
     "state/*",
     "*.db",
     "*.db-shm",
     "*.db-wal",
     "*.sqlite",
     "*.sqlite3",
-    # Logs and journals.
     "logs/*",
     "*.log",
-    # Temporary and editor/merge leftovers.
     "*.tmp",
     "*.temp",
     "*.bak",
     "*.orig",
     "*.rej",
     "*~",
-    # Caches and build output.
     "__pycache__/*",
     "*/__pycache__/*",
     "*.pyc",
@@ -196,11 +167,8 @@ def is_runtime_artifact(path: str, patterns: Sequence[str] | None = None) -> boo
 def classify_untracked(
     paths: Iterable[str], patterns: Sequence[str] | None = None
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Split untracked paths into ``(runtime_artifacts, work)``.
-
-    Unknown files land in ``work`` on purpose: they are preserved on the
-    rescue branch rather than archived away from the repository.
-    """
+    """Split untracked paths into ``(runtime_artifacts, work)``; unknown files land
+    in ``work`` on purpose - preserved on the rescue branch, not archived away."""
     resolved = patterns if patterns is not None else runtime_artifact_patterns()
     artifacts = tuple(p for p in paths if is_runtime_artifact(p, resolved))
     work = tuple(p for p in paths if p not in artifacts)
@@ -233,11 +201,8 @@ def git_output(repo_root: Path | str, args: Sequence[str], *, what: str) -> str:
 
 
 def _parse_status(raw: str) -> tuple[list[str], list[str], list[str], str | None]:
-    """Parse ``git status --porcelain=v1 -b -z -uall`` output.
-
-    Returns ``(staged, tracked, untracked, branch_header)``.  NUL-separated
-    output is used so paths with spaces, quotes or newlines survive intact.
-    """
+    """Parse ``git status --porcelain=v1 -b -z -uall`` output into (staged, tracked,
+    untracked, branch_header); NUL-separated so odd paths survive intact."""
     staged: list[str] = []
     tracked: list[str] = []
     untracked: list[str] = []
@@ -318,13 +283,8 @@ def _sha256(path: Path) -> str:
 
 
 class ArchiveIndex:
-    """Content index that keeps repeated archiving from duplicating files.
-
-    Retrying a refresh must not fill the archive with copy after copy of the
-    same artifact, so every archived file is recorded under
-    ``<relative path>:<sha256>``.  A later run that finds the same content
-    already archived - and still present - reuses that entry.
-    """
+    """Content index keyed by ``<relative path>:<sha256>``, so a retry reuses an
+    already-archived copy instead of filling the archive with duplicates."""
 
     def __init__(self, root: Path) -> None:
         self._path = root / _ARCHIVE_INDEX_NAME
@@ -368,16 +328,10 @@ class ArchiveIndex:
 
 
 class _ArchiveTransaction:
-    """Archive moves that can still be undone.
-
-    Archiving runs before the rescue commit, so the commit phase failing has
-    to put the artifacts back. An artifact already outside the repository is
-    a change to the checkout, and the contract is that a failed rescue leaves
-    the checkout exactly as it was - so the moves stay provisional until the
-    whole rescue has succeeded. Until :meth:`commit`, nothing is persisted:
-    the index is unsaved and the deduplicated originals are only parked in a
-    holding directory, never deleted.
-    """
+    """Archive moves that stay provisional until the whole rescue succeeds: until
+    :meth:`commit`, the index is unsaved and parked duplicates are only held,
+    never deleted - a failed rescue puts every artifact back, leaving the
+    checkout exactly as it was."""
 
     def __init__(self, index: ArchiveIndex | None = None, archive_dir: Path | None = None) -> None:
         self._index = index
@@ -461,37 +415,31 @@ class CheckoutRescue:
     def archive_root(self) -> Path:
         return self._archive_root
 
-    # -- public API ------------------------------------------------------
+    # Public API
 
     def prepare(self, state: CheckoutState | None = None) -> RescueReport:
-        """Preserve local changes, then leave the worktree clean.
-
-        Raises :class:`RescueError` without having changed anything the
-        caller cannot see when preservation is not possible.
-        """
+        """Preserve local changes, then leave the worktree clean; raises
+        :class:`RescueError` without changing anything the caller cannot see
+        when preservation is not possible."""
         current = state or inspect_checkout(self._repo_root)
         if current.clean:
             return RescueReport(notes=("checkout was clean; nothing to rescue",))
 
         timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime(self._clock()))
         artifacts, work = classify_untracked(current.untracked, self._patterns)
-        # A symlink is never archived, whatever it is named: moving it would
-        # either follow it out of the repository or leave a dangling link, and
-        # skipping it would leave the worktree dirty. Git stores the link
-        # itself, so the rescue branch is the honest place for it.
+        # A symlink is never archived, whatever it is named: moving it could follow
+        # it out of the repository or leave a dangling link, and skipping it would
+        # leave the worktree dirty. Git stores the link itself, so the rescue
+        # branch is the honest place for it.
         symlinks = tuple(path for path in artifacts if (self._repo_root / path).is_symlink())
         if symlinks:
             artifacts = tuple(path for path in artifacts if path not in symlinks)
             work = (*work, *symlinks)
         work_paths = tuple(dict.fromkeys((*current.staged, *current.tracked, *work)))
 
-        # Archive first: it is the only step that touches the filesystem
-        # outside git, and doing it before any git mutation means a broken
-        # archive aborts the refresh with the checkout still exactly as it was.
-        # The moves stay provisional until the rescue as a whole succeeds, so a
-        # later failure - creating the branch, staging, committing, switching
-        # back - puts the artifacts back rather than leaving the checkout in a
-        # half-rescued state.
+        # Archive first, before any git mutation, so a broken archive aborts with
+        # the checkout still exactly as it was; moves stay provisional and later
+        # failures put the artifacts back.
         transaction = self._archive_runtime_artifacts(artifacts, timestamp)
 
         notes: list[str] = []
@@ -516,9 +464,8 @@ class CheckoutRescue:
                     + ", ".join((*remaining.staged, *remaining.tracked, *remaining.untracked))[:300]
                 )
         except BaseException:
-            # A rescue commit that already exists is left alone - deleting it
-            # would destroy the work it preserves, and it is reachable by name
-            # in the error. The archive is what gets undone.
+            # An existing rescue commit is left alone - deleting it would destroy
+            # the work it preserves; the archive is what gets undone.
             transaction.rollback()
             raise
 
@@ -535,12 +482,9 @@ class CheckoutRescue:
         )
 
     def preserve_commits(self, head: str, *, reason: str = "diverged deployment branch") -> str:
-        """Point a rescue branch at *head* so commits survive a realignment.
-
-        Used when the deployment branch carries local commits that block a
-        fast-forward: naming them keeps them reachable, which is what makes
-        moving the branch reference non-destructive.
-        """
+        """Point a rescue branch at *head* so local commits that block a
+        fast-forward stay reachable - naming them is what makes moving the
+        branch reference non-destructive."""
         timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime(self._clock()))
         branch = self._rescue_branch_name(head, timestamp)
         result = git(self._repo_root, ["branch", branch, head])
@@ -551,7 +495,7 @@ class CheckoutRescue:
             )
         return branch
 
-    # -- archiving -------------------------------------------------------
+    # Archiving
 
     def _archive_runtime_artifacts(
         self, artifacts: Sequence[str], timestamp: str
@@ -582,8 +526,8 @@ class CheckoutRescue:
                 digest = _sha256(source)
                 existing = index.lookup(relative, digest)
                 if existing is not None:
-                    # Identical content is already archived; keeping a second
-                    # copy would make retries accumulate duplicates.
+                    # Identical content already archived; a second copy would
+                    # accumulate on retries.
                     parked = self._duplicate_backup(source, timestamp)
                     shutil.move(str(source), str(parked))
                     transaction.record_duplicate(source, parked, relative, existing)
@@ -598,11 +542,8 @@ class CheckoutRescue:
         return transaction
 
     def _duplicate_backup(self, source: Path, timestamp: str) -> Path:
-        """Staging path for an artifact whose content is already archived.
-
-        The file is moved aside rather than deleted outright so a failure
-        later in the same run can still put it back.
-        """
+        """Staging path for an artifact whose content is already archived; moved
+        aside, not deleted, so a later failure in the same run can put it back."""
         holding = self._archive_root / f".duplicates-{timestamp}"
         holding.mkdir(parents=True, exist_ok=True)
         return self._unique_destination(holding / source.name)
@@ -618,7 +559,7 @@ class CheckoutRescue:
                 return alternative
         raise RescueError(f"could not find a free archive name for {candidate.name}")
 
-    # -- rescue branch ---------------------------------------------------
+    # Rescue branch
 
     def _commit_work(
         self, work_paths: Sequence[str], state: CheckoutState, timestamp: str
@@ -650,10 +591,9 @@ class CheckoutRescue:
             )
             if commit.returncode != 0:
                 if self._worktree_is_clean():
-                    # Staging refreshed an index that only looked dirty - stat
-                    # changes with identical content - so there is nothing to
-                    # commit. The worktree is clean, which is all the refresh
-                    # needs; an empty rescue branch would only be noise.
+                    # Stat-only changes with identical content: nothing to commit;
+                    # the clean worktree is all the refresh needs - an empty rescue
+                    # branch would only be noise.
                     self._discard_empty_branch(branch)
                     return None, None, (
                         "local changes were stat-only; no rescue commit was needed"
@@ -666,8 +606,8 @@ class CheckoutRescue:
                 self._repo_root, ["rev-parse", "HEAD"], what="could not read the rescue commit"
             ).strip()
         except RescueError:
-            # Put the checkout back on the branch it came from; the working
-            # tree changes travel with it, so nothing is lost.
+            # Put the checkout back on the branch it came from; working-tree
+            # changes travel with it, so nothing is lost.
             git(self._repo_root, ["switch", state.branch])
             git(self._repo_root, ["branch", "--delete", "--force", branch])
             raise
@@ -686,11 +626,8 @@ class CheckoutRescue:
         return result.returncode == 0 and not result.stdout.strip()
 
     def _discard_empty_branch(self, branch: str) -> None:
-        """Drop a rescue branch that never received a commit.
-
-        It points at the same commit the deployment branch does, so the safe
-        delete succeeds and nothing becomes unreachable.
-        """
+        """Drop a rescue branch that never received a commit; it points at the
+        same commit as the deployment branch, so the delete loses nothing."""
         switch_back = git(self._repo_root, ["switch", self._target_branch])
         if switch_back.returncode != 0:
             raise RescueError(

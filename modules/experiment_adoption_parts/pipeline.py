@@ -133,9 +133,8 @@ class PipelineMixin:
                     changed_files=actual_files,
                     diff_stat=sanitized_reason(snapshot["diff_stat"], max_chars=1000),
                 )
-                # Validation already proved there is something to adopt, and
-                # said in which shape: an uncommitted diff still to be
-                # committed, or a commit an earlier attempt left behind.
+                # Validation proved there is something to adopt and in which shape:
+                # an uncommitted diff to commit, or a commit an earlier attempt left.
                 experiment_commit_sha = validation["committed_commit_sha"]
                 commit_message = self._commit_message(
                     experiment_id, experiment.goal, experiment.plan
@@ -177,10 +176,9 @@ class PipelineMixin:
                     )
                 experiment_commit_sha = self._git_stdout(["rev-parse", "HEAD"], worktree_path, elog).strip() or None
 
-            # Persist the source commit whichever way it was obtained. A
-            # requeue resets this column, so an adoption that adopts an
-            # already-committed change has to write it back - otherwise the
-            # next attempt is blind again in exactly the same way.
+            # Persist the source commit whichever way it was obtained; a requeue
+            # resets this column, so an already-committed change must write it back
+            # or the next attempt is blind again the same way.
             self._set_status(
                 experiment_id,
                 STATUS_ADOPTING,
@@ -208,10 +206,9 @@ class PipelineMixin:
                     elog=elog,
                 )
 
-            # The whole change since the experiment branch left main, not
-            # only its last commit: a retry builds on the earlier attempt's
-            # commits, and picking just its own commit either conflicts or
-            # lands half a change (#455, the reverted #410).
+            # The whole change since the experiment branch left main, not only its
+            # last commit: a retry builds on earlier attempts, and picking just its
+            # own commit either conflicts or lands half a change (#455, reverted #410).
             squash = _run_git(
                 ["merge", "--squash", experiment_commit_sha or "HEAD"],
                 cwd=str(integration_path),
@@ -402,8 +399,8 @@ class PipelineMixin:
                 integrated_changed,
                 str(integration_path),
             )
-            # Soft gate findings (#519) go to the reviewer; without one they
-            # stay a hard stop here, before anything is pushed.
+            # Soft gate findings (#519) go to the reviewer; without one they stay a
+            # hard stop here, before anything is pushed.
             integrated_soft = eval_result.soft_findings() if self.reviewer is not None else None
             review_findings = [
                 f for f in (
@@ -503,8 +500,8 @@ class PipelineMixin:
                     elog=elog,
                 )
 
-            # CI ran on the experiment branch; what merges is that change on
-            # top of today's main. Test exactly that tree first (#455).
+            # CI ran on the experiment branch; what merges is that change on top of
+            # today's main. Test exactly that tree first (#455).
             if published_sha and not (exact_ci and evidence.passed and published_sha == checkpoint_sha):
                 final_ci = self.github_work_tracking.wait_for_commit_ci(
                     published_sha, experiment_id=experiment_id

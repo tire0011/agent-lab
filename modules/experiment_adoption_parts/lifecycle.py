@@ -81,15 +81,12 @@ class LifecycleMixin:
 
 
     def close(self) -> None:
-        # Adoption pipelines run in daemon threads and use both the shared SQLite
-        # connection and temporary worktrees. Closing/removing their resources
-        # while a thread is still active can corrupt sqlite state or crash the
-        # interpreter. Join all known workers before closing the connection.
+        # Adoption threads use the shared SQLite connection and temporary worktrees;
+        # closing those while a thread is active can corrupt sqlite or crash the
+        # interpreter, so join all workers first. A thread may be inside a verification
+        # run bounded by the watchdog's absolute safety cap, so wait for that, not a
+        # shorter fixed timeout.
         for thread in list(self._threads.values()):
-            # An adoption thread may be inside a local verification run, which
-            # the progress watchdog bounds by the absolute safety cap rather
-            # than by a five-minute timeout - so wait for that, not for a
-            # value the run can legitimately exceed.
             thread.join(
                 timeout=self.experiment_service._get_test_watchdog_config().safety_cap_seconds
                 + _DEFAULT_GIT_TIMEOUT_SECONDS
@@ -114,33 +111,16 @@ class LifecycleMixin:
     ) -> ExperimentAdoption:
         """Queue adoption for a verified experiment.
 
-        Restarting a *failed* adoption reuses the same row - there is one
-        per experiment - which means the retry would silently overwrite
-        the failure that preceded it. So the replaced failure is always
-        appended to the durable attempt history first, in the transaction
-        that queues the retry (Issue #136).
-
-        Whether a failed adoption *should* be restarted is the caller's
-        policy decision, not this method's: the finalization coordinator
-        consults :meth:`assess_failure` before reopening an exhausted
-        lifecycle, while an operator calling the adopt endpoint has
-        already decided.
-
-        ``superseded`` is that assessment, passed back by a caller that
-        restarted *because* current evidence overruled the recorded
-        failure. Only such a restart consumes ``stale_retry_attempts``:
-        that budget bounds how often changed evidence may reopen the
-        lifecycle, so ordinary retries - a finalization retry still inside
-        its own budget, an operator pressing adopt - must not spend it.
-        Otherwise two ordinary retries would exhaust the evidence budget
-        before any evidence had changed, and #136's whole point (changed
-        evidence reopens an exhausted lifecycle) would be unreachable.
+        Restarting a *failed* adoption reuses the same row, so the replaced failure
+        is always archived to the durable attempt history first, in the same
+        transaction (#136). ``superseded`` is the caller's assessment that current
+        evidence overruled the recorded failure; only such an evidence-granted
+        restart consumes ``stale_retry_attempts`` - ordinary retries must not spend
+        that budget (#136).
         """
         existing = self.get(experiment_id)
-        # A `needs_review` row is reopened only by a caller that brings an
-        # assessment saying its blocker has cleared (#171). Without one it
-        # stays exactly as terminal as before - an operator pressing adopt
-        # on a review row still gets the record back untouched.
+        # A needs_review row is reopened only with an assessment saying its blocker
+        # has cleared (#171); otherwise it stays as terminal as before.
         reopening_review = existing.status == STATUS_NEEDS_REVIEW and bool(
             superseded is not None and superseded.retryable
         )
@@ -173,9 +153,8 @@ class LifecycleMixin:
         adoption_id = existing.id or uuid.uuid4().hex
 
         retry_reason: str | None = None
-        # A fresh start (nothing failed yet) resets the budget; an ordinary
-        # retry carries it unchanged; only an evidence-granted retry spends
-        # one unit of it.
+        # Fresh start resets the budget, an ordinary retry carries it unchanged,
+        # only an evidence-granted retry spends one unit.
         stale_retry_attempts = existing.stale_retry_attempts if restarting_failure else 0
         if restarting_failure:
             retry_reason = (
@@ -190,11 +169,10 @@ class LifecycleMixin:
                 f"{existing.reason or 'unknown'}"
             )
 
-        # One transaction: the previous failure is archived, the row is
-        # reset to `queued` and the attempt is counted before any worker
-        # exists to observe an in-between state. A crash between the two
-        # writes could otherwise either lose the failure history or hand
-        # out an unbounded retry.
+        # One transaction: archive the previous failure, reset the row to queued
+        # and count the attempt before any worker can observe an in-between state;
+        # a crash between separate writes could lose the history or allow an
+        # unbounded retry.
         with self._lock, self._conn:
             if restarting_failure:
                 self._archive_failure(existing, superseded_by=retry_reason or "retry")
@@ -312,26 +290,14 @@ class LifecycleMixin:
     def recover_after_restart(self) -> list[str]:
         """Resume adoptions that a process restart interrupted mid-flight.
 
-        A restart is a resumable boundary, not a failure: Nexus restarts
-        itself as a normal part of the refresh/deploy flow, so an adoption
-        that was still ``queued``/``adopting`` when the process died must
-        be reconstructed from durable evidence rather than declared
-        ``interrupted`` (which the finalization coordinator then turned
-        into a misleading ``needs_review``).
-
-        For each interrupted adoption, in order of how much evidence it
-        takes to be sure:
-
-        1. **GitHub already shows the pull request merged** - the work
-           really finished and only the bookkeeping was lost. Record it as
-           ``adopted`` with the real merge commit; never merge again.
-        2. **Otherwise resume** the *same* adoption record (same adoption
-           id, experiment, issue, PR and branch) by re-running the
-           pipeline, which re-derives its state from git.
-        3. **Evidence is unavailable or the attempt budget is spent** ->
-           ``needs_review`` naming the actual obstacle.
-
-        Returns the experiment ids it acted on.
+        A restart is a resumable boundary, not a failure (refresh restarts Nexus
+        deliberately): an adoption still queued/adopting when the process died is
+        reconstructed from durable evidence. Per interrupted adoption: if GitHub
+        already shows the PR merged, record ``adopted`` with the real merge commit
+        and never merge again; otherwise resume the same adoption record by
+        re-running the pipeline; if evidence is unavailable or the attempt budget
+        is spent, mark ``needs_review`` naming the obstacle. Returns the experiment
+        ids it acted on.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -346,13 +312,10 @@ class LifecycleMixin:
             experiment_id = row["experiment_id"]
             handled.append(experiment_id)
             try:
-                # Adoptions are serialized by design (start_adoption refuses
-                # a second one), so finding several interrupted at once is
-                # already an inconsistency. Recording an already-merged one
-                # is safe for any number of them, but only the oldest
-                # remaining record is actually resumed: running two
-                # pipelines would just have them fight over the adoption
-                # lock and fail each other.
+                # Adoptions are serialized by design, so several interrupted at
+                # once is already an inconsistency: recording already-merged ones
+                # is always safe, but only the oldest remaining record is resumed -
+                # two pipelines would fight over the adoption lock.
                 resumed = self._recover_one(row, allow_resume=not resumed_one)
                 resumed_one = resumed_one or resumed
             except Exception:  # noqa: BLE001 - one bad record must not block the rest
@@ -377,8 +340,8 @@ class LifecycleMixin:
 
         merged_sha = self._merged_sha_for(experiment_id)
         if merged_sha:
-            # The merge landed before the restart; finishing it again would
-            # be a duplicate. Persist what actually happened instead.
+            # The merge landed before the restart; finishing it again would be a
+            # duplicate. Persist what actually happened instead.
             self._set_status(
                 experiment_id,
                 STATUS_ADOPTED,
@@ -545,11 +508,8 @@ class LifecycleMixin:
 
 
     def failure_history(self, experiment_id: str) -> list[dict[str, Any]]:
-        """Superseded adoption failures, oldest first.
-
-        The adoption row itself is reused across retries, so this is where
-        a replaced failure remains readable after the retry moved on.
-        """
+        """Superseded adoption failures, oldest first - the row itself is reused
+        across retries, so this is where a replaced failure stays readable."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM experiment_adoption_failures WHERE experiment_id=? "
@@ -602,13 +562,9 @@ class LifecycleMixin:
 
 
     def _elog(self, experiment_id: str):
-        """An ExperimentLogger for this experiment, or a no-op stand-in.
-
-        Diagnostics must never be able to break the lifecycle they
-        describe, and the logger factory can legitimately refuse (an id
-        that is not path-safe, a log directory that cannot be created), so
-        a failure here degrades to silence rather than propagating.
-        """
+        """An ExperimentLogger for this experiment, or a no-op stand-in: diagnostics
+        must never break the lifecycle they describe, so a logger-factory failure
+        (unsafe id, unusable log dir) degrades to silence rather than propagating."""
         try:
             return self.experiment_service.get_experiment_logger(experiment_id)
         except Exception:  # noqa: BLE001 - logging is never worth a lifecycle failure

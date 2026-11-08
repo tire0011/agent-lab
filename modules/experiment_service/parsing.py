@@ -7,7 +7,6 @@ from typing import Any
 from .models import ExperimentPlan
 
 
-# ---------------------------------------------------------------------------
 
 _PLAN_FIELD_PATTERNS: dict[str, str] = {
     "title": r"title",
@@ -25,12 +24,9 @@ _PLAN_FIELD_PATTERNS: dict[str, str] = {
 
 
 def _find_balanced_json_objects(text: str) -> list[str]:
-    """Scan *text* and return the exact substrings of every top-level
-    balanced ``{...}`` object, tracking string/escape state so that braces
-    inside JSON string values (e.g. in a ``"risks"`` free-text field) never
-    throw off the matching. Only top-level objects are returned (nested
-    objects are part of their parent's span, not reported separately).
-    """
+    """Scan *text* and return every top-level balanced ``{...}`` substring, tracking
+    string/escape state so braces inside JSON string values never throw off the
+    matching (nested objects stay part of their parent's span)."""
     objects: list[str] = []
     depth = 0
     start: int | None = None
@@ -65,27 +61,16 @@ def _find_balanced_json_objects(text: str) -> list[str]:
 
 
 def extract_single_json_object(raw_text: str | None) -> dict[str, Any] | None:
-    """Tolerantly extract exactly one JSON object from *raw_text*.
-
-    Accepts, in order of preference:
-      1. The whole trimmed text being pure JSON.
-      2. Exactly one JSON object inside a ```json fenced code block.
-      3. Exactly one top-level balanced ``{...}`` object anywhere in the
-         text (braces inside JSON string values are correctly ignored via
-         proper string/escape tracking, unlike a naive first/last-brace
-         slice).
-
-    Returns ``None`` — never guesses or merges — if zero or more than one
-    top-level JSON object is found, or if the found object does not parse.
-    No values are invented; this only locates and decodes exactly one
-    object if unambiguously present.
+    """Tolerantly extract exactly one JSON object from *raw_text*: pure JSON first,
+    then one object in a ```json fence, then one top-level balanced object.
+    Returns ``None`` — never guesses or merges — when zero or several candidates
+    are found or the object does not parse.
     """
     if not raw_text or not raw_text.strip():
         return None
 
     text = raw_text.strip()
 
-    # 1) Whole text is pure JSON.
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
@@ -93,7 +78,6 @@ def extract_single_json_object(raw_text: str | None) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         pass
 
-    # 2) Exactly one fenced ```json ... ``` block containing an object.
     fenced_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if len(fenced_blocks) == 1:
         try:
@@ -106,7 +90,6 @@ def extract_single_json_object(raw_text: str | None) -> dict[str, Any] | None:
     if len(fenced_blocks) > 1:
         return None  # ambiguous: more than one candidate, do not guess
 
-    # 3) Exactly one top-level balanced {...} object anywhere in the text.
     candidates = _find_balanced_json_objects(text)
     if len(candidates) != 1:
         return None  # zero or ambiguous multiple objects: reject, don't guess
@@ -119,14 +102,10 @@ def extract_single_json_object(raw_text: str | None) -> dict[str, Any] | None:
 
 
 def parse_plan(raw_text: str | None) -> ExperimentPlan | None:
-    """Best-effort parse of the selection phase's structured output.
-
-    Prefers a single, unambiguous JSON object (see
-    ``extract_single_json_object``). Falls back to a simple
-    ``Field: value`` line format only when no JSON object is present at
-    all. Returns ``None`` if the fields cannot be reliably extracted —
-    callers must treat that as "reject, do not guess".
-    """
+    """Best-effort parse of the selection phase's structured output: one unambiguous
+    JSON object if present (``extract_single_json_object``), else ``Field: value``
+    lines. Returns ``None`` when fields cannot be reliably extracted - callers
+    must treat that as "reject, do not guess"."""
     if not raw_text or not raw_text.strip():
         return None
 
@@ -134,12 +113,9 @@ def parse_plan(raw_text: str | None) -> ExperimentPlan | None:
     data = extract_single_json_object(text)
 
     if data is None:
-        # Fallback: "Field: value" lines. Only used when the text contains
-        # no JSON object candidates at all (extract_single_json_object
-        # returns None both for "no object" and "ambiguous multiple
-        # objects" — in the ambiguous case this fallback will also very
-        # likely fail to find clean field lines, which is the desired
-        # conservative behavior).
+        # Fallback: "Field: value" lines, only when no JSON object was present;
+        # in the ambiguous case this fails to find clean fields too, which is
+        # the desired conservative behavior.
         data = {}
         for line in text.splitlines():
             match = re.match(r"^\s*[-*]?\s*([A-Za-z_ ]+):\s*(.+)$", line)
@@ -183,11 +159,8 @@ def parse_plan(raw_text: str | None) -> ExperimentPlan | None:
     if not affected_files or any(v is None for v in required.values()):
         return None
 
-    # New, optional-for-backward-compatibility fields: absent in any plan
-    # produced before this vocabulary existed, or in a raw model response
-    # that fell back to the "Field: value" text format above. Defaults are
-    # applied by ``ExperimentPlan`` itself; this only normalizes whatever
-    # was actually present.
+    # Optional backward-compatibility fields; defaults are applied by
+    # ``ExperimentPlan`` itself, this only normalizes what was present.
     change_kind_raw = _get_str("change_kind")
     change_kind = change_kind_raw.strip().lower() if change_kind_raw else "implementation"
 

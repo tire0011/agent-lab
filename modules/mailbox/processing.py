@@ -43,12 +43,9 @@ logger = logging.getLogger(__name__)
 
 
 def transient_mailbox_task_id(relative_source: str) -> str:
-    """Stable, content-free correlation id available before parsing succeeds.
-
-    Public because the log-trace read path (``modules.log_trace``) has to
-    derive the same id from an inbox filename to find a message's log
-    file - both sides must agree on one definition, not two.
-    """
+    """Stable, content-free correlation id available before parsing succeeds. Public
+    because the log-trace read path (``modules.log_trace``) derives the same id from
+    an inbox filename - both sides must agree on one definition."""
     digest = hashlib.sha256(relative_source.encode("utf-8", errors="replace")).hexdigest()[:32]
     return f"mailbox-{digest}"
 
@@ -65,12 +62,9 @@ def _process_idea(
     *,
     sender_trusted: bool = True,
 ) -> tuple[str, str | None]:
-    """Append idea to IDEAS.md. Returns (result_body, idea_id).
-
-    An untrusted sender's idea is stored for review only: it must never enter
-    IDEAS.md in state ``new``, because the initiative tick would pick it up as
-    executable work.
-    """
+    """Append idea to IDEAS.md. Returns (result_body, idea_id). An untrusted sender's
+    idea is stored for review only - never in state ``new``, which the initiative
+    tick would pick up as executable work."""
     if not sender_trusted:
         conn.execute(
             """
@@ -131,15 +125,12 @@ def _process_task(
     sender_trusted: bool = True,
 ) -> tuple[str, None]:
     """Record the task request; the task worker hands it straight to Nexus (#264).
-
-    Only a sender the authorization gate verified (via the git commit that
-    added the inbox file, never the file's own ``created_by`` text) gets a
-    ``queued`` task; everyone else gets ``pending_approval``, which the worker
-    never runs.
-    """
+    Only a sender verified via the git commit that added the inbox file (never the
+    file's own ``created_by`` text) gets a ``queued`` task; everyone else gets
+    ``pending_approval``, which the worker never runs."""
     explicit_key = msg.meta.get("idempotency_key") or None
-    # A malformed key fails the message visibly instead of being swallowed
-    # by the best-effort approval insert below.
+    # A malformed key fails the message visibly instead of being swallowed by the
+    # best-effort approval insert below.
     resolve_idempotency_key(db_msg_id, explicit_key)
     try:
         conn.execute(
@@ -151,16 +142,16 @@ def _process_task(
         logger.warning("_process_task: failed to store task_body for msg %s", db_msg_id)
 
     try:
-        # A retry of this same inbox row keeps the task it already created,
-        # even if the sender edited the file's key in between.
+        # A retry of this inbox row keeps the task it already created, even if the
+        # sender edited the file's key in between.
         existing = conn.execute(
             "SELECT id FROM mailbox_task_approvals WHERE mailbox_msg_id = ?",
             (db_msg_id,),
         ).fetchone()
         if not existing:
-            # An optional front-matter ``idempotency_key`` lets a sender
-            # redeliver the same task as a new file without a second task
-            # (#378); otherwise the key is derived from this inbox row.
+            # An optional front-matter ``idempotency_key`` lets a sender redeliver
+            # the same task as a new file without a second task (#378); otherwise
+            # the key is derived from this inbox row.
             approval_id, created = insert_task_approval(
                 conn,
                 mailbox_msg_id=db_msg_id,
@@ -194,10 +185,8 @@ def _process_task(
 
 
 def _default_issue_fetcher(repository: str, issue_number: int) -> dict[str, Any]:
-    """Fetch the current title/body of one issue via the GitHub API.
-
-    Used to bind an approval to the issue's content hash at approval time.
-    """
+    """Fetch the current title/body of one issue via the GitHub API, to bind an
+    approval to the issue's content hash at approval time."""
     proc = subprocess.run(
         [
             "gh", "api", f"repos/{repository}/issues/{issue_number}",
@@ -230,15 +219,12 @@ def _process_issue_approval(
     sender_trusted: bool = True,
     issue_fetcher: Any = None,
 ) -> tuple[str, None]:
-    """Structured issue authorization command from the trusted mailbox.
-
-    Front matter (never free text): ``repository``, ``issue``, ``decision`` in
-    {approved, revoked, rejected}. Only a sender verified through the git
-    provenance of the adding commit (``sender_trusted``) may change the
-    approval registry; the file's own ``created_by`` is not proof of identity.
-    Approvals are bound to the issue's current content hash, recorded
-    transactionally and idempotently; the confirmation goes to the outbox.
-    No shell is involved.
+    """Structured issue authorization from the trusted mailbox: front matter (never
+    free text) ``repository``/``issue``/``decision`` in {approved, revoked, rejected}.
+    Only a sender verified via the adding commit's git provenance may change the
+    registry - the file's own ``created_by`` is not proof. Approvals are bound to the
+    issue's current content hash, recorded transactionally and idempotently, confirmed
+    to the outbox. No shell is involved.
     """
     if not sender_trusted:
         logger.warning("issue_approval rejected: untrusted sender for %s", msg.file_path.name)
@@ -392,11 +378,8 @@ def _process_setting(
     *,
     sender_trusted: bool = True,
 ) -> tuple[str, None]:
-    """Change one allowlisted setting from the front matter (``key``, ``value``).
-
-    Settings change Nexus's own guardrails, so only a verified trusted sender
-    may change them.
-    """
+    """Change one allowlisted setting from the front matter (``key``, ``value``) -
+    settings change Nexus's own guardrails, so only a verified trusted sender may."""
     if not sender_trusted:
         return "Setting changes require a sender the repository owner trusts. Refused.", None
     key = str(msg.meta.get("key") or "").strip()
@@ -493,11 +476,8 @@ def _process_operation_chain(
     *,
     sender_trusted: bool = True,
 ) -> Any:
-    """Parse, validate, and start an operation_chain message.
-
-    An operation chain executes operations, so an untrusted sender never gets
-    one started, no matter what the message text claims.
-    """
+    """Parse, validate, and start an operation_chain message - an untrusted sender
+    never gets one started, no matter what the message text claims."""
     import hashlib as _hashlib
 
     if not sender_trusted:
@@ -657,17 +637,11 @@ class MailboxProcessor:
         return git_is_clean(self._mailbox_repo_path)
 
     def prune_old_messages(self, *, now=None) -> Any:
-        """Delete finished outbox responses and dead inbox messages.
-
-        Runs as part of the normal poll (see ``run_mailbox_poll_once``),
-        after pending commits have been retried - a file still needed to
-        finalize a commit is protected, and retrying first lets those
-        records reach ``done`` so the next poll can prune them.
-
-        The deletions are committed with explicit pathspecs; pushing is
-        left to the poll's existing fetch/rebase/push sync. A pass with
-        nothing to prune makes no commit at all.
-        """
+        """Delete finished outbox responses and dead inbox messages, as part of the
+        normal poll after pending commits were retried (files still needed to finalize
+        a commit are protected). Deletions are committed with explicit pathspecs and
+        pushed by the poll's existing sync; a pass with nothing to prune commits
+        nothing."""
         from . import retention
 
         days = retention.retention_days()
@@ -710,19 +684,15 @@ class MailboxProcessor:
         return plan
 
     def _write_discard_notice(self, path: Path) -> Path | None:
-        """An outbox answer for a message dropped after its retries (#521).
-
-        Without it a failed message just vanished from the inbox and its
-        sender never learned why (a crashing command went unnoticed).
-        """
+        """An outbox answer for a message dropped after its retries (#521) - without
+        it a failed message vanished and its sender never learned why."""
         row = self.conn.execute(
             "SELECT retry_count, last_error, msg_type FROM mailbox_messages WHERE file_path = ?",
             (str(path),),
         ).fetchone()
         notice = self.outbox / f"failed-{path.stem}.md"
-        # The last error is exception text - for a command it can quote the
-        # command's own output - and the notice is committed to the mailbox
-        # repository, so it is masked like every other outbound result (#220).
+        # Exception text can quote a command's own output, and the notice is committed
+        # to the mailbox repo, so it is masked like every other outbound result (#220).
         last_error = redact_outbound(str(row[1]) if row and row[1] else "") or "unknown"
         body = (
             "---\n"
@@ -745,12 +715,9 @@ class MailboxProcessor:
         return notice
 
     def _log_terminal_inbox_message(self, path: Path) -> None:
-        """Record why an inbox message is being dropped, before it is gone.
-
-        Written through the same task logger the message used while it was
-        being processed, so ``GET /logs/trace/{reference}`` can still
-        explain what happened to it once the file no longer exists.
-        """
+        """Record why an inbox message is being dropped, before it is gone, through
+        the same task logger it used - so ``GET /logs/trace/{reference}`` can still
+        explain it once the file no longer exists."""
         try:
             rel = str(path.relative_to(self._mailbox_repo_path))
         except ValueError:
@@ -800,12 +767,9 @@ class MailboxProcessor:
 
     def process_inbox(self, files: list[Path] | None = None) -> list[dict[str, Any]]:
         """Process inbox messages, by default every message currently present.
-
-        ``files`` restricts the run to an explicit batch.  The inbox drain loop
-        uses it to process only the messages that arrived after an earlier
-        pass, so a message deliberately left behind — deferred, awaiting a
-        retry, or out of retries — is not re-run within the same invocation.
-        """
+        ``files`` restricts the run to an explicit batch, which the drain loop uses to
+        process only newly arrived messages - a message deliberately left behind
+        (deferred, retrying, out of retries) is not re-run in the same invocation."""
         if files is None:
             files = self._get_inbox_files()
         results = []
@@ -814,11 +778,8 @@ class MailboxProcessor:
         return results
 
     def list_inbox_files(self) -> list[Path]:
-        """Inbox messages currently on disk, oldest first.
-
-        Public so a caller can compare two scans of the queue without reaching
-        into the processor internals.
-        """
+        """Inbox messages currently on disk, oldest first - public so a caller can
+        compare two scans of the queue without reaching into processor internals."""
         return self._get_inbox_files()
 
     def _get_inbox_files(self) -> list[Path]:
@@ -911,9 +872,9 @@ class MailboxProcessor:
         commit_sha = git_current_commit(self._mailbox_repo_path)
         now = _now_iso()
 
-        # The authorization gate for this message: the verdict comes from the
-        # git commit that added the inbox file, never from the file's own
-        # ``created_by`` front matter (which is attacker-controlled text).
+        # Authorization gate: the verdict comes from the git commit that added the
+        # inbox file, never from the file's own ``created_by`` front matter
+        # (attacker-controlled text).
         sender_verdict = github_authorization.classify_mailbox_message(
             msg.created_by, self._mailbox_repo_path, file_path
         )
@@ -997,8 +958,8 @@ class MailboxProcessor:
         except Exception as exc:
             error = str(exc)
             if msg.msg_type == COMMAND_TYPE:
-                # Exception text from a command run is user-visible (status,
-                # API, discard notice) and may quote the command's output.
+                # Exception text from a command run is user-visible and may quote the
+                # command's output, so it is redacted like every outbound result.
                 error = redact_outbound(error)
                 logger.error("Error processing %s: %s", file_path, error)
             else:
