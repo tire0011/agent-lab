@@ -1,4 +1,4 @@
-"""One-shot local-model coding worker for small experiments. The prompt is fitted
+"""Local-model coding worker for small experiments. The prompt is fitted
 into the model's context window (#569): the window is read from the server per run
 (``GET /props``; fallback ``LOCAL_MODEL_CONTEXT`` then 8192) and the prompt measured
 with the server's tokenizer (``POST /tokenize``; fallback a safe bytes-per-token
@@ -6,16 +6,32 @@ estimate). Room is filled by priority: instructions+goal (never cut), then the
 named files, then the handover cut from the end. When the first two do not fit, the
 model is not called: the run ends ``context_too_small`` and the experiment hands
 the task to an external agent.
+
+Correction loop (#597): each answer must be a unified diff that passes
+``git apply --check``, applies, and leaves every changed ``.py`` file passing
+``python -m py_compile``. On a failure the round's changes are rolled back to the
+pre-round working tree (pre-existing changes kept, new files removed) and the model
+is asked again with the same fitted prompt plus a bounded feedback section: the
+last error (up to ~1500 chars) and the previous diff, cut to fit. Room for it is
+made by cutting the handover; the request still fits the run's ``n_ctx``. Feedback
+is never accumulated: only the last round's is sent. After ``MAX_PATCH_ROUNDS``
+failed rounds the run fails with the last reason and the number of rounds. Each
+round is logged as ``local_patch_round``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import math
 import os
 import re
+import shutil
+import stat
 import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +58,10 @@ _MAX_FILE_BYTES = 16 * 1024
 _SYSTEM_PROMPT = "You are a coding worker. Produce a minimal correct unified diff."
 _CLOSING = "Return only one unified git diff. Do not use Markdown prose or fences."
 _CUT_MARKER = "\n...[handover cut to fit the local model's context]"
+_DIFF_CUT_MARKER = "\n...[previous diff cut to fit the local model's context]"
+_ERROR_CUT_MARKER = "\n...[error cut]"
+MAX_PATCH_ROUNDS = 3
+FEEDBACK_ERROR_CHARS = 1500
 # Where the handover ends inside the experiment prompt templates
 # (modules/experiment_service/prompts.py).
 _HANDOVER_END_MARKERS = ("\n\nVerification feedback (bounded):\n", "\n\nInstructions:\n1. ")
@@ -133,13 +153,25 @@ def _render_files(files: list[tuple[str, str]], keywords: set[str], level: tuple
     return "".join(f"\n--- {path} ---\n{_excerpt(content, keywords, *level)}" for path, content in files)
 
 
-def _render_prompt(essential: str, files_text: str, handover: str) -> str:
+def _render_feedback(round_no: int, error: str, previous_diff: str) -> str:
+    text = (
+        f"Correction (round {round_no} of {MAX_PATCH_ROUNDS}): your previous answer was rejected.\n"
+        f"Error:\n{error}\n"
+    )
+    if previous_diff:
+        text += f"\nPrevious diff (fix it, do not repeat the mistake):\n{previous_diff}\n"
+    return text
+
+
+def _render_prompt(essential: str, files_text: str, handover: str, feedback: str = "") -> str:
     prompt = (
         f"Goal and instructions:\n{essential}\n\n"
         f"Contents of files named in the goal (relevant parts):{files_text or ' none'}\n\n"
     )
     if handover:
         prompt += f"{handover}\n\n"
+    if feedback:
+        prompt += f"{feedback}\n"
     return prompt + _CLOSING
 
 
@@ -208,6 +240,11 @@ class PromptPlan:
     file_level: int = 0
     handover_tokens_kept: int = 0
     handover_cut: bool = False
+    # Parts of the fitted prompt, kept for the correction rounds (#597).
+    essential: str = field(default="", repr=False)
+    files_text: str = field(default="", repr=False)
+    handover: str = field(default="", repr=False)
+    counter: "TokenCounter | None" = field(default=None, repr=False)
 
     def log_fields(self) -> dict[str, Any]:
         return {
@@ -219,7 +256,7 @@ class PromptPlan:
         }
 
 
-async def _cut_to(text: str, limit: int, count: TokenCounter) -> str:
+async def _cut_to(text: str, limit: int, count: TokenCounter, marker: str = _CUT_MARKER) -> str:
     """The longest prefix of *text* (plus a cut marker) within *limit* tokens."""
     if limit <= 0 or not text:
         return ""
@@ -231,10 +268,24 @@ async def _cut_to(text: str, limit: int, count: TokenCounter) -> str:
         keep = int(keep * min(0.95, limit / max(tokens, 1) * 0.95))
         if keep <= 0:
             return ""
-        candidate = text[:keep].rstrip() + _CUT_MARKER
+        candidate = text[:keep].rstrip() + marker
         tokens = await count(candidate)
         if tokens <= limit:
             return candidate
+    return ""
+
+
+async def _fit_part(text: str, budget: int, measure: Callable[[str], Awaitable[int]],
+                    count: TokenCounter, marker: str = _CUT_MARKER) -> str:
+    """The longest prefix of *text* whose rendered prompt (``measure``) stays in *budget*."""
+    if not text:
+        return ""
+    limit = budget - await measure("") - 8  # the blank lines joining it
+    for _ in range(6):
+        kept = await _cut_to(text, limit, count, marker)
+        if not kept or await measure(kept) <= budget:
+            return kept
+        limit -= max(16, limit // 10)
     return ""
 
 
@@ -280,17 +331,9 @@ async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_t
             )
 
     # 3. The handover, cut from the end, re-checked on the rendered prompt.
-    kept = ""
-    if handover:
-        used = await total(_render_prompt(essential, files_text, ""))
-        limit = budget - used - 8  # the two blank lines joining it
-        for _ in range(6):
-            kept = await _cut_to(handover, limit, count)
-            if not kept or await total(_render_prompt(essential, files_text, kept)) <= budget:
-                break
-            limit -= max(16, limit // 10)
-        else:
-            kept = ""
+    kept = await _fit_part(
+        handover, budget, lambda h: total(_render_prompt(essential, files_text, h)), count,
+    )
 
     prompt = _render_prompt(essential, files_text, kept)
     prompt_tokens = await total(prompt)
@@ -301,7 +344,263 @@ async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_t
         prompt_tokens=prompt_tokens, token_source=count.source, named_files=names,
         file_level=level_used, handover_tokens_kept=await count(kept) if kept else 0,
         handover_cut=bool(handover) and kept != handover,
+        essential=essential, files_text=files_text, handover=handover, counter=count,
     )
+
+
+@dataclass
+class FeedbackPrompt:
+    prompt: str
+    prompt_tokens: int
+    error_chars: int
+    diff_cut: bool
+    handover_tokens_kept: int
+
+
+async def build_feedback_prompt(plan: PromptPlan, client: Any, *, round_no: int, error: str,
+                                previous_diff: str) -> FeedbackPrompt:
+    """The fitted prompt plus one bounded feedback section, within ``plan.budget_tokens``.
+
+    Priority: instructions+goal and named files exactly as fitted, then the error
+    (at most ``FEEDBACK_ERROR_CHARS``), then the previous diff cut from the end, then
+    whatever handover still fits. ``n_ctx`` is not read again.
+    """
+    count = plan.counter or TokenCounter(client)
+    budget = plan.budget_tokens
+    system_tokens = await count(_SYSTEM_PROMPT)
+
+    async def total(err: str, diff: str, handover: str) -> int:
+        feedback = _render_feedback(round_no, err, diff) if err else ""
+        return system_tokens + await count(_render_prompt(plan.essential, plan.files_text, handover, feedback))
+
+    err = error.strip() or "unknown error"
+    if len(err) > FEEDBACK_ERROR_CHARS:
+        err = err[:FEEDBACK_ERROR_CHARS].rstrip() + _ERROR_CUT_MARKER
+    if await total(err, "", "") > budget:
+        err = await _fit_part(err, budget, lambda e: total(e, "", ""), count, _ERROR_CUT_MARKER)
+    diff = ""
+    if err:
+        diff = await _fit_part(previous_diff, budget, lambda d: total(err, d, ""), count, _DIFF_CUT_MARKER)
+    handover = await _fit_part(plan.handover, budget, lambda h: total(err, diff, h), count)
+    tokens = await total(err, diff, handover)
+    if tokens > budget:  # counter not additive: fall back to the smallest feedback that fits
+        diff, handover = "", ""
+        tokens = await total(err, "", "")
+        if tokens > budget:
+            err = ""
+            tokens = await total("", "", "")
+    feedback = _render_feedback(round_no, err, diff) if err else ""
+    return FeedbackPrompt(
+        prompt=_render_prompt(plan.essential, plan.files_text, handover, feedback),
+        prompt_tokens=tokens, error_chars=len(err),
+        diff_cut=bool(previous_diff) and diff != previous_diff,
+        handover_tokens_kept=await count(handover) if handover else 0,
+    )
+
+
+# Applying, checking and rolling back one round's patch
+
+class RollbackError(RuntimeError):
+    """The working tree could not be restored to its pre-round state."""
+
+
+class _PatchRejected(Exception):
+    def __init__(self, outcome: str, reason: str) -> None:
+        super().__init__(reason)
+        self.outcome = outcome
+        self.reason = reason
+
+
+_QUOTED_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _unquote(path: str) -> str:
+    """Undo git's C-style path quoting (``"a/t\\303\\244b"``)."""
+    path = path.strip()
+    match = _QUOTED_RE.fullmatch(path)
+    if not match:
+        return path
+    raw = match.group(1).encode("latin-1", errors="backslashreplace")
+    return codecs.escape_decode(raw)[0].decode("utf-8", errors="replace")
+
+
+def _strip_prefix(path: str) -> str | None:
+    """Strip git apply's default ``-p1`` component; ``None`` for ``/dev/null``."""
+    path = _unquote(path)
+    if path == "/dev/null" or not path:
+        return None
+    return path.split("/", 1)[1] if "/" in path else None
+
+
+def patch_paths(patch: str) -> set[str]:
+    """Every path a patch may touch: old and new names, created and deleted files."""
+    paths: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith(("--- ", "+++ ")):
+            target = line[4:]
+            if not target.startswith('"'):
+                target = target.split("\t", 1)[0]
+            found = _strip_prefix(target)
+            if found:
+                paths.add(found)
+        elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+            paths.add(_unquote(line.split(" ", 2)[2]))
+        elif line.startswith("diff --git "):
+            rest = line[len("diff --git "):]
+            quoted = _QUOTED_RE.findall(rest)
+            if len(quoted) == 2:
+                candidates = [f'"{q}"' for q in quoted]
+            else:
+                match = re.match(r"^(a/.+?) (b/.+)$", rest)
+                candidates = list(match.groups()) if match else []
+            for candidate in candidates:
+                found = _strip_prefix(candidate)
+                if found:
+                    paths.add(found)
+    return paths
+
+
+def _inside(root: Path, rel: str) -> Path | None:
+    full = (root / rel)
+    try:
+        resolved = full.parent.resolve() / full.name
+    except OSError:
+        return None
+    return full if root == resolved or root in resolved.parents else None
+
+
+@dataclass
+class _Snapshot:
+    """The pre-round state of the paths a patch touches."""
+
+    root: Path
+    files: dict[str, tuple[str, bytes, int] | None]
+    new_dirs: list[Path]
+    status: str
+
+
+def _git_status(working_dir: str, timeout: float) -> str:
+    done = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=working_dir, capture_output=True, timeout=timeout,
+    )
+    if done.returncode != 0:
+        raise RollbackError(f"git status failed: {done.stderr.decode(errors='replace').strip()}")
+    return done.stdout.decode("utf-8", errors="replace")
+
+
+def _read_state(full: Path) -> tuple[str, bytes, int] | None:
+    if full.is_symlink():
+        return ("link", os.readlink(full).encode(), 0)
+    if full.is_file():
+        return ("file", full.read_bytes(), stat.S_IMODE(full.stat().st_mode))
+    if full.exists():
+        return ("other", b"", 0)
+    return None
+
+
+def take_snapshot(working_dir: str, paths: set[str], timeout: float) -> _Snapshot:
+    root = Path(working_dir).resolve()
+    files: dict[str, tuple[str, bytes, int] | None] = {}
+    new_dirs: set[Path] = set()
+    for rel in paths:
+        full = _inside(root, rel)
+        if full is None:
+            continue  # git apply refuses paths outside the tree
+        state = _read_state(full)
+        files[rel] = state
+        if state is None:
+            parent = full.parent
+            while parent != root and root in parent.parents and not parent.exists():
+                new_dirs.add(parent)
+                parent = parent.parent
+    ordered = sorted(new_dirs, key=lambda d: len(d.parts), reverse=True)
+    return _Snapshot(root=root, files=files, new_dirs=ordered, status=_git_status(working_dir, timeout))
+
+
+def restore_snapshot(snapshot: _Snapshot, timeout: float) -> None:
+    """Put every touched path back as it was before the round, then verify it."""
+    try:
+        for rel, state in snapshot.files.items():
+            full = snapshot.root / rel
+            if state is not None and state[0] == "other":
+                continue  # a directory or special file: git apply does not replace those
+            if full.is_symlink() or full.is_file():
+                full.unlink()
+            elif full.is_dir():
+                shutil.rmtree(full)
+            if state is None:
+                continue
+            kind, data, mode = state
+            full.parent.mkdir(parents=True, exist_ok=True)
+            if kind == "link":
+                os.symlink(data.decode(), full)
+            else:
+                full.write_bytes(data)
+                os.chmod(full, mode)
+        for directory in snapshot.new_dirs:
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+    except OSError as exc:
+        raise RollbackError(f"could not restore the working tree: {exc}") from exc
+    changed = [rel for rel, state in snapshot.files.items() if _read_state(snapshot.root / rel) != state]
+    if changed:
+        raise RollbackError(f"working tree differs after rollback: {', '.join(sorted(changed))}")
+    if _git_status(str(snapshot.root), timeout) != snapshot.status:
+        raise RollbackError("git status differs after rollback")
+
+
+def _compile_check(working_dir: str, paths: list[str], timeout: float) -> str | None:
+    """``None`` when every file compiles, else the compiler's error text."""
+    if not paths:
+        return None
+    with tempfile.TemporaryDirectory(prefix="local-worker-pyc-") as cache:
+        # -I: the repo's own modules cannot shadow py_compile; bytecode goes to *cache*,
+        # so no __pycache__ is left in the working tree.
+        done = subprocess.run(
+            [sys.executable, "-I", "-X", f"pycache_prefix={cache}", "-m", "py_compile", *paths],
+            cwd=working_dir, text=True, capture_output=True, timeout=timeout,
+        )
+    if done.returncode == 0:
+        return None
+    return (done.stderr.strip() or done.stdout.strip() or f"py_compile exited {done.returncode}")
+
+
+def _git_apply(args: list[str], working_dir: str, patch: str, timeout: float) -> str | None:
+    done = subprocess.run(["git", "apply", *args, "-"], cwd=working_dir, input=patch,
+                          text=True, capture_output=True, timeout=timeout)
+    if done.returncode == 0:
+        return None
+    return done.stderr.strip() or done.stdout.strip() or "unknown git apply error"
+
+
+def apply_and_check(patch: str, working_dir: str, timeout: float) -> None:
+    """Apply *patch* and compile its ``.py`` files, or roll back and raise.
+
+    Raises :class:`_PatchRejected` after a successful rollback, and
+    :class:`RollbackError` when the tree could not be restored.
+    """
+    if not patch:
+        raise _PatchRejected("no_diff", "local model did not return a unified diff")
+    reason = _git_apply(["--check"], working_dir, patch, timeout)
+    if reason is not None:
+        raise _PatchRejected("does_not_apply", f"local model patch does not apply: {reason}")
+    paths = patch_paths(patch)
+    snapshot = take_snapshot(working_dir, paths, timeout)
+    try:
+        reason = _git_apply([], working_dir, patch, timeout)
+        if reason is not None:
+            raise _PatchRejected("apply_failed", f"local model patch failed to apply: {reason}")
+        root = snapshot.root
+        changed_py = sorted(rel for rel in snapshot.files
+                            if rel.endswith(".py") and (root / rel).is_file() and not (root / rel).is_symlink()
+                            and _read_state(root / rel) != snapshot.files[rel])
+        reason = _compile_check(working_dir, changed_py, timeout)
+        if reason is not None:
+            raise _PatchRejected("compile_failed", f"local model patch breaks py_compile: {reason}")
+    except BaseException:
+        restore_snapshot(snapshot, timeout)
+        raise
 
 
 class LocalCodingWorker:
@@ -333,35 +632,61 @@ class LocalCodingWorker:
                 f"({plan.n_ctx_source}, counted by {plan.token_source})",
                 **plan.log_fields(),
             )
-            output = asyncio.run(self.client.complete(
-                plan.prompt,
-                system=_SYSTEM_PROMPT,
-                temperature=0.0,
-                max_tokens=self.max_tokens,
-            ))
-            patch = _extract_diff(output)
-            if not patch:
-                raise RuntimeError("local model did not return a unified diff")
-            check = subprocess.run(
-                ["git", "apply", "--check", "-"], cwd=working_dir, input=patch,
-                text=True, capture_output=True, timeout=timeout_seconds,
-            )
-            if check.returncode != 0:
-                reason = check.stderr.strip() or check.stdout.strip() or "unknown git apply error"
-                raise RuntimeError(f"local model patch does not apply: {reason}")
-            applied = subprocess.run(
-                ["git", "apply", "-"], cwd=working_dir, input=patch,
-                text=True, capture_output=True, timeout=timeout_seconds,
-            )
-            if applied.returncode != 0:
-                reason = applied.stderr.strip() or applied.stdout.strip() or "unknown git apply error"
-                raise RuntimeError(f"local model patch failed to apply: {reason}")
-            return self._result(task, working_dir, output, None, started, success=True, exit_code=0)
+            return self._correction_loop(plan, task, working_dir, timeout_seconds,
+                                         experiment_logger, phase, started)
         except subprocess.TimeoutExpired:
             return self._result(task, working_dir, "", "local model patch application timed out", started,
                                 success=False, exit_code=None, timed_out=True)
         except Exception as exc:  # worker failures are represented, never leaked into the pipeline
             return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
+
+    def _correction_loop(self, plan: PromptPlan, task: str, working_dir: str, timeout: float,
+                         experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
+        reason = ""
+        previous_diff = ""
+        for round_no in range(1, MAX_PATCH_ROUNDS + 1):
+            prompt, extra = plan.prompt, {"prompt_tokens": plan.prompt_tokens}
+            if round_no > 1:
+                fb = asyncio.run(build_feedback_prompt(
+                    plan, self.client, round_no=round_no, error=reason, previous_diff=previous_diff,
+                ))
+                prompt = fb.prompt
+                extra = {"prompt_tokens": fb.prompt_tokens, "feedback_error_chars": fb.error_chars,
+                         "feedback_diff_cut": fb.diff_cut, "handover_tokens_kept": fb.handover_tokens_kept}
+            output = asyncio.run(self.client.complete(
+                prompt, system=_SYSTEM_PROMPT, temperature=0.0, max_tokens=self.max_tokens,
+            ))
+            patch = _extract_diff(output)
+            try:
+                apply_and_check(patch, working_dir, timeout)
+            except _PatchRejected as exc:
+                reason = exc.reason
+                previous_diff = patch or output.strip()
+                self._log_round(experiment_logger, phase, round_no, exc.outcome, reason, **extra)
+                continue
+            except RollbackError as exc:
+                reason = f"local model patch rollback failed in round {round_no}: {exc}"
+                self._log_round(experiment_logger, phase, round_no, "rollback_failed", reason, **extra)
+                return self._result(task, working_dir, "", reason, started, success=False, exit_code=1)
+            except subprocess.TimeoutExpired:
+                self._log_round(experiment_logger, phase, round_no, "timed_out",
+                                "local model patch application timed out", **extra)
+                raise
+            self._log_round(experiment_logger, phase, round_no, "applied", "", **extra)
+            return self._result(task, working_dir, output, None, started, success=True, exit_code=0)
+        return self._result(
+            task, working_dir, "",
+            f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}",
+            started, success=False, exit_code=1,
+        )
+
+    def _log_round(self, experiment_logger: Any | None, phase: str, round_no: int, outcome: str,
+                   reason: str, **fields: Any) -> None:
+        self._log(
+            experiment_logger, phase, "local_patch_round",
+            f"Local patch round {round_no}/{MAX_PATCH_ROUNDS}: {outcome}" + (f" ({reason[:300]})" if reason else ""),
+            warning=outcome != "applied", round=round_no, outcome=outcome, reason=reason, **fields,
+        )
 
     @staticmethod
     def _log(experiment_logger: Any | None, phase: str, event: str, message: str,
