@@ -1,7 +1,6 @@
-"""Development extensions for the Git-backed Nexus mailbox.
-
-The command channel is available for the trusted development mailbox.
-Mailbox tasks need nothing here: they go straight to Nexus (#264).
+"""Development extensions for the Git-backed Nexus mailbox: the command channel,
+available for the trusted development mailbox only (mailbox tasks go straight to
+Nexus, #264).
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from modules.redaction import redact
+from modules.redaction import redact_outbound
 
 from .command_recovery import (
     evaluate_interrupted_command,
@@ -37,7 +36,6 @@ _COMMAND_META_KEYS = {
     "timeout",
     "recovery_services",
 }
-_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ACTIVE_COMMANDS: dict[int, subprocess.Popen] = {}
 _SENSITIVE_ENV_MARKERS = (
     "TOKEN",
@@ -47,9 +45,6 @@ _SENSITIVE_ENV_MARKERS = (
     "CREDENTIAL",
     "AZURE_OPENAI",
 )
-
-def development_mode_enabled() -> bool:
-    return os.environ.get("NEXUS_DEVELOPMENT_MODE", "").strip().lower() in _TRUE_VALUES
 
 
 def _command_environment() -> dict[str, str]:
@@ -61,7 +56,10 @@ def _command_environment() -> dict[str, str]:
 
 
 def _bounded_redacted(text: str | None) -> str:
-    clean = redact(text or "")
+    # Credentials only (#220): every configured credential value and generic
+    # credential shape becomes ``****``; the rest (paths, URLs, text) is the
+    # diagnostic payload. Masked before truncation so a cut cannot split a value.
+    clean = redact_outbound(text)
     if len(clean) <= MAX_OUTPUT_CHARS:
         return clean
     omitted = len(clean) - MAX_OUTPUT_CHARS
@@ -134,13 +132,23 @@ def process_command(
     repo_path: Path,
     conn: Any,
     db_msg_id: int,
+    *,
+    sender_trusted: bool = True,
 ) -> tuple[str, None]:
+    if not sender_trusted:
+        # A shell command from an unverified sender must never run (#506).
+        logger.warning("command rejected: sender is not a trusted actor")
+        return (
+            "**Status:** rejected\n\n"
+            "**Reason:** the sender is not a trusted actor; the command was not run.",
+            None,
+        )
     command = msg.body.strip()
     if not command:
         raise ValueError("command body must not be empty")
 
-    # Internal orchestrator commands predate mailbox front matter and provide
-    # only a body. Treat absent metadata exactly like an empty header.
+    # Internal orchestrator commands predate front matter and provide only a body;
+    # treat absent metadata like an empty header.
     meta = getattr(msg, "meta", None)
     timeout = _command_timeout(meta)
     unknown_meta = _unknown_command_meta(meta)
@@ -296,11 +304,9 @@ def process_command(
                     partial_stderr.rstrip("\n") + "\n" if partial_stderr.strip() else ""
                 ) + evidence_line
 
-                # Persist the recovered outcome once so a later poll (including
-                # one triggered by a second restart) reads this cached result
-                # via the exit_path branch above instead of re-deriving it —
-                # this is what keeps the eventual Outbox reply a single,
-                # idempotent publication.
+                # Persist the recovered outcome once so a later poll (even after a
+                # second restart) reads this cached result instead of re-deriving
+                # it - this keeps the Outbox reply a single idempotent publication.
                 try:
                     exit_path.write_text(str(returncode))
                     stderr_path.write_text(raw_stderr)

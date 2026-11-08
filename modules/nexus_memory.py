@@ -5,6 +5,14 @@ The first implementation deliberately reuses data Nexus already has:
 - prior Nexus task/dialog events,
 - a small set of project memory documents.
 
+Event journal vs. memory (#248): ``nexus_task_events`` is the event journal.
+It keeps every event, including orchestration bookkeeping, for audit, replay
+and failure analysis. This module is the read side of curated memory: it only
+treats an event as knowledge when :func:`is_memory_eligible_event` says so.
+Orchestration kinds (``ORCHESTRATION_EVENT_KINDS``) stay in the journal and are
+never returned by :meth:`NexusMemory.search`. A later MemoryStore with explicit
+knowledge promotion can replace that predicate without changing ``search()``.
+
 The tool surface is intentionally stable so this lexical backend can later be
 replaced by embeddings/RAG without changing orchestration prompts or callers.
 """
@@ -30,8 +38,9 @@ _ISSUE_QUERY_RE = re.compile(r"\bissue\s+#?(\d+)\b", re.IGNORECASE)
 
 # Orchestrator bookkeeping must never become project knowledge. In particular,
 # indexing memory_search results makes later memory_search calls recursively
-# contain earlier serialized searches (#238).
-_TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY = (
+# contain earlier serialized searches (#238). The journal still stores these
+# events; memory just does not read them (#248).
+ORCHESTRATION_EVENT_KINDS: tuple[str, ...] = (
     "memory_search",
     "controller_decision",
     "find_tool",
@@ -41,6 +50,16 @@ _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY = (
     "knowledge_collection",
     "preflight_plan",
 )
+
+
+def is_memory_eligible_event(kind: str) -> bool:
+    """Whether a journal event of ``kind`` may be returned as knowledge.
+
+    This is the single place that decides which journal events count as
+    memory. Today it is a deny-list of orchestration kinds; an explicit
+    promotion step can replace it later.
+    """
+    return kind not in ORCHESTRATION_EVENT_KINDS
 
 
 def _terms(query: str) -> list[str]:
@@ -168,7 +187,7 @@ class NexusMemory:
         issue_number: int | None = None,
     ) -> None:
         excluded_kind_placeholders = ", ".join(
-            "?" for _ in _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY
+            "?" for _ in ORCHESTRATION_EVENT_KINDS
         )
         try:
             rows = self._conn.execute(
@@ -178,11 +197,13 @@ class NexusMemory:
                     JOIN nexus_task_sessions s ON s.id=e.session_id
                     WHERE e.kind NOT IN ({excluded_kind_placeholders})
                     ORDER BY e.id DESC LIMIT 500""",
-                _TASK_EVENT_KINDS_EXCLUDED_FROM_MEMORY,
+                ORCHESTRATION_EVENT_KINDS,
             ).fetchall()
         except sqlite3.Error:
             return
         for row in rows:
+            if not is_memory_eligible_event(str(row["kind"])):
+                continue
             text = f"{row['title'] or ''} {row['kind']} {row['content']}"
             if issue_number is not None and not _mentions_issue(
                 text,

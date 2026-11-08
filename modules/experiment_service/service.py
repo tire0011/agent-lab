@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -18,13 +19,22 @@ from typing import Any, Callable
 
 from modules.coding_provider import (
     build_random_worker,
+    build_worker,
+    is_provider_overload,
+    other_provider,
     provider_of,
     random_worker_factory,
 )
 from modules.codex_worker import CodexResult, CodexWorker
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_evaluation import parse_git_status_short
-from modules.central_logging import DEFAULT_LOG_DIR, ExperimentLogger, sanitize_command
+from modules.central_logging import (
+    DEFAULT_LOG_DIR,
+    ExperimentLogger,
+    _tail_read_lines,
+    sanitize_command,
+)
+from modules.github_work_tracking import failing_test_names
 from modules.redaction import sanitized_reason
 from modules.run_store import (
     DEFAULT_DB_PATH,
@@ -36,6 +46,7 @@ from modules.run_store import (
 )
 from modules.test_run_log import global_heartbeat_bridge
 from modules.verification_runner import (
+    VerificationRunResult,
     WatchdogConfig,
     run_verification_test_monitored,
 )
@@ -43,9 +54,11 @@ from modules.verification_runner import (
 from .git_utils import _run_git
 from .models import (
     Experiment,
+    ExperimentAlreadyActiveError,
     ExperimentNotFoundError,
     ExperimentNotRunnableError,
     ExperimentNotCancellableError,
+    PIPELINE_CRASH_ERROR_PREFIX,
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
@@ -66,48 +79,58 @@ from .text_utils import _truncate_text, _utcnow_iso
 
 logger = logging.getLogger("modules.experiment_service")
 
-# Statuses that represent a problem worth surfacing at WARNING level in the
-# journal (as opposed to ordinary forward progress, logged at INFO). Kept
-# as a small fixed set here so lifecycle logging in ``_transition``/
-# ``_force_status`` stays centralized and consistent.
-_WARNING_STATUSES = frozenset(
-    {"rejected", "failed", "timed_out", "needs_review", "cancelled", "interrupted"}
+
+from .service_parts.core import (
+    BASELINE_RECHECK_ENV_VAR,
+    DEFAULT_BASELINE_RECHECK_SECONDS,
+    DEFAULT_STALL_GRACE_SECONDS,
+    DEFAULT_WORKTREE_RETENTION_HOURS,
+    EXPERIMENT_TOKEN_BUDGET_ENV_VAR,
+    STALL_GRACE_ENV_VAR,
+    WORKTREE_RETENTION_ENV_VAR,
+    WorktreeCleanupResult,
+    _ADOPTION_TERMINAL_STATUSES,
+    _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
+    _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES,
+    _DEFAULT_MAX_DIFF_BYTES,
+    _DEFAULT_MAX_RAW_MESSAGE_BYTES,
+    _DEFAULT_MAX_REPAIR_ITERATIONS,
+    _DEFAULT_MAX_TEST_OUTPUT_BYTES,
+    _DEFAULT_PLAN_TIMEOUT_SECONDS,
+    _DEFAULT_RESEARCH_TIMEOUT_SECONDS,
+    _DEFAULT_TEST_COMMAND_KEY,
+    _DEFAULT_TEST_PYTHON_EXECUTABLE,
+    _ERROR_STATUSES,
+    _GITHUB_ISSUE_GOAL_RE,
+    _INTERRUPTED_BY_RESTART_ERROR,
+    _MAX_ERROR_TEST_NAMES,
+    _REFORMAT_RETRY_TIMEOUT_SECONDS,
+    _STALLED_ERROR_PREFIX,
+    _STALL_LOG_TAIL_BYTES,
+    _STALL_SWEEP_STATUSES,
+    _STALL_TERMINATE_GRACE_SECONDS,
+    _TEST_COMMANDS,
+    _TEST_TOTAL_SETTING_KEY,
+    _WARNING_STATUSES,
+    _baseline_verdict,
+    _experiment_token_budget,
+    _is_real_test_id,
+    _is_stalled,
+    _parse_utc,
+    _test_file_for_id,
+    stall_grace_seconds,
+    worker_run_token_total,
+    worktree_retention_hours,
 )
-
-# Subset of the above that represents an actual failure (as opposed to a
-# policy rejection or a review handoff) — logged at ERROR in the
-# structured per-experiment JSONL log (journald keeps the coarser
-# WARNING/INFO split above for backward compatibility).
-_ERROR_STATUSES = frozenset({"failed", "timed_out"})
-
-_DEFAULT_MAX_TEST_OUTPUT_BYTES = 32 * 1024
-_DEFAULT_MAX_DIFF_BYTES = 64 * 1024
-_DEFAULT_MAX_RAW_MESSAGE_BYTES = 16 * 1024
-_DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES = 64 * 1024
-_DEFAULT_RESEARCH_TIMEOUT_SECONDS = 120
-_DEFAULT_PLAN_TIMEOUT_SECONDS = 90
-_REFORMAT_RETRY_TIMEOUT_SECONDS = 60
-# Absolute cap only (#327): the coding agent is progress-watched and stopped
-# when it stalls; see modules.coding_worker.agent_watchdog_limits.
-_DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 3 * 60 * 60
-_DEFAULT_MAX_REPAIR_ITERATIONS = 2
-
-# Error recorded on experiments whose thread died with the process (#281).
-_INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
-
-# Worktree retention (#376). Every experiment keeps its worktree after it ends
-# so it can be inspected, retried or adopted - but a full checkout per run on a
-# 1 GB VM silently exhausts the disk. Terminal experiments whose ``ended_at``
-# is older than this many hours have their worktree directory removed; the
-# experiment row, its log and its branch are kept. ``0`` disables cleanup, and
-# so does anything unparsable or negative: a typo must not start deleting.
-WORKTREE_RETENTION_ENV_VAR = "NEXUS_EXPERIMENT_WORKTREE_RETENTION_HOURS"
-DEFAULT_WORKTREE_RETENTION_HOURS = 7 * 24
-
-# Adoption statuses that still need the experiment's worktree, whatever its age.
-_ADOPTION_TERMINAL_STATUSES = ("adopted", "needs_review", "failed", "interrupted")
+from .service_parts.records import RecordsMixin
+from .service_parts.diagnostics import DiagnosticsMixin
+from .service_parts.implementation import ImplementationMixin
+from .service_parts.verification import VerificationMixin
+from .service_parts.stall import StallSweepMixin
+from .service_parts.cleanup import CleanupMixin
 
 
+<<<<<<< HEAD
 def worktree_retention_hours(raw: str | None = None) -> float:
     """Configured worktree retention in hours; ``0`` disables cleanup."""
     value = raw if raw is not None else os.environ.get(WORKTREE_RETENTION_ENV_VAR)
@@ -1732,3 +1755,20 @@ class ExperimentService:
             )
         except Exception as exc:  # noqa: BLE001 - recording is best effort
             logger.warning("could not record worktree cleanup failure for %s: %s", experiment_id, exc)
+=======
+class ExperimentService(
+    RecordsMixin,
+    DiagnosticsMixin,
+    ImplementationMixin,
+    VerificationMixin,
+    StallSweepMixin,
+    CleanupMixin,
+):
+    """Orchestrates one bounded self-development experiment at a time, using the
+    external coding-agent workers (``CodexWorker``/``ClaudeWorker``) for the read-only
+    selection phase and the isolated implementation phase. The provider is chosen by
+    a persistent rotation (``modules.coding_provider``) unless a worker/factory is
+    injected, and recorded on the experiment as ``implementation_provider``.
+    """
+
+>>>>>>> f37de2ccae2815173b5d42bd0942ad2bd396fa5d

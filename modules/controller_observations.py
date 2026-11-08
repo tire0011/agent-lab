@@ -1,9 +1,5 @@
-"""Controller-facing views of persisted tool observations.
-
-Raw events remain unchanged in the journal. This module prepares only the
-semantic view the next controller decision needs; prompt sizing belongs to
-prompt_budget.
-"""
+"""Controller-facing semantic view of persisted tool observations (raw events stay
+in the journal; prompt sizing belongs to prompt_budget)."""
 
 from __future__ import annotations
 

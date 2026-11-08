@@ -12,6 +12,7 @@ from modules.experiment_handover import HANDOVER_HEADING
 from modules.nexus_controller_service import NexusControllerService
 from modules.nexus_task_store import NexusTaskStore
 from modules.task_orchestrator import ACTION_NEW_EXPERIMENT, ACTION_RESUME_EXPERIMENT, TaskDecision
+from modules.nexus_sources import task_source
 
 
 class NexusControllerServiceTests(unittest.TestCase):
@@ -70,10 +71,13 @@ class NexusControllerServiceTests(unittest.TestCase):
         )
         self.orchestrator.experiment_service.create_experiment.return_value = experiment
 
-        self.service.handle_task("Implement the requested feature", source_id="task-1")
+        self.service.handle_source(task_source("Implement the requested feature", source_id="task-1"))
 
         self.orchestrator.experiment_service.create_experiment.assert_called_once_with(
-            "Implement the requested feature"
+            "Implement the requested feature",
+            complexity=None,
+            source_type="task",
+            source_id="task-1",
         )
         self.github.ensure_for_source.assert_called_once()
         self.github.bind_experiment.assert_called_once()
@@ -89,7 +93,7 @@ class NexusControllerServiceTests(unittest.TestCase):
             id="exp-263"
         )
 
-        self.service.handle_task("Implement the requested feature", source_id="task-1")
+        self.service.handle_source(task_source("Implement the requested feature", source_id="task-1"))
 
         goal = self.orchestrator.experiment_service.create_experiment.call_args[0][0]
         self.assertTrue(goal.startswith("Implement the requested feature\n\n"))
@@ -109,7 +113,7 @@ class NexusControllerServiceTests(unittest.TestCase):
         )
 
         with self.assertRaises(GitHubWorkTrackingError):
-            self.service.handle_task("Implement the requested feature", source_id="task-1")
+            self.service.handle_source(task_source("Implement the requested feature", source_id="task-1"))
 
         self.orchestrator.experiment_service.create_experiment.assert_not_called()
 

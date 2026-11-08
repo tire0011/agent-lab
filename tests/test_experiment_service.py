@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -46,18 +47,49 @@ from modules.experiment_service import (
     ExperimentNotRunnableError,
     ExperimentService,
     _build_direct_implementation_prompt,
-    _build_implementation_prompt,
-    _build_plan_prompt,
-    _build_policy_replan_prompt,
-    _build_reformat_retry_prompt,
-    _build_research_prompt,
     _check_goal_policy,
     _goal_secret_warning,
-    _extract_diagnostic_log,
     extract_single_json_object,
     parse_plan,
     plan_violates_policy,
 )
+
+
+# modules.experiment_service.service was split into modules/experiment_service/service_parts/
+# (#576): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_SERVICE_LOOKUPS = {
+    "build_worker": (
+        "modules.experiment_service.service_parts.records",
+        "modules.experiment_service.service_parts.implementation",
+    ),
+    "other_provider": (
+        "modules.experiment_service.service_parts.implementation",
+    ),
+    "run_verification_test_monitored": (
+        "modules.experiment_service.service_parts.verification",
+    ),
+}
+
+
+@contextmanager
+def _patch_service(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _SERVICE_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
+
+
+def _verification_runs(service, experiment_id: str) -> list[dict]:
+    with service._lock:
+        rows = service._conn.execute(
+            "SELECT status, output, failure_fingerprint FROM verification_runs "
+            "WHERE experiment_id = ? ORDER BY iteration",
+            (experiment_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
 
 
 # Sanitized, real Codex raw response captured while reproducing the
@@ -278,144 +310,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
     # Selection phase behavior
     # ------------------------------------------------------------------
 
-    @unittest.skip("research phase removed")
-    def test_research_phase_runs_read_only_in_repo_root(self):
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        self.selection_worker.run.assert_called_once()
-        _, kwargs = self.selection_worker.run.call_args
-        self.assertEqual(kwargs["sandbox"], "read-only")
-        self.assertEqual(kwargs["working_dir"], str(self.repo_root))
-        self.assertLessEqual(kwargs["timeout_seconds"], 120)
-        self.assertNotIn("output_schema", kwargs)
-
-    @unittest.skip("plan phase removed")
-    def test_plan_phase_uses_schema_but_isolated_scratch_dir(self):
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        self.plan_worker.run.assert_called_once()
-        _, kwargs = self.plan_worker.run.call_args
-        self.assertEqual(kwargs["sandbox"], "read-only")
-        self.assertIsNotNone(kwargs.get("output_schema"))
-        # Never repo_root: an isolated scratch dir, so even a stray tool
-        # invocation could not do any further repository research.
-        self.assertNotEqual(kwargs["working_dir"], str(self.repo_root))
-        self.assertEqual(self.plan_worker_factory_calls, [kwargs["working_dir"]])
-        # The scratch dir is intentionally not a git repository; codex
-        # exec must be told to skip its trusted-git-repo check there.
-        self.assertTrue(kwargs.get("skip_git_repo_check"))
-
-    @unittest.skip("plan phase removed")
-    def test_plan_phase_receives_research_summary(self):
-        self.selection_worker.run.return_value = _make_result(
-            final_message="RESEARCH_MARKER: found interesting file X."
-        )
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        _, kwargs = self.plan_worker.run.call_args
-        self.assertIn("RESEARCH_MARKER: found interesting file X.", kwargs["task"])
-
-    @unittest.skip("research/plan phases removed")
-    def test_research_runs_before_plan(self):
-        call_order: list[str] = []
-        self.selection_worker.run.side_effect = lambda **kw: (
-            call_order.append("research") or _make_result(final_message="research text")
-        )
-        self.plan_worker.run.side_effect = lambda **kw: (
-            call_order.append("plan") or _make_result()
-        )
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-        self.assertEqual(call_order, ["research", "plan"])
-
-    @unittest.skip("research phase removed")
-    def test_research_phase_diagnostic_log_may_contain_tool_events(self):
-        self.selection_worker.run.return_value = _make_result(
-            final_message="Investigated the repo.",
-            stdout=json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "i0",
-                        "type": "command_execution",
-                        "command": "cat IDEAS.md",
-                        "exit_code": 0,
-                        "status": "completed",
-                    },
-                }
-            ) + "\n",
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertIsNotNone(result.research_diagnostic_log)
-        self.assertIn("command_execution", result.research_diagnostic_log)
-
-    @unittest.skip("research phase removed")
-    def test_research_raw_summary_is_size_limited(self):
-        long_text = "y" * 20000
-        self.selection_worker.run.return_value = _make_result(final_message=long_text)
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertLessEqual(
-            len(result.research_raw_summary.encode("utf-8")), self.service.max_raw_message_bytes + 64
-        )
-        self.assertIn("truncated", result.research_raw_summary)
-
-    @unittest.skip("research phase removed")
-    def test_research_raw_summary_secrets_are_redacted(self):
-        leaky_message = "Found config with AZURE_OPENAI_API_KEY=sk-verysecretvalue1234"
-        self.selection_worker.run.return_value = _make_result(final_message=leaky_message)
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertNotIn("sk-verysecretvalue1234", result.research_raw_summary or "")
-        self.assertIn("[REDACTED]", result.research_raw_summary or "")
-
-    @unittest.skip("research phase removed")
-    def test_research_diagnostic_log_excludes_reasoning_and_full_command_output(self):
-        self.selection_worker.run.return_value = _make_result(
-            final_message="Investigated the repo.",
-            stdout="\n".join([
-                json.dumps({
-                    "type": "item.completed",
-                    "item": {"id": "r0", "type": "reasoning", "text": "secret chain of thought"},
-                }),
-                json.dumps({
-                    "type": "item.completed",
-                    "item": {
-                        "id": "c0",
-                        "type": "command_execution",
-                        "command": "cat IDEAS.md",
-                        "exit_code": 0,
-                        "status": "completed",
-                        "aggregated_output": "full file contents that must not be persisted",
-                    },
-                }),
-            ]),
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertNotIn("secret chain of thought", result.research_diagnostic_log or "")
-        self.assertNotIn("full file contents that must not be persisted", result.research_diagnostic_log or "")
-        self.assertIn("command_execution", result.research_diagnostic_log or "")
-
-    @unittest.skip("research/plan phases removed")
-    def test_research_placeholder_text_not_parsed_as_plan(self):
-        # The research phase may itself emit prose that superficially
-        # mentions JSON-like content; it must never be fed into
-        # parse_plan()/plan_violates_policy() directly.
-        self.selection_worker.run.return_value = _make_result(
-            final_message='Still investigating... maybe {"title": "NONE"} later.'
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        # The plan actually used/stored must come from the plan_worker's
-        # (schema-conformant, mocked) response, not the research prose.
-        self.assertNotEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.plan["title"], "Add a docstring test")
-
     def test_accepted_plan_creates_isolated_worktree(self):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
@@ -466,6 +360,80 @@ class ExperimentServiceTestCase(unittest.TestCase):
             experiment.id, result.worktree_path
         )
 
+    def _run_against_red_ci(self, *details: str | None):
+        """One experiment whose checkpoints CI rejects with *details* in turn (#472)."""
+        github = MagicMock()
+        github.experiment_base_sha.return_value = subprocess.run(
+            ["git", "-C", str(self.repo_root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        github.checkpoint_experiment.return_value = SimpleNamespace(
+            branch_name="nexus/issue-472", checkpoint_sha="checkpoint-sha",
+        )
+        github.wait_for_ci.side_effect = [
+            SimpleNamespace(
+                status="failed", commit_sha="a" * 40, conclusion="failure",
+                run_id=55, url="https://example.invalid/runs/55", reason=None,
+                failure_detail=detail,
+            )
+            for detail in details
+        ]
+        self.service.max_repair_iterations = len(details) - 1
+        experiment = self.service.create_experiment(goal="Change it.")
+        result = self.service.run_experiment(experiment.id, github_work_tracking=github)
+        return result, _verification_runs(self.service, experiment.id)
+
+    def _ci_detail(self, *tests: str) -> str:
+        return "Failed job: unittest\nFailed step: Run tests\nFailing tests:\n" + "\n".join(
+            f"FAILED {test} - AssertionError" for test in tests
+        )
+
+    def test_the_repair_prompt_names_the_test_ci_rejected(self):
+        self._run_against_red_ci(
+            self._ci_detail("tests/test_a.py::test_one"),
+            self._ci_detail("tests/test_a.py::test_two"),
+        )
+
+        repair = self.implementation_worker.run.call_args_list[1].kwargs
+        self.assertEqual(repair["phase"], "implementation_repair")
+        self.assertIn("tests/test_a.py::test_one", repair["task"])
+        self.assertIn("Failed step: Run tests", repair["task"])
+
+    def test_the_error_names_the_first_failing_tests(self):
+        result, _ = self._run_against_red_ci(
+            self._ci_detail(*(f"tests/test_a.py::test_{index}" for index in range(5)))
+        )
+
+        self.assertEqual(
+            result.error,
+            "tests failed (exit code 1): tests/test_a.py::test_0, "
+            "tests/test_a.py::test_1, tests/test_a.py::test_2",
+        )
+
+    def test_without_failure_detail_the_error_keeps_its_old_form(self):
+        result, runs = self._run_against_red_ci(None)
+
+        self.assertEqual(result.error, "tests failed (exit code 1)")
+        self.assertNotIn("\n", runs[0]["output"])
+
+    def test_the_first_line_of_the_output_is_unchanged(self):
+        result, _ = self._run_against_red_ci(self._ci_detail("tests/test_a.py::test_one"))
+
+        self.assertEqual(
+            result.test_output.splitlines()[0],
+            f"GitHub Actions run 55 for commit {'a' * 40} completed with conclusion "
+            "failure. https://example.invalid/runs/55",
+        )
+
+    def test_different_failing_tests_have_different_fingerprints(self):
+        _, runs = self._run_against_red_ci(
+            self._ci_detail("tests/test_a.py::test_one"),
+            self._ci_detail("tests/test_a.py::test_two"),
+        )
+
+        self.assertEqual(len(runs), 2)
+        self.assertNotEqual(runs[0]["failure_fingerprint"], runs[1]["failure_fingerprint"])
+
     def test_implementation_uses_workspace_write_only_in_worktree(self):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
@@ -510,7 +478,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertRegex(output, r"(?m)^Ran \d+ tests? in ")
         self.assertNotRegex(output, r"(?m)^[.]+$")
 
-    def test_failed_verification_gets_bounded_repair_in_same_worktree(self):
+    def test_pre_existing_failure_does_not_trigger_repair(self):
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
             "import unittest\n\n"
             "class T(unittest.TestCase):\n"
@@ -543,9 +511,40 @@ class ExperimentServiceTestCase(unittest.TestCase):
         experiment = self.service.create_experiment(goal="Fix the failing test.")
         result = self.service.run_experiment(experiment.id)
 
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertEqual(calls, 1)
+        self.assertEqual(
+            result.baseline_test_classifications,
+            {"test_placeholder.T.test_fail": "pre_existing"},
+        )
+        runs = _verification_runs(self.service, experiment.id)
+        self.assertEqual([run["status"] for run in runs], [STATUS_NEEDS_REVIEW])
+
+    def test_failed_verification_gets_bounded_repair_in_same_worktree(self):
+        calls = 0
+
+        def repairable_worker(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            worktree = Path(kwargs["working_dir"])
+            (worktree / "implementation.py").write_text('"""implemented."""\n')
+            assertion = "self.assertTrue(False)" if calls == 1 else "self.assertTrue(True)"
+            (worktree / "tests" / "test_added.py").write_text(
+                "import unittest\n\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_new(self):\n"
+                f"        {assertion}\n"
+            )
+            return _make_result(sandbox="workspace-write")
+
+        self.implementation_worker.run.side_effect = repairable_worker
+        self.service.test_python_executable = sys.executable
+        experiment = self.service.create_experiment(goal="Fix the failing test.")
+        result = self.service.run_experiment(experiment.id)
+
         self.assertEqual(result.status, STATUS_SUCCEEDED)
         self.assertEqual(calls, 2)
-        runs = self.service.list_verification_runs(experiment.id)
+        runs = _verification_runs(self.service, experiment.id)
         self.assertEqual([run["status"] for run in runs], [STATUS_FAILED, STATUS_SUCCEEDED])
         self.assertEqual(
             self.implementation_worker.run.call_args_list[1].kwargs["phase"],
@@ -708,38 +707,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
     # Rejection handling
     # ------------------------------------------------------------------
 
-    @unittest.skip("plan phase removed")
-    def test_none_plan_is_rejected(self):
-        self.plan_worker.run.return_value = _make_result(
-            final_message=json.dumps({"title": "NONE", "motivation": "nothing small enough"})
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.policy_rule, "unparseable_plan")
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("plan phase removed")
-    def test_unparseable_plan_is_rejected(self):
-        self.plan_worker.run.return_value = _make_result(final_message="not structured at all")
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.policy_rule, "unparseable_plan")
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_policy_violation_persists_matched_policy_rule(self):
-        # Goal policy check: commit keyword → rejected with disallowed_keyword rule.
-        experiment = self.service.create_experiment(
-            goal="Implement the feature then run git commit and push."
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.policy_rule, "disallowed_keyword")
-        self.assertIsNotNone(result.error)
-        self.implementation_worker.run.assert_not_called()
-
     def test_resolve_experiment_accepts_unambiguous_prefix(self):
         experiment = self.service.create_experiment(goal="g")
         prefix = experiment.id[:8]
@@ -764,26 +731,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
         with self.assertRaises(ExperimentNotFoundError):
             self.service.resolve_experiment(shared_prefix)
 
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_goal_mentioning_commit_is_rejected(self):
-        # Security check on goal text: "commit" triggers the denylist.
-        experiment = self.service.create_experiment(
-            goal="Implement the feature then run git commit and push."
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_goal_mentioning_package_install_is_rejected(self):
-        # Security check on goal text: "pip install" triggers the denylist.
-        experiment = self.service.create_experiment(
-            goal="Run pip install requests then use it in the code."
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
     def test_goal_with_harmless_vm_mention_is_not_rejected(self):
         # A bare VM mention without a paired action verb must not block the goal.
         experiment = self.service.create_experiment(
@@ -794,33 +741,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
         )
         result = self.service.run_experiment(experiment.id)
         self.assertNotEqual(result.status, STATUS_REJECTED)
-
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_goal_creating_vm_is_rejected(self):
-        experiment = self.service.create_experiment(
-            goal="Create a new Azure VM for the worker pool."
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_goal_deleting_vm_is_rejected(self):
-        experiment = self.service.create_experiment(
-            goal="Delete the Azure VM that is no longer needed."
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_goal_deploying_to_production_is_rejected(self):
-        experiment = self.service.create_experiment(
-            goal="Deploy the application to the production environment."
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
 
     def test_goal_with_cost_action_is_rejected(self):
         # "enable billing" is in the hard keyword denylist.
@@ -858,27 +778,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertNotEqual(result.status, STATUS_REJECTED)
         self.implementation_worker.run.assert_called()
 
-    @unittest.skip("plan-specific check removed")
-    def test_plan_touching_too_many_files_is_rejected(self):
-        plan = json.loads(VALID_PLAN_JSON)
-        plan["affected_files"] = [f"modules/f{i}.py" for i in range(6)]
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(plan))
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_rejected_experiment_never_creates_worktree(self):
-        # Goal policy rejection must happen before any worktree is created.
-        experiment = self.service.create_experiment(
-            goal="Run git commit and push after implementing the change."
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertIsNone(result.worktree_path)
-        self.assertFalse(self.worktrees_root.exists() and any(self.worktrees_root.iterdir()))
-
     def test_second_start_is_rejected(self):
         experiment = self.service.create_experiment(goal="g")
         self.service.run_experiment(experiment.id)
@@ -894,44 +793,6 @@ class ExperimentServiceTestCase(unittest.TestCase):
     # ------------------------------------------------------------------
     # Timeout / exception handling never leaves an active status
     # ------------------------------------------------------------------
-
-    @unittest.skip("research phase removed")
-    def test_research_timeout_yields_timed_out_not_active(self):
-        self.selection_worker.run.return_value = _make_result(
-            timed_out=True, success=False, error="Codex process timed out after 120s"
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_TIMED_OUT)
-        self.plan_worker.run.assert_not_called()
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("research phase removed")
-    def test_research_exception_yields_failed_not_active(self):
-        self.selection_worker.run.side_effect = RuntimeError("boom")
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_FAILED)
-        self.assertIn("boom", result.error)
-        self.plan_worker.run.assert_not_called()
-
-    @unittest.skip("plan phase removed")
-    def test_plan_timeout_yields_timed_out_not_active(self):
-        self.plan_worker.run.return_value = _make_result(
-            timed_out=True, success=False, error="Codex process timed out after 90s"
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_TIMED_OUT)
-        self.implementation_worker.run.assert_not_called()
-
-    @unittest.skip("plan phase removed")
-    def test_plan_exception_yields_failed_not_active(self):
-        self.plan_worker.run.side_effect = RuntimeError("plan-boom")
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_FAILED)
-        self.assertIn("plan-boom", result.error)
 
     def test_implementation_exception_yields_failed_not_active(self):
         self.implementation_worker.run.side_effect = RuntimeError("kaboom")
@@ -949,6 +810,39 @@ class ExperimentServiceTestCase(unittest.TestCase):
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_TIMED_OUT)
+
+    def test_overloaded_provider_falls_back_to_the_other_agent(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write",
+            error="API Error: 529 Overloaded. This is a server-side issue",
+        )
+        fallback = MagicMock()
+        fallback.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="real failure",
+        )
+        with _patch_service("other_provider", return_value="codex"), _patch_service(
+            "build_worker", return_value=fallback
+        ) as build:
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+        build.assert_called_once()
+        self.assertEqual(build.call_args.args[0], "codex")
+        fallback.run.assert_called_once()
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("real failure", result.error)
+
+    def test_other_errors_do_not_fall_back(self):
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="kaboom",
+        )
+        with _patch_service("build_worker") as build:
+            experiment = self.service.create_experiment(goal="g")
+            self.service.run_experiment(experiment.id)
+        build.assert_not_called()
 
     # ------------------------------------------------------------------
     # needs_review when a safe test command cannot be determined
@@ -975,7 +869,7 @@ class ExperimentServiceTestCase(unittest.TestCase):
         result = self.service.run_experiment(experiment.id)
         self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
 
-    def test_failing_tests_yield_failed_status(self):
+    def test_pre_existing_failing_tests_yield_needs_review(self):
         self.service.test_python_executable = sys.executable
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
             "import unittest\n\n"
@@ -990,8 +884,12 @@ class ExperimentServiceTestCase(unittest.TestCase):
 
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
         self.assertNotEqual(result.test_exit_code, 0)
+        self.assertEqual(
+            result.baseline_test_classifications,
+            {"test_placeholder.T.test_fail": "pre_existing"},
+        )
         output = result.test_output or ""
         self.assertIn("Traceback (most recent call last)", output)
         self.assertRegex(output, r"(?m)^Ran \d+ tests? in ")
@@ -1165,51 +1063,9 @@ class PlanPolicyTestCase(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertIsNone(plan_violates_policy(plan, json.dumps(data)))
 
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_creating_vm_is_rejected(self):
-        data = json.loads(VALID_PLAN_JSON)
-        data["expected_changes"] = "Create a new Azure VM for the worker pool."
-        plan = parse_plan(json.dumps(data))
-        self.assertIsNotNone(plan)
-        reason = plan_violates_policy(plan, json.dumps(data))
-        self.assertIsNotNone(reason)
-        self.assertIn("infrastructure/deployment", reason)
-
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_deleting_vm_is_rejected(self):
-        data = json.loads(VALID_PLAN_JSON)
-        data["expected_changes"] = "Delete the old VM once migration finishes."
-        plan = parse_plan(json.dumps(data))
-        self.assertIsNotNone(plan)
-        self.assertIsNotNone(plan_violates_policy(plan, json.dumps(data)))
-
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_deploying_to_production_is_rejected(self):
-        data = json.loads(VALID_PLAN_JSON)
-        data["expected_changes"] = "Deploy the new build to the production server."
-        plan = parse_plan(json.dumps(data))
-        self.assertIsNotNone(plan)
-        self.assertIsNotNone(plan_violates_policy(plan, json.dumps(data)))
-
-    @unittest.skip("obsolete broad action policy removed by issue #190")
-    def test_cloud_resource_change_is_rejected(self):
-        data = json.loads(VALID_PLAN_JSON)
-        data["expected_changes"] = "Resize the resource group's storage account."
-        plan = parse_plan(json.dumps(data))
-        self.assertIsNotNone(plan)
-        self.assertIsNotNone(plan_violates_policy(plan, json.dumps(data)))
-
     def test_cost_action_is_rejected(self):
         data = json.loads(VALID_PLAN_JSON)
         data["risks"] = "Requires purchasing additional compute credits."
-        plan = parse_plan(json.dumps(data))
-        self.assertIsNotNone(plan)
-        self.assertIsNotNone(plan_violates_policy(plan, json.dumps(data)))
-
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_push_and_merge_are_still_rejected(self):
-        data = json.loads(VALID_PLAN_JSON)
-        data["expected_changes"] = "Implement the change, then push and merge it."
         plan = parse_plan(json.dumps(data))
         self.assertIsNotNone(plan)
         self.assertIsNotNone(plan_violates_policy(plan, json.dumps(data)))
@@ -1459,658 +1315,9 @@ class PolicyActionSecretTestCase(unittest.TestCase):
         self.assertIsNone(plan_violates_policy(plan, json.dumps(data)))
 
 
-@unittest.skip("reformat-retry phase removed")
-class ReformatRetryTestCase(unittest.TestCase):
-    """Covers the exactly-one-shot read-only reformat retry."""
 
-    UNPARSEABLE_TEXT = "I looked around but I will just describe it in prose."
 
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.repo_root = Path(self.tmp.name) / "repo"
-        self.repo_root.mkdir()
-        _init_git_repo(self.repo_root)
 
-        self.worktrees_root = Path(self.tmp.name) / "worktrees"
-        self.db_path = str(Path(self.tmp.name) / "agent.db")
-
-        self.selection_worker = MagicMock()
-        self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: looked at IDEAS.md and repo layout."
-        )
-        self.plan_worker = MagicMock()
-
-        def plan_factory(scratch_dir: str):
-            return self.plan_worker
-
-        self.implementation_worker = MagicMock()
-        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
-
-        def factory(worktree_path: str):
-            return self.implementation_worker
-
-        self.service = ExperimentService(
-            selection_worker=self.selection_worker,
-            plan_worker_factory=plan_factory,
-            worker_factory=factory,
-            db_path=self.db_path,
-            repo_root=str(self.repo_root),
-            worktrees_root=str(self.worktrees_root),
-        )
-        self.addCleanup(self.service.close)
-
-    def test_retry_is_triggered_exactly_once_on_parse_failure(self):
-        # First call (selection) returns unparseable prose; second call
-        # (the reformat retry) returns valid JSON.
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=VALID_PLAN_JSON, runtime_ms=5),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(self.plan_worker.run.call_count, 2)
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-        self.assertIsNotNone(result.reformat_retry_task_id)
-        self.assertEqual(result.reformat_retry_runtime_ms, 5)
-
-    def test_retry_prompt_does_not_ask_to_select_new_feature(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        retry_call = self.plan_worker.run.call_args_list[1]
-        retry_prompt = retry_call.kwargs.get("task") or retry_call.args[0]
-        self.assertIn("Do not select or modify the feature", retry_prompt)
-        self.assertIn(self.UNPARSEABLE_TEXT, retry_prompt)
-        self.assertEqual(retry_call.kwargs.get("sandbox"), "read-only")
-        self.assertEqual(retry_call.kwargs.get("timeout_seconds"), 60)
-
-    def test_failed_retry_ends_rejected_not_active(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message="still just prose, no json here"),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(self.plan_worker.run.call_count, 2)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertIsNotNone(result.reformat_retry_task_id)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_no_second_retry_is_ever_issued(self):
-        # Even though the retry also fails, the worker must only ever be
-        # called twice in total (one selection + one retry), never three
-        # or more times.
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-        self.assertEqual(self.plan_worker.run.call_count, 2)
-
-    def test_successful_retry_continues_normal_flow_and_creates_worktree(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-        self.assertTrue(Path(result.worktree_path).exists())
-        self.implementation_worker.run.assert_called_once()
-
-    def test_retry_usage_and_task_id_are_persisted(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(
-                final_message=VALID_PLAN_JSON,
-                usage={"input_tokens": 42, "output_tokens": 7},
-            ),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertIsNotNone(result.reformat_retry_task_id)
-        self.assertEqual(result.reformat_retry_usage, {"input_tokens": 42, "output_tokens": 7})
-
-        reloaded = self.service.get_experiment(experiment.id)
-        self.assertEqual(reloaded.reformat_retry_task_id, result.reformat_retry_task_id)
-        self.assertEqual(reloaded.reformat_retry_usage, {"input_tokens": 42, "output_tokens": 7})
-
-    def test_no_retry_when_plan_valid_on_first_attempt(self):
-        self.plan_worker.run.return_value = _make_result(final_message=VALID_PLAN_JSON)
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(self.plan_worker.run.call_count, 1)
-        self.assertIsNone(result.reformat_retry_task_id)
-
-    def test_policy_violation_still_rejected_after_successful_retry(self):
-        bad_plan = json.loads(VALID_PLAN_JSON)
-        bad_plan["affected_files"] = ["/etc/passwd"]
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=json.dumps(bad_plan)),
-            _make_result(final_message=json.dumps(bad_plan)),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_no_implementation_before_successful_validation(self):
-        # Both selection and retry fail to parse: implementation must
-        # never be invoked.
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_plan_phase_uses_plan_schema(self):
-        from modules.experiment_service import PLAN_JSON_SCHEMA
-
-        self.plan_worker.run.return_value = _make_result(final_message=VALID_PLAN_JSON)
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        call_kwargs = self.plan_worker.run.call_args.kwargs
-        self.assertEqual(call_kwargs.get("output_schema"), PLAN_JSON_SCHEMA)
-
-    def test_retry_uses_same_plan_schema(self):
-        from modules.experiment_service import PLAN_JSON_SCHEMA
-
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        retry_call_kwargs = self.plan_worker.run.call_args_list[1].kwargs
-        self.assertEqual(retry_call_kwargs.get("output_schema"), PLAN_JSON_SCHEMA)
-
-    def test_native_schema_output_still_validated_against_policy(self):
-        # Even if the worker "natively" honors the schema, a policy
-        # violation embedded in the resulting JSON must still be rejected;
-        # the schema alone must never be trusted to enforce security
-        # boundaries.
-        bad_plan = json.loads(VALID_PLAN_JSON)
-        bad_plan["affected_files"] = ["/etc/passwd"]
-        self.plan_worker.run.return_value = _make_result(final_message=json.dumps(bad_plan))
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_native_schema_output_still_requires_all_fields(self):
-        incomplete_plan = json.loads(VALID_PLAN_JSON)
-        del incomplete_plan["risks"]
-        self.plan_worker.run.return_value = _make_result(
-            final_message=json.dumps(incomplete_plan)
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-
-    def test_selection_usage_persisted_even_when_rejected(self):
-        self.plan_worker.run.return_value = _make_result(
-            final_message=self.UNPARSEABLE_TEXT,
-            usage={"input_tokens": 11, "output_tokens": 22},
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.selection_usage, {"input_tokens": 11, "output_tokens": 22})
-
-    # ------------------------------------------------------------------
-    # Raw message diagnosability (selection_raw_message / reformat_raw_message)
-    # ------------------------------------------------------------------
-
-    def test_selection_raw_message_stored_on_success(self):
-        self.plan_worker.run.return_value = _make_result(final_message=VALID_PLAN_JSON)
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-        self.assertEqual(result.selection_raw_message, VALID_PLAN_JSON)
-
-    def test_selection_raw_message_stored_on_rejected(self):
-        self.plan_worker.run.return_value = _make_result(final_message=self.UNPARSEABLE_TEXT)
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.selection_raw_message, self.UNPARSEABLE_TEXT)
-
-    def test_reformat_raw_message_stored_separately(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT),
-            _make_result(final_message=VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.selection_raw_message, self.UNPARSEABLE_TEXT)
-        self.assertEqual(result.reformat_raw_message, VALID_PLAN_JSON)
-
-    def test_empty_final_message_is_diagnosable(self):
-        self.plan_worker.run.return_value = _make_result(final_message="")
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        # Empty string, not None: distinguishable from "never captured".
-        self.assertEqual(result.selection_raw_message, "")
-
-    def test_empty_final_message_is_diagnosable_none_value(self):
-        self.plan_worker.run.return_value = _make_result(final_message=None)
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.selection_raw_message, "")
-
-    def test_raw_message_size_limit_and_truncation_marker(self):
-        svc = ExperimentService(
-            selection_worker=self.selection_worker,
-            plan_worker_factory=lambda p: self.plan_worker,
-            worker_factory=lambda p: self.implementation_worker,
-            db_path=str(Path(self.tmp.name) / "agent2.db"),
-            repo_root=str(self.repo_root),
-            worktrees_root=str(self.worktrees_root),
-            max_raw_message_bytes=50,
-        )
-        self.addCleanup(svc.close)
-        long_text = "x" * 5000
-        self.plan_worker.run.return_value = _make_result(final_message=long_text)
-
-        experiment = svc.create_experiment(goal="g")
-        result = svc.run_experiment(experiment.id)
-
-        self.assertLessEqual(len(result.selection_raw_message.encode("utf-8")), 50 + 64)
-        self.assertIn("truncated", result.selection_raw_message)
-
-
-@unittest.skip("policy-replan phase removed")
-class PolicyReplanTestCase(unittest.TestCase):
-    """Covers the exactly-one-shot policy replan (distinct from the parser
-    reformat retry above): triggered when a syntactically valid,
-    schema-conformant plan is rejected by plan_violates_policy()."""
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.repo_root = Path(self.tmp.name) / "repo"
-        self.repo_root.mkdir()
-        _init_git_repo(self.repo_root)
-
-        self.worktrees_root = Path(self.tmp.name) / "worktrees"
-        self.db_path = str(Path(self.tmp.name) / "agent.db")
-
-        self.selection_worker = MagicMock()
-        self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: looked at IDEAS.md and repo layout."
-        )
-        self.plan_worker = MagicMock()
-
-        def plan_factory(scratch_dir: str):
-            return self.plan_worker
-
-        self.implementation_worker = MagicMock()
-        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
-
-        def factory(worktree_path: str):
-            return self.implementation_worker
-
-        self.service = ExperimentService(
-            selection_worker=self.selection_worker,
-            plan_worker_factory=plan_factory,
-            worker_factory=factory,
-            db_path=self.db_path,
-            repo_root=str(self.repo_root),
-            worktrees_root=str(self.worktrees_root),
-        )
-        self.addCleanup(self.service.close)
-
-    def test_exactly_one_replan_after_policy_rejection(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=POLICY_VIOLATING_PLAN_JSON),
-            _make_result(final_message=SECOND_VALID_PLAN_JSON, runtime_ms=7),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(self.plan_worker.run.call_count, 2)
-        self.assertIsNotNone(result.policy_replan_task_id)
-        self.assertEqual(result.policy_replan_runtime_ms, 7)
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-
-    def test_research_runs_only_once(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=POLICY_VIOLATING_PLAN_JSON),
-            _make_result(final_message=SECOND_VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        self.service.run_experiment(experiment.id)
-
-        self.selection_worker.run.assert_called_once()
-
-    def test_no_replan_when_plan_immediately_acceptable(self):
-        self.plan_worker.run.return_value = _make_result(final_message=VALID_PLAN_JSON)
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(self.plan_worker.run.call_count, 1)
-        self.assertIsNone(result.policy_replan_task_id)
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-
-    def test_no_policy_replan_on_parser_failure(self):
-        # Unparseable output triggers the reformat retry, not the policy
-        # replan; if the reformat retry also fails to parse, the
-        # experiment is rejected without ever invoking a policy replan.
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message="not json at all, just prose"),
-            _make_result(final_message="still not json, more prose"),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(self.plan_worker.run.call_count, 2)
-        self.assertIsNone(result.policy_replan_task_id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-
-    def test_second_acceptable_plan_is_passed_through_to_implementation(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=POLICY_VIOLATING_PLAN_JSON),
-            _make_result(final_message=SECOND_VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-        self.assertEqual(result.plan["title"], "Add a second docstring test")
-        self.implementation_worker.run.assert_called_once()
-
-    def test_second_unacceptable_plan_ends_experiment_rejected(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=POLICY_VIOLATING_PLAN_JSON),
-            _make_result(final_message=POLICY_VIOLATING_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(self.plan_worker.run.call_count, 2)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertIsNotNone(result.policy_replan_task_id)
-        self.implementation_worker.run.assert_not_called()
-
-    def test_separate_usage_per_phase(self):
-        self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary text.",
-            usage={"input_tokens": 111, "output_tokens": 11},
-        )
-        self.plan_worker.run.side_effect = [
-            _make_result(
-                final_message=POLICY_VIOLATING_PLAN_JSON,
-                usage={"input_tokens": 222, "output_tokens": 22},
-            ),
-            _make_result(
-                final_message=SECOND_VALID_PLAN_JSON,
-                usage={"input_tokens": 333, "output_tokens": 33},
-            ),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.research_usage, {"input_tokens": 111, "output_tokens": 11})
-        self.assertEqual(result.selection_usage, {"input_tokens": 222, "output_tokens": 22})
-        self.assertEqual(result.policy_replan_usage, {"input_tokens": 333, "output_tokens": 33})
-        # All three must be distinct from one another.
-        usages = [result.research_usage, result.selection_usage, result.policy_replan_usage]
-        self.assertEqual(len({json.dumps(u, sort_keys=True) for u in usages}), 3)
-
-    def test_policy_replan_prompt_contains_goal_research_plan_and_reason(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=POLICY_VIOLATING_PLAN_JSON),
-            _make_result(final_message=SECOND_VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="my special goal")
-        self.service.run_experiment(experiment.id)
-
-        replan_call = self.plan_worker.run.call_args_list[1]
-        replan_prompt = replan_call.kwargs.get("task") or replan_call.args[0]
-        self.assertIn("my special goal", replan_prompt)
-        self.assertIn("Research summary: looked at IDEAS.md and repo layout.", replan_prompt)
-        self.assertIn("Create a new Azure VM", replan_prompt)
-        self.assertIn("infrastructure/deployment", replan_prompt)
-        self.assertEqual(replan_call.kwargs.get("sandbox"), "read-only")
-        self.assertIn("output_schema", replan_call.kwargs)
-
-    def test_policy_replan_raw_message_and_diagnostic_log_are_size_limited_and_redacted(self):
-        secret_text = "api_key=abcdef0123456789 sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890123456789"
-        long_text = secret_text + ("x" * 5000)
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=POLICY_VIOLATING_PLAN_JSON),
-            _make_result(final_message=long_text),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertIsNotNone(result.policy_replan_raw_message)
-        self.assertNotIn("abcdef0123456789", result.policy_replan_raw_message)
-        self.assertNotIn("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890123456789", result.policy_replan_raw_message)
-        self.assertLessEqual(len(result.policy_replan_raw_message.encode("utf-8")), 5000)
-
-    def test_build_policy_replan_prompt_helper(self):
-        prompt = _build_policy_replan_prompt(
-            goal="goal-x",
-            research_summary="summary-y",
-            rejected_plan_json='{"title": "bad"}',
-            rejection_reason="reason-z",
-        )
-        self.assertIn("goal-x", prompt)
-        self.assertIn("summary-y", prompt)
-        self.assertIn('{"title": "bad"}', prompt)
-        self.assertIn("reason-z", prompt)
-        self.assertIn("code, test, or", prompt)
-
-
-class ExtractDiagnosticLogTestCase(unittest.TestCase):
-    """Unit tests for the standalone _extract_diagnostic_log() filter."""
-
-    def test_returns_none_for_empty_stdout(self):
-        self.assertIsNone(_extract_diagnostic_log("", 1024))
-        self.assertIsNone(_extract_diagnostic_log(None, 1024))
-
-    def test_keeps_lifecycle_and_agent_message_events(self):
-        stdout = "\n".join([
-            json.dumps({"type": "thread.started", "thread_id": "tid-1"}),
-            json.dumps({"type": "turn.started"}),
-            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "hello"}}),
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5}}),
-        ])
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertIn("thread.started", log)
-        self.assertIn("turn.started", log)
-        self.assertIn("agent_message", log)
-        self.assertIn("hello", log)
-        self.assertIn("turn.completed", log)
-
-    def test_drops_reasoning_items(self):
-        stdout = "\n".join([
-            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "secret chain of thought"}}),
-            json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "final"}}),
-        ])
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertNotIn("reasoning", log)
-        self.assertNotIn("secret chain of thought", log)
-        self.assertIn("final", log)
-
-    def test_command_execution_kept_metadata_only_not_full_output(self):
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {
-                "id": "i0",
-                "type": "command_execution",
-                "command": "ls -la",
-                "aggregated_output": "this is a huge dump of file contents that must not be stored",
-                "exit_code": 0,
-                "status": "completed",
-            },
-        })
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertIn("command_execution", log)
-        self.assertIn("ls -la", log)
-        self.assertIn("exit_code", log)
-        self.assertNotIn("huge dump of file contents", log)
-
-    def test_ignores_malformed_json_lines(self):
-        stdout = "\n".join([
-            "not json at all",
-            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "ok"}}),
-        ])
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertIn("ok", log)
-
-    def test_secrets_are_redacted(self):
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {
-                "id": "i0",
-                "type": "agent_message",
-                "text": "here is my api_key=sk-ABCDEFGHIJ1234567890 for reference",
-            },
-        })
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertNotIn("sk-ABCDEFGHIJ1234567890", log)
-        self.assertIn("REDACTED", log)
-
-    def test_bearer_token_is_redacted(self):
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "agent_message", "text": "Authorization: Bearer abcdef0123456789"},
-        })
-        log = _extract_diagnostic_log(stdout, 1024)
-        self.assertNotIn("abcdef0123456789", log)
-
-    def test_size_limit_and_truncation_marker_with_original_size(self):
-        big_text = "y" * 5000
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "agent_message", "text": big_text},
-        })
-        log = _extract_diagnostic_log(stdout, 200)
-        self.assertLessEqual(len(log.encode("utf-8")), 200 + 100)
-        self.assertIn("truncated", log)
-        self.assertIn("original size", log)
-
-    def test_no_diagnostic_events_yields_none(self):
-        # Only a reasoning item and nothing else safe to keep.
-        stdout = json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "reasoning", "text": "thinking..."},
-        })
-        self.assertIsNone(_extract_diagnostic_log(stdout, 1024))
-
-
-class DiagnosticLogPipelineTestCase(unittest.TestCase):
-    """Verifies selection_diagnostic_log / reformat_diagnostic_log are
-    stored (separately) by the actual experiment pipeline."""
-
-    UNPARSEABLE_TEXT = "I looked around but I will just describe it in prose."
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.repo_root = Path(self.tmp.name) / "repo"
-        self.repo_root.mkdir()
-        _init_git_repo(self.repo_root)
-
-        self.worktrees_root = Path(self.tmp.name) / "worktrees"
-        self.db_path = str(Path(self.tmp.name) / "agent.db")
-
-        self.selection_worker = MagicMock()
-        self.selection_worker.run.return_value = _make_result(
-            final_message="Research summary: looked at IDEAS.md and repo layout."
-        )
-        self.plan_worker = MagicMock()
-
-        def plan_factory(scratch_dir: str):
-            return self.plan_worker
-
-        self.implementation_worker = MagicMock()
-        self.implementation_worker.run.side_effect = _write_affected_files_side_effect()
-
-        def factory(worktree_path: str):
-            return self.implementation_worker
-
-        self.service = ExperimentService(
-            selection_worker=self.selection_worker,
-            plan_worker_factory=plan_factory,
-            worker_factory=factory,
-            db_path=self.db_path,
-            repo_root=str(self.repo_root),
-            worktrees_root=str(self.worktrees_root),
-        )
-        self.addCleanup(self.service.close)
-
-    def _stdout_for(self, message: str) -> str:
-        return json.dumps({
-            "type": "item.completed",
-            "item": {"id": "i0", "type": "agent_message", "text": message},
-        })
-
-    @unittest.skip("selection phase removed")
-    def test_selection_diagnostic_log_stored_on_rejection(self):
-        self.plan_worker.run.return_value = _make_result(
-            final_message=self.UNPARSEABLE_TEXT,
-            stdout=self._stdout_for(self.UNPARSEABLE_TEXT),
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertIsNotNone(result.selection_diagnostic_log)
-        self.assertIn(self.UNPARSEABLE_TEXT, result.selection_diagnostic_log)
-
-    @unittest.skip("reformat-retry phase removed")
-    def test_reformat_diagnostic_log_stored_separately(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message=self.UNPARSEABLE_TEXT, stdout=self._stdout_for(self.UNPARSEABLE_TEXT)),
-            _make_result(final_message=VALID_PLAN_JSON, stdout=self._stdout_for(VALID_PLAN_JSON)),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertIn(self.UNPARSEABLE_TEXT, result.selection_diagnostic_log)
-        self.assertIn("title", result.reformat_diagnostic_log)
-        self.assertNotEqual(result.selection_diagnostic_log, result.reformat_diagnostic_log)
-
-    def test_no_secrets_in_stored_diagnostic_logs(self):
-        leaky_message = "plan info AZURE_OPENAI_API_KEY=sk-verysecretvalue1234"
-        self.plan_worker.run.return_value = _make_result(
-            final_message=leaky_message,
-            stdout=self._stdout_for(leaky_message),
-        )
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-
-        self.assertNotIn("sk-verysecretvalue1234", result.selection_diagnostic_log or "")
 
 
 class NexusIdentityPromptTestCase(unittest.TestCase):
@@ -2118,7 +1325,6 @@ class NexusIdentityPromptTestCase(unittest.TestCase):
         plan = parse_plan(VALID_PLAN_JSON)
         prompts = [
             _build_direct_implementation_prompt("some goal"),
-            _build_implementation_prompt(plan),
         ]
         # Old prompts still exist as helpers but are no longer called in the
         # live pipeline; verify the new direct-implementation prompt and the
@@ -2130,55 +1336,8 @@ class NexusIdentityPromptTestCase(unittest.TestCase):
                 self.assertIn('not as "the user"', prompt)
                 self.assertIn("not independently Nexus", prompt)
 
-class ResearchPromptRequirementsTestCase(unittest.TestCase):
-    """The research prompt must instruct Codex to investigate read-only and
-    produce a free-form (non-JSON) summary, without forcing a final plan."""
-
-    def test_research_prompt_is_read_only_and_investigative(self):
-        prompt = " ".join(_build_research_prompt("some goal").split())
-        self.assertIn("READ-ONLY", prompt)
-        self.assertIn("Do not modify any files", prompt)
-        self.assertIn("IDEAS.md", prompt)
-
-    def test_research_prompt_forbids_final_json_or_plan(self):
-        prompt = " ".join(_build_research_prompt("some goal").split())
-        self.assertIn("Do NOT emit a final structured plan or any JSON object", prompt)
-        self.assertIn("prose, not JSON", prompt)
 
 
-@unittest.skip("plan phase removed")
-class PlanPromptRequirementsTestCase(unittest.TestCase):
-    """The plan prompt must instruct Codex it has no tools, embed the
-    research summary, forbid placeholder/intention-only answers, and
-    require at least one affected file. The reformat retry prompt must
-    remain reformat-only (no new research)."""
-
-    def test_plan_prompt_declares_no_tools(self):
-        prompt = " ".join(_build_plan_prompt("some goal", "some research").split())
-        self.assertIn("You have NO tools available", prompt)
-        self.assertIn("cannot run any command or", prompt)
-
-    def test_plan_prompt_embeds_research_summary(self):
-        prompt = _build_plan_prompt("some goal", "UNIQUE_RESEARCH_MARKER_XYZ")
-        self.assertIn("UNIQUE_RESEARCH_MARKER_XYZ", prompt)
-
-    def test_plan_prompt_requires_concrete_feature_and_nonempty_affected_files(self):
-        prompt = " ".join(_build_plan_prompt("some goal", "research").split())
-        self.assertIn("one concrete", prompt)
-        self.assertIn("affected_files", prompt)
-        self.assertIn("must contain at least one existing or planned repository file", prompt)
-
-    def test_plan_prompt_forbids_progress_or_placeholder_content(self):
-        prompt = " ".join(_build_plan_prompt("some goal", "research").split())
-        self.assertIn("Do not return progress, placeholder, or intention-only content", prompt)
-
-    def test_reformat_retry_prompt_still_forbids_new_selection(self):
-        prompt = _build_reformat_retry_prompt("some previous output")
-        self.assertIn("Do not select or modify the feature", prompt)
-        self.assertIn("Output JSON only", prompt)
-        # The retry prompt must not itself instruct further investigation;
-        # it must only ask for reformatting of the already-produced text.
-        self.assertNotIn("Investigate the repository", prompt)
 
 
 class PlaceholderPlanPolicyTestCase(unittest.TestCase):
@@ -2341,7 +1500,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch("modules.experiment_service.service.run_verification_test_monitored") as local_tests:
+        with _patch_service("run_verification_test_monitored") as local_tests:
             result = self.service.run_experiment(
                 experiment.id, github_work_tracking=github
             )
@@ -2376,7 +1535,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch("modules.experiment_service.service.run_verification_test_monitored") as local_tests:
+        with _patch_service("run_verification_test_monitored") as local_tests:
             result = self.service.run_experiment(
                 experiment.id, github_work_tracking=github
             )
@@ -2402,8 +1561,8 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         experiment = self.service.create_experiment(goal="Add a small docstring test.")
 
-        with patch(
-            "modules.experiment_service.service.run_verification_test_monitored",
+        with _patch_service(
+            "run_verification_test_monitored",
             wraps=run_verification_test_monitored,
         ) as local_tests:
             result = self.service.run_experiment(
@@ -2418,7 +1577,7 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
             [entry["event"] for entry in entries],
         )
 
-    def test_test_failure_is_logged_as_error_with_context(self):
+    def test_pre_existing_test_failure_is_classified_and_logged(self):
         (self.repo_root / "tests" / "test_placeholder.py").write_text(
             "import unittest\n\n"
             "class T(unittest.TestCase):\n"
@@ -2430,16 +1589,18 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
 
         experiment = self.service.create_experiment(goal="g")
         result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
 
         entries = self._read_log(experiment.id)
-        failed = [e for e in entries if e["event"] == "tests_failed"]
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["level"], "ERROR")
-        self.assertEqual(failed[0]["phase"], "verifying")
-        self.assertIn("exit_code", failed[0])
-        status_change = [e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_FAILED]
-        self.assertTrue(status_change, "expected a status_forced -> failed entry")
+        classified = [e for e in entries if e["event"] == "baseline_recheck_classified"]
+        self.assertEqual(len(classified), 1)
+        self.assertIn("test_placeholder.T.test_fail", classified[0]["classifications"])
+        self.assertIn("pre_existing", classified[0]["classifications"])
+        status_change = [
+            e for e in entries
+            if e["event"] == "status_forced" and e.get("to_status") == STATUS_NEEDS_REVIEW
+        ]
+        self.assertTrue(status_change, "expected a status_forced -> needs_review entry")
 
     def test_stalled_test_run_is_not_classified_as_a_test_failure(self):
         """A verification run the watchdog aborts must be reported as its own
@@ -2453,13 +1614,15 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         )
         service = self._make_watchdog_service(str(Path(self.tmp.name) / "stall.db"))
         experiment = service.create_experiment(goal="g")
-        result = service.run_experiment(experiment.id)
+        with patch.dict(os.environ, {"NEXUS_BASELINE_RECHECK_SECONDS": "0.2"}):
+            result = service.run_experiment(experiment.id)
 
-        self.assertEqual(result.status, STATUS_TIMED_OUT)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
         self.assertIsNone(result.test_exit_code)
-        self.assertIn("stalled", result.error)
-        # The diagnostics must name the test progress stopped on.
-        self.assertIn("test_hangs", result.error)
+        self.assertEqual(
+            result.baseline_test_classifications,
+            {"test_placeholder.T.test_hangs": "pre_existing"},
+        )
 
         entries = self._read_log(experiment.id)
         stalls = [e for e in entries if e["event"] == "test_stalled"]
@@ -2472,9 +1635,10 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         # Never classified as a plain test failure.
         self.assertEqual([e for e in entries if e["event"] == "tests_failed"], [])
         status_change = [
-            e for e in entries if e["event"] == "status_forced" and e.get("to_status") == STATUS_TIMED_OUT
+            e for e in entries
+            if e["event"] == "status_forced" and e.get("to_status") == STATUS_NEEDS_REVIEW
         ]
-        self.assertTrue(status_change, "expected a status_forced -> timed_out entry")
+        self.assertTrue(status_change, "expected a status_forced -> needs_review entry")
 
     def test_progressing_suite_is_not_aborted_by_a_long_total_runtime(self):
         """The whole point of #209: a suite that keeps finishing tests must be
@@ -2610,22 +1774,6 @@ class ExperimentLoggingIntegrationTests(unittest.TestCase):
         entries = self._read_log(experiment.id)
         status_events = [e for e in entries if e["event"] == "status_forced"]
         self.assertTrue(any(e.get("to_status") == STATUS_TIMED_OUT for e in status_events))
-
-    @unittest.skip("reformat-retry phase removed")
-    def test_reformat_retry_is_logged_as_warning(self):
-        self.plan_worker.run.side_effect = [
-            _make_result(final_message="not valid json at all"),
-            _make_result(final_message=VALID_PLAN_JSON),
-        ]
-        experiment = self.service.create_experiment(goal="g")
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_SUCCEEDED)
-
-        entries = self._read_log(experiment.id)
-        retries = [e for e in entries if e["event"] == "plan_reformat_retry"]
-        self.assertEqual(len(retries), 1)
-        self.assertEqual(retries[0]["level"], "WARNING")
-        self.assertEqual(retries[0]["phase"], "selection")
 
     def test_logging_failure_never_changes_experiment_status(self):
         """A broken logger (disk full, permission error, ...) must never
@@ -2946,41 +2094,10 @@ class SingleCallPipelineRegressionTests(unittest.TestCase):
         self.assertIsNone(_check_goal_policy('implement it and then run git commit'))
     def test_git_push_command_is_allowed(self):
         self.assertIsNone(_check_goal_policy('after tests pass, run git push'))
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_git_merge_command_is_blocked(self):
-        self.assertIsNotNone(_check_goal_policy("run git merge to integrate changes"))
-
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_commit_changes_is_blocked(self):
-        # Verb + object proximity: "commit the changes" is a git action.
-        self.assertIsNotNone(_check_goal_policy("commit the changes to the repo"))
-
     def test_push_branch_is_allowed(self):
         self.assertIsNone(_check_goal_policy('push the branch to origin'))
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_merge_pull_request_is_blocked(self):
-        self.assertIsNotNone(_check_goal_policy("merge the pull request after review"))
-
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_commit_result_is_blocked(self):
-        self.assertIsNotNone(_check_goal_policy("implement and commit the result"))
-
     def test_push_code_is_allowed(self):
         self.assertIsNone(_check_goal_policy('push the code when done'))
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_merge_pr_is_blocked(self):
-        self.assertIsNotNone(_check_goal_policy("merge the pr and mark complete"))
-
-    @unittest.skip("obsolete Git keyword policy removed by issue #190")
-    def test_git_action_rule_classified_as_disallowed_keyword(self):
-        # The policy_rule for a git-action rejection must be disallowed_keyword.
-        experiment = self.service.create_experiment(
-            goal="push the branch after the implementation is done"
-        )
-        result = self.service.run_experiment(experiment.id)
-        self.assertEqual(result.status, STATUS_REJECTED)
-        self.assertEqual(result.policy_rule, "disallowed_keyword")
-
     # Negated or incidental mentions that MUST be allowed ---
 
     def test_do_not_commit_or_push_is_allowed(self):

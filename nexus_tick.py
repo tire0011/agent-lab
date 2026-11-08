@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Nexus initiative tick — decide and start one piece of Nexus's own work.
+"""Nexus initiative tick - decide and start one piece of Nexus's own work.
 
-This is the entry point that makes Nexus self-directed. Everything else in the
-system waits to be asked: the mailbox timer waits for a human to write a file,
-the chat waits for someone to type, the task worker waits for an approval. This
-runs on a timer, looks at Nexus's own state, picks the single most useful thing
-to do next, records why, and hands it to the existing pipeline.
-
-The services are built exactly as ``api.py`` builds them, so a tick observes the
-same lifecycle rules as every other caller.
+Runs on a timer, looks at Nexus's own state, picks the single most useful
+next step, records why, and hands it to the existing pipeline. Services are
+built as ``api.py`` builds them.
 """
 
 from __future__ import annotations
@@ -21,8 +16,10 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime, timedelta, timezone
 
+from modules import github_authorization
 from modules.logging_config import configure_logging
 from modules.nexus_initiative import NexusInitiativeService
 from modules.nexus_task_store import NexusTaskStore
@@ -39,17 +36,57 @@ _PLANNER_STALL_SECONDS = 300
 
 # Things worth telling Claude about, collected during one tick (#365).
 _events: list[str] = []
+# How often the stall sweep (#400) runs while the tick waits for its experiment.
+_STALL_SWEEP_INTERVAL_SECONDS = 5 * 60
+
+
+def _service_diagnostics() -> dict:
+    url = os.environ.get(
+        "NEXUS_DIAGNOSTICS_URL", "http://127.0.0.1:8000/diagnostics/public"
+    )
+    with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - fixed/operator URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _restart_stale_service() -> None:
+    from modules.task_finalization import TaskFinalizationCoordinator
+
+    TaskFinalizationCoordinator._restart_services(
+        TaskFinalizationCoordinator._restart_service_names()
+    )
+
+
+def _checkout_revision(repo_root: str) -> str:
+    """Read the revision of the checkout executing this initiative tick."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _main_commit_date(repo_root: str) -> str:
+    """Read the date of the newest commit on the local ``origin/main`` ref."""
+    proc = subprocess.run(
+        ["git", "log", "-1", "--format=%cI", "origin/main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
-    """Return the open GitHub issue backlog available to Nexus.
+    """The open GitHub issue backlog available to Nexus (no label gate).
 
-    The initiative budget and one-at-a-time gate are the safety boundary.  A
-    label gate made the supposedly self-directed tick depend on a human first
-    labelling every issue, and in production that left it with no work to
-    plan. Pull a bounded view of the ordinary issue backlog instead. Pull
-    requests are excluded by ``gh issue list`` and linked issues are filtered
-    by :class:`NexusInitiativeService` before dispatch.
+    The budget and the one-at-a-time gate are the safety boundary; pull
+    requests are excluded and linked issues are filtered before dispatch.
     """
     try:
         proc = subprocess.run(
@@ -57,7 +94,9 @@ def _list_open_issues(repo_root: str) -> list[dict]:
                 "gh", "issue", "list",
                 "--state", "open",
                 "--limit", str(_ISSUE_LIMIT),
-                "--json", "number,title,body,labels",
+                # ``author`` decides whether the content-hash check applies
+                # (trusted authors may edit their issue after approval).
+                "--json", "number,title,body,labels,author",
             ],
             cwd=repo_root,
             capture_output=True,
@@ -114,6 +153,47 @@ def _count_open_proposals(repo_root: str) -> int:
     return len(json.loads(proc.stdout or "[]"))
 
 
+def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[dict[str, str]]:
+    """Proposals the owner closed lately, with the closing comment as the reason.
+
+    A rejected proposal keeps its label; its last comment says why. The
+    planner sees these so it does not suggest the same thing again.
+    """
+    from modules.nexus_planner import PROPOSAL_LABEL
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    proc = subprocess.run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/issues?state=closed&labels={PROPOSAL_LABEL}"
+         f"&since={since}&per_page={limit}"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+    decisions = []
+    for issue in json.loads(proc.stdout or "[]")[:limit]:
+        if issue.get("state_reason") == "completed":
+            decisions.append({"title": str(issue.get("title") or ""), "reason": "implemented"})
+            continue
+        comments = subprocess.run(
+            ["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{issue['number']}/comments?per_page=100"],
+            cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+        )
+        bodies = json.loads(comments.stdout or "[]") if comments.returncode == 0 else []
+        # Only comments whose API-verified author is a trusted actor count as
+        # the owner's decision; comment text itself is never trusted.
+        trusted_bodies = [
+            c for c in bodies
+            if isinstance(c, dict) and github_authorization.classify_comment(c).trusted
+        ]
+        reason = str(trusted_bodies[-1].get("body") or "") if trusted_bodies else ""
+        reason = reason.split("\n---\n", 1)[0]
+        decisions.append({
+            "title": str(issue.get("title") or ""),
+            "reason": " ".join(reason.split())[:400] or f"closed ({issue.get('state_reason') or 'no reason'})",
+        })
+    return decisions
+
+
 def _explore_with_claude(repo_root: str, prompt: str) -> str:
     """Plan as a read-only Claude agent with the Nexus MCP read tools (#384)."""
     import tempfile
@@ -161,6 +241,12 @@ def _planner(repo_root: str):
     from modules.nexus_planner import IssuePlanner
 
     def complete(prompt: str) -> str:
+        # Free registry models first (#552), Azure only when none answers.
+        from modules import model_registry
+
+        free = model_registry.chat_first(prompt, role="planning", max_cost="free", max_tokens=2000)
+        if free.success:
+            return free.content
         service = NexusDelegationService()
         try:
             result = asyncio.run(service.azure_chat(prompt, max_tokens=2000)).to_dict()
@@ -205,6 +291,11 @@ def _build_service(args) -> NexusInitiativeService:
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
+        decision_lister=lambda: _owner_decisions(args.repo_root),
+        diagnostics_client=_service_diagnostics,
+        checkout_revision=lambda: _checkout_revision(args.repo_root),
+        main_commit_date=lambda: _main_commit_date(args.repo_root),
+        restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )
 
@@ -212,11 +303,8 @@ def _build_service(args) -> NexusInitiativeService:
 def _reconcile_stale_claims(db_path: str) -> None:
     """Release controller claims whose worker stopped heartbeating (#162).
 
-    The tick runs on a timer, which makes it the natural place to notice a dead
-    worker: the API only reconciles at startup, and a worker that dies while
-    the API keeps running would otherwise hold its claim until the next
-    restart. Never resumes the work and never fails the tick - a tick that
-    could not reap is still a tick that can decide.
+    The API only reconciles at startup, so the timer is where a dead worker is
+    noticed. Never resumes work and never fails the tick.
     """
     store = None
     try:
@@ -256,12 +344,30 @@ def _cleanup_expired_worktrees(service) -> None:
         logger.warning("could not clean up expired experiment worktrees: %s", exc)
 
 
-def _wait_for_experiments() -> None:
+def _sweep_stalled_experiments(service) -> None:
+    """Fail experiments that logged nothing past their phase limit (#400).
+
+    A hung worker otherwise holds the issue, the daily budget and this tick's
+    wait until a restart. Never fails the tick.
+    """
+    experiment_service = getattr(service, "experiment_service", None)
+    if experiment_service is None:
+        return
+    try:
+        stalled = experiment_service.sweep_stalled_experiments()
+    except Exception as exc:  # noqa: BLE001 - the sweep must not break a tick
+        logger.warning("could not sweep stalled experiments: %s", exc)
+        return
+    # The notification picks them up through _finished_badly.
+    for experiment_id in stalled:
+        logger.warning("experiment %s stalled and was marked failed", experiment_id)
+
+
+def _wait_for_experiments(service=None) -> None:
     """Keep the process alive until the work it started has ended (#358).
 
-    The controller runs an experiment, and the adoption service an
-    integration, in a daemon thread of this process; the oneshot unit would
-    otherwise exit and kill it while it is still queued or adopting.
+    Experiments and adoptions run in daemon threads; the oneshot unit would
+    otherwise kill them on exit.
     """
     from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
     from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
@@ -278,7 +384,12 @@ def _wait_for_experiments() -> None:
             return
         for thread in pending:
             logger.info("waiting for %s to finish", thread.name)
-            thread.join()
+            # Wake up now and then: the experiment this tick waits for may be
+            # the one whose worker hangs (#400).
+            while thread.is_alive():
+                thread.join(timeout=_STALL_SWEEP_INTERVAL_SECONDS)
+                if thread.is_alive() and service is not None:
+                    _sweep_stalled_experiments(service)
 
 
 def _finished_badly(db_path: str, since: str) -> list[str]:
@@ -308,6 +419,70 @@ def _finished_badly(db_path: str, since: str) -> list[str]:
     finally:
         db.close()
     return found
+
+
+# Nexus stood still for 17 hours after #506 and every tick only said "idle"
+# (#521). After this long without starting work, the owner hears about it,
+# at most once a day.
+_STALL_ALARM_HOURS = 6
+_STALL_ALARM_REPEAT_HOURS = 24
+_STALL_ALARM = "stall_alarm"
+# Decisions that explain a quiet stretch on their own.
+_EXPECTED_QUIET = ("busy", "budget_exhausted", "paused")
+
+
+def _stall_alarm(db_path: str, now: datetime | None = None) -> str | None:
+    """A message when Nexus has started no work for a long time, else ``None``.
+
+    Records the alarm in the initiative log so it is sent once a day.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        db = sqlite3.connect(db_path, timeout=30)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = db.execute(
+            "SELECT created_at, decision, detail FROM nexus_initiative_log ORDER BY created_at"
+        ).fetchall()
+        if not rows:
+            return None
+        dispatched = [r[0] for r in rows if r[1] == "dispatched"]
+        since = dispatched[-1] if dispatched else rows[0][0]
+        window = [r for r in rows if r[0] > since and r[1] != _STALL_ALARM]
+        quiet_for = now - datetime.fromisoformat(since)
+        if quiet_for < timedelta(hours=_STALL_ALARM_HOURS):
+            return None
+        if window and window[-1][1] in _EXPECTED_QUIET:
+            return None
+        alarms = [r[0] for r in rows if r[1] == _STALL_ALARM and r[0] > since]
+        if alarms and now - datetime.fromisoformat(alarms[-1]) < timedelta(hours=_STALL_ALARM_REPEAT_HOURS):
+            return None
+        counts: dict[str, int] = {}
+        for _created, decision, _detail in window:
+            counts[decision] = counts.get(decision, 0) + 1
+        seen = ", ".join(f"{d} x{n}" for d, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+        examples = list(dict.fromkeys(
+            str(detail)[:150] for _c, decision, detail in reversed(window)
+            if detail and decision != "idle"
+        ))[:3]
+        message = (
+            f"Nexus has started no work for {int(quiet_for.total_seconds() // 3600)}h "
+            f"(decisions since: {seen or 'none'})"
+            + (f"; e.g. {' | '.join(examples)}" if examples else "")
+        )
+        with db:
+            db.execute(
+                "INSERT INTO nexus_initiative_log (tick_id, created_at, decision, detail) "
+                "VALUES (?, ?, ?, ?)",
+                (f"stall-{now.isoformat()}", now.isoformat(), _STALL_ALARM, message[:1000]),
+            )
+        return message
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        logger.warning("stall alarm: %s", exc)
+        return None
+    finally:
+        db.close()
 
 
 def _notify(repo_root: str, messages: list[str]) -> None:
@@ -352,8 +527,17 @@ def main(argv: list[str] | None = None) -> int:
     # included.
     if not args.dry_run:
         _reconcile_stale_claims(args.db_path)
+        from modules.main_guard import guard_main
+
+        reverted = guard_main(args.repo_root)
+        if reverted:
+            logger.warning("main guard: %s", reverted)
+            _events.append(reverted)
 
     service = _build_service(args)
+    if not args.dry_run:
+        # Before the busy check, so a hung experiment does not block this tick.
+        _sweep_stalled_experiments(service)
     try:
         if not args.dry_run and service.controller is not None:
             resume = service.resume_blocked_capability()
@@ -399,14 +583,18 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("no work started (%s): %s", decision.decision, decision.detail)
         return 0 if decision.decision != "error" else 1
     finally:
-        _wait_for_experiments()
+        _wait_for_experiments(None if args.dry_run else service)
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
         service.close()
         if not args.dry_run:
             if decision is not None and decision.decision == "error":
                 _events.append(f"Tick error: {str(decision.detail or '')[:300]}")
-            _notify(args.repo_root, _events + _finished_badly(args.db_path, started_at))
+            stalled = _stall_alarm(args.db_path)
+            _notify(
+                args.repo_root,
+                _events + _finished_badly(args.db_path, started_at) + ([stalled] if stalled else []),
+            )
 
 
 if __name__ == "__main__":

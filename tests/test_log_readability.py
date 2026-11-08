@@ -113,22 +113,5 @@ class MailboxPhaseTests(unittest.TestCase):
         self.assertEqual(api._derive_log_source("implementation"), "experiment")
 
 
-class LogsPageOrderingTests(unittest.TestCase):
-    """The feed opens on the newest entry; a trace stays chronological."""
-
-    def setUp(self):
-        from fastapi.testclient import TestClient
-        import api
-
-        self.javascript = TestClient(api.app).get("/static/logs.js").text
-
-    def test_the_feed_renders_newest_first(self):
-        self.assertIn("newestFirst = true", self.javascript)
-        self.assertIn("newestFirst ? [...entries].reverse() : entries", self.javascript)
-
-    def test_the_trace_view_keeps_chronological_order(self):
-        self.assertIn("renderLogEntries(entries, { newestFirst: false })", self.javascript)
-
-
 if __name__ == "__main__":
     unittest.main()

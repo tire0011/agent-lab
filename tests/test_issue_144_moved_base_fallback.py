@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from modules.experiment_adoption_service import STATUS_ADOPTED, STATUS_FAILED
 from modules.experiment_service import _truncate_text
@@ -21,6 +22,26 @@ from tests.test_experiment_adoption_service import AdoptionRepoFixture, git
 
 _TIMEOUT_REASON = "Die Integrationstests konnten nicht erfolgreich abgeschlossen werden."
 
+
+
+# modules.experiment_adoption_service was split into modules/experiment_adoption_parts/
+# (#574): a patched name is looked up in the parts module that uses it, so one mock
+# is installed in every parts module that looks the name up at call time.
+_ADOPTION_LOOKUPS = {
+    "run_verification_test_monitored": (
+        "modules.experiment_adoption_parts.pipeline",
+    ),
+
+}
+
+
+@contextmanager
+def _patch_adoption(name: str, **kwargs):
+    mock = MagicMock(**kwargs)
+    with ExitStack() as stack:
+        for module in _ADOPTION_LOOKUPS[name]:
+            stack.enter_context(patch(f"{module}.{name}", new=mock))
+        yield mock
 
 class MovedBaseIntegrationFallbackTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -219,8 +240,8 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
                 "wait_for_ci",
                 return_value=unavailable,
             ),
-            patch(
-                "modules.experiment_adoption_service.run_verification_test_monitored",
+            _patch_adoption(
+                "run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):
@@ -252,8 +273,8 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
                 "wait_for_ci",
                 return_value=unavailable,
             ),
-            patch(
-                "modules.experiment_adoption_service.run_verification_test_monitored",
+            _patch_adoption(
+                "run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):
@@ -298,8 +319,8 @@ class MovedBaseIntegrationFallbackTests(unittest.TestCase):
                 "wait_for_ci",
                 return_value=unavailable,
             ),
-            patch(
-                "modules.experiment_adoption_service.run_verification_test_monitored",
+            _patch_adoption(
+                "run_verification_test_monitored",
                 side_effect=real_run_verification_test,
             ) as local_tests,
         ):

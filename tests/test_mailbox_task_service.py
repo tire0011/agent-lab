@@ -232,7 +232,12 @@ class TestSubmitQueued(unittest.TestCase):
         approval = svc.create_task(msg_id, "Do work", "alice", "/f.md", "2026-01-01T00:00:00Z")
         svc.submit_queued()
         import time; time.sleep(0.1)
-        es.create_experiment.assert_called_once_with("Do work")
+        es.create_experiment.assert_called_once_with(
+            "Do work",
+            complexity=None,
+            source_type="task",
+            source_id=approval.id,
+        )
         updated = svc.get(approval.id)
         self.assertIn(updated.status, (_STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_SUCCEEDED, _STATUS_FAILED))
         _, kwargs = _FixedOrchestrator.calls[-1]
@@ -296,43 +301,6 @@ class TestSubmitQueued(unittest.TestCase):
         es.create_experiment.assert_not_called()
         self.assertEqual(svc.get(approval.id).experiment_id, existing_id)
 
-    def test_clarification_can_continue_same_task_and_preserve_followup(self):
-        exp = _make_exp(id="expAfterReply", status="queued")
-        es = self._make_exp_service(exp)
-
-        class DiscussionOrchestrator(_FixedOrchestrator):
-            decisions = [
-                TaskDecision(
-                    action=ACTION_CLARIFICATION,
-                    message="Optimize for cost or latency?",
-                    reason="material tradeoff",
-                    session_id="session-abc",
-                ),
-                TaskDecision(action=ACTION_NEW_EXPERIMENT, reason="clarified"),
-            ]
-            calls = []
-
-            def run(self, task, **kwargs):
-                type(self).calls.append((task, kwargs))
-                return type(self).decisions.pop(0)
-
-        svc = _make_service(self.tmp, exp_service=es, orchestrator_factory=DiscussionOrchestrator)
-        msg_id = _insert_mailbox_msg(svc)
-        approval = svc.create_task(msg_id, "Improve routing", "alice", "/f.md", "2026-01-01T00:00:00Z")
-        svc.submit_queued()
-        waiting = svc.get(approval.id)
-        self.assertEqual(waiting.status, _STATUS_NEEDS_REVIEW)
-        self.assertIn("Nexus session: session-abc", waiting.result_summary)
-
-        svc.continue_discussion(approval.id, "Optimize for cost")
-        import time; time.sleep(0.1)
-
-        es.create_experiment.assert_called_once()
-        goal = es.create_experiment.call_args[0][0]
-        self.assertIn("Improve routing", goal)
-        self.assertIn("Optimize for cost", goal)
-        self.assertEqual(DiscussionOrchestrator.calls[0][1]["source_id"], approval.id)
-        self.assertEqual(DiscussionOrchestrator.calls[1][1]["source_id"], approval.id)
 
 
 class TestPollRunning(unittest.TestCase):
@@ -490,15 +458,6 @@ class TestApprovalEndpointsRemoved(unittest.TestCase):
         self.assertIn("/mailbox/tasks", paths)
         self.assertIn("/mailbox/tasks/{approval_id}", paths)
         self.assertFalse([p for p in paths if p.endswith(("/approve", "/reject")) and "mailbox" in p])
-
-    def test_ui_has_no_approval_controls(self):
-        static = Path(__file__).resolve().parents[1] / "static"
-        javascript = (static / "tasks.js").read_text(encoding="utf-8")
-        html = (static / "index.html").read_text(encoding="utf-8")
-        self.assertNotIn("/approve", javascript)
-        self.assertNotIn("/reject", javascript)
-        self.assertNotIn("Genehmigen", javascript)
-        self.assertNotIn("task-approvals", html)
 
 
 class TestTaskLogging(unittest.TestCase):

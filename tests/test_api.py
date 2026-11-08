@@ -106,7 +106,20 @@ class HealthEndpointTests(ApiTestsBase):
     def test_health_returns_ok(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok", "version": VERSION})
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["version"], VERSION)
+        self.assertIn("git_revision", body)
+        self.assertIn("checkout_revision", body)
+        self.assertIn("stale", body)
+
+
+class StaticAssetsRemovedTests(ApiTestsBase):
+    def test_static_assets_are_gone_and_health_still_works(self):
+        response = self.client.get("/static/app.js")
+        self.assertEqual(response.status_code, 404)
+        health = self.client.get("/health")
+        self.assertEqual(health.status_code, 200)
 
 
 class MailboxGithubWebhookTests(ApiTestsBase):
@@ -207,161 +220,6 @@ class MailboxGithubWebhookTests(ApiTestsBase):
         self.assertNotIn(secret, serialized)
         self.assertNotIn(bad_signature, serialized)
         self.assertNotIn(payload_text, serialized)
-
-
-class WebClientTests(ApiTestsBase):
-    def test_index_returns_html(self):
-        response = self.client.get("/")
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.headers["content-type"].startswith("text/html"))
-        self.assertIn("Agent Lab", response.text)
-
-    def test_stylesheet_is_reachable(self):
-        response = self.client.get("/static/styles.css")
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.headers["content-type"].startswith("text/css"))
-
-    def test_javascript_is_reachable(self):
-        response = self.client.get("/static/utils.js")
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("javascript", response.headers["content-type"])
-        self.assertIn("textContent", response.text)
-
-    def test_experiment_detail_shows_full_id_and_copy_control(self):
-        javascript = self.client.get("/static/tasks.js").text
-        detail_block = javascript.split("async function showExperimentDetail(experimentId)", 1)[1].split(
-            "taskElements.loadButton.addEventListener", 1
-        )[0]
-        self.assertIn('["Experiment-ID", fullExperimentId || "–"]', detail_block)
-        self.assertIn('copyButton.textContent = "Kopieren"', detail_block)
-        self.assertIn("copyTextToClipboard(fullExperimentId)", detail_block)
-        self.assertNotIn("fullExperimentId.slice(0, 8)", detail_block)
-
-    def test_public_experiment_detail_fetch_path_is_preserved(self):
-        javascript = self.client.get("/static/tasks.js").text
-        fetch_block = javascript.split("async function fetchExperimentSummary(experimentId)", 1)[1].split(
-            "// States left by the removed approval step (#264)", 1
-        )[0]
-        self.assertIn(
-            "const path = state.apiKey ? `/experiments/${experimentId}` : `/experiments/${experimentId}/public`;",
-            fetch_block,
-        )
-
-    def test_experiment_detail_mobile_layout_rule_is_preserved(self):
-        stylesheet = self.client.get("/static/styles.css").text
-        mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
-        self.assertIn(".detail-list { grid-template-columns: 1fr; }", mobile_rules)
-
-    def test_logs_status_contract(self):
-        html = self.client.get("/").text
-        self.assertIn('id="logs-visible-count"', html)
-        self.assertIn('id="logs-last-successful-refresh"', html)
-        self.assertIn("Sichtbar:", html)
-        self.assertIn("Zuletzt erfolgreich aktualisiert:", html)
-
-    def test_logs_render_and_filter_optional_chat_correlations(self):
-        html = self.client.get("/").text
-        javascript = self.client.get("/static/logs.js").text
-        self.assertIn('id="logs-job-input"', html)
-        self.assertIn('id="logs-session-input"', html)
-        self.assertIn('addDetail("Chat-Job-ID", entry.job_id)', javascript)
-        self.assertIn('addDetail("Session-ID", entry.session_id)', javascript)
-        self.assertIn('if (jobId) params.set("job_id", jobId)', javascript)
-        self.assertIn('if (sessionId) params.set("session_id", sessionId)', javascript)
-        self.assertNotIn("setInterval(loadLogs", javascript)
-
-    def test_logs_refresh_uses_rendered_arrays_and_shared_load_function(self):
-        javascript = self.client.get("/static/logs.js").text
-        self.assertIn("const visibleCount = renderedEntries.length;", javascript)
-        self.assertIn('const baseUrl = `/logs?${params.toString()}`;', javascript)
-        self.assertIn("await requestJson(baseUrl, { headers: authHeaders() });", javascript)
-        # Rendering and the status update stay paired on the refresh path.
-        # Matched indentation-insensitively: reading logs no longer has a
-        # separate unauthenticated branch (DECISIONS.md D-012), so the
-        # single remaining code path sits one level less deep.
-        self.assertRegex(
-            javascript, r"renderLogEntries\(entries\);\s*\n\s*updateLogsSuccessStatus\(entries\);"
-        )
-        self.assertNotIn("setInterval(loadLogs", javascript)
-        self.assertIn('logsElements.refreshButton.addEventListener("click", loadLogs)', javascript)
-
-    def test_logs_default_view_uses_unified_feed_not_activity_summaries(self):
-        """The default unified Nexus timeline must show real structured
-        log entries (GET /logs) rather than lifecycle/status summaries
-        (GET /activity)."""
-        javascript = self.client.get("/static/logs.js").text
-        self.assertNotIn("/activity?", javascript)
-        self.assertNotIn("renderLogsFromActivity", javascript)
-
-    def test_logs_has_no_experiment_selector(self):
-        """Issue #105: the Logs tab must not require picking an experiment
-        or show "Alle Experimente" - experiment id is only an optional
-        filter input."""
-        html = self.client.get("/").text
-        self.assertNotIn("Alle Experimente", html)
-        self.assertNotIn('id="logs-experiment-select"', html)
-        self.assertIn('id="logs-experiment-input"', html)
-
-    def test_logs_has_no_separate_journalctl_section(self):
-        """Issue #105: journalctl/system logs are merged into the one
-        unified GET /logs timeline, not shown in a separate UI section."""
-        html = self.client.get("/").text
-        javascript = self.client.get("/static/logs.js").text
-        self.assertNotIn('id="logs-journalctl-content"', html)
-        self.assertNotIn("loadJournalctlLogs", javascript)
-        self.assertIn('id="logs-source-select"', html)
-
-    def test_logs_success_timestamp_is_not_updated_in_error_paths(self):
-        javascript = self.client.get("/static/logs.js").text
-        load_logs = javascript.split("async function loadLogs()", 1)[1].split(
-            'logsElements.refreshButton.addEventListener("click", loadLogs)', 1
-        )[0]
-        self.assertEqual(load_logs.count("updateLogsSuccessStatus("), 2)
-        for error_path in load_logs.split("catch (error)")[1:]:
-            catch_body = error_path.split("}", 1)[0]
-            self.assertNotIn("updateLogsSuccessStatus", catch_body)
-
-    def test_logs_error_paths_reset_visible_count_but_not_timestamp(self):
-        javascript = self.client.get("/static/logs.js").text
-        self.assertIn(
-            "function updateLogsErrorStatus() {\n"
-            "  logsElements.visibleCount.textContent = \"0\";\n"
-            "}",
-            javascript,
-        )
-        self.assertNotIn("lastSuccessfulRefresh", javascript.split(
-            "function updateLogsErrorStatus() {", 1
-        )[1].split("}", 1)[0])
-
-        load_logs = javascript.split("async function loadLogs()", 1)[1].split(
-            'logsElements.refreshButton.addEventListener("click", loadLogs)', 1
-        )[0]
-        self.assertEqual(load_logs.count("updateLogsErrorStatus()"), 2)
-        for error_path in load_logs.split("catch (error)")[1:]:
-            catch_body = error_path.split("}", 1)[0]
-            self.assertIn("updateLogsErrorStatus()", catch_body)
-            self.assertNotIn("lastSuccessfulRefresh", catch_body)
-
-    def test_logs_status_wraps_on_small_screens(self):
-        stylesheet = self.client.get("/static/styles.css").text
-        self.assertIn(".logs-status {", stylesheet)
-        self.assertIn("flex-wrap: wrap", stylesheet)
-        mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
-        self.assertIn(".logs-status { align-items: flex-start; flex-direction: column;", mobile_rules)
-
-    def test_idea_input_is_multiline_textarea(self):
-        """Issue #351: the idea field is a ~3-row textarea capped at 500
-        characters, full width on mobile, and still read by overview.js."""
-        html = self.client.get("/").text
-        self.assertRegex(html, r'<textarea id="idea-input"[^>]*\smaxlength="500"')
-        self.assertRegex(html, r'<textarea id="idea-input"[^>]*\srows="3"')
-        self.assertNotIn('<input id="idea-input"', html)
-        stylesheet = self.client.get("/static/styles.css").text
-        mobile_rules = stylesheet.split("@media (max-width: 640px)", 1)[1]
-        self.assertIn(".idea-form textarea, .idea-form button { flex-basis: 100%; }", mobile_rules)
-        javascript = self.client.get("/static/overview.js").text
-        self.assertIn('ideaInput: document.querySelector("#idea-input")', javascript)
-        self.assertIn("elements.ideaInput.value.trim()", javascript)
 
 
 class MailboxTaskDetailEndpointTests(ApiTestsBase):
@@ -732,17 +590,6 @@ class AdoptionAndOperationsEndpointTests(ApiTestsBase):
         response = self.client.post("/operations/execute", headers=self.HEADERS, json={"operation": "git_log", "args": {}})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "bad op")
-
-    def test_web_assets_contain_operations_tab_and_no_innerhtml(self):
-        html = self.client.get("/").text
-        js = "\n".join([
-            self.client.get(f"/static/{name}").text
-            for name in ["utils.js", "api-key.js", "tab-nav.js", "overview.js", "chat.js", "tasks.js", "mailbox.js", "operations.js", "chain-editor.js", "logs.js", "app.js"]
-        ])
-        self.assertIn('data-tab="operations"', html)
-        self.assertIn('id="tab-operations"', html)
-        self.assertIn("loadOperationsCatalog", js)
-        self.assertNotIn("innerHTML", js)
 
 
 class TestStartupOutboxRecovery(unittest.TestCase):

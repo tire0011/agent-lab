@@ -10,14 +10,9 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_TIMEOUT_SECONDS = 10
 DEFAULT_CHAT_PATH = "/chat"
 
-# ---------------------------------------------------------------------------
-# Codex task API client constants.
-#
-# The CLI is a thin HTTP client: it never imports CodexWorker/CodexTaskService
-# and never chooses working_dir/sandbox (both are server-enforced). These
-# constants mirror the server-side limits documented in api.py so the CLI can
-# size its own HTTP timeout safely without an extra round trip.
-# ---------------------------------------------------------------------------
+# Codex task API client: a thin HTTP client that never chooses
+# working_dir/sandbox (server-enforced). These mirror the server limits so the
+# CLI can size its HTTP timeout.
 CODEX_SERVER_MAX_TIMEOUT_SECONDS = 120  # mirrors api.py CODEX_MAX_TIMEOUT_SECONDS
 CODEX_RUN_TIMEOUT_MARGIN_SECONDS = int(
     os.getenv("AGENT_CODEX_RUN_TIMEOUT_MARGIN_SECONDS", "15")
@@ -40,11 +35,8 @@ EXIT_TASK_TERMINAL_FAILURE = 3
 class ClientError(Exception):
     """Raised for any failed request.
 
-    ``http_status`` is set when the server returned a definitive HTTP
-    response (e.g. 401/404/409/422/500): the outcome is known, just
-    unsuccessful. It is left ``None`` for genuine transport-level failures
-    (connection refused, client-side timeout, malformed JSON) where whether
-    the server-side action happened at all is ambiguous.
+    ``http_status`` is set when the server answered definitively; ``None``
+    means a transport failure where the server-side outcome is unknown.
     """
 
     def __init__(self, message: str, *, http_status: int | None = None) -> None:
@@ -303,13 +295,7 @@ def _require_api_key(args: argparse.Namespace) -> str | None:
 
 
 def _task_exit_code(task: Any) -> int:
-    """Map a task's own terminal status to a CLI exit code.
-
-    A successful HTTP response whose task ended in 'failed' or 'timed_out'
-    is still a real failure from the caller's point of view (see README.md
-    for the full exit-code convention), so it is surfaced as a non-zero
-    exit code distinct from transport-level errors.
-    """
+    """Map a task's terminal status to a CLI exit code ('failed'/'timed_out' -> 3)."""
     if isinstance(task, dict) and task.get("status") in CODEX_TERMINAL_FAILURE_STATUSES:
         return EXIT_TASK_TERMINAL_FAILURE
     return EXIT_OK

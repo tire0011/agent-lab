@@ -1,9 +1,65 @@
-# agent-lab
+# agent-lab: Nexus
 
-Experimental project for distributed self-improving LLM agents under strict budget constraints.
+**Nexus** is a self-developing agent. It runs on a small Azure VM, picks its own
+work from the GitHub issues of this repository, changes its own code through
+coding agents (Claude Code and Codex), checks every change, and merges it
+itself. The owner steers through issues and by releasing Nexus's own proposals.
+The project goal: find out how far such a system can improve itself safely,
+measurably and within a tight budget.
 
-Repository development and verification conventions are documented in
-[`CODING_GUIDELINES.md`](CODING_GUIDELINES.md).
+Identity and attribution rules are in [`NEXUS.md`](NEXUS.md); development and
+verification conventions are in [`CODING_GUIDELINES.md`](CODING_GUIDELINES.md).
+
+## How Nexus works
+
+Every 15 minutes the initiative tick (`nexus_tick.py`, `nexus-tick.timer`) runs
+one step:
+
+1. **Plan.** A read-only planner (Claude with the Nexus MCP read tools, Azure as
+   fallback) picks the next open issue. It also suggests one new issue of its
+   own, opened with the `proposal` label. It sees its recent experiments, its
+   open proposals and the owner's decisions on closed ones.
+2. **Implement.** An experiment runs in an isolated git worktree on the issue's
+   branch. A retry first merges the current `main`. The coding agent rotates
+   between Claude and Codex; when one is overloaded, the other takes over.
+3. **Check.** Tests, a deterministic quality gate, GitHub Actions on the
+   experiment commit, and a review that rotates between Claude, Codex and
+   Azure. Before the merge, CI must also pass on exactly the tree that goes to
+   `main`.
+4. **Merge.** Nexus squash-merges its own pull request (`Fixes #N` closes the
+   issue). If `main` turns red after a Nexus merge, the next tick reverts it and
+   reopens the issue.
+5. **Report.** Failures, reverts and new proposals are posted as comments on
+   `tire0011/agent-lab-mailbox#6`.
+
+Limits: one piece of work at a time; a daily budget of self-started
+experiments (set by a mailbox `setting` message; `--daily-budget` in
+`deploy/nexus-tick.service` is the default); at most two
+failed attempts per issue. A provider overload or a crash of Nexus's own
+pipeline does not use up an attempt, and a retry after a blocking review runs
+at once and outside the budget.
+
+## Working with Nexus
+
+- **Give work:** open a GitHub issue with a concrete Problem / Change / Test.
+  Nexus treats only paths in the Change section as files it must create.
+  The public repo is discovery and discussion only: Nexus lists all open
+  issues, but **only issues written by a trusted actor (the owner) or
+  explicitly approved through the private mailbox** are eligible for
+  autonomous execution (for issues from untrusted authors the
+  approval is additionally bound to the issue's title+body hash, so editing
+  such an issue requires renewed approval). Approve or revoke with a
+  structured `issue_approval` mailbox message - see
+  `docs/issue-authorization.md`. Unapproved issues are recorded as
+  `skipped_unapproved_issue` and never start experiments.
+- **Review its ideas:** proposals carry the `proposal` label and are not worked
+  on. Remove the label to release one; close it with a comment to reject it.
+  The closing comment is shown to the planner as the owner's decision, but
+  only when the comment's API-verified author is a trusted actor.
+- **Watch it:** comments on `tire0011/agent-lab-mailbox#6`, the open `WIP:`
+  pull requests, and `GET /diagnostics/public`.
+- **Deploy changes:** after a merge by hand, run `scripts/nexus-refresh.ps1` on
+  the VM (or via a mailbox command); Nexus restarts stale services itself.
 
 ## Mailbox
 
@@ -11,7 +67,7 @@ Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed m
 
 **Inbox** (`<AGENT_MAILBOX_REPO_PATH>/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus. This root-level directory is the only supported inbox; the code repository's former `communication/inbox/` path is not scanned.
 
-Supported message types: `idea`, `task`, `question`, `context`, `refresh`.
+Supported message types: `idea`, `task`, `question`, `context`, `refresh`, `setting`, `issue_approval` (approve/revoke an issue for autonomous execution - see `docs/issue-authorization.md`).
 
 Example: `agent-lab-mailbox/examples/idea-template.md`.
 
@@ -46,6 +102,35 @@ them.
   ---
   ```
 
+- `setting` — changes one allowlisted owner setting from the front matter;
+  no shell. `daily_budget` (0–50) is the daily budget of self-started
+  experiments; it overrides `--daily-budget` from
+  `deploy/nexus-tick.service` from the next tick on. `extra_budget` (0–20)
+  adds that many starts on top of it for the next 24 hours, then expires on
+  its own. Only paid work counts: a start that used only the local model
+  (no planner, no Azure, no paid delegation, no coding experiment) is free.
+  `paused` (1/0) stops and resumes all new work: no starts, adoptions or
+  retries while it is 1; running experiments finish. Note that
+  `daily_budget` 0 means no limit, not a pause.
+  `planner_mission` replaces the planner's mission text with the message
+  body (up to 4000 characters); a body of `default` restores the built-in one.
+
+  ```markdown
+  ---
+  type: setting
+  created_by: rene
+  key: daily_budget
+  value: 5
+  ---
+  ```
+
+- Chat models: `config/models.json` lists the external chat models Nexus can
+  call through one OpenAI-compatible interface (`modules/model_registry.py`).
+  Adding a provider is a new entry (base URL, model, `api_key_env`, `cost`,
+  `roles`); a model whose key is not set in `/etc/agent-lab/agent.env` is off.
+  Free models are tried before paid ones (delegate `free_tier`, controller
+  fallback, planner) and do not count in the daily budget.
+
 **Safety:**
 
 - Files over 64 KB, binary files, symlinks, path traversals, unknown types, and files containing secrets (e.g. `sk-`, `API_KEY=`) are rejected.
@@ -69,12 +154,9 @@ python mailbox_processor.py [--dry-run] [--db-path PATH] [--code-repo-path PATH]
 
 The VM normally sets `AGENT_CODE_REPO_PATH=/agent` and `AGENT_MAILBOX_REPO_PATH` to the separate mailbox checkout.
 
-## Current status
+## API overview
 
-- V0 (`agent.py`) works locally and on Azure VM.
-- V0 supports Azure OpenAI calls and logs run artifacts under `state/runs/`.
-- V1 (MCP-based) is in progress.
-- API service (`api.py`) provides:
+The API service (`api.py`) provides:
 	- public `GET /health`
 	- public `GET /activity/public` and `GET /experiments/{id}/public` with
 	  strict allowlisted observability fields (no prompts, diffs, raw logs, or paths)
@@ -87,16 +169,6 @@ The VM normally sets `AGENT_CODE_REPO_PATH=/agent` and `AGENT_MAILBOX_REPO_PATH`
 	  `GET /codex/tasks`, `GET /codex/tasks/{id}`,
 	  `POST /codex/tasks/{id}/run`) — synchronous, `read-only` sandbox,
 	  `working_dir` fixed to `/agent`; see "Coding task API" below
-
-## Current direction
-
-The project is not run from a fixed roadmap. Open, unprioritized ideas
-for future work live in `IDEAS.md` and may be added to by humans or
-agents at any time; see that file for current candidate ideas (V1 MCP
-completion, benchmarking, provider abstraction, cheaper models,
-evaluation gating, controlled self-improvement, and more) and their
-lightweight states (`new`, `exploring`, `selected`, `tested`, `adopted`,
-`rejected`).
 
 ## Local quick start
 
@@ -134,6 +206,19 @@ CLI runner):
 - `python3 -m venv .venv && .venv/bin/pip install -r requirements-api.txt`
 - `AGENT_API_KEY=<value> .venv/bin/uvicorn api:app --reload`
 - Optional for GitHub mailbox webhook: `AGENT_GITHUB_WEBHOOK_SECRET=<value>`
+  and `AGENT_MAILBOX_REPO=owner/mailbox-repo` (payloads from any other
+  repository are ignored even with a valid signature).
+- Optional trusted-actor configuration: `NEXUS_TRUSTED_ACTORS=<comma-separated
+  logins>` (default: the repository owner, from `NEXUS_REPO_OWNER` or
+  `GITHUB_REPOSITORY`). See `modules/github_authorization.py` and
+  `docs/issue-authorization.md`. Mailbox inbox files are authorized by the
+  git author of the commit that added the file (a trusted actor's GitHub
+  noreply address, or an address in `NEXUS_TRUSTED_MAILBOX_EMAILS`, default:
+  the owner's, Claude's, Vibe's and Codex/GPT's `@openai.com`) - the `created_by` front
+  matter is display-only and never trusted; untrusted senders get
+  `pending_approval` tasks that never run. Issue execution authorization
+  itself lives in the local SQLite `issue_approvals` table, fed only by
+  `issue_approval` mailbox messages from trusted senders.
 - Required for Nexus implementation tasks: `GITHUB_REPOSITORY=owner/repository`
   and `GITHUB_TOKEN=<fine-grained token with Issues, Contents and Pull requests write access plus Actions read access>`.
   Without them the API remains available for read-only work, but implementation
@@ -195,6 +280,10 @@ Notes:
 - The trailing slash in `/mcp/` is part of the endpoint URL and should be kept
   in client configuration.
 
+The tool router itself (`find_tool`, `call_tool`) is a separate stdio server:
+`python -m modules.tool_router_mcp`. See `docs/issue-118-tool-router-mcp.md`,
+which includes the Copilot CLI setup.
+
 ## Adding ideas
 
 `POST /ideas` (authenticated with `x-api-key`, same as `/secure-health` and
@@ -208,15 +297,13 @@ Notes:
   `### Inbox` subsection at the end of the `## Ideas` section.
 - Writes are guarded by an exclusive file lock (`fcntl.flock`) so
   concurrent requests append one at a time instead of racing.
-- The Web UI's "Idee hinzufügen" field/button on `/` calls this endpoint
-  and refreshes the ideas list on success.
 
 ## Coding task API
 
 Small, authenticated FastAPI wrapper around `modules.codex_task_service.CodexTaskService`,
 which itself reuses the coding-agent workers — `modules.codex_worker.CodexWorker`
 (`codex exec`) and `modules.claude_worker.ClaudeWorker` (`claude --print`),
-never `shell=True`. Currently synchronous only, no chat/Web UI integration, no
+never `shell=True`. Currently synchronous only, no chat integration, no
 background queue, no parallel execution.
 
 Which agent runs a task is selected by a persistent round-robin when the task is created and
@@ -275,8 +362,7 @@ State machine: `queued → submitted → running → succeeded / failed / needs_
 A background `MailboxTaskWorker` daemon (10 s poll interval) calls
 `submit_queued()` + `poll_running()` on each tick. Experiments run
 serially (one VM, one budget). Results reach the outbox as
-`task-approval-result-<id>.md` (file name kept for compatibility). The Web UI
-"Mailbox-Aufträge" card lists the records.
+`task-approval-result-<id>.md` (file name kept for compatibility).
 
 Records from before #264 stay readable: `approved` rows became `queued` on
 migration; `pending_approval` and `rejected` rows keep their status and are
@@ -317,9 +403,7 @@ curl -s "$BASE/logs/trace/verification%20succeeded"
 ```
 
 An unresolvable reference returns `found: false` with an empty timeline rather
-than a 404. The Logs tab exposes both: a free-text search box over the full
-history, and an "Auftrag verfolgen" field (plus a per-entry button) that renders
-the same trace with its summary.
+than a 404.
 
 ## Nexus diagnostic commands
 
@@ -365,7 +449,7 @@ so its diagnosis and your `nexus logs` see the same facts.
 
 `GET /activity/public` returns the latest 100 sanitized lifecycle events without
 authentication. `GET /experiments/{id}/public` returns the corresponding public
-experiment summary. The website displays this feed and refreshes it every 10 seconds.
+experiment summary.
 Public experiment lookups accept either the full ID or a unique lowercase hexadecimal
 prefix of at least eight characters.
 
@@ -404,8 +488,7 @@ activity events stored in the database are already safe to return.
 **Never returned:** API keys, tokens, credentials, or headers; prompts or
 user-provided task bodies; environment variables; source code, diffs, or
 file contents; stack traces with internal paths; or unrestricted/raw
-command output. The website's Diagnostics card and
-`./scripts/nexus-logs.ps1` both display this same model.
+command output. `./scripts/nexus-logs.ps1` displays this same model.
 
 ## Security
 
@@ -419,7 +502,7 @@ command output. The website's Diagnostics card and
 - VM: `agent-lab-vm` (`Standard_B1s`, Ubuntu 22.04)
 - Azure OpenAI resource: `openAI-tire0011`
 - Deployment: `gpt-4o` (`2024-05-13`, GlobalStandard)
-- Public HTTPS host: `agent-lab-tire0011.germanywestcentral.cloudapp.azure.com`
+- Public HTTPS host: `<vm-host>`
 
 ## Additional documentation
 
@@ -508,7 +591,7 @@ Integration tests are intentionally separated from unit tests and only run when
 
 Example:
 
-- `AGENT_API_URL=https://agent-lab-tire0011.germanywestcentral.cloudapp.azure.com python -m unittest discover -s tests/integration -v`
+- `AGENT_API_URL=https://<vm-host> python -m unittest discover -s tests/integration -v`
 
 Covered checks:
 

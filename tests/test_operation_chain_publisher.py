@@ -13,12 +13,8 @@ import unittest
 from pathlib import Path
 
 from modules.mailbox import MailboxProcessor, git_is_clean
-from modules.operation_chain_publisher import (
-    PUBLISH_FAILED,
-    PUBLISH_PENDING,
-    PUBLISH_PUSHED,
-    OperationChainPublisher,
-)
+from modules.operation_chain_publisher import OperationChainPublisher
+from modules.outbox_publisher import PUBLISH_FAILED, PUBLISH_PUSHED
 from modules.run_store import init_db
 
 
@@ -56,7 +52,7 @@ def _insert_chain_row(
     db_path: str,
     request_id: str,
     outbox_rel_path: str,
-    publish_status: str = PUBLISH_PENDING,
+    publish_status: str = "pending",
     publish_commit_sha: str | None = None,
 ) -> None:
     conn = init_db(db_path)

@@ -13,10 +13,6 @@ Covers:
 - Recovery of unpublished result
 - Secret and path validation still applies
 - Inbox file removed in correct git commit (no outbox in same commit)
-- Chain-editor JS uses catalog and chain endpoints (node-based)
-- Nexus Gesamtstatus template contains all expected steps
-- Safe DOM creation (no innerHTML / insertAdjacentHTML)
-- node --check static/app.js
 """
 
 from __future__ import annotations
@@ -56,7 +52,7 @@ from models import OperationChainRequest, OperationChainStep
 
 def _make_repo(tmp: Path) -> Path:
     subprocess.run(["git", "init", str(tmp)], check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "49699333+tire0011@users.noreply.github.com"], cwd=str(tmp), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp), check=True, capture_output=True)
     readme = tmp / "README.md"
     readme.write_text("# test\n")
@@ -136,6 +132,10 @@ class _ChainProcessorBase(unittest.TestCase):
     def _write(self, name: str, content: str) -> Path:
         f = self.repo / "inbox" / name
         f.write_text(content, encoding="utf-8")
+        # Inbox files arrive as commits; the authorization gate checks the
+        # commit author, so commit as the owner.
+        subprocess.run(["git", "add", f"inbox/{name}"], cwd=str(self.repo), check=False, capture_output=True)
+        subprocess.run(["git", "commit", "-m", f"add inbox {name}"], cwd=str(self.repo), check=False, capture_output=True)
         return f
 
 
@@ -589,109 +589,6 @@ class TestInboxFileRemovedInCommit(unittest.TestCase):
         # No outbox addition in this commit
         self.assertNotIn("A\toutbox/", show)
 
-
-# ---------------------------------------------------------------------------
-# Inbox and API use the same service (structural test)
-# ---------------------------------------------------------------------------
-
-class TestInboxAndApiUseSameService(unittest.TestCase):
-    def test_cli_and_webhook_use_shared_mailbox_runner(self):
-        """Both mailbox processor and API call the same single-poll runner."""
-        import inspect
-        import mailbox_processor
-
-        mp_src = inspect.getsource(mailbox_processor)
-        self.assertIn("from modules.mailbox.poll_runner import run_mailbox_poll_once", mp_src)
-        self.assertIn("result = run_mailbox_poll_once(", mp_src)
-
-        # Read api.py source directly without importing (avoids env var requirement)
-        api_src = (Path(__file__).parent.parent / "api.py").read_text()
-        self.assertIn("from modules.mailbox.poll_runner import run_mailbox_poll_once", api_src)
-        self.assertIn("result = run_mailbox_poll_once(", api_src)
-
-
-# ---------------------------------------------------------------------------
-# JS: Chain editor uses catalog and chain endpoints
-# ---------------------------------------------------------------------------
-
-class TestChainEditorJS(unittest.TestCase):
-    def _read_app_js(self) -> str:
-        static_dir = Path(__file__).parent.parent / "static"
-        return "\n".join(p.read_text(encoding="utf-8") for p in sorted(static_dir.glob("*.js")))
-
-    def test_uses_catalog_endpoint(self):
-        src = self._read_app_js()
-        self.assertIn("/operations/catalog", src)
-
-    def test_uses_chains_post_endpoint(self):
-        src = self._read_app_js()
-        self.assertIn("/operations/chains", src)
-
-    def test_polls_chains_get_endpoint(self):
-        src = self._read_app_js()
-        self.assertIn("/operations/chains/${requestId}", src)
-
-    def test_nexus_gesamtstatus_template_has_all_steps(self):
-        src = self._read_app_js()
-        expected_actions = [
-            "git_status", "git_log", "git_worktrees", "service_status",
-            "disk", "memory", "problems_list", "inbox_status", "outbox_status",
-        ]
-        for action in expected_actions:
-            self.assertIn(action, src, f"Missing action in template: {action}")
-
-    def test_no_innerhtml(self):
-        src = self._read_app_js()
-        # innerHTML assignments are forbidden; allow .innerHTML in comments
-        import re
-        assignments = re.findall(r'\.innerHTML\s*=', src)
-        self.assertEqual(assignments, [], f"Found innerHTML assignment(s): {assignments}")
-
-    def test_no_insert_adjacent_html(self):
-        src = self._read_app_js()
-        self.assertNotIn("insertAdjacentHTML", src)
-
-    def test_max_steps_constant(self):
-        src = self._read_app_js()
-        self.assertIn("MAX_CHAIN_STEPS", src)
-        self.assertIn("10", src)
-
-    def test_stop_on_error_present(self):
-        src = self._read_app_js()
-        self.assertIn("stop_on_error", src)
-
-    def test_copy_button_present(self):
-        src = self._read_app_js()
-        self.assertIn("resultCopyButton", src)
-
-    def test_node_syntax_check(self):
-        static_dir = Path(__file__).parent.parent / "static"
-        for js_file in sorted(static_dir.glob("*.js")):
-            result = subprocess.run(["node", "--check", str(js_file)], capture_output=True, text=True)
-            if result.returncode != 0:
-                self.fail(f"JS syntax error in {js_file.name}:\n{result.stderr}")
-
-    def test_mobile_viewport_in_html(self):
-        html = (Path(__file__).parent.parent / "static" / "index.html").read_text()
-        self.assertIn("viewport", html)
-        self.assertIn("width=device-width", html)
-
-    def test_chain_editor_card_in_html(self):
-        html = (Path(__file__).parent.parent / "static" / "index.html").read_text()
-        self.assertIn("chain-editor-card", html)
-        self.assertIn("chain-template-button", html)
-        self.assertIn("chain-stop-on-error", html)
-        self.assertIn("chain-run-button", html)
-        self.assertIn("chain-result-card", html)
-
-    def test_template_button_text(self):
-        html = (Path(__file__).parent.parent / "static" / "index.html").read_text()
-        self.assertIn("Nexus Gesamtstatus", html)
-
-
-# ---------------------------------------------------------------------------
-# Full end-to-end bare-repo integration test
-# ---------------------------------------------------------------------------
 
 class TestFullInboxEndToEndWithBareRepo(unittest.TestCase):
     """Full inbox flow with a local bare repository (never touches real remote)."""

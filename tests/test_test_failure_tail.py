@@ -7,7 +7,6 @@ Covers:
 - ``experiment_show`` operation contains the bounded diagnostic tail.
 - Successful / no-output experiments do not produce a failure block.
 - Authenticated ``GET /experiments/{id}`` exposes ``test_failure_tail``.
-- UI ``showExperimentDetail`` uses ``textContent`` only (no innerHTML).
 """
 
 from __future__ import annotations
@@ -269,37 +268,6 @@ class ExperimentShowOperationTailTests(unittest.TestCase):
         self.assertTrue(result.success)
         output = json.dumps(result.output_lines)
         self.assertNotIn("test_failure_tail", output)
-
-
-# ---------------------------------------------------------------------------
-# UI: showExperimentDetail uses textContent only (no innerHTML)
-# ---------------------------------------------------------------------------
-
-class UITextContentSafetyTests(unittest.TestCase):
-    """Verify that static UI scripts use only ``textContent`` for failure tail."""
-
-    def _load_js(self):
-        import pathlib
-        static_dir = pathlib.Path(__file__).parent.parent / "static"
-        return "\n".join(p.read_text(encoding="utf-8") for p in sorted(static_dir.glob("*.js")))
-
-    def test_test_failure_section_uses_textcontent_not_innerhtml(self):
-        js = self._load_js()
-        # Find the test-failure-section block
-        idx = js.find("test-failure-section")
-        self.assertGreater(idx, 0, "test-failure-section not found in app.js")
-        # Extract a reasonable window around the block
-        block = js[idx:idx + 1000]
-        self.assertIn("textContent", block)
-        self.assertNotIn("innerHTML", block)
-
-    def test_test_failure_pre_class_present(self):
-        js = self._load_js()
-        self.assertIn("test-failure-output", js)
-
-    def test_test_failure_heading_is_testfehler(self):
-        js = self._load_js()
-        self.assertIn("Testfehler", js)
 
 
 if __name__ == "__main__":

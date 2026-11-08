@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from modules.experiment_adoption_service import ExperimentAdoptionService
 from tests.test_nexus_initiative import InitiativeFixture
 
-ISSUE = [{"number": 398, "title": "Goal policy corpus", "body": "Change: add tests."}]
+ISSUE = [{"number": 398, "author": {"login": "tire0011"}, "title": "Goal policy corpus", "body": "Change: add tests."}]
 
 
 class NeedsReviewRetriedTests(unittest.TestCase):

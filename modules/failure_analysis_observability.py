@@ -1,10 +1,7 @@
-"""Structured observability for the reusable failure-analysis lifecycle (#151).
-
-The underlying FailureAnalysisService intentionally stays focused on diagnosis.
-This module instruments its stable public/private seams plus the mailbox call
-sites so operators can reconstruct why an analysis did (or did not) happen
-from normal Nexus logs.  It never logs prompts, raw model output, credentials,
-or full failure text.
+"""Structured observability for the reusable failure-analysis lifecycle (#151):
+instruments the service's seams and the mailbox call sites so operators can
+reconstruct why an analysis did or did not happen. Never logs prompts, raw model
+output, credentials, or full failure text.
 """
 
 from __future__ import annotations
@@ -44,9 +41,8 @@ def _safe_model(value: Any) -> str | None:
     if value is None:
         return None
     text = _safe_text(value)
-    # Local model identifiers are sometimes full filesystem paths.  The
-    # filename is enough to identify the active model without exposing the
-    # host's directory layout.
+    # Local model identifiers are sometimes full paths; the filename identifies the
+    # active model without exposing the host's directory layout.
     return Path(text).name if ("/" in text or "\\" in text) else text
 
 
@@ -208,8 +204,8 @@ def _install_service_instrumentation() -> None:
         try:
             analysis = await original_analyze_async(self, *args, **kwargs)
         except Exception as exc:
-            # The underlying service is designed not to raise, but retain a
-            # defensive event if that contract is ever accidentally broken.
+            # The service is designed not to raise; keep a defensive event in case
+            # that contract is ever accidentally broken.
             _event(
                 "failure_analysis_unavailable",
                 level=logging.ERROR,
@@ -300,8 +296,8 @@ def _install_service_instrumentation() -> None:
         try:
             persisted = bool(original_persist(self, analysis))
         except Exception as exc:
-            # _persist currently swallows its own errors; this protects the
-            # event sequence if its implementation changes later.
+            # _persist swallows its own errors; this protects the event sequence
+            # if that implementation changes later.
             _PERSIST_OUTCOME.set("failed")
             _event(
                 "failure_analysis_persist_failed",
@@ -335,12 +331,9 @@ def _install_service_instrumentation() -> None:
 
     @functools.wraps(original_gather)
     async def observed_gather(self: Any, **kwargs: Any):
-        """Make the evidence-gathering phase visible without exposing it (#172).
-
-        Counts and statuses only: the goals a role asked for and the output a
-        tool returned are exactly the strings that can carry credentials or
-        repository detail, and they already have their place - the bounded,
-        redacted prompt - without also being copied into the log pipeline.
+        """Make the evidence-gathering phase visible without exposing it (#172):
+        counts and statuses only - goals asked for and tool output can carry
+        credentials or repository detail and are never copied into the log pipeline.
         """
         fields = _context_fields(
             subject_type=str(kwargs.get("subject_type") or "") or None,

@@ -5,9 +5,11 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
-# ---------------------------------------------------------------------------
 # Status constants — small deterministic state machine.
-# ---------------------------------------------------------------------------
+
+# Start of the error of a run the pipeline itself crashed in. Nexus reads it to
+# tell such a run from a judged attempt (#467).
+PIPELINE_CRASH_ERROR_PREFIX = "unhandled exception in experiment pipeline: "
 
 STATUS_QUEUED = "queued"
 STATUS_SELECTING = "selecting"
@@ -21,19 +23,6 @@ STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_CANCELLED = "cancelled"
 STATUS_INTERRUPTED = "interrupted"
 
-EXPERIMENT_STATUSES = (
-    STATUS_QUEUED,
-    STATUS_SELECTING,
-    STATUS_REJECTED,
-    STATUS_IMPLEMENTING,
-    STATUS_VERIFYING,
-    STATUS_SUCCEEDED,
-    STATUS_FAILED,
-    STATUS_TIMED_OUT,
-    STATUS_NEEDS_REVIEW,
-    STATUS_CANCELLED,
-    STATUS_INTERRUPTED,
-)
 
 _TERMINAL_STATUSES = (
     STATUS_REJECTED,
@@ -45,11 +34,9 @@ _TERMINAL_STATUSES = (
     STATUS_INTERRUPTED,
 )
 
-# Valid forward state transitions. ``run_experiment`` walks this graph and
-# refuses to run twice: only queued -> implementing is a valid entry point
-# for new experiments. queued -> selecting is retained for backward
-# compatibility with any stored experiments that began under the old
-# multi-phase pipeline (research → selection → implementation).
+# Valid forward transitions; run_experiment walks this graph and refuses to run
+# twice (only queued -> implementing is a valid entry point; queued -> selecting
+# is kept for stored experiments from the old multi-phase pipeline).
 _STATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
     STATUS_QUEUED: (STATUS_IMPLEMENTING, STATUS_REJECTED, STATUS_FAILED, STATUS_SELECTING),
     STATUS_SELECTING: (STATUS_REJECTED, STATUS_IMPLEMENTING, STATUS_FAILED, STATUS_TIMED_OUT),
@@ -59,6 +46,17 @@ _STATE_TRANSITIONS: dict[str, tuple[str, ...]] = {
 
 class ExperimentNotFoundError(LookupError):
     """Raised when an experiment id does not exist in the store."""
+
+
+class ExperimentAlreadyActiveError(RuntimeError):
+    """Raised when an issue already has a non-terminal experiment."""
+
+    def __init__(self, experiment_id: str, status: str) -> None:
+        self.experiment_id = experiment_id
+        self.status = status
+        super().__init__(
+            f"experiment {experiment_id!r} is already active (status={status!r})"
+        )
 
 
 class ExperimentNotRunnableError(RuntimeError):
@@ -73,14 +71,10 @@ class ExperimentNotCancellableError(RuntimeError):
 class ExperimentPlan:
     """Structured feature plan as selected by the read-only selection phase.
 
-    ``change_kind``, ``required_artifacts``, and ``acceptance_criteria``
-    were added for the deterministic quality evaluation in
-    ``modules.experiment_evaluation`` (see ``validate_plan``/
-    ``evaluate_implementation``). They all default to safe,
-    backward-compatible values so plans parsed from an older raw model
-    response (before these keys existed) keep working unchanged —
-    ``change_kind`` defaults to ``"implementation"`` (the strictest of the
-    four kinds), and the two list fields default to empty.
+    ``change_kind``/``required_artifacts``/``acceptance_criteria`` serve the
+    deterministic quality evaluation (``experiment_evaluation``) and default to
+    safe values, so older stored plans keep working: ``change_kind`` defaults to
+    ``"implementation"``, the strictest kind; the lists default to empty.
     """
 
     title: str
@@ -119,8 +113,11 @@ class Experiment:
     selection_started_at: str | None = None
     selection_ended_at: str | None = None
     # Coding agent that ran the implementation (codex | claude); None for
-    # experiments from before the second agent existed.
+    # pre-second-agent experiments.
     implementation_provider: str | None = None
+    complexity: str | None = None
+    source_type: str | None = None
+    source_id: str | None = None
     implementation_started_at: str | None = None
     implementation_ended_at: str | None = None
     ended_at: str | None = None
@@ -129,6 +126,7 @@ class Experiment:
     plan: dict[str, Any] | None = None
     worktree_path: str | None = None
     branch_name: str | None = None
+    base_commit_sha: str | None = None
     research_task_id: str | None = None
     research_started_at: str | None = None
     research_ended_at: str | None = None
@@ -163,6 +161,7 @@ class Experiment:
     error: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
+    baseline_test_classifications: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,6 +172,9 @@ class Experiment:
             "selection_started_at": self.selection_started_at,
             "selection_ended_at": self.selection_ended_at,
             "implementation_provider": self.implementation_provider,
+            "complexity": self.complexity,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
             "implementation_started_at": self.implementation_started_at,
             "implementation_ended_at": self.implementation_ended_at,
             "ended_at": self.ended_at,
@@ -181,6 +183,7 @@ class Experiment:
             "plan": self.plan,
             "worktree_path": self.worktree_path,
             "branch_name": self.branch_name,
+            "base_commit_sha": self.base_commit_sha,
             "research_task_id": self.research_task_id,
             "research_started_at": self.research_started_at,
             "research_ended_at": self.research_ended_at,
@@ -215,6 +218,7 @@ class Experiment:
             "error": self.error,
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
+            "baseline_test_classifications": self.baseline_test_classifications,
         }
 
 
@@ -234,6 +238,9 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
             if "implementation_provider" in row.keys()
             else None
         ),
+        complexity=row["complexity"] if "complexity" in row.keys() else None,
+        source_type=row["source_type"] if "source_type" in row.keys() else None,
+        source_id=row["source_id"] if "source_id" in row.keys() else None,
         implementation_started_at=row["implementation_started_at"],
         implementation_ended_at=row["implementation_ended_at"],
         ended_at=row["ended_at"],
@@ -242,6 +249,7 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         plan=_json_or_none(row["plan_json"]),
         worktree_path=row["worktree_path"],
         branch_name=row["branch_name"],
+        base_commit_sha=row["base_commit_sha"] if "base_commit_sha" in row.keys() else None,
         research_task_id=row["research_task_id"],
         research_started_at=row["research_started_at"],
         research_ended_at=row["research_ended_at"],
@@ -278,7 +286,10 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         quality_evaluation=(
             _json_or_none(row["quality_evaluation_json"]) if "quality_evaluation_json" in row.keys() else None
         ),
+        baseline_test_classifications=(
+            _json_or_none(row["baseline_test_classifications_json"])
+            if "baseline_test_classifications_json" in row.keys() else None
+        ),
     )
 
 
-# ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from modules import mailbox
 from modules.mailbox import development as mailbox_development
-from modules.mailbox.development import development_mode_enabled, install, process_command
+from modules.mailbox.development import install, process_command
 from modules.run_store import init_db
 
 
@@ -89,11 +89,6 @@ class TestMailboxDevelopment(unittest.TestCase):
         self.assertIn("command", mailbox.SUPPORTED_TYPES)
         self.assertIs(mailbox._PROCESSORS["command"], process_command)
 
-    def test_development_mode_is_opt_in(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(development_mode_enabled())
-        with patch.dict(os.environ, {"NEXUS_DEVELOPMENT_MODE": "1"}, clear=True):
-            self.assertTrue(development_mode_enabled())
 
     def test_command_executes_without_development_mode(self):
         msg = SimpleNamespace(body="printf hello", meta={})
@@ -377,3 +372,20 @@ class TestMailboxDevelopment(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommandSenderTrustTests(unittest.TestCase):
+    """The poll passes ``sender_trusted`` to every processor (#506)."""
+
+    def test_trusted_sender_keyword_is_accepted(self):
+        msg = SimpleNamespace(body="printf hello", meta={})
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = process_command(msg, Path(tmp), None, 0, sender_trusted=True)
+        self.assertIn("hello", body)
+
+    def test_untrusted_sender_never_runs_a_shell(self):
+        msg = SimpleNamespace(body="printf ran > ran.txt", meta={})
+        with tempfile.TemporaryDirectory() as tmp:
+            body, _ = process_command(msg, Path(tmp), None, 0, sender_trusted=False)
+            self.assertFalse((Path(tmp) / "ran.txt").exists())
+        self.assertIn("not a trusted", body)

@@ -6,9 +6,7 @@ import time
 from modules.central_logging import ExperimentLogger
 
 
-# ---------------------------------------------------------------------------
 # Git helpers (fixed argv lists only, never shell=True)
-# ---------------------------------------------------------------------------
 
 
 def _run_git(

@@ -1,24 +1,16 @@
 """Non-destructive refresh of the live Nexus checkout.
 
-Refresh used to be a shell sequence that gave up the moment ``/agent`` was
-dirty, which left the VM running nine-commit-old code because of a single
-generated outbox file.  This module drives the same deployment step as a
-sequence that first *makes* the checkout deployable:
+1. inspect branch, changes and ahead/behind state;
+2. hand a dirty checkout to :class:`~modules.checkout_rescue.CheckoutRescue`
+   (work onto a rescue branch, runtime artifacts archived) - or abort untouched;
+3. switch to the deployment branch and verify it is clean;
+4. fetch and fast-forward only - never a merge, reset or force;
+5. verify the checkout is at ``origin/<branch>``;
+6. restart services only after that;
+7. report what was rescued, archived and moved, and how the services came back.
 
-1. inspect branch, staged/tracked/untracked changes and ahead/behind state;
-2. hand a dirty checkout to :class:`~modules.checkout_rescue.CheckoutRescue`,
-   which commits work onto a rescue branch and archives runtime artifacts
-   outside the repository - and aborts the refresh, untouched, if it cannot;
-3. switch to the deployment branch and verify the worktree is clean;
-4. fetch and fast-forward only - never a merge, a reset or a force;
-5. verify the checkout really is at ``origin/<branch>``;
-6. restart services only after that verification passes;
-7. report what was rescued, what was archived, which commits moved, and how
-   the services came back.
-
-The module is also the CLI the deployment scripts call
-(``python -m modules.nexus_refresh --repo-root /agent``); it prints a human
-summary and, with ``--json``, the machine-readable result.
+Also the CLI the deployment scripts call
+(``python -m modules.nexus_refresh --repo-root /agent [--json]``).
 """
 
 from __future__ import annotations
@@ -143,10 +135,10 @@ def systemd_restarter(
     use_sudo: bool = True,
     current_unit: str | None = _UNSET,
 ) -> Callable[[], dict[str, str]]:
-    """Restarter that asks systemd to restart *services*, one report per unit.
+    """Restart *services* through systemd, one report per unit.
 
-    Restarting our own unit is handed to a transient unit, so the outcome is
-    unknown to us and is reported as scheduled rather than as done.
+    Our own unit is restarted by a transient unit; if that cannot be scheduled,
+    a best-effort ``systemctl --no-block`` is tried and reported as uncertain.
     """
     unit = get_current_systemd_unit() if current_unit is _UNSET else current_unit
 
@@ -156,10 +148,8 @@ def systemd_restarter(
             replacing_self = unit is not None and service == unit
             prefix = ["sudo"] if use_sudo else []
             if replacing_self:
-                # Stopping a unit kills its whole control group, and a
-                # plain `systemctl` would be a child inside that group -
-                # killed mid-restart, reported as `exit -15` for a restart
-                # that worked. A transient unit is systemd's, not ours.
+                # Stopping a unit kills its whole cgroup, including a plain
+                # systemctl child; a transient unit belongs to systemd instead.
                 command = prefix + [
                     "systemd-run",
                     "--collect",
@@ -179,24 +169,65 @@ def systemd_restarter(
                     timeout=_SERVICE_TIMEOUT,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                results[service] = f"error: {redact_secrets(str(exc))[:200]}"
-                continue
-            if completed.returncode == 0:
+                completed = None
+                primary_error = redact_secrets(
+                    str(exc) or exc.__class__.__name__
+                ).strip()[:200]
+            else:
+                primary_error = ""
+            if completed is not None and completed.returncode == 0:
                 results[service] = (
                     "restart scheduled (this process is being replaced)"
                     if replacing_self
                     else "restarted"
                 )
+                continue
+
+            if replacing_self:
+                # Without systemd-run, a --no-block restart is racy but usually
+                # works: success and SIGTERM both mean "attempted, now verify".
+                fallback = prefix + ["systemctl", "restart", "--no-block", service]
+                try:
+                    attempted = subprocess.run(
+                        fallback,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=_SERVICE_TIMEOUT,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    fallback_error = redact_secrets(
+                        str(exc) or exc.__class__.__name__
+                    ).strip()[:200]
+                else:
+                    if attempted.returncode == 0:
+                        results[service] = "restart scheduled via fallback; outcome unknown"
+                        continue
+                    if attempted.returncode == -15:
+                        results[service] = "restart attempted via fallback; replaced mid-call, outcome unknown"
+                        continue
+                    fallback_error = _restart_failure_detail(attempted)
+
+                first = primary_error or _restart_failure_detail(completed)
+                results[service] = (
+                    "error: not restarted; transient restart failed: "
+                    f"{first}; fallback failed: {fallback_error}"
+                )
             else:
                 # systemctl can fail with both streams empty, so the exit
                 # code is the only thing always worth reporting.
-                detail = redact_secrets(completed.stderr or completed.stdout).strip()[:200]
-                if not detail:
-                    detail = "no output; run it by hand to see why"
-                results[service] = f"error: exit {completed.returncode}: {detail}"
+                results[service] = f"error: {primary_error or _restart_failure_detail(completed)}"
         return results
 
     return restart
+
+
+def _restart_failure_detail(completed: subprocess.CompletedProcess[str]) -> str:
+    """Return an actionable, bounded description of a failed restart call."""
+    detail = redact_secrets(completed.stderr or completed.stdout).strip()[:200]
+    if not detail:
+        detail = "no output; run it by hand to see why"
+    return f"exit {completed.returncode}: {detail}"
 
 
 class NexusRefresh:

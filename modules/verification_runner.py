@@ -1,34 +1,12 @@
 """The verification test subprocess runner.
 
-``run_verification_test_monitored`` streams the test process's output, records
-every test start and result to a dedicated per-test log, maintains a test
-heartbeat, and runs a watchdog that decides on *progress* rather than on total
-runtime (#209). It replaced a fixed-timeout runner outright rather than
-sitting beside one: two runners would have meant two answers to "did this run
-fail?", and the wall-clock one was the wrong answer.
-
-Why the fixed timeout had to go
--------------------------------
-A wall-clock limit cannot tell these apart:
-
-* a healthy but slow suite,
-* one stuck test,
-* a dead test process,
-* a run that is still actively progressing.
-
-On 2026-09-16 experiment ``df97d67bc08e45b4bc5c573db0c84d85`` fell back to
-local verification and was reported ``timed_out`` with no exit code, which
-says nothing about which of the four actually happened. The watchdog here
-answers that question directly: a run continues for as long as tests keep
-starting and finishing, and is aborted when progress stops - with diagnostics
-naming the test it stopped on.
-
-The absolute cap remains, but only as a final guard against a permanently
-orphaned process. It is deliberately large (90 minutes by default) so that it
-is never the mechanism that decides whether a healthy run is failing.
-
-GitHub CI verification is untouched by all of this: it does not run a local
-subprocess at all.
+``run_verification_test_monitored`` streams the test output, records every
+test start and result to a per-test log, keeps a test heartbeat, and runs a
+watchdog that decides on progress instead of total runtime (#209): a run goes
+on while tests keep starting and finishing, and is aborted when progress
+stops, naming the test it stopped on. A large absolute cap (90 minutes by
+default) only guards against an orphaned process. GitHub CI verification does
+not use this.
 """
 
 from __future__ import annotations
@@ -46,9 +24,11 @@ from typing import Any, Callable, Mapping, Sequence
 from modules.test_progress import (
     EVENT_END,
     EVENT_START,
+    FAILING_RESULTS,
     ProgressTracker,
     UnittestStreamParser,
     format_stall_diagnostics,
+    parse_failed_test_ids,
     parse_total_tests,
 )
 from modules.test_run_log import VerificationTestLog, prune_test_logs
@@ -56,10 +36,8 @@ from modules.verification_env import build_verification_test_env
 
 logger = logging.getLogger("nexus.verification_runner")
 
-# How long the whole suite may go without a single test starting or finishing
-# before it counts as stalled. Sized against the slowest *single* test plus a
-# wide margin, not against the suite: this is "nothing happened at all", which
-# a healthy run never produces.
+# How long the suite may go without any test starting or finishing before it
+# counts as stalled; sized against the slowest single test, not the suite.
 DEFAULT_STALL_TIMEOUT_SECONDS = 900  # 15 minutes
 # Floor for the configured stall timeout: below a few minutes a genuinely slow
 # single test would be killed as a stall, which is the failure mode this whole
@@ -100,10 +78,8 @@ def _coerce_number(value: object) -> float | None:
 class WatchdogConfig:
     """Progress rules for one monitored verification run.
 
-    Constructed directly (tests use sub-second intervals) or through
-    :meth:`resolve`, which falls back to the environment and clamps what it
-    finds there to a floor - an operator's configuration must not be able to
-    reintroduce a short fixed timeout by another name.
+    Built directly (tests use sub-second intervals) or via :meth:`resolve`,
+    which clamps environment values to a floor.
     """
 
     stall_timeout_seconds: float = DEFAULT_STALL_TIMEOUT_SECONDS
@@ -121,16 +97,10 @@ class WatchdogConfig:
     ) -> "WatchdogConfig":
         """Build a config from explicit values, the environment, or defaults.
 
-        The floors apply to what comes out of the *environment*, because that
-        is where a typo turns into "declare healthy runs dead": an operator
-        who sets ``NEXUS_TEST_STALL_SECONDS=5`` must not thereby restore the
-        short fixed timeout #209 removed. An explicit argument is code, and is
-        trusted as written - which is what lets a test drive the watchdog in
-        seconds instead of minutes.
-
-        One invariant holds either way: the safety cap always stays above the
-        stall timeout, so the cap can never become the mechanism that ends a
-        run first.
+        Floors apply to environment values only, so a typo like
+        ``NEXUS_TEST_STALL_SECONDS=5`` cannot bring back a short fixed timeout;
+        explicit arguments are trusted (tests). The safety cap always stays
+        above the stall timeout.
         """
         source: Mapping[str, str] = os.environ if env is None else env
         stall = _resolve_seconds(
@@ -198,6 +168,14 @@ class VerificationRunResult:
     test_log_path: str | None = None
     #: Total tests reported by the suite itself, when it got that far.
     tests_total: int | None = None
+    #: Canonical unittest IDs which failed, errored, or were running at a stall.
+    failed_test_ids: list[str] | None = None
+    #: The test the watchdog found running when it aborted the run, if any.
+    aborted_test_id: str | None = None
+    #: Canonical unittest IDs the runner saw start. Baseline rechecks use them
+    #: so that loader errors, bad selectors or zero-test runs never exculpate
+    #: an experiment.
+    observed_test_ids: list[str] | None = None
 
     @property
     def output(self) -> str:
@@ -218,12 +196,9 @@ def run_verification_test_monitored(
 ) -> VerificationRunResult:
     """Run the verification tests under a progress-aware watchdog.
 
-    *on_heartbeat* is invoked once per watchdog tick with the current test
-    heartbeat. That is how the global Nexus heartbeat learns that verification
-    is alive and progressing: the caller writes one summary entry per tick to
-    its own experiment log, while the per-test detail stays in the dedicated
-    test log. A failing callback is logged and never propagates - the callers'
-    loggers are instrumentation, not part of the test run.
+    *on_heartbeat* is called once per watchdog tick with the test heartbeat,
+    so the caller can log a summary that keeps the global Nexus heartbeat
+    alive. A failing callback is logged and never propagates.
     """
     config = config or WatchdogConfig.resolve()
     started = time.perf_counter()
@@ -233,6 +208,8 @@ def run_verification_test_monitored(
 
     parser = UnittestStreamParser()
     tracker = ProgressTracker(expected_total=expected_total)
+    failed_test_ids: set[str] = set()
+    observed_test_ids: set[str] = set()
     stdout_chunks: list[str] = []
 
     env = build_verification_test_env()
@@ -275,6 +252,10 @@ def run_verification_test_monitored(
             tracker.note_activity()
             for event in events:
                 tracker.record(event)
+                if event.kind == EVENT_START:
+                    observed_test_ids.add(event.test_id)
+                if event.kind == EVENT_END and event.result in FAILING_RESULTS:
+                    failed_test_ids.add(event.test_id)
                 _log_test_event(test_log, event)
 
     def _drain_stdout() -> None:
@@ -334,6 +315,11 @@ def run_verification_test_monitored(
     tracker.set_total_tests(total_tests)
 
     exit_code = process.returncode
+    # The closing report is authoritative once the suite got that far; the live
+    # events only have to stand in for a run that was aborted before it.
+    reported_failures = parse_failed_test_ids(stderr_text)
+    if total_tests is not None and (reported_failures or exit_code == 0):
+        failed_test_ids = reported_failures
     if on_process is not None:
         on_process(None)
     # A negative return code means a signal, not a verdict: the suite never
@@ -345,6 +331,7 @@ def run_verification_test_monitored(
     test_log.write_heartbeat(final_snapshot)
 
     diagnostics: str | None = None
+    aborted_test_id: str | None = None
     if process_died:
         diagnostics = format_stall_diagnostics(
             final_snapshot,
@@ -360,6 +347,10 @@ def run_verification_test_monitored(
         diagnostics = format_stall_diagnostics(stall_snapshot or final_snapshot, title=title)
         stderr_text += f"\n[{diagnostics}]\n"
         test_log.log_run_event(abort_reason, diagnostics, **(stall_snapshot or final_snapshot))
+        current_test = (stall_snapshot or final_snapshot).get("current_test")
+        if current_test:
+            aborted_test_id = str(current_test)
+            failed_test_ids.add(aborted_test_id)
     else:
         test_log.log_run_event(
             "test_run_finished",
@@ -381,6 +372,9 @@ def run_verification_test_monitored(
         progress=final_snapshot,
         test_log_path=str(test_log.path),
         tests_total=total_tests,
+        failed_test_ids=sorted(failed_test_ids),
+        aborted_test_id=aborted_test_id,
+        observed_test_ids=sorted(observed_test_ids),
     )
 
 
@@ -392,9 +386,8 @@ def run_verification_test_monitored(
 def _iter_chunks(stream: Any):
     """Yield decoded chunks as soon as the pipe has any bytes.
 
-    ``os.read`` rather than ``readline``: unittest writes a test's description
-    and ``" ... "`` without a newline at start, and that unterminated fragment
-    is precisely what names the *currently running* test.
+    ``os.read``, not ``readline``: unittest writes the running test's name
+    without a newline at start.
     """
     if stream is None:
         return
@@ -410,12 +403,7 @@ def _iter_chunks(stream: Any):
 
 
 def _process_state(process: subprocess.Popen) -> dict[str, Any]:
-    """PID, liveness and - where the platform offers it - CPU/memory.
-
-    CPU and memory are what distinguish a busy process from a deadlocked one,
-    so they are worth reading; they come from ``/proc`` directly rather than
-    from a new dependency, and their absence is never an error.
-    """
+    """PID, liveness and, where available, CPU/memory from ``/proc`` (absence is no error)."""
     alive = process.poll() is None
     state: dict[str, Any] = {"pid": process.pid, "process_alive": alive}
     if not alive:
