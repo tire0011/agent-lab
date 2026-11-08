@@ -1,39 +1,11 @@
 """Per-test progress tracking for verification test runs (#209).
 
-A fixed wall-clock timeout cannot tell a healthy-but-slow suite from a single
-stuck test or a dead process: all three look identical from outside, which is
-why experiment ``df97d67bc08e45b4bc5c573db0c84d85`` was reported as
-``timed_out`` with no exit code while the suite may well have still been
-making progress. This module supplies the missing signal - *what the test
-process is actually doing right now* - so the watchdog in
-:mod:`modules.verification_runner` can decide on progress instead of on total
-runtime.
-
-Two pieces, both pure (no I/O, no threads of their own beyond a lock):
-
-:class:`UnittestStreamParser`
-    An incremental parser for ``python -m unittest ... -v`` output. It is fed
-    raw chunks as they arrive and emits :class:`ProgressEvent` objects for every
-    test start and completion.
-
-:class:`ProgressTracker`
-    Thread-safe accumulation of those events into the *test heartbeat*: the
-    current test, counts, and when progress was last observed.
-
-Why the parser reads chunks rather than lines
----------------------------------------------
-``unittest``'s verbose stream writes a test's description and the separator
-``" ... "`` at *start* (flushed, deliberately without a newline) and the
-result token plus the newline at *end*. Reading whole lines would therefore
-only ever see a test that has already finished, which is exactly the test a
-stall diagnostic does not care about. Reading chunks lets the currently
-*running* test be named while it runs.
-
-Parsing text is best effort by nature: a test that writes to stderr itself
-interleaves with the runner's stream. The design makes that survivable rather
-than pretending it cannot happen - an unrecognized line is treated as plain
-activity and the current test stays current, so mis-parsing can never invent
-a completion or lose the run.
+:class:`UnittestStreamParser` parses ``python -m unittest -v`` output chunk by
+chunk into :class:`ProgressEvent` objects (chunks, not lines: unittest names a
+test at start without a newline, which is how the running test is known).
+:class:`ProgressTracker` turns them into the thread-safe test heartbeat.
+Parsing is best effort: an unrecognized line is plain activity and can never
+invent a completion.
 """
 
 from __future__ import annotations
@@ -126,12 +98,7 @@ def parse_total_tests(output: str | None) -> int | None:
 
 
 def parse_failed_test_ids(output: str | None) -> set[str]:
-    """Canonical IDs from unittest's closing failure report.
-
-    Stricter than the live stream in both directions: subtest failures appear
-    only here, and a passing test that logs a line starting with ``ERROR``
-    appears only there.
-    """
+    """Canonical IDs from unittest's closing failure report (the only place subtest failures appear)."""
     failed: set[str] = set()
     for match in _FAILURE_HEADER_RE.finditer(output or ""):
         method, target = match.group("method"), match.group("target")
@@ -166,12 +133,8 @@ class ProgressEvent:
 class UnittestStreamParser:
     """Incremental parser for a verbose ``unittest`` output stream.
 
-    Besides the events, the parser rebuilds a *filtered* copy of the stream
-    with the per-test ``"<description> ... ok"`` lines removed. That keeps the
-    output the verification pipeline persists (and truncates head-first, and
-    tails for the failure summary) the same size it was under ``-q``, so
-    switching the command to ``-v`` buys progress visibility without pushing
-    the failure summary past the output cap. Lines for failing tests are kept.
+    It also rebuilds the stream without the per-test ``... ok`` lines, so the
+    persisted output is as small as under ``-q``; failing tests' lines stay.
     """
 
     def __init__(self) -> None:
@@ -276,12 +239,10 @@ class UnittestStreamParser:
 
 
 def _split_description(text: str) -> tuple[str, str]:
-    """Split text preceding a start marker into (earlier output, description).
+    """Split text before a start marker into (earlier output, description).
 
-    ``TextTestResult.getDescription`` returns ``str(test)`` alone, or
-    ``str(test)`` and the docstring's first line joined by a newline, so the
-    description is the last line - plus the line before it when that line is
-    itself a well-formed ``str(test)``.
+    The description is the last line, plus the line before when that line is
+    itself a well-formed ``str(test)`` (docstring descriptions).
     """
     lines = text.split("\n")
     take = 1
@@ -297,11 +258,8 @@ def _split_description(text: str) -> tuple[str, str]:
 class ProgressTracker:
     """The test heartbeat: what is running, how far along, and since when.
 
-    Progress is judged on *test* events (a start or a completion) whenever any
-    have been seen, and only falls back to raw output activity before the
-    first one - so a process that keeps printing while wedged between tests is
-    still recognized as stalled, while a run whose output this parser cannot
-    read at all is not declared dead for that reason alone.
+    Progress is judged on test events once any have been seen, so a process
+    printing while wedged between tests still counts as stalled.
     """
 
     def __init__(self, *, expected_total: int | None = None) -> None:

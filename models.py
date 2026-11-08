@@ -72,14 +72,9 @@ class ChatJobResponse(BaseModel):
     error: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Codex task models
-#
-# ``working_dir`` and ``sandbox`` are never accepted from the client: they
-# are fixed server-side (see api.py) to keep Codex task execution read-only
-# and confined to the repository root. ``timeout_seconds`` may only be
-# lowered by the client; the upper bound is enforced by ``le=`` below.
-# ---------------------------------------------------------------------------
+# Codex task models. ``working_dir`` and ``sandbox`` are never accepted from
+# the client (fixed server-side: read-only, repository root);
+# ``timeout_seconds`` can only be lowered, bounded by ``le=``.
 
 
 class CodexTaskCreateRequest(BaseModel):
@@ -414,14 +409,9 @@ class PublicExperimentSummary(BaseModel):
     usage: PublicExperimentUsage | None = None
 
 
-# ---------------------------------------------------------------------------
-# Public diagnostics model (GET /diagnostics/public)
-#
-# Every field here is drawn from an explicit allowlist assembled in api.py;
-# nothing is derived from a generic ``to_dict()``/``model_dump()`` call, so
-# adding a new internal field to ``Experiment`` or ``MailboxTaskApproval``
-# can never silently widen this public response.
-# ---------------------------------------------------------------------------
+# Public diagnostics (GET /diagnostics/public): every field comes from an
+# explicit allowlist, never a generic ``to_dict()``/``model_dump()``, so a new
+# internal field can never widen this public response.
 
 
 class DiagnosticLifecyclePhase(BaseModel):
@@ -478,15 +468,9 @@ class PublicDiagnosticsResponse(BaseModel):
     problems: list[Problem] = Field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Mailbox inbox/outbox listing (public, sanitized).
-#
-# Every field is drawn from an explicit allowlist assembled in api.py.
-# ``preview`` is always short and redacted; full prompts, task bodies,
-# absolute file paths, and unfiltered file/command output are never
-# included here (see the "Aufträge"/task-approval and "Logs" endpoints for
-# authenticated, more detailed views).
-# ---------------------------------------------------------------------------
+# Mailbox inbox/outbox listing (public, sanitized): explicit allowlist only;
+# ``preview`` is short and redacted, and full prompts, task bodies, absolute
+# paths and raw output are never included.
 
 
 class MailboxMessageEntry(BaseModel):
@@ -544,13 +528,9 @@ class ExperimentLogsResponse(BaseModel):
 
 
 class UnifiedLogsResponse(BaseModel):
-    """One chronological Nexus log timeline: structured JSONL entries
-    (experiments, mailbox tasks, chat jobs, system) merged with the
-    ``agent-api``/``nexus-mailbox``/``llama-server`` systemd journals.
-
-    Backs the Logs tab's default view; entries use the same explicit
-    allowlist as ``ExperimentLogsResponse``, plus ``source``.
-    """
+    """One chronological timeline: structured JSONL entries merged with the
+    agent-api/nexus-mailbox/llama-server journals, using the same allowlist as
+    ``ExperimentLogsResponse`` plus ``source``."""
 
     count: int
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
@@ -565,11 +545,8 @@ class UnifiedLogsResponse(BaseModel):
 class LogTraceResponse(BaseModel):
     """Everything Nexus did for one order, reconstructed from its logs.
 
-    ``reference`` echoes what was asked for; ``correlation_ids`` reports
-    which experiment/mailbox-task/session/job ids that reference turned
-    out to span, so an operator can see *why* these entries belong
-    together. ``summary`` is derived from ``entries`` alone, so it can
-    never contradict the timeline beneath it.
+    ``correlation_ids`` shows which ids the reference spans; ``summary`` is
+    derived from ``entries`` alone, so it cannot contradict them.
     """
 
     reference: str
@@ -741,13 +718,7 @@ class NexusSessionClaim(BaseModel):
 
 
 class NexusLivenessResponse(BaseModel):
-    """Heartbeat/liveness state, so "is this still running?" is answerable.
-
-    ``unclaimed_working_sessions`` counts rows in a working status that carry
-    no heartbeat at all - pre-heartbeat rows, or a caller that never claimed
-    its work. They are reported rather than hidden: that gap is precisely what
-    heartbeats exist to close.
-    """
+    """Heartbeat/liveness state; ``unclaimed_working_sessions`` counts working rows with no heartbeat."""
 
     generated_at: str
     stale_after_seconds: int
@@ -761,12 +732,10 @@ class NexusLivenessResponse(BaseModel):
 
 
 class DiagnosticProgress(BaseModel):
-    """Is this work still running, was it interrupted, or did it finish? (#188)
+    """Running, interrupted or finished? (#188)
 
-    ``source`` names the signal ``last_progress_at`` came from - a controller
-    heartbeat, a structured log entry, or the row's own ``updated_at`` - so a
-    caller can tell an explicit "I am alive" from a merely witnessed side
-    effect. See ``modules.nexus_diagnostics``.
+    ``source`` names where ``last_progress_at`` came from: a controller
+    heartbeat, a log entry, or the row's ``updated_at``.
     """
 
     state: str
@@ -779,12 +748,7 @@ class DiagnosticProgress(BaseModel):
 
 
 class DiagnosticLifecycle(BaseModel):
-    """One unit of work's lifecycle state, joined across every subsystem.
-
-    Deliberately flat and stably named: a caller answering "where did this
-    stop?" should never need to know which of the mailbox, experiment,
-    adoption, GitHub-link or controller-session tables an answer came out of.
-    """
+    """One unit of work's lifecycle state, flat and stably named across subsystems."""
 
     subject_type: str
     subject_id: str
@@ -832,12 +796,7 @@ class DiagnosticReportResponse(BaseModel):
 
 
 class DiagnosticServiceLogsResponse(BaseModel):
-    """``nexus logs service <name>``: a bounded journal slice.
-
-    ``error`` is populated rather than raised when the journal cannot be read
-    (no systemd, unknown unit, a timeout): an unreadable journal is itself a
-    finding, and which unit was consulted over what window still stands.
-    """
+    """``nexus logs service <name>``: a bounded journal slice; read errors go into ``error``."""
 
     generated_at: str
     service: str

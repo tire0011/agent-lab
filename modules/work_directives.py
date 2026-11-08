@@ -1,20 +1,10 @@
-"""Explicit work-tracking constraints parsed out of a Nexus task instruction.
+"""Explicit work-tracking constraints parsed from a Nexus task instruction (#184).
 
-Issue #184: a mailbox task said "implement GitHub issue #180 ... do not
-create another branch or issue". Nexus ignored both constraints and opened a
-duplicate tracking Issue (#181), so one piece of work had two GitHub records
-and the governance instruction was silently violated.
-
-This module turns that free-form instruction into a small, inspectable value
-object. It never talks to GitHub: deciding *whether* a named Issue is usable
-belongs to ``modules.github_work_tracking``; deciding *what the author asked
-for* belongs here.
-
-Detection is deliberately conservative. A passing mention ("see issue #12 for
-background") must not hijack the lifecycle, so an Issue only becomes the work
-target when a directive verb points at it ("implement issue #180") - or when
-the task forbids a new Issue and names exactly one, which leaves no other
-reading.
+Turns "implement issue #180 ... do not create another branch or issue" into a
+small value object; whether the issue is usable is decided by
+``modules.github_work_tracking``. Detection is conservative: an issue becomes
+the target only when a directive verb points at it, or when the task forbids
+a new issue and names exactly one.
 """
 
 from __future__ import annotations
@@ -56,11 +46,10 @@ _KINDS = r"(?:github\s+|tracking\s+)*"
 
 
 def _no_new_patterns(noun: str) -> tuple[re.Pattern[str], ...]:
-    """Patterns for "do not create another <noun>" in its common phrasings.
+    """Patterns for "do not create another <noun>".
 
-    A "newness" word (new/another/...) or an immediately following noun is
-    required so that an unrelated instruction such as "do not create a PR
-    that closes the issue" is not read as a ban on tracking Issues.
+    A newness word or an immediately following noun is required, so "do not
+    create a PR that closes the issue" is not a ban on issues.
     """
     return (
         re.compile(

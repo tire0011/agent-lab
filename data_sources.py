@@ -1,23 +1,13 @@
 """Read-only adapters over existing data sources.
 
-No new persistent storage is introduced here. Problems and ideas are derived
-from files that already exist in the repository/runtime state:
+- Problems: failed/rejected experiments plus legacy error entries in
+  state/runs/*.json.
+- Ideas: entries under "## Ideas" in IDEAS.md, with an optional trailing
+  `` `state` `` marker (default "new").
 
-- Problems: failed/rejected experiments in the SQLite experiment store plus
-  legacy error entries logged by agent.py under state/runs/*.json.
-- Ideas: entries under "## Ideas" in IDEAS.md, each an open-ended thought
-  rather than a task; an optional trailing `` `state` `` marker (one of
-  new/exploring/selected/tested/adopted/rejected) is parsed if present and
-  defaults to "new" otherwise. Ideas are never a fixed roadmap or priority
-  list.
-
-``add_idea`` is the one write path in this module: it appends a new,
-sanitized, state-``new`` idea under a fixed "### Inbox" subsection at the
-end of "## Ideas", guarded by an exclusive file lock so concurrent
-appends cannot interleave and corrupt IDEAS.md.
-
-Both /problems and /ideas as well as the chat endpoint call these same
-functions, so structured endpoints and chat answers never diverge.
+``add_idea`` is the one write path: it appends a sanitized idea under
+"### Inbox", guarded by an exclusive file lock. The endpoints and the chat use
+these same functions, so their answers never diverge.
 """
 
 from __future__ import annotations
@@ -137,12 +127,7 @@ def list_problems(
     *,
     experiment_db_path: str | Path | None = None,
 ) -> list[Problem]:
-    """Return recent experiment and legacy run-log problems, newest first.
-
-    Read errors (missing directory, unreadable/corrupt files) are treated as
-    "no problems found" rather than raised, since this is a best-effort,
-    read-only view over operational logs.
-    """
+    """Recent experiment and legacy run-log problems, newest first; read errors mean none found."""
     if limit <= 0:
         return []
     since_timestamp = _parse_timestamp(
@@ -206,16 +191,10 @@ def list_problems(
 
 
 def list_ideas() -> list[Idea]:
-    """Return ideas parsed from the "## Ideas" section of IDEAS.md.
+    """Ideas from the "## Ideas" section of IDEAS.md.
 
-    Only list items inside the "## Ideas" section are returned (the
-    surrounding intro/states/unknowns sections are prose, not ideas).
-    "###" headings within that section become the ``section`` field. Each
-    item may end with a trailing `` `state` `` marker (one of new,
-    exploring, selected, tested, adopted, rejected); items without one
-    default to "new". Missing or unreadable file yields an empty list
-    rather than an error, matching the read-only, best-effort contract of
-    this adapter.
+    "###" headings become ``section``; a trailing `` `state` `` marker is
+    parsed (default "new"). A missing or unreadable file gives an empty list.
     """
     try:
         text = IDEAS_PATH.read_text(encoding="utf-8")
@@ -280,12 +259,9 @@ def _parse_ideas(text: str) -> list[Idea]:
 def _sanitize_idea_text(raw: str) -> str:
     """Validate and normalize idea text before it is written to IDEAS.md.
 
-    Collapses internal whitespace/newlines to single spaces (so an idea is
-    always exactly one Markdown list item, never a stray heading or a
-    multi-line block) and strips backticks (so a submitted idea can never
-    forge a trailing `` `state` `` marker or break the surrounding
-    Markdown code span). Raises ``InvalidIdeaTextError`` for empty,
-    whitespace-only, or too-long input.
+    Whitespace collapses to single spaces (one list item, never a heading) and
+    backticks are stripped (no forged state marker). Raises
+    ``InvalidIdeaTextError`` for empty or too-long input.
     """
     normalized = " ".join(raw.split())
     normalized = normalized.replace("`", "'")
@@ -305,17 +281,11 @@ def _sanitize_idea_text(raw: str) -> str:
 
 
 def add_idea(raw_text: str) -> Idea:
-    """Append a new idea (state ``new``) to the "## Ideas" / "### Inbox"
-    section of IDEAS.md and return it.
+    """Append a new idea (state ``new``) under "## Ideas" / "### Inbox" and return it.
 
-    Uses an exclusive advisory file lock (``fcntl.flock``) around the
-    read-modify-write so concurrent requests append one at a time instead
-    of racing and corrupting the file. Text is sanitized first so a
-    submitted idea can never inject a fake heading, state marker, or
-    multi-line content into the document. The returned ``Idea`` is parsed
-    from the content this call just wrote (still under the lock), never
-    from a fresh disk read, so a concurrent writer appending immediately
-    afterwards cannot make this call report the wrong idea.
+    The read-modify-write runs under an exclusive ``fcntl.flock``; the text is
+    sanitized first, so no heading, state marker or multi-line content can be
+    injected. The result is parsed from what this call wrote, under the lock.
     """
     text = _sanitize_idea_text(raw_text)
 
@@ -339,10 +309,8 @@ def add_idea(raw_text: str) -> Idea:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
     if not ideas or ideas[-1].text != text:
-        # Should be unreachable given the insert logic below always adds
-        # the new idea at the end of the "## Ideas" section (i.e. last in
-        # document order); guard defensively rather than silently
-        # returning a mismatched idea.
+        # Unreachable (the new idea is always last); guard rather than return a
+        # mismatched idea.
         raise RuntimeError("failed to append idea to IDEAS.md")
     return ideas[-1]
 

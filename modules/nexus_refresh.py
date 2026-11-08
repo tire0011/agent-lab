@@ -1,24 +1,16 @@
 """Non-destructive refresh of the live Nexus checkout.
 
-Refresh used to be a shell sequence that gave up the moment ``/agent`` was
-dirty, which left the VM running nine-commit-old code because of a single
-generated outbox file.  This module drives the same deployment step as a
-sequence that first *makes* the checkout deployable:
+1. inspect branch, changes and ahead/behind state;
+2. hand a dirty checkout to :class:`~modules.checkout_rescue.CheckoutRescue`
+   (work onto a rescue branch, runtime artifacts archived) - or abort untouched;
+3. switch to the deployment branch and verify it is clean;
+4. fetch and fast-forward only - never a merge, reset or force;
+5. verify the checkout is at ``origin/<branch>``;
+6. restart services only after that;
+7. report what was rescued, archived and moved, and how the services came back.
 
-1. inspect branch, staged/tracked/untracked changes and ahead/behind state;
-2. hand a dirty checkout to :class:`~modules.checkout_rescue.CheckoutRescue`,
-   which commits work onto a rescue branch and archives runtime artifacts
-   outside the repository - and aborts the refresh, untouched, if it cannot;
-3. switch to the deployment branch and verify the worktree is clean;
-4. fetch and fast-forward only - never a merge, a reset or a force;
-5. verify the checkout really is at ``origin/<branch>``;
-6. restart services only after that verification passes;
-7. report what was rescued, what was archived, which commits moved, and how
-   the services came back.
-
-The module is also the CLI the deployment scripts call
-(``python -m modules.nexus_refresh --repo-root /agent``); it prints a human
-summary and, with ``--json``, the machine-readable result.
+Also the CLI the deployment scripts call
+(``python -m modules.nexus_refresh --repo-root /agent [--json]``).
 """
 
 from __future__ import annotations
@@ -143,11 +135,10 @@ def systemd_restarter(
     use_sudo: bool = True,
     current_unit: str | None = _UNSET,
 ) -> Callable[[], dict[str, str]]:
-    """Restarter that asks systemd to restart *services*, one report per unit.
+    """Restart *services* through systemd, one report per unit.
 
-    Restarting our own unit is handed to a transient unit.  If that cannot be
-    scheduled, make a best-effort ``systemctl --no-block`` attempt from this
-    process and report its inherently uncertain outcome honestly.
+    Our own unit is restarted by a transient unit; if that cannot be scheduled,
+    a best-effort ``systemctl --no-block`` is tried and reported as uncertain.
     """
     unit = get_current_systemd_unit() if current_unit is _UNSET else current_unit
 
@@ -157,10 +148,8 @@ def systemd_restarter(
             replacing_self = unit is not None and service == unit
             prefix = ["sudo"] if use_sudo else []
             if replacing_self:
-                # Stopping a unit kills its whole control group, and a
-                # plain `systemctl` would be a child inside that group -
-                # killed mid-restart, reported as `exit -15` for a restart
-                # that worked. A transient unit is systemd's, not ours.
+                # Stopping a unit kills its whole cgroup, including a plain
+                # systemctl child; a transient unit belongs to systemd instead.
                 command = prefix + [
                     "systemd-run",
                     "--collect",
@@ -195,10 +184,8 @@ def systemd_restarter(
                 continue
 
             if replacing_self:
-                # A missing/denied/broken systemd-run must not turn a deploy
-                # into a no-op.  --no-block is racy when restarting our own
-                # cgroup, but it usually performs the restart; success and a
-                # SIGTERM exit therefore both mean "attempted, now verify".
+                # Without systemd-run, a --no-block restart is racy but usually
+                # works: success and SIGTERM both mean "attempted, now verify".
                 fallback = prefix + ["systemctl", "restart", "--no-block", service]
                 try:
                     attempted = subprocess.run(
