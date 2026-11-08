@@ -189,9 +189,14 @@ def get_mailbox_task_service() -> MailboxTaskService:
 
     Overridable in tests via ``app.dependency_overrides[get_mailbox_task_service]``.
     """
+    from modules.task_issue_planner import TaskIssuePlanner
+
+    config = MailboxConfig.from_env()
     return MailboxTaskService(
         experiment_service=_resolve_experiment_service(),
-        mailbox_config=MailboxConfig.from_env(),
+        mailbox_config=config,
+        # #294: an external planner writes the issue for free-form changes.
+        issue_planner=TaskIssuePlanner(working_dir=str(config.code_repo_path)),
     )
 
 
@@ -377,7 +382,12 @@ def _resume_blocked_capabilities_after_startup() -> None:
                 operations_registry=registry,
                 experiment_service=experiment_service,
             )
-            controller = NexusControllerService(orchestrator=orchestrator)
+            from modules.task_issue_planner import TaskIssuePlanner
+
+            controller = NexusControllerService(
+                orchestrator=orchestrator,
+                issue_planner=TaskIssuePlanner(working_dir=str(registry.repo_root)),
+            )
             initiative = NexusInitiativeService(
                 db_path=DEFAULT_DB_PATH,
                 experiment_service=experiment_service,

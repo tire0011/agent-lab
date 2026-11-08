@@ -163,6 +163,16 @@ Which agent ran a given piece of work is recorded: `provider` on
 `GET /codex/tasks/{id}` and `implementation_provider` on
 `GET /experiments/{id}`.
 
+Free-form tasks (#294): when a task such as "update ubuntu" changes something,
+one of these CLI agents is also used once as the `planner` role, in read-only
+mode, to write the GitHub issue (title, goal, current state, plan, acceptance
+criteria) that replaces the `Mailbox task <id>` placeholder. The same allow
+list and pin apply. If no agent is installed or none returns a usable issue,
+the placeholder issue is opened as before. `NEXUS_TASK_PLANNER=off` turns the
+planner off. Questions and read-only commands (`free -m`, `systemctl status`)
+open no issue; machine work that changes something gets an issue before the
+command runs and a result comment afterwards (closed when it succeeded).
+
 Both `agent-api.service` and `nexus-mailbox.service` already load this shared
 environment file. Missing configuration blocks only implementation/resume work;
 the API and read-only operations remain available and log an actionable startup

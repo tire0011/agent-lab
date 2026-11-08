@@ -275,11 +275,14 @@ def _build_service(args) -> NexusInitiativeService:
     controller = None
     if not args.integration_only:
         registry = OperationsRegistry(experiment_service=experiment_service)
+        from modules.task_issue_planner import TaskIssuePlanner
+
         controller = NexusControllerService(
             orchestrator=NexusTaskOrchestrator(
                 operations_registry=registry,
                 experiment_service=experiment_service,
-            )
+            ),
+            issue_planner=TaskIssuePlanner(working_dir=args.repo_root),
         )
     return NexusInitiativeService(
         db_path=args.db_path,

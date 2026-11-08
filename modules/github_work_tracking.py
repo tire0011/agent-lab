@@ -477,8 +477,15 @@ class GitHubWorkTrackingService:
             # stop and say so instead of silently creating a replacement.
             raise GitHubWorkTrackingError(self._unusable_reuse_message(directives))
         else:
-            issue_title = self._issue_title(title, content)
-            issue = self._find_exact_open_issue(issue_title) or self._create_issue(issue_title, content)
+            # #294: a free-form task may carry a planner that writes a proper
+            # issue. It runs only here, where a new issue would be opened, so
+            # a retried task or one that names its issue never plans again.
+            draft = self._planned_draft(source) if source_type == "task" else None
+            if draft is not None:
+                issue = self.open_planned_issue(draft)
+            else:
+                issue_title = self._issue_title(title, content)
+                issue = self._find_exact_open_issue(issue_title) or self._create_issue(issue_title, content)
 
         issue_number = int(issue["number"])
         issue_title = str(issue.get("title") or f"Issue {issue_number}")
@@ -1570,6 +1577,49 @@ class GitHubWorkTrackingService:
             {"title": title, "body": body[:30000] + footer, "labels": ["proposal"]},
         )
         return {"number": issue.get("number"), "url": issue.get("html_url"), "reused": False}
+
+    @staticmethod
+    def _planned_draft(source) -> Any:
+        """The source's planned issue (#294), or ``None`` for the placeholder."""
+        plan = getattr(source, "issue_draft", None)
+        if plan is None:
+            metadata = getattr(source, "metadata", None)
+            plan = metadata.get("issue_draft") if isinstance(metadata, dict) else None
+        if not callable(plan):
+            return None
+        try:
+            draft = plan()
+        except Exception as exc:  # noqa: BLE001 - planning never blocks the work
+            logger.warning("issue planner failed; using the placeholder issue: %s", exc)
+            return None
+        if draft is None or not str(getattr(draft, "title", "") or "").strip():
+            return None
+        return draft
+
+    def open_planned_issue(self, draft) -> dict[str, Any]:
+        """Open the issue an external planner wrote for a free-form task (#294).
+
+        An open issue with exactly the same title is reused instead of
+        opening a duplicate.
+        """
+        self.require_lifecycle_ready()
+        title = self._issue_title(str(draft.title), str(draft.body))
+        existing = self._find_exact_open_issue(title)
+        if existing:
+            return existing
+        return self._request(
+            "POST",
+            f"/repos/{self.repository}/issues",
+            {"title": title, "body": str(draft.body)[:60000]},
+        )
+
+    def close_issue(self, issue_number: int) -> None:
+        """Close a finished issue as completed (#294: machine work done)."""
+        self._request(
+            "PATCH",
+            f"/repos/{self.repository}/issues/{issue_number}",
+            {"state": "closed", "state_reason": "completed"},
+        )
 
     def _create_issue(self, title: str, content: str) -> dict[str, Any]:
         body = (
