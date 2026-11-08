@@ -221,7 +221,8 @@ class ExecutionMixin:
                 "result": result[:4000],
                 "message": (
                     "No known runtime mapping exists for this executable. Use python_run for Python, "
-                    "select another capability, or choose missing_capability. Do not repeat this command "
+                    "install its Ubuntu package with the install_tool operation, select another capability, "
+                    "or choose missing_capability. Do not repeat this command "
                     "and do not repeat memory searches for it."
                 ),
             }
