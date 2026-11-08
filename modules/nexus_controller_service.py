@@ -14,6 +14,13 @@ from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrac
 from modules.mailbox.development import process_command
 from modules.nexus_sources import NexusSource, idea_source, issue_source, task_source
 from modules.run_store import DEFAULT_DB_PATH
+from modules.task_issue_planner import (
+    WORK_CODE,
+    LazyIssueDraft,
+    open_machine_issue,
+    planned_goal,
+    report_machine_result,
+)
 from modules.task_orchestrator import (
     ACTION_COMMAND,
     ACTION_NEW_EXPERIMENT,
@@ -54,6 +61,15 @@ def _keep_title_and_tail(goal: str, first_input: str) -> str:
     return head + goal[-(GOAL_CHAR_CAP - len(head)):]
 
 
+def _with_issue_draft(source, planned: LazyIssueDraft):
+    """A copy of *source* that carries its lazy issue plan (#294)."""
+    metadata = dict(getattr(source, "metadata", None) or {})
+    metadata["issue_draft"] = planned
+    return NexusSource(
+        source.source_type, source.source_id, source.title, source.content, metadata
+    )
+
+
 class NexusControllerService:
     """Feed heterogeneous work into one persistent local-LLM controller.
 
@@ -71,8 +87,12 @@ class NexusControllerService:
         self,
         orchestrator: NexusTaskOrchestrator,
         github_work_tracking: GitHubWorkTrackingService | None = None,
+        issue_planner=None,
     ) -> None:
         self.orchestrator = orchestrator
+        # #294: writes the issue for a free-form change; ``None`` keeps the
+        # placeholder issue. Issue sources never use it: their issue exists.
+        self.issue_planner = issue_planner
         db_path = getattr(self.experiment_service, "db_path", DEFAULT_DB_PATH)
         if not isinstance(db_path, (str, Path)):
             db_path = DEFAULT_DB_PATH
@@ -231,6 +251,9 @@ class NexusControllerService:
                 source_id=decision.session_id,
                 title="Nexus controller task",
             )
+            planned = self._lazy_issue_draft(lifecycle_source, decision)
+            if planned is not None:
+                lifecycle_source = _with_issue_draft(lifecycle_source, planned)
             try:
                 work_ref = self.github_work_tracking.ensure_for_source(lifecycle_source)
             except GitHubWorkTrackingError as exc:
@@ -239,9 +262,17 @@ class NexusControllerService:
                 )
                 raise
 
+            experiment_task = source_content
+            if planned is not None and planned.result is not None:
+                experiment_task = planned_goal(work_ref.issue_number, planned.result)
+                self._record_execution(
+                    decision,
+                    "issue_planned",
+                    f"issue=#{work_ref.issue_number} planner={planned.result.planner}",
+                )
             try:
                 experiment = self.experiment_service.create_experiment(
-                    with_handover(source_content, decision.experiment_handover),
+                    with_handover(experiment_task, decision.experiment_handover),
                     complexity=decision.complexity,
                     source_type=lifecycle_source.source_type,
                     source_id=lifecycle_source.source_id,
@@ -325,6 +356,19 @@ class NexusControllerService:
             command = (decision.command or "").strip()
             if not command:
                 raise RuntimeError("command decision has no command")
+            # #294: machine work that changes something hangs on an issue.
+            issue_number = None
+            if source is None or source.source_type == "task":
+                issue_number, _ = open_machine_issue(
+                    self.github_work_tracking,
+                    self.issue_planner,
+                    task=source_content,
+                    facts=decision.experiment_handover or "",
+                    command=command,
+                    placeholder_title="Nexus controller task: machine work",
+                )
+            if issue_number:
+                self._record_execution(decision, "machine_issue_opened", f"issue=#{issue_number}")
             result, _ = process_command(
                 SimpleNamespace(body=command, meta={}),
                 self.repo_root,
@@ -332,6 +376,19 @@ class NexusControllerService:
                 0,
             )
             self._record_execution(decision, "command_result", result[:4000])
+            report_machine_result(
+                self.github_work_tracking, issue_number, command, result,
+                succeeded="**Exit code:** 0" in result,
+            )
+
+    def _lazy_issue_draft(self, source, decision: TaskDecision) -> LazyIssueDraft | None:
+        """Plan the issue only for a free-form task that opens a new one (#294)."""
+        if self.issue_planner is None or getattr(source, "source_type", None) != "task":
+            return None
+        planner = self.issue_planner
+        content = str(getattr(source, "content", "") or "")
+        facts = decision.experiment_handover or ""
+        return LazyIssueDraft(lambda: planner.draft(content, facts, work=WORK_CODE))
 
     def _record_execution(self, decision: TaskDecision, kind: str, content: str) -> None:
         if not decision.session_id:

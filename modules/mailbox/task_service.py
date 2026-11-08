@@ -36,6 +36,13 @@ from modules.outbox_publisher import (
     TaskApprovalOutboxPublisher,
 )
 from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.task_issue_planner import (
+    WORK_CODE,
+    LazyIssueDraft,
+    open_machine_issue,
+    planned_goal,
+    report_machine_result,
+)
 # ``modules.task_orchestrator`` is imported lazily, not here. It imports
 # ``modules.mailbox.development``, which runs this package's ``__init__`` and
 # comes straight back to this module - so importing the orchestrator *first*
@@ -145,8 +152,12 @@ class MailboxTaskService:
         github_work_tracking: GitHubWorkTrackingService | None = None,
         task_log_dir: str | Path | None = None,
         failure_analysis_service: Any | None = None,
+        issue_planner: Any | None = None,
     ) -> None:
         self.db_path = db_path
+        # #294: an external planner writes the issue for a free-form change;
+        # ``None`` keeps the ``Mailbox task <id>`` placeholder issue.
+        self.issue_planner = issue_planner
         self.experiment_service = experiment_service
         self._task_log_dir = task_log_dir
         self.failure_analysis_service = failure_analysis_service
@@ -534,6 +545,8 @@ class MailboxTaskService:
         current_approval = self.get(approval.id)
         task_log = self._task_logger(approval.id)
         task_log.info("queued", "github_work_tracking_started", "starting GitHub work tracking")
+        handover = decision.experiment_handover if decision is not None else None
+        planned = self._lazy_issue_draft(current_approval.task_body, handover)
         try:
             work_ref = self.github_work_tracking.ensure_for_source(
                 SimpleNamespace(
@@ -541,6 +554,7 @@ class MailboxTaskService:
                     source_id=approval.id,
                     title=f"Mailbox task {approval.id[:8]}",
                     content=current_approval.task_body,
+                    issue_draft=planned,
                 )
             )
         except GitHubWorkTrackingError as exc:
@@ -564,6 +578,16 @@ class MailboxTaskService:
             issue_number=work_ref.issue_number,
             branch_name=work_ref.branch_name,
         )
+        # #294: the planned issue is the goal, like ``solve github issue #N``.
+        experiment_task = current_approval.task_body
+        if planned is not None and planned.result is not None:
+            experiment_task = planned_goal(work_ref.issue_number, planned.result)
+            task_log.info(
+                "queued", "issue_planned",
+                f"issue #{work_ref.issue_number} planned by {planned.result.planner}",
+                issue_number=work_ref.issue_number,
+                planner=planned.result.planner,
+            )
         with self._lock:
             current = self._conn.execute(
                 "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
@@ -573,10 +597,7 @@ class MailboxTaskService:
             # What Nexus already learned travels with the task (#263).
             try:
                 experiment = self.experiment_service.create_experiment(
-                    with_handover(
-                        current_approval.task_body,
-                        decision.experiment_handover if decision is not None else None,
-                    ),
+                    with_handover(experiment_task, handover),
                     complexity=decision.complexity if decision is not None else None,
                     source_type="task",
                     source_id=approval.id,
@@ -872,6 +893,15 @@ class MailboxTaskService:
             self._conn.commit()
         if not claimed:
             return
+        # #294: machine work that changes something hangs on an issue too.
+        issue_number, _ = open_machine_issue(
+            self.github_work_tracking,
+            self.issue_planner,
+            task=approval.task_body or "",
+            facts=decision.experiment_handover or "",
+            command=command,
+            placeholder_title=f"Mailbox task {approval.id[:8]}: machine work",
+        )
         try:
             msg = SimpleNamespace(body=command, meta={})
             result_body, _ = process_command(
@@ -881,6 +911,10 @@ class MailboxTaskService:
                 approval.mailbox_msg_id,
             )
             success = "**Exit code:** 0" in result_body
+            if report_machine_result(
+                self.github_work_tracking, issue_number, command, result_body, succeeded=success
+            ):
+                result_body = f"{result_body}\n\nReported on GitHub issue #{issue_number}."
             self._complete_claimed_without_experiment(
                 approval,
                 _STATUS_SUCCEEDED if success else _STATUS_FAILED,
@@ -888,12 +922,26 @@ class MailboxTaskService:
                 error=None if success else "command failed",
             )
         except Exception as exc:
+            report_machine_result(
+                self.github_work_tracking, issue_number, command,
+                f"Command execution failed: {_safe_error(str(exc)) or type(exc).__name__}",
+                succeeded=False,
+            )
             self._complete_claimed_without_experiment(
                 approval,
                 _STATUS_FAILED,
                 f"Command execution failed: {_safe_error(str(exc)) or type(exc).__name__}",
                 error=str(exc),
             )
+
+    def _lazy_issue_draft(self, task_body: str | None, facts: str | None) -> LazyIssueDraft | None:
+        """Plan the issue for this task only if a new one is opened (#294)."""
+        if self.issue_planner is None:
+            return None
+        planner = self.issue_planner
+        return LazyIssueDraft(
+            lambda: planner.draft(task_body or "", facts or "", work=WORK_CODE)
+        )
 
     def _start_thread(self, experiment_id: str, target: Any) -> None:
         def _run() -> None:

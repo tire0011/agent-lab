@@ -675,6 +675,28 @@ Decision log for architecture and operating choices.
   built. It replaces `is_memory_eligible_event()`; the `memory_search` tool
   surface stays the same.
 
+### D-029: Free-form changes get an issue written by an external planner
+
+- Status: Accepted
+- Decision: a free-form `task` that changes something (controller chose
+  `new_experiment`, or a `command` that `command_changes_something()` in
+  `modules/task_issue_planner.py` does not recognise as read-only) gets its
+  GitHub issue from one external planner call (Claude/Codex CLI, read-only,
+  role `planner`), fed with the task and the controller's handover facts. The
+  local model is never the planner. Code work then runs with the planned issue
+  as its goal (`GitHub Issue #N: ...`); machine work gets a result comment.
+  The planner runs lazily inside `ensure_for_source`, only where a new issue
+  would be opened, so retries and `solve github issue #N` never plan.
+- Why: the local 7B controller misread free-form requests and issues (#292);
+  a plan from a strong model is easier to follow and every change is traceable.
+- Change vs. question: decided by the controller's action plus a conservative
+  command allow list, not by an extra model call. A wrong "changes" costs one
+  issue; a wrong "read-only" would leave a change untracked.
+- Fallback: no provider or no usable answer -> the old placeholder issue.
+- Evidence: `tests/test_task_issue_planner.py`.
+- Revisit if: the allow list misclassifies real commands, or a cheap planner
+  pre-check proves more reliable than the controller's choice.
+
 ## Under evaluation
 
 ### D-007: Replace unnecessary custom orchestration with OpenAI Agents SDK patterns
