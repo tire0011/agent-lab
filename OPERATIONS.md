@@ -601,6 +601,31 @@ and values assigned to `password`/`api_key`/`token`/`secret`/... keys), but
 paths and URLs are shown unchanged, so the text stays analysable. The model
 name is not stored per job, so only `provider: local` is shown.
 
+### Missing executables / capability gaps (#120)
+
+A `command not found` from a controller `command` becomes a structured
+`capability_gap` in the observation (session history) and in the
+`capability_gaps` SQLite table (key: normalized tool name, with recurrence
+count, chosen recovery and linked issue). See `modules/capability_gaps.py`.
+Recovery is chosen in this order:
+
+1. **Existing equivalent**: a tool that is already installed (`rg` -> `grep -R -E`).
+   Nexus runs it once; the failing command is not repeated.
+2. **Install/provision**: operation `provision_tool {"tool": "rg"}` (apt with
+   `sudo -n`, or pip into the Nexus venv). It is audited in `operation_log`.
+   The controller can always call it. Nexus runs it automatically during
+   recovery only when `NEXUS_AUTO_PROVISION_TOOLS=1` is set.
+3. **Reusable operation**: e.g. `search_text` (portable regex search across
+   repository files). It is recommended in the observation and marked
+   `promoted` once the gap recurs.
+4. Otherwise a structured `missing_capability`.
+
+Known tools (rg, jq, fd, tree), and unknown tools seen at least twice, get one
+GitHub issue per tool identity ("Provide <capability> when <tool> is
+unavailable"). The issue is deduplicated locally and by exact open-issue title.
+Nexus comments on the issue and closes it once the tool is provisioned or
+later runs. If tracking fails, the task still continues.
+
 ## Maintenance API (temporary remote-maintenance bridge)
 
 The maintenance API provides a fixed set of named operations for remote VM

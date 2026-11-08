@@ -1563,6 +1563,8 @@ class GitHubWorkTrackingService:
         recovery: str,
         installation_attempted: bool = False,
         origin: str | None = None,
+        display_name: str | None = None,
+        suggested_solution: str | None = None,
     ) -> dict[str, Any]:
         """Create or reuse one open issue for a durable missing capability.
 
@@ -1573,7 +1575,7 @@ class GitHubWorkTrackingService:
         """
         self.require_lifecycle_ready()
         identity = _slug(capability or missing_executable, max_len=80)
-        title = f"Provide {capability} when {missing_executable} is unavailable"[:240]
+        title = f"Provide {capability} when {display_name or missing_executable} is unavailable"[:240]
         existing = self._find_exact_open_issue(title)
         if existing is not None:
             return {
@@ -1594,7 +1596,13 @@ class GitHubWorkTrackingService:
                 f"Installation attempted: {'yes' if installation_attempted else 'no'}",
                 f"Originating Nexus task/session/experiment: {origin or 'not available'}",
                 "",
-                "Suggested durable solution: provide the executable on the Nexus VM or expose this capability through OperationsRegistry/tool routing.",
+                "Suggested durable solution: "
+                + (
+                    suggested_solution
+                    or "provide the executable on the Nexus VM or expose this capability through OperationsRegistry/tool routing."
+                ),
+                "",
+                "Nexus comments and closes this issue once the capability is available.",
             ]
         )
         created = self._request(
@@ -1606,6 +1614,15 @@ class GitHubWorkTrackingService:
             "created": True,
             "capability_key": identity,
         }
+
+    def resolve_capability_issue(self, number: int, *, note: str) -> None:
+        """Comment why a capability gap is gone and close its issue (#120)."""
+        self.require_lifecycle_ready()
+        path = f"/repos/{self.repository}/issues/{int(number)}"
+        if str((self._request("GET", path) or {}).get("state")) == "closed":
+            return
+        self.comment(int(number), note)
+        self._request("PATCH", path, {"state": "closed", "state_reason": "completed"})
 
     def _ensure_branch(self, branch_name: str) -> None:
         quoted = urllib.parse.quote(branch_name, safe="")

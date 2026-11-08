@@ -375,6 +375,8 @@ class GitHubWorkTrackingTests(unittest.TestCase):
             attempted_command="rg -n VERSION .",
             recovery="repository text search: rg -> grep -R -E",
             origin="session-120",
+            display_name="ripgrep",
+            suggested_solution="install `ripgrep` via apt",
         )
         title = self.fake.issues[first["number"]]["title"]
 
@@ -389,13 +391,14 @@ class GitHubWorkTrackingTests(unittest.TestCase):
             capability="repository text-search capability",
             missing_executable="rg",
             attempted_command="rg TODO",
-            recovery="search_repository_text",
+            recovery="search_text",
+            display_name="ripgrep",
         )
 
         self.assertTrue(first["created"])
         self.assertFalse(second["created"])
         self.assertEqual(second["number"], first["number"])
-        self.assertEqual(title, "Provide repository text-search capability when rg is unavailable")
+        self.assertEqual(title, "Provide repository text-search capability when ripgrep is unavailable")
 
     def test_controller_task_reuses_issue_from_goal_header(self):
         self.fake.issues[220] = {

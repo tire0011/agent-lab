@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import json
+import re
+import shutil
+import sqlite3
 from datetime import (
     datetime,
     timezone,
@@ -11,6 +14,19 @@ from datetime import (
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from modules.capability_gaps import (
+    ALT_EXISTING_EQUIVALENT,
+    ALT_INSTALL,
+    ALT_REUSABLE_OPERATION,
+    CHOICE_MISSING_CAPABILITY,
+    PROVISION_OPERATION,
+    CapabilityGapStore,
+    auto_provisioning_enabled,
+    normalized_identity,
+    plan_recovery,
+    suggested_solution,
+    tool_profile,
+)
 from modules.mailbox.development import process_command
 from modules.nexus_tool_router import (
     ACTION_CALL_TOOL,
@@ -52,6 +68,7 @@ from modules.task_orchestrator_parts.core import (
     _PROVIDER_FALLBACKS,
 )
 logger = logging.getLogger("modules.task_orchestrator")
+_LEADING_EXECUTABLE = re.compile(r"^([\w./+@:-]+)(?=\s|$)")
 
 
 class ExecutionMixin:
@@ -205,6 +222,7 @@ class ExecutionMixin:
 
         failure = classify_command_failure(result)
         if failure is None:
+            self._resolve_gap_if_now_available(command)
             return {**payload, "result": result[:10000]}
 
         mapping = corrected_command(
@@ -212,54 +230,38 @@ class ExecutionMixin:
             missing_executable=failure.executable,
             interpreter=interpreter,
         )
-        if mapping is None:
-            mapping = equivalent_command(command, missing_executable=failure.executable)
-        capability = self._missing_tool_capability(failure.executable)
-        recovery_name = mapping[1] if mapping else "no equivalent capability available"
-        durable_gap = Path(failure.executable).name.lower() not in {"python", "python3", "pip", "pip3"}
-        capability_issue = (
-            self._ensure_capability_issue(
-                capability=capability,
-                missing_executable=failure.executable,
-                command=command,
-                recovery=recovery_name,
-                origin=str((extra or {}).get("session_id") or "") or None,
+        if mapping is not None:
+            # A runtime alias (python -> resolved interpreter), not a capability gap.
+            return self._retry_with_mapping(
+                command, failure.executable, mapping, payload, working_directory,
+                choice="runtime_mapping",
             )
-            if durable_gap
-            else {"status": "not_required", "reason": "resolved runtime alias is not a durable gap"}
+        return self._recover_capability_gap(
+            command,
+            failure,
+            result,
+            payload,
+            working_directory,
+            origin=str((extra or {}).get("session_id") or "") or None,
         )
-        if mapping is None:
-            logger.warning(
-                "command_resolution original=%s missing_executable=%s mapping=none outcome=missing_capability",
-                redact_secrets(command)[:500],
-                failure.executable[:120],
-            )
-            return {
-                **payload,
-                "event": "command_not_found",
-                "missing_executable": failure.executable[:120],
-                "detail": failure.detail,
-                "capability_gap": {
-                    "capability": capability,
-                    "normalized_identity": Path(failure.executable).name.lower(),
-                    "alternatives": ["existing_equivalent", "install_or_provision", "capability_issue", "reusable_operation"],
-                    "chosen": "missing_capability",
-                    "installation_attempted": False,
-                    "issue": capability_issue,
-                },
-                "result": result[:4000],
-                "message": (
-                    "No known runtime mapping exists for this executable. Use python_run for Python, "
-                    "select another capability, or choose missing_capability. Do not repeat this command "
-                    "and do not repeat memory searches for it."
-                ),
-            }
 
+    def _retry_with_mapping(
+        self,
+        command: str,
+        executable: str,
+        mapping: tuple[str, str],
+        payload: dict[str, Any],
+        working_directory: Path,
+        *,
+        choice: str,
+        extra_recovery: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run the one corrected command; the failing one is never repeated."""
         corrected, mapping_name = mapping
         logger.info(
             "command_resolution original=%s missing_executable=%s mapping=%s corrected=%s",
             redact_secrets(command)[:500],
-            failure.executable[:120],
+            executable[:120],
             mapping_name,
             redact_secrets(corrected)[:500],
         )
@@ -267,11 +269,11 @@ class ExecutionMixin:
         recovery = {
             "event": "command_resolution_retry",
             "original_command": redact_secrets(command)[:2000],
-            "missing_executable": failure.executable[:120],
+            "missing_executable": executable[:120],
             "mapping": mapping_name,
             "attempts": 2,
-            "choice": "existing_equivalent" if " -> " in mapping_name and "python" not in mapping_name else "runtime_mapping",
-            "capability_issue": capability_issue,
+            "choice": choice,
+            **(extra_recovery or {}),
         }
         payload = {**payload, "command": redact_secrets(corrected)[:2000], "recovery": recovery}
         if retry_error is not None:
@@ -284,34 +286,264 @@ class ExecutionMixin:
         )
         return {**payload, "result": (retried or "")[:10000]}
 
-    @staticmethod
-    def _missing_tool_capability(executable: str) -> str:
-        if Path(executable).name.lower() == "rg":
-            return "repository text-search capability"
-        return f"development capability provided by {Path(executable).name}"
+    def _capability_gap_store(self) -> CapabilityGapStore | None:
+        try:
+            return CapabilityGapStore(str(getattr(self.operations_registry, "db_path", "state/agent.db")))
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("capability gap store unavailable: %s", str(exc)[:300])
+            return None
 
-    def _ensure_capability_issue(self, **details: Any) -> dict[str, Any]:
-        """Best-effort durable tracking; issue creation never blocks recovery."""
+    def _available_operation_names(self) -> set[str]:
+        try:
+            return {spec.name for spec in self.operations_registry.catalog()}
+        except Exception:  # noqa: BLE001 - a partial registry still allows recovery
+            return set()
+
+    def _recover_capability_gap(
+        self,
+        command: str,
+        failure: Any,
+        result: str,
+        payload: dict[str, Any],
+        working_directory: Path,
+        *,
+        origin: str | None,
+    ) -> dict[str, Any]:
+        """Treat a missing executable as a capability gap (#120).
+
+        Chooses among: an installed equivalent, provisioning the tool, a
+        reusable Nexus operation, or a structured missing_capability. Durable
+        or recurring gaps get one deduplicated GitHub issue; tracking never
+        blocks the current task. The gap (choice, issue link) is part of the
+        returned observation and thus of the session history.
+        """
+        executable = failure.executable
+        identity = normalized_identity(executable)
+        profile = tool_profile(executable)
+        store = self._capability_gap_store()
+        try:
+            occurrences = 1
+            if store is not None:
+                occurrences = store.record(
+                    identity=identity,
+                    executable=executable,
+                    capability=profile.capability,
+                    command=redact_secrets(command),
+                    origin=origin,
+                )
+            equivalent = equivalent_command(command, missing_executable=executable)
+            gap = plan_recovery(
+                executable=executable,
+                command=redact_secrets(command),
+                equivalent=equivalent,
+                occurrences=occurrences,
+                auto_provision=auto_provisioning_enabled(),
+                available_operations=self._available_operation_names(),
+            )
+            gap["origin"] = origin
+
+            installed = False
+            if gap["chosen"] == ALT_INSTALL:
+                installed = self._provision_missing_tool(gap)
+                if not installed:
+                    # Provisioning failed: fall back to the next alternative.
+                    gap["chosen"] = (
+                        ALT_REUSABLE_OPERATION if gap["recommended_operation"] else CHOICE_MISSING_CAPABILITY
+                    )
+
+            recovery_text = self._recovery_description(gap, equivalent)
+            if store is not None:
+                store.set_recovery(identity, recovery_text)
+            if installed:
+                gap["issue"] = self._resolve_capability_issue(
+                    store, identity, f"`{identity}` was provisioned on the Nexus VM by `provision_tool`."
+                )
+            elif gap["durable"]:
+                gap["issue"] = self._ensure_capability_issue(
+                    store,
+                    identity,
+                    capability=profile.capability,
+                    display_name=profile.display_name,
+                    missing_executable=executable,
+                    command=redact_secrets(command),
+                    recovery=recovery_text,
+                    installation_attempted=bool(gap["installation_attempted"]),
+                    origin=origin,
+                    suggested_solution=suggested_solution(executable),
+                )
+            else:
+                gap["issue"] = {"status": "not_required", "reason": "first occurrence of an unknown tool"}
+        finally:
+            if store is not None:
+                store.close()
+
+        logger.warning(
+            "capability_gap missing_executable=%s identity=%s occurrences=%s chosen=%s issue=%s",
+            executable[:120],
+            identity,
+            gap["occurrences"],
+            gap["chosen"],
+            (gap["issue"] or {}).get("status"),
+        )
+        if gap["chosen"] == ALT_EXISTING_EQUIVALENT and equivalent is not None:
+            return self._retry_with_mapping(
+                command, executable, equivalent, payload, working_directory,
+                choice=ALT_EXISTING_EQUIVALENT,
+                extra_recovery={"capability_gap": gap, "capability_issue": gap["issue"]},
+            )
+        if installed:
+            return self._retry_with_mapping(
+                command, executable, (command, f"provisioned {identity}"), payload, working_directory,
+                choice=ALT_INSTALL,
+                extra_recovery={"capability_gap": gap, "capability_issue": gap["issue"]},
+            )
+        return {
+            **payload,
+            "event": "command_not_found",
+            "missing_executable": executable[:120],
+            "detail": failure.detail,
+            "capability_gap": gap,
+            "result": result[:4000],
+            "message": self._capability_gap_message(gap),
+        }
+
+    @staticmethod
+    def _recovery_description(gap: dict[str, Any], equivalent: tuple[str, str] | None) -> str:
+        chosen = gap["chosen"]
+        if chosen == ALT_EXISTING_EQUIVALENT and equivalent is not None:
+            return f"{ALT_EXISTING_EQUIVALENT}: {equivalent[1]}"
+        if chosen == ALT_INSTALL:
+            return f"{ALT_INSTALL}: {PROVISION_OPERATION} tool={gap['normalized_identity']}"
+        if chosen == ALT_REUSABLE_OPERATION:
+            return f"{ALT_REUSABLE_OPERATION}: {gap['recommended_operation']}"
+        return CHOICE_MISSING_CAPABILITY
+
+    @staticmethod
+    def _capability_gap_message(gap: dict[str, Any]) -> str:
+        hints = []
+        if gap.get("recommended_operation"):
+            hints.append(f"call operation {gap['recommended_operation']} for the same capability")
+        install = next((a for a in gap["alternatives"] if a["kind"] == ALT_INSTALL), None)
+        if install and install["available"]:
+            hints.append(f"or install it with operation {PROVISION_OPERATION} {{\"tool\": \"{gap['normalized_identity']}\"}}")
+        hints.append("use python_run for Python, select another capability, or choose missing_capability")
+        return (
+            f"Capability gap: {gap['missing_executable']} is not installed. "
+            + "; ".join(hints)
+            + ". Do not repeat this command and do not repeat memory searches for it."
+        )
+
+    def _provision_missing_tool(self, gap: dict[str, Any]) -> bool:
+        """Install via the audited provision_tool operation (visible and reproducible)."""
+        gap["installation_attempted"] = True
+        try:
+            outcome = self.operations_registry.execute(
+                PROVISION_OPERATION,
+                {"tool": gap["normalized_identity"]},
+                caller="nexus capability recovery",
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to other alternatives
+            gap["installation"] = {"success": False, "error": str(exc)[:500]}
+            return False
+        gap["installation"] = {
+            "success": bool(outcome.success),
+            "output": list(outcome.output_lines or [])[:20],
+            "error": outcome.error_summary,
+        }
+        return bool(outcome.success)
+
+    def _capability_issue_service(self) -> Any | None:
         factory = getattr(self.operations_registry, "github_work_tracking_factory", None)
         if not callable(factory):
-            return {"status": "unavailable"}
+            return None
+        return factory(
+            db_path=getattr(self.operations_registry, "db_path", "state/agent.db"),
+            repo_root=str(self._repo_root()),
+        )
+
+    def _ensure_capability_issue(
+        self, store: CapabilityGapStore | None, identity: str, **details: Any
+    ) -> dict[str, Any]:
+        """Best-effort, deduplicated issue tracking; never blocks recovery."""
+        known = store.get(identity) if store is not None else None
+        if known and known.get("issue_number"):
+            # Local dedup: the same tool identity already has an issue.
+            return {
+                "status": "reused",
+                "number": int(known["issue_number"]),
+                "url": str(known.get("issue_url") or ""),
+                "created": False,
+                "capability_key": identity,
+            }
         service = None
         try:
-            service = factory(
-                db_path=getattr(self.operations_registry, "db_path", "state/agent.db"),
-                repo_root=str(self._repo_root()),
-            )
-            result = service.ensure_capability_issue(**details)
-            return {"status": "created" if result.get("created") else "reused", **result}
+            service = self._capability_issue_service()
+            if service is None:
+                return {"status": "unavailable"}
+            attempted = details.pop("command")
+            issue = service.ensure_capability_issue(attempted_command=attempted, **details)
+            number = int(issue.get("number") or 0)
+            if store is not None and number:
+                store.set_issue(identity, number, str(issue.get("url") or ""))
+            return {"status": "created" if issue.get("created") else "reused", **issue}
         except Exception as exc:  # noqa: BLE001 - tracking must not block current work
             logger.warning("capability issue tracking failed: %s", str(exc)[:500])
             return {"status": "failed", "reason": str(exc)[:500]}
         finally:
-            if service is not None:
-                try:
-                    service.close()
-                except Exception:  # noqa: BLE001
-                    logger.debug("could not close capability issue service", exc_info=True)
+            self._close_quietly(service)
+
+    def _resolve_capability_issue(
+        self, store: CapabilityGapStore | None, identity: str, note: str
+    ) -> dict[str, Any]:
+        """Close the gap's issue once the capability is available."""
+        if store is None:
+            return {"status": "not_tracked"}
+        known = store.get(identity)
+        store.mark_resolved(identity)
+        if not known or not known.get("issue_number"):
+            return {"status": "not_required", "reason": "capability available; no issue was open"}
+        number = int(known["issue_number"])
+        service = None
+        try:
+            service = self._capability_issue_service()
+            if service is None:
+                return {"status": "unavailable", "number": number}
+            service.resolve_capability_issue(number, note=note)
+            store.clear_issue(identity)
+            return {"status": "closed", "number": number, "url": str(known.get("issue_url") or "")}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("capability issue resolution failed: %s", str(exc)[:500])
+            return {"status": "failed", "number": number, "reason": str(exc)[:500]}
+        finally:
+            self._close_quietly(service)
+
+    def _resolve_gap_if_now_available(self, command: str) -> None:
+        """A command whose formerly missing executable now runs closes its gap."""
+        match = _LEADING_EXECUTABLE.match((command or "").strip())
+        if match is None:
+            return
+        identity = normalized_identity(match.group(1))
+        store = self._capability_gap_store()
+        if store is None:
+            return
+        try:
+            known = store.get(identity)
+            if not known or known.get("status") != "open" or not shutil.which(identity):
+                return
+            self._resolve_capability_issue(
+                store, identity, f"`{identity}` is now available on the Nexus VM (command ran successfully)."
+            )
+        finally:
+            store.close()
+
+    @staticmethod
+    def _close_quietly(service: Any | None) -> None:
+        if service is None:
+            return
+        try:
+            service.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("could not close capability issue service", exc_info=True)
 
     @staticmethod
     def _rejected_python_run(decision: dict[str, Any], error: str) -> dict[str, Any]:

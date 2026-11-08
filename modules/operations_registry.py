@@ -229,6 +229,7 @@ class OperationsRegistry:
         search_query = OperationArgSpec("query", "string", "Regex für die Repository-Textsuche.", required=True)
         search_paths = OperationArgSpec("paths", "string", "Kommagetrennte repository-relative Dateien/Verzeichnisse; Standard: gesamtes Repository.", default=".")
         context_lines = OperationArgSpec("context_lines", "integer", "Kontextzeilen vor und nach einem Treffer.", default=0, minimum=0, maximum=20)
+        provision_tool_name = OperationArgSpec("tool", "string", "Name des fehlenden Executables, z. B. rg.", required=True)
         diagnostic_tags = [
             "diagnose", "diagnostics", "logs", "log", "status", "lifecycle", "state",
             "task", "experiment", "session", "issue", "pull request", "branch",
@@ -241,12 +242,20 @@ class OperationsRegistry:
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
             "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
-            "search_repository_text": OperationSpec(
-                "search_repository_text",
+            "search_text": OperationSpec(
+                "search_text",
                 "Portierbare Regex-Textsuche in Repository-Dateien, unabhängig von rg/grep auf dem Host.",
                 [search_query, search_paths, context_lines],
-                ["search", "repository", "text", "regex", "find", "ripgrep", "rg", "grep", "source code"],
+                ["search", "text", "regex", "grep", "ripgrep", "rg", "source code", "text search"],
                 mutates_state=False,
+            ),
+            "provision_tool": OperationSpec(
+                "provision_tool",
+                "Fehlendes Entwicklungswerkzeug auf der Nexus-VM installieren (apt bzw. Nexus-virtualenv) und prüfen (#120).",
+                [provision_tool_name],
+                ["install", "provision", "missing tool", "missing executable", "command not found", "package"],
+                mutates_state=True,
+                controller_allowed=True,
             ),
             "help": OperationSpec("help", "Liste aller erlaubten Operationen.", tags=["help", "catalog", "operations"], mutates_state=False),
             "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh", "write"], mutates_state=True),
@@ -515,7 +524,7 @@ class OperationsRegistry:
         result.operation = "git_worktrees"
         return result
 
-    def _op_search_repository_text(self, args: dict[str, Any]) -> OperationResult:
+    def _op_search_text(self, args: dict[str, Any]) -> OperationResult:
         started = time.perf_counter()
         query = args.get("query")
         if not isinstance(query, str) or not query or len(query) > 1000:
@@ -566,7 +575,36 @@ class OperationsRegistry:
             if len(lines) >= 500:
                 break
         return OperationResult(
-            "search_repository_text", True, lines, int((time.perf_counter() - started) * 1000)
+            "search_text", True, lines, int((time.perf_counter() - started) * 1000)
+        )
+
+    def _op_provision_tool(self, args: dict[str, Any]) -> OperationResult:
+        from modules.capability_gaps import provision_tool
+
+        started = time.perf_counter()
+        tool = args.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise OperationValidationError("tool ist erforderlich.")
+        try:
+            outcome = provision_tool(tool.strip(), runner=self.subprocess_runner)
+        except ValueError as exc:
+            raise OperationValidationError(str(exc)) from exc
+        command = outcome.get("command")
+        lines = [
+            f"tool: {outcome['tool']}",
+            f"status: {outcome['status']}",
+            f"command: {' '.join(command) if command else '-'}",
+            f"available: {'yes' if outcome['available'] else 'no'}",
+        ]
+        if outcome.get("detail"):
+            lines.extend(bounded_lines(str(outcome["detail"]), max_lines=40))
+        return OperationResult(
+            "provision_tool",
+            bool(outcome["available"]),
+            lines,
+            int((time.perf_counter() - started) * 1000),
+            exit_code=outcome.get("exit_code"),
+            error_summary=None if outcome["available"] else sanitized_reason(f"{outcome['status']}: {outcome.get('detail') or ''}"),
         )
 
     def _op_experiment_show(self, args: dict[str, Any]) -> OperationResult:
