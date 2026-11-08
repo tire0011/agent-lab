@@ -110,11 +110,27 @@ class OperationsRegistryTests(unittest.TestCase):
         self.assertIn("mailbox_status", names)
         self.assertIn("local_model_status", names)
         self.assertIn("process_status", names)
+        self.assertIn("search_repository_text", names)
         self.assertNotIn("experiment adopt", names)
         self.registry._specs.pop("git_status")
         result = self.registry.execute("git_status", {})
         self.assertTrue(result.success)
 
+    def test_search_repository_text_is_host_tool_independent(self):
+        nested = self.repo / "src"
+        nested.mkdir()
+        (nested / "app.py").write_text("before\nVERSION = '1.2'\nafter\n", encoding="utf-8")
+
+        result = self.registry.execute(
+            "search_repository_text",
+            {"query": "VERSION", "paths": "src", "context_lines": 1},
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            result.output_lines,
+            ["src/app.py:1:before", "src/app.py:2:VERSION = '1.2'", "src/app.py:3:after"],
+        )
     def test_local_model_status_handler_returns_models_response(self):
         class FakeResponse:
             status = 200

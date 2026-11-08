@@ -34,6 +34,7 @@ from modules.runtime_execution import (
     build_python_command,
     classify_command_failure,
     corrected_command,
+    equivalent_command,
     resolve_python_interpreter,
 )
 from modules.tool_result_reader import (
@@ -100,7 +101,11 @@ class ExecutionMixin:
                 str(decision.get("reason", ""))[:500],
                 len(command),
             )
-            return self._run_command_with_recovery(command, tool=ACTION_COMMAND)
+            return self._run_command_with_recovery(
+                command,
+                tool=ACTION_COMMAND,
+                extra={"session_id": str(decision.get("session_id", ""))},
+            )
         if tool == TOOL_PYTHON_RUN:
             return self._execute_python_run(decision)
         if tool == TOOL_READ_TOOL_RESULT:
@@ -208,6 +213,22 @@ class ExecutionMixin:
             interpreter=interpreter,
         )
         if mapping is None:
+            mapping = equivalent_command(command, missing_executable=failure.executable)
+        capability = self._missing_tool_capability(failure.executable)
+        recovery_name = mapping[1] if mapping else "no equivalent capability available"
+        durable_gap = Path(failure.executable).name.lower() not in {"python", "python3", "pip", "pip3"}
+        capability_issue = (
+            self._ensure_capability_issue(
+                capability=capability,
+                missing_executable=failure.executable,
+                command=command,
+                recovery=recovery_name,
+                origin=str((extra or {}).get("session_id") or "") or None,
+            )
+            if durable_gap
+            else {"status": "not_required", "reason": "resolved runtime alias is not a durable gap"}
+        )
+        if mapping is None:
             logger.warning(
                 "command_resolution original=%s missing_executable=%s mapping=none outcome=missing_capability",
                 redact_secrets(command)[:500],
@@ -218,6 +239,14 @@ class ExecutionMixin:
                 "event": "command_not_found",
                 "missing_executable": failure.executable[:120],
                 "detail": failure.detail,
+                "capability_gap": {
+                    "capability": capability,
+                    "normalized_identity": Path(failure.executable).name.lower(),
+                    "alternatives": ["existing_equivalent", "install_or_provision", "capability_issue", "reusable_operation"],
+                    "chosen": "missing_capability",
+                    "installation_attempted": False,
+                    "issue": capability_issue,
+                },
                 "result": result[:4000],
                 "message": (
                     "No known runtime mapping exists for this executable. Use python_run for Python, "
@@ -241,6 +270,8 @@ class ExecutionMixin:
             "missing_executable": failure.executable[:120],
             "mapping": mapping_name,
             "attempts": 2,
+            "choice": "existing_equivalent" if " -> " in mapping_name and "python" not in mapping_name else "runtime_mapping",
+            "capability_issue": capability_issue,
         }
         payload = {**payload, "command": redact_secrets(corrected)[:2000], "recovery": recovery}
         if retry_error is not None:
@@ -252,6 +283,35 @@ class ExecutionMixin:
             "unresolved" if classify_command_failure(retried) else "recovered",
         )
         return {**payload, "result": (retried or "")[:10000]}
+
+    @staticmethod
+    def _missing_tool_capability(executable: str) -> str:
+        if Path(executable).name.lower() == "rg":
+            return "repository text-search capability"
+        return f"development capability provided by {Path(executable).name}"
+
+    def _ensure_capability_issue(self, **details: Any) -> dict[str, Any]:
+        """Best-effort durable tracking; issue creation never blocks recovery."""
+        factory = getattr(self.operations_registry, "github_work_tracking_factory", None)
+        if not callable(factory):
+            return {"status": "unavailable"}
+        service = None
+        try:
+            service = factory(
+                db_path=getattr(self.operations_registry, "db_path", "state/agent.db"),
+                repo_root=str(self._repo_root()),
+            )
+            result = service.ensure_capability_issue(**details)
+            return {"status": "created" if result.get("created") else "reused", **result}
+        except Exception as exc:  # noqa: BLE001 - tracking must not block current work
+            logger.warning("capability issue tracking failed: %s", str(exc)[:500])
+            return {"status": "failed", "reason": str(exc)[:500]}
+        finally:
+            if service is not None:
+                try:
+                    service.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("could not close capability issue service", exc_info=True)
 
     @staticmethod
     def _rejected_python_run(decision: dict[str, Any], error: str) -> dict[str, Any]:
@@ -685,4 +745,3 @@ class ExecutionMixin:
             )
         except OSError:
             return
-

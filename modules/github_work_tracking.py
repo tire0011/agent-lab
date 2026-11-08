@@ -1554,6 +1554,59 @@ class GitHubWorkTrackingService:
             {"title": title, "body": body},
         )
 
+    def ensure_capability_issue(
+        self,
+        *,
+        capability: str,
+        missing_executable: str,
+        attempted_command: str,
+        recovery: str,
+        installation_attempted: bool = False,
+        origin: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or reuse one open issue for a durable missing capability.
+
+        Exact normalized titles provide remote deduplication across processes;
+        the capability key is included in the body for durable identity and
+        later automation.  Failure is intentionally left to the caller to
+        report without blocking its fallback.
+        """
+        self.require_lifecycle_ready()
+        identity = _slug(capability or missing_executable, max_len=80)
+        title = f"Provide {capability} when {missing_executable} is unavailable"[:240]
+        existing = self._find_exact_open_issue(title)
+        if existing is not None:
+            return {
+                "number": int(existing.get("number") or 0),
+                "url": str(existing.get("html_url") or existing.get("url") or ""),
+                "created": False,
+                "capability_key": identity,
+            }
+        body = "\n".join(
+            [
+                "Created automatically by Nexus after a durable runtime capability gap.",
+                "",
+                f"Capability key: `{identity}`",
+                f"Requested capability: {capability}",
+                f"Missing executable/tool: `{missing_executable}`",
+                f"Attempted command: `{attempted_command[:2000]}`",
+                f"Fallback/recovery chosen: {recovery}",
+                f"Installation attempted: {'yes' if installation_attempted else 'no'}",
+                f"Originating Nexus task/session/experiment: {origin or 'not available'}",
+                "",
+                "Suggested durable solution: provide the executable on the Nexus VM or expose this capability through OperationsRegistry/tool routing.",
+            ]
+        )
+        created = self._request(
+            "POST", f"/repos/{self.repository}/issues", {"title": title, "body": body}
+        )
+        return {
+            "number": int(created.get("number") or 0),
+            "url": str(created.get("html_url") or created.get("url") or ""),
+            "created": True,
+            "capability_key": identity,
+        }
+
     def _ensure_branch(self, branch_name: str) -> None:
         quoted = urllib.parse.quote(branch_name, safe="")
         try:

@@ -368,6 +368,35 @@ class GitHubWorkTrackingTests(unittest.TestCase):
         self.assertIn(ref.branch_name, self.fake.refs)
         self.assertTrue(any(call[0:2] == ("POST", "/repos/tire0011/agent-lab/issues") for call in self.fake.calls))
 
+    def test_capability_issue_records_recovery_and_deduplicates(self):
+        first = self.service.ensure_capability_issue(
+            capability="repository text-search capability",
+            missing_executable="rg",
+            attempted_command="rg -n VERSION .",
+            recovery="repository text search: rg -> grep -R -E",
+            origin="session-120",
+        )
+        title = self.fake.issues[first["number"]]["title"]
+
+        def search_with_existing(method, path, payload=None):
+            if method == "GET" and path.startswith("/search/issues?"):
+                issue = self.fake.issues[first["number"]]
+                return {"items": [{**issue, "html_url": "https://example/43"}]}
+            return self.fake(method, path, payload)
+
+        self.service._transport = search_with_existing
+        second = self.service.ensure_capability_issue(
+            capability="repository text-search capability",
+            missing_executable="rg",
+            attempted_command="rg TODO",
+            recovery="search_repository_text",
+        )
+
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(second["number"], first["number"])
+        self.assertEqual(title, "Provide repository text-search capability when rg is unavailable")
+
     def test_controller_task_reuses_issue_from_goal_header(self):
         self.fake.issues[220] = {
             "number": 220,

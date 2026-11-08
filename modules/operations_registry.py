@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -225,6 +226,9 @@ class OperationsRegistry:
             required=True,
             minimum=1,
         )
+        search_query = OperationArgSpec("query", "string", "Regex für die Repository-Textsuche.", required=True)
+        search_paths = OperationArgSpec("paths", "string", "Kommagetrennte repository-relative Dateien/Verzeichnisse; Standard: gesamtes Repository.", default=".")
+        context_lines = OperationArgSpec("context_lines", "integer", "Kontextzeilen vor und nach einem Treffer.", default=0, minimum=0, maximum=20)
         diagnostic_tags = [
             "diagnose", "diagnostics", "logs", "log", "status", "lifecycle", "state",
             "task", "experiment", "session", "issue", "pull request", "branch",
@@ -237,6 +241,13 @@ class OperationsRegistry:
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
             "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
+            "search_repository_text": OperationSpec(
+                "search_repository_text",
+                "Portierbare Regex-Textsuche in Repository-Dateien, unabhängig von rg/grep auf dem Host.",
+                [search_query, search_paths, context_lines],
+                ["search", "repository", "text", "regex", "find", "ripgrep", "rg", "grep", "source code"],
+                mutates_state=False,
+            ),
             "help": OperationSpec("help", "Liste aller erlaubten Operationen.", tags=["help", "catalog", "operations"], mutates_state=False),
             "inbox_refresh": OperationSpec("inbox_refresh", "Genau einen kontrollierten Mailbox-Poll auslösen.", tags=["mailbox", "poll", "refresh", "write"], mutates_state=True),
             "memory": OperationSpec("memory", "Speicherbelegung aus /proc/meminfo.", tags=["memory", "ram", "host", "usage"], mutates_state=False),
@@ -503,6 +514,60 @@ class OperationsRegistry:
         result = self._run_command(["git", "worktree", "list"], cwd=self.repo_root, timeout=10)
         result.operation = "git_worktrees"
         return result
+
+    def _op_search_repository_text(self, args: dict[str, Any]) -> OperationResult:
+        started = time.perf_counter()
+        query = args.get("query")
+        if not isinstance(query, str) or not query or len(query) > 1000:
+            raise OperationValidationError("query muss 1 bis 1000 Zeichen lang sein.")
+        try:
+            pattern = re.compile(query)
+        except re.error as exc:
+            raise OperationValidationError(f"Ungültiger Regex: {exc}") from exc
+        raw_paths = args.get("paths", ".")
+        if not isinstance(raw_paths, str):
+            raise OperationValidationError("paths muss eine kommagetrennte Zeichenfolge sein.")
+        context = args.get("context_lines", 0)
+        if isinstance(context, bool) or not isinstance(context, int) or not 0 <= context <= 20:
+            raise OperationValidationError("context_lines muss zwischen 0 und 20 liegen.")
+        root = self.repo_root.resolve()
+        files: list[Path] = []
+        for item in (part.strip() for part in raw_paths.split(",")):
+            candidate = (root / (item or ".")).resolve()
+            if candidate != root and root not in candidate.parents:
+                raise OperationValidationError("paths müssen innerhalb des Repositorys liegen.")
+            if candidate.is_file():
+                files.append(candidate)
+            elif candidate.is_dir():
+                files.extend(path for path in candidate.rglob("*") if path.is_file())
+        lines: list[str] = []
+        blocked_parts = {".git", ".venv", "state", "logs", "__pycache__"}
+        for path in sorted(set(files)):
+            relative = path.relative_to(root)
+            if blocked_parts.intersection(relative.parts) or path.stat().st_size > 1_000_000:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            source_lines = content.splitlines()
+            emitted: set[int] = set()
+            for index, source_line in enumerate(source_lines):
+                if not pattern.search(source_line):
+                    continue
+                for shown in range(max(0, index - context), min(len(source_lines), index + context + 1)):
+                    if shown not in emitted:
+                        lines.append(f"{relative}:{shown + 1}:{source_lines[shown][:500]}")
+                        emitted.add(shown)
+                    if len(lines) >= 500:
+                        break
+                if len(lines) >= 500:
+                    break
+            if len(lines) >= 500:
+                break
+        return OperationResult(
+            "search_repository_text", True, lines, int((time.perf_counter() - started) * 1000)
+        )
 
     def _op_experiment_show(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)

@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,6 +220,31 @@ def corrected_command(
     if rebuilt == command:
         return None
     return rebuilt, mapping
+
+
+def equivalent_command(
+    command: str,
+    *,
+    missing_executable: str,
+) -> tuple[str, str] | None:
+    """Return a cheap, already-installed equivalent for a missing CLI.
+
+    These mappings are deliberately capability based and bounded.  They are
+    only used when the replacement is present, and only rewrite the leading
+    executable, so a failed command is never blindly repeated.  More complex
+    gaps remain visible to the controller instead of being guessed at here.
+    """
+    command = (command or "").strip()
+    match = _LEADING_TOKEN_RE.match(command)
+    if match is None or Path(match.group(1)).name != Path(missing_executable).name:
+        return None
+    name = Path(missing_executable).name
+    if name == "rg" and shutil.which("grep"):
+        # grep needs recursive traversal explicitly; it accepts rg's common
+        # -n/-C options and extended regex is the closest portable equivalent.
+        replacement = "grep -R -E"
+        return replacement + command[match.end(1):], "repository text search: rg -> grep -R -E"
+    return None
 
 
 def _normalized_args(args: Iterable[str] | None) -> list[str]:
