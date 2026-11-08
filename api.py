@@ -161,32 +161,7 @@ _STALE_SESSION_SECONDS = int(os.environ.get("NEXUS_STALE_SESSION_SECONDS", 6 * 6
 _STALE_HEARTBEAT_SECONDS = resolve_stale_timeout(
     os.environ.get("NEXUS_STALE_HEARTBEAT_SECONDS")
 )
-
-
-
-# Codex task API: clients never choose the working directory or sandbox mode -
-# both are hard-coded so tasks stay read-only and confined to the repository root,
-# regardless of the request payload.
-CODEX_WORKING_DIR = "/agent"
-CODEX_SANDBOX = "read-only"
-CODEX_DEFAULT_TIMEOUT_SECONDS = 120
-CODEX_MAX_TIMEOUT_SECONDS = 120
 LIMIT_MIN = 1
-CODEX_LIST_DEFAULT_LIMIT = 20
-CODEX_LIST_MAX_LIMIT = 100
-CODEX_LIST_PROMPT_PREVIEW_CHARS = 80
-MAILBOX_TASKS_DEFAULT_LIMIT = 20
-MAILBOX_TASKS_MAX_LIMIT = 100
-EXPERIMENTS_DEFAULT_LIMIT = 20
-EXPERIMENTS_MAX_LIMIT = 100
-EXPERIMENT_LOGS_DEFAULT_LIMIT = 500
-EXPERIMENT_LOGS_MAX_LIMIT = 5000
-UNIFIED_LOGS_DEFAULT_LIMIT = 500
-UNIFIED_LOGS_MAX_LIMIT = 5000
-ACTIVITY_DEFAULT_LIMIT = 50
-ACTIVITY_MAX_LIMIT = 200
-OPERATION_CHAINS_DEFAULT_LIMIT = 20
-OPERATION_CHAINS_MAX_LIMIT = 100
 
 
 @lru_cache(maxsize=1)
@@ -631,748 +606,6 @@ def authorize(x_api_key: str | None):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-@app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
-    checkout_revision = _read_git_revision()
-    return HealthResponse(
-        status="ok",
-        version=VERSION,
-        git_revision=_STARTUP_REVISION,
-        checkout_revision=checkout_revision,
-        stale=_revisions_differ(_STARTUP_REVISION, checkout_revision),
-    )
-
-@app.get("/secure-health")
-def secure_health(x_api_key: str | None = Header(default=None)):
-    authorize(x_api_key)
-    return {"status": "ok", "auth": "ok"}
-
-
-@app.get("/status", response_model=StatusResponse)
-def status() -> StatusResponse:
-    return StatusResponse(**chat_module.build_status())
-
-
-@app.get("/problems", response_model=ProblemsResponse)
-def problems(
-    limit: int = Query(default=20, ge=1, le=200),
-    since: datetime | None = Query(default=None),
-) -> ProblemsResponse:
-    found: list[Problem] = list_problems(limit=limit, since=since)
-    return ProblemsResponse(count=len(found), problems=found)
-
-
-@app.get("/ideas", response_model=IdeasResponse)
-def ideas() -> IdeasResponse:
-    found: list[Idea] = list_ideas()
-    return IdeasResponse(count=len(found), ideas=found)
-
-
-@app.post("/ideas", response_model=Idea, status_code=201)
-def create_idea(
-    request: IdeaCreateRequest,
-    x_api_key: str | None = Header(default=None),
-) -> Idea:
-    authorize(x_api_key)
-
-    try:
-        return add_idea(request.text)
-    except InvalidIdeaTextError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/chat", response_model=ChatJobResponse, status_code=202)
-def chat(
-    request: ChatRequest,
-    x_api_key: str | None = Header(default=None),
-) -> ChatJobResponse:
-    authorize(x_api_key)
-    service = _resolve_nexus_chat_job_service()
-    try:
-        job = service.submit(request.message, session_id=request.session_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return ChatJobResponse(job_id=job.id, status=job.status, session_id=job.session_id)
-
-
-@app.get("/chat/jobs/{job_id}", response_model=ChatJobResponse)
-def get_chat_job(
-    job_id: str,
-    x_api_key: str | None = Header(default=None),
-) -> ChatJobResponse:
-    authorize(x_api_key)
-    service = _resolve_nexus_chat_job_service()
-    job = service.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="chat job not found")
-    if job.status == STATUS_SUCCEEDED and job.result is not None:
-        result = job.result
-        return ChatJobResponse(
-  job_id=job.id,
-  status=job.status,
-  reply=result.reply,
-  intent=result.action,
-  session_id=result.session_id,
-  action=result.action,
-  experiment_id=result.experiment_id,
-        )
-    return ChatJobResponse(
-        job_id=job.id,
-        status=job.status,
-        session_id=job.session_id,
-        error=job.error if job.status == STATUS_FAILED else None,
-    )
-
-
-
-@app.post("/codex/tasks", response_model=CodexTaskResponse, status_code=201)
-def create_codex_task(
-    request: CodexTaskCreateRequest,
-    x_api_key: str | None = Header(default=None),
-    service: CodexTaskService = Depends(get_codex_service),
-) -> CodexTaskResponse:
-    authorize(x_api_key)
-
-    prompt = request.prompt.strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt must not be empty")
-
-    timeout_seconds = min(
-        request.timeout_seconds or CODEX_DEFAULT_TIMEOUT_SECONDS,
-        CODEX_MAX_TIMEOUT_SECONDS,
-    )
-
-    task = service.create_task(
-        prompt=prompt,
-        working_dir=CODEX_WORKING_DIR,
-        sandbox=CODEX_SANDBOX,
-        timeout_seconds=timeout_seconds,
-    )
-    return CodexTaskResponse(**task.to_dict())
-
-
-def _prompt_preview(prompt: str, max_chars: int = CODEX_LIST_PROMPT_PREVIEW_CHARS) -> str:
-    stripped = prompt.strip()
-    if len(stripped) <= max_chars:
-        return stripped
-    return stripped[:max_chars].rstrip() + "…"
-
-
-@app.get("/codex/tasks", response_model=CodexTaskListResponse)
-def list_codex_tasks(
-    x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=CODEX_LIST_DEFAULT_LIMIT, ge=LIMIT_MIN, le=CODEX_LIST_MAX_LIMIT),
-    service: CodexTaskService = Depends(get_codex_service),
-) -> CodexTaskListResponse:
-    authorize(x_api_key)
-
-    tasks = service.list_tasks(limit=limit)
-    return CodexTaskListResponse(
-        count=len(tasks),
-        tasks=[
-            CodexTaskSummary(
-                **task.to_dict(),
-                prompt_preview=_prompt_preview(task.prompt),
-            )
-            for task in tasks
-        ],
-    )
-
-
-@app.get("/codex/tasks/{task_id}", response_model=CodexTaskResponse)
-def get_codex_task(
-    task_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: CodexTaskService = Depends(get_codex_service),
-) -> CodexTaskResponse:
-    authorize(x_api_key)
-
-    try:
-        task = service.get_task(task_id)
-    except TaskNotFoundError:
-        raise HTTPException(status_code=404, detail="task not found")
-    return CodexTaskResponse(**task.to_dict())
-
-
-@app.post("/codex/tasks/{task_id}/run", response_model=CodexTaskResponse)
-def run_codex_task(
-    task_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: CodexTaskService = Depends(get_codex_service),
-) -> CodexTaskResponse:
-    authorize(x_api_key)
-
-    try:
-        task = service.run_task(task_id)
-    except TaskNotFoundError:
-        raise HTTPException(status_code=404, detail="task not found")
-    except TaskNotRunnableError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception:
-        # Worker-level failures are already captured as a stored task status; anything
-        # reaching here is unexpected - never leak tracebacks/secrets.
-        raise HTTPException(status_code=500, detail="internal error running codex task")
-    return CodexTaskResponse(**task.to_dict())
-
-
-
-
-def _approval_to_response(approval) -> MailboxTaskApproval:
-    return MailboxTaskApproval(**approval.to_dict())
-
-
-@app.get("/mailbox/tasks", response_model=MailboxTaskApprovalsResponse)
-def list_mailbox_tasks(
-    x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=MAILBOX_TASKS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=MAILBOX_TASKS_MAX_LIMIT),
-    service: MailboxTaskService = Depends(get_mailbox_task_service),
-) -> MailboxTaskApprovalsResponse:
-    authorize(x_api_key)
-    tasks = service.list_recent(limit=limit)
-    return MailboxTaskApprovalsResponse(
-        count=len(tasks),
-        tasks=[_approval_to_response(t) for t in tasks],
-    )
-
-
-@app.get("/mailbox/tasks/{approval_id}", response_model=MailboxTaskApproval)
-def get_mailbox_task(
-    approval_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: MailboxTaskService = Depends(get_mailbox_task_service),
-) -> MailboxTaskApproval:
-    authorize(x_api_key)
-    try:
-        approval = service.get(approval_id)
-    except ApprovalNotFoundError:
-        raise HTTPException(status_code=404, detail="approval not found")
-    return _approval_to_response(approval)
-
-
-@app.post("/mailbox/webhook/github")
-async def mailbox_github_webhook(
-    request: Request,
-    x_hub_signature_256: str | None = Header(default=None),
-    x_github_event: str | None = Header(default=None),
-) -> JSONResponse:
-    secret = os.environ.get(GITHUB_WEBHOOK_SECRET_ENV)
-    if not secret:
-        _logger.error("mailbox_webhook failed reason=missing_secret")
-        raise HTTPException(status_code=503, detail="webhook not configured")
-
-    raw_body = await request.body()
-    if not verify_signature(
-        secret=secret,
-        raw_body=raw_body,
-        signature_header=x_hub_signature_256,
-    ):
-        _logger.warning("mailbox_webhook rejected reason=invalid_signature")
-        raise HTTPException(status_code=401, detail="invalid signature")
-
-    try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        _logger.warning("mailbox_webhook rejected reason=invalid_json")
-        raise HTTPException(status_code=400, detail="invalid json")
-
-    if is_ping_event(x_github_event):
-        _logger.info("mailbox_webhook ignored reason=ping")
-        return JSONResponse(status_code=200, content={"status": "pong"})
-
-    if (x_github_event or "").strip().lower() != "push":
-        _logger.info("mailbox_webhook ignored reason=event")
-        return JSONResponse(status_code=200, content={"status": "ignored"})
-
-    if not isinstance(payload, dict) or not has_inbox_changes(payload):
-        _logger.info("mailbox_webhook ignored reason=no_inbox_changes")
-        return JSONResponse(status_code=200, content={"status": "ignored"})
-
-    if not repository_matches(payload, expected_repository()):
-        _logger.warning("mailbox_webhook ignored reason=unexpected_repository")
-        return JSONResponse(status_code=202, content={"status": "ignored"})
-
-    _start_mailbox_webhook_poll()
-    _logger.info("mailbox_webhook accepted reason=inbox_change")
-    return JSONResponse(status_code=202, content={"status": "accepted"})
-
-
-# Public, sanitized inbox/outbox listing: shows what came in and went out without
-# ever exposing full prompts, file paths, or secrets.
-
-MAILBOX_MESSAGES_DEFAULT_LIMIT = 20
-MAILBOX_MESSAGES_MAX_LIMIT = 100
-
-_MAILBOX_TYPE_LABELS_DE = {
-    "idea": "Idee",
-    "task": "Auftrag",
-    "question": "Frage",
-    "context": "Kontext",
-    "task_approval_result": "Auftragsergebnis",
-    "failure_analysis": "Fehleranalyse",
-}
-
-_SAFE_SENDER_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
-
-
-def _mailbox_type_label(msg_type: str | None) -> str:
-    if not msg_type:
-        return "Nachricht"
-    return _MAILBOX_TYPE_LABELS_DE.get(msg_type, msg_type.replace("_", " ").strip().capitalize() or "Nachricht")
-
-
-def _safe_mailbox_sender(raw: str | None) -> str | None:
-    """Only expose sender/creator identifiers matching a safe, narrow shape."""
-    if not raw:
-        return None
-    candidate = raw.strip()
-    return candidate if _SAFE_SENDER_RE.fullmatch(candidate) else None
-
-
-def _mailbox_preview(text: str | None) -> str | None:
-    if not text:
-        return None
-    # Drop markdown headings so the preview starts with actual content, then redact
-    # and bound it like every other diagnostic.
-    stripped = "\n".join(
-        line for line in text.splitlines() if not line.strip().startswith("#")
-    ).strip()
-    return redaction.sanitized_reason(stripped, max_chars=220)
-
-
-def _inbox_entries(service: ExperimentService, limit: int) -> list[MailboxMessageEntry]:
-    rows = mailbox_module.list_recent_db_messages(service._conn, limit=limit)
-    entries = []
-    for row in rows:
-        preview = _mailbox_preview(mailbox_module.read_inbox_preview(row.get("file_path")))
-        entries.append(
-            MailboxMessageEntry(
-                id=f"msg-{row['id']}",
-                timestamp=row.get("received_at") or "",
-                type=row.get("msg_type") or "unknown",
-                status=row.get("status") or "unknown",
-                sender=_safe_mailbox_sender(row.get("created_by")),
-                title=_mailbox_type_label(row.get("msg_type")),
-                preview=preview,
-            )
-        )
-    return entries
-
-
-def _outbox_entries(limit: int) -> list[MailboxMessageEntry]:
-    files = mailbox_module.list_outbox_files(_OUTBOX_DIR, limit=limit)
-    entries = []
-    for item in files:
-        meta = item.get("meta") or {}
-        msg_type = meta.get("type")
-        entries.append(
-            MailboxMessageEntry(
-                id=item["filename"],
-                timestamp=meta.get("processed_at") or meta.get("created_at") or "",
-                type=msg_type or "unknown",
-                status=meta.get("status") or "unknown",
-                sender=_safe_mailbox_sender(meta.get("created_by") or meta.get("sender")),
-                title=_mailbox_type_label(msg_type),
-                preview=_mailbox_preview(item.get("body")),
-            )
-        )
-    return entries
-
-
-@app.get("/mailbox/messages", response_model=MailboxMessagesResponse)
-def list_mailbox_messages(
-    limit: int = Query(default=MAILBOX_MESSAGES_DEFAULT_LIMIT, ge=LIMIT_MIN, le=MAILBOX_MESSAGES_MAX_LIMIT),
-    service: ExperimentService = Depends(get_experiment_service),
-) -> MailboxMessagesResponse:
-    inbox = _inbox_entries(service, limit)
-    outbox = _outbox_entries(limit)
-    return MailboxMessagesResponse(
-        inbox_count=len(inbox),
-        outbox_count=len(outbox),
-        inbox=inbox,
-        outbox=outbox,
-    )
-
-
-# Experiment and activity log endpoints: thin routes over the existing
-# ExperimentService/run_store persistence; no new orchestration or SQLite access here.
-
-
-@app.get("/experiments", response_model=ExperimentsResponse)
-def list_experiments(
-    x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=EXPERIMENTS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENTS_MAX_LIMIT),
-    service: ExperimentService = Depends(get_experiment_service),
-) -> ExperimentsResponse:
-    authorize(x_api_key)
-    experiments = service.list_experiments(limit=limit)
-    return ExperimentsResponse(
-        count=len(experiments),
-        experiments=[exp.to_dict() for exp in experiments],
-    )
-
-
-@app.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
-def get_experiment(
-    experiment_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: ExperimentService = Depends(get_experiment_service),
-) -> ExperimentDetail:
-    authorize(x_api_key)
-    try:
-        experiment = service.resolve_experiment(experiment_id)
-    except ExperimentNotFoundError:
-        raise HTTPException(status_code=404, detail="experiment not found")
-    adoption_service = _resolve_experiment_adoption_service()
-    adoption = adoption_service.get(experiment.id)
-    payload = experiment.to_dict()
-    if experiment.test_exit_code not in (None, 0):
-        payload["test_failure_tail"] = redaction.test_failure_tail(experiment.test_output)
-    if adoption.status != "not_started":
-        payload["adoption"] = adoption.to_dict()
-    return ExperimentDetail(**payload)
-
-
-@app.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)
-def cancel_experiment(
-    experiment_id: str,
-    x_api_key: str | None = Header(default=None),
-    x_cancelled_by: str | None = Header(default=None),
-    service: ExperimentService = Depends(get_experiment_service),
-) -> ExperimentDetail:
-    authorize(x_api_key)
-    try:
-        experiment = service.cancel_experiment(experiment_id, x_cancelled_by or "api")
-    except ExperimentNotFoundError:
-        raise HTTPException(status_code=404, detail="experiment not found")
-    except ExperimentNotCancellableError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return ExperimentDetail(**experiment.to_dict())
-
-
-_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
-
-# Coarse grouping of a structured entry's ``phase`` into the timeline's ``source``;
-# experiment/mailbox task/job ids remain available as detail/filter fields on every entry.
-_MAILBOX_SOURCE_PHASES = {
-    "mailbox",
-    "queued",
-    # Entries written before the mailbox phase fix carry the logger's module name as
-    # their phase; recognizing those reclassifies the existing history on read, no migration.
-    "mailbox_processor",
-    "poll_runner",
-    "processing",
-    "retention",
-}
-_CONTROLLER_SOURCE_PHASES = {
-    "research", "selection", "selection_reformat_retry", "selection_policy_replan",
-}
-
-
-def _derive_log_source(phase: str | None) -> str:
-    if phase in _MAILBOX_SOURCE_PHASES:
-        return "mailbox"
-    if phase in _CONTROLLER_SOURCE_PHASES:
-        return "controller"
-    if phase == "chat":
-        return "chat"
-    if phase == "system":
-        return "system"
-    return "experiment"
-
-
-def _apply_log_source(raw_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    for raw in raw_entries:
-        raw["source"] = _derive_log_source(raw.get("phase"))
-    return raw_entries
-
-
-@app.get("/experiments/{experiment_id}/logs", response_model=ExperimentLogsResponse)
-def get_experiment_logs(
-    experiment_id: str,
-    x_api_key: str | None = Header(default=None),
-    level: str | None = Query(default=None),
-    phase: str | None = Query(default=None),
-    cursor: str | None = Query(default=None),
-    limit: int = Query(default=EXPERIMENT_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=EXPERIMENT_LOGS_MAX_LIMIT),
-    service: ExperimentService = Depends(get_experiment_service),
-) -> ExperimentLogsResponse:
-    """Single, chronological view of one experiment's complete run - mailbox
-    approval through research, implementation, verification, cleanup - from the
-    durable JSONL log, merged with its mailbox task's pre-experiment entries.
-    """
-    authorize(x_api_key)
-    try:
-        experiment = service.resolve_experiment(experiment_id)
-    except ExperimentNotFoundError:
-        raise HTTPException(status_code=404, detail="experiment not found")
-
-    if level is not None and level.upper() not in _LOG_LEVELS:
-        raise HTTPException(status_code=400, detail="invalid level filter")
-
-    mailbox_task_id = _mailbox_task_id(service, experiment.id)
-    try:
-        # Fetch one extra entry to detect whether an older page remains.
-        raw_entries = central_logging_module.read_experiment_logs(
-            service.experiment_log_dir, experiment.id,
-            mailbox_task_id=mailbox_task_id, level=level, phase=phase,
-            limit=limit + 1, before=cursor,
-        )
-    except OSError as exc:
-        _logger.error("experiment log read failed: %s", _sanitized_reason(str(exc)))
-        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
-
-    raw_entries, next_cursor = _paginate_log_entries(raw_entries, limit)
-    _apply_log_source(raw_entries)
-
-    entries: list[ExperimentLogEntry] = []
-    for raw in raw_entries:
-        try:
-            entries.append(ExperimentLogEntry(**raw))
-        except Exception:
-            # A malformed entry must not fail the whole response.
-            continue
-    return ExperimentLogsResponse(
-        count=len(entries), experiment_id=experiment.id, entries=entries, next_cursor=next_cursor,
-    )
-
-
-# Per-service journalctl line count merged into every unfiltered-by-id page of
-# GET /logs; bounded so one refresh cannot become an unbounded read across three
-# services. LogReader normalizes each journal entry's timestamp and attaches the same
-# sort/cursor keys, so both entry kinds order and paginate together.
-_UNIFIED_LOGS_JOURNAL_LINES = 100
-
-
-@app.get("/logs", response_model=UnifiedLogsResponse)
-async def get_unified_logs(
-    level: str | None = Query(default=None),
-    phase: str | None = Query(default=None),
-    source: str | None = Query(default=None),
-    search: str | None = Query(default=None),
-    experiment_id: str | None = Query(default=None),
-    mailbox_task_id: str | None = Query(default=None),
-    job_id: str | None = Query(default=None),
-    session_id: str | None = Query(default=None),
-    cursor: str | None = Query(default=None),
-    limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
-    include_journal: bool = Query(default=True),
-    service: ExperimentService = Depends(get_experiment_service),
-    log_reader: LogReader = Depends(get_log_reader),
-) -> UnifiedLogsResponse:
-    """One complete, chronological Nexus log timeline.
-
-    Merges every ``<experiment_log_dir>/*.jsonl`` entry (including pre-experiment
-    ``task-<mailbox_task_id>`` files) with the systemd journals on unfiltered pages;
-    every entry carries a coarse ``source`` usable as a filter. Bounded reads and
-    one cursor scheme paginate both kinds without re-showing entries across pages;
-    an unreadable journal source is reported in ``source_errors``, not silently dropped.
-    """
-    if level is not None and level.upper() not in _LOG_LEVELS:
-        raise HTTPException(status_code=400, detail="invalid level filter")
-
-    resolved_experiment_id = experiment_id
-    if experiment_id:
-        try:
-            resolved_experiment_id = service.resolve_experiment(experiment_id).id
-        except ExperimentNotFoundError:
-            return UnifiedLogsResponse(count=0, entries=[])
-
-    resolved_mailbox_task_id = mailbox_task_id
-    if resolved_experiment_id and not resolved_mailbox_task_id:
-        # Correlate the experiment with its mailbox task log automatically, same as the
-        # single-experiment endpoint.
-        resolved_mailbox_task_id = _mailbox_task_id(service, resolved_experiment_id)
-
-    try:
-        # Fetch one extra entry to detect an older page; still a correct upper bound after
-        # merging journal entries - the final page never needs more than `limit + 1`
-        # structured entries.
-        scan = central_logging_module.scan_log_entries(
-            service.experiment_log_dir,
-            experiment_id=resolved_experiment_id,
-            mailbox_task_id=resolved_mailbox_task_id,
-            job_id=job_id,
-            session_id=session_id,
-            level=level,
-            phase=phase,
-            search=search,
-            limit=limit + 1,
-            before=cursor,
-        )
-    except OSError as exc:
-        _logger.error("unified log read failed: %s", _sanitized_reason(str(exc)))
-        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
-
-    raw_entries = scan.entries
-    _apply_log_source(raw_entries)
-
-    # The journal is merged only into the unfiltered-by-id feed, on *every* such page -
-    # a cursor must not opt it out, or later pages could never surface any journal entry.
-    source_errors: dict[str, str] | None = None
-    merged_entries = raw_entries
-    is_default_page = (
-        not resolved_experiment_id and not resolved_mailbox_task_id
-        and not job_id and not session_id
-    )
-    if include_journal and is_default_page:
-        decoded_cursor = central_logging_module.decode_log_cursor(cursor) if cursor else None
-        journal_before: str | None = decoded_cursor[0] if decoded_cursor else None
-        # Reuse the cursor's timestamp as the journal page boundary; an unrecognized/legacy
-        # cursor omits ``--until`` (falls back to each service's newest window) rather than
-        # risk an incorrectly-scoped, duplicate-producing query.
-        journal_entries, errors = await log_reader.read_all_journal_entries(
-            lines=_UNIFIED_LOGS_JOURNAL_LINES, before=journal_before, search=search,
-        )
-        if decoded_cursor is not None:
-            # ``journalctl --until`` has only second precision and is inclusive, so it can return
-            # an entry already on the previous page; re-apply the exact sub-second cursor
-            # comparison the structured feed uses, so correctness never depends on journalctl's
-            # coarser boundary semantics.
-            journal_entries = [
-                e for e in journal_entries
-                if central_logging_module.entry_sort_key(e) < decoded_cursor
-            ]
-        if level:
-            journal_entries = [e for e in journal_entries if e.get("level") == level.upper()]
-        if phase:
-            journal_entries = [e for e in journal_entries if e.get("phase") == phase]
-        merged_entries = raw_entries + journal_entries
-        if errors:
-            source_errors = errors
-
-    if source:
-        wanted = source.strip().lower()
-        merged_entries = [e for e in merged_entries if str(e.get("source", "")).lower() == wanted]
-    # `search` is deliberately *not* re-applied here: it is pushed down into both readers
-    # (JSONL scan and `journalctl --grep`), so it searches the whole retained history,
-    # not just whatever one page contained.
-
-    # One shared sort + cursor scheme spans structured and journal entries, so `next_cursor`
-    # reflects the true oldest entry of the *merged* page - never just the structured feed's
-    # boundary - and no entry is shown twice or skipped across pages.
-    merged_entries.sort(key=central_logging_module.entry_sort_key)
-    merged_entries, next_cursor = _paginate_log_entries(merged_entries, limit)
-
-    entries: list[ExperimentLogEntry] = []
-    for raw in merged_entries:
-        try:
-            entries.append(ExperimentLogEntry(**raw))
-        except Exception:
-            # A malformed entry must not fail the whole response.
-            continue
-    return UnifiedLogsResponse(
-        count=len(entries), entries=entries, next_cursor=next_cursor,
-        source_errors=source_errors, truncated=scan.truncated,
-    )
-
-
-@app.get("/logs/trace/{reference:path}", response_model=LogTraceResponse)
-def get_log_trace(
-    reference: str,
-    limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
-    service: ExperimentService = Depends(get_experiment_service),
-) -> LogTraceResponse:
-    """Everything Nexus did for one order, from any reference to it.
-
-    *reference* may be an experiment/mailbox task/session/chat job id, an inbox
-    message filename, or a distinctive fragment; everything sharing the resolved
-    correlation ids comes back.
-
-    An unresolvable reference returns ``found: false`` with an empty timeline rather
-    than a 404: "I looked and found nothing" is a useful answer here.
-    """
-    try:
-        trace = log_trace_module.resolve_trace(
-            service.experiment_log_dir, reference, limit=limit,
-        )
-    except OSError as exc:
-        _logger.error("log trace read failed: %s", _sanitized_reason(str(exc)))
-        raise HTTPException(status_code=500, detail="log storage is unreadable") from exc
-
-    raw_entries = _apply_log_source(trace.entries)
-    entries: list[ExperimentLogEntry] = []
-    for raw in raw_entries:
-        try:
-            entries.append(ExperimentLogEntry(**raw))
-        except Exception:
-            # A malformed entry must not fail the whole trace.
-            continue
-
-    return LogTraceResponse(
-        reference=reference,
-        found=trace.found,
-        correlation_ids=trace.correlation_ids,
-        summary=log_trace_module.summarize(raw_entries),
-        count=len(entries),
-        entries=entries,
-        truncated=trace.truncated,
-    )
-
-
-@app.post("/experiments/{experiment_id}/adopt", response_model=ExperimentAdoptionStatus, status_code=202)
-def adopt_experiment(
-    experiment_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: ExperimentService = Depends(get_experiment_service),
-    adoption_service: ExperimentAdoptionService = Depends(get_experiment_adoption_service),
-) -> ExperimentAdoptionStatus:
-    authorize(x_api_key)
-    try:
-        experiment = service.resolve_experiment(experiment_id)
-    except ExperimentNotFoundError:
-        raise HTTPException(status_code=404, detail="experiment not found")
-    try:
-        adoption = adoption_service.start_adoption(experiment.id)
-    except ExperimentAdoptionError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc))
-    return ExperimentAdoptionStatus(**adoption.to_dict())
-
-
-@app.get("/experiments/{experiment_id}/adoption", response_model=ExperimentAdoptionStatus)
-def get_experiment_adoption(
-    experiment_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: ExperimentService = Depends(get_experiment_service),
-    adoption_service: ExperimentAdoptionService = Depends(get_experiment_adoption_service),
-) -> ExperimentAdoptionStatus:
-    authorize(x_api_key)
-    try:
-        experiment = service.resolve_experiment(experiment_id)
-    except ExperimentNotFoundError:
-        raise HTTPException(status_code=404, detail="experiment not found")
-    # Chosen contract: never 404 just because adoption was not started yet.
-    payload = adoption_service.get(experiment.id).to_dict()
-    payload["previous_failures"] = adoption_service.failure_history(experiment.id)
-    return ExperimentAdoptionStatus(**payload)
-
-
-@app.get("/operations/catalog", response_model=OperationsCatalogResponse)
-def get_operations_catalog(
-    x_api_key: str | None = Header(default=None),
-    operations_service: OperationsRegistry = Depends(get_operations_service),
-) -> OperationsCatalogResponse:
-    authorize(x_api_key)
-    operations = [OperationCatalogEntry(**entry.to_dict()) for entry in operations_service.catalog()]
-    return OperationsCatalogResponse(count=len(operations), operations=operations)
-
-
-@app.post("/operations/execute", response_model=OperationsExecuteResponse)
-def execute_operation(
-    request: OperationsExecuteRequest,
-    x_api_key: str | None = Header(default=None),
-    operations_service: OperationsRegistry = Depends(get_operations_service),
-) -> OperationsExecuteResponse:
-    authorize(x_api_key)
-    try:
-        result = operations_service.execute(
-            request.operation,
-            request.args.model_dump(exclude_none=True),
-            invocation_id=request.invocation_id,
-        )
-    except OperationValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return OperationsExecuteResponse(**result.to_dict())
-
 
 _PUBLIC_PHASES = {
     "queued": "queued", "selecting": "selecting", "implementing": "implementing",
@@ -1424,163 +657,12 @@ def _mailbox_task_id(service: ExperimentService, experiment_id: str) -> str | No
     return lookup(experiment_id) if lookup else None
 
 
-def _paginate_log_entries(
-    raw_entries: list[dict[str, Any]], limit: int
-) -> tuple[list[dict[str, Any]], str | None]:
-    """Split a *raw_entries* list fetched with ``limit + 1`` into ``limit`` entries
-    plus the ``next_cursor`` for the following (older) page, if any.
-
-    The cursor anchors to the oldest entry actually returned - not the look-ahead
-    entry - and is opaque, so entries sharing a timestamp at a page boundary are
-    never skipped or duplicated across "load older" calls.
-    """
-    if len(raw_entries) <= limit:
-        return raw_entries, None
-    page = raw_entries[-limit:] if limit > 0 else []
-    next_cursor = central_logging_module.encode_log_cursor(page[0]) if page else None
-    return page, next_cursor
-
-
-def _public_experiment_usage(experiment) -> dict[str, int | None] | None:
-    fields = ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens")
-    totals: dict[str, int | None] = {field: None for field in fields}
-    for usage in (
-        experiment.research_usage,
-        experiment.selection_usage,
-        experiment.reformat_retry_usage,
-        experiment.policy_replan_usage,
-        experiment.implementation_usage,
-    ):
-        if not isinstance(usage, dict):
-            continue
-        for field in fields:
-            value = usage.get(field)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                totals[field] = (totals[field] or 0) + int(value)
-    return totals if any(value is not None for value in totals.values()) else None
-
-
-def _public_experiment(experiment, mailbox_task_id: str | None) -> PublicExperimentSummary:
-    # Strict allowlist: never derive this response from to_dict/model_dump.
-    return PublicExperimentSummary(
-        id=experiment.id,
-        mailbox_task_id=mailbox_task_id,
-        phase=_public_phase(experiment.status),
-        status=experiment.status,
-        created_at=experiment.created_at,
-        ended_at=experiment.ended_at,
-        failure_reason=_failure_reason(experiment),
-        test_exit_code=experiment.test_exit_code,
-        changed_files=_changed_file_names(experiment.git_status),
-        test_summary=_test_summary(experiment),
-        usage=_public_experiment_usage(experiment),
-    )
-
-
-@app.get("/experiments/{experiment_id}/public", response_model=PublicExperimentSummary)
-def get_public_experiment(
-    experiment_id: str,
-    service: ExperimentService = Depends(get_experiment_service),
-) -> PublicExperimentSummary:
-    try:
-        experiment = service.resolve_public_experiment(experiment_id)
-    except ExperimentNotFoundError:
-        raise HTTPException(status_code=404, detail="experiment not found")
-    return _public_experiment(experiment, _mailbox_task_id(service, experiment.id))
-
-
 _SECRET_PATTERN = redaction._SECRET_PATTERN
 _PATH_PATTERN = redaction._PATH_PATTERN
 
 
 def _redact(text: str) -> str:
     return redaction.redact(text)
-
-
-def _diagnostic_lines(raw: str | None) -> list[str]:
-    """Return bounded, redacted test diagnostics; never return raw output."""
-    return redaction.bounded_lines(raw)
-
-
-def _sanitized_rejection_reason(raw: str | None) -> str | None:
-    """Bounded, redacted single-line rejection/error reason for diagnostics."""
-    return redaction.sanitized_reason(raw)
-
-
-
-@app.get("/activity/public", response_model=PublicActivityResponse)
-def list_public_activity(
-    service: ExperimentService = Depends(get_experiment_service),
-) -> PublicActivityResponse:
-    result = []
-    for entry in service.list_activity(limit=100):
-        try:
-            experiment = service.get_experiment(entry["entity_id"])
-        except ExperimentNotFoundError:
-            continue
-        status = entry.get("to_status") or experiment.status
-        result.append({
-            "timestamp": entry["timestamp"],
-            "phase": _public_phase(status),
-            "status": status,
-            "message": f"Experiment phase is {_public_phase(status)}.",
-            "mailbox_task_id": _mailbox_task_id(service, experiment.id),
-            "experiment_id": experiment.id,
-            "failure_reason": _failure_reason(experiment) if status in _PUBLIC_PHASES and _public_phase(status) in {"failed", "needs_review"} else None,
-            "test_exit_code": experiment.test_exit_code,
-            "changed_files": _changed_file_names(experiment.git_status),
-            "test_summary": _test_summary(experiment),
-        })
-    return PublicActivityResponse(count=len(result), activity=result)
-
-
-@app.get("/activity", response_model=DiagnosticActivityResponse)
-def list_activity(
-    x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=ACTIVITY_DEFAULT_LIMIT, ge=LIMIT_MIN, le=ACTIVITY_MAX_LIMIT),
-    experiment_id: str | None = Query(default=None),
-    mailbox_task_id: str | None = Query(default=None),
-    service: ExperimentService = Depends(get_experiment_service),
-) -> DiagnosticActivityResponse:
-    authorize(x_api_key)
-    if mailbox_task_id:
-        approval_service = _resolve_mailbox_task_service()
-        try:
-            approval = approval_service.get(mailbox_task_id)
-        except ApprovalNotFoundError:
-            return DiagnosticActivityResponse(count=0, activity=[])
-        if experiment_id and approval.experiment_id != experiment_id:
-            return DiagnosticActivityResponse(count=0, activity=[])
-        experiment_id = approval.experiment_id
-        if not experiment_id:
-            return DiagnosticActivityResponse(count=0, activity=[])
-    entries = service.list_activity(limit=limit, experiment_id=experiment_id)
-    diagnostics = []
-    for entry in entries:
-        experiment = service.get_experiment(entry["entity_id"])
-        diagnostics.append({
-            **entry,
-            "message": None,
-            "mailbox_task_id": _mailbox_task_id(service, experiment.id),
-            "phase": _public_phase(entry.get("to_status") or experiment.status),
-            "policy_rule": experiment.policy_rule,
-            "rejection_reason": _sanitized_rejection_reason(experiment.error),
-            "test_command": experiment.test_command,
-            "test_exit_code": experiment.test_exit_code,
-            "changed_files": _changed_file_names(experiment.git_status),
-            "test_output_lines": _diagnostic_lines(experiment.test_output),
-        })
-    return DiagnosticActivityResponse(count=len(diagnostics), activity=diagnostics)
-
-
-# GET /diagnostics/public: built exclusively from the explicit allowlist below, never
-# derived from to_dict()/model_dump() of internal records.
-# Excluded by construction: API keys, tokens, credentials, headers, prompts/task bodies,
-# env vars, source code/diffs/file contents, stack traces with internal paths, and
-# unrestricted/raw command output.
-
-DIAGNOSTICS_DEFAULT_LIMIT = 10
-DIAGNOSTICS_MAX_LIMIT = 100
 
 
 def _revisions_differ(startup: str | None, checkout: str | None) -> bool:
@@ -1597,229 +679,6 @@ def _deployment_time() -> str | None:
         )
     except Exception:
         return None
-
-
-def _phase_duration_ms(started_at: str | None, ended_at: str | None) -> int | None:
-    if not started_at or not ended_at:
-        return None
-    try:
-        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
-        return max(0, int((end - start).total_seconds() * 1000))
-    except (ValueError, TypeError):
-        return None
-
-
-def _experiment_lifecycle(experiment) -> list[dict[str, Any]]:
-    phases = (
-        ("research", experiment.research_started_at, experiment.research_ended_at),
-        ("selecting", experiment.selection_started_at, experiment.selection_ended_at),
-        ("implementing", experiment.implementation_started_at, experiment.implementation_ended_at),
-    )
-    lifecycle = []
-    for name, started_at, ended_at in phases:
-        if not started_at and not ended_at:
-            continue
-        lifecycle.append({
-            "phase": name,
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "duration_ms": _phase_duration_ms(started_at, ended_at),
-        })
-    return lifecycle
-
-
-def _aggregate_usage(experiment) -> dict[str, int] | None:
-    """Sum token usage across all phases; never returns raw prompts/messages."""
-    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    found = False
-    for usage in (
-        experiment.research_usage,
-        experiment.selection_usage,
-        experiment.reformat_retry_usage,
-        experiment.policy_replan_usage,
-        experiment.implementation_usage,
-    ):
-        if not usage:
-            continue
-        found = True
-        input_tokens = int(usage.get("input_tokens", 0) or 0)
-        output_tokens = int(usage.get("output_tokens", 0) or 0)
-        totals["input_tokens"] += input_tokens
-        totals["output_tokens"] += output_tokens
-        totals["total_tokens"] += int(usage.get("total_tokens", 0) or (input_tokens + output_tokens))
-    return totals if found else None
-
-
-def _estimated_cost(usage: dict[str, int] | None) -> dict[str, Any] | None:
-    """Best-effort estimated cost from configured model prices; omitted when unavailable."""
-    if not usage:
-        return None
-    provider = os.environ.get("AGENT_COST_PROVIDER", "azure")
-    model = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-    try:
-        conn = get_experiment_service()._conn  # same shared connection/db as run_store
-        price = get_applicable_price(conn, provider, model, datetime.now(timezone.utc).isoformat())
-    except Exception:
-        price = None
-    if not price:
-        return {"status": "unavailable"}
-    cost = calculate_estimated_cost(
-        usage["input_tokens"],
-        usage["output_tokens"],
-        price["input_price_per_million_tokens"],
-        price["output_price_per_million_tokens"],
-    )
-    return {"status": "ok", "amount": round(cost, 6), "currency": price["currency"]}
-
-
-def _diagnostic_experiment(service: ExperimentService, experiment) -> PublicDiagnosticExperiment:
-    diagnostic_messages = []
-    for entry in service.list_activity(limit=20, experiment_id=experiment.id):
-        message = redaction.sanitized_reason(entry.get("message"))
-        if message:
-            diagnostic_messages.append(message)
-
-    usage = _aggregate_usage(experiment)
-    return PublicDiagnosticExperiment(
-        id=experiment.id,
-        mailbox_task_id=_mailbox_task_id(service, experiment.id),
-        phase=_public_phase(experiment.status),
-        status=experiment.status,
-        created_at=experiment.created_at,
-        ended_at=experiment.ended_at,
-        lifecycle=_experiment_lifecycle(experiment),
-        rejection_reason=redaction.sanitized_reason(experiment.error),
-        policy_rule=experiment.policy_rule,
-        test_command=redaction.test_command_name(experiment.test_command),
-        test_exit_code=experiment.test_exit_code,
-        failure_summary=_failure_reason(experiment),
-        changed_files=_changed_file_names(experiment.git_status),
-        diagnostic_messages=diagnostic_messages[:20],
-        usage=usage,
-        estimated_cost=_estimated_cost(usage),
-    )
-
-
-def _diagnostic_mailbox_task(approval) -> PublicDiagnosticMailboxTask:
-    return PublicDiagnosticMailboxTask(
-        id=approval.id,
-        status=approval.status,
-        received_at=approval.received_at,
-        experiment_id=approval.experiment_id,
-    )
-
-
-# Operation Chain endpoints (authenticated, sequential operation execution).
-
-
-@app.post("/operations/chains", response_model=OperationChainResult, status_code=202)
-def start_operation_chain(
-    request: OperationChainRequest,
-    x_api_key: str | None = Header(default=None),
-    service: OperationChainService = Depends(get_operation_chain_service),
-) -> OperationChainResult:
-    authorize(x_api_key)
-    try:
-        result = service.start_chain(request)
-        return result
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid chain: {str(exc)}")
-
-
-@app.get("/operations/chains/{request_id}", response_model=OperationChainResult)
-def get_operation_chain(
-    request_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: OperationChainService = Depends(get_operation_chain_service),
-) -> OperationChainResult:
-    authorize(x_api_key)
-    result = service.get_chain(request_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Chain not found")
-    return result
-
-
-@app.get("/operations/chains", response_model=list[OperationChainResult])
-def list_operation_chains(
-    limit: int = Query(default=OPERATION_CHAINS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=OPERATION_CHAINS_MAX_LIMIT),
-    x_api_key: str | None = Header(default=None),
-    service: OperationChainService = Depends(get_operation_chain_service),
-) -> list[OperationChainResult]:
-    authorize(x_api_key)
-    return service.list_chains(limit=limit)
-
-
-@app.get("/diagnostics/public", response_model=PublicDiagnosticsResponse)
-def get_public_diagnostics(
-    limit: int = Query(default=DIAGNOSTICS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=DIAGNOSTICS_MAX_LIMIT),
-    service: ExperimentService = Depends(get_experiment_service),
-    mailbox_service: MailboxTaskService = Depends(get_mailbox_task_service),
-) -> PublicDiagnosticsResponse:
-    experiments = service.list_experiments(limit=limit)
-    diagnostic_experiments = [_diagnostic_experiment(service, exp) for exp in experiments]
-
-    try:
-        pending = mailbox_service.list_pending(limit=200)
-        recent = mailbox_service.list_recent(limit=limit)
-        mailbox_status = PublicDiagnosticMailboxStatus(
-            status="ok",
-            pending_count=len(pending),
-            latest_tasks=[_diagnostic_mailbox_task(a) for a in recent],
-        )
-    except Exception:
-        mailbox_status = PublicDiagnosticMailboxStatus(status="unavailable", pending_count=0, latest_tasks=[])
-
-    checkout_revision = _read_git_revision()
-    return PublicDiagnosticsResponse(
-        service=PublicDiagnosticServiceStatus(
-            status="ok",
-            git_revision=_STARTUP_REVISION,
-            checkout_revision=checkout_revision,
-            stale=_revisions_differ(_STARTUP_REVISION, checkout_revision),
-            deployment_time=_deployment_time(),
-        ),
-        mailbox=mailbox_status,
-        experiments=diagnostic_experiments,
-        problems=list_problems(),
-    )
-
-
-
-# Failure analysis (#145): manual inspection of stored diagnoses and on-demand
-# triggers; the automatic integrations live in modules/mailbox/, this surface is
-# for humans and scripts.
-
-FAILURE_ANALYSES_DEFAULT_LIMIT = 20
-FAILURE_ANALYSES_MAX_LIMIT = 100
-
-
-@app.get("/diagnostics/nexus/liveness", response_model=NexusLivenessResponse)
-def get_nexus_liveness(
-    x_api_key: str | None = Header(default=None),
-    stale_after_seconds: int | None = Query(default=None, ge=0),
-    store: NexusTaskStore = Depends(get_nexus_task_store),
-) -> NexusLivenessResponse:
-    """Who owns which controller work, and when it last reported itself alive.
-
-    Read-only: reports staleness but never reaps, so an operator can inspect a
-    suspect session without changing its state. ``stale_after_seconds`` is clamped
-    to the reaper's safe floor, so no query can make live work look dead (#162).
-    """
-    authorize(x_api_key)
-    snapshot = store.liveness(
-        stale_after_seconds if stale_after_seconds else _STALE_HEARTBEAT_SECONDS
-    )
-    return NexusLivenessResponse(
-        **{**snapshot, "claims": [NexusSessionClaim(**c) for c in snapshot["claims"]]}
-    )
-
-
-# Nexus diagnostics (#188): first-class read-only answers to "what happened to this
-# work?", resolved through the one shared backend (modules/nexus_diagnostics.py).
-
-DIAGNOSTIC_LOG_DEFAULT_LINES = nexus_diagnostics_module.DEFAULT_LOG_LINES
-DIAGNOSTIC_LOG_MAX_LINES = nexus_diagnostics_module.MAX_LOG_LINES
 
 
 def get_nexus_diagnostics() -> Iterator[nexus_diagnostics_module.NexusDiagnostics]:
@@ -1843,462 +702,186 @@ def get_nexus_diagnostics() -> Iterator[nexus_diagnostics_module.NexusDiagnostic
         diagnostics.close()
 
 
-def _diagnostic_report_response(
-    report: nexus_diagnostics_module.DiagnosticReport,
-) -> DiagnosticReportResponse:
-    return DiagnosticReportResponse(**report.to_dict())
+# Router wiring (#579): the routes live in api_routers/ by topic; this module
+# stays the single entry point - same app object, lifespan, /mcp mount and
+# service/dependency helpers - and re-exports every moved name. The routers
+# are included in the exact order the routes were registered on app before
+# the split, so path matching (fixed paths before /{...} paths) is unchanged.
+
+from fastapi.routing import APIRouter
+
+from api_routers import (
+    activity,
+    codex,
+    diagnostics,
+    experiments,
+    logs,
+    mailbox,
+    maintenance,
+    operations,
+)
+from api_routers import chat as chat_routes
+from api_routers import health as health_routes
+from api_routers import ideas as ideas_routes
+from api_routers import status as status_routes
 
 
-@app.get("/diagnostics/logs/service/{service}", response_model=DiagnosticServiceLogsResponse)
-async def get_diagnostic_service_logs(
-    service: str,
-    x_api_key: str | None = Header(default=None),
-    lines: int = Query(
-        default=nexus_diagnostics_module.DEFAULT_SERVICE_LINES,
-        ge=LIMIT_MIN,
-        le=DIAGNOSTIC_LOG_MAX_LINES,
-    ),
-    since_minutes: int | None = Query(default=None, ge=1, le=60 * 24 * 7),
-    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
-    log_reader: LogReader = Depends(get_log_reader),
-) -> DiagnosticServiceLogsResponse:
-    """Recent logs for one Nexus service, without constructing ``journalctl``.
+from api_routers.activity import (  # noqa: E402
+    ACTIVITY_DEFAULT_LIMIT,
+    ACTIVITY_MAX_LIMIT,
+    _diagnostic_lines,
+    _sanitized_rejection_reason,
+    list_activity,
+    list_public_activity,
+)
+from api_routers.chat import chat, get_chat_job  # noqa: E402
+from api_routers.codex import (  # noqa: E402
+    CODEX_DEFAULT_TIMEOUT_SECONDS,
+    CODEX_LIST_DEFAULT_LIMIT,
+    CODEX_LIST_MAX_LIMIT,
+    CODEX_LIST_PROMPT_PREVIEW_CHARS,
+    CODEX_MAX_TIMEOUT_SECONDS,
+    CODEX_SANDBOX,
+    CODEX_WORKING_DIR,
+    _prompt_preview,
+    create_codex_task,
+    get_codex_task,
+    list_codex_tasks,
+    run_codex_task,
+)
+from api_routers.diagnostics import (  # noqa: E402
+    DIAGNOSTIC_LOG_DEFAULT_LINES,
+    DIAGNOSTIC_LOG_MAX_LINES,
+    DIAGNOSTICS_DEFAULT_LIMIT,
+    DIAGNOSTICS_MAX_LIMIT,
+    FAILURE_ANALYSES_DEFAULT_LIMIT,
+    FAILURE_ANALYSES_MAX_LIMIT,
+    _aggregate_usage,
+    _diagnostic_experiment,
+    _diagnostic_mailbox_task,
+    _diagnostic_report_response,
+    _estimated_cost,
+    _experiment_lifecycle,
+    _phase_duration_ms,
+    get_diagnostic_last_failure,
+    get_diagnostic_llm_job,
+    get_diagnostic_logs,
+    get_diagnostic_service_logs,
+    get_diagnostic_status,
+    get_failure_analysis,
+    get_nexus_liveness,
+    get_public_diagnostics,
+    list_failure_analyses,
+    trigger_failure_analysis,
+)
+from api_routers.experiments import (  # noqa: E402
+    EXPERIMENTS_DEFAULT_LIMIT,
+    EXPERIMENTS_MAX_LIMIT,
+    _public_experiment,
+    _public_experiment_usage,
+    adopt_experiment,
+    cancel_experiment,
+    get_experiment,
+    get_experiment_adoption,
+    get_public_experiment,
+    list_experiments,
+)
+from api_routers.health import health, secure_health  # noqa: E402
+from api_routers.ideas import create_idea, ideas  # noqa: E402
+from api_routers.logs import (  # noqa: E402
+    EXPERIMENT_LOGS_DEFAULT_LIMIT,
+    EXPERIMENT_LOGS_MAX_LIMIT,
+    UNIFIED_LOGS_DEFAULT_LIMIT,
+    UNIFIED_LOGS_MAX_LIMIT,
+    _apply_log_source,
+    _derive_log_source,
+    _paginate_log_entries,
+    _CONTROLLER_SOURCE_PHASES,
+    _LOG_LEVELS,
+    _MAILBOX_SOURCE_PHASES,
+    _UNIFIED_LOGS_JOURNAL_LINES,
+    get_experiment_logs,
+    get_log_trace,
+    get_public_unified_logs,
+    get_unified_logs,
+)
+from api_routers.mailbox import (  # noqa: E402
+    MAILBOX_MESSAGES_DEFAULT_LIMIT,
+    MAILBOX_MESSAGES_MAX_LIMIT,
+    MAILBOX_TASKS_DEFAULT_LIMIT,
+    MAILBOX_TASKS_MAX_LIMIT,
+    _approval_to_response,
+    _inbox_entries,
+    _mailbox_preview,
+    _mailbox_type_label,
+    _outbox_entries,
+    _safe_mailbox_sender,
+    _MAILBOX_TYPE_LABELS_DE,
+    _SAFE_SENDER_RE,
+    get_mailbox_task,
+    list_mailbox_messages,
+    list_mailbox_tasks,
+    mailbox_github_webhook,
+)
+from api_routers.maintenance import (  # noqa: E402
+    get_maintenance_audit,
+    get_maintenance_status,
+    maintenance_execute,
+)
+from api_routers.operations import (  # noqa: E402
+    OPERATION_CHAINS_DEFAULT_LIMIT,
+    OPERATION_CHAINS_MAX_LIMIT,
+    _op_response,
+    execute_operation,
+    get_operation_chain,
+    get_operations_catalog,
+    list_operation_chains,
+    operations_context_env,
+    operations_context_set_config,
+    operations_git_commit_push,
+    operations_git_pull,
+    operations_git_status,
+    operations_healing_cleanup_temps,
+    operations_healing_diagnose,
+    operations_healing_fix_locks,
+    operations_llama_reload_model,
+    operations_logs_errors,
+    operations_logs_tail,
+    operations_models_status,
+    operations_models_test,
+    operations_services_restart,
+    operations_services_status,
+    start_operation_chain,
+)
+from api_routers.status import problems, status  # noqa: E402
 
-    *service* may be a friendly name (``api``, ``mailbox``, ``llm``) or a unit name;
-    anything unrecognized is validated as a unit name before use, so no caller can
-    smuggle a shell fragment through this route.
+def _include_router(router: APIRouter) -> None:
+    """Register *router*'s routes on the app, in the router's own order.
+
+    The routes are appended to ``app.router.routes`` directly - exactly what
+    ``@app.get(...)`` did before the split - so ``app.routes`` lists every
+    route in registration order. The routers are created with this app as
+    their ``dependency_overrides_provider``, so ``app.dependency_overrides``
+    keeps applying to their ``Depends(...)`` dependencies.
     """
-    authorize(x_api_key)
-    diagnostics.log_reader = log_reader
-    try:
-        result = await diagnostics.service_logs(
-            service, lines=lines, since_minutes=since_minutes
-        )
-    except nexus_diagnostics_module.DiagnosticsError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return DiagnosticServiceLogsResponse(**result.to_dict())
-
-
-@app.get("/diagnostics/logs/last-failure", response_model=DiagnosticReportResponse)
-def get_diagnostic_last_failure(
-    x_api_key: str | None = Header(default=None),
-    lines: int = Query(
-        default=DIAGNOSTIC_LOG_DEFAULT_LINES, ge=LIMIT_MIN, le=DIAGNOSTIC_LOG_MAX_LINES
-    ),
-    scan: int = Query(
-        default=nexus_diagnostics_module.DEFAULT_LAST_FAILURE_CANDIDATES,
-        ge=LIMIT_MIN,
-        le=nexus_diagnostics_module.MAX_LAST_FAILURE_CANDIDATES,
-    ),
-    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
-) -> DiagnosticReportResponse:
-    """The most recent failed *or stalled* work, with its error context.
-
-    Stalled counts: a process that died mid-run never wrote a ``failed`` row, so
-    searching explicit failures alone would miss exactly this case (#186/#187).
-    """
-    authorize(x_api_key)
-    try:
-        return _diagnostic_report_response(diagnostics.last_failure(lines=lines, scan=scan))
-    except nexus_diagnostics_module.DiagnosticsError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get("/diagnostics/llm-jobs/{job_id}", response_class=PlainTextResponse)
-def get_diagnostic_llm_job(
-    job_id: str,
-    x_api_key: str | None = Header(default=None),
-    view: str = Query(default="summary", pattern="^(summary|result|prompt)$"),
-    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
-) -> str:
-    """``nexus debug llm-job <id> [--result|--prompt]`` (#259), read-only.
-
-    Plain ``key: value`` lines, the same the ``nexus_llm_job`` operation returns.
-    """
-    authorize(x_api_key)
-    try:
-        job = diagnostics.llm_job(job_id)
-    except nexus_diagnostics_module.DiagnosticsError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return "\n".join(nexus_diagnostics_module.render_llm_job(job, view=view)) + "\n"
-
-
-@app.get("/diagnostics/status/{reference:path}", response_model=DiagnosticReportResponse)
-def get_diagnostic_status(
-    reference: str,
-    x_api_key: str | None = Header(default=None),
-    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
-) -> DiagnosticReportResponse:
-    """Lifecycle state for one piece of work, with no log bodies.
-
-    *reference* may be a mailbox task id, experiment id, controller session id,
-    issue or PR number (``188``, ``#188``, ``PR #195``), inbox filename, or a
-    unique prefix of any id.
-    """
-    authorize(x_api_key)
-    try:
-        return _diagnostic_report_response(diagnostics.status_report(reference))
-    except nexus_diagnostics_module.DiagnosticsError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get("/diagnostics/logs/{reference:path}", response_model=DiagnosticReportResponse)
-def get_diagnostic_logs(
-    reference: str,
-    x_api_key: str | None = Header(default=None),
-    lines: int = Query(
-        default=DIAGNOSTIC_LOG_DEFAULT_LINES, ge=LIMIT_MIN, le=DIAGNOSTIC_LOG_MAX_LINES
-    ),
-    diagnostics: nexus_diagnostics_module.NexusDiagnostics = Depends(get_nexus_diagnostics),
-) -> DiagnosticReportResponse:
-    """Lifecycle state *and* the bounded logs that explain it, for one reference.
-
-    Registered after the fixed ``/diagnostics/logs/service/...`` and
-    ``/diagnostics/logs/last-failure`` routes on purpose: a ``:path`` parameter
-    would otherwise swallow both.
-    """
-    authorize(x_api_key)
-    try:
-        return _diagnostic_report_response(diagnostics.diagnose(reference, lines=lines))
-    except nexus_diagnostics_module.DiagnosticsError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get("/diagnostics/failure-analyses", response_model=FailureAnalysesResponse)
-def list_failure_analyses(
-    x_api_key: str | None = Header(default=None),
-    limit: int = Query(default=FAILURE_ANALYSES_DEFAULT_LIMIT, ge=LIMIT_MIN, le=FAILURE_ANALYSES_MAX_LIMIT),
-    subject_type: str | None = Query(default=None),
-    subject_id: str | None = Query(default=None),
-    service: FailureAnalysisService = Depends(get_failure_analysis_service),
-) -> FailureAnalysesResponse:
-    authorize(x_api_key)
-    entries = service.list_recent(limit=limit, subject_type=subject_type, subject_id=subject_id)
-    return FailureAnalysesResponse(count=len(entries), analyses=entries)
-
-
-@app.get("/diagnostics/failure-analyses/{analysis_id}", response_model=FailureAnalysisEntry)
-def get_failure_analysis(
-    analysis_id: str,
-    x_api_key: str | None = Header(default=None),
-    service: FailureAnalysisService = Depends(get_failure_analysis_service),
-) -> FailureAnalysisEntry:
-    authorize(x_api_key)
-    entry = service.get(analysis_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="failure analysis not found")
-    return FailureAnalysisEntry(**entry)
-
-
-@app.post("/diagnostics/failure-analyses/analyze", response_model=FailureAnalysisEntry, status_code=201)
-def trigger_failure_analysis(
-    request: FailureAnalysisRequest,
-    x_api_key: str | None = Header(default=None),
-    service: FailureAnalysisService = Depends(get_failure_analysis_service),
-) -> FailureAnalysisEntry:
-    authorize(x_api_key)
-    if not request.experiment_id and not request.mailbox_task_id:
-        raise HTTPException(
-            status_code=400, detail="experiment_id or mailbox_task_id is required"
-        )
-    subject_id = request.experiment_id or request.mailbox_task_id
-    analysis = service.analyze_from_logs(
-        subject_type=request.subject_type,
-        subject_id=subject_id,
-        experiment_id=request.experiment_id,
-        mailbox_task_id=request.mailbox_task_id,
-        failure={"reason": request.reason or "manual analysis request"},
-    )
-    return FailureAnalysisEntry(**analysis.to_dict())
-
-
-@app.get("/logs/public", response_model=UnifiedLogsResponse)
-async def get_public_unified_logs(
-    level: str | None = Query(default=None),
-    phase: str | None = Query(default=None),
-    source: str | None = Query(default=None),
-    search: str | None = Query(default=None),
-    experiment_id: str | None = Query(default=None),
-    mailbox_task_id: str | None = Query(default=None),
-    job_id: str | None = Query(default=None),
-    session_id: str | None = Query(default=None),
-    cursor: str | None = Query(default=None),
-    limit: int = Query(default=UNIFIED_LOGS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=UNIFIED_LOGS_MAX_LIMIT),
-    include_journal: bool = Query(default=True),
-    service: ExperimentService = Depends(get_experiment_service),
-    log_reader: LogReader = Depends(get_log_reader),
-) -> UnifiedLogsResponse:
-    """Backwards-compatible alias of ``GET /logs`` - both return the identical,
-    complete timeline, and reading logs needs no API key (DECISIONS.md D-012).
-
-    Kept as a separate path only so existing clients keep working; it delegates
-    rather than maintaining a second read implementation that could drift.
-    """
-    return await get_unified_logs(
-        level=level,
-        phase=phase,
-        source=source,
-        search=search,
-        experiment_id=experiment_id,
-        mailbox_task_id=mailbox_task_id,
-        job_id=job_id,
-        session_id=session_id,
-        cursor=cursor,
-        limit=limit,
-        include_journal=include_journal,
-        service=service,
-        log_reader=log_reader,
-    )
-
-
-# All /maintenance/* endpoints require the normal X-Api-Key, a second
-# X-Maintenance-Token header, MAINTENANCE_ENABLED=true, and UTC time before
-# MAINTENANCE_EXPIRY (if set). Temporary remote-maintenance bridge - disable it
-# again after use (unset MAINTENANCE_ENABLED).
-
-
-@app.get("/maintenance/status", response_model=MaintenanceStatusResponse)
-def get_maintenance_status(
-    x_api_key: str | None = Header(default=None),
-    service: MaintenanceService = Depends(get_maintenance_service),
-) -> MaintenanceStatusResponse:
-    """Return whether the maintenance service is currently enabled."""
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    expiry = os.environ.get("MAINTENANCE_EXPIRY") or None
-    return MaintenanceStatusResponse(
-        enabled=service.is_enabled(),
-        expiry=expiry,
-    )
-
-
-@app.post("/maintenance/execute", response_model=MaintenanceExecuteResponse)
-def maintenance_execute(
-    body: MaintenanceExecuteRequest,
-    x_api_key: str | None = Header(default=None),
-    x_maintenance_token: str | None = Header(default=None),
-    service: MaintenanceService = Depends(get_maintenance_service),
-) -> MaintenanceExecuteResponse:
-    """Execute a named maintenance operation.
-
-    Returns the result as a JSON object; background operations (``run_router_test``,
-    ``run_tests``) return a ``task_id`` pollable via ``router_task_status`` /
-    ``test_task_status``.
-    """
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        result = service.execute(body.operation, x_maintenance_token, body.args)
-    except MaintenanceDisabledError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except MaintenanceAuthError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except MaintenanceOperationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return MaintenanceExecuteResponse(operation=body.operation, result=result)
-
-
-@app.get("/maintenance/audit", response_model=MaintenanceAuditResponse)
-def get_maintenance_audit(
-    x_api_key: str | None = Header(default=None),
-    service: MaintenanceService = Depends(get_maintenance_service),
-) -> MaintenanceAuditResponse:
-    """Return the in-memory maintenance audit log."""
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    entries = service.audit_log
-    return MaintenanceAuditResponse(
-        entries=[
-            {"timestamp": e.timestamp, "operation": e.operation,
-             "args": e.args, "outcome": e.outcome}
-            for e in entries
-        ],
-        total=len(entries),
-    )
-
-
-
-def _op_response(result, operation: str) -> OperationResponse:
-    from modules.operations_executor import OperationResult
-    return OperationResponse(
-        success=result.success,
-        status=result.status,
-        operation=operation,
-        timestamp=result.timestamp,
-        data=result.data,
-        error=result.error,
-        duration_ms=result.duration_ms,
-    )
-
-
-
-@app.post("/operations/git/pull", response_model=OperationResponse)
-async def operations_git_pull(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("git/pull", {})
-    return _op_response(result, "git/pull")
-
-
-@app.get("/operations/git/status", response_model=OperationResponse)
-async def operations_git_status(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("git/status", {})
-    return _op_response(result, "git/status")
-
-
-@app.post("/operations/git/commit-and-push", response_model=OperationResponse)
-async def operations_git_commit_push(
-    request: GitCommitPushRequest,
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute(
-        "git/commit-and-push",
-        {"message": request.message, "files": request.files},
-    )
-    return _op_response(result, "git/commit-and-push")
-
-
-
-@app.post("/operations/services/restart", response_model=OperationResponse)
-async def operations_services_restart(
-    request: ServiceRestartRequest,
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("services/restart", {"service": request.service})
-    return _op_response(result, "services/restart")
-
-
-@app.get("/operations/services/status", response_model=OperationResponse)
-async def operations_services_status(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("services/status", {})
-    return _op_response(result, "services/status")
-
-
-@app.post("/operations/services/llama/reload-model", response_model=OperationResponse)
-async def operations_llama_reload_model(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("services/llama/reload-model", {})
-    return _op_response(result, "services/llama/reload-model")
-
-
-
-@app.get("/operations/logs/tail", response_model=OperationResponse)
-async def operations_logs_tail(
-    service: str = Query(...),
-    lines: int = Query(default=50, ge=1, le=500),
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("logs/tail", {"service": service, "lines": lines})
-    return _op_response(result, "logs/tail")
-
-
-@app.get("/operations/logs/errors", response_model=OperationResponse)
-async def operations_logs_errors(
-    service: str = Query(...),
-    since_minutes: int = Query(default=60, ge=1, le=1440),
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute(
-        "logs/errors", {"service": service, "since_minutes": since_minutes}
-    )
-    return _op_response(result, "logs/errors")
-
-
-
-@app.post("/operations/healing/fix-locks", response_model=OperationResponse)
-async def operations_healing_fix_locks(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("healing/fix-locks", {})
-    return _op_response(result, "healing/fix-locks")
-
-
-@app.post("/operations/healing/cleanup-temps", response_model=OperationResponse)
-async def operations_healing_cleanup_temps(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("healing/cleanup-temps", {})
-    return _op_response(result, "healing/cleanup-temps")
-
-
-@app.get("/operations/healing/diagnose", response_model=OperationResponse)
-async def operations_healing_diagnose(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("healing/diagnose", {})
-    return _op_response(result, "healing/diagnose")
-
-
-
-@app.get("/operations/models/status", response_model=OperationResponse)
-async def operations_models_status(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("models/status", {})
-    return _op_response(result, "models/status")
-
-
-@app.post("/operations/models/test", response_model=OperationResponse)
-async def operations_models_test(
-    request: LlamaModelTestRequest,
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute(
-        "models/test", {"model": request.model, "prompt": request.prompt}
-    )
-    return _op_response(result, "models/test")
-
-
-
-@app.get("/operations/context/env", response_model=OperationResponse)
-async def operations_context_env(
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute("context/env", {})
-    return _op_response(result, "context/env")
-
-
-@app.post("/operations/context/set-config", response_model=OperationResponse)
-async def operations_context_set_config(
-    request: SetConfigRequest,
-    x_api_key: str | None = Header(default=None),
-    executor: OperationsExecutor = Depends(get_operations_executor),
-) -> OperationResponse:
-    authorize(x_api_key)
-    result = await executor.execute(
-        "context/set-config", {"key": request.key, "value": request.value}
-    )
-    return _op_response(result, "context/set-config")
+    app.router.routes.extend(router.routes)
+    app.router._mark_routes_changed()
+
+
+_include_router(health_routes.router)
+_include_router(status_routes.router)
+_include_router(ideas_routes.router)
+_include_router(chat_routes.router)
+_include_router(codex.router)
+_include_router(mailbox.router)
+_include_router(experiments.router)
+_include_router(logs.router)
+_include_router(experiments.adoption_router)
+_include_router(operations.registry_router)
+_include_router(experiments.public_router)
+_include_router(activity.router)
+_include_router(operations.chains_router)
+_include_router(diagnostics.router)
+_include_router(logs.public_router)
+_include_router(maintenance.router)
+_include_router(operations.executor_router)
