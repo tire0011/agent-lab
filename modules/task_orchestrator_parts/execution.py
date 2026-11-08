@@ -221,7 +221,8 @@ class ExecutionMixin:
                 "result": result[:4000],
                 "message": (
                     "No known runtime mapping exists for this executable. Use python_run for Python, "
-                    "select another capability, or choose missing_capability. Do not repeat this command "
+                    "install its Ubuntu package with the install_tool operation, select another capability, "
+                    "or choose missing_capability. Do not repeat this command "
                     "and do not repeat memory searches for it."
                 ),
             }
@@ -684,5 +685,17 @@ class ExecutionMixin:
                 encoding="utf-8",
             )
         except OSError:
-            return
+            pass
+        # Tell the owner, not just a file on the VM (#592).
+        try:
+            self.operations_registry.execute(
+                "request_from_owner",
+                {
+                    "title": (decision.message or decision.reason or "missing capability").splitlines()[0][:150],
+                    "body": f"## Need\n\n{decision.message[:3000]}\n\n## Why\n\n{decision.reason[:1000]}"
+                    f"\n\n## Task\n\n{task[:2000]}",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("missing_capability: could not open the need issue", exc_info=True)
 

@@ -107,7 +107,7 @@ def test_prompt_keeps_local_model_as_real_development_path():
     assert "Own the task" in prompt
     assert "Repository code changes of any size go through new_experiment" in prompt
     assert "Use command or python_run for machine work and for reading" in prompt
-    assert "find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart and machine_reboot)" in prompt
+    assert "find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart, machine_reboot, install_tool and request_from_owner)" in prompt
     assert "Development path for every repository code change, small ones included" in prompt
     # Both execution capabilities carry the same boundary; the controller picks
     # actions from these descriptions, not only from the rules (#263).

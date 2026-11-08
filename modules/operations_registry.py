@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -33,6 +34,8 @@ _LOCAL_MODEL_RESTART_POLL_SECONDS = 2.0
 # machine_reboot (#319): handed to a transient systemd unit so the reply can
 # still be written before the machine goes down. The sudoers rule from
 # scripts/setup-nexus-permissions.sh allows exactly this command.
+INSTALL_TOOL_COMMAND = ("sudo", "-n", "/usr/local/sbin/nexus-install-tool")
+_PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{1,62}$")
 MACHINE_REBOOT_COMMAND = ("sudo", "-n", "systemd-run", "--collect", "--on-active=60", "systemctl", "reboot")
 # Experiment statuses that a reboot would interrupt. Queued work has not
 # started and remains durable across a reboot, so it must not prevent one.
@@ -324,6 +327,28 @@ class OperationsRegistry:
                 "Die VM in 60 Sekunden neu starten, z. B. nach einem Ubuntu-Update. "
                 "Wird verweigert, solange ein Experiment aktiv ist.",
                 tags=["machine", "vm", "host", "reboot", "restart", "update", "ubuntu", "system"],
+                mutates_state=True,
+                controller_allowed=True,
+            ),
+            "install_tool": OperationSpec(
+                "install_tool",
+                "Ein fehlendes Werkzeug als Ubuntu-Paket installieren (apt, z. B. ripgrep für rg). "
+                "Dienste, Container und Rechte-Pakete stehen auf einer Sperrliste.",
+                [OperationArgSpec("package", "string", "Name des Ubuntu-Pakets.", required=True)],
+                ["install", "tool", "package", "apt", "missing", "executable", "command not found", "capability"],
+                mutates_state=True,
+                controller_allowed=True,
+            ),
+            "request_from_owner": OperationSpec(
+                "request_from_owner",
+                "Den Owner per GitHub-Issue um etwas bitten, das Nexus selbst nicht bekommt "
+                "(API-Key, mehr RAM/GPU, gesperrtes Paket, Repo-Einstellung, Budget). "
+                "Höchstens 3 neue am Tag; ein offenes Issue mit gleichem Titel wird wiederverwendet.",
+                [
+                    OperationArgSpec("title", "string", "Kurz: was gebraucht wird.", required=True),
+                    OperationArgSpec("body", "string", "Wofür, was schon versucht wurde, was der Owner tun soll.", required=True),
+                ],
+                ["owner", "request", "need", "blocked", "missing", "capability", "issue", "proposal", "key", "budget"],
                 mutates_state=True,
                 controller_allowed=True,
             ),
@@ -740,6 +765,38 @@ class OperationsRegistry:
             _ACTIVE_EXPERIMENT_STATUSES,
         ).fetchall()
         return [row["id"] for row in rows]
+
+    def _op_install_tool(self, args: dict[str, Any]) -> OperationResult:
+        package = str(args.get("package") or "")
+        if not _PACKAGE_NAME.match(package):
+            raise OperationValidationError("install_tool braucht genau einen Ubuntu-Paketnamen.")
+        result = self._run_command([*INSTALL_TOOL_COMMAND, package], timeout=600)
+        result.operation = "install_tool"
+        if result.exit_code == 3:
+            result.output_lines = [*result.output_lines, "denied: ask the owner with request_from_owner if you need it"]
+        return result
+
+    def _op_request_from_owner(self, args: dict[str, Any]) -> OperationResult:
+        title = " ".join(str(args.get("title") or "").split())
+        body = str(args.get("body") or "").strip()
+        if not title or not body:
+            raise OperationValidationError("request_from_owner braucht title und body.")
+        started = time.perf_counter()
+        service = self.github_work_tracking_factory(db_path=self.db_path, repo_root=str(self.repo_root))
+        try:
+            issue = service.open_need_issue(title, redact(body))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult("request_from_owner", False, [], int((time.perf_counter() - started) * 1000),
+                                   error_summary=sanitized_reason(str(exc)))
+        finally:
+            close = getattr(service, "close", None)
+            if callable(close):
+                close()
+        state = "reused" if issue.get("reused") else "opened"
+        return OperationResult(
+            "request_from_owner", True, [f"issue #{issue.get('number')} {state}: {issue.get('url')}"],
+            int((time.perf_counter() - started) * 1000),
+        )
 
     def _op_machine_reboot(self, args: dict[str, Any]) -> OperationResult:
         if args:
