@@ -1554,6 +1554,76 @@ class GitHubWorkTrackingService:
             {"title": title, "body": body},
         )
 
+    def ensure_capability_issue(
+        self,
+        *,
+        capability: str,
+        missing_executable: str,
+        attempted_command: str,
+        recovery: str,
+        installation_attempted: bool = False,
+        origin: str | None = None,
+        display_name: str | None = None,
+        suggested_solution: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or reuse one open issue for a durable missing capability.
+
+        Exact normalized titles provide remote deduplication across processes;
+        the capability key is included in the body for durable identity and
+        later automation.  Failure is intentionally left to the caller to
+        report without blocking its fallback.
+        """
+        self.require_lifecycle_ready()
+        identity = _slug(capability or missing_executable, max_len=80)
+        title = f"Provide {capability} when {display_name or missing_executable} is unavailable"[:240]
+        existing = self._find_exact_open_issue(title)
+        if existing is not None:
+            return {
+                "number": int(existing.get("number") or 0),
+                "url": str(existing.get("html_url") or existing.get("url") or ""),
+                "created": False,
+                "capability_key": identity,
+            }
+        body = "\n".join(
+            [
+                "Created automatically by Nexus after a durable runtime capability gap.",
+                "",
+                f"Capability key: `{identity}`",
+                f"Requested capability: {capability}",
+                f"Missing executable/tool: `{missing_executable}`",
+                f"Attempted command: `{attempted_command[:2000]}`",
+                f"Fallback/recovery chosen: {recovery}",
+                f"Installation attempted: {'yes' if installation_attempted else 'no'}",
+                f"Originating Nexus task/session/experiment: {origin or 'not available'}",
+                "",
+                "Suggested durable solution: "
+                + (
+                    suggested_solution
+                    or "provide the executable on the Nexus VM or expose this capability through OperationsRegistry/tool routing."
+                ),
+                "",
+                "Nexus comments and closes this issue once the capability is available.",
+            ]
+        )
+        created = self._request(
+            "POST", f"/repos/{self.repository}/issues", {"title": title, "body": body}
+        )
+        return {
+            "number": int(created.get("number") or 0),
+            "url": str(created.get("html_url") or created.get("url") or ""),
+            "created": True,
+            "capability_key": identity,
+        }
+
+    def resolve_capability_issue(self, number: int, *, note: str) -> None:
+        """Comment why a capability gap is gone and close its issue (#120)."""
+        self.require_lifecycle_ready()
+        path = f"/repos/{self.repository}/issues/{int(number)}"
+        if str((self._request("GET", path) or {}).get("state")) == "closed":
+            return
+        self.comment(int(number), note)
+        self._request("PATCH", path, {"state": "closed", "state_reason": "completed"})
+
     def _ensure_branch(self, branch_name: str) -> None:
         quoted = urllib.parse.quote(branch_name, safe="")
         try:

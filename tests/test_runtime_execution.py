@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from modules.runtime_execution import (
     INTERPRETER_ENV_VAR,
@@ -13,8 +14,21 @@ from modules.runtime_execution import (
     build_python_command,
     classify_command_failure,
     corrected_command,
+    equivalent_command,
     resolve_python_interpreter,
 )
+
+
+class EquivalentCommandTests(unittest.TestCase):
+    def test_rg_has_bounded_grep_equivalent_when_available(self):
+        with patch("modules.runtime_execution.shutil.which", return_value="/usr/bin/grep"):
+            recovered = equivalent_command(
+                'rg -n -C 4 "VERSION" agent.py tests', missing_executable="rg"
+            )
+        self.assertEqual(recovered, (
+            'grep -R -E -n -C 4 "VERSION" agent.py tests',
+            "repository text search: rg -> grep -R -E",
+        ))
 
 
 def _make_executable(path: Path) -> Path:

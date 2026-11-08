@@ -1127,6 +1127,45 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertTrue(retried.startswith(self._interpreter()))
         self.assertIn("agent.py --version", retried)
 
+    def test_missing_rg_uses_fallback_tracks_gap_and_continues(self):
+        client = _Client([])
+        orchestrator = self._orchestrator(client)
+
+        class CapabilityIssues:
+            calls = []
+            def ensure_capability_issue(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"number": 1200, "url": "https://example/issues/1200", "created": True}
+            def close(self):
+                pass
+
+        issue_service = CapabilityIssues()
+        orchestrator.operations_registry.github_work_tracking_factory = lambda **_kwargs: issue_service
+        try:
+            with _patch_orchestrator(
+                "process_command",
+                side_effect=[
+                    ("exit_code: 127\nstderr:\nrg: command not found", None),
+                    ("exit_code: 0\nstdout:\nagent.py:10:VERSION = '1'", None),
+                ],
+            ) as command_mock, patch(
+                "modules.runtime_execution.shutil.which", return_value="/usr/bin/grep"
+            ):
+                observation = orchestrator._run_command_with_recovery(
+                    "rg -n VERSION agent.py",
+                    tool="command",
+                    extra={"session_id": "rg-session"},
+                )
+        finally:
+            orchestrator.close()
+
+        self.assertEqual(command_mock.call_count, 2)
+        self.assertTrue(command_mock.call_args.args[0].body.startswith("grep -R -E"))
+        self.assertEqual(observation["recovery"]["choice"], "existing_equivalent")
+        self.assertEqual(observation["recovery"]["capability_issue"]["status"], "created")
+        self.assertEqual(issue_service.calls[0]["missing_executable"], "rg")
+        self.assertEqual(issue_service.calls[0]["origin"], "rg-session")
+
     def test_python_run_uses_the_resolved_interpreter_and_preserves_arguments(self):
         client = _Client([
             '{"type":"tool","tool":"python_run","script":"agent.py","argv":["--version"],'
