@@ -1,10 +1,7 @@
-"""The operation contract: what a capability declares, takes and returns.
-
-Split out of ``operations_registry`` to break an import cycle with
-``nexus_tool_router``. It must stay a leaf - pure data and validation, no
-project imports - or the cycle comes back. The registry re-exports these, so
-``from modules.operations_registry import OperationSpec`` keeps working.
-"""
+"""The operation contract: what a capability declares, takes and returns. Split out of
+``operations_registry`` to break an import cycle with ``nexus_tool_router``; must stay a leaf
+(pure data and validation, no project imports) or the cycle comes back. The registry
+re-exports these, so ``from modules.operations_registry import OperationSpec`` keeps working."""
 
 from __future__ import annotations
 
@@ -40,15 +37,11 @@ class OperationArgSpec:
 
 @dataclass(slots=True)
 class OperationSpec:
-    """One capability's metadata, including whether calling it can change state.
-
-    ``mutates_state`` has no default on purpose: a read-only role filters on
-    it, so an operation that forgets to declare it must fail to construct
-    rather than default to safe.
-
-    ``controller_allowed`` lets the task controller find and call one mutating
-    operation; every other read-only role still sees only ``mutates_state=False``.
-    """
+    """One capability metadata, including whether calling it can change state. ``mutates_state``
+    has no default on purpose: a read-only role filters on it, so an operation that forgets to
+    declare it must fail to construct rather than default to safe. ``controller_allowed`` lets the
+    task controller find and call one mutating operation; every other read-only role still sees
+    only ``mutates_state=False``."""
 
     name: str
     description: str

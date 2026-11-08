@@ -1,29 +1,12 @@
-"""Dedicated per-test log and test heartbeat file for verification runs (#209).
-
-The global Nexus feed (``modules.central_logging``) is what an operator reads
-to follow an experiment: intake, planning, implementation, verification,
-adoption. A suite of ~1900 tests would add ~3800 entries per verification run
-to it, which does not make the run more observable - it makes everything else
-unreadable. So per-test detail gets its own durable file, in its own
-subdirectory:
-
-``<log_dir>/test-runs/test-<run_id>.jsonl``
-    one JSON object per test start and per test completion.
-
-``<log_dir>/test-runs/test-<run_id>.heartbeat.json``
-    the current test heartbeat, rewritten atomically on every watchdog tick,
-    so a second process (a diagnostic command, a human with ``cat``) can see
-    what the test run is doing without reading the whole log.
-
-The subdirectory is what keeps the two apart: the unified feed globs
-``*.jsonl`` in the log directory itself and does not recurse, so these files
-are never merged into it. What *does* reach the global feed is the periodic
-progress summary the runner emits through the caller's own logger - one entry
-per watchdog tick, not per test.
-
-Like ``central_logging``, nothing in here may break a test run: every public
-method swallows its own I/O errors and reports them through stdlib logging.
-"""
+"""Dedicated per-test log and test heartbeat file for verification runs (#209). The global feed
+(``modules.central_logging``) is what an operator follows; a ~1900-test suite would add ~3800 entries
+per run to it, making everything else unreadable, so per-test detail gets its own durable files in
+its own subdirectory: ``<log_dir>/test-runs/test-<run_id>.jsonl`` (one JSON object per test start and
+completion) and ``<log_dir>/test-runs/test-<run_id>.heartbeat.json`` (current heartbeat, rewritten
+atomically each watchdog tick so another process can see what the run is doing). The subdirectory
+keeps them out of the unified feed - it globs ``*.jsonl`` in the log dir itself, no recursion; only
+the periodic progress summary reaches the global feed. Like ``central_logging``, nothing here may
+break a test run: every public method swallows its own I/O errors and reports via stdlib logging."""
 
 from __future__ import annotations
 
@@ -45,13 +28,12 @@ TEST_LOG_SUBDIR = "test-runs"
 TEST_LOG_PREFIX = "test-"
 TEST_LOG_DIR_ENV_VAR = "NEXUS_TEST_LOG_DIR"
 
-# A verification run writes two entries per test; ~1900 tests is well under a
-# megabyte. The ceiling only exists so a pathological run (a test looping on
-# output) cannot fill the disk.
+# A verification run writes two entries per test (~1900 tests is well under a megabyte); the
+# ceiling exists only so a pathological run (a test looping on output) cannot fill the disk.
 DEFAULT_MAX_TEST_LOG_BYTES = 32 * 1024 * 1024
 
-# How many past test-run logs are kept. Enough to compare a stalled run with
-# the last few healthy ones, bounded so the directory cannot grow forever.
+# How many past test-run logs are kept: enough to compare a stalled run with the last few healthy
+# ones, bounded so the directory cannot grow forever.
 DEFAULT_KEEP_TEST_LOGS = 50
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -59,13 +41,9 @@ _UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def resolve_test_log_dir(env: dict[str, str] | None = None) -> str:
-    """Where per-test logs are written.
-
-    ``NEXUS_TEST_LOG_DIR`` overrides it outright; otherwise it is the
-    ``test-runs`` subdirectory of whatever ``resolve_log_dir`` resolves to, so
-    a test run's detail always lands next to - but never inside - the
-    experiment logs of the same deployment.
-    """
+    """Where per-test logs are written: ``NEXUS_TEST_LOG_DIR`` overrides outright, otherwise the
+    ``test-runs`` subdirectory of whatever ``resolve_log_dir`` resolves to - next to, but never inside,
+    the experiment logs of the same deployment."""
     source = os.environ if env is None else env
     explicit = (source.get(TEST_LOG_DIR_ENV_VAR) or "").strip()
     if explicit:
@@ -78,8 +56,8 @@ def safe_run_id(value: object) -> str:
     text = str(value or "").strip()
     if _SAFE_ID_RE.fullmatch(text):
         return text
-    # Dots are legal in a run id but must not be able to start one: a
-    # name like "../../etc/passwd" has to become a plain file name here.
+    # Dots are legal in a run id but must not start one: "../../etc/passwd" has to become a plain
+    # file name here.
     cleaned = _UNSAFE_CHARS_RE.sub("-", text).strip("-.")[:128]
     return cleaned or "unknown"
 
@@ -111,9 +89,7 @@ class VerificationTestLog:
     def path(self) -> Path:
         return self._path
 
-    # ------------------------------------------------------------------
     # writing
-    # ------------------------------------------------------------------
 
     def log_run_event(self, event: str, message: str, **extra: Any) -> None:
         """A run-level event (started, finished, stalled, safety cap, ...)."""
@@ -142,12 +118,8 @@ class VerificationTestLog:
         })
 
     def write_heartbeat(self, snapshot: dict[str, Any]) -> None:
-        """Replace the heartbeat file atomically.
-
-        Atomically, because a reader must never see half a heartbeat and
-        conclude the run is broken: the temporary file is written and replaced
-        in one ``os.replace``.
-        """
+        """Replace the heartbeat file atomically (temp file + one ``os.replace``) - a reader must never
+        see half a heartbeat and conclude the run is broken."""
         if self._disabled:
             return
         payload = dict(snapshot)
@@ -168,9 +140,7 @@ class VerificationTestLog:
             except OSError:  # pragma: no cover - best effort cleanup
                 pass
 
-    # ------------------------------------------------------------------
     # internals
-    # ------------------------------------------------------------------
 
     def _append(self, entry: dict[str, Any]) -> None:
         if self._disabled:
@@ -209,11 +179,8 @@ def prune_test_logs(
     *,
     keep: int = DEFAULT_KEEP_TEST_LOGS,
 ) -> int:
-    """Delete all but the *keep* newest test runs. Returns how many went.
-
-    Both the ``.jsonl`` and its ``.heartbeat.json`` are removed together, so a
-    heartbeat can never outlive the log it summarizes.
-    """
+    """Delete all but the *keep* newest test runs, returning how many went; the ``.jsonl`` and its
+    ``.heartbeat.json`` are removed together so a heartbeat never outlives the log it summarizes."""
     directory = Path(log_dir) if log_dir is not None else Path(resolve_test_log_dir())
     try:
         logs = sorted(
@@ -240,17 +207,11 @@ def global_heartbeat_bridge(
     *,
     event: str = "test_progress",
 ) -> Any:
-    """Build an ``on_heartbeat`` callback that publishes to the global log.
-
-    This is the propagation the global Nexus heartbeat needs. While local
-    verification runs, the experiment's own log keeps receiving one entry per
-    watchdog tick, and that entry is what
-    :func:`modules.nexus_diagnostics.assess_progress` reads as "this work is
-    alive and moving" - the same contract every other long-running Nexus
-    subsystem uses. Only the summary crosses over: the per-test entries stay
-    in the dedicated test log, so the global feed gains one line a minute
-    rather than two per test.
-    """
+    """Build an ``on_heartbeat`` callback that publishes to the global log - the propagation the global
+    Nexus heartbeat needs: while verification runs, the experiment log receives one entry per watchdog
+    tick, which is what :func:`modules.nexus_diagnostics.assess_progress` reads as "alive and moving".
+    Only the summary crosses over; per-test entries stay in the dedicated test log, so the global feed
+    gains one line a minute rather than two per test."""
 
     def _publish(snapshot: dict[str, Any]) -> None:
         completed = snapshot.get("tests_completed")

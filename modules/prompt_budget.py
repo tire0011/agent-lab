@@ -1,20 +1,11 @@
-"""Prompt budget for the persistent Nexus controller, bounded by the context window.
-
-The controller resends its observations every turn, so an unbounded prompt
-would outgrow the model's context window. The window is the one hard limit:
-llama-server allocates its KV cache for ``n_ctx`` up front, and on the VM a
-full-context prompt costs ~109 MB more RSS than a tiny one, once (#230). Host
-memory is therefore reported as a signal (``low_memory``,
-``safe_local_budget_chars``) and never shrinks the budget or gates a local
-call.
-
-The sections that are not compacted - the rules and the capability catalog -
-are passed in as their measured length (``fixed_chars``), not guessed as a
-share. What remains goes to the current input, the observations and, last,
-the persisted (and re-readable) history.
-
-Kept dependency-free so it stays unit testable.
-"""
+"""Prompt budget for the persistent Nexus controller, bounded by the context window: the
+controller resends its observations every turn, so an unbounded prompt would outgrow it. The
+window is the one hard limit (llama-server allocates its KV cache for ``n_ctx`` up front; a
+full-context prompt costs ~109 MB more RSS on the VM, #230), so host memory is only reported as
+a signal (``low_memory``, ``safe_local_budget_chars``) and never shrinks the budget or gates a
+local call. Non-compacted sections (rules, capability catalog) are passed in as their measured
+length (``fixed_chars``); what remains goes to the current input, the observations and, last, the
+persisted (re-readable) history. Dependency-free so it stays unit testable."""
 
 from __future__ import annotations
 
@@ -31,18 +22,17 @@ from modules.tool_result_reader import read_hint
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEMINFO_PATH = "/proc/meminfo"
-# Conservative estimate for English/code text; used only for logging and
-# coarse budgeting, never for exact tokenizer-accurate truncation.
+# Conservative estimate for English/code text; used only for logging and coarse budgeting,
+# never for exact tokenizer-accurate truncation.
 CHARS_PER_TOKEN = 4
 
-# Shares of the *variable* room (budget minus the measured fixed sections).
-# The current input is capped, history keeps a small reserved floor, and the
-# observations get everything else - they carry the answer to the current
-# task, while history is persisted and can be re-read.
+# Shares of the *variable* room (budget minus the measured fixed sections): the current
+# input is capped, history keeps a small reserved floor, observations get the rest - they
+# carry the answer to the current task, while history is persisted and re-readable.
 INPUT_SHARE = 0.20
 HISTORY_FLOOR_SHARE = 0.10
-# Below this much variable room a controller cannot see its own tool results
-# and would loop; it fails loudly instead of running blind (#230).
+# Below this much variable room a controller cannot see its own tool results and would loop;
+# it fails loudly instead of running blind (#230).
 MIN_VARIABLE_CHARS = 2000
 
 
@@ -58,32 +48,21 @@ def _env_int(name: str, default: int) -> int:
 
 
 def read_mem_available_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
-    """Best-effort read of ``MemAvailable`` (kB) from ``/proc/meminfo``.
-
-    Returns ``None`` when the file is missing/unreadable so callers can fall
-    back to context-window-only budgeting instead of failing.
-    """
+    """Best-effort read of ``MemAvailable`` (kB) from /proc/meminfo; ``None`` when missing or
+    unreadable, so callers fall back to context-window-only budgeting instead of failing."""
     return _read_meminfo_field(meminfo_path, "MemAvailable")
 
 
 def read_swap_free_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
-    """Best-effort read of ``SwapFree`` (kB) from ``/proc/meminfo``.
-
-    Low/absent swap is an additional low-memory signal: a host relying on
-    swap to absorb an inference spike is already close to OOM pressure even
-    if ``MemAvailable`` alone looks tolerable. Meaningful only when swap is
-    actually configured; see ``read_swap_total_kb``.
-    """
+    """Best-effort read of ``SwapFree`` (kB) from /proc/meminfo. Low/absent swap is an extra
+    low-memory signal only when swap is actually configured (see ``read_swap_total_kb``) - a host
+    without swap reports ``SwapFree: 0`` forever, which is not itself pressure."""
     return _read_meminfo_field(meminfo_path, "SwapFree")
 
 
 def read_swap_total_kb(meminfo_path: str = DEFAULT_MEMINFO_PATH) -> int | None:
-    """Best-effort read of ``SwapTotal`` (kB) from ``/proc/meminfo``.
-
-    A host without swap configured always reports ``SwapFree: 0``, which is
-    not itself a low-memory signal; callers must check ``SwapTotal > 0``
-    before treating a low ``SwapFree`` reading as pressure.
-    """
+    """Best-effort read of ``SwapTotal`` (kB) from /proc/meminfo; callers must check
+    ``SwapTotal > 0`` before treating a low ``SwapFree`` as pressure."""
     return _read_meminfo_field(meminfo_path, "SwapTotal")
 
 
@@ -104,19 +83,12 @@ def _read_meminfo_field(meminfo_path: str, field: str) -> int | None:
 
 @dataclass(slots=True)
 class PromptBudgetPlan:
-    """One budget computation, used both for prompt sizing and for logging.
-
-    ``effective_budget_chars`` is the whole rendered prompt, bounded by the
-    context window minus the reserved output. It splits into
-    ``fixed_chars`` (measured, never compacted) and ``variable_chars``,
-    which in turn splits into ``current_input_chars`` (a cap),
-    ``observation_chars`` and ``history_chars`` (a reserved floor; history
-    also gets whatever the observations leave unused). For a plan that is
-    not ``starved`` the four sections sum to ``effective_budget_chars``.
-
-    The memory fields are advisory signals only: they are logged and
-    reported, and never shrink a section or gate a local call (#230).
-    """
+    """One budget computation, used for prompt sizing and logging: ``effective_budget_chars``
+    (context window minus reserved output) splits into measured ``fixed_chars`` (never compacted)
+    and ``variable_chars``, which splits into ``current_input_chars`` (a cap), ``observation_chars``
+    and ``history_chars`` (a reserved floor; history also gets what observations leave unused). For
+    a non-starved plan the four sum to ``effective_budget_chars``. The memory fields are advisory
+    signals only - logged and reported, never applied (#230)."""
 
     model_context_tokens: int
     reserved_output_tokens: int
@@ -183,18 +155,12 @@ def compute_budget(
     kb_per_input_token: int | None = None,
     chars_per_token: int = CHARS_PER_TOKEN,
 ) -> PromptBudgetPlan:
-    """Compute the prompt budget from the context window.
-
-    ``fixed_chars`` is the measured length of every prompt section that is
-    rendered in full (rules, capability catalog, framing). It is subtracted
-    as-is; only the remainder is shared between input, observations and
-    history.
-
-    Host memory is read only to report pressure. It does not change any
-    section: a resident model's KV cache is already sized for the whole
-    context window, so a larger prompt costs a bounded ~100 MB, and an
-    attempt can succeed where a prediction said it would not.
-    """
+    """Compute the prompt budget from the context window: ``fixed_chars`` is the measured length of
+    every section rendered in full (rules, capability catalog, framing) and is subtracted as-is; only
+    the remainder is shared between input, observations and history. Host memory is read only to
+    report pressure - it changes no section: a resident model KV cache is already sized for the
+    whole window, so a larger prompt costs a bounded ~100 MB and an attempt can succeed where a
+    prediction said it would not."""
     model_context_tokens = model_context_tokens if model_context_tokens is not None else _env_int(
         "NEXUS_LOCAL_MODEL_CONTEXT_TOKENS", 8192
     )
@@ -223,19 +189,19 @@ def compute_budget(
             memory_budget_chars = 0
         else:
             memory_budget_chars = int(surplus_kb // kb_per_input_token) * chars_per_token
-        # A host with no swap reports ``SwapFree: 0`` forever, so exhausted
-        # swap is only pressure when swap exists and RAM is thin too.
+        # A host with no swap reports ``SwapFree: 0`` forever, so exhausted swap is only pressure
+        # when swap exists and RAM is thin too.
         swap_configured = swap_total_kb is not None and swap_total_kb > 0
         ram_pressure = surplus_kb < inference_headroom_kb
         if swap_configured and swap_free_kb is not None and swap_free_kb < inference_headroom_kb and ram_pressure:
             low_memory = True
             memory_budget_chars = 0
 
-    # The context window is the bound; there is no floor that would let the
-    # budget claim room the window does not have.
+    # The context window is the bound; there is no floor that would let the budget claim room
+    # the window does not have.
     effective_budget_chars = context_budget_chars
-    # Advisory only. A resident model can still serve a request under
-    # pressure, so this must never become a routing gate.
+    # Advisory only: a resident model can still serve a request under pressure, so this must
+    # never become a routing gate.
     safe_local_budget_chars = 0 if low_memory else effective_budget_chars
 
     fixed_chars = max(0, int(fixed_chars))
@@ -268,11 +234,9 @@ def compute_budget(
 
 
 def fit_history(history: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
-    """Keep the newest history events whose serialised list fits ``max_chars``.
-
-    History is persisted and re-readable, so it is the section that gives way
-    when the observations need the room. Order is preserved.
-    """
+    """Keep the newest history events whose serialised list fits ``max_chars``; history is
+    persisted and re-readable, so it is the section that gives way when observations need the room.
+    Order is preserved."""
     kept: list[dict[str, Any]] = []
     for event in reversed(history):
         candidate = [event, *kept]
@@ -294,14 +258,9 @@ def truncate_text(text: str, max_chars: int, *, note: str = "truncated") -> tupl
 
 
 def prompt_json(value: Any) -> str:
-    """Serialise for a model prompt, without the parts that carry no meaning.
-
-    ``"arguments":[]`` and ``"default":null`` say what their absence says,
-    and at seven tokens a second each is paid for in wall-clock time.
-
-    Prompts only. ``OperationSpec.to_dict`` also answers the catalog
-    endpoint, where a stable shape is the contract.
-    """
+    """Serialise for a model prompt, dropping no-meaning defaults (``"arguments":[]``,
+    ``"default":null`` - paid for in wall-clock time at seven tokens each). Prompts only;
+    ``OperationSpec.to_dict`` also answers the catalog endpoint, where a stable shape is the contract."""
     return json.dumps(_without_empties(value), separators=(",", ":"))
 
 
@@ -323,18 +282,11 @@ def compact_observations(
     budget_chars: int,
     keep_recent_full: int = 2,
 ) -> tuple[list[dict[str, Any]], list[int]]:
-    """Bound observations sent to the model to a total character budget.
-
-    An observation that fits its share is passed through unchanged. One that
-    does not is replaced by a semantic summary (``observation_summary``) when
-    that fits; the most recent ``keep_recent_full`` may otherwise still be
-    truncated in place; everything else becomes a small stub referencing its
-    stable event id, so the raw result stays retrievable from the database
-    without resending it inline.
-    Returns ``(compacted_observations, omitted_indices)`` where
-    ``omitted_indices`` are 0-based positions in the *input* list that were
-    reduced to a stub.
-    """
+    """Bound observations to a total character budget: one that fits its share passes through
+    unchanged; otherwise a semantic summary (``observation_summary``) when it fits; the most recent
+    ``keep_recent_full`` may still be truncated in place; everything else becomes a small stub
+    referencing its stable event id, so the raw result stays retrievable from the database. Returns
+    ``(compacted_observations, omitted_indices)`` with 0-based input positions reduced to a stub."""
     n = len(observations)
     if n == 0 or budget_chars <= 0:
         return (list(observations), []) if budget_chars > 0 else (
@@ -356,8 +308,8 @@ def compact_observations(
             result[index] = obs
             remaining = max(0, remaining - len(serialized))
             continue
-        # Middle step (#561): the fields the next decision needs, before
-        # either a blind cut or the bare stub. Not counted as omitted.
+        # Middle step (#561): the fields the next decision needs, between a blind cut and the bare
+        # stub. Not counted as omitted.
         summary = summarize_observation(obs, fair_share)
         if summary is not None:
             result[index] = summary
@@ -381,11 +333,9 @@ def compact_observations(
     return [item for item in result if item is not None], sorted(omitted)
 
 
-# What a next decision depends on, kept even when the body is dropped. These
-# cost tens of characters; the body is what is expensive. A stub without them
-# reads "a github_issue happened here", which cannot stop the controller
-# asking the identical question again (#218, #223). With them it reads
-# "github_issue(196) succeeded, event 158" - the whole decision.
+# What a next decision depends on, kept even when the body is dropped - tens of characters vs
+# an expensive body; a stub without them reads "a github_issue happened here" and cannot stop
+# the controller asking the identical question again (#218, #223).
 _STUB_IDENTITY_FIELDS = (
     "goal",
     "status",
@@ -415,14 +365,12 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str):
             value = value[:_STUB_FIELD_CHARS]
         elif field == "args" and isinstance(value, dict):
-            # The values the call ran with, which is what makes one call
-            # distinguishable from another. Kept whole or not at all: half an
-            # argument list identifies nothing, and a stub is meant to be small.
+            # The values the call ran with distinguish one call from another; kept whole or not at all -
+            # half an argument list identifies nothing, and a stub is meant to be small.
             rendered = json.dumps(value, separators=(",", ":"), default=str)
             value = value if len(rendered) <= _STUB_FIELD_CHARS else None
         elif isinstance(value, dict):
-            # `operation` is a full schema on a found result; its name is the
-            # part a decision needs.
+            # `operation` is a full schema on a found result; its name is the part a decision needs.
             value = str(value.get("operation", ""))[:_STUB_FIELD_CHARS] or None
         elif not isinstance(value, (bool, int, float, type(None))):
             continue
@@ -431,8 +379,8 @@ def _stub(obs: dict[str, Any]) -> dict[str, Any]:
     event_id = obs.get("event_id")
     if event_id is not None:
         stub["event_id"] = event_id
-        # Says what is missing; names a way back only where one exists:
-        # read_tool_result (#562) pages through stored tool-call results only.
+        # Says what is missing and names a way back only where one exists: read_tool_result (#562)
+        # pages through stored tool-call results only.
         stub["note"] = (
             f"the result is not in this prompt; it is stored in event {event_id}"
             + read_hint(obs, event_id)

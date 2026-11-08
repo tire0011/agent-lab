@@ -21,15 +21,10 @@ from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger(__name__)
 
-# Statuses in which a live worker is supposed to be driving the session. Only
-# these can go stale: everything else is either finished or deliberately at
-# rest.
-#
-# Every status a worker sets while it is blocked on a model call belongs here,
-# not just `waiting_for_llm`. The tool resolver and the knowledge collector each
-# park the session under their own name for the length of an inference, and a
-# worker that dies in that window left a row no reaper would look at and no
-# diagnostic would list - the session simply stopped, unclaimed and invisible.
+# Statuses in which a live worker should be driving the session; only these can go
+# stale. Every status a worker sets while blocked on a model call belongs here (not
+# just `waiting_for_llm`) - a worker that dies mid-inference under any of them leaves
+# a row no reaper would find.
 WORKING_STATUSES: tuple[str, ...] = (
     "active",
     "queued",
@@ -38,9 +33,8 @@ WORKING_STATUSES: tuple[str, ...] = (
     "waiting_for_knowledge",
 )
 
-# Intentional resting states. A session waiting for a human reply, or blocked
-# on a capability nobody has built yet, has no worker by design - silence there
-# is correct, not death (#162).
+# Intentional resting states: no worker by design, so silence there is correct, not
+# death (#162).
 RESTING_STATUSES: tuple[str, ...] = (
     "waiting_for_user",
     "blocked_missing_capability",
@@ -53,10 +47,9 @@ STATUS_ABANDONED = "abandoned"
 STATUS_FAILED = "failed"
 TERMINAL_REASON_HEARTBEAT_TIMEOUT = "heartbeat_timeout"
 
-# A turn that died in the open says so. Without this the row would stay
-# `active` with a frozen heartbeat until the reaper found it, and an outcome we
-# actually witnessed - an exception, a cancellation - would be recorded as
-# "nobody ever told us", which is a different and weaker fact.
+# A turn that died in the open says so: without this the row would stay `active` with
+# a frozen heartbeat until the reaper found it, and a witnessed outcome (exception,
+# cancellation) would be recorded as the weaker "nobody ever told us".
 TERMINAL_REASON_TURN_FAILED = "turn_failed"
 TERMINAL_REASON_TURN_CANCELLED = "turn_cancelled"
 
@@ -65,11 +58,9 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Defensive ceiling only: bounds pathological/unbounded growth (e.g. a runaway
-# command) while still storing "complete" raw results for realistic tool
-# outputs, per the requirement that durable event_ids resolve to the full
-# result rather than a value the orchestrator already truncated before
-# persistence.
+# Defensive ceiling only: bounds runaway growth while still storing complete raw
+# results, so durable event_ids always resolve to the full result rather than a value
+# the orchestrator already truncated before persistence.
 MAX_EVENT_CONTENT_CHARS = 200_000
 
 
@@ -87,10 +78,9 @@ class NexusTaskSession:
     last_heartbeat_at: str | None = None
     terminal_reason: str | None = None
     requires_completion_evidence: bool = False
-    # Identity of the implementation request currently in force, and the
-    # requests for which evidence has actually been observed. Comparing keys
-    # is what keeps one task's evidence from completing a later, different
-    # one, and it survives any event-window limit.
+    # Identity of the implementation request currently in force: comparing keys keeps one
+    # task evidence from completing a later, different one, and survives any event-window
+    # limit.
     completion_intent_key: str | None = None
     completion_evidence_key: str | None = None
     verification_evidence_key: str | None = None
@@ -163,13 +153,10 @@ class NexusTaskStore:
             self._migrate_session_columns()
 
     def _migrate_session_columns(self) -> None:
-        """Add the explicit ownership/liveness columns (#162).
-
-        ``updated_at`` moves whenever anything touches the row, which is why it
-        was never a usable liveness signal. These columns say instead who
-        claimed the work, since when, when that worker last reported itself
-        alive, and how the claim ended.
-        """
+        """Add the explicit ownership/liveness columns (#162). ``updated_at`` moves whenever
+        anything touches the row, so it was never a usable liveness signal; these columns say
+        who claimed the work, since when, when that worker last reported alive, and how the
+        claim ended."""
         existing = {
             row[1] for row in self._conn.execute("PRAGMA table_info(nexus_task_sessions)")
         }
@@ -248,12 +235,8 @@ class NexusTaskStore:
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> int:
-        """Persist the full bounded event; prompt history is compacted separately.
-
-        Returns the durable event id so callers can reference the raw stored
-        content later (e.g. to compact an observation to a stub in a prompt
-        while still being able to retrieve the full result by id).
-        """
+        """Persist the full bounded event (prompt history is compacted separately); returns the
+        durable event id so callers can retrieve the raw stored content later."""
         now = _now()
         with self._lock:
             cursor = self._conn.execute(
@@ -326,12 +309,9 @@ class NexusTaskStore:
     def tool_result_content(
         self, session_id: str, event_id: int, kinds: frozenset[str] | set[str]
     ) -> str | None:
-        """The stored content of one tool-call result of this session, else ``None``.
-
-        The access rule of ``read_tool_result`` (#562) is the WHERE clause: same
-        session, ``role='tool'``, and a kind from ``kinds``. Only ``content`` is
-        selected - never metadata - so nothing else can leak through a read.
-        """
+        """The stored content of one tool-call result of this session, else ``None``. The
+        access rule of ``read_tool_result`` (#562) is the WHERE clause: same session,
+        ``role='tool'``, a kind from ``kinds`` - only ``content`` is selected, never metadata."""
         allowed = sorted(str(kind)[:64] for kind in kinds)
         if not session_id or not allowed:
             return None
@@ -346,12 +326,8 @@ class NexusTaskStore:
         return None if row is None else str(row["content"])
 
     def user_inputs(self, session_id: str) -> list[str]:
-        """Return complete user input events in their original order.
-
-        This is a durable-state read, not a prompt view: it deliberately has
-        no history limit or character budget. Knowledge-collector bookkeeping
-        remains auditable in the journal but is not user-authored task text.
-        """
+        """Return complete user input events in original order - a durable-state read, not a
+        prompt view: deliberately no history limit or character budget."""
         with self._lock:
             rows = self._conn.execute(
                 """SELECT content, metadata_json
@@ -380,23 +356,15 @@ class NexusTaskStore:
         max_chars: int = 9000,
         max_event_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Return recent history compact enough for a small local context window.
-
-        Storage keeps larger event bodies. Only this prompt-facing view truncates
-        individual events and stops once the aggregate character budget is hit.
-
-        ``max_event_id`` excludes any event with a strictly greater id. Callers
-        that already track the current run's own tool observations in memory
-        (see ``NexusTaskOrchestrator``) pass the id of the event that started
-        the current run so those in-memory observations are never duplicated
-        by also being re-read back out of persisted history.
-        """
+        """Return recent history compact enough for a small local context window: storage
+        keeps larger bodies, only this prompt-facing view truncates events and stops at the
+        aggregate budget. ``max_event_id`` excludes events with a strictly greater id, so
+        in-memory observations of the current run are not duplicated from persisted history."""
         limit = max(1, min(limit, 100))
         max_chars = max(1000, min(max_chars, 32000))
-        # Collector-internal source lookups stay in the durable journal for
-        # audit/debugging, but are not part of Nexus' prompt-facing history.
-        # Over-fetch so hidden rows do not crowd useful task history out of
-        # the caller's requested visible limit.
+        # Collector-internal source lookups stay in the journal for audit/debugging but are not
+        # prompt-facing history; over-fetch so hidden rows do not crowd useful history out of
+        # the caller visible limit.
         fetch_limit = min(limit * 3, 300)
         with self._lock:
             if max_event_id is None:
@@ -450,11 +418,8 @@ class NexusTaskStore:
         safe_local_budget_chars: int | None = None,
         detail: str | None = None,
     ) -> None:
-        """Persist what decided one controller turn, and what came of it.
-
-        Recording is best-effort on purpose: instrumentation must never be the
-        reason a turn fails.
-        """
+        """Persist what decided one controller turn and what came of it - best-effort on
+        purpose: instrumentation must never be the reason a turn fails."""
         try:
             with self._lock:
                 self._conn.execute(
@@ -480,22 +445,12 @@ class NexusTaskStore:
             logger.exception("failed to record controller turn for %s", session_id)
 
     def stale_sessions(self, older_than_seconds: int) -> list[NexusTaskSession]:
-        """Sessions left mid-turn with nothing driving them.
-
-        A session only reaches a terminal status through ``_persist_final``. If
-        the turn never gets there - the process died, an exception escaped, the
-        loop hit a limit - the row simply stays ``active`` forever. On the live
-        database 17 of 41 sessions ever started were in that state, untouched
-        for 8 to 19 days, with nothing reaping or reporting them.
-
-        This is the legacy, pre-heartbeat safety net and only covers sessions
-        that never reported a heartbeat at all: rows written before #162, or by
-        a caller that does not claim its work. Liveness there can only be
-        inferred from ``updated_at``, so the threshold has to sit well clear of
-        a slow but healthy turn. Claimed work is governed by
-        ``reconcile_stale_heartbeats`` instead, which is both faster and
-        honest about what it measures.
-        """
+        """Sessions left mid-turn with nothing driving them. A session only reaches a terminal
+        status through ``_persist_final``; if the turn never gets there the row stays ``active``
+        forever. This is the legacy pre-heartbeat net and only covers sessions that never
+        heartbeat at all (pre-#162 rows or unclaimed callers), so the threshold must sit well
+        clear of a slow but healthy turn; claimed work is governed by
+        ``reconcile_stale_heartbeats`` instead."""
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=max(60, older_than_seconds))
         ).isoformat()
@@ -513,13 +468,9 @@ class NexusTaskStore:
         return [self._row(r) for r in rows]
 
     def abandon_stale_sessions(self, older_than_seconds: int) -> list[NexusTaskSession]:
-        """Give up on stale sessions explicitly instead of leaving them ``active``.
-
-        Deliberately does *not* resume them: re-running a controller turn costs
-        a model call and may repeat whatever killed it. Marking the state
-        honestly is the useful part - it makes the count visible and stops a
-        dead session from looking like work in progress.
-        """
+        """Give up on stale sessions explicitly instead of leaving them ``active``. Deliberately
+        does NOT resume them: re-running a turn costs a model call and may repeat whatever
+        killed it - marking the state honestly is the useful part."""
         stale = self.stale_sessions(older_than_seconds)
         for session in stale:
             self.set_status(session.id, "abandoned")
@@ -535,15 +486,11 @@ class NexusTaskStore:
         return stale
 
     # ------------------------------------------------------------------
-    # Explicit ownership and liveness (#162)
-    #
-    # The contract: a worker claims a session before it starts driving it,
-    # refreshes ``last_heartbeat_at`` while it is alive, and releases the claim
-    # with an explicit terminal reason when the turn ends. A claim whose
-    # heartbeats stopped is reconciled to ``abandoned`` - not because the row
-    # is old, but because the worker responsible for it stopped saying it was
-    # alive.
-    # ------------------------------------------------------------------
+    # Explicit ownership and liveness (#162): a worker claims a session before driving
+    # it, refreshes ``last_heartbeat_at`` while alive, and releases the claim with an
+    # explicit terminal reason at the end. A claim whose heartbeats stopped is reconciled to
+    # ``abandoned`` - not because the row is old, but because its worker stopped saying it
+    # was alive.
 
     def claim_blocked_missing_capability(
         self,
@@ -566,14 +513,10 @@ class NexusTaskStore:
         return cursor.rowcount > 0
 
     def claim_session(self, session_id: str, *, worker_id: str) -> bool:
-        """Record who owns this session now, and start its heartbeat.
-
-        Claiming is deliberately unconditional: the controller runs one turn
-        per session at a time today, and a restarted worker must be able to
-        take over its own abandoned session. It is the claim *identity* that
-        makes a takeover observable, and ``heartbeat`` that stops the previous
-        owner from keeping a claim it no longer holds alive.
-        """
+        """Record who owns this session now and start its heartbeat. Claiming is deliberately
+        unconditional - one turn per session today, and a restarted worker must be able to
+        take over its own abandoned session; the claim *identity* makes a takeover observable
+        and ``heartbeat`` stops the previous owner from keeping a lost claim alive."""
         now = _now()
         with self._lock:
             cursor = self._conn.execute(
@@ -587,13 +530,10 @@ class NexusTaskStore:
         return cursor.rowcount > 0
 
     def heartbeat(self, session_id: str, *, worker_id: str) -> bool:
-        """Report the owning worker alive. Returns False if the claim is gone.
-
-        Only ``last_heartbeat_at`` moves: ``updated_at`` keeps meaning "the
-        session changed", so a heartbeat never disguises a dead turn as recent
-        activity. The ``worker_id`` guard means a worker whose claim was reaped
-        or taken over cannot resurrect it by continuing to beat.
-        """
+        """Report the owning worker alive; False once the claim is gone. Only
+        ``last_heartbeat_at`` moves - ``updated_at`` keeps meaning "the session changed" - and
+        the ``worker_id`` guard means a worker whose claim was reaped or taken over cannot
+        resurrect it by continuing to beat."""
         with self._lock:
             cursor = self._conn.execute(
                 """UPDATE nexus_task_sessions
@@ -616,16 +556,10 @@ class NexusTaskStore:
         event_content: str = "",
         event_metadata: dict[str, Any] | None = None,
     ) -> bool:
-        """End a turn: journal it, set its status and release the claim, atomically.
-
-        One transaction, one ownership check. Split across three calls these
-        writes could straddle a takeover - the event landing in a session the
-        worker no longer owns, or the release clearing the *new* owner's
-        heartbeat - and a turn would end half in one worker's world and half in
-        another's. Returns False when the claim has already moved on, in which
-        case nothing is written at all: the session belongs to whoever holds it
-        now, and this worker's turn is over either way.
-        """
+        """End a turn - journal it, set its status, release the claim - in one transaction with
+        one ownership check: split across calls, the writes could straddle a takeover and end
+        half in each workers world. Returns False when the claim has moved on; then nothing
+        is written - the session belongs to whoever holds it now."""
         now = _now()
         clause = " AND worker_id=?" if worker_id is not None else ""
         params: list[Any] = [status[:64], str(reason)[:200], now, session_id]
@@ -661,13 +595,9 @@ class NexusTaskStore:
     def stale_heartbeat_sessions(
         self, stale_after_seconds: object = None
     ) -> list[NexusTaskSession]:
-        """Claimed working sessions whose worker stopped reporting itself alive.
-
-        Resting and terminal statuses are excluded by construction: they have
-        no worker to declare dead. Sessions that never heartbeat are excluded
-        too - there is no claim to reconcile - and remain the legacy
-        ``stale_sessions`` path's problem.
-        """
+        """Claimed working sessions whose worker stopped reporting alive. Resting/terminal
+        statuses are excluded by construction (no worker to declare dead), and sessions that
+        never heartbeat remain the legacy ``stale_sessions`` path."""
         timeout = resolve_stale_timeout(stale_after_seconds)
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=timeout)
@@ -690,15 +620,10 @@ class NexusTaskStore:
     def reconcile_stale_heartbeats(
         self, stale_after_seconds: object = None
     ) -> list[NexusTaskSession]:
-        """Give abandoned claims an explicit terminal outcome, exactly once.
-
-        Idempotent by construction: reconciling clears ``last_heartbeat_at``,
-        which is the very thing ``stale_heartbeat_sessions`` selects on, so a
-        second pass over the same session finds nothing. Like #160 this never
-        re-runs the work - re-running a controller turn costs a model call and
-        may repeat whatever killed it - but unlike #160 it can act in minutes
-        rather than hours, because a missing heartbeat means something.
-        """
+        """Give abandoned claims an explicit terminal outcome, exactly once. Idempotent by
+        construction: reconciling clears ``last_heartbeat_at``, the very thing
+        ``stale_heartbeat_sessions`` selects on. Like #160 it never re-runs the work, but it
+        can act in minutes rather than hours, because a missing heartbeat means something."""
         timeout = resolve_stale_timeout(stale_after_seconds)
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout)).isoformat()
         stale = self.stale_heartbeat_sessions(timeout)
@@ -706,14 +631,10 @@ class NexusTaskStore:
         reconciled: list[NexusTaskSession] = []
         for session in stale:
             with self._lock:
-                # Re-check every condition that made this session a candidate,
-                # inside the write. Selecting and updating are two statements,
-                # and reaping runs in a different process from the worker: if
-                # the owner beats, or a restarted worker takes the session
-                # over, in between, the row no longer matches and the write
-                # does nothing. Matching on the exact heartbeat that was
-                # selected is what makes that a compare-and-set rather than a
-                # hope.
+                # Re-check every candidate condition inside the write: select and update are two
+                # statements and reaping runs in another process - if the owner beats or a restarted
+                # worker takes over in between, the row no longer matches and the write does nothing.
+                # Matching on the exact heartbeat selected makes it a compare-and-set, not a hope.
                 cursor = self._conn.execute(
                     f"""UPDATE nexus_task_sessions
                         SET status=?, terminal_reason=?, last_heartbeat_at=NULL,
@@ -736,9 +657,8 @@ class NexusTaskStore:
                 )
                 self._conn.commit()
             if cursor.rowcount == 0:
-                # The claim moved on between selection and now - a fresh
-                # heartbeat, a takeover, or another reaper. Either way it is
-                # not ours to end, and not ours to report.
+                # The claim moved on between selection and now (fresh heartbeat, takeover, another
+                # reaper): not ours to end, not ours to report.
                 continue
             age = heartbeat_age_seconds(session.last_heartbeat_at)
             self.append_event(
@@ -763,13 +683,10 @@ class NexusTaskStore:
         return reconciled
 
     def liveness(self, stale_after_seconds: object = None) -> dict[str, Any]:
-        """What Nexus and operators need to answer "is this still alive?".
-
-        Returns every claim the store knows about together with its heartbeat
-        age, plus the working sessions that carry no claim at all - those are
-        the blind spot heartbeats exist to close, so they are counted rather
-        than hidden.
-        """
+        """Answer "is this still alive?": every claim with its heartbeat age, plus working
+        sessions with no claim at all - the blind spot heartbeats exist to close, counted
+        rather than hidden. Only working rows are listed, so the journal growth stays
+        bounded."""
         timeout = resolve_stale_timeout(stale_after_seconds)
         now = datetime.now(timezone.utc)
         placeholders = ",".join("?" for _ in WORKING_STATUSES)
@@ -862,11 +779,8 @@ class NexusTaskStore:
         return blocked
 
     def wait_for_experiment(self, session_id: str, experiment_id: str) -> bool:
-        """Park a session whose turn ended in new_experiment until it finishes.
-
-        Called once the experiment exists. The session holds no claim while it
-        waits, so the local model stays free for other work (#263).
-        """
+        """Park a session whose turn ended in new_experiment until the experiment finishes. The
+        session holds no claim while it waits, so the local model stays free for other work (#263)."""
         with self._lock:
             cursor = self._conn.execute(
                 """UPDATE nexus_task_sessions
@@ -903,11 +817,8 @@ class NexusTaskStore:
     def claim_waiting_for_experiment(
         self, session_id: str, experiment_id: str, *, worker_id: str
     ) -> bool:
-        """Atomically claim a session parked on *experiment_id* exactly once.
-
-        The event path and the polling safety net can both see the same
-        finished experiment; only one of them resumes the session.
-        """
+        """Atomically claim a session parked on *experiment_id* exactly once - the event path
+        and the polling safety net can both see the same finished experiment; only one resumes."""
         now = _now()
         with self._lock:
             cursor = self._conn.execute(
@@ -931,12 +842,8 @@ class NexusTaskStore:
         *,
         intent_key: str | None = None,
     ) -> None:
-        """Persist that this session owes completion evidence for *intent_key*.
-
-        The key identifies which implementation request is in force. A new
-        request in the same session replaces it, which is what stops evidence
-        produced for the previous one from satisfying the new one.
-        """
+        """Persist that this session owes completion evidence for *intent_key*; a new request in
+        the same session replaces it, so evidence for the previous one cannot satisfy the new."""
         with self._lock:
             self._conn.execute(
                 """UPDATE nexus_task_sessions
@@ -947,13 +854,9 @@ class NexusTaskStore:
             self._conn.commit()
 
     def record_completion_evidence(self, session_id: str, intent_key: str, kind: str) -> None:
-        """Record that evidence of *kind* was observed for *intent_key*.
-
-        Written on the session row rather than left to be re-read from the
-        event log: a long session scrolls old tool events out of any bounded
-        window, and evidence that ages out would leave the session unable to
-        ever finish.
-        """
+        """Record that evidence of *kind* was observed for *intent_key*, on the session row rather
+        than re-read from the event log: a long session scrolls old events out of any bounded
+        window, and evidence that aged out would leave the session unable to finish."""
         column = {
             "change": "completion_evidence_key",
             "verify": "verification_evidence_key",
@@ -970,13 +873,9 @@ class NexusTaskStore:
             self._conn.commit()
 
     def set_status(self, session_id: str, status: str, *, worker_id: str | None = None) -> bool:
-        """Move a session's status, optionally only while ``worker_id`` owns it.
-
-        Passing the owner makes the write a no-op once the claim has moved on,
-        so a superseded worker cannot drive the state of a session another
-        worker now holds. Callers with no claim (recovery paths, tests) omit it
-        and write unconditionally, as before.
-        """
+        """Move a session's status, optionally only while ``worker_id`` owns it - then the write is
+        a no-op once the claim moved on, so a superseded worker cannot drive another worker's
+        session. Callers with no claim (recovery paths, tests) omit it and write unconditionally."""
         clause = " AND worker_id=?" if worker_id is not None else ""
         params: list[Any] = [status[:64], _now(), session_id]
         if worker_id is not None:

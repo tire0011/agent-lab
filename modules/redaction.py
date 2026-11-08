@@ -1,38 +1,29 @@
-"""Shared redaction/sanitization helpers.
-
-Centralized here so both the write path (``ExperimentService``, which
-persists activity-log messages) and the read path (``api.py`` response
-builders) use exactly one implementation. Applying redaction *before*
-persistence (not only at response time) means activity events are safe
-by design: even a bug in a future read-path formatter cannot leak a
-secret or absolute filesystem path that was never written to the
-database in the first place.
-
-Nothing here ever returns raw command output, stack traces with
-internal paths, environment variables, prompts, or credentials.
-"""
+"""Shared redaction/sanitization helpers - one implementation for the write path (persisted
+activity logs) and the read path (API responses). Redacting *before* persistence means
+events are safe by design: even a future read-path bug cannot leak a secret or absolute
+path that was never written to the database. Nothing here ever returns raw command
+output, stack traces with internal paths, environment variables, prompts, or credentials."""
 
 from __future__ import annotations
 
 import os
 import re
 
-# Credentials whose *literal value* is scrubbed wherever it appears, in
-# addition to the keyword/shape patterns below. The patterns only catch a
-# secret that is introduced by a recognizable keyword ("api_key=", "Bearer
-# ", "sk-..."); a bare value echoed on its own - by a shell command, a
-# config dump, a stack trace - would otherwise pass straight through.
-# That matters because the log surface is readable without an API key
-# (see DECISIONS.md D-012), so a leaked AGENT_API_KEY would hand a reader
-# the *write* endpoints, including shell-backed operations.
+# Credentials whose *literal value* is scrubbed wherever it appears, in addition to the
+# keyword/shape patterns: the patterns only catch a secret introduced by a recognizable
+# keyword ("api_key=", "Bearer ", "sk-..."); a bare value echoed on its own - by a shell
+# command, a config dump, a stack trace - would otherwise pass straight through. That
+# matters because the log surface is readable without an API key (DECISIONS.md D-012), so
+# a leaked AGENT_API_KEY would hand a reader the *write* endpoints, including shell-backed
+# operations.
 _SECRET_ENV_VARS = (
     "AGENT_API_KEY",
     "AGENT_GITHUB_WEBHOOK_SECRET",
     "GITHUB_TOKEN",
     "AZURE_OPENAI_API_KEY",
 )
-# Short values are ignored: a 1-2 character secret would otherwise match
-# almost every line and destroy the logs' usefulness.
+# Short values are ignored: a 1-2 character secret would match almost every line and
+# destroy the logs' usefulness.
 _MIN_SECRET_VALUE_CHARS = 8
 
 _PLACEHOLDER = "[REDACTED]"

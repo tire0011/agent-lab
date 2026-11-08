@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Is the local model server applying the JSON schemas Nexus sends?
-
-The method and the reasoning live in `modules.llm_schema_probe`; this is the
-command-line way in. Nexus can also run it itself, as the read-only operation
-`local_model_schema_check` - which probes only the shape Nexus uses plus the
-control, while this compares all four.
-"""
+"""Is the local model server applying the JSON schemas Nexus sends? The method and reasoning live in
+``modules.llm_schema_probe``; this is the command-line way in. Nexus can also run it as the read-only
+operation ``local_model_schema_check`` (Nexus shape plus control only), while this compares all four shapes."""
 
 from __future__ import annotations
 

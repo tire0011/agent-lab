@@ -37,30 +37,19 @@ def _connect(db_path: str) -> sqlite3.Connection:
     path = Path(db_path)
     _migrate_legacy_db_if_needed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False: callers that keep a long-lived connection
-    # (e.g. CodexTaskService) may be invoked from FastAPI's sync-route
-    # threadpool, where a given connection can legitimately be used from a
-    # different thread on each call. Callers that share a connection across
-    # threads remain responsible for serializing concurrent access.
+    # check_same_thread=False: long-lived connections (e.g. CodexTaskService) may be used from
+    # FastAPI sync-route threadpool threads, a different one per call; callers sharing a
+    # connection across threads remain responsible for serializing access.
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     _apply_durability(conn)
     return conn
 
 
-# Production keeps SQLite's default durability: every commit is fsynced, so a
-# power cut cannot lose an acknowledged write. That is the right default for a
-# journal whose whole job is to still be there afterwards.
-#
-# It is also the single biggest cost in the test suite. Measured on the VM, 500
-# commits take 5.01s against 0.37s on a dev box - fsync there is 13.5x more
-# expensive, and the suite commits constantly because nearly every test builds
-# its own temporary database. Pure CPU is only 1.6x slower and process spawning
-# 2.8x, so the disk is what makes the VM run take half an hour.
-#
-# A test database lives in a temporary directory and is deleted at the end of
-# the test. There is nothing to recover, so paying for durability buys nothing.
-# WAL + synchronous=NORMAL takes those 500 commits from 0.463s to 0.007s here.
+# Production keeps SQLite default durability (every commit fsynced) - the right default
+# for a journal whose job is to still be there after a power cut. It is also the biggest
+# test-suite cost on the VM (fsync 13.5x more expensive there), so a test database in a
+# temp dir - nothing to recover - uses WAL + synchronous=NORMAL via NEXUS_DB_DURABILITY.
 _DURABILITY_ENV_VAR = "NEXUS_DB_DURABILITY"
 
 
@@ -68,8 +57,8 @@ def _apply_durability(conn: sqlite3.Connection) -> None:
     mode = (os.environ.get(_DURABILITY_ENV_VAR) or "").strip().lower()
     if mode != "relaxed":
         return
-    # journal_mode is persistent in the file; synchronous is per connection,
-    # so both are set on every connect rather than once at creation.
+    # journal_mode is persistent in the file, synchronous is per connection, so both are set
+    # on every connect rather than once at creation.
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
 
@@ -305,10 +294,9 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-# Columns that may be missing on an already-existing ``experiments`` table
-# (created by an older version of this module). ``CREATE TABLE IF NOT
-# EXISTS`` never retroactively adds columns, so any new, additive columns
-# must be migrated in explicitly via ``ALTER TABLE ... ADD COLUMN``.
+# Columns that may be missing on an existing ``experiments`` table (created by an older
+# version): CREATE TABLE IF NOT EXISTS never adds columns retroactively, so new additive
+# columns are migrated explicitly via ALTER TABLE ... ADD COLUMN.
 _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("research_task_id", "TEXT"),
     ("research_started_at", "TEXT"),
@@ -333,14 +321,13 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
     ("base_commit_sha", "TEXT"),
-    # Process group of the live worker, so the stall sweep (#400) can stop it
-    # from another process; NULL while no worker runs.
+    # Process group of the live worker, so the stall sweep (#400) can stop it from another
+    # process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),
 ]
 
-# Same additive treatment for ``codex_tasks``: the table predates the second
-# coding agent, so rows written before this column existed keep provider NULL
-# and are read back as the historical default (codex).
+# Same additive treatment for codex_tasks: rows written before the provider column existed
+# keep provider NULL and read back as the historical default (codex).
 _CODEX_TASKS_ADDITIVE_COLUMNS = [
     ("provider", "TEXT"),
 ]
@@ -442,8 +429,7 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_mta_experiment_id ON mailbox_task_approvals(experiment_id);
         """
     )
-    # Additive migration: add publish columns to pre-existing tables that were
-    # created before these columns were introduced.
+    # Additive migration: add publish columns to tables created before these columns existed.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(mailbox_task_approvals)")}
     for column_name, column_type in _MAILBOX_TASK_APPROVALS_ADDITIVE_COLUMNS:
         if column_name not in existing:
@@ -451,11 +437,10 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE mailbox_task_approvals ADD COLUMN {column_name} {column_type}"
             )
 
-    # Idempotency keys (#378): a redelivered message must map back to its
-    # original task. Rows from before the key existed get the key their
-    # message would derive today (``modules/mailbox/task_ingest.py``), so a
-    # redelivery after the upgrade is still recognised. Only the oldest row
-    # per message gets it: legacy duplicates would violate the unique index.
+    # Idempotency keys (#378): a redelivered message must map back to its original task; rows
+    # from before the key existed get the key their message would derive today
+    # (modules/mailbox/task_ingest.py), and only the oldest row per message gets it so legacy
+    # duplicates cannot violate the unique index.
     conn.execute(
         """
         UPDATE mailbox_task_approvals
@@ -477,15 +462,14 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
         "ON mailbox_task_approvals(idempotency_key)"
     )
 
-    # The approval step is gone (#264). An approved task was only waiting for
-    # the worker, which now takes queued ones. Old pending_approval and
-    # rejected rows stay as they are: readable, never run.
+    # The approval step is gone (#264): an approved task was only waiting for the worker,
+    # which now takes queued ones. Old pending_approval/rejected rows stay readable, never run.
     conn.execute(
         "UPDATE mailbox_task_approvals SET status='queued' WHERE status='approved'"
     )
 
-    # Backfill: create task records for any task messages that don't already
-    # have one. A task whose body was not stored is not handed to Nexus.
+    # Backfill: create task records for task messages that have none; a task whose body was not
+    # stored is not handed to Nexus.
     import uuid
     from datetime import datetime, timezone
 
@@ -526,9 +510,8 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
              received_at or now, status, error, f"mailbox-msg:{msg_id}", now, now),
         )
 
-    # Rows created before the structured constraint, and the orphans above,
-    # keep their original body: a restart must not forget an older
-    # "do not merge" instruction.
+    # Rows created before the structured constraint, and the orphans above, keep their original
+    # body: a restart must not forget an older "do not merge" instruction.
     candidates = conn.execute(
         "SELECT id, task_body FROM mailbox_task_approvals WHERE merge_forbidden=0"
     ).fetchall()
@@ -593,9 +576,8 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
             ON experiment_adoption_failures(experiment_id, superseded_at);
         """
     )
-    # CREATE TABLE IF NOT EXISTS never adds columns to a table an older
-    # version already created, so the attempt counters are migrated in
-    # explicitly.
+    # CREATE TABLE IF NOT EXISTS never adds columns to a table an older version created, so the
+    # attempt counters are migrated in explicitly.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(experiment_adoptions)")}
     if "recovery_attempts" not in existing:
         conn.execute(
@@ -605,9 +587,8 @@ def _migrate_experiment_adoptions(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE experiment_adoptions ADD COLUMN stale_retry_attempts INTEGER NOT NULL DEFAULT 0"
         )
-    # Which re-evaluable condition produced a `needs_review` row (#171).
-    # The reason text alone cannot be re-checked; this names the blocker so
-    # a later attempt can ask whether it still applies.
+    # Which re-evaluable condition produced a needs_review row (#171): the reason text alone
+    # cannot be re-checked, so the blocker is named for a later attempt to ask about.
     if "review_blocker" not in existing:
         conn.execute("ALTER TABLE experiment_adoptions ADD COLUMN review_blocker TEXT NULL")
 
@@ -634,10 +615,8 @@ def _migrate_operations_audit(conn: sqlite3.Connection) -> None:
     )
 
 
-# Columns that may be missing on an already-existing ``operation_chains``
-# table (created before the publish-status columns existed). ``CREATE TABLE
-# IF NOT EXISTS`` never retroactively adds columns, so any new, additive
-# columns must be migrated in explicitly via ``ALTER TABLE ... ADD COLUMN``.
+# Columns that may be missing on an existing ``operation_chains`` table: additive columns
+# are migrated explicitly via ALTER TABLE ... ADD COLUMN.
 _OPERATION_CHAINS_ADDITIVE_COLUMNS = [
     ("outbox_file", "TEXT"),
     ("publish_status", "TEXT"),
@@ -691,8 +670,8 @@ def _migrate_operation_chains(conn: sqlite3.Connection) -> None:
             )
 
 
-# Additive migration (#148): correlation ids + the shared outbox publish
-# lifecycle columns (see modules.outbox_publisher / modules.failure_analysis_service).
+# Additive migration (#148): correlation ids + the shared outbox publish lifecycle columns
+# (see modules/outbox_publisher / modules/failure_analysis_service).
 _FAILURE_ANALYSES_ADDITIVE_COLUMNS = [
     ("experiment_id", "TEXT"),
     ("mailbox_task_id", "TEXT"),
@@ -708,16 +687,10 @@ _FAILURE_ANALYSES_ADDITIVE_COLUMNS = [
 
 
 def _migrate_failure_analyses(conn: sqlite3.Connection) -> None:
-    """Create failure_analyses table (idempotent additive migration).
-
-    Owned centrally here (not by FailureAnalysisService itself) so that
-    every caller who only ever goes through init_db() - including
-    FailureAnalysisOutboxPublisher, which never constructs a
-    FailureAnalysisService - can rely on the table existing before it runs
-    a query against it. A publisher that only sees the table via a
-    service-owned lazy CREATE TABLE could hit "no such table" on a real
-    deployment DB where no analysis has ever run yet.
-    """
+    """Create failure_analyses table (idempotent additive migration), owned centrally here so
+    every init_db() caller - including FailureAnalysisOutboxPublisher, which never constructs
+    a FailureAnalysisService - can rely on the table existing; a service-owned lazy CREATE
+    would hit "no such table" on a deployment DB where no analysis has run yet."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS failure_analyses (

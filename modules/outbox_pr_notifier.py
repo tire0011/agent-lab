@@ -1,24 +1,13 @@
-"""Publish Outbox messages as comments on the persistent communication PR (#196).
+"""Publish Outbox messages as comments on the persistent communication PR (#196) - the
+ChatGPT Work trigger watches one long-lived Nexus communication PR (#194), so every persisted
+Outbox message must also appear as a top-level comment on it.
 
-The ChatGPT Work trigger watches one long-lived *Nexus communication* pull
-request (#194).  Every Outbox message that Nexus persists must therefore also
-appear as a top-level conversation comment on that PR, so the external trigger
-wakes up.
-
-Contract
---------
-- Delivery is keyed by Outbox message id: one message produces at most one
-  comment, no matter how often it is reprocessed.
-- A GitHub failure never rolls back or loses the Outbox message.  The
-  notification stays ``pending`` and is retried with bounded exponential
-  backoff by :meth:`OutboxPRNotifier.deliver_pending`.
-- A closed communication PR is reopened (recreating its head branch first if
-  GitHub deleted it) rather than replaced.
-- Only when the original PR is genuinely unusable is an equivalent channel
-  recreated - and that condition is logged at ERROR with the new number and
-  URL, because the external trigger is still scoped to the old PR.
-- The communication PR is never merged from here.
-"""
+Contract: delivery is keyed by Outbox message id (at most one comment per message); a GitHub
+failure never rolls back or loses the message - it stays ``pending`` and is retried with bounded
+backoff by :meth:`deliver_pending`; a closed communication PR is reopened (recreating its head
+branch first if deleted) rather than replaced; only when the original PR is genuinely unusable
+is an equivalent channel recreated, logged at ERROR with the new number/URL because the external
+trigger is still scoped to the old PR; the communication PR is never merged from here."""
 
 from __future__ import annotations
 
@@ -76,11 +65,8 @@ def _redact(value: str) -> str:
 
 
 def build_comment_body(message_id: str, content: str, created_at: str) -> str:
-    """Render the PR comment for one Outbox message.
-
-    The marker and the identifying metadata come first so that a truncated
-    body still carries everything the trigger and a human reader need.
-    """
+    """Render the PR comment for one Outbox message; the marker and identifying metadata come
+    first so a truncated body still carries everything the trigger and a human reader need."""
     content = content or "(no content)"
     fences = re.findall(r"`+", content)
     fence = "`" * max(3, (max((len(f) for f in fences), default=0) + 1))
@@ -138,18 +124,13 @@ class OutboxPRNotifier:
     def configured(self) -> bool:
         return bool(self.repository and (self.token or self._transport))
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def enqueue(self, message_id: str, content: str, created_at: str | None = None) -> None:
-        """Durably record that this message must be announced.
-
-        Separate from :meth:`notify` so a producer can persist the intent
-        before the step that would otherwise be able to lose it (see
-        ``OutboxPublisher._enqueue_notification``). Repeat calls for the
-        same id are no-ops, which is what keeps delivery single-comment.
-        """
+        """Durably record that this message must be announced - separate from :meth:`notify` so a
+        producer can persist the intent before the step that could lose it (see
+        ``OutboxPublisher._enqueue_notification``); repeat calls for the same id are no-ops, which
+        keeps delivery single-comment."""
         if not message_id:
             return
         self._enqueue(message_id, content, created_at or _utcnow_iso())
@@ -174,9 +155,7 @@ class OutboxPRNotifier:
         ).fetchall()
         return sum(1 for row in rows if self._attempt(row))
 
-    # ------------------------------------------------------------------
     # Delivery
-    # ------------------------------------------------------------------
 
     def _attempt(self, row: sqlite3.Row) -> bool:
         message_id = row["message_id"]
@@ -234,9 +213,7 @@ class OutboxPRNotifier:
             _redact(error),
         )
 
-    # ------------------------------------------------------------------
     # Communication PR resolution
-    # ------------------------------------------------------------------
 
     def _resolve_pr(self) -> int:
         """Return a usable, open communication PR number, repairing as needed."""
@@ -297,14 +274,11 @@ class OutboxPRNotifier:
         return str(sha)
 
     def _recreate_channel(self) -> int:
-        """Last resort: build an equivalent channel and shout about the new number.
-
-        The replacement always gets its own branch cut from the base head and
-        its own commit on top. Reusing ``communication_branch`` would fail
-        exactly when recreation is most likely - after the old PR was merged,
-        the branch still exists and its file is already in base, so GitHub
-        rejects the new PR with "No commits between base and head".
-        """
+        """Last resort: build an equivalent channel and log the new number at ERROR. The replacement
+        always gets its own branch cut from the base head plus its own commit - reusing
+        ``communication_branch`` would fail exactly when recreation is most likely (after the old PR
+        was merged, the branch exists and its file is already in base, so GitHub rejects the new PR
+        with "No commits between base and head")."""
         branch = f"{self.communication_branch}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
         self._request(
             "POST",
@@ -340,12 +314,9 @@ class OutboxPRNotifier:
         return new_number
 
     def _write_communication_file(self, branch: str) -> None:
-        """Commit the channel file on *branch* so it differs from the base.
-
-        Written unconditionally, and updated in place when the file is
-        already there (the merged-PR case): a branch identical to its base
-        cannot become a pull request.
-        """
+        """Commit the channel file on *branch* so it differs from the base - written unconditionally,
+        updated in place when already there (the merged-PR case); a branch identical to its base cannot
+        become a pull request."""
         existing_sha: str | None = None
         try:
             current = self._request(
@@ -372,9 +343,7 @@ class OutboxPRNotifier:
             "PUT", f"/repos/{self.repository}/contents/{COMMUNICATION_FILE}", payload
         )
 
-    # ------------------------------------------------------------------
     # Persistence
-    # ------------------------------------------------------------------
 
     def _ensure_schema(self) -> None:
         with self._conn:
@@ -422,9 +391,7 @@ class OutboxPRNotifier:
     def _set_active_pr_number(self, pr_number: int) -> None:
         set_setting(self._conn, _PR_SETTING_KEY, str(pr_number), updated_at=_utcnow_iso())
 
-    # ------------------------------------------------------------------
     # GitHub transport
-    # ------------------------------------------------------------------
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         if self._transport is not None:
@@ -472,11 +439,8 @@ def _pr_number_from_env() -> int:
 
 
 def notifier_from_env(db_path: str = DEFAULT_DB_PATH) -> OutboxPRNotifier | None:
-    """Build a notifier from the environment, or ``None`` when unconfigured.
-
-    Unconfigured is a normal local/test state, not an error: outbox publishing
-    itself keeps working, only the PR notification is skipped.
-    """
+    """Build a notifier from the environment, or ``None`` when unconfigured - a normal local/test
+    state, not an error: outbox publishing keeps working, only the PR notification is skipped."""
     notifier = OutboxPRNotifier(db_path=db_path)
     if not notifier.configured:
         notifier.close()

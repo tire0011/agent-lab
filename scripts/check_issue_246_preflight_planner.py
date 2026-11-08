@@ -130,11 +130,10 @@ async def live_collection() -> tuple[list[dict], dict]:
             source_id=f"issue-246-live-knowledge-collector-{uuid.uuid4().hex}",
             title=TASK,
         )
-        # The mailbox command runner intentionally strips TOKEN/KEY/SECRET
-        # variables, while the real agent-api service has GITHUB_TOKEN. For this
-        # manual checker, seed the real issue observation fixture and exercise
-        # live Nexus memory plus the same synthesis path instead of treating the
-        # command sandbox as a production GitHub-read failure.
+        # The mailbox command runner intentionally strips TOKEN/KEY/SECRET variables while the real agent-api
+        # service has GITHUB_TOKEN; for this manual checker, seed the real issue observation fixture and exercise
+        # live Nexus memory plus the same synthesis path instead of treating the command sandbox as a production
+        # GitHub-read failure.
         knowledge_request = orchestrator._knowledge_request(TASK)
         sources = [ISSUE_238_OBSERVATION]
         sources.append(

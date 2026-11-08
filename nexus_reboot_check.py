@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Nexus reboot check — reboot the VM when Ubuntu asks for it (#332).
-
-After a system update Ubuntu writes ``/var/run/reboot-required``. Until now
-someone had to notice the marker and ask Nexus to reboot. This runs on a timer
-(``deploy/nexus-reboot-check.timer``) and, when the marker exists, schedules the
-reboot through the existing ``machine_reboot`` operation. That operation already
-refuses while an experiment is selecting, implementing or verifying, so a
-reboot never kills work mid-run; the next check simply tries again.
-
-No controller and no model call: this is a file check and one operation.
-"""
+"""Nexus reboot check - reboot the VM when Ubuntu asks for it (#332). After a system update Ubuntu
+writes ``/var/run/reboot-required``; this runs on a timer (``deploy/nexus-reboot-check.timer``) and,
+when the marker exists, schedules the reboot through the existing ``machine_reboot`` operation, which
+already refuses while an experiment is selecting/implementing/verifying, so a reboot never kills work
+mid-run - the next check simply tries again. No controller and no model call: a file check and one
+operation."""
 
 from __future__ import annotations
 
@@ -29,11 +24,8 @@ REBOOT_REQUIRED_PATH = "/var/run/reboot-required"
 
 
 def check(registry: OperationsRegistry, *, marker_path: str = REBOOT_REQUIRED_PATH) -> str:
-    """Schedule a reboot if one is required and nothing is running.
-
-    Returns the decision: ``not_required``, ``busy``, ``scheduled`` or
-    ``failed``.
-    """
+    """Schedule a reboot if one is required and nothing is running; returns ``not_required``, ``busy``,
+    ``scheduled`` or ``failed``."""
     if not Path(marker_path).exists():
         logger.info("no reboot required (%s absent)", marker_path)
         return "not_required"
@@ -55,8 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--marker-path", default=REBOOT_REQUIRED_PATH)
     args = parser.parse_args(argv)
 
-    # machine_reboot only reads the experiments table; no experiment service
-    # (and so no controller) is needed.
+    # machine_reboot only reads the experiments table; no experiment service (and so no controller) is
+    # needed.
     registry = OperationsRegistry(experiment_service=None, db_path=args.db_path)
     try:
         decision = check(registry, marker_path=args.marker_path)

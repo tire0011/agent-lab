@@ -1,9 +1,6 @@
-"""Systemd service management wrapper for the operations API.
-
-Service names are passed through to systemd without a static application allowlist.
-All subprocess output is sanitized via :mod:`modules.redaction` before being
-returned to callers.
-"""
+"""Systemd service management wrapper for the operations API. Service names pass through to
+systemd without a static application allowlist; all subprocess output is sanitized via
+:mod:`modules.redaction` before being returned to callers."""
 
 from __future__ import annotations
 
@@ -16,11 +13,12 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_NEXUS_SERVICES: tuple[str, ...] = ("agent-api", "nexus-mailbox", "llama-server")
 
+# Seconds before SIGKILL.
 _GRACEFUL_STOP_TIMEOUT = 5  # seconds before SIGKILL
 
 
 async def _systemctl(args: list[str], timeout: int = 15) -> tuple[int, str]:
-    # The API runs as an unprivileged user; a restart needs root (#315).
+    # The API runs as an unprivileged user; a restart needs root, hence sudo -n (#315).
     prefix = ["sudo", "-n"] if args[:1] == ["restart"] else []
     proc = await asyncio.create_subprocess_exec(
         *prefix, "systemctl", *args,

@@ -1,21 +1,10 @@
-"""Cheap, transparent memory search for the Nexus task orchestrator.
-
-The first implementation deliberately reuses data Nexus already has:
-- structured ``knowledge`` rows in SQLite,
-- prior Nexus task/dialog events,
-- a small set of project memory documents.
-
-Event journal vs. memory (#248): ``nexus_task_events`` is the event journal.
-It keeps every event, including orchestration bookkeeping, for audit, replay
-and failure analysis. This module is the read side of curated memory: it only
-treats an event as knowledge when :func:`is_memory_eligible_event` says so.
-Orchestration kinds (``ORCHESTRATION_EVENT_KINDS``) stay in the journal and are
-never returned by :meth:`NexusMemory.search`. A later MemoryStore with explicit
-knowledge promotion can replace that predicate without changing ``search()``.
-
-The tool surface is intentionally stable so this lexical backend can later be
-replaced by embeddings/RAG without changing orchestration prompts or callers.
-"""
+"""Cheap, transparent memory search for the Nexus task orchestrator, reusing data Nexus
+already has (structured ``knowledge`` rows, prior task/dialog events, project memory
+documents). Event journal vs. memory (#248): ``nexus_task_events`` is the audit/replay
+journal and keeps every event; this module is the read side of curated memory and only
+returns events that :func:`is_memory_eligible_event` allows - orchestration kinds
+(``ORCHESTRATION_EVENT_KINDS``) stay in the journal and never become knowledge. The tool
+surface is stable so this lexical backend can later be replaced by embeddings/RAG."""
 
 from __future__ import annotations
 
@@ -36,10 +25,9 @@ _MEMORY_DOCS = (
 _WORD_RE = re.compile(r"[A-Za-z0-9_./:-]{2,}")
 _ISSUE_QUERY_RE = re.compile(r"\bissue\s+#?(\d+)\b", re.IGNORECASE)
 
-# Orchestrator bookkeeping must never become project knowledge. In particular,
-# indexing memory_search results makes later memory_search calls recursively
-# contain earlier serialized searches (#238). The journal still stores these
-# events; memory just does not read them (#248).
+# Orchestrator bookkeeping must never become project knowledge: indexing memory_search
+# results would make later searches recursively contain earlier ones (#238). The journal
+# still stores these events; memory just does not read them (#248).
 ORCHESTRATION_EVENT_KINDS: tuple[str, ...] = (
     "memory_search",
     "controller_decision",
@@ -53,12 +41,8 @@ ORCHESTRATION_EVENT_KINDS: tuple[str, ...] = (
 
 
 def is_memory_eligible_event(kind: str) -> bool:
-    """Whether a journal event of ``kind`` may be returned as knowledge.
-
-    This is the single place that decides which journal events count as
-    memory. Today it is a deny-list of orchestration kinds; an explicit
-    promotion step can replace it later.
-    """
+    """Whether a journal event of ``kind`` may be returned as knowledge - the single place that
+    decides; today a deny-list of orchestration kinds, replaceable by explicit promotion later."""
     return kind not in ORCHESTRATION_EVENT_KINDS
 
 

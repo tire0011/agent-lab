@@ -159,14 +159,10 @@ def insert_activity(
     to_status: str | None = None,
     message: str | None = None,
 ) -> int:
-    """Append one persistent activity log entry (e.g. an experiment lifecycle event).
-
-    Callers are responsible for their own commit/locking semantics when
-    inserting as part of a larger transaction (e.g. ``ExperimentService``
-    inserts activity rows inside the same ``with self._conn:`` block used
-    for the state transition itself, so a failed transition never leaves an
-    orphaned activity row and vice versa).
-    """
+    """Append one persistent activity log entry (e.g. an experiment lifecycle event). Callers
+    inserting as part of a larger transaction own the commit/locking (ExperimentService inserts
+    activity rows in the same ``with self._conn:`` block as the state transition, so a failed
+    transition never leaves an orphaned activity row and vice versa)."""
     cursor = conn.execute(
         """
         INSERT INTO activity_log (
@@ -222,11 +218,9 @@ def list_activity(
 
 
 def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
-    """Return the persisted value for ``key`` from ``service_settings``, or
-    ``None`` if it has never been set. Used for small, durable pieces of
-    adaptive service state (e.g. the auto-tuned verification test timeout)
-    that must be reused across process restarts, not just within a single
-    long-lived connection."""
+    """Return the persisted value for ``key`` from ``service_settings``, or ``None`` if never
+    set - for small durable adaptive state (e.g. the auto-tuned verification timeout) that must
+    survive process restarts."""
     row = conn.execute("SELECT value FROM service_settings WHERE key = ?", (key,)).fetchone()
     return row[0] if row is not None else None
 

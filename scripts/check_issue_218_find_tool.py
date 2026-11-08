@@ -1,28 +1,13 @@
 #!/usr/bin/env python3
-"""Manual #218 check: drive the real local controller over the failing task.
-
-The regression suite scripts llama-server's responses, so it proves the
-orchestrator's behaviour but says nothing about what the real local model
-decides. This runs the genuine path - real `NexusTaskOrchestrator`, real
-`OperationsRegistry`, real llama-server - over the task text that produced
-session ``1ca2d781836a481d8152744f5c1ff94d`` and reports whether the failure
-signature is back.
-
-The failure signature is:
-
-* ``find_tool`` resolved more than once for the identical goal, or
-* the task ended because the loop guard stopped it.
-
-Either one exits 1. A run that never reached ``find_tool`` at all - because
-llama-server was unreachable, or because the controller went straight to a
-final action - exits 2: it verified nothing, and reporting that as a pass
-would be the same mistake as trusting a test that never ran.
-
-This is a real controller turn, so the controller may run read-only
-operations and shell commands exactly as it would for any task. It writes to
-a scratch database (``--db-path``) so production session state is untouched,
-but the repository it inspects is the real one.
-"""
+"""Manual #218 check: drive the real local controller over the failing task. The regression suite
+scripts llama-server responses, so it proves orchestrator behaviour but nothing about what the real
+local model decides; this runs the genuine path (real NexusTaskOrchestrator, OperationsRegistry,
+llama-server) over the task text that produced session 1ca2d781836a481d8152744f5c1ff94d and reports
+whether the failure signature is back: find_tool resolved more than once for the identical goal, or the
+task ended because the loop guard stopped it (exit 1). A run that never reached find_tool exits 2 - it
+verified nothing, and reporting that as a pass would be trusting a test that never ran. The controller may
+run read-only operations and shell commands as for any task; it writes to a scratch database (--db-path) so
+production session state is untouched, but inspects the real repository."""
 
 from __future__ import annotations
 
@@ -32,8 +17,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-# Support direct execution via /agent/scripts/check_issue_218_find_tool.py as
-# well as `python -m scripts.check_issue_218_find_tool` from the repo root.
+# Support direct execution via /agent/scripts/check_issue_218_find_tool.py as well as
+# `python -m scripts.check_issue_218_find_tool` from the repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -46,11 +31,8 @@ LOOP_GUARD_EVENTS = {"duplicate_tool_call", "non_progressing_cycle", "retry_reas
 
 
 def _experiment_service():
-    """Resolves nothing, like a task with no experiment behind it.
-
-    The check is about tool discovery, and a service that answers every lookup
-    would let a commit sha in the task text masquerade as an experiment.
-    """
+    """Resolves nothing, like a task with no experiment behind it - the check is about tool discovery, and
+    a service that answers every lookup would let a commit sha in the task text masquerade as an experiment."""
     return SimpleNamespace(
         resolve_experiment=lambda experiment_id: (_ for _ in ()).throw(
             KeyError(f"unknown experiment {experiment_id!r}")
@@ -73,10 +55,9 @@ def _describe(observation: dict) -> str:
         for item in observation.get("related_operations") or []
     ]
     metrics = observation.get("metrics") or {}
-    # The reason is the only thing that separates "the resolver said none of
-    # these fit" from "the resolver's answer could not be used at all", and
-    # every status but `found` carries one. Printing it is not optional: a
-    # trace without it can say a lookup failed but never why.
+    # The reason is the only thing that separates "the resolver said none of these fit" from "the answer
+    # could not be used at all" - every status but `found` carries one, and printing it is not optional: a trace
+    # without it can say a lookup failed but never why.
     return (
         f"{line}\n"
         f"      reason:                  {observation.get('reason')}\n"
@@ -91,13 +72,9 @@ def _describe(observation: dict) -> str:
 
 
 def _resolver_only(args) -> int:
-    """One find_tool lookup against the real resolver, and what it answered.
-
-    A whole controller run costs several minutes per turn on the VM, and most
-    questions about the resolver ("can it resolve this goal at all?") need only
-    this. Prints the raw model answer too, because when a response cannot be
-    used, what it actually said is the only thing that explains why.
-    """
+    """One find_tool lookup against the real resolver and what it answered - a whole controller run costs
+    minutes per turn on the VM, and most resolver questions need only this. Prints the raw model answer too,
+    because when a response cannot be used, what it actually said is the only thing that explains why."""
     import asyncio
 
     registry = OperationsRegistry(
@@ -244,8 +221,8 @@ def main() -> int:
             print(f"FAIL: {failure}")
         return 1
 
-    # A run that never got as far as find_tool proves nothing about the path
-    # this check exists to exercise, and must not be reported as a pass.
+    # A run that never got as far as find_tool proves nothing about the path this check exists to exercise,
+    # and must not be reported as a pass.
     if not resolved_goals:
         print("INCONCLUSIVE: the controller never reached find_tool, so nothing was verified")
         if "local inference failed" in result.reason:

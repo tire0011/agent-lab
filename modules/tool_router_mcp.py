@@ -1,23 +1,12 @@
-"""The Nexus tool router as a standalone MCP stdio server (#118).
-
-``python -m modules.tool_router_mcp`` exposes exactly two tools, ``find_tool``
-and ``call_tool``, so an external MCP client such as Copilot CLI can exercise
-the router without the task orchestrator's prompt loop around it.
-
-This module is transport only. Candidate scoring, the resolver prompt, argument
-binding, the grant rule and registry-side validation, redaction and audit all
-stay in :class:`~modules.nexus_tool_router.NexusToolRouter` and
-:class:`~modules.operations_registry.OperationsRegistry`, and a ``find_tool``
-answer is passed on unchanged. Two things are specific to this entry point:
-
-* **The caller is not the controller.** ``controller=False`` is what keeps
-  ``service_restart`` and ``machine_reboot`` out of reach: they are
-  ``controller_allowed`` operations that belong to the controller's own
-  session, and a local stdio client must not inherit that privilege.
-* **The session is the process.** A stdio connection is one server process, so
-  one session id per process scopes every grant to that connection. Grants are
-  in memory and end with it; a new connection starts with none.
-"""
+"""The Nexus tool router as a standalone MCP stdio server (#118):
+``python -m modules.tool_router_mcp`` exposes exactly two tools, ``find_tool`` and ``call_tool``,
+so an external MCP client (e.g. Copilot CLI) can exercise the router without the orchestrator prompt
+loop. This module is transport only - scoring, the resolver prompt, argument binding, the grant rule,
+registry validation, redaction and audit stay in NexusToolRouter/OperationsRegistry, and a find_tool
+answer passes on unchanged. Two things are specific to this entry point: the caller is NOT the
+controller (``controller=False`` keeps ``service_restart``/``machine_reboot`` out of reach - a local
+stdio client must not inherit that privilege), and the session is the process (one session id per
+connection scopes every grant to it; grants are in memory and end with it)."""
 
 from __future__ import annotations
 
@@ -62,14 +51,10 @@ SERVER_INSTRUCTIONS = (
 
 
 class LocalLlmResolver:
-    """The router's inference path here: the shared local-LLM job queue.
-
-    The same queue every other role uses, so a resolver call from this process
-    takes its turn on the one inference slot instead of competing with the
-    controller for llama-server. The job service starts a worker thread, so it
-    is acquired on first use and a lookup that never reaches the resolver
-    (``invalid_goal``, no candidates) costs nothing.
-    """
+    """The router inference path here: the shared local-LLM job queue, so a resolver call from this
+    process takes its turn on the one inference slot instead of competing with the controller for
+    llama-server. The job service starts a worker thread, so it is acquired on first use and a lookup
+    that never reaches the resolver (``invalid_goal``, no candidates) costs nothing."""
 
     def __init__(self, *, db_path: str = DEFAULT_DB_PATH) -> None:
         self._db_path = db_path
@@ -108,12 +93,9 @@ class LocalLlmResolver:
 
 
 class DeterministicResolver:
-    """The evaluator's lexical resolver, for checks that need no model.
-
-    Answers in the same resolver schema, so everything after inference runs
-    the production path. Its selection is lexical and it binds no argument
-    values, which is why it is opt-in and never the default.
-    """
+    """The evaluator lexical resolver for checks that need no model: answers in the same resolver
+    schema so everything after inference runs the production path; its selection is lexical and binds
+    no argument values, so it is opt-in and never the default."""
 
     def __init__(self) -> None:
         # Lazy: the evaluation module pulls in the task orchestrator.
@@ -145,11 +127,8 @@ class DeterministicResolver:
 
 
 class LazyExperimentService:
-    """``ExperimentService``, built only if an experiment operation needs it.
-
-    Most lookups never touch an experiment, and constructing the service would
-    almost double this process's startup time.
-    """
+    """``ExperimentService``, built only if an experiment operation needs it - most lookups never touch
+    one, and constructing the service would almost double this process startup time."""
 
     def __init__(self) -> None:
         self._service: Any | None = None
@@ -176,11 +155,8 @@ def build_server(router: NexusToolRouter, *, session_id: str) -> MCPServer:
 
     @server.tool()
     async def find_tool(goal: str) -> CallToolResult:
-        """Resolve a concrete capability to one Nexus operation.
-
-        Returns status found, invalid_goal, not_found or unavailable. Only
-        found grants the operation it selects to this session.
-        """
+        """Resolve a concrete capability to one Nexus operation: returns found / invalid_goal / not_found /
+        unavailable; only found grants the selected operation to this session."""
         return tool_result(await router.resolve_find_tool(goal, session_id=session_id))
 
     @server.tool()

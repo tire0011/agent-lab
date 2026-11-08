@@ -22,8 +22,8 @@ from modules.task_orchestrator import (
     TaskDecision,
 )
 
-# Experiments run in threads of this process; a short-lived caller such as
-# the initiative tick must wait for them before it exits (#358).
+# Experiments run in threads of this process; a short-lived caller such as the initiative
+# tick must wait for them before it exits (#358).
 EXPERIMENT_THREAD_PREFIX = "nexus-controller-exp-"
 
 GOAL_CHAR_CAP = 24000
@@ -55,17 +55,11 @@ def _keep_title_and_tail(goal: str, first_input: str) -> str:
 
 
 class NexusControllerService:
-    """Feed heterogeneous work into one persistent local-LLM controller.
-
-    The orchestrator chooses the action; this service executes the selected
-    primitive. Tool calls performed during reasoning still happen inside the
-    orchestrator and always return control to the local model first.
-
-    GitHub work tracking is the mandatory outer lifecycle: a
-    durable Issue and human-readable remote branch are resolved/created before
-    a new implementation experiment starts. The isolated experiment worktree
-    remains an internal execution detail.
-    """
+    """Feed heterogeneous work (task, issue, idea, discussion) into one persistent local-LLM
+    controller: the orchestrator chooses the action, this service executes the selected
+    primitive. GitHub work tracking is the mandatory outer lifecycle - a durable Issue and
+    human-readable branch are resolved/created before a new implementation experiment starts;
+    the experiment worktree stays an internal detail."""
 
     def __init__(
         self,
@@ -181,11 +175,9 @@ class NexusControllerService:
         return completed
 
     def _execution_goal(self, session_id: str, fallback: str) -> str:
-        """Reconstruct the user-visible task across clarification replies.
-
-        Tool observations remain available to the controller through persistent
-        history/memory but are not copied verbatim into an implementation goal.
-        """
+        """Reconstruct the user-visible task across clarification replies. Tool observations stay
+        available to the controller through persistent history/memory but are not copied verbatim
+        into an implementation goal."""
         try:
             stored_inputs = self.orchestrator.task_store.user_inputs(session_id)
         except Exception:
@@ -197,8 +189,8 @@ class NexusControllerService:
         user_inputs = [item for item in user_inputs if item]
         if not user_inputs:
             return fallback
-        # #495: a retried issue stores the whole body again, so an input that a
-        # later input repeats (or starts with) adds nothing but tokens.
+        # #495: a retried issue stores the whole body again, so an input a later one repeats (or
+        # starts with) adds nothing but tokens.
         kept = _drop_repeated_inputs(user_inputs)
         dropped = len(user_inputs) - len(kept)
         goal = "\n\nUser follow-up:\n".join(kept)

@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""Nexus initiative tick — decide and start one piece of Nexus's own work.
-
-This is the entry point that makes Nexus self-directed. Everything else in the
-system waits to be asked: the mailbox timer waits for a human to write a file,
-the chat waits for someone to type, the task worker waits for an approval. This
-runs on a timer, looks at Nexus's own state, picks the single most useful thing
-to do next, records why, and hands it to the existing pipeline.
-
-The services are built exactly as ``api.py`` builds them, so a tick observes the
-same lifecycle rules as every other caller.
-"""
+"""Nexus initiative tick - decide and start one piece of Nexus own work. This is the entry
+point that makes Nexus self-directed: everything else waits to be asked (mailbox timer, chat,
+task worker), while this runs on a timer, looks at Nexus state, picks the single most useful
+thing to do next, records why, and hands it to the existing pipeline. Services are built exactly
+as api.py builds them, so a tick observes the same lifecycle rules as every other caller."""
 
 from __future__ import annotations
 
@@ -88,23 +82,19 @@ def _main_commit_date(repo_root: str) -> str:
 
 
 def _list_open_issues(repo_root: str) -> list[dict]:
-    """Return the open GitHub issue backlog available to Nexus.
-
-    The initiative budget and one-at-a-time gate are the safety boundary.  A
-    label gate made the supposedly self-directed tick depend on a human first
-    labelling every issue, and in production that left it with no work to
-    plan. Pull a bounded view of the ordinary issue backlog instead. Pull
-    requests are excluded by ``gh issue list`` and linked issues are filtered
-    by :class:`NexusInitiativeService` before dispatch.
-    """
+    """Return the open GitHub issue backlog available to Nexus. The initiative budget and
+    one-at-a-time gate are the safety boundary; a label gate would make the self-directed tick
+    depend on a human labelling every issue first, so the ordinary bounded backlog is pulled instead
+    (PRs excluded by ``gh issue list``; linked issues filtered by NexusInitiativeService before
+    dispatch)."""
     try:
         proc = subprocess.run(
             [
                 "gh", "issue", "list",
                 "--state", "open",
                 "--limit", str(_ISSUE_LIMIT),
-                # ``author`` decides whether the content-hash check applies
-                # (trusted authors may edit their issue after approval).
+                # ``author`` decides whether the content-hash check applies (trusted authors may edit their
+                # issue after approval).
                 "--json", "number,title,body,labels,author",
             ],
             cwd=repo_root,
@@ -142,7 +132,7 @@ def _comment_on_issue(repo_root: str, number: int, text: str) -> None:
 def _open_proposal(repo_root: str, title: str, body: str) -> None:
     from modules.nexus_planner import PROPOSAL_LABEL
 
-    # The label exists in the repository; the VM's gh has no `label` command.
+    # The label exists in the repository; the VM
     footer = "\n\n---\nSuggested by the Nexus planning step. Remove the `proposal` label to let Nexus work on it."
     _gh(repo_root, ["issue", "create", "--title", title, "--body", body + footer, "--label", PROPOSAL_LABEL])
     _events.append(f"New proposal issue: {title}")
@@ -163,11 +153,8 @@ def _count_open_proposals(repo_root: str) -> int:
 
 
 def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[dict[str, str]]:
-    """Proposals the owner closed lately, with the closing comment as the reason.
-
-    A rejected proposal keeps its label; its last comment says why. The
-    planner sees these so it does not suggest the same thing again.
-    """
+    """Proposals the owner closed lately, with the closing comment as the reason - a rejected
+    proposal keeps its label, and the planner sees these so it does not suggest the same again."""
     from modules.nexus_planner import PROPOSAL_LABEL
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -188,8 +175,8 @@ def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[di
             cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
         )
         bodies = json.loads(comments.stdout or "[]") if comments.returncode == 0 else []
-        # Only comments whose API-verified author is a trusted actor count as
-        # the owner's decision; comment text itself is never trusted.
+        # Only comments whose API-verified author is a trusted actor count as the owner decision;
+        # comment text itself is never trusted.
         trusted_bodies = [
             c for c in bodies
             if isinstance(c, dict) and github_authorization.classify_comment(c).trusted
@@ -310,14 +297,10 @@ def _build_service(args) -> NexusInitiativeService:
 
 
 def _reconcile_stale_claims(db_path: str) -> None:
-    """Release controller claims whose worker stopped heartbeating (#162).
-
-    The tick runs on a timer, which makes it the natural place to notice a dead
-    worker: the API only reconciles at startup, and a worker that dies while
-    the API keeps running would otherwise hold its claim until the next
-    restart. Never resumes the work and never fails the tick - a tick that
-    could not reap is still a tick that can decide.
-    """
+    """Release controller claims whose worker stopped heartbeating (#162). The tick runs on a
+    timer, so it is the natural place to notice a dead worker - the API only reconciles at startup,
+    and a worker that dies while the API keeps running would hold its claim until the next restart.
+    Never resumes the work, never fails the tick."""
     store = None
     try:
         store = NexusTaskStore(db_path=db_path)
@@ -338,11 +321,8 @@ def _reconcile_stale_claims(db_path: str) -> None:
 
 
 def _cleanup_expired_worktrees(service) -> None:
-    """Remove worktrees of terminal experiments past their retention (#376).
-
-    The API only cleans up at startup; the tick is what keeps a long-running
-    deployment from filling its disk. Never fails the tick.
-    """
+    """Remove worktrees of terminal experiments past their retention (#376). The API only cleans up
+    at startup; the tick keeps a long-running deployment from filling its disk. Never fails the tick."""
     experiment_service = getattr(service, "experiment_service", None)
     if experiment_service is None:
         return
@@ -357,11 +337,8 @@ def _cleanup_expired_worktrees(service) -> None:
 
 
 def _sweep_stalled_experiments(service) -> None:
-    """Fail experiments that logged nothing past their phase limit (#400).
-
-    A hung worker otherwise holds the issue, the daily budget and this tick's
-    wait until a restart. Never fails the tick.
-    """
+    """Fail experiments that logged nothing past their phase limit (#400) - a hung worker otherwise
+    holds the issue, the daily budget and this tick wait until a restart. Never fails the tick."""
     experiment_service = getattr(service, "experiment_service", None)
     if experiment_service is None:
         return
@@ -376,18 +353,15 @@ def _sweep_stalled_experiments(service) -> None:
 
 
 def _wait_for_experiments(service=None) -> None:
-    """Keep the process alive until the work it started has ended (#358).
-
-    The controller runs an experiment, and the adoption service an
-    integration, in a daemon thread of this process; the oneshot unit would
-    otherwise exit and kill it while it is still queued or adopting.
-    """
+    """Keep the process alive until the work it started has ended (#358): the controller runs an
+    experiment, and the adoption service an integration, in a daemon thread of this process, and the
+    oneshot unit would otherwise exit and kill it while still queued/adopting."""
     from modules.experiment_adoption_service import ADOPTION_THREAD_PREFIX
     from modules.nexus_controller_service import EXPERIMENT_THREAD_PREFIX
 
-    # A thread can start the next one - a controller session that resumes
-    # after a rejected experiment starts a new one (#388) - so look again
-    # until none is left.
+    # A thread can start the next one (a controller session that resumes after a rejected experiment
+    # starts a new one, #388) - look again until none is left. Wake now and then: the experiment this
+    # tick waits for may be the one whose worker hangs (#400).
     while True:
         pending = [
             thread for thread in threading.enumerate()
@@ -434,9 +408,8 @@ def _finished_badly(db_path: str, since: str) -> list[str]:
     return found
 
 
-# Nexus stood still for 17 hours after #506 and every tick only said "idle"
-# (#521). After this long without starting work, the owner hears about it,
-# at most once a day.
+# Nexus stood still for 17 hours after #506/#521 and every tick only said "idle"; after this long
+# without starting work the owner hears about it, at most once a day.
 _STALL_ALARM_HOURS = 6
 _STALL_ALARM_REPEAT_HOURS = 24
 _STALL_ALARM = "stall_alarm"
@@ -445,10 +418,8 @@ _EXPECTED_QUIET = ("busy", "budget_exhausted", "paused")
 
 
 def _stall_alarm(db_path: str, now: datetime | None = None) -> str | None:
-    """A message when Nexus has started no work for a long time, else ``None``.
-
-    Records the alarm in the initiative log so it is sent once a day.
-    """
+    """A message when Nexus has started no work for a long time, else ``None``; the alarm is recorded
+    in the initiative log so it is sent once a day."""
     now = now or datetime.now(timezone.utc)
     try:
         db = sqlite3.connect(db_path, timeout=30)
@@ -499,11 +470,9 @@ def _stall_alarm(db_path: str, now: datetime | None = None) -> str | None:
 
 
 def _notify(repo_root: str, messages: list[str]) -> None:
-    """Comment on the watched notification PR so Claude wakes up (#365).
-
-    ``NEXUS_NOTIFY_PR`` is ``owner/repo#number``; unset means no notifications.
-    Best effort: a failed comment must not fail the tick.
-    """
+    """Comment on the watched notification PR so Claude wakes up (#365). ``NEXUS_NOTIFY_PR`` is
+    ``owner/repo#number``; unset means no notifications. Best effort: a failed comment must not fail
+    the tick."""
     target = os.environ.get("NEXUS_NOTIFY_PR", "").strip()
     if not target or not messages or "#" not in target:
         return
@@ -536,8 +505,7 @@ def main(argv: list[str] | None = None) -> int:
     _events.clear()
     decision = None
 
-    # --dry-run reports what would happen and changes nothing, reaping
-    # included.
+    # --dry-run reports what would happen and changes nothing, reaping included.
     if not args.dry_run:
         _reconcile_stale_claims(args.db_path)
         from modules.main_guard import guard_main

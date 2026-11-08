@@ -41,22 +41,17 @@ def _internal_api_key() -> str:
     return getattr(nexus_api, "API_KEY", os.environ["AGENT_API_KEY"])
 
 
-# ---------------------------------------------------------------------------
-# Test-runner helper — module-level so it is importable and testable directly.
-# ---------------------------------------------------------------------------
+# Test-runner helper - module-level so it is importable and testable directly.
 
-#: Hard cap on bytes buffered from the test runner during execution.
-#: Output is additionally bounded to 200 lines before being returned.
+#: Hard cap on bytes buffered from the test runner; output is additionally bounded to 200 lines
+#: before being returned.
 _TESTS_MAX_OUTPUT_BYTES: int = 512 * 1024  # 512 KiB
 
 
 def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
-    """Run ``python -m unittest discover`` with streaming output bounding.
-
-    A ``threading.Timer`` enforces the wall-clock deadline independently of
-    stdout state, so a test process that closes its pipe early cannot bypass
-    the timeout.  The entire process group is killed when the deadline fires.
-    """
+    """Run ``python -m unittest discover`` with streaming output bounding. A ``threading.Timer`` enforces
+    the wall-clock deadline independently of stdout state, so a test process that closes its pipe early
+    cannot bypass the timeout; the whole process group is killed when it fires."""
     from modules.redaction import bounded_lines
 
     t0 = time.monotonic()
@@ -95,7 +90,7 @@ def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
             timer.daemon = True
             timer.start()
 
-            # killer_thread: wait for proc exit, set _proc_done, free pipe.
+            # killer_thread: wait for proc exit, set _proc_done, free the pipe.
             _proc_done = threading.Event()
 
             def _killer() -> None:
@@ -146,9 +141,9 @@ def _run_tests_sync(timeout_seconds: int, repo_root: str) -> dict[str, Any]:
             reader_thread.start()
 
             reader_thread.join(timeout=timeout_seconds + 10)
-            # Only cancel the timer when the process is confirmed dead.
-            # If stdout was closed early (pipe-close bypass) the reader exits
-            # but the process is still running; the timer must NOT be cancelled.
+            # Only cancel the timer once the process is confirmed dead via _proc_done - if stdout was closed
+            # early (pipe-close bypass) the reader exits but the process still runs; the timer must NOT be
+            # cancelled.
             if _proc_done.is_set():
                 timer.cancel()
 
@@ -561,11 +556,7 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         limit = _validate_limit(limit, minimum=1, maximum=200)
         return {"log": _read_command(["git", "log", f"-{limit}", "--format=%h %ad %s", "--date=short"])}
 
-    # ------------------------------------------------------------------
-    # Write tools — only active when MCP_WRITE_ENABLED=true
-    # All tools call _require_write_enabled() as their first action so
-    # they fail immediately (and loudly) when the flag is off.
-    # ------------------------------------------------------------------
+    # Write tools - only active when MCP_WRITE_ENABLED=true.
 
     @mcp.tool(
         description=(

@@ -1,10 +1,6 @@
-"""Versioned prompt template library.
-
-Prompts live in ``prompts/`` as Markdown files with YAML front-matter.  This
-module loads them, validates the front-matter, and performs simple
-``{{variable}}`` substitution so callers never have to do string formatting
-themselves.
-"""
+"""Versioned prompt template library: prompts live in ``prompts/`` as Markdown files with
+YAML front-matter; this module loads them, validates the front-matter, and performs simple
+``{{variable}}`` substitution so callers never do string formatting themselves."""
 
 from __future__ import annotations
 
@@ -25,11 +21,9 @@ class PromptLibraryError(Exception):
 
 
 def _parse_front_matter(text: str) -> tuple[dict[str, str], str]:
-    """Split YAML front-matter from Markdown body.
-
-    Returns ``(metadata_dict, body_without_front_matter)``.
-    The front-matter block is optional; if absent an empty dict is returned.
-    """
+    """Split YAML front-matter from the Markdown body; returns ``(metadata_dict,
+    body_without_front_matter)``. The front-matter block is optional - if absent, an empty dict
+    is returned."""
     front_matter: dict[str, str] = {}
     body = text
 
@@ -48,25 +42,9 @@ def _parse_front_matter(text: str) -> tuple[dict[str, str], str]:
 
 
 def load_prompt(role: str, prompts_dir: Path | None = None) -> str:
-    """Load the raw Markdown template for *role* (e.g. ``"router"``).
-
-    Parameters
-    ----------
-    role:
-        One of ``PROMPT_ROLES``.
-    prompts_dir:
-        Override the default prompts directory (useful in tests).
-
-    Returns
-    -------
-    str
-        The Markdown body (front-matter stripped).
-
-    Raises
-    ------
-    PromptLibraryError
-        If the file does not exist or the role is unknown.
-    """
+    """Load the raw Markdown template for *role* (one of ``PROMPT_ROLES``), front-matter
+    stripped; ``prompts_dir`` overrides the default directory (useful in tests). Raises
+    :class:`PromptLibraryError` when the file does not exist or the role is unknown."""
     if role not in PROMPT_ROLES:
         raise PromptLibraryError(
             f"Unknown prompt role {role!r}. Available: {PROMPT_ROLES}"
@@ -83,21 +61,9 @@ def load_prompt(role: str, prompts_dir: Path | None = None) -> str:
 
 
 def render_prompt(role: str, variables: dict[str, Any], prompts_dir: Path | None = None) -> str:
-    """Load and render the prompt for *role* by substituting *variables*.
-
-    Template placeholders use the ``{{variable_name}}`` syntax.  Extra
-    variables are silently ignored; missing ones cause a
-    :class:`PromptLibraryError`.
-
-    Parameters
-    ----------
-    role:
-        Prompt role (``"router"``, ``"planner"``, ``"developer"``, ``"tester"``).
-    variables:
-        Mapping of placeholder names to values.
-    prompts_dir:
-        Override the default prompts directory (useful in tests).
-    """
+    """Load and render the prompt for *role* by substituting *variables*: placeholders use the
+    ``{{variable_name}}`` syntax, extra variables are silently ignored, missing ones raise
+    :class:`PromptLibraryError`. ``prompts_dir`` overrides the default directory (tests)."""
     body = load_prompt(role, prompts_dir=prompts_dir)
 
     # Find all {{placeholders}} in the template.

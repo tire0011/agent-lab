@@ -1,21 +1,11 @@
-"""Explicit work-tracking constraints parsed out of a Nexus task instruction.
-
-Issue #184: a mailbox task said "implement GitHub issue #180 ... do not
-create another branch or issue". Nexus ignored both constraints and opened a
-duplicate tracking Issue (#181), so one piece of work had two GitHub records
-and the governance instruction was silently violated.
-
-This module turns that free-form instruction into a small, inspectable value
-object. It never talks to GitHub: deciding *whether* a named Issue is usable
-belongs to ``modules.github_work_tracking``; deciding *what the author asked
-for* belongs here.
-
-Detection is deliberately conservative. A passing mention ("see issue #12 for
-background") must not hijack the lifecycle, so an Issue only becomes the work
-target when a directive verb points at it ("implement issue #180") - or when
-the task forbids a new Issue and names exactly one, which leaves no other
-reading.
-"""
+"""Explicit work-tracking constraints parsed out of a Nexus task instruction (#184: a task said
+"implement issue #180 ... do not create another branch or issue" and Nexus opened a duplicate
+Issue #181). This module turns the free-form instruction into a small inspectable value object and
+never talks to GitHub - whether a named Issue is usable belongs to
+``modules.github_work_tracking``. Detection is deliberately conservative: a passing mention
+("see issue #12 for background") must not hijack the lifecycle, so an Issue becomes the work target
+only when a directive verb points at it ("implement issue #180"), or when the task forbids a new
+Issue and names exactly one."""
 
 from __future__ import annotations
 
@@ -56,12 +46,9 @@ _KINDS = r"(?:github\s+|tracking\s+)*"
 
 
 def _no_new_patterns(noun: str) -> tuple[re.Pattern[str], ...]:
-    """Patterns for "do not create another <noun>" in its common phrasings.
-
-    A "newness" word (new/another/...) or an immediately following noun is
-    required so that an unrelated instruction such as "do not create a PR
-    that closes the issue" is not read as a ban on tracking Issues.
-    """
+    """Patterns for "do not create another <noun>" in common phrasings: a "newness" word or an
+    immediately following noun is required, so "do not create a PR that closes the issue" is not read
+    as a ban on tracking Issues."""
     return (
         re.compile(
             rf"\b{_NEGATION}\b[^.\n]{{0,40}}?\b{_CREATE}\b[^.\n]{{0,40}}?"
@@ -78,8 +65,8 @@ def _no_new_patterns(noun: str) -> tuple[re.Pattern[str], ...]:
 
 _NO_NEW_ISSUE_RES = _no_new_patterns("issue")
 _NO_NEW_BRANCH_RES = _no_new_patterns("branch")
-# Deliberately broad, also for a quoted mention: a wrong match leaves a pull
-# request open for a human, a missed one is an irreversible merge (#185).
+# Deliberately broad, also for a quoted mention: a wrong match leaves a PR open for a human; a
+# missed one is an irreversible merge (#185).
 _NO_MERGE_RE = re.compile(
     r"\b(?:do\s+not|don['\u2019]t|must\s+not|should\s+not|never)\s+"
     r"(?:auto(?:matically)?[\s-]*)?merge\b"
@@ -101,9 +88,8 @@ _BRANCH_TARGET_RES = (
     re.compile(rf"\bbranch\b\s*[:=]\s*[`'\"]?({_BRANCH_TOKEN})", re.IGNORECASE),
 )
 
-# A branch name that carries no separator and no digit is almost always an
-# ordinary English word swallowed from a sentence ("use the branch that
-# already exists"), not a ref. These few are real branch names all the same.
+# A branch name with no separator and no digit is almost always an English word swallowed from a
+# sentence ("use the branch that already exists"), not a ref - these few are real branch names.
 _PLAIN_BRANCH_NAMES = frozenset({"main", "master", "develop", "development", "trunk"})
 
 
@@ -139,19 +125,17 @@ def parse_work_directives(text: str | None) -> WorkDirectives:
     ):
         issue_number: int | None = header_issue_number
     elif header_issue_number is not None:
-        # A verb-led target is more explicit than the standard goal heading,
-        # but conflicting numbers remain ambiguous rather than silently
-        # choosing either Issue.
+        # A verb-led target is more explicit than the standard goal heading, but conflicting numbers stay
+        # ambiguous rather than silently choosing either Issue.
         issue_number = None
     elif len(targets) == 1:
         issue_number: int | None = targets[0]
     elif not targets and forbid_new_issue and len(mentions) == 1:
-        # "Do not create another issue" plus exactly one Issue in the task
-        # leaves only one issue it can mean.
+        # "Do not create another issue" plus exactly one Issue in the task leaves only one reading.
         issue_number = mentions[0]
     else:
-        # No target, or several competing ones: the caller decides whether
-        # that is a plain "no directive" or an ambiguity it must refuse.
+        # No target, or several competing ones: the caller decides whether that is a plain "no directive"
+        # or an ambiguity it must refuse.
         issue_number = None
 
     merge_match = _NO_MERGE_RE.search(source)

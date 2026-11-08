@@ -1,13 +1,8 @@
-"""Planning step of the initiative tick: pick the one issue to work on next (#354).
-
-The tick used to take open issues in list order. This asks a strong model
-which single open issue is the most useful next step and why. There is no
-fixed plan and no count: every tick that is free to start work asks again.
-
-The model may also suggest one new issue. Such a suggestion is opened with the
-``proposal`` label, and the tick never works on it until a human removes the
-label.
-"""
+"""Planning step of the initiative tick: pick the one issue to work on next (#354). The tick
+used to take open issues in list order; this asks a strong model which single open issue is
+most useful next and why - no fixed plan, every free tick asks again. The model may also
+suggest one new issue, opened with the ``proposal`` label; the tick never works on it until
+a human removes the label."""
 
 from __future__ import annotations
 
@@ -204,12 +199,9 @@ def parse_choice(raw: str, allowed: set[int]) -> PlanChoice | None:
 
 
 class IssuePlanner:
-    """Ask a model which open issue comes next.
-
-    *explore* (prompt -> raw answer) is an agent that can read the code and
-    use read-only tools (#384); *complete* is a single model call, used alone
-    or when exploring fails.
-    """
+    """Ask a model which open issue comes next. *explore* (prompt -> raw answer) is an agent that
+    can read the code and use read-only tools (#384); *complete* is a single model call, used alone
+    or when exploring fails."""
 
     def __init__(
         self,

@@ -1,23 +1,13 @@
-"""Paging through stored tool results: ``read_tool_result`` (#562, part 2 of #232).
+"""Paging through stored tool results: ``read_tool_result`` (#562, part 2 of #232). Part 1 (#561)
+shows a large tool result as a semantic summary and names the storing event; this read-only tool
+returns one deterministic slice of that stored result, so the controller pulls back only the part it
+needs.
 
-Part 1 (#561) shows a large tool result as a semantic summary and names the
-event that stores it in full. This read-only controller tool returns one
-deterministic slice of that stored result, so the controller pulls back only
-the part it needs instead of the whole result.
-
-Access rule (exact): an event is readable only when it
-
-- belongs to the **same session** as the caller,
-- has ``role == "tool"``, and
-- has one of the tool-result kinds the orchestrator writes for a tool call
-  (``TOOL_RESULT_KINDS``).
-
-Anything else - a user, assistant or system event, another session's event, a
-non-result tool event such as ``goal_truncated``, or an unknown id - gets the
-same refusal without content, so a refusal does not reveal whether the id
-exists. Only the event's ``content`` column is read; never its metadata and
-never another table.
-"""
+Access rule (exact): an event is readable only when it belongs to the **same session** as the
+caller, has ``role == "tool"``, and has one of the tool-result kinds (``TOOL_RESULT_KINDS``).
+Anything else - another session, a non-result tool event, an unknown id - gets the same refusal
+without content, so a refusal does not reveal whether the id exists. Only the event ``content``
+column is read, never metadata, never another table."""
 
 from __future__ import annotations
 
@@ -25,10 +15,9 @@ from typing import Any, Protocol
 
 TOOL_READ_TOOL_RESULT = "read_tool_result"
 
-# The ``kind`` values the orchestrator writes for the stored result of a tool
-# call (``kind = observation["tool"]``, or the action itself for experiments).
-# ``read_tool_result`` is deliberately absent: its own results are copies of a
-# slice, and paging through them would only re-read what is already readable.
+# The ``kind`` values the orchestrator writes for a stored tool result (``kind = observation["tool"]``,
+# or the action itself for experiments). ``read_tool_result`` is deliberately absent - its own results
+# are copies of a slice, and paging through them would only re-read what is already readable.
 TOOL_RESULT_KINDS: frozenset[str] = frozenset(
     {
         "find_tool",
@@ -79,11 +68,9 @@ def _as_int(value: Any) -> int | None:
 def normalize_arguments(
     decision: dict[str, Any], cap: int
 ) -> tuple[dict[str, int] | None, str | None]:
-    """``(arguments, error)``: the effective ``event_id``/``offset``/``limit``.
-
-    ``limit`` defaults to and is reduced to ``cap``, so a read above the cap and
-    a read at the cap are the same range - for the reader and for the loop guard.
-    """
+    """``(arguments, error)``: the effective ``event_id``/``offset``/``limit`` - ``limit`` defaults to
+    and is reduced to the cap, so a read above the cap and one at the cap are the same range for the
+    reader and the loop guard."""
     event_id = _as_int(decision.get("event_id"))
     if event_id is None or event_id <= 0:
         return None, "event_id must be a positive integer id of a stored tool result"
@@ -161,11 +148,8 @@ def read_hint(observation: dict[str, Any], event_id: Any) -> str:
 
 
 def duplicate_read_guidance(arguments: dict[str, Any]) -> dict[str, Any]:
-    """What a refused re-read of the same range says to do instead.
-
-    Reading another range of the same event is progress, so the recovery names
-    the next range rather than sending the controller to another tool.
-    """
+    """What a refused re-read of the same range says instead: reading another range of the same event
+    is progress, so the recovery names the next range rather than sending the controller to another tool."""
     event_id = arguments.get("event_id")
     offset = max(0, _as_int(arguments.get("offset")) or 0)
     limit = max(0, _as_int(arguments.get("limit")) or 0)

@@ -1,15 +1,9 @@
-"""Code review before Nexus merges its own pull request (#396).
-
-Tests and the deterministic quality gate say whether a change runs and
-matches its plan, not whether it is good. Before the merge, one of three
-reviewers reads the issue and the diff: Claude and Codex as read-only agents
-in the integration worktree (they can open any file), Azure from the diff
-alone. They take turns, so each model gets to review.
-
-A reviewer that cannot run is skipped for the next one. When none can run,
-the change is not blocked: tests and the quality gate already passed, and a
-missing reviewer must not stop Nexus. The result says so.
-"""
+"""Code review before Nexus merges its own pull request (#396). Tests and the deterministic
+quality gate say whether a change runs and matches its plan, not whether it is good; before
+the merge, one of three reviewers reads the issue and the diff (Claude and Codex as read-only
+agents in the integration worktree, Azure from the diff alone), taking turns. A reviewer that
+cannot run is skipped; when none can run the change is NOT blocked - tests and the quality
+gate already passed - and the result says so."""
 
 from __future__ import annotations
 

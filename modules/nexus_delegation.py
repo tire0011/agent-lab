@@ -1,19 +1,9 @@
-"""Bounded LLM delegation tools used by the local Nexus controller.
-
-The local model remains the controller. Delegates are consultants/workers that
-return an observation; control always comes back to the local orchestrator.
-
-The ``local_worker`` delegate runs on the same shared local-LLM job path as
-every other local-model caller (#167/D-019): it is another role on the one
-queue, not a second way to reach llama-server. The external delegates
-(``codex_readonly``, ``claude_readonly``, ``azure_openai``) talk to their own
-services and are not affected by that rule.
-
-The two CLI coding agents are offered as *named* delegates here: this is the
-controller deliberately consulting one of them, so nothing is drawn at random
-(that happens for tasks and experiments — see ``modules.coding_provider``).
-``claude_readonly`` is only advertised when the Claude CLI is installed.
-"""
+"""Bounded LLM delegation tools for the local Nexus controller: delegates are consultants
+that return an observation, control always comes back to the local orchestrator. The
+``local_worker`` delegate runs on the shared local-LLM job queue like every other local
+caller (#167/D-019) - one queue, not a second path to llama-server. The CLI coding agents
+are offered as *named* delegates (the controller deliberately consults one, nothing is
+drawn at random); ``claude_readonly`` is advertised only when the Claude CLI is installed."""
 
 from __future__ import annotations
 
@@ -106,9 +96,8 @@ class NexusDelegationService:
         repo_root: str = "/agent",
         llm_job_service: LocalLlmJobService | None = None,
     ) -> None:
-        # Local delegation is queued work, not a private HTTP path: the same
-        # shared service the controller and failure analysis use runs it, so a
-        # delegate cannot race them at llama-server.
+        # Local delegation is queued work, not a private HTTP path: the same shared service the
+        # controller and failure analysis use runs it, so a delegate cannot race them at llama-server.
         self.llm_jobs = llm_job_service or acquire_local_llm_job_service(
             db_path=db_path, llama_client=llama_client
         )
@@ -228,12 +217,9 @@ class NexusDelegationService:
     async def _cli_agent(
         self, provider: str, delegate: str, task: str, context: str
     ) -> DelegationResult:
-        """Consult one named CLI coding agent in read-only mode.
-
-        The task service is shared between both agents; the provider is passed
-        per task, so a delegate the controller asked for by name is never
-        swapped for the other one.
-        """
+        """Consult one named CLI coding agent in read-only mode: the shared task service runs both
+        agents and the provider is passed per task, so a delegate asked for by name is never
+        swapped for the other one."""
         try:
             service = self.codex_service
             if service is None:
@@ -281,11 +267,8 @@ class NexusDelegationService:
         return await self._azure_chat(prompt, max_tokens=900, timeout=60.0)
 
     async def azure_chat(self, prompt: str, *, max_tokens: int) -> DelegationResult:
-        """Send *prompt* to Azure as is: no wrapper and no truncation.
-
-        Used when Azure drives the controller itself (#337). Unlike a delegated
-        sub-problem, a controller prompt must arrive whole.
-        """
+        """Send *prompt* to Azure as is - no wrapper, no truncation: used when Azure drives the
+        controller itself (#337), where unlike a delegated sub-problem the prompt must arrive whole."""
         return await self._azure_chat(prompt, max_tokens=max_tokens, timeout=120.0)
 
     async def _azure_chat(self, prompt: str, *, max_tokens: int, timeout: float) -> DelegationResult:

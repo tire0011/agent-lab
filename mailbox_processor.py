@@ -22,12 +22,9 @@ _PERMANENT_SKIP_MARKERS = ("max retries",)
 
 
 def _is_permanent_skip(reason: str | None) -> bool:
-    """Whether a skip reason will still hold on every future poll.
-
-    A message whose retries are exhausted is skipped forever; one skipped
-    because it is already done disappears as soon as its inbox file is
-    cleaned up. Only the first kind needs to stop being re-announced.
-    """
+    """Whether a skip reason will still hold on every future poll: a message whose retries are
+    exhausted is skipped forever, while one skipped because it is already done disappears once its
+    inbox file is cleaned up - only the first kind needs to stop being re-announced."""
     text = (reason or "").lower()
     return any(marker in text for marker in _PERMANENT_SKIP_MARKERS)
 
@@ -37,15 +34,10 @@ def _resolve_repo_paths(
     mailbox_repo_path_arg: str | None,
     repo_path_arg: str | None,
 ) -> tuple[Path, Path]:
-    """Resolve code and mailbox repository paths from CLI arguments and env vars.
-
-    Priority: explicit flags > ``--repo-path`` alias > environment variables.
-    The code repository defaults to ``/agent``; the mailbox repository must be
-    explicit. Raises :exc:`ValueError` if ``--repo-path`` is
-    combined with ``--code-repo-path`` or ``--mailbox-repo-path``.
-
-    Returns ``(code_repo_path, mailbox_repo_path)``.
-    """
+    """Resolve code and mailbox repository paths from CLI args and env vars. Priority: explicit flags >
+    ``--repo-path`` alias > environment variables. The code repo defaults to /agent; the mailbox repo must
+    be explicit. Raises :exc:`ValueError` if ``--repo-path`` is combined with the specific flags. Returns
+    ``(code_repo_path, mailbox_repo_path)``."""
     explicit_alias = repo_path_arg is not None
     explicit_code = code_repo_path_arg is not None
     explicit_mailbox = mailbox_repo_path_arg is not None
@@ -117,8 +109,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Resolve repo paths via the module-level helper so that the same logic
-    # is reachable from tests without starting the full processor.
+    # Resolve repo paths via the module-level helper so the same logic is reachable from tests without
+    # starting the full processor.
     try:
         code_repo_path, mailbox_repo_path = _resolve_repo_paths(
             args.code_repo_path, args.mailbox_repo_path, args.repo_path
@@ -142,11 +134,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if result.status == "busy":
-        # Lock contention is the timer doing its job, not a failure: the
-        # processor that holds the lock rescans the inbox before exiting, so
-        # this invocation has nothing to do.  Exiting non-zero here made
-        # systemd report "Failed to start Nexus mailbox processor" for a
-        # perfectly healthy mailbox.
+        # Lock contention is the timer doing its job, not a failure: the processor holding the lock rescans
+        # the inbox before exiting, so this invocation has nothing to do. Exiting non-zero here made systemd
+        # report "Failed to start Nexus mailbox processor" for a perfectly healthy mailbox.
         logger.info("Mailbox poll skipped: another processor is already running")
         return 0
     if result.status == "dirty_worktree":
@@ -156,10 +146,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("git pull --ff-only failed; refusing mailbox processing")
         return 1
     if result.status == "sync_failed":
-        # Reported below rather than here: a sync that failed partway through
-        # the drain still leaves completed messages worth logging.  Unlike a
-        # held lock, this one is a real fault - the mailbox checkout is out of
-        # step with its remote, so messages are not being delivered.
+        # Reported below rather than here: a sync that failed partway still leaves completed messages worth
+        # logging. Unlike a held lock this is a real fault - the mailbox checkout is out of step with its
+        # remote, so messages are not being delivered.
         logger.error("Mailbox sync with the remote failed; remaining work is left for the next run")
     if result.status == "error":
         logger.error("Mailbox processing failed: %s", sanitized_reason(result.error) or "unknown")
@@ -171,12 +160,9 @@ def main(argv: list[str] | None = None) -> int:
         if status == "done":
             logger.info("done: %s -> %s", file_, r.get("outbox", ""))
         elif status == "skipped":
-            # A message skipped for a permanent reason is skipped again on
-            # every future poll, so announcing it at INFO each time floods
-            # the feed and pushes real events out of the default window
-            # (see PROJECT_HISTORY lesson 37: keep success quiet, keep the
-            # detail available on demand). The count still appears in the
-            # summary below, and the per-file detail stays at DEBUG.
+            # A permanently skipped message is skipped again on every future poll, so announcing it at INFO each
+            # time floods the feed (PROJECT_HISTORY lesson 37: keep success quiet, keep detail on demand); the
+            # count still appears in the summary below and per-file detail stays at DEBUG.
             level = logging.DEBUG if _is_permanent_skip(r.get("reason")) else logging.INFO
             logger.log(level, "skipped: %s (%s)", file_, r.get("reason", ""))
         else:

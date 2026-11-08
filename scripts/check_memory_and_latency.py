@@ -1,29 +1,13 @@
 #!/usr/bin/env python3
-"""Does a bigger prompt budget cost the VM its headroom, or its speed?
-
-The prompt budget used to collapse to 500 characters on any host where the
-model was resident, because it subtracted that model's footprint from
-``MemAvailable`` (#223). With that corrected, prompts run against the full
-context window instead - which is the point, and also a sustained change in
-what llama-server holds.
-
-Two numbers decide whether that is safe here, and neither can be reasoned
-out:
-
-* **Headroom.** ``llama-server.service`` sets ``MemoryMax=6G``. A full-context
-  prompt was measured at 6138 MiB resident against that 6144 MiB ceiling. Six
-  mebibytes is not a margin. The model is mmap'd, so the likely failure is not
-  an OOM kill but the kernel evicting model pages and reading them back - on a
-  host whose disk is 13.5x slower than a dev box, that does not look like a
-  crash, it looks like inference stopping.
-* **Latency.** Each controller turn now writes its decision to the production
-  database, which commits with ``synchronous=FULL``. Two extra fsyncs per turn
-  on that disk is a cost worth knowing before it is shipped, not after.
-
-Neither is a pass/fail the script can decide alone: what counts as acceptable
-latency is a judgement. It reports, and fails only on the one outcome that is
-unambiguously bad - llama-server going away.
-"""
+"""Does a bigger prompt budget cost the VM its headroom, or its speed? The prompt budget used to
+collapse to 500 chars on any host with a resident model, because it subtracted the model footprint from
+``MemAvailable`` (#223); with that corrected, prompts run against the full context window. Two numbers
+decide whether that is safe here, and neither can be reasoned out: headroom (llama-server.service sets
+``MemoryMax=6G`` and a full-context prompt measured 6138 MiB against that 6144 MiB ceiling - six mebibytes
+is no margin, and since the model is mmap the likely failure is page eviction looking like stopped inference,
+not an OOM kill) and latency (each turn now commits with ``synchronous=FULL``; two extra fsyncs per turn on
+that disk is a cost worth knowing before shipping). Neither is a pass/fail the script can decide alone - it
+reports, and fails only on the one unambiguous outcome, llama-server going away."""
 
 from __future__ import annotations
 
@@ -204,8 +188,8 @@ def main() -> int:
         print(f"peak rss {peak} MiB against a {ceiling} MiB ceiling "
               f"({ceiling - peak} MiB spare)")
         if ceiling - peak < 64:
-            # Not a failure: the run survived. But a margin this thin is the
-            # thing to watch, and saying so is the point of the check.
+            # Not a failure - the run survived - but a margin this thin is the thing to watch, and saying so is the
+            # point of the check.
             print("  WARNING: under 64 MiB of headroom. The model is mmap'd, so")
             print("  the kernel is more likely to evict its pages than to kill it -")
             print("  which shows up as inference slowing down, not as a crash.")

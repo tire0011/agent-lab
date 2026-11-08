@@ -1,10 +1,6 @@
-"""Service for executing validated, ordered operation chains.
-
-State machine: queued → running → completed | completed_with_errors | failed | rejected | interrupted
-
-Persistence: SQLite operation_chains table.
-Idempotency: request_id uniqueness enforced at DB level.
-"""
+"""Service for executing validated, ordered operation chains. State machine: queued ->
+running -> completed | completed_with_errors | failed | rejected | interrupted. Persisted in
+the SQLite operation_chains table; request_id uniqueness enforced at DB level."""
 
 from __future__ import annotations
 
@@ -54,7 +50,7 @@ STATUS_INTERRUPTED = "interrupted"
 _TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS, STATUS_FAILED, STATUS_REJECTED, STATUS_INTERRUPTED}
 
 
-# Forbidden patterns in arguments (basic injection prevention)
+# Forbidden patterns in arguments (basic injection prevention).
 _FORBIDDEN_PATTERNS = {
     "eval",
     "exec",
@@ -90,14 +86,11 @@ class OperationChainService:
             self.outbox_dir = Path(outbox_dir)
         self.db_path = db_path
         self.operations_registry = operations_registry
-        # RLock (not Lock): several code paths call locked helper methods while
-        # already holding the lock (e.g. the exception handler in
-        # _run_chain_pipeline calls _get_created_at/_get_started_at/_store_result
-        # while holding self._lock). A plain Lock would deadlock there; an RLock
-        # allows safe reentrant acquisition from the same thread while still
-        # serializing all sqlite3 access across threads (the shared connection
-        # is opened with check_same_thread=False and is not safe for
-        # unsynchronized concurrent use).
+        # RLock (not Lock): several code paths call locked helpers while already holding the lock
+        # (the exception handler in _run_chain_pipeline calls _get_created_at/_store_result inside
+        # self._lock) - a plain Lock would deadlock; the RLock still serializes all sqlite3 access
+        # across threads (the shared connection is opened with check_same_thread=False and is not
+        # safe for unsynchronized concurrent use).
         self._lock = threading.RLock()
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
@@ -105,13 +98,10 @@ class OperationChainService:
         self._running_threads: dict[str, threading.Thread] = {}
 
     def close(self) -> None:
-        """Join any still-running chain-execution threads before closing the
-        shared sqlite3 connection. The connection is opened with
-        check_same_thread=False specifically so the background pipeline
-        threads can use it, so it must not be closed (or its backing file
-        removed) while one of those threads might still be executing a
-        query -- doing so corrupts the connection and can segfault the
-        interpreter."""
+        """Join any still-running chain-execution threads before closing the shared sqlite3
+        connection: it is opened with check_same_thread=False so background pipeline threads can
+        use it, and closing (or removing its file) while one might still be querying corrupts the
+        connection and can segfault the interpreter."""
         for thread in list(self._running_threads.values()):
             thread.join(timeout=10)
         self._conn.close()
@@ -121,7 +111,7 @@ class OperationChainService:
         if request.request_id is None:
             request.request_id = uuid.uuid4().hex
 
-        # Validate chain before ANY execution
+        # Validate the chain before ANY execution.
         valid, reason = self._validate_chain(request)
         if not valid:
             result = OperationChainResult(
@@ -132,11 +122,10 @@ class OperationChainService:
                 steps_successful=0,
                 steps_failed=0,
             )
-            # Rejected chains still need a persistent row before the outbox
-            # publish lifecycle is recorded.  Previously _store_result() and
-            # _write_outbox_result() only issued UPDATE statements against a
-            # row that did not exist yet, leaving an untracked outbox file with
-            # no DB publish state and permanently blocking later mailbox polls.
+            # Rejected chains still need a persistent row before the outbox publish lifecycle is
+            # recorded - previously _store_result()/_write_outbox_result() only issued UPDATEs against a
+            # row that did not exist yet, leaving an untracked outbox file with no DB publish state and
+            # permanently blocking later mailbox polls.
             with self._lock:
                 chain_id = uuid.uuid4().hex
                 now = _now_iso()
@@ -160,16 +149,16 @@ class OperationChainService:
             self._write_outbox_result(request.request_id, result)
             return result
 
-        # Check idempotency
+        # Check idempotency.
         with self._lock:
             existing = self._get_chain_by_request_id(request.request_id)
             if existing:
-                # Same content → return existing status; different → conflict
+                # Same content -> return the existing status; different -> conflict.
                 existing_req = json.loads(existing["request_json"])
                 if existing_req == json.loads(request.model_dump_json()):
                     return self.get_chain(request.request_id) or result
                 else:
-                    # Conflict: same request_id, different content
+                    # Conflict: same request_id, different content.
                     conflict_result = OperationChainResult(
                         request_id=request.request_id,
                         overall_status=STATUS_REJECTED,
@@ -182,7 +171,7 @@ class OperationChainService:
                     self._write_outbox_result(request.request_id, conflict_result)
                     return conflict_result
 
-            # Create initial queued record
+            # Create the initial queued record.
             chain_id = uuid.uuid4().hex
             now = _now_iso()
             self._conn.execute(
@@ -195,7 +184,7 @@ class OperationChainService:
             )
             self._conn.commit()
 
-        # Start background thread
+        # Start the background thread.
         thread = threading.Thread(
             target=self._run_chain_pipeline,
             args=(chain_id, request),
@@ -247,12 +236,12 @@ class OperationChainService:
 
     def _validate_chain(self, request: OperationChainRequest) -> tuple[bool, str | None]:
         """Comprehensive validation before execution."""
-        # Unique step IDs
+        # Unique step IDs.
         step_ids = [s.id for s in request.steps]
         if len(step_ids) != len(set(step_ids)):
             return False, "duplicate step IDs"
 
-        # Validate each step
+        # Validate each step.
         for step in request.steps:
 
             # Arguments safe?
@@ -262,14 +251,14 @@ class OperationChainService:
                     if pattern in val_str:
                         return False, f"forbidden pattern '{pattern}' in argument '{key}'"
 
-            # Arguments match operation spec?
+            # Arguments match the operation spec?
             if self.operations_registry:
                 spec = self.operations_registry._specs.get(step.action)
                 if spec and spec.arguments:
                     for arg_spec in spec.arguments:
                         if arg_spec.name in step.arguments:
                             arg_val = step.arguments[arg_spec.name]
-                            # Basic type check: if int, must be int
+                            # Basic type check: if int, must be int.
                             if arg_spec.type == "integer":
                                 try:
                                     arg_val = int(arg_val)
@@ -300,7 +289,7 @@ class OperationChainService:
 
             for step in request.steps:
                 if request.stop_on_error and steps_failed > 0:
-                    # Skip remaining steps
+                    # Skip the remaining steps.
                     step_results.append(
                         OperationChainStepResult(
                             id=step.id,
@@ -322,7 +311,7 @@ class OperationChainService:
                 else:
                     steps_failed += 1
 
-            # Determine overall status
+            # Determine the overall status.
             if steps_failed == 0:
                 overall_status = STATUS_COMPLETED
             else:
@@ -343,7 +332,7 @@ class OperationChainService:
                 steps=step_results,
             )
 
-            # Store result
+            # Store the result.
             self._store_result(result)
             self._write_outbox_result(request.request_id, result)
 
@@ -393,6 +382,7 @@ class OperationChainService:
                 step.arguments,
                 invocation_id=invocation_id,
             )
+            # Limit to 100 lines.
             output_lines = result.output_lines[:100]  # Limit to 100 lines
             output_lines = [line[:500] if len(line) > 500 else line for line in output_lines]
 

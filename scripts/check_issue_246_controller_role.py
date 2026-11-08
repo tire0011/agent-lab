@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-"""Issue #246: exercise one real Nexus controller turn without executing it.
-
-This is deliberately a controller-only check. It renders the production Nexus
-prompt and sends it through the real local llama-server, then stops after
-parsing the chosen action. No selected tool is executed.
-
-Scenarios:
-- initial: "solve github issue #238" before issue contents are known.
-- after-read: the same task after a successful github_issue(238) observation
-  already supplied the root cause, suggested fix and acceptance criteria.
-- after-memory: the same task after that issue read plus a successful
-  memory_search that returned only older github_issue(238) reads and no new
-  implementation information.
-
-Exit codes:
-  0 = controller chose an acceptable next action
-  1 = regression reproduced
-  2 = setup/inference failure
-"""
+"""Issue #246: exercise one real Nexus controller turn without executing it - render the production
+Nexus prompt, send it through the real local llama-server, stop after parsing the chosen action; no
+selected tool is executed. Scenarios: initial ("solve github issue #238" before contents are known),
+after-read (after a successful github_issue(238) observation), after-memory (plus a memory_search returning
+only older reads). Exit codes: 0 = acceptable next action, 1 = regression reproduced, 2 = setup/inference
+failure."""
 from __future__ import annotations
 
 import argparse
@@ -63,10 +50,9 @@ ISSUE_238_OBSERVATION = {
 
 
 
-# Shaped exactly as production emits it: `results`, not `result`, and no
-# `limit`. `dedupe_nested_results` keys off `results`, so the old spelling
-# made this fixture invisible to it - the `after-memory` scenario then pinned
-# a verdict against a prompt shape a real run never produces.
+# Shaped exactly as production emits it: `results`, not `result`, and no `limit` - dedupe_nested_results
+# keys off `results`, so the old spelling made this fixture invisible and pinned a verdict against a prompt
+# shape a real run never produces.
 MEMORY_SEARCH_OBSERVATION = {
     "tool": "memory_search",
     "query": "exclude orchestrator bookkeeping from the memory index",

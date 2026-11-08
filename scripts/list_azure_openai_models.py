@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
-"""Browse the Azure OpenAI models/deployments available to this environment.
-
-Two views are printed:
-
-1. Data-plane: deployments actually reachable with the configured
-   ``AZURE_OPENAI_API_KEY`` (via the resource's own REST API). This reflects
-   exactly what ``NexusDelegationService`` can call.
-2. Management-plane (optional): deployments visible via ``az`` CLI, if the
-   caller is logged in and authorized. Useful cross-check / admin view.
-
-Usage:
-    python scripts/list_azure_openai_models.py
-"""
+"""Browse the Azure OpenAI models/deployments available to this environment. Two views are printed:
+1. data-plane - deployments reachable with the configured ``AZURE_OPENAI_API_KEY`` via the resource own
+REST API, exactly what ``NexusDelegationService`` can call; 2. management-plane (optional) - deployments
+visible via ``az`` CLI when logged in, a useful cross-check/admin view. Usage:
+``python scripts/list_azure_openai_models.py``."""
 
 from __future__ import annotations
 
@@ -28,9 +20,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# Reuse the same env-loading behaviour as test_azure_openai.py so this script
-# works standalone on the VM (root-only /etc/agent-lab/agent.env) as well as
-# locally where env vars are already exported.
+# Reuse the same env-loading behaviour as test_azure_openai.py so this script works standalone on the VM
+# (root-only /etc/agent-lab/agent.env) as well as locally where env vars are already exported.
 _AGENT_ENV_FILE = Path("/etc/agent-lab/agent.env")
 
 
@@ -78,9 +69,8 @@ def _load_agent_env(path: Path = _AGENT_ENV_FILE) -> None:
         os.environ.setdefault(key, value)
 
 
-# Meters that aren't plain per-token chat/completion pricing (fine-tuning,
-# batch, realtime/audio, TTS, transcription, cached-input variants, etc.).
-# We only want the standard pay-as-you-go input/output token rates.
+# Meters that are not plain per-token chat/completion pricing (fine-tuning, batch, realtime/audio, TTS,
+# transcription, cached-input variants, ...) - only standard pay-as-you-go input/output token rates wanted.
 _PRICE_EXCLUDE_KEYWORDS = (
     "batch", "realtime", " rt ", "-rt-", "aud", "tts", "transcribe", "tcrb",
     " ft ", "-ft-", "grader", "grdr", "cchd", "cached", "fine-tun", "finetun",
@@ -104,6 +94,7 @@ def _fetch_region_prices(region: str) -> list[dict]:
         f"?$filter=serviceName eq 'Foundry Models' and armRegionName eq '{region}'"
         " and contains(productName,'Azure OpenAI')"
     )
+    # Safety cap on pagination.
     for _ in range(20):  # safety cap on pagination
         try:
             response = httpx.get(url, timeout=30.0)
@@ -120,10 +111,8 @@ def _fetch_region_prices(region: str) -> list[dict]:
 
 
 def _assign_prices_to_models(items: list[dict], model_names: list[str]) -> dict[str, list[dict]]:
-    """Greedily assign each pricing meter to the most specific (longest
-    name) catalog model it matches, avoiding e.g. 'gpt-5' swallowing
-    'gpt-5-mini' meters.
-    """
+    """Greedily assign each pricing meter to the most specific (longest name) catalog model it matches, so
+    e.g. "gpt-5" does not swallow "gpt-5-mini" meters."""
     import re
 
     ordered = sorted(set(model_names), key=len, reverse=True)
@@ -148,11 +137,9 @@ def _assign_prices_to_models(items: list[dict], model_names: list[str]) -> dict[
 
 
 def _best_io_price_per_million(candidates: list[dict]) -> tuple[float | None, float | None]:
-    """Pick the cheapest global (non-DataZone) input/output $-per-1M-token
-    rate from ``candidates``. Returns (input_price, output_price); either
-    may be None if not found. Embedding-style single-meter models will have
-    only an "input" price (Azure doesn't split embeddings by output).
-    """
+    """Pick the cheapest global (non-DataZone) input/output $-per-1M-token rate from ``candidates``; returns
+    ``(input_price, output_price)``, either may be ``None``. Embedding-style single-meter models have only an
+    "input" price (Azure does not split embeddings by output)."""
 
     def per_million(item: dict) -> float:
         price = float(item.get("retailPrice", 0.0))
@@ -176,8 +163,8 @@ def _best_io_price_per_million(candidates: list[dict]) -> tuple[float | None, fl
     input_price = min((per_million(c) for c in inputs), default=None)
     output_price = min((per_million(c) for c in outputs), default=None)
 
-    # Single-meter models (e.g. embeddings) have neither "inp" nor "outp" in
-    # the meter name; treat the sole price as the (only) input price.
+    # Single-meter models (e.g. embeddings) have neither "inp" nor "outp" in the meter name; treat the sole
+    # price as the (only) input price.
     if input_price is None and output_price is None and global_candidates:
         input_price = min(per_million(c) for c in global_candidates)
 
@@ -217,19 +204,15 @@ def _print_data_plane_deployments(endpoint: str, api_key: str) -> None:
 
 
 def _account_name_from_endpoint(endpoint: str) -> str:
-    """Derive the Cognitive Services account name from its endpoint host.
-
-    e.g. https://openai-tire0011.openai.azure.com -> openai-tire0011
-    """
+    """Derive the Cognitive Services account name from its endpoint host, e.g.
+    https://openai-tire0011.openai.azure.com -> openai-tire0011."""
     host = endpoint.split("//", 1)[-1]
     return host.split(".", 1)[0]
 
 
 def _discover_account(az_path: str, account_hint: str) -> tuple[str, str]:
-    """Resolve the actual (correctly-cased) account name and its resource
-    group via az CLI (best effort). Matching is case-insensitive because
-    Azure hostnames are always lowercased, but resource names may not be.
-    """
+    """Resolve the actual (correctly-cased) account name and its resource group via az CLI, best effort;
+    matching is case-insensitive because Azure hostnames are always lowercased but resource names may not be."""
     try:
         proc = subprocess.run(
             [
@@ -399,7 +382,7 @@ def _print_available_catalog(
 
     for name in sorted(grouped):
         versions = sorted(set(grouped[name]))
-        # Use the newest version's capabilities as representative.
+        # Use the newest version capabilities as representative.
         caps = capabilities.get((name, versions[-1]), {})
         ctx = caps.get("maxContextToken", "?")
         out_tok = caps.get("maxOutputToken", "?")

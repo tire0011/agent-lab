@@ -1,13 +1,9 @@
-"""Semantic summaries of tool observations too large for the prompt (#561).
-
-The middle step between a full observation and the bare stub of #227: a
-small, deterministic set of the fields the next controller decision needs,
-chosen per operation with a generic default. The raw result stays stored
-unchanged in ``nexus_task_events``; this only shapes what the prompt shows.
-
-``summarize_observation`` returns ``None`` when no summary fits ``max_chars``;
-the caller then falls back to the stub.
-"""
+"""Semantic summaries of tool observations too large for the prompt (#561) - the middle step
+between a full observation and the bare stub of #227: a small deterministic set of the fields
+the next controller decision needs, chosen per operation with a generic default. The raw
+result stays stored unchanged in ``nexus_task_events``; this only shapes what the prompt shows.
+``summarize_observation`` returns ``None`` when no summary fits ``max_chars``; the caller then
+falls back to the stub."""
 
 from __future__ import annotations
 
@@ -39,9 +35,10 @@ _IDENTITY_FIELDS = (
 )
 _IDENTITY_TEXT_CHARS = 300
 
-# Caps for the summary content at scale 1. Each further attempt halves them,
-# so a summary shrinks deterministically before the stub takes over.
+# Caps for summary content at scale 1; each further attempt halves them, so a summary
+# shrinks deterministically before the stub takes over.
 _SCALES = (1.0, 0.5, 0.25, 0.125)
+# Goal / acceptance criteria.
 _TEXT_CHARS = 1500  # goal / acceptance criteria
 _LINE_CHARS = 240
 _TAIL_LINES = 15
@@ -279,11 +276,8 @@ def _summarizer_for(obs: dict[str, Any]) -> _Summarizer:
 
 
 def summarize_observation(obs: dict[str, Any], max_chars: int) -> dict[str, Any] | None:
-    """Return a semantic summary of ``obs`` within ``max_chars``, or ``None``.
-
-    ``None`` means even the tightest summary does not fit, or there was no
-    content to summarise; the caller uses the stub instead.
-    """
+    """Return a semantic summary of ``obs`` within ``max_chars``, or ``None`` - ``None`` means even
+    the tightest summary does not fit or there was no content; the caller uses the stub instead."""
     if not isinstance(obs, dict) or max_chars <= 0:
         return None
     original_chars = _size(obs)

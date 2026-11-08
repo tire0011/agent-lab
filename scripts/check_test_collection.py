@@ -1,17 +1,8 @@
-"""Fail if any test file contributes no tests.
-
-CI ran `unittest discover` for months, which only collects
-``unittest.TestCase`` subclasses. Eight files are written as plain pytest
-functions or plain pytest classes, so 147 tests were collected zero times while
-CI reported green - including the entire provider-routing and local-model
-layer, directly under the gate that adoption treats as authoritative evidence.
-
-The switch to pytest fixed that instance. This guards the class of problem: a
-file that silently contributes nothing is indistinguishable from a file whose
-tests all pass, and the difference only shows up when someone goes looking.
-
-Exits non-zero and names the offending files.
-"""
+"""Fail if any test file contributes no tests. CI ran ``unittest discover`` for months, which only collects
+``unittest.TestCase`` subclasses, so files written as plain pytest functions/classes contributed zero tests
+while CI reported green - including layers directly under the gate adoption treats as authoritative evidence.
+The switch to pytest fixed that instance; this guards the class: a file contributing nothing is
+indistinguishable from one whose tests all pass. Exits non-zero and names the offending files."""
 
 from __future__ import annotations
 
@@ -35,6 +26,7 @@ def _collected_files(rootdir: Path) -> set[str]:
         check=False,
         cwd=str(rootdir),
     )
+    # 5 = no tests collected at all.
     if proc.returncode not in (0, 5):  # 5 = no tests collected at all
         print(proc.stdout[-4000:])
         print(proc.stderr[-2000:], file=sys.stderr)

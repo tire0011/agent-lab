@@ -79,11 +79,8 @@ async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, 
 
 
 async def run_router_pipeline(task: str, db: Any) -> str:
-    """Run the local-model router pipeline and return the final response text.
-
-    This function lazily imports the orchestrator modules so the base agent
-    continues to work even when the local model server is not running.
-    """
+    """Run the local-model router pipeline and return the final response text; the orchestrator modules
+    are imported lazily so the base agent keeps working even when the local model server is not running."""
     from modules.llama_cpp_client import LlamaCppClient
     from modules.multi_provider_orchestrator import MultiProviderOrchestrator
 
@@ -94,12 +91,8 @@ async def run_router_pipeline(task: str, db: Any) -> str:
         return response
 
     async def codex_run_fn(prompt: str) -> str:
-        """Delegate a sub-task to Codex via CodexTaskService.
-
-        The router picked ``codex`` by name here, so the provider is pinned
-        rather than drawn: only callers that did not name an agent get the
-        random choice.
-        """
+        """Delegate a sub-task to Codex via CodexTaskService. The router picked ``codex`` by name here, so the
+        provider is pinned rather than drawn - only callers that did not name an agent get the random choice."""
         from modules.codex_task_service import CodexTaskService, STATUS_SUCCEEDED
         from modules.codex_worker import PROVIDER as PROVIDER_CODEX
         from modules.run_store import DEFAULT_DB_PATH
@@ -133,8 +126,8 @@ async def run_router_pipeline(task: str, db: Any) -> str:
 def main() -> int:
     args = parse_args()
 
-    # Keep runtime-only dependencies behind argument parsing so informational
-    # flags such as --version work in lightweight environments (including CI).
+    # Keep runtime-only dependencies behind argument parsing so informational flags such as --version work
+    # in lightweight environments (including CI).
     from modules.cli_output import print_cost_summary, print_run_summary
     from modules.cost_monitor import AzureCostMonitor
     from modules.logging_config import configure_logging
@@ -161,7 +154,7 @@ def main() -> int:
     started = time.perf_counter()
 
     if args.use_router:
-        # ── Router pipeline (local model → Azure/Codex/local) ─────────────
+        # Router pipeline (local model → Azure/Codex/local)
         provider = "local_router"
         model_name = os.getenv("LOCAL_MODEL_NAME") or os.getenv("LLAMA_CPP_MODEL", "qwen2.5-coder-7b-instruct")
         try:
@@ -260,7 +253,7 @@ def main() -> int:
             print(str(exc), file=sys.stderr)
             return 1
 
-    # ── Standard Azure OpenAI pipeline ────────────────────────────────────────
+    # Standard Azure OpenAI pipeline
     provider = "azure_openai"
     model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 

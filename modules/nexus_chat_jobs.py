@@ -27,13 +27,10 @@ class NexusChatJob:
 
 
 class NexusChatJobService:
-    """Run complete Nexus chat turns outside the request/response lifetime.
-
-    Local inference can take minutes on the small Nexus VM. Keeping the whole
-    orchestrator loop inside POST /chat therefore makes the reverse proxy time
-    out even though Nexus is still working. This service keeps one bounded
-    worker queue and lets the browser poll a short-lived job instead.
-    """
+    """Run complete Nexus chat turns outside the request/response lifetime. Local inference
+    can take minutes on the small VM, so keeping the orchestrator loop inside POST /chat makes
+    the reverse proxy time out while Nexus is still working; this service keeps one bounded
+    worker queue and lets the browser poll a short-lived job instead."""
 
     def __init__(
         self,

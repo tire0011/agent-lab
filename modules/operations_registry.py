@@ -26,16 +26,16 @@ logger = logging.getLogger(__name__)
 _DEFAULT_REPO_ROOT = "/agent"
 _DEFAULT_MAILBOX_LOCK_PATH = "/var/lib/nexus/mailbox.lock"
 _DEFAULT_SERVICE_NAME = "agent-api"
-# The services the controller may restart (#315); never the API itself.
+# Services the controller may restart (#315); never the API itself.
 _RESTARTABLE_SERVICES = ("nexus-mailbox", "llama-server")
 _LOCAL_MODEL_RESTART_TIMEOUT_SECONDS = 120.0
 _LOCAL_MODEL_RESTART_POLL_SECONDS = 2.0
-# machine_reboot (#319): handed to a transient systemd unit so the reply can
-# still be written before the machine goes down. The sudoers rule from
-# scripts/setup-nexus-permissions.sh allows exactly this command.
+# machine_reboot (#319): handed to a transient systemd unit so the reply can still be
+# written before the machine goes down; the sudoers rule from setup-nexus-permissions.sh
+# allows exactly this command.
 MACHINE_REBOOT_COMMAND = ("sudo", "-n", "systemd-run", "--collect", "--on-active=60", "systemctl", "reboot")
-# Experiment statuses that a reboot would interrupt. Queued work has not
-# started and remains durable across a reboot, so it must not prevent one.
+# Experiment statuses a reboot would interrupt; queued work has not started and stays
+# durable across a reboot, so it must not prevent one.
 _ACTIVE_EXPERIMENT_STATUSES = ("selecting", "implementing", "verifying")
 
 
@@ -45,9 +45,8 @@ def _default_github_work_tracking_factory(*, db_path: str, repo_root: str) -> An
     return GitHubWorkTrackingService(db_path=db_path, repo_root=repo_root)
 
 
-# Re-exported, not redefined: these live in a leaf module so
-# ``nexus_tool_router`` can import them without completing this module first.
-# See modules/operation_contract.py.
+# Re-exported, not redefined: these live in a leaf module so nexus_tool_router can import
+# them without completing this module first (see modules/operation_contract.py).
 from modules.operation_contract import (  # noqa: E402
     OperationArgSpec,
     OperationResult,
@@ -88,8 +87,8 @@ class OperationsRegistry:
         self.mailbox_processor_factory = mailbox_processor_factory
         self.subprocess_runner = subprocess_runner
         self.meminfo_path = Path(meminfo_path)
-        # Imported lazily by default: github_status is one operation among
-        # many, and the tracking service opens its own database connection.
+        # Imported lazily by default: github_status is one operation among many, and the tracking
+        # service opens its own database connection.
         self.github_work_tracking_factory = (
             github_work_tracking_factory or _default_github_work_tracking_factory
         )
@@ -135,10 +134,9 @@ class OperationsRegistry:
                 return recorded
         started = time.perf_counter()
         try:
-            # Executability is defined by an implemented handler, not by the
-            # metadata catalog.  This avoids a second positive allowlist that can
-            # silently block operations which are already implemented elsewhere.
-            # Unknown names still fail safely because no handler exists.
+            # Executability is defined by an implemented handler, not the metadata catalog - this
+            # avoids a second positive allowlist that could silently block implemented operations;
+            # unknown names still fail safely because no handler exists.
             handler = getattr(self, f"_op_{operation}", None)
             if handler is None or not callable(handler):
                 raise OperationValidationError(f"Unbekannte Operation: {operation}")
@@ -366,6 +364,7 @@ class OperationsRegistry:
         caller: str,
         invocation_id: str | None,
     ) -> None:
+        # Never persist credentials or identifiers from the API key.
         del caller  # never persist credentials or identifiers from the API key
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         logged_params = json.dumps(self._logged_params(args), sort_keys=True)
@@ -538,12 +537,9 @@ class OperationsRegistry:
         return OperationResult("experiment_logs", True, lines, 0)
 
     def _op_local_model_schema_check(self, args: dict[str, Any]) -> OperationResult:
-        """Ask the model server whether it applies Nexus's own JSON schema.
-
-        Read-only in the sense that matters here: it changes no Nexus state and
-        touches no repository. It is not cheap - two real completions - but a
-        capability that silently stopped working is worth minutes to detect.
-        """
+        """Ask the model server whether it applies Nexus JSON schema - read-only (no Nexus state,
+        no repository), but not cheap (two real completions); a capability that silently stopped
+        working is worth minutes to detect."""
         if args:
             raise OperationValidationError(
                 "local_model_schema_check akzeptiert keine Argumente."
@@ -711,8 +707,7 @@ class OperationsRegistry:
         if service not in _RESTARTABLE_SERVICES:
             raise OperationValidationError(f"service_restart erlaubt nur mailbox oder llm, nicht {service}.")
         started = time.perf_counter()
-        # Reuses the API restart; run in its own thread so a running event loop
-        # of the caller does not matter.
+        # Reuses the API restart; own thread so the caller event loop does not matter.
         with ThreadPoolExecutor(max_workers=1) as pool:
             outcome = pool.submit(asyncio.run, ServiceOperations().restart(service)).result()
         status = outcome["results"][service]
@@ -750,8 +745,7 @@ class OperationsRegistry:
             raise OperationValidationError("machine_reboot akzeptiert keine Argumente.")
         active = self._active_experiment_ids()
         if active:
-            # A reboot would kill the experiment mid-run; it would never
-            # write a failed status (#188).
+            # A reboot would kill the experiment mid-run and it would never write a failed status (#188).
             raise OperationValidationError(
                 "machine_reboot verweigert: Experiment aktiv (" + ", ".join(i[:8] for i in active[:5]) + ")."
             )
@@ -779,10 +773,9 @@ class OperationsRegistry:
                 return True
             if unit != "nexus-mailbox.service" or check.exit_code != 3:
                 return False
-            # systemctl status returns 3 for an inactive unit. That is the
-            # expected steady state for this timer-triggered oneshot service
-            # after a successful run, so treat it as healthy only when the
-            # status output proves both facts explicitly.
+            # systemctl status returns 3 for an inactive unit - the expected steady state for this
+            # timer-triggered oneshot after a successful run, so treat it as healthy only when the
+            # output proves both facts explicitly.
             status_text = "\n".join(check.output_lines).lower()
             return (
                 "active: inactive (dead)" in status_text
@@ -794,8 +787,8 @@ class OperationsRegistry:
         failed_checks: list[OperationResult] = []
         for unit, check in checks:
             output_lines.append(f"{unit}:")
-            # Reserve room for both unit labels and exit-code lines while
-            # keeping the combined response within the 200-line bound.
+            # Reserve room for both unit labels and exit-code lines while keeping the combined
+            # response within the 200-line bound.
             output_lines.extend(bounded_lines("\n".join(check.output_lines), max_lines=96))
             output_lines.append(f"exit_code: {check.exit_code if check.exit_code is not None else '-'}")
             if not check_is_healthy(unit, check):
@@ -813,10 +806,9 @@ class OperationsRegistry:
         )
 
     def _op_service_logs(self, args: dict[str, Any]) -> OperationResult:
-        # Friendly names ("mailbox", "api", "llm") resolve to units through the
-        # same table the diagnostic backend uses, so a caller never has to know
-        # unit names here either (#188). An unrecognized name is still accepted
-        # but validated, so nothing shell-shaped reaches journalctl.
+        # Friendly names (mailbox, api, llm) resolve through the same table the diagnostics backend
+        # uses (#188); an unrecognized name is still accepted but validated, so nothing
+        # shell-shaped reaches journalctl.
         service = self._resolve_service(args)
         limit = self._limit(args, default=50, maximum=500)
         command = ["journalctl", "-u", service, "-n", str(limit), "--no-pager"]
@@ -827,12 +819,9 @@ class OperationsRegistry:
         result.operation = "service_logs"
         return result
 
-    # ------------------------------------------------------------------
-    # Nexus diagnostics (#188): the same backend the API and the
-    # failure-analysis routine use, rendered as operation output lines so
-    # ChatGPT and the mailbox reach it through the existing catalog rather
-    # than by inventing shell commands.
-    # ------------------------------------------------------------------
+    # Nexus diagnostics (#188): the same backend the API and failure analysis use, rendered
+    # as operation output lines - chat and the mailbox reach it through the catalog instead of
+    # inventing shell commands.
 
     def _diagnostics(self):
         from modules.nexus_diagnostics import NexusDiagnostics
@@ -863,11 +852,9 @@ class OperationsRegistry:
             report = build(diagnostics)
             output_lines = (render or render_report)(report)
         except DiagnosticsError as exc:
-            # A reference that resolves to nothing - or a database that cannot
-            # be read - is an answer, not a crash: "I looked and found
-            # nothing" is what an operator needs to hear, and a raised
-            # exception here would be recorded as an operation fault rather
-            # than as the diagnostic finding it is.
+            # A reference that resolves to nothing, or an unreadable database, is an answer, not a
+            # crash: "I looked and found nothing" is what an operator needs; raising here would be
+            # recorded as an operation fault instead of the diagnostic finding.
             return OperationResult(
                 operation=operation,
                 success=False,
@@ -1030,14 +1017,10 @@ class OperationsRegistry:
         return OperationResult("outbox_status", True, lines, 0)
 
     def _op_github_status(self, args: dict[str, Any]) -> OperationResult:
-        """Current GitHub lifecycle readiness, as the running process sees it.
-
-        Read-only and value-free: it reports *whether* a repository and a
-        credential are resolvable right now, never the credential itself.
-        That distinction is what makes it safe to answer the question a
-        persisted ``GITHUB_TOKEN/GH_TOKEN`` blocker raises - "is that still
-        true?" - which a stored error string cannot answer at all (#172).
-        """
+        """Current GitHub lifecycle readiness as the running process sees it: read-only and
+        value-free - it reports *whether* a repository and credential are resolvable now, never
+        the credential itself, which is what makes it safe to answer "is that stored
+        GITHUB_TOKEN blocker still true?" (#172)."""
         if args:
             raise OperationValidationError("github_status akzeptiert keine Argumente.")
         started = time.perf_counter()

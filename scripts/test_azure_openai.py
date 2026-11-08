@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 # Support direct execution via /agent/scripts/test_azure_openai.py as well as
-# `python -m scripts.test_azure_openai` from the repository root.
+# `python -m scripts.test_azure_openai` from the repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))

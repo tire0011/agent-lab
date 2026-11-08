@@ -1,8 +1,5 @@
-"""Persistent publisher for completed operation-chain results.
-
-This module is kept as a thin backward-compatible shim.  All git logic now
-lives in ``modules.outbox_publisher.OperationChainOutboxPublisher``.
-"""
+"""Persistent publisher for completed operation-chain results - a thin backward-compatible
+shim; all git logic lives in ``modules.outbox_publisher.OperationChainOutboxPublisher``."""
 
 from __future__ import annotations
 

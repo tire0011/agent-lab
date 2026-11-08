@@ -1,26 +1,13 @@
-"""Deterministic runtime (interpreter) execution for the local Nexus controller.
-
-The persistent controller can run shell commands, but a shell command alone has
-no deterministic representation of *this* project's Python runtime: an LLM has
-to guess an interpreter name, and a guess such as ``python`` fails with exit
-code 127 whenever only ``python3`` or a virtualenv interpreter exists.
-
-This module provides two building blocks used by
-``modules.task_orchestrator``:
-
-* :func:`resolve_python_interpreter` / :func:`build_python_command` — a typed
-  Python execution capability whose interpreter comes from the running Nexus
-  environment (explicit configuration, active/project virtualenv or
-  ``sys.executable``), never from an LLM guess.
-* :func:`classify_command_failure` / :func:`corrected_command` — bounded,
-  deterministic recovery for command-resolution failures (exit code 127 /
-  ``command not found``), so one corrected retry can be performed without
-  another LLM inference.
-
-No host-specific executable literal is ever exposed to the controller prompt;
-the controller expresses a script/module plus arguments and Nexus resolves the
-executable itself.
-"""
+"""Deterministic runtime (interpreter) execution for the local Nexus controller. A shell
+command alone has no deterministic representation of this project Python runtime - an LLM
+has to guess an interpreter name, and a guess like ``python`` fails with exit 127 whenever
+only ``python3`` or a venv interpreter exists. This module provides the typed building blocks
+used by ``modules.task_orchestrator``: :func:`resolve_python_interpreter` /
+:func:`build_python_command` (interpreter resolved from the running Nexus environment - explicit
+config, active/project virtualenv, ``sys.executable`` - never an LLM guess) and
+:func:`classify_command_failure` / :func:`corrected_command` (bounded deterministic recovery for
+exit-127 / command-not-found, so one corrected retry happens without another LLM inference). No
+host-specific executable literal is ever exposed to the controller prompt."""
 
 from __future__ import annotations
 
@@ -48,9 +35,9 @@ _PYTHON_ALIASES = ("python", "python3")
 _PIP_ALIASES = ("pip", "pip3")
 
 _EXIT_CODE_RE = re.compile(r"(?im)^[^\w]*exit[ _]code[^\w]*[:\s]\s*[^\w]*(\d+)")
-# A plain, unquoted leading executable token. Deliberately excludes quotes and
-# shell metacharacters so a correction can splice the replacement in without
-# reinterpreting the rest of the command line.
+# A plain, unquoted leading executable token - deliberately excludes quotes and shell
+# metacharacters so a correction can splice the replacement in without reinterpreting the rest
+# of the command line.
 _LEADING_TOKEN_RE = re.compile(r"^([\w./+@:-]+)(?=\s|$)")
 _NOT_FOUND_RE = re.compile(
     r"(?im)^(?:.*?:\s*)?(?:line\s+\d+:\s*)?([\w.\-/+]+):\s*(?:command\s+not\s+found|not\s+found)\s*$"
@@ -81,17 +68,11 @@ class CommandResolutionFailure:
 
 
 def resolve_python_interpreter(repo_root: str | os.PathLike[str] | None = None) -> str:
-    """Return the interpreter Nexus should use for project Python execution.
-
-    Resolution order (first usable wins):
-
-    1. ``NEXUS_PYTHON_EXECUTABLE`` when it points at an executable file.
-    2. The active virtualenv (``VIRTUAL_ENV``).
-    3. The project virtualenv under ``repo_root`` (``.venv``).
-    4. ``sys.executable`` of the running Nexus process.
-    5. ``python3`` as a last resort when Python is embedded without an
-       ``sys.executable`` (never a controller guess).
-    """
+    """Return the interpreter for project Python execution. Resolution order, first usable wins:
+    1. ``NEXUS_PYTHON_EXECUTABLE`` if it points at an executable file; 2. the active virtualenv
+    (``VIRTUAL_ENV``); 3. the project virtualenv under ``repo_root`` (``.venv``); 4. ``sys.executable``
+    of the running Nexus process; 5. ``python3`` as a last resort when Python is embedded without a
+    ``sys.executable`` (never a controller guess)."""
     configured = os.environ.get(INTERPRETER_ENV_VAR, "").strip()
     if configured and _is_executable(configured):
         return configured
@@ -120,12 +101,9 @@ def build_python_command(
     repo_root: str | os.PathLike[str] | None = None,
     interpreter: str | None = None,
 ) -> PythonCommand:
-    """Build a deterministic ``python`` invocation for the command runner.
-
-    Exactly one of ``script`` or ``module`` must be given. Arguments are
-    preserved verbatim and shell-quoted, so no argument can inject additional
-    shell syntax.
-    """
+    """Build a deterministic ``python`` invocation for the command runner. Exactly one of
+    ``script`` or ``module`` must be given; arguments are preserved verbatim and shell-quoted, so
+    no argument can inject additional shell syntax."""
     script = (script or "").strip()
     module = (module or "").strip()
     if bool(script) == bool(module):
@@ -155,12 +133,9 @@ def build_python_command(
 
 
 def classify_command_failure(output: str | None) -> CommandResolutionFailure | None:
-    """Classify command runner output as a command-resolution failure.
-
-    Returns ``None`` for successful commands and for ordinary failures (a test
-    that fails, a non-zero application exit code, ...) so only genuine
-    executable-resolution problems trigger recovery.
-    """
+    """Classify command runner output as a command-resolution failure: ``None`` for successes and
+    ordinary failures (a failing test, a non-zero application exit), so only genuine
+    executable-resolution problems trigger recovery."""
     text = output or ""
     if not text.strip():
         return None
@@ -186,15 +161,11 @@ def corrected_command(
     missing_executable: str,
     interpreter: str,
 ) -> tuple[str, str] | None:
-    """Return ``(corrected_command, mapping)`` for a known executable mapping.
-
-    Only the leading executable token is replaced; the remainder of the command
-    line is preserved verbatim, so shell operators (``&&``, ``|``, ``>``, ...),
-    quoting and redirection in the tail keep their original meaning. Unknown
-    executables, and commands whose leading token is not the unresolved
-    executable, return ``None`` so the caller can report a controlled
-    missing-capability observation instead of guessing.
-    """
+    """Return ``(corrected_command, mapping)`` for a known executable mapping. Only the leading
+    executable token is replaced; the rest of the command line is preserved verbatim, so shell
+    operators, quoting and redirection in the tail keep their meaning. Unknown executables, or a
+    leading token that is not the unresolved one, return ``None`` so the caller reports a controlled
+    missing-capability observation instead of guessing."""
     command = (command or "").strip()
     if not command:
         return None
@@ -246,11 +217,8 @@ def _is_executable(path: str) -> bool:
 
 
 def exit_code_of(text: str) -> int | None:
-    """Public alias of :func:`_exit_code` for callers outside this module.
-
-    The tolerant pattern is the only one that matches what ``process_command``
-    actually renders, so consumers share it instead of writing their own.
-    """
+    """Public alias of :func:`_exit_code`: the tolerant pattern is the only one that matches what
+    ``process_command`` actually renders, so consumers share it instead of writing their own."""
     return _exit_code(text)
 
 

@@ -47,12 +47,9 @@ def issue_source(
     state: str | None = None,
     url: str | None = None,
 ) -> NexusSource:
-    """Wrap issue data supplied by a GitHub/MCP adapter for Nexus.
-
-    Fetching is deliberately kept outside the controller. This lets the same
-    source work with the official GitHub MCP, a future global MCP gateway or a
-    test adapter without coupling orchestration to one GitHub client.
-    """
+    """Wrap issue data supplied by a GitHub/MCP adapter for Nexus; fetching stays outside the
+    controller so the same source works with the official GitHub MCP, a future global MCP gateway
+    or a test adapter."""
     if issue_number <= 0:
         raise NexusSourceError("issue number must be positive")
     clean_title = (title or f"Issue #{issue_number}").strip()[:500]

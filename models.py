@@ -1,8 +1,5 @@
-"""Pydantic models for the agent-lab API.
-
-Kept intentionally small: one module for request/response shapes so routes
-in api.py stay thin and data adapters in data_sources.py stay storage-only.
-"""
+"""Pydantic models for the agent-lab API - one module for request/response shapes so routes in
+api.py stay thin and data adapters in data_sources.py stay storage-only."""
 
 from datetime import datetime
 from typing import Any
@@ -72,14 +69,11 @@ class ChatJobResponse(BaseModel):
     error: str | None = None
 
 
-# ---------------------------------------------------------------------------
 # Codex task models
 #
-# ``working_dir`` and ``sandbox`` are never accepted from the client: they
-# are fixed server-side (see api.py) to keep Codex task execution read-only
-# and confined to the repository root. ``timeout_seconds`` may only be
-# lowered by the client; the upper bound is enforced by ``le=`` below.
-# ---------------------------------------------------------------------------
+# ``working_dir`` and ``sandbox`` are never accepted from the client: they are fixed server-side
+# (see api.py) to keep Codex task execution read-only and confined to the repository root.
+# ``timeout_seconds`` may only be lowered by the client; the upper bound is enforced by ``le=`` below.
 
 
 class CodexTaskCreateRequest(BaseModel):
@@ -108,10 +102,9 @@ class CodexTaskResponse(BaseModel):
 
 
 class CodexTaskSummary(BaseModel):
-    """Smaller listing shape: omits the full (potentially large) prompt and
-    final_message fields present on ``CodexTaskResponse``, but keeps a short
-    ``prompt_preview`` so list output remains useful without printing a
-    long prompt."""
+    """Smaller listing shape: omits the full (potentially large) prompt and final_message fields of
+    ``CodexTaskResponse`` but keeps a short ``prompt_preview`` so list output stays useful without
+    printing a long prompt."""
 
     id: str
     status: str
@@ -135,9 +128,7 @@ class CodexTaskListResponse(BaseModel):
     tasks: list[CodexTaskSummary]
 
 
-# ---------------------------------------------------------------------------
 # Mailbox task approval models
-# ---------------------------------------------------------------------------
 
 
 class MailboxTaskApproval(BaseModel):
@@ -165,9 +156,7 @@ class MailboxTaskApprovalsResponse(BaseModel):
     tasks: list[MailboxTaskApproval]
 
 
-# ---------------------------------------------------------------------------
 # Experiment activity log models
-# ---------------------------------------------------------------------------
 
 
 
@@ -204,9 +193,8 @@ class ExperimentAdoptionStatus(BaseModel):
     diagnostic_worktree_path: str | None = None
     recovery_attempts: int = 0
     stale_retry_attempts: int = 0
-    # Failures this adoption row already superseded. There is one row per
-    # experiment, so a retry overwrites the failure that preceded it; this
-    # is where the earlier reason stays readable (Issue #136).
+    # Failures this adoption row already superseded: one row per experiment, so a retry overwrites the
+    # failure that preceded it - this is where the earlier reason stays readable (#136).
     previous_failures: list[ExperimentAdoptionFailure] = Field(default_factory=list)
     created_at: str | None = None
     updated_at: str | None = None
@@ -245,9 +233,8 @@ class OperationCatalogEntry(BaseModel):
     operation: str
     description: str
     arguments: list[OperationArgumentDefinition] = Field(default_factory=list)
-    # Whether calling this capability can change Nexus state. Surfaced so the
-    # boundary a read-only role filters on is visible wherever the catalog is
-    # read, not only inside the tool router.
+    # Whether calling this capability can change Nexus state - surfaced so the boundary a read-only role
+    # filters on is visible wherever the catalog is read, not only inside the tool router.
     mutates_state: bool = False
 
 
@@ -414,14 +401,11 @@ class PublicExperimentSummary(BaseModel):
     usage: PublicExperimentUsage | None = None
 
 
-# ---------------------------------------------------------------------------
 # Public diagnostics model (GET /diagnostics/public)
 #
-# Every field here is drawn from an explicit allowlist assembled in api.py;
-# nothing is derived from a generic ``to_dict()``/``model_dump()`` call, so
-# adding a new internal field to ``Experiment`` or ``MailboxTaskApproval``
-# can never silently widen this public response.
-# ---------------------------------------------------------------------------
+# Every field here is drawn from an explicit allowlist assembled in api.py; nothing is derived from a
+# generic ``to_dict()``/``model_dump()`` call, so adding an internal field to ``Experiment`` or
+# ``MailboxTaskApproval`` can never silently widen this public response.
 
 
 class DiagnosticLifecyclePhase(BaseModel):
@@ -478,15 +462,11 @@ class PublicDiagnosticsResponse(BaseModel):
     problems: list[Problem] = Field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
 # Mailbox inbox/outbox listing (public, sanitized).
 #
-# Every field is drawn from an explicit allowlist assembled in api.py.
-# ``preview`` is always short and redacted; full prompts, task bodies,
-# absolute file paths, and unfiltered file/command output are never
-# included here (see the "Aufträge"/task-approval and "Logs" endpoints for
-# authenticated, more detailed views).
-# ---------------------------------------------------------------------------
+# Every field is drawn from an explicit allowlist assembled in api.py; ``preview`` is always short and
+# redacted - full prompts, task bodies, absolute file paths and unfiltered file/command output are never
+# included here (the authenticated task-approval and Logs endpoints give the detailed views).
 
 
 class MailboxMessageEntry(BaseModel):
@@ -507,11 +487,9 @@ class MailboxMessagesResponse(BaseModel):
 
 
 class ExperimentLogEntry(BaseModel):
-    """One structured, defensively re-sanitized line from an experiment's
-    JSONL log (``state/experiment-logs/<experiment_id>.jsonl``). Explicit
-    allowlist only - never a generic serialization of the raw log dict, so
-    an unexpected/legacy field written by an older logger version cannot
-    leak into the API response."""
+    """One structured, defensively re-sanitized line from an experiment. Explicit allowlist
+    only - never a generic serialization of the raw log dict, so an unexpected/legacy field written by an
+    older logger version cannot leak into the API response."""
 
     timestamp: str
     level: str
@@ -544,33 +522,24 @@ class ExperimentLogsResponse(BaseModel):
 
 
 class UnifiedLogsResponse(BaseModel):
-    """One chronological Nexus log timeline: structured JSONL entries
-    (experiments, mailbox tasks, chat jobs, system) merged with the
-    ``agent-api``/``nexus-mailbox``/``llama-server`` systemd journals.
-
-    Backs the Logs tab's default view; entries use the same explicit
-    allowlist as ``ExperimentLogsResponse``, plus ``source``.
-    """
+    """One chronological Nexus log timeline: structured JSONL entries (experiments, mailbox tasks, chat
+    jobs, system) merged with the agent-api/nexus-mailbox/llama-server systemd journals. Backs the Logs
+    tab default view; entries use the same explicit allowlist as ``ExperimentLogsResponse``, plus ``source``."""
 
     count: int
     entries: list[ExperimentLogEntry] = Field(default_factory=list)
     next_cursor: str | None = None
     source_errors: dict[str, str] | None = None
-    # True when the scan stopped at its byte/file budget before reaching
-    # the oldest history, so a caller can say "there may be older matches"
-    # instead of presenting a partial search as an exhaustive one.
+    # True when the scan stopped at its byte/file budget before reaching the oldest history, so a caller
+    # can say "there may be older matches" instead of presenting a partial search as exhaustive.
     truncated: bool = False
 
 
 class LogTraceResponse(BaseModel):
-    """Everything Nexus did for one order, reconstructed from its logs.
-
-    ``reference`` echoes what was asked for; ``correlation_ids`` reports
-    which experiment/mailbox-task/session/job ids that reference turned
-    out to span, so an operator can see *why* these entries belong
-    together. ``summary`` is derived from ``entries`` alone, so it can
-    never contradict the timeline beneath it.
-    """
+    """Everything Nexus did for one order, reconstructed from its logs. ``reference`` echoes what was
+    asked for; ``correlation_ids`` reports which experiment/mailbox-task/session/job ids that reference
+    spanned, so an operator sees *why* these entries belong together; ``summary`` is derived from
+    ``entries`` alone, so it can never contradict the timeline beneath it."""
 
     reference: str
     found: bool
@@ -581,9 +550,7 @@ class LogTraceResponse(BaseModel):
     truncated: bool = False
 
 
-# ---------------------------------------------------------------------------
 # Operation Chain models
-# ---------------------------------------------------------------------------
 
 
 class OperationChainStep(BaseModel):
@@ -622,7 +589,7 @@ class OperationChainResult(BaseModel):
     rejection_reason: str | None = None
 
 
-# ── Maintenance API models ────────────────────────────────────────────────────
+# Maintenance API models
 
 class MaintenanceExecuteRequest(BaseModel):
     operation: str
@@ -651,9 +618,7 @@ class MaintenanceStatusResponse(BaseModel):
     expiry: str | None = None
 
 
-# ---------------------------------------------------------------------------
 # Self-Healing / Operations Executor models
-# ---------------------------------------------------------------------------
 
 
 class GitCommitPushRequest(BaseModel):
@@ -686,9 +651,7 @@ class OperationResponse(BaseModel):
     duration_ms: int = 0
 
 
-# ---------------------------------------------------------------------------
 # Failure analysis (#145): the reusable LLM-powered diagnosis service.
-# ---------------------------------------------------------------------------
 
 
 class FailureAnalysisRootCause(BaseModel):
@@ -741,13 +704,9 @@ class NexusSessionClaim(BaseModel):
 
 
 class NexusLivenessResponse(BaseModel):
-    """Heartbeat/liveness state, so "is this still running?" is answerable.
-
-    ``unclaimed_working_sessions`` counts rows in a working status that carry
-    no heartbeat at all - pre-heartbeat rows, or a caller that never claimed
-    its work. They are reported rather than hidden: that gap is precisely what
-    heartbeats exist to close.
-    """
+    """Heartbeat/liveness state, so "is this still running?" is answerable. ``unclaimed_working_sessions``
+    counts working-status rows with no heartbeat at all (pre-heartbeat rows or callers that never claimed)
+    - reported rather than hidden, because that gap is precisely what heartbeats exist to close."""
 
     generated_at: str
     stale_after_seconds: int
@@ -761,13 +720,9 @@ class NexusLivenessResponse(BaseModel):
 
 
 class DiagnosticProgress(BaseModel):
-    """Is this work still running, was it interrupted, or did it finish? (#188)
-
-    ``source`` names the signal ``last_progress_at`` came from - a controller
-    heartbeat, a structured log entry, or the row's own ``updated_at`` - so a
-    caller can tell an explicit "I am alive" from a merely witnessed side
-    effect. See ``modules.nexus_diagnostics``.
-    """
+    """Is this work still running, was it interrupted, or did it finish? (#188). ``source`` names the
+    signal ``last_progress_at`` came from - a controller heartbeat, a structured log entry, or the row own
+    ``updated_at`` - so a caller can tell an explicit "I am alive" from a merely witnessed side effect."""
 
     state: str
     reason: str
@@ -779,12 +734,9 @@ class DiagnosticProgress(BaseModel):
 
 
 class DiagnosticLifecycle(BaseModel):
-    """One unit of work's lifecycle state, joined across every subsystem.
-
-    Deliberately flat and stably named: a caller answering "where did this
-    stop?" should never need to know which of the mailbox, experiment,
-    adoption, GitHub-link or controller-session tables an answer came out of.
-    """
+    """joined across every subsystem - deliberately flat and stably
+    named, so a caller answering "where did this stop?" never needs to know which of the mailbox, experiment,
+    adoption, GitHub-link or controller-session tables an answer came from."""
 
     subject_type: str
     subject_id: str
@@ -832,12 +784,9 @@ class DiagnosticReportResponse(BaseModel):
 
 
 class DiagnosticServiceLogsResponse(BaseModel):
-    """``nexus logs service <name>``: a bounded journal slice.
-
-    ``error`` is populated rather than raised when the journal cannot be read
-    (no systemd, unknown unit, a timeout): an unreadable journal is itself a
-    finding, and which unit was consulted over what window still stands.
-    """
+    """``nexus logs service <name>``: a bounded journal slice. ``error`` is populated rather than raised
+    when the journal cannot be read (no systemd, unknown unit, timeout) - an unreadable journal is itself a
+    finding, and which unit was consulted over what window still stands."""
 
     generated_at: str
     service: str
