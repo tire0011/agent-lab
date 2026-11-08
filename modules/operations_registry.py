@@ -203,6 +203,7 @@ class OperationsRegistry:
             duration_ms=int(payload.get("duration_ms") or 0),
             exit_code=payload.get("exit_code"),
             error_summary=payload.get("error_summary"),
+            metrics=dict(payload.get("metrics") or {}),
         )
 
     def _build_specs(self) -> dict[str, OperationSpec]:
@@ -376,6 +377,16 @@ class OperationsRegistry:
                 mutates_state=False,
             ),
             "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", [limit20, since_timestamp], tags=["problems", "errors", "failures", "issues"], mutates_state=False),
+            "web_research": OperationSpec(
+                "web_research",
+                "Begrenzte Web-Recherche über SearXNG mit robots.txt-Prüfung und Quellen-URLs.",
+                [
+                    OperationArgSpec("query", "string", "Konkrete Recherchefrage.", required=True),
+                    OperationArgSpec("max_pages", "integer", "Maximal abzurufende Ergebnisseiten.", default=3, minimum=1, maximum=10),
+                ],
+                ["web", "search", "research", "internet", "sources", "current information"],
+                mutates_state=False,
+            ),
             "inbox_status": OperationSpec("inbox_status", "Status der Mailbox-Inbox.", tags=["mailbox", "inbox", "status", "messages"], mutates_state=False),
             "outbox_status": OperationSpec("outbox_status", "Neueste Dateien in der Mailbox-Outbox.", tags=["mailbox", "outbox", "status", "messages"], mutates_state=False),
         }
@@ -1015,6 +1026,25 @@ class OperationsRegistry:
             if key in interesting:
                 lines.append(f"{key}: {value.strip()}")
         return OperationResult("memory", True, lines, 0)
+
+    def _op_web_research(self, args: dict[str, Any]) -> OperationResult:
+        from modules.web_research import WebResearchClient, WebResearchConfig
+
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise OperationValidationError("query muss ein nicht-leerer Text sein.")
+        if len(query) > 500:
+            raise OperationValidationError("query darf höchstens 500 Zeichen lang sein.")
+        client = WebResearchClient(WebResearchConfig.from_env())
+        research = client.research(query.strip(), max_pages=args.get("max_pages", 3))
+        return OperationResult(
+            "web_research",
+            research.success,
+            research.lines,
+            research.runtime_ms,
+            error_summary=research.error,
+            metrics=research.metrics,
+        )
 
     def _op_problems_list(self, args: dict[str, Any]) -> OperationResult:
         from data_sources import list_problems

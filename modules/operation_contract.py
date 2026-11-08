@@ -79,6 +79,7 @@ class OperationResult:
     duration_ms: int
     exit_code: int | None = None
     error_summary: str | None = None
+    metrics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +89,7 @@ class OperationResult:
             "duration_ms": self.duration_ms,
             "exit_code": self.exit_code,
             "error_summary": self.error_summary,
+            "metrics": dict(self.metrics),
         }
 
 
