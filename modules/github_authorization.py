@@ -1,23 +1,13 @@
 """Trusted-actor checks for the channels Nexus trusts, and Git provenance for
-mailbox messages.
+mailbox messages. Issue execution authorization is NOT decided here (it lives in
+``modules.issue_approvals``); this module answers which GitHub actor content
+provably comes from, using only API actor fields (``user.login``) or the git
+author of the commit that added a mailbox inbox file. Author information embedded
+in issue, comment or file text is never trusted, and everything fails closed.
 
-Issue execution authorization is NOT decided here: it lives in the persistent
-approval registry (``modules.issue_approvals``), fed only by structured
-``issue_approval`` messages from the private mailbox. This module answers a
-narrower question - which GitHub actor a piece of content provably comes from -
-using only API actor fields (``user.login``) or the git author of the commit
-that added a mailbox inbox file. Author information embedded in issue,
-comment or file text is never trusted, and everything fails closed.
-
-Configuration (all optional):
-
-- ``NEXUS_REPO_OWNER`` / ``GITHUB_REPOSITORY`` (``owner/repo``) - the owner
-  login; defaults to ``tire0011``.
-- ``NEXUS_TRUSTED_ACTORS`` - comma-separated logins trusted in addition to /
-  instead of the owner (e.g. accounts allowed to push to the private mailbox).
-- ``NEXUS_TRUSTED_MAILBOX_EMAILS`` - comma-separated git author emails (or
-  ``@domain``) whose mailbox commits are trusted; replaces the default list of
-  the owner's and the coding agents' addresses.
+Config (all optional): ``NEXUS_REPO_OWNER``/``GITHUB_REPOSITORY`` (owner login),
+``NEXUS_TRUSTED_ACTORS`` (extra trusted logins), ``NEXUS_TRUSTED_MAILBOX_EMAILS``
+(git author emails or ``@domain`` suffixes whose mailbox commits are trusted).
 """
 
 from __future__ import annotations
@@ -59,9 +49,9 @@ _NOREPLY_EMAIL_RE = re.compile(
 
 _TRUSTED_MAILBOX_EMAILS_ENV = "NEXUS_TRUSTED_MAILBOX_EMAILS"
 
-# Git author addresses the owner and their coding agents (Claude, Vibe, Codex /
-# GPT) commit to the private mailbox with. Only accounts with push access can
-# commit there at all; this list decides which of those commits may execute.
+# Git author addresses of the owner and their coding agents; only accounts with
+# push access can commit to the private mailbox at all, and this list decides
+# which of those commits may execute.
 DEFAULT_TRUSTED_MAILBOX_EMAILS = (
     "tire0011@gmx.net",
     "noreply@anthropic.com",
@@ -199,11 +189,9 @@ def classify_mailbox_message(
     *,
     trusted: frozenset[str] | None = None,
 ) -> ActorDecision:
-    """Classify a mailbox inbox file by the git commit that added it.
-
-    ``created_by`` is front matter written inside the file itself - text the
-    pusher controls - so it is never used for the decision. The commit author
-    is the only signal that cannot be forged from within the file.
+    """Classify a mailbox inbox file by the git commit that added it. ``created_by``
+    is front matter inside the file - text the pusher controls - so it is never
+    used; the commit author is the only signal not forgeable from within the file.
     """
     email = file_adding_commit_email(repo_path, file_path)
     if is_trusted_mailbox_email(email):

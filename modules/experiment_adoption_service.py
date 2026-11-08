@@ -86,8 +86,7 @@ class ExperimentAdoptionService(
 ):
     """Persisted, exactly-once experiment adoption state machine.
 
-    Adoption publishes only through the mandatory GitHub lifecycle: append to
-    the Issue-linked branch, open/reuse its PR, mark the verified Draft ready
-    and merge it. Direct pushes to main are not allowed.
+    Adoption publishes only through the mandatory GitHub lifecycle (Issue-linked
+    branch, PR, verified draft, merge); direct pushes to main are not allowed.
     """
 

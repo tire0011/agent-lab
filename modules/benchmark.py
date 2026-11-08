@@ -1,22 +1,10 @@
-"""Fixed benchmark of ``new_experiment``, with a baseline to compare against (#343).
+"""Fixed benchmark of ``new_experiment`` against a stored baseline (#343).
 
-``benchmarks/tasks/*.md`` is a small frozen set of real, already merged issues.
-Each task pins the commit the issue was started from, so every run gets the same
-starting point, and names the files the merged fix touched. The runner executes
-the tasks through ``ExperimentService`` with one provider, model and prompt and
-stores one ``benchmark_runs`` row per task; the report puts a run next to a
-stored baseline run.
-
-Three things here are deliberate, because the obvious version measures wrong:
-
-  * Usage is counted at the worker, not read from the experiment. The experiment
-    keeps only the first implementation call, so a model that needs two repair
-    rounds would look cheaper than one that gets it right the first time.
-  * An unknown number stays ``NULL`` and is reported as ``n/a``. Most setups have
-    no ``model_prices`` row, and a cost of 0 would make them look free.
-  * Runs go to their own database (:func:`default_benchmark_db_path`). In the
-    production database adoption, the planner, ``problems`` and the tick
-    notifications would treat benchmark experiments as real work.
+Tasks come from ``benchmarks/tasks/*.md`` (frozen merged issues, each pinning its
+start commit). Deliberate choices: usage is counted at the worker (the experiment
+keeps only the first implementation call), an unknown cost stays ``NULL``/``n/a``
+rather than 0, and runs go to their own database so adoption never treats them as
+real work.
 """
 
 from __future__ import annotations
@@ -54,10 +42,9 @@ _MEMORY_SAMPLE_SECONDS = 1.0
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _TEST_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
-# Runs the named modules, not the whole suite: a full run takes about 14 minutes
-# and on the VM it stalls on the real llama-server, so its noise would drown the
-# signal. tests.conftest has to load first, a single module does not start
-# without it. -v is what the verification watchdog reads progress from.
+# Run the named modules, not the whole suite (a full run takes ~14 min and stalls
+# on the real llama-server on the VM); tests.conftest must load first, and -v is
+# what the verification watchdog reads progress from.
 _TEST_LAUNCHER = (
     "import sys, unittest, tests.conftest; "
     "unittest.main(module=None, argv=['unittest', '-v', *sys.argv[1:]])"
@@ -69,9 +56,7 @@ def default_benchmark_db_path() -> str:
     return str(Path(DEFAULT_DB_PATH).with_name("benchmark.db"))
 
 
-# ---------------------------------------------------------------------------
 # Task set
-# ---------------------------------------------------------------------------
 
 
 class BenchmarkError(ValueError):
@@ -152,9 +137,7 @@ def load_tasks(
     return [task for task in tasks if task.id in wanted]
 
 
-# ---------------------------------------------------------------------------
 # Scoring
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -179,9 +162,7 @@ def score_experiment(task: BenchmarkTask, experiment: Experiment) -> TaskScore:
     return TaskScore(round(score, 1), tests_green, touched, outcome)
 
 
-# ---------------------------------------------------------------------------
 # Measuring
-# ---------------------------------------------------------------------------
 
 
 class _UsageMeter:
@@ -276,18 +257,15 @@ class _PeakMemorySampler:
         self._thread.join()
 
 
-# ---------------------------------------------------------------------------
 # Runner
-# ---------------------------------------------------------------------------
 
 
 class BenchmarkRunner:
     """Runs tasks through ``ExperimentService``, one fresh service per task.
 
-    *provider* ``None`` keeps the normal rotation between the coding agents,
-    which is the current production setup. *prompt_text* is appended to every
-    coding-agent call; a change to the built-in prompt shows up in
-    ``prompt_sha256`` without any option.
+    *provider* ``None`` keeps the normal provider rotation (the production
+    setup); *prompt_text* is appended to every coding-agent call, so a change to
+    the built-in prompt shows up in ``prompt_sha256``.
     """
 
     def __init__(
@@ -460,9 +438,7 @@ def _insert_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # Baseline and report
-# ---------------------------------------------------------------------------
 
 VERDICT_BETTER = "better"
 VERDICT_WORSE = "worse"
@@ -505,10 +481,10 @@ class BenchmarkComparison:
 def compare_runs(
     conn: sqlite3.Connection, run_id: str, baseline_run_id: str
 ) -> BenchmarkComparison:
-    """Compares by total score. A tie stays a tie; the report shows the costs.
+    """Compares by total score; a tie stays a tie and the report shows the costs.
 
-    Scores only mean something over the same tasks, so a differing set or a task
-    file changed between the runs gives no verdict instead of a misleading one.
+    Scores only mean something over the same task set, so a differing set or a
+    changed task file gives no verdict instead of a misleading one.
     """
     run = load_run(conn, run_id)
     baseline = load_run(conn, baseline_run_id)

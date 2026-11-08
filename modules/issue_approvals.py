@@ -1,21 +1,14 @@
 """Persistent issue-approval registry (SQLite) - the authorization state for
-external GitHub issues.
+external GitHub issues. Public GitHub is discovery/discussion only; approvals are
+recorded exclusively through structured ``issue_approval`` messages from the
+trusted private mailbox (``modules/mailbox/processing.py``) - issue text,
+comments, labels and PRs can never create or modify an approval.
 
-Architecture: **public GitHub = discovery, proposals and discussion; the
-private mailbox = trusted approval commands; this local SQLite table =
-persistent authorization state; Nexus = autonomous planning and execution of
-approved issues only.**
-
-An issue is executable only when this registry holds an ``approved`` row for
-its ``(repository, issue_number)``. For issues whose author is not a trusted
-account the ``content_hash`` must also match the issue's current title+body
-(a stranger could edit their own issue after approval). Anything else - no
-row (pending), ``revoked``, ``rejected``, a repository/issue mismatch, a
-corrupted row, or (for untrusted authors) edited issue content - fails closed.
-Approvals are recorded exclusively through structured ``issue_approval``
-mailbox messages from the trusted private mailbox (see
-``modules/mailbox/processing.py``); issue text, comments, labels and PRs can
-never create or modify an approval.
+An issue is executable only with an ``approved`` row for its ``(repository,
+issue_number)``; for untrusted authors the ``content_hash`` must also match the
+current title+body (a stranger could edit their own issue after approval).
+Anything else - no row, revoked/rejected, mismatch, corrupted row, edited content -
+fails closed.
 """
 
 from __future__ import annotations
@@ -48,9 +41,9 @@ STATUS_REVOKED = "revoked"
 STATUS_REJECTED = "rejected"
 KNOWN_STATUSES = frozenset({STATUS_APPROVED, STATUS_REVOKED, STATUS_REJECTED})
 
-# Same canonicalization the controller sees (title capped at 500, body at
-# 16000 chars), so the hash computed at approval time matches the hash checked
-# at dispatch time regardless of where the text was truncated.
+# Same canonicalization the controller sees (title capped at 500, body at 16000
+# chars), so the approval-time hash matches the dispatch-time hash regardless of
+# where truncation happened.
 _TITLE_CAP = 500
 _BODY_CAP = 16000
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -124,13 +117,9 @@ def record_decision(
     content_hash: str = "",
     source_mailbox_msg_id: Any = None,
 ) -> tuple[IssueApproval, bool]:
-    """Record an approval decision transactionally and idempotently.
-
-    Returns ``(approval, changed)``. Re-delivering the same decision (same
-    status, content hash and source message) changes nothing and returns
-    ``changed=False``, so duplicate mailbox messages are safe. A row for a
-    different repository or issue number is a separate entry.
-    """
+    """Record an approval decision transactionally and idempotently; returns
+    ``(approval, changed)``. Re-delivering the same decision changes nothing
+    (``changed=False``), so duplicate mailbox messages are safe."""
     repo = normalize_repository(repository)
     if not repo:
         raise ValueError(f"invalid repository {repository!r} (expected 'owner/repo')")
@@ -234,18 +223,12 @@ def check_execution(
     skip_content_hash: bool = False,
     trusted_author: bool = False,
 ) -> ExecutionVerdict:
-    """May Nexus start new work on this issue right now?
-
-    Fails closed on every anomaly: no row (pending), revoked/rejected,
-    unknown repository or issue number, corrupted status or hash, or -
-    unless ``skip_content_hash`` is set - a content hash that no longer
-    matches the approved one (the issue was edited and needs renewed
-    approval). The hash check is skipped only for issues whose author is a
-    trusted actor: a stranger could edit their own issue after approval,
-    while a trusted author's edit (e.g. a typo fix) must not invalidate it.
-    An issue a trusted actor wrote needs no approval record: the owner's
-    own issues (and released proposals) are approved by being written. An
-    explicit revoked/rejected record still blocks it.
+    """May Nexus start new work on this issue right now? Fails closed on every
+    anomaly: no row (pending), revoked/rejected, unknown repo/issue, corrupted
+    status or hash, or - unless ``skip_content_hash`` - a hash that no longer
+    matches (issue edited after approval; skipped only for trusted authors, whose
+    own edits must not invalidate it). A trusted actor's issue needs no approval
+    record, but an explicit revoked/rejected record still blocks it.
     """
     repo = normalize_repository(repository)
     try:

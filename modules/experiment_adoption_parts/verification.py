@@ -15,38 +15,19 @@ class VerificationMixin:
     def _exact_commit_ci(
         self, experiment_id: str, *, phase: str = "adoption", elog: Any = None
     ) -> AuthoritativeCI:
-        """Authoritative GitHub CI for the exact verified checkpoint (#134).
+        """Authoritative GitHub CI for the exact verified checkpoint (#134) - the
+        single definition shared by the pipeline and the stale-failure assessment:
+        evidence counts only when it verifies the very commit adoption integrates
+        (the SHA comparison rejects a verdict for another commit of the experiment).
 
-        The single definition of "authoritative", shared by the adoption
-        pipeline and the stale-failure assessment: CI evidence only counts
-        when it verifies the very commit adoption is about to integrate.
-        ``wait_for_ci`` already refuses to report a result whose base has
-        moved; the SHA comparison here rejects a result reported for some
-        other commit of the same experiment.
-
-        A verdict already accepted for that exact commit is read from the
-        durable store first and is sufficient on its own (Issue #138).
-        Re-deriving it needs live credentials, so a restart into a context
-        without a token used to make accepted evidence vanish and left the
-        #136 retry stuck at ``no_ci_evidence`` - the lifecycle is only
-        restart-safe if the fact outlives the process that observed it.
-
-        Precedence is therefore: **the most recent authoritative
-        observation for the checkpoint SHA, taken on the base we are about
-        to integrate onto, wins.** A live lookup runs only when no such
-        verdict is stored, and whatever it finds is written through, so a
-        re-run that flips the conclusion supersedes the old record. An
-        implementation replaced through the normal lifecycle gets a new
-        checkpoint SHA, which has no record and so goes live.
-
-        The base is part of the question, not a detail: ``wait_for_ci``
-        refuses to call CI authoritative once the target branch has moved
-        past the checkpoint's parent, because cherry-picking the same
-        checkpoint onto a different base produces a tree CI never saw
-        (#134). Reading a stored verdict has to honour that too, so the
-        base this adoption will actually integrate onto is resolved from
-        the local ``origin/<target>`` ref - no credentials needed - and a
-        verdict recorded against any other base is not reused.
+        A verdict already accepted for that exact commit is read from the durable
+        store first (#138) - re-deriving needs live credentials, and the fact must
+        outlive the process that observed it (#136). Precedence: the most recent
+        authoritative observation for the checkpoint SHA on the base we integrate
+        onto wins; a live lookup runs only when no such verdict is stored and is
+        written through. The base comes from the local ``origin/<target>`` ref (no
+        credentials); a verdict recorded against any other base is not reused,
+        because cherry-picking onto a moved base produces a tree CI never saw (#134).
         """
         elog = elog or self._elog(experiment_id)
         work_ref = self.github_work_tracking.for_experiment(experiment_id)
@@ -77,11 +58,9 @@ class VerificationMixin:
             verification = recorded
             evidence_source = "persisted"
             if recorded.status == "passed":
-                # `ci_evidence_reused` means an accepted, usable verdict.
-                # A red one is loaded the same way but supports nothing, so
-                # it is reported below as a rejection instead - one piece of
-                # evidence must never be logged as both accepted and
-                # rejected in the same pass.
+                # `ci_evidence_reused` means an accepted, usable verdict; a red one
+                # supports nothing and is reported as a rejection below - one piece
+                # of evidence must never be logged as both accepted and rejected.
                 elog.info(
                     phase,
                     "ci_evidence_reused",
@@ -99,9 +78,8 @@ class VerificationMixin:
                 )
         else:
             evidence_source = "live"
-            # Why the store could not answer decides what the operator has
-            # to fix, so name it rather than collapsing every case into
-            # "no evidence".
+            # Why the store could not answer decides what the operator has to fix,
+            # so name it rather than collapsing every case into "no evidence".
             if stored is None:
                 fallback_reason = "no_persisted_evidence"
             elif not integration_base:
@@ -137,10 +115,9 @@ class VerificationMixin:
                 completion_timeout_seconds=0,
                 poll_interval_seconds=0.01,
             )
-            # `reason` is where "GitHub CI identity unavailable: configure
-            # GITHUB_TOKEN/GH_TOKEN" surfaces. Logging it here is what makes
-            # a credential problem readable as itself instead of arriving
-            # later disguised as a generic adoption failure (#141).
+            # `reason` is where "configure GITHUB_TOKEN/GH_TOKEN" surfaces; logging
+            # it here keeps a credential problem readable as itself instead of
+            # arriving later disguised as a generic adoption failure (#141).
             level = "info" if verification.status == "passed" else "warning"
             getattr(elog, level)(
                 phase,
@@ -159,9 +136,8 @@ class VerificationMixin:
 
         exact = bool(checkpoint_sha and verification.commit_sha == checkpoint_sha)
         if not exact and verification.status in {"passed", "failed"}:
-            # An authoritative verdict that belongs to a different commit is
-            # a distinct situation from having none: the run exists, it just
-            # does not verify the tree adoption is about to integrate.
+            # A verdict for a different commit is distinct from having none: the run
+            # exists but does not verify the tree adoption is about to integrate.
             elog.warning(
                 phase,
                 "ci_evidence_rejected",
@@ -174,10 +150,8 @@ class VerificationMixin:
                 run_id=verification.run_id,
             )
         elif exact and verification.status == "failed":
-            # CI verified this exact tree and rejected it. Logged here, at
-            # the one place that resolves a verdict, so it reads the same
-            # whether the row came from the store or from a live lookup -
-            # and so no consumer has to repeat it.
+            # CI verified this exact tree and rejected it; logged here, the one place
+            # that resolves a verdict, so it reads the same for stored and live rows.
             elog.warning(
                 phase,
                 "ci_evidence_rejected",

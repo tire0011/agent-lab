@@ -1,10 +1,6 @@
-"""What a Nexus ``new_experiment`` hands to the coding agent (#263).
-
-Before this the experiment started from the bare task text: whatever Nexus
-had already learned in the run - the knowledge briefing, a delegate's
-analysis, what it had tried - was left behind, and the coding agent had to
-rediscover it.
-"""
+"""What a Nexus ``new_experiment`` hands to the coding agent (#263): the run's
+knowledge briefing, delegates' analyses and earlier attempts, appended to the task
+so the coding agent does not rediscover them."""
 
 from __future__ import annotations
 
@@ -21,19 +17,15 @@ _MAX_ATTEMPT_CHARS = 300
 
 
 def _clip(text: Any, limit: int) -> str:
-    # Redact before cutting: a secret split at the limit no longer matches
-    # its configured literal value, and its prefix would be kept.
+    # Redact before cutting: a secret split at the limit no longer matches its
+    # configured literal value, and its prefix would be kept.
     value = redact_secrets(str(text or "")).strip()
     return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
 def experiment_handover(nexus_goal: Any, observations: list[dict[str, Any]]) -> str:
-    """Nexus' own goal and what the run found, to append to the task.
-
-    The task itself is left to the caller, which knows its full form (the
-    original request plus any clarification replies). Empty when the run
-    found nothing to hand over.
-    """
+    """Nexus' own goal and what the run found, to append to the task (the caller
+    keeps the full task text); empty when nothing was found to hand over."""
     sections: list[str] = []
     goal = _clip(nexus_goal, 2000)
     if goal:

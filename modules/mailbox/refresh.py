@@ -1,28 +1,11 @@
 """The `refresh` mailbox type: move the deployment to a branch, no shell (#228).
 
-Refreshing the live checkout used to need a `type: command` message, which is
-an arbitrary shell script - the widest possible interface for one of the
-narrowest operations the VM performs. A reviewer had to read a shell script to
-learn that it only moved a checkout, and a routine, reversible refresh was
-indistinguishable from any other production command.
-
-This type carries no shell. Everything it can do is in the front matter:
-
-    ---
-    type: refresh
-    branch: main
-    ---
-
-The body is ignored. What it cannot do follows from there being nothing else
-to say: the message cannot pick a repository, a remote, an archive path, or a
-service to restart. Those come from the deployment, not from whoever wrote the
-file.
-
-The safety of the operation itself is `nexus_refresh`'s, not ours: it rescues
-a dirty checkout instead of discarding it, verifies the checkout really is at
-``origin/<branch>`` before restarting anything, and restarts only after that
-verification passes. A refresh to the wrong branch is undone by a refresh
-back, which is the same operation.
+Everything the message can do is in the front matter (``type: refresh``,
+``branch: main``); the body is ignored, so it cannot pick a repository, remote,
+archive path, or service to restart - those come from the deployment, not from
+whoever wrote the file. The operation's own safety is ``nexus_refresh``'s: rescue
+a dirty checkout instead of discarding it, verify the checkout is really at
+``origin/<branch>`` before restarting anything.
 """
 
 from __future__ import annotations
@@ -35,19 +18,16 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# Which services a refresh may restart. Deliberately not reachable from the
-# message: naming a unit would turn "move the checkout" into "restart anything
-# on this host", and that is a different operation with a different blast
-# radius. Extending this list is a code change and a review.
+# Services a refresh may restart - deliberately not reachable from the message:
+# naming a unit would turn "move the checkout" into "restart anything on this host".
+# Extending this list is a code change and a review.
 ALLOWED_SERVICES: tuple[str, ...] = ("agent-api",)
 
 MAX_BRANCH_CHARS = 200
 
-# Deliberately narrower than git's own rules. This is an allowlist of what a
-# branch name may contain, not a denylist of what it may not, so a spelling
-# nobody considered is rejected rather than passed through. Nothing here ever
-# reaches a shell - the refresh runs in-process - so this is defence in depth,
-# not the thing standing between a message and `rm -rf`.
+# Allowlist of what a branch name may contain (not a denylist), so an
+# unconsidered spelling is rejected. Nothing here ever reaches a shell - the
+# refresh runs in-process - so this is defence in depth, not the only guard.
 _BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9._/-]{1,%d}$" % MAX_BRANCH_CHARS)
 
 
@@ -99,11 +79,8 @@ def process_refresh(
     repo_root: Path | str | None = None,
     sender_trusted: bool = True,
 ) -> tuple[str, None]:
-    """Refresh the deployment checkout to the branch the message names.
-
-    A refresh moves the live deployment and restarts services, so only a
-    sender the authorization gate verified as trusted may request one.
-    """
+    """Refresh the deployment checkout to the branch the message names - only a
+    sender the authorization gate verified as trusted may request one."""
     del conn, db_msg_id
 
     if not sender_trusted:
@@ -120,8 +97,8 @@ def process_refresh(
         branch = validate_branch((msg.meta or {}).get("branch", "main"))
     except InvalidBranchError as exc:
         logger.warning("refresh rejected: %s", exc)
-        # Rejected before anything is touched, and the reason goes back to the
-        # sender rather than into a log they cannot read.
+        # Rejected before anything is touched; the reason goes back to the sender,
+        # not only into a log they cannot read.
         return (
             f"## Refresh rejected\n\n"
             f"**Reason:** {exc}\n\n"
@@ -136,9 +113,9 @@ def process_refresh(
     try:
         result = run(branch, root)
     except Exception as exc:  # noqa: BLE001 - the report is the deliverable
-        # nexus_refresh reports its own failures rather than raising, so
-        # reaching here means something further out broke. The sender still
-        # needs an answer, not a traceback in a journal.
+        # nexus_refresh reports its own failures rather than raising, so reaching here
+        # means something further out broke; the sender still needs an answer, not a
+        # traceback in a journal.
         logger.exception("refresh failed for branch %s", branch)
         return (
             f"## Refresh failed\n\n**Branch:** `{branch}`\n\n"
@@ -159,9 +136,8 @@ def _format(branch: str, result: Any) -> str:
     """Render the refresh report: what it is on now, and whether it moved."""
     success = bool(getattr(result, "success", False))
     services = getattr(result, "services", None) or {}
-    # A restart this process handed to systemd and will not survive to see is
-    # neither done nor failed. Calling it failed was the mirror of the bug it
-    # replaced: the service does restart, we are simply not around to watch.
+    # A restart this process handed to systemd and will not survive to see is neither
+    # done nor failed; calling it failed would misreport a restart that does happen.
     unknown_services = sorted(
         name for name, state in services.items() if "outcome unknown" in str(state)
     )
@@ -180,9 +156,9 @@ def _format(branch: str, result: Any) -> str:
     if not success:
         heading = "failed"
     elif failed_services:
-        # The checkout moved but the process did not: the new code is on disk
-        # and the old code is still serving. Calling that "complete" is how a
-        # deploy gets believed before it has happened.
+        # The checkout moved but the process did not: new code on disk, old code still
+        # serving. Calling that "complete" is how a deploy gets believed before it
+        # has happened.
         heading = "incomplete - code updated but a service did not restart"
     else:
         heading = "complete"
@@ -218,9 +194,8 @@ def _format(branch: str, result: Any) -> str:
         lines += ["", "### Services", ""]
         lines += [f"- `{name}`: {state}" for name, state in sorted(services.items())]
     else:
-        # Said explicitly: "no services restarted" and "the field was missing"
-        # look the same otherwise, and they mean different things after a
-        # refresh that reports success.
+        # Said explicitly: "no services restarted" and "field missing" look the same
+        # otherwise but mean different things after a successful refresh.
         lines += ["", "No services were restarted."]
 
     error = getattr(result, "error", None)

@@ -36,12 +36,9 @@ class GitHubPrMixin:
 
     def _lifecycle_readiness_blocker(self) -> str | None:
         """``REVIEW_BLOCKER_GITHUB_LIFECYCLE`` iff the lifecycle is unconfigured now.
-
-        A ``GitHubWorkTrackingError`` is not automatically a readiness
-        problem - the same call can fail because the GitHub API rejected a
-        request - and only the readiness case is re-evaluable. So the
-        blocker is recorded from the service's own current verdict rather
-        than from the exception text.
+        Recorded from the service's own current readiness verdict, not from the
+        exception text - a ``GitHubWorkTrackingError`` can also mean the API
+        rejected a request, which is not re-evaluable.
         """
         try:
             return (
@@ -58,11 +55,9 @@ class GitHubPrMixin:
         self, experiment_id, goal, work_ref, integration_path, elog, *, gate_findings: str = "",
     ) -> str | None:
         """Review the change before the merge (#396); the reason if it is blocked.
-
-        The review result goes on the pull request either way. A review that
-        cannot run does not block: tests and the quality gate already passed.
-        With quality-gate findings (#519) only a real verdict may merge: the
-        reviewer was asked to judge them, so no verdict means no merge.
+        The result goes on the PR either way; a review that cannot run does not
+        block (tests and the quality gate already passed). With quality-gate
+        findings (#519) only a real verdict may merge - no verdict means no merge.
         """
         no_verdict = (
             f"Qualitäts-Gate-Befund ohne Reviewer-Urteil: {gate_findings}" if gate_findings else None

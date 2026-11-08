@@ -33,43 +33,15 @@ class FailureMixin:
     def assess_failure(self, experiment_id: str) -> StaleFailureAssessment:
         """Decide whether a persisted adoption failure still stands.
 
-        A ``needs_review`` row is assessed too (#171), by
-        :meth:`_assess_needs_review`: it is only retryable when the row
-        names a re-evaluable blocker and that blocker demonstrably no
-        longer applies. Everything below is about ``failed``/``interrupted``.
-
-        A ``failed`` row is not automatically an immutable fact about the
-        implementation (Issue #136). It can also record that the *local*
-        run never reached a verdict - it timed out, the worktree could not
-        be prepared, git failed - or that a gate has since been removed.
-        The concrete case: adoption re-ran the full local suite, that run
-        timed out after ~11 minutes, and #134 then removed the local suite
-        as a mandatory gate in favour of exact-commit GitHub CI. Without
-        this assessment the obsolete row blocks every future retry forever
-        and the lifecycle fix cannot reach the experiments it was written
-        for.
-
-        The rule is deliberately narrow and evidence-based, never a
-        keyword match on the German failure text:
-
-        * ``test_exit_code`` set to a non-zero value is a *verdict* about
-          the change - the tests ran and rejected it. That stays terminal
-          no matter how much other evidence appears; only a repair may
-          clear it. (The #134 branch that honours failing authoritative CI
-          records exit code 1 for exactly this reason.)
-        * ``test_exit_code`` unset means no verdict was ever reached. Such
-          a failure is superseded only when authoritative CI for the exact
-          verified checkpoint is green *now* - the same evidence adoption
-          itself would accept.
-
-        So a genuinely broken implementation is never retried: its CI is
-        red or missing, and the assessment refuses.
-
-        The outcome is logged once, here, as ``stale_adoption_assessment``
-        (Issue #141): the evidence events that led to it come from
-        :meth:`_exact_commit_ci`, and repeating the verdict at every
-        return path inside would just be the same decision logged six
-        times.
+        ``needs_review`` rows are assessed too (#171, :meth:`_assess_needs_review`):
+        retryable only when the row names a re-evaluable blocker that no longer
+        holds. For ``failed``/``interrupted`` the rule is narrow and evidence-based,
+        never a keyword match: a non-zero ``test_exit_code`` is a verdict about the
+        change and stays terminal; an unset one means no verdict was reached, and
+        such a failure is superseded only by green authoritative CI for the exact
+        verified checkpoint now (#136, #134). A genuinely broken implementation is
+        never retried - its CI is red or missing. The outcome is logged once here as
+        ``stale_adoption_assessment`` (#141).
         """
         elog = self._elog(experiment_id)
         assessment = self._assess_failure(experiment_id, elog)
@@ -143,10 +115,8 @@ class FailureMixin:
 
         ci = evidence.verification
         if not evidence.passed:
-            # Why the evidence does not support a retry has already been
-            # named by `_exact_commit_ci` (red_verdict, target_base_moved,
-            # checkpoint_mismatch, ...); repeating it here would log one
-            # decision twice.
+            # Why the evidence does not support a retry was already named by
+            # `_exact_commit_ci`; repeating it here would log one decision twice.
             return StaleFailureAssessment(
                 False,
                 "no_ci_evidence",
@@ -170,18 +140,11 @@ class FailureMixin:
     def _assess_needs_review(self, record: ExperimentAdoption) -> StaleFailureAssessment:
         """Decide whether a persisted ``needs_review`` may be resumed (#171).
 
-        ``needs_review`` means adoption stopped without a verdict about the
-        change - but not every such stop is a request for a human. Some
-        record an external condition (#115/PR #116: the GitHub lifecycle was
-        unconfigured, the VM was fixed afterwards and the service
-        restarted). Those are re-checkable, and re-checking is the only
-        honest answer: returning the persisted text would present a stale
-        configuration failure as a current readiness verdict.
-
-        The re-check asks the *live* dependency, never the recorded text,
-        and only for a blocker the row actually names. Anything else -
-        a file mismatch, a denied path, a failed merge, a manual review -
-        has no re-evaluable condition and stays terminal.
+        Some needs_review rows record an external condition (e.g. the GitHub
+        lifecycle was unconfigured, #115/#116); those are re-checkable, and the
+        re-check asks the *live* dependency, never the recorded text, and only
+        for a blocker the row actually names. Anything else (file mismatch,
+        denied path, failed merge, manual review) stays terminal.
         """
         blocker = self._review_blocker_of(record)
         previous_reason = record.reason
@@ -222,14 +185,9 @@ class FailureMixin:
 
     @staticmethod
     def _review_blocker_of(record: ExperimentAdoption) -> str | None:
-        """The row's named blocker, recognizing rows written before #171.
-
-        Older rows - including the one this issue was filed for - predate
-        the column, so the readiness refusal survives only as text. That
-        one sentence is exported by the tracking service that produces it
-        (``LIFECYCLE_READINESS_MESSAGE``), so recognizing it is still
-        reading the producer's own marker rather than guessing keywords.
-        """
+        """The row's named blocker, recognizing rows written before #171 via the
+        producer's own exported marker (``LIFECYCLE_READINESS_MESSAGE``) rather
+        than guessed keywords."""
         blocker = (record.review_blocker or "").strip()
         if blocker:
             return blocker
@@ -287,15 +245,10 @@ class FailureMixin:
         status: str = STATUS_NEEDS_REVIEW,
         elog=None,
     ) -> ExperimentAdoption:
-        """Park the adoption for review.
-
-        ``review_blocker`` names a re-evaluable external condition when there
-        is one (#171). It is deliberately not derived from ``reason``: the
-        text is a human explanation, while this is the machine-readable
-        handle a later attempt uses to ask whether the condition still holds.
-        Leaving it ``None`` keeps the review terminal, which is the default
-        for everything that is a judgement about the change itself.
-        """
+        """Park the adoption for review. ``review_blocker`` names a re-evaluable
+        external condition when there is one (#171) - deliberately not derived
+        from ``reason``, which is the human explanation; ``None`` keeps the
+        review terminal, the default for judgements about the change itself."""
         if elog is not None:
             elog.warning(
                 "adoption",

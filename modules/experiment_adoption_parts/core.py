@@ -22,7 +22,7 @@ STATUS_ADOPTED = "adopted"
 STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
-# Everything but the merge is done: the task forbids it (#185). Not a
+# Everything but the merge is done and the task forbids it (#185) - not a
 # needs_review, which Nexus would try again.
 STATUS_READY_FOR_REVIEW = "ready_for_review"
 
@@ -38,24 +38,21 @@ _ACTIVE_STATUSES = {STATUS_QUEUED, STATUS_ADOPTING}
 _DEFAULT_GIT_TIMEOUT_SECONDS = 60
 _DEFAULT_TARGET_BRANCH = "main"
 
-# How often one adoption may be resumed across process restarts before it
-# is handed to a human. Restarts are expected (the refresh flow restarts
-# Nexus deliberately), but an adoption that keeps dying mid-pipeline is a
-# real problem and must not resume forever.
+# How often one adoption may be resumed across restarts before it goes to a
+# human; restarts are expected (refresh restarts Nexus deliberately), but an
+# adoption that keeps dying mid-pipeline is a real problem and must not resume
+# forever.
 _MAX_RECOVERY_ATTEMPTS = 3
 
-# How often a *failed* adoption may be retried because its recorded
-# failure turned out to be stale. Separate from the restart-recovery
-# budget above: that one bounds crashes mid-pipeline, this one bounds
-# retries granted on fresh external evidence. A failure that keeps coming
-# back despite green CI is a real problem and must reach a human.
+# How often a *failed* adoption may be retried on fresh external evidence that
+# overruled the recorded failure (separate from the restart budget above); a
+# failure that keeps coming back despite green CI must reach a human.
 _MAX_STALE_RETRIES = 2
 
-# A `needs_review` row records *why* adoption stopped. Most reasons are a
-# judgement about the change itself and stay terminal, but some are an
-# external condition that a later attempt can simply re-check (#171). Such
-# a condition is named here, in the row, because the reason *text* cannot
-# be re-evaluated - only a named blocker can be asked "do you still hold?".
+# A needs_review row records why adoption stopped; most reasons stay terminal,
+# but an external condition a later attempt can re-check (#171) is named here in
+# the row, because the reason *text* cannot be re-evaluated - only a named blocker
+# can be asked "do you still hold?".
 REVIEW_BLOCKER_GITHUB_LIFECYCLE = "github_lifecycle_not_ready"
 
 _DEFAULT_LOCK_PATH = "/var/lib/nexus/adoption.lock"

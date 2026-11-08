@@ -49,16 +49,10 @@ class IntegrationMixin:
         current_stat = (snapshot["diff_stat"] or "").strip()
         stored_stat = (experiment.diff_stat or "").strip()
         if current_status != stored_status or current_stat != stored_stat:
-            # `git status`/`diff --stat` describe how the content is *arranged*
-            # in the worktree, not what the content is. Adoption's own first
-            # step commits the verified changes, which turns a dirty worktree
-            # into a clean one and makes those strings differ from the ones
-            # verification stored - so a resumed adoption accused itself of
-            # tampering and could never converge (#147 follow-up; the real
-            # blocker behind the eight identical needs_review retries).
-            # The content invariant answers the question the strings only
-            # approximated: is the tree adoption would integrate byte-for-byte
-            # the tree CI verified?
+            # Compare content, not arrangement: git status/diff strings change once
+            # adoption commits the verified changes, which made a resumed adoption
+            # accuse itself of tampering (#147 follow-up). The invariant: is the
+            # tree adoption would integrate byte-for-byte the tree CI verified?
             checkpoint_sha = self._verified_checkpoint_sha(experiment_id, experiment)
             verified_tree = self._tree_sha_of(worktree_path, checkpoint_sha, elog, phase="adoption")
             current_tree = (snapshot.get("tree_sha") or "").strip()
@@ -76,11 +70,9 @@ class IntegrationMixin:
                 )
 
         actual_files = _safe_list(snapshot["changed"].all_paths())
-        # An empty uncommitted diff is not the same thing as an empty change:
-        # the verified content may already be committed in the worktree. Decide
-        # that here rather than in the pipeline, so a retry that cannot possibly
-        # succeed is refused *before* it spends an attempt from the bounded
-        # budget - which is how ten seconds exhausted the retries in #175.
+        # An empty uncommitted diff is not an empty change: the verified content
+        # may already be committed. Decide here, before the pipeline spends a
+        # bounded retry attempt on a retry that cannot succeed (#175).
         committed_commit_sha: str | None = None
         if not actual_files:
             committed_commit_sha, actual_files = self._committed_verified_work(
@@ -165,11 +157,9 @@ class IntegrationMixin:
                 elog=elog,
                 phase=phase,
             )
-            # The scratch index already holds HEAD plus every worktree change,
-            # so its tree *is* the content adoption would integrate. Recording
-            # it lets the content be compared directly against the verified
-            # checkpoint, independently of whether that content currently sits
-            # in the worktree as uncommitted changes or as a commit.
+            # The scratch index holds HEAD plus every worktree change, so its tree
+            # is exactly what adoption would integrate; compare that against the
+            # verified checkpoint regardless of where the content currently sits.
             tree_proc = _run_git(
                 ["write-tree"],
                 cwd=worktree_path,
@@ -194,22 +184,13 @@ class IntegrationMixin:
     ) -> tuple[str | None, list[str]]:
         """``HEAD`` and its changed paths when the verified content is already committed.
 
-        Adoption commits the verified changes as its own first step, so any
-        attempt that got that far leaves a *clean* worktree with the content in
-        ``HEAD``. Deriving the file list from the uncommitted diff then yields
-        nothing and the attempt dies with "Keine Änderungen zur Übernahme
-        vorhanden." - for a change whose CI is green and whose content is
-        sitting right there. The adoption record cannot rescue it either:
-        requeuing resets ``experiment_commit_sha`` to NULL, so
-        :meth:`_resumable_commit_sha` has nothing left to resume from (#175).
-
-        The content invariant answers this without trusting any record, which
-        is also why it survives a process restart: if ``HEAD`` carries exactly
-        the tree verification accepted, and that tree differs from the target
-        branch, then ``HEAD`` *is* the change to adopt. Returns ``(None, [])``
-        when the content is not committed or there is genuinely nothing left
-        to integrate, and raises when the comparison itself could not be made
-        - an unanswerable question must not read as an empty answer.
+        Adoption commits the verified changes first, so an attempt that got that
+        far leaves a clean worktree with the content in ``HEAD`` - reading only
+        the uncommitted diff then yields nothing (#175). The content invariant
+        answers without trusting any record: if ``HEAD`` carries exactly the tree
+        verification accepted and differs from the target branch, ``HEAD`` *is*
+        the change to adopt. Raises when the comparison could not be made - an
+        unanswerable question must not read as an empty answer.
         """
         checkpoint_sha = self._verified_checkpoint_sha(experiment_id, experiment)
         verified_tree = self._tree_sha_of(worktree_path, checkpoint_sha, elog, phase="adoption")
@@ -217,10 +198,8 @@ class IntegrationMixin:
         head_tree = self._tree_sha_of(worktree_path, head_sha, elog, phase="adoption")
         if not verified_tree or not head_tree or verified_tree != head_tree:
             return None, []
-        # "Nothing to adopt" may only be concluded against a target branch
-        # that actually resolved. Without that check an unreachable ref would
-        # report an empty change set - reintroducing the very symptom this
-        # method exists to remove, under a cause nobody would look for.
+        # "Nothing to adopt" may only be concluded against a target branch that
+        # actually resolved; an unreachable ref must not read as an empty change.
         target_ref = f"origin/{_DEFAULT_TARGET_BRANCH}"
         resolved_target = _run_git(
             ["rev-parse", "--verify", f"{target_ref}^{{commit}}"],
@@ -233,8 +212,8 @@ class IntegrationMixin:
             raise ExperimentAdoptionError(
                 f"Der Ziel-Branch {target_ref} ist im Experiment-Worktree nicht auflösbar."
             )
-        # Three dots: what this experiment added since it diverged from the
-        # target branch, not whatever else landed on the target meanwhile.
+        # Three dots: what this experiment added since it diverged from the target
+        # branch, not whatever else landed on the target meanwhile.
         changed = _run_git(
             ["diff", "--name-only", f"{target_ref}...HEAD"],
             cwd=worktree_path,
@@ -279,12 +258,9 @@ class IntegrationMixin:
 
 
     def _verified_checkpoint_sha(self, experiment_id: str, experiment: Any) -> str:
-        """Return the commit whose content verification actually accepted.
-
-        The GitHub work ref is authoritative. ``test_command`` is the fallback
-        for experiments verified before a work ref existed: verification writes
-        it as ``["GitHub Actions", <workflow>, <sha>]``.
-        """
+        """Return the commit whose content verification actually accepted: the
+        GitHub work ref's checkpoint, else the SHA verification recorded in
+        ``test_command`` as ``["GitHub Actions", <workflow>, <sha>]``."""
         try:
             work_ref = self.github_work_tracking.for_experiment(experiment_id)
         except Exception:
@@ -312,14 +288,10 @@ class IntegrationMixin:
 
 
     def _integration_base_sha(self) -> str:
-        """The target-branch commit adoption would cherry-pick onto.
-
-        Read from the local ``origin/<target>`` ref rather than from
-        GitHub, because this has to work in a process with no
-        credentials - and because it is the base adoption actually uses.
-        Returns an empty string when it cannot be resolved, which callers
-        treat as "cannot prove the base is unchanged".
-        """
+        """The target-branch commit adoption would cherry-pick onto, read from the
+        local ``origin/<target>`` ref so it works without credentials and matches
+        the base adoption actually uses; empty when unresolvable, which callers
+        treat as "cannot prove the base is unchanged"."""
         proc = _run_git(
             ["rev-parse", f"origin/{_DEFAULT_TARGET_BRANCH}"],
             cwd=str(self.repo_root),
@@ -359,8 +331,8 @@ class IntegrationMixin:
             return "Änderungen unter communication/outbox/ werden nicht automatisch übernommen."
         if lower == ".env" or lower.endswith("/.env") or lower.endswith(".pem"):
             return "Sensible Konfigurationsdateien werden nicht automatisch übernommen."
-        # Test files may be named after what they test (fixtures such as
-        # "print_vault_secrets.md"); the reviewer reads their content.
+        # Test files may be named after what they test ("print_vault_secrets.md"
+        # fixtures); the reviewer reads their content.
         if ("secret" in lower or "credential" in lower) and not lower.startswith("tests/"):
             return "Potentiell sensible Dateien werden nicht automatisch übernommen."
         return None

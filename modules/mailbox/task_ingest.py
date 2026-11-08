@@ -1,17 +1,9 @@
-"""Idempotent mailbox task ingestion (#378).
-
-Every mailbox task carries an idempotency key, stored under a unique index on
-``mailbox_task_approvals.idempotency_key``. Delivering the same message again -
-a retried poll, a redelivered webhook, a second API call - returns the task
-that already exists instead of creating (and later dispatching) another one.
-
-The key is derived from the source message id unless the caller supplies one
-explicitly. Explicit keys are namespaced so they can never collide with a
-derived key.
-
-Kept free of service imports: both ``processing`` (the poller) and
-``task_service`` (the API-facing service) use it, and they must not import
-each other.
+"""Idempotent mailbox task ingestion (#378). Every task carries an idempotency key
+under a unique index on ``mailbox_task_approvals.idempotency_key``, so redelivering a
+message (retried poll, webhook, second API call) returns the existing task instead of
+creating another. The key derives from the source message id unless given explicitly;
+explicit keys are namespaced so they cannot collide with derived ones. Kept free of
+service imports because both ``processing`` and ``task_service`` use it.
 """
 
 from __future__ import annotations
@@ -23,8 +15,8 @@ from datetime import datetime, timezone
 
 # Must match the backfill in ``modules/run_store/schema.py``.
 DERIVED_KEY_PREFIX = "mailbox-msg:"
-# A task from a verified trusted sender goes straight to Nexus; anything else
-# waits for owner approval and is never run by the worker.
+# A verified trusted sender's task goes straight to Nexus; anything else waits for
+# owner approval and is never run by the worker.
 _STATUS_QUEUED = "queued"
 _STATUS_PENDING_APPROVAL = "pending_approval"
 _ALLOWED_STATUSES = frozenset({_STATUS_QUEUED, _STATUS_PENDING_APPROVAL})
@@ -62,19 +54,13 @@ def insert_task_approval(
     idempotency_key: str | None = None,
     status: str = _STATUS_QUEUED,
 ) -> tuple[str, bool]:
-    """Create the pending task for a message, or find the one it already created.
-
-    Returns ``(approval_id, created)``. The insert and the duplicate check are
-    one statement, so concurrent deliveries - from other threads, connections
-    or processes - cannot both create a task: the unique index lets exactly
-    one insert through and every other caller reads that winner back.
-
-    ``status`` is ``queued`` only for senders the authorization gate verified as
-    trusted; untrusted senders get ``pending_approval``, which the worker never
-    runs. The task's no-merge constraint (#185) is recorded in the same
-    transaction: a queued task is never visible to the worker without it,
-    and if recording it fails the task is rolled back with it.
-    """
+    """Create the pending task for a message, or find the one it already created;
+    returns ``(approval_id, created)``. Insert and duplicate check are one statement,
+    so concurrent deliveries cannot both create a task - the unique index lets one
+    insert through and the others read that winner back. ``status`` is ``queued``
+    only for gate-verified trusted senders (others get ``pending_approval``, never
+    run); the no-merge constraint (#185) is recorded in the same transaction, and a
+    failure there rolls the task back with it."""
     from modules.run_store.schema import record_merge_constraint
 
     if status not in _ALLOWED_STATUSES:

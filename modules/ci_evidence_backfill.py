@@ -1,9 +1,8 @@
 """Backfill authoritative GitHub Actions evidence from pre-#139 lifecycle state.
 
-Issue #138 made exact-commit CI verdicts durable in ``github_ci_verifications``.
-Experiments verified before that table existed can already contain the same
-accepted verdict in ``verification_runs``. This migration copies only that
-explicit GitHub Actions evidence; it never upgrades a generic/local test pass.
+Copies only explicit GitHub Actions verdicts from ``verification_runs`` into the
+durable ``github_ci_verifications`` table (#138/#139); it never upgrades a
+generic/local test pass.
 """
 
 from __future__ import annotations

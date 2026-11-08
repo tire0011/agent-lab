@@ -1,7 +1,5 @@
-"""Backward-compatible mailbox façade.
-
-This module keeps the historical import surface used across the codebase while
-delegating the real implementation to the split modules below.
+"""Backward-compatible mailbox facade: keeps the historical import surface while
+delegating to the split modules below.
 """
 
 from __future__ import annotations
@@ -84,25 +82,24 @@ __all__ = [
     "redact",
 ]
 
-# Keep the historic ``modules.mailbox.task_service`` import surface while
-# extending its service with the persisted post-verification lifecycle.
+# Keep the historic ``modules.mailbox.task_service`` import surface while extending
+# its service with the persisted post-verification lifecycle.
 from .finalizing_task_service import install as _install_finalizing_task_service
 
 _install_finalizing_task_service()
 del _install_finalizing_task_service
 
-# Install the failure-analysis diagnostics only after the finalizing mailbox
-# class is behind the historic import surface.  This instruments both direct
-# task failures and resumed/finalization paths without changing their lifecycle
+# Install failure-analysis diagnostics after the finalizing class is behind the
+# historic import surface; instruments task failures without changing lifecycle
 # behavior or eagerly constructing an LLM client.
 from modules.failure_analysis_observability import install as _install_failure_analysis_observability
 
 _install_failure_analysis_observability()
 del _install_failure_analysis_observability
 
-# The package import above happens before configure_logging() in the API and
-# mailbox entry points.  Patch the mailbox service constructor now so it emits
-# the startup feature-status event later, once central logging is active.
+# This package is imported before configure_logging() in the API/mailbox entry
+# points; patch the service constructor now so it emits the startup feature-status
+# event later, once central logging is active.
 from modules.failure_analysis_startup_observability import install as _install_failure_analysis_startup_observability
 
 _install_failure_analysis_startup_observability()

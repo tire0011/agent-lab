@@ -1,22 +1,9 @@
-"""Local-model Decision Router.
-
-Uses a local OpenAI-compatible model server (llama.cpp / llama-server or any
-compatible endpoint) to parse an incoming task and decide which execution
-strategy to use.
-
-Routing separates **role** from **provider**:
-
-* **Roles** describe *what* step runs next:
-  ``router``, ``context_gatherer``, ``planner``, ``developer``, ``reviewer``.
-* **Providers** describe *who* executes a role:
-  ``local``, ``azure_openai``, ``codex``, ``copilot``.
-
-The legacy ``decision`` field (``SELF / AZURE_OPENAI / CODEX / CONSULT``) is
-retained for backward compatibility and is derived automatically from
-``provider`` when not explicitly set by the model.
-
-Router decisions are persisted to the ``router_decisions`` SQLite table so
-costs and routing patterns can be analysed over time.
+"""Local-model decision router: parses a task and decides which provider runs it.
+Roles (what step runs next: router, context_gatherer, planner, developer, reviewer)
+are separate from providers (who executes: local, azure_openai, codex, copilot).
+The legacy ``decision`` token (SELF/AZURE_OPENAI/CODEX/CONSULT) is kept for backward
+compatibility and derived from ``provider`` when unset. Decisions are persisted to
+the ``router_decisions`` SQLite table for cost/routing analysis.
 """
 
 from __future__ import annotations
@@ -31,7 +18,7 @@ from modules.llama_cpp_client import LlamaCppClient, LlamaCppClientError, extrac
 from modules.prompt_library import render_prompt
 
 
-# ── Valid values ──────────────────────────────────────────────────────────────
+# Valid values
 
 # Legacy decision tokens kept for backward compatibility.
 VALID_DECISIONS = frozenset({"SELF", "AZURE_OPENAI", "CODEX", "CONSULT"})
@@ -59,13 +46,8 @@ _PROVIDER_TO_DECISION: dict[str, str] = {
 
 @dataclass
 class RouterDecision:
-    """Parsed output of a single router call.
-
-    The ``provider`` and ``role`` fields carry the new role/provider
-    vocabulary.  The legacy ``decision`` field is retained for backward
-    compatibility and is always set (derived from ``provider`` if not
-    provided explicitly by the model).
-    """
+    """Parsed output of one router call: ``provider``/``role`` plus the legacy
+    ``decision`` token, always set (derived from ``provider`` when unset)."""
 
     # New fields (preferred)
     provider: str = "local"   # local | azure_openai | codex | copilot
@@ -86,18 +68,15 @@ class RouterDecision:
 
 
 def _parse_router_response(raw: str) -> RouterDecision:
-    """Extract a :class:`RouterDecision` from the model's raw text output.
-
-    Accepts both the new ``provider``/``role`` format and the legacy
-    ``decision`` format, so old prompt templates continue to work.
-    """
+    """Extract a :class:`RouterDecision` from raw model text, accepting both the
+    ``provider``/``role`` format and the legacy ``decision`` format."""
     data: dict[str, Any] = extract_json(raw)
 
-    # ── New format: provider + role ───────────────────────────────────────
+    # New format: provider + role
     provider_raw = str(data.get("provider", "")).lower()
     role_raw = str(data.get("role", "")).lower()
 
-    # ── Legacy format: decision ───────────────────────────────────────────
+    # Legacy format: decision
     decision_raw = str(data.get("decision", "")).upper()
 
     if provider_raw and provider_raw in VALID_PROVIDERS:
@@ -134,26 +113,10 @@ def _parse_router_response(raw: str) -> RouterDecision:
 
 
 class LlamaRouter:
-    """Routes tasks to the appropriate execution provider using a local model.
-
-    The local model server endpoint is configured via the ``LOCAL_MODEL_URL``
-    environment variable (default: ``http://127.0.0.1:8080/v1``).  The model
-    itself is configured via ``LOCAL_MODEL_NAME``
-    (default: ``qwen2.5-coder-7b-instruct``).
-    This makes the router server/model-agnostic: swap GGUF files or switch to
-    a different llama.cpp build without changing orchestration code.
-
-    Parameters
-    ----------
-    client:
-        A :class:`~modules.llama_cpp_client.LlamaCppClient` instance.  If
-        *None*, a default instance is constructed from environment variables.
-    db:
-        Open SQLite connection used to persist decisions.  The
-        ``router_decisions`` table is created if it does not already exist.
-    prompts_dir:
-        Override the default prompts directory (useful in tests).
-    """
+    """Routes tasks to a provider using a local model (``LOCAL_MODEL_URL`` /
+    ``LOCAL_MODEL_NAME`` env vars, so GGUF/server swaps need no code change).
+    client defaults to one built from env; db persists decisions (table created if
+    missing); prompts_dir overrides the prompt directory (useful in tests)."""
 
     def __init__(
         self,
@@ -168,19 +131,9 @@ class LlamaRouter:
             _ensure_router_tables(db)
 
     async def route(self, task: str) -> RouterDecision:
-        """Ask the local model to decide how to handle *task*.
-
-        Returns
-        -------
-        RouterDecision
-            The routing decision with metadata, including the new ``provider``
-            and ``role`` fields and the legacy ``decision`` token.
-
-        Raises
-        ------
-        LlamaCppClientError
-            If the model is unavailable or returns an unparseable response.
-        """
+        """Ask the local model to decide how to handle *task*; returns the
+        RouterDecision (provider, role, legacy decision token). Raises
+        :class:`LlamaCppClientError` when the model is unavailable or unparseable."""
         prompt = render_prompt(
             "router",
             {"task": task},
@@ -205,14 +158,11 @@ class LlamaRouter:
         return await self._client.is_available()
 
 
-# ── SQLite helpers ────────────────────────────────────────────────────────────
+# SQLite helpers
 
 def _ensure_router_tables(conn: sqlite3.Connection) -> None:
-    """Create the router_decisions table if it does not exist.
-
-    The ``provider`` and ``role`` columns are added additively if the table
-    already exists from an earlier schema version.
-    """
+    """Create ``router_decisions`` if missing; provider/role columns are added
+    additively for older schemas."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS router_decisions (

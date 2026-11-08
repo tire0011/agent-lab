@@ -1,38 +1,14 @@
-"""Generic restart-recovery evidence for the mailbox command channel.
+"""Generic restart-recovery evidence for the mailbox command channel. A ``command``
+message may restart Nexus mid-run, killing the detached runner before it writes an
+exit code. This module never inspects the command text: it only compares the repo's
+git state before/after, plus the optionally declared ``recovery_services``.
 
-A mailbox ``command`` message may run a shell command that intentionally
-restarts Nexus (for example a self-refresh: pull the latest code, then
-restart services). The detached runner process can be killed by that
-restart before it writes its exit code, so a later poll only sees a dead
-pid with no recorded outcome.
-
-This module supplies operation-agnostic evidence for that situation. It
-never inspects the command text: it only compares the target repository's
-git state before/after the interruption, plus an optional, explicitly
-*declared* set of systemd services the command expects to end up active.
-
-Git convergence (a clean HEAD matching its upstream branch) proves only
-that a git update step completed — not that the rest of a multi-step
-command (such as a service restart after the pull) ever ran or succeeded.
-So git convergence by itself is reported as ``unknown``, never
-``succeeded``, unless the command's author has declared what "complete"
-means for it via the message's ``recovery_services`` field:
-
-- not declared at all -> git convergence alone stays ``unknown``; only
-  git evidence of definite failure (HEAD moved but did not converge) is
-  ever reported as ``failed``.
-- ``recovery_services: none`` -> the author declares that reaching a
-  clean, converged git state *is* the complete expected state for this
-  command; git convergence alone is then reported as ``succeeded``.
-- ``recovery_services: svc-a, svc-b`` -> the author declares that the
-  command is only complete once git has converged *and* every listed
-  systemd unit is active; any listed service found inactive is reported
-  as a verified ``failed`` (this is exactly the "pull converged but the
-  restart did not complete" case), not a false success.
-
-Anything that cannot be distinguished (no git repository, no recorded
-baseline, unchanged HEAD, or declared services whose state cannot be
-determined) is reported as ``unknown`` rather than guessed.
+Git convergence alone proves only that a git-update step ran, so it is reported
+``unknown`` - never ``succeeded`` - unless the message declares what "complete"
+means: undeclared -> ``unknown`` (only definite git failure is ``failed``);
+``recovery_services: none`` -> convergence alone is ``succeeded``; a service list ->
+converged AND all listed units active, else a verified ``failed``. Anything
+indistinguishable is ``unknown``, never guessed.
 """
 
 from __future__ import annotations
@@ -53,9 +29,8 @@ RECOVERY_FILE_NAME = "recovery.json"
 
 RecoveryStatus = Literal["succeeded", "failed", "unknown"]
 
-# Sentinel meta value meaning "git convergence alone is the complete
-# expected state for this command" (as opposed to the field being absent,
-# which means no expected-state declaration was made at all).
+# Sentinel meaning "git convergence alone is the complete expected state" (as
+# opposed to the field being absent = no declaration at all).
 _NO_SERVICES_SENTINEL = "none"
 
 ServiceChecker = Callable[[Sequence[str]], "bool | None"]
@@ -67,13 +42,8 @@ def _is_git_repo(repo_path: Path) -> bool:
 
 
 def parse_expected_services(meta: dict | None) -> list[str] | None:
-    """Parse the optional ``recovery_services`` mailbox message field.
-
-    Returns ``None`` when the command made no declaration (the safe
-    default), ``[]`` when it explicitly declared git convergence as its
-    complete expected state (``recovery_services: none``), or the list of
-    systemd unit names it expects to be active otherwise.
-    """
+    """Parse the optional ``recovery_services`` field: ``None`` when undeclared (the
+    safe default), ``[]`` for ``recovery_services: none``, else the expected units."""
     if not meta:
         return None
     raw = meta.get("recovery_services")
@@ -86,12 +56,8 @@ def parse_expected_services(meta: dict | None) -> list[str] | None:
 
 
 def _systemctl_is_active(names: Sequence[str]) -> bool | None:
-    """Best-effort check that every named systemd unit is active.
-
-    Returns ``True``/``False`` when the state could be determined, or
-    ``None`` when ``systemctl`` is unavailable (e.g. in a non-systemd/test
-    environment) and the check is therefore undetermined rather than failed.
-    """
+    """Best-effort check that every named systemd unit is active: True/False when
+    determined, ``None`` when systemctl is unavailable (undetermined, not failed)."""
     if shutil.which("systemctl") is None:
         return None
     try:
@@ -107,14 +73,9 @@ def _systemctl_is_active(names: Sequence[str]) -> bool | None:
 
 
 def capture_pre_start_state(repo_path: Path) -> dict:
-    """Best-effort, local-only snapshot taken before a command runs.
-
-    Only runs ``git rev-parse HEAD`` in *repo_path* — no network access, so
-    this stays cheap on the hot path where a command finishes normally and
-    recovery evidence is never consulted. Returns ``{"pre_commit": None}``
-    when *repo_path* is not a git repository so the command channel keeps
-    working for arbitrary non-git working directories.
-    """
+    """Best-effort local-only pre-run snapshot: just ``git rev-parse HEAD`` in
+    *repo_path* (no network, cheap on the hot path). Returns ``{"pre_commit": None}``
+    for non-git working directories so the command channel keeps working there."""
     if not _is_git_repo(repo_path):
         return {"pre_commit": None}
     return {"pre_commit": git_current_commit(repo_path)}
@@ -157,12 +118,8 @@ def evaluate_interrupted_command(
     repo_path: Path,
     service_checker: ServiceChecker = _systemctl_is_active,
 ) -> RecoveryOutcome:
-    """Decide whether an interrupted command reached a verifiable end state.
-
-    Called once a command's runner process has been confirmed dead without
-    ever writing an exit code (typically because it — or Nexus itself — was
-    killed by a restart the command triggered).
-    """
+    """Decide whether an interrupted command (runner confirmed dead without an exit
+    code, typically killed by a restart it triggered) reached a verifiable end state."""
     recorded = _read_recovery_state(state_dir)
     pre_commit = recorded.get("pre_commit")
     expected_services = recorded.get("expected_services")
@@ -212,10 +169,8 @@ def evaluate_interrupted_command(
             "failed rather than assuming success.",
         )
 
-    # Git converged. That proves a git-update step completed, but not that a
-    # multi-step command (e.g. refresh: pull, then restart services) finished
-    # — so success requires the command to have declared what "complete"
-    # means for it via recovery_services.
+    # Git converged: that proves a git-update step ran, but not that a multi-step
+    # command finished - success requires a declared recovery_services contract.
     if expected_services is None:
         return RecoveryOutcome(
             "unknown",
