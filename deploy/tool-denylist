@@ -1,0 +1,39 @@
+# Packages Nexus' install_tool refuses (#589), one shell glob per line. It is
+# copied to /etc/agent-lab/tool-denylist only when that file is missing, so
+# the copy on the VM is the owner's to edit.
+# Network services and remote access
+openssh-server
+telnetd
+*-server
+apache2*
+nginx*
+lighttpd
+vsftpd
+samba*
+xinetd
+postfix*
+exim4*
+sendmail*
+bind9*
+dnsmasq*
+squid*
+tor
+openvpn*
+wireguard*
+# Containers and virtualisation
+docker*
+containerd*
+podman*
+lxd*
+lxc*
+snapd
+qemu*
+# Privileges, firewall and the update path
+sudo*
+policykit*
+polkit*
+ufw
+iptables*
+nftables
+firewalld
+unattended-upgrades
