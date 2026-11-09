@@ -1151,7 +1151,10 @@ class NexusInitiativeService:
         else:
             entry["commits_behind"] = "unknown"
             entry["overlap_files"] = ""
-        return True
+        # Validation can fail before fetch (for example, a removed worktree),
+        # and a failed fetch must be retried for the next experiment.  Only a
+        # confirmed successful fetch makes the shared origin/main current.
+        return fetched or bool(drift.get("fetched"))
 
     def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:
         """The one issue the planner picks as next, or none (#354).

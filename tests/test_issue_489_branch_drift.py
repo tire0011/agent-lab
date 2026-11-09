@@ -135,21 +135,76 @@ class BranchDriftTests(unittest.TestCase):
     def test_a_missing_repository_and_worktree_is_unknown(self):
         drift = branch_drift(BRANCH, repo_root=str(self.r.repo / "gone"), worktree_path=str(self.r.repo / "also-gone"))
         self.assertEqual(drift["status"], "unknown")
-        self.assertEqual(drift["reason"], "repository or worktree not found")
+        self.assertEqual(drift["reason"], "experiment worktree not found")
         self.assertFalse(drift["worktree_exists"])
-        self.assertEqual(drift_summary(drift), "drift: unknown (repository or worktree not found)")
+        self.assertEqual(drift_summary(drift), "drift: unknown (experiment worktree not found)")
 
     def test_an_experiment_without_branch_is_unknown(self):
         drift = self.r.drift(None)
         self.assertEqual(drift["status"], "unknown")
         self.assertEqual(drift["reason"], "experiment has no branch")
 
-    def test_an_unreachable_origin_still_reports_the_last_known_main(self):
+    def test_an_unreachable_origin_is_unknown_not_stale_cached_data(self):
         git(self.r.repo, "remote", "set-url", "origin", str(self.r.origin) + "-missing")
         drift = self.r.drift()
-        self.assertEqual(drift["status"], "ok")
+        self.assertEqual(drift["status"], "unknown")
+        self.assertEqual(drift["reason"], "git fetch origin main failed")
+        self.assertIsNone(drift["commits_behind"])
         self.assertFalse(drift["fetched"])
         self.assertTrue(drift["fetch_error"])
+
+    def test_a_timed_out_fetch_is_unknown_not_stale_cached_data(self):
+        def runner(command, **kwargs):
+            if command[1:3] == ["fetch", "--quiet"]:
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+            return subprocess.run(command, **kwargs)
+
+        drift = self.r.drift(runner=runner)
+        self.assertEqual(drift["status"], "unknown")
+        self.assertEqual(drift["reason"], "git fetch origin main failed")
+        self.assertIsNone(drift["commits_behind"])
+        self.assertFalse(drift["fetched"])
+
+    def test_a_supplied_missing_worktree_is_unknown_even_when_branch_ref_exists(self):
+        drift = self.r.drift(worktree_path=str(self.r.worktree.parent / "missing"))
+        self.assertEqual(drift["status"], "unknown")
+        self.assertEqual(drift["reason"], "experiment worktree not found")
+
+    def test_a_supplied_worktree_on_the_wrong_branch_is_unknown(self):
+        drift = self.r.drift(worktree_path=str(self.r.repo))
+        self.assertEqual(drift["status"], "unknown")
+        self.assertIn("does not have branch", drift["reason"])
+
+    def test_a_failed_required_diff_is_unknown(self):
+        def runner(command, **kwargs):
+            if command[1:3] == ["diff", "--name-only"]:
+                return subprocess.CompletedProcess(command, 1, "", "diff failed")
+            return subprocess.run(command, **kwargs)
+
+        drift = self.r.drift(fetch=False, runner=runner)
+        self.assertEqual(drift["status"], "unknown")
+        self.assertEqual(drift["reason"], "required git diff failed")
+        self.assertEqual(drift["overlap_files"], [])
+
+    def test_a_timed_out_required_diff_is_unknown(self):
+        def runner(command, **kwargs):
+            if command[1:3] == ["diff", "--name-only"]:
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+            return subprocess.run(command, **kwargs)
+
+        drift = self.r.drift(fetch=False, runner=runner)
+        self.assertEqual(drift["status"], "unknown")
+        self.assertEqual(drift["reason"], "required git diff failed")
+
+    def test_a_failed_worktree_diff_is_unknown(self):
+        def runner(command, **kwargs):
+            if kwargs.get("cwd") == str(self.r.worktree) and command[1:3] == ["diff", "--name-only"]:
+                return subprocess.CompletedProcess(command, 1, "", "diff failed")
+            return subprocess.run(command, **kwargs)
+
+        drift = self.r.drift(fetch=False, runner=runner)
+        self.assertEqual(drift["status"], "unknown")
+        self.assertEqual(drift["reason"], "required worktree diff failed")
 
     def test_experiment_drift_resolves_the_experiment(self):
         experiment = SimpleNamespace(id="e1", branch_name=BRANCH, worktree_path=str(self.r.worktree))
@@ -274,7 +329,7 @@ class PlannerDriftTests(unittest.TestCase):
         def drift(branch, worktree, fetch=True):
             calls.append((branch, worktree, fetch))
             if branch == "experiment/e1":
-                return {"status": "ok", "commits_behind": 7, "overlap_files": ["modules/experiment_service/service.py"]}
+                return {"status": "ok", "commits_behind": 7, "overlap_files": ["modules/experiment_service/service.py"], "fetched": True}
             return {"status": "unknown", "reason": "branch not found"}
 
         planner = _Planner(_answer(351))
@@ -291,6 +346,22 @@ class PlannerDriftTests(unittest.TestCase):
         # A merged experiment's branch no longer matters.
         self.assertIn("- succeeded / merge: merged: Goal for e3\n", prompt)
         self.assertEqual(calls, [("experiment/e1", "/wt/e1", True), ("experiment/e2", "/wt/e2", False)])
+
+    def test_an_unknown_before_fetch_does_not_make_later_drift_use_stale_main(self):
+        fx = self._fixture_with_branches()
+        calls = []
+
+        def drift(branch, worktree, fetch=True):
+            calls.append((branch, fetch))
+            if branch == "experiment/e1":
+                return {"status": "unknown", "reason": "experiment worktree not found", "fetched": False}
+            return {"status": "ok", "commits_behind": 2, "overlap_files": [], "fetched": True}
+
+        planner = _Planner(_answer(351))
+        svc = fx.service(issue_lister=lambda: ISSUES[:2], planner=planner, branch_drift=drift)
+        self.addCleanup(svc.close)
+        svc.tick()
+        self.assertEqual(calls, [("experiment/e1", True), ("experiment/e2", True)])
 
     def test_a_failing_drift_reader_does_not_block_planning(self):
         fx = self._fixture_with_branches()

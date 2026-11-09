@@ -75,6 +75,20 @@ def _is_git_dir(path: str | None, runner: Runner) -> bool:
     return _ok(proc)
 
 
+def _worktree_error(path: str | None, branch: str, runner: Runner) -> str | None:
+    """Why ``path`` is not a worktree with ``branch`` checked out, if any."""
+    if not path or not Path(path).is_dir():
+        return "experiment worktree not found"
+    inside = _git(runner, ["rev-parse", "--is-inside-work-tree"], cwd=path, timeout=10)
+    if not _ok(inside) or (inside.stdout or "").strip() != "true":
+        return "experiment worktree is not a Git worktree"
+    head = _git(runner, ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=path, timeout=10)
+    checked_out = (head.stdout or "").strip() if _ok(head) else ""
+    if checked_out != branch:
+        return f"experiment worktree does not have branch {branch} checked out"
+    return None
+
+
 def fetch_main(repo_root: str, *, runner: Runner = subprocess.run) -> tuple[bool, str | None]:
     """``git fetch origin main``; returns (fetched, error)."""
     proc = _git(runner, ["fetch", "--quiet", "origin", MAIN_BRANCH], cwd=repo_root, timeout=_FETCH_TIMEOUT_SECONDS)
@@ -111,6 +125,10 @@ def branch_drift(
     extra = {"worktree_path": worktree_path, "worktree_exists": worktree_exists, "fetched": False, "fetch_error": None}
     if branch is None:
         return _unknown(None, "experiment has no branch", **extra)
+    if worktree_path is not None:
+        worktree_error = _worktree_error(worktree_path, branch, runner)
+        if worktree_error:
+            return _unknown(branch, worktree_error, **extra)
     cwd = repo_root if _is_git_dir(repo_root, runner) else None
     if cwd is None and worktree_exists and _is_git_dir(worktree_path, runner):
         cwd = str(worktree_path)
@@ -119,6 +137,8 @@ def branch_drift(
 
     if fetch:
         extra["fetched"], extra["fetch_error"] = fetch_main(cwd, runner=runner)
+        if not extra["fetched"]:
+            return _unknown(branch, "git fetch origin main failed", **extra)
     if not _ok(_git(runner, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{MAIN_REF}^{{commit}}"], cwd=cwd, timeout=10)):
         return _unknown(branch, f"{MAIN_REF} not found", **extra)
     branch_ref = _resolve_branch_ref(branch, cwd, runner)
@@ -137,17 +157,22 @@ def branch_drift(
         commits_ahead = int((ahead.stdout or "").strip()) if _ok(ahead) else None
     except ValueError:
         commits_behind = commits_ahead = None
-    if commits_behind is None:
+    if commits_behind is None or commits_ahead is None:
         return _unknown(branch, "commit count failed", merge_base=merge_base, **extra)
 
-    on_main = set(_lines(_git(runner, ["diff", "--name-only", merge_base, MAIN_REF], cwd=cwd)))
-    on_branch = set(_lines(_git(runner, ["diff", "--name-only", merge_base, branch_ref], cwd=cwd)))
-    if worktree_exists and _is_git_dir(worktree_path, runner):
-        # Only when that worktree really has this branch checked out.
-        head = _git(runner, ["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(worktree_path), timeout=10)
-        if _ok(head) and (head.stdout or "").strip() == branch:
-            on_branch.update(_lines(_git(runner, ["diff", "--name-only", merge_base], cwd=str(worktree_path))))
-            on_branch.update(_lines(_git(runner, ["ls-files", "--others", "--exclude-standard"], cwd=str(worktree_path))))
+    main_diff = _git(runner, ["diff", "--name-only", merge_base, MAIN_REF], cwd=cwd)
+    branch_diff = _git(runner, ["diff", "--name-only", merge_base, branch_ref], cwd=cwd)
+    if not _ok(main_diff) or not _ok(branch_diff):
+        return _unknown(branch, "required git diff failed", merge_base=merge_base, **extra)
+    on_main = set(_lines(main_diff))
+    on_branch = set(_lines(branch_diff))
+    if worktree_path is not None:
+        worktree_diff = _git(runner, ["diff", "--name-only", merge_base], cwd=str(worktree_path))
+        untracked = _git(runner, ["ls-files", "--others", "--exclude-standard"], cwd=str(worktree_path))
+        if not _ok(worktree_diff) or not _ok(untracked):
+            return _unknown(branch, "required worktree diff failed", merge_base=merge_base, **extra)
+        on_branch.update(_lines(worktree_diff))
+        on_branch.update(_lines(untracked))
 
     return {
         "status": STATUS_OK,
