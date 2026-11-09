@@ -1401,7 +1401,7 @@ class NexusInitiativeService:
                 outcome = f"{row['status']}: {row['error'] or ''}"
             else:
                 continue
-            lines.append(f"- experiment {str(row['id'])[:8]}, {' '.join(outcome.split())[:1500]}")
+            lines.append(f"- experiment {str(row['id'])[:8]}, {' '.join(outcome.split())[:4000]}")
         if not lines:
             return ""
         return f"\n\n{EARLIER_ATTEMPTS_HEADING}\n" + "\n".join(lines)
