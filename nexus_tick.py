@@ -547,7 +547,8 @@ def main(argv: list[str] | None = None) -> int:
                     resume.candidate.ref if resume.candidate else "?",
                 )
                 return 0
-            if resume.decision in {"busy", "budget_exhausted", "error"}:
+            # budget_exhausted goes on: tick() still adopts verified work (#538).
+            if resume.decision in {"busy", "error"}:
                 logger.info("capability resume not started (%s): %s", resume.decision, resume.detail)
                 return 0 if resume.decision != "error" else 1
 
