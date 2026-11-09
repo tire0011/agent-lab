@@ -12,7 +12,7 @@ Operational runbook for running and maintaining `agent-lab` on local machine and
 
 ### Azure VM
 
-- Host: `agent-lab-vm` (Ubuntu 22.04, `Standard_B1s`)
+- Host: `agent-lab-vm` (Ubuntu 22.04, `Standard_D2ds_v5`)
 - Resource group: `agent-lab-rg`
 - Region: `germanywestcentral`
 - Public HTTPS host: `<vm-host>`
@@ -46,6 +46,15 @@ must also provide:
 - `GITHUB_REPOSITORY=tire0011/agent-lab`
 - `GITHUB_TOKEN=<fine-grained token>` with write access to Issues, Contents and
   Pull requests. The token value must never be logged.
+
+For the GitHub MCP integration (#41, see `docs/github-mcp.md`), the
+`github-mcp-server` binary must be on `PATH` (or `GITHUB_MCP_SERVER_COMMAND`
+must name it), and `/etc/agent-lab/agent.env` must contain a token:
+`GITHUB_PERSONAL_ACCESS_TOKEN`, falling back to `GITHUB_TOKEN`/`GH_TOKEN`.
+Optional: `GITHUB_MCP_SERVER_ARGS` (default `stdio`), `GITHUB_MCP_TOOLSETS`
+and `GITHUB_MCP_TIMEOUT_SECONDS` (default 60). Each call starts the server
+itself, so no unit is needed and restarts need no extra step. Verify with
+`python scripts/github_mcp_check.py [--write]`.
 
 Optional, for controller work liveness (see ARCHITECTURE.md section 10):
 

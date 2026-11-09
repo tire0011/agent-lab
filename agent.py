@@ -37,7 +37,13 @@ async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, 
     )
     from agents.model_settings import ModelSettings
 
-    from modules.agent_clients import build_filesystem_server, build_openai_client
+    from contextlib import AsyncExitStack
+
+    from modules.agent_clients import (
+        build_filesystem_server,
+        build_github_server,
+        build_openai_client,
+    )
     from modules.agent_result import extract_tool_trace, extract_usage_totals
     from modules.serialization import to_json_string
 
@@ -47,18 +53,30 @@ async def run_agent(task: str) -> tuple[str, int, int, int, str, list[dict[str, 
     set_default_openai_client(build_openai_client(), use_for_tracing=False)
     set_default_openai_api("chat_completions")
 
-    async with build_filesystem_server() as fs_server:
+    async with AsyncExitStack() as stack:
+        fs_server = await stack.enter_async_context(build_filesystem_server())
+        mcp_servers = [fs_server]
+        instructions = (
+            "You are a minimal coding agent with read-only filesystem access. "
+            "Use MCP tools only when needed to answer the task. "
+            "Available filesystem tools are list_directory and read_file only. "
+            "All paths must stay under /agent. "
+            "Never invent file contents; read files first when needed."
+        )
+        # #41: the official GitHub MCP server, when a token and the binary exist.
+        github_server = build_github_server()
+        if github_server is not None:
+            mcp_servers.append(await stack.enter_async_context(github_server))
+            instructions += (
+                " GitHub MCP tools are available for GitHub Issues, pull requests, "
+                "commits and repository contents; the default repository is "
+                f"{os.getenv('GITHUB_REPOSITORY') or 'tire0011/agent-lab'}."
+            )
         agent = Agent(
             name="Filesystem Reader",
             model=model_name,
-            instructions=(
-                "You are a minimal read-only coding agent. "
-                "Use MCP tools only when needed to answer the task. "
-                "Available tools are list_directory and read_file only. "
-                "All paths must stay under /agent. "
-                "Never invent file contents; read files first when needed."
-            ),
-            mcp_servers=[fs_server],
+            instructions=instructions,
+            mcp_servers=mcp_servers,
             model_settings=ModelSettings(temperature=0),
         )
 

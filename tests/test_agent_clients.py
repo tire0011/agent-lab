@@ -23,6 +23,7 @@ with patch.dict(
     from modules import agent_clients
 
 build_filesystem_server = agent_clients.build_filesystem_server
+build_github_server = agent_clients.build_github_server
 
 
 class BuildFilesystemServerTests(unittest.TestCase):
@@ -77,6 +78,30 @@ class BuildFilesystemServerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as raised:
                 build_filesystem_server()
         self.assertIs(raised.exception, constructor_error)
+
+
+class BuildGitHubServerTests(unittest.TestCase):
+    """#41: the official GitHub MCP server joins the agent only when usable."""
+
+    @patch.object(agent_clients, "MCPServerStdio")
+    def test_absent_without_token_or_binary(self, mock_mcp_server_stdio):
+        with patch.dict(os.environ, {"GITHUB_MCP_SERVER_COMMAND": "definitely-not-installed"}, clear=True):
+            self.assertIsNone(build_github_server())
+        mock_mcp_server_stdio.assert_not_called()
+
+    @patch.object(agent_clients, "MCPServerStdio")
+    def test_runs_the_configured_server_over_stdio_with_the_token_in_env(self, mock_mcp_server_stdio):
+        mock_mcp_server_stdio.return_value = sentinel.github
+        environment = {"GITHUB_TOKEN": "tok", "GITHUB_MCP_SERVER_COMMAND": sys.executable}
+        with patch.dict(os.environ, environment, clear=True):
+            server = build_github_server()
+        self.assertIs(server, sentinel.github)
+        kwargs = mock_mcp_server_stdio.call_args.kwargs
+        self.assertEqual(kwargs["name"], "github")
+        self.assertEqual(kwargs["params"]["command"], sys.executable)
+        self.assertEqual(kwargs["params"]["args"], ["stdio"])
+        self.assertEqual(kwargs["params"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"], "tok")
+        self.assertTrue(kwargs["cache_tools_list"])
 
 
 if __name__ == "__main__":
