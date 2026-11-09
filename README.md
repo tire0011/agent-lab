@@ -510,7 +510,7 @@ command output. `./scripts/nexus-logs.ps1` displays this same model.
 
 - Azure resource group: `agent-lab-rg`
 - Region: `germanywestcentral`
-- VM: `agent-lab-vm` (`Standard_B1s`, Ubuntu 22.04)
+- VM: `agent-lab-vm` (`Standard_D2ds_v5`, Ubuntu 22.04)
 - Azure OpenAI resource: `openAI-tire0011`
 - Deployment: `gpt-4o` (`2024-05-13`, GlobalStandard)
 - Public HTTPS host: `<vm-host>`

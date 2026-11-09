@@ -12,7 +12,7 @@ Operational runbook for running and maintaining `agent-lab` on local machine and
 
 ### Azure VM
 
-- Host: `agent-lab-vm` (Ubuntu 22.04, `Standard_B1s`)
+- Host: `agent-lab-vm` (Ubuntu 22.04, `Standard_D2ds_v5`)
 - Resource group: `agent-lab-rg`
 - Region: `germanywestcentral`
 - Public HTTPS host: `<vm-host>`

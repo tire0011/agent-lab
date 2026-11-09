@@ -57,7 +57,7 @@ Primary objective: learn how far the system can improve itself safely and measur
 
 - Resource group: `agent-lab-rg`
 - Region: `germanywestcentral`
-- VM: `agent-lab-vm` (`Standard_B1s`, 1 vCPU / 1 GB RAM, Ubuntu 22.04)
+- VM: `agent-lab-vm` (`Standard_D2ds_v5`, Ubuntu 22.04)
 - VM identity: system-assigned managed identity (no broad permissions currently)
 - Repo: `tire0011/agent-lab`
 - Azure OpenAI resource: `openAI-tire0011`

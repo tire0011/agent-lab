@@ -10,7 +10,7 @@
 ## Current cost-related facts
 
 - Azure OpenAI deployment in use: `gpt-4o` (`2024-05-13`, GlobalStandard).
-- Compute baseline: `Standard_B1s` VM (1 vCPU, 1 GB RAM).
+- Compute baseline: `Standard_D2ds_v5` VM.
 - V2 stores run metrics in SQLite at `/agent/state/agent.db`.
 - Estimated LLM cost is computed from token usage and `model_prices` rows valid at run time.
 - If no matching model price exists, run execution continues and estimated cost is stored as unknown/null.
@@ -47,4 +47,3 @@ Total estimated cost is the sum of both values.
 | Date (UTC) | Experiment | Model/Provider | Tokens (in/out/total) | Runtime (s) | Est. Cost | Notes |
 |---|---|---|---:|---:|---:|---|
 | TBD | TBD | TBD | TBD | TBD | TBD | Per-task numbers live in `benchmark_runs`; see `benchmarks/README.md` |
-

@@ -148,7 +148,7 @@ signature stay the same.
 
 ### 5) Infrastructure
 
-- Single low-cost VM (`Standard_B1s`) in `germanywestcentral`
+- Single VM (`Standard_D2ds_v5`) in `germanywestcentral`
 - Azure OpenAI deployment: `gpt-4o` (GlobalStandard)
 
 ### 6) Mailbox
