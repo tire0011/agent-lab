@@ -17,6 +17,21 @@ made by cutting the handover; the request still fits the run's ``n_ctx``. Feedba
 is never accumulated: only the last round's is sent. After ``MAX_PATCH_ROUNDS``
 failed rounds the run fails with the last reason and the number of rounds. Each
 round is logged as ``local_patch_round``.
+
+Subtasks (#598, ``split_tasks=True``; the production factory sets it from
+``LOCAL_TASK_SPLIT``, default on): before patching, the local model is asked for
+an ordered JSON plan of small subtasks (each one or two files, optional named
+tests). If its plan is unusable, exactly one free-tier registry model is asked
+once (:func:`free_tier_plan`); a paid model is never called and a failed call is
+not retried elsewhere. Without a usable plan of at least two subtasks the task
+runs one-shot as before. Subtasks run in order on the same working tree, each
+through the correction loop with its own prompt (its files, the diff of the
+earlier subtasks, the overall goal as cuttable context); a patch may only touch
+the subtask's files and named tests, and the named tests must pass. The first
+failing subtask stops the run: the result fails and names it, earlier subtasks'
+changes stay in the tree but never count as success. Every run logs
+``local_task_split`` (when planned) and ``local_task_split_result`` (split,
+subtasks, subtasks_succeeded, failed_subtask, success).
 """
 
 from __future__ import annotations
@@ -293,9 +308,20 @@ async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_t
                        margin_tokens: int = CONTEXT_MARGIN_TOKENS) -> PromptPlan:
     """Fit the local prompt into the server's context, or raise :class:`ContextTooSmallError`."""
     n_ctx, n_ctx_source = await discover_context_size(client)
-    count = TokenCounter(client)
-    budget = n_ctx - max_output_tokens - margin_tokens
     essential, handover = split_handover(task)
+    return await build_prompt_parts(
+        essential, handover, working_dir, client, max_output_tokens=max_output_tokens,
+        margin_tokens=margin_tokens, n_ctx=n_ctx, n_ctx_source=n_ctx_source,
+    )
+
+
+async def build_prompt_parts(essential: str, handover: str, working_dir: str, client: Any, *,
+                             max_output_tokens: int, n_ctx: int, n_ctx_source: str,
+                             margin_tokens: int = CONTEXT_MARGIN_TOKENS,
+                             counter: TokenCounter | None = None) -> PromptPlan:
+    """:func:`build_prompt` for an already split task and an already known ``n_ctx``."""
+    count = counter or TokenCounter(client)
+    budget = n_ctx - max_output_tokens - margin_tokens
     files = _named_files(essential, working_dir)
     keywords = _keywords(essential)
     names = [path for path, _ in files]
@@ -396,6 +422,152 @@ async def build_feedback_prompt(plan: PromptPlan, client: Any, *, round_no: int,
         diff_cut=bool(previous_diff) and diff != previous_diff,
         handover_tokens_kept=await count(handover) if handover else 0,
     )
+
+
+# Splitting a task into small subtasks (#598)
+
+@dataclass(frozen=True)
+class Subtask:
+    goal: str
+    files: tuple[str, ...]
+    tests: tuple[str, ...] = ()
+
+
+class PlanUnusable(ValueError):
+    """A planner's answer is not a usable ordered list of small subtasks."""
+
+
+@dataclass
+class SplitOutcome:
+    """What was logged as ``local_task_split`` / ``local_task_split_result``."""
+
+    split: bool = False
+    planner: str = ""  # "local", "free_tier" or "" (not split)
+    planner_model: str = ""
+    reason: str = ""
+    subtasks: list[Subtask] = field(default_factory=list)
+    succeeded: int = 0
+    failed_subtask: int | None = None
+    free_tier_calls: int = 0
+
+    def log_fields(self) -> dict[str, Any]:
+        return {
+            "split": self.split, "planner": self.planner, "planner_model": self.planner_model,
+            "reason": self.reason, "subtasks": len(self.subtasks),
+            "subtasks_succeeded": self.succeeded, "failed_subtask": self.failed_subtask,
+            "free_tier_calls": self.free_tier_calls,
+        }
+
+
+ENV_TASK_SPLIT = "LOCAL_TASK_SPLIT"
+MAX_SUBTASKS = 6
+MAX_SUBTASK_FILES = 2
+MAX_SUBTASK_TESTS = 3
+PLAN_MAX_TOKENS = 1024
+NAMED_TEST_TIMEOUT_SECONDS = 300.0
+_PLAN_SYSTEM_PROMPT = "You are a planning worker. Split coding tasks into small ordered steps. Answer only JSON."
+_PLAN_INSTRUCTIONS = (
+    "Split the coding task below into an ordered list of small subtasks for a small local "
+    f"model. At most {MAX_SUBTASKS} subtasks. Each subtask is one small change to one or two "
+    "files (repository-relative paths) and must leave the code compiling. A later subtask "
+    "sees the changes of the earlier ones. Name test files only if they already exist or an "
+    "earlier or the same subtask creates them.\n"
+    "Answer with JSON only, no prose, in exactly this shape:\n"
+    '{"subtasks": [{"goal": "what to change", "files": ["path/a.py"], '
+    '"tests": ["tests/test_a.py"]}]}'
+)
+_FREE_TIER_ESSENTIAL_CHARS = 12000
+_FREE_TIER_HANDOVER_CHARS = 6000
+
+
+def task_split_enabled() -> bool:
+    """``LOCAL_TASK_SPLIT`` (default on); ``0``/``false``/``off`` runs one-shot."""
+    return os.environ.get(ENV_TASK_SPLIT, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _render_plan_prompt(essential: str, names: list[str], handover: str) -> str:
+    prompt = f"{_PLAN_INSTRUCTIONS}\n\nTask:\n{essential}\n\n"
+    prompt += f"Files named in the task: {', '.join(names) if names else 'none'}\n\n"
+    if handover:
+        prompt += f"{handover}\n\n"
+    return prompt + "Return only the JSON object."
+
+
+def _relative_path(value: Any, root: Path, what: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PlanUnusable(f"{what} is not a path")
+    path = value.strip().replace("\\", "/")
+    if path.startswith("./"):
+        path = path[2:]
+    if path.startswith("/") or ".." in path.split("/") or _inside(root, path) is None:
+        raise PlanUnusable(f"{what} {value!r} is not inside the repository")
+    return path
+
+
+def parse_plan(text: str, working_dir: str) -> list[Subtask]:
+    """The ordered subtasks in a planner answer, or raise :class:`PlanUnusable`."""
+    import json
+
+    fenced = re.search(r"```(?:json)?\s*\n(.*?)```", text or "", re.DOTALL | re.IGNORECASE)
+    candidate = fenced.group(1) if fenced else (text or "")
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if start < 0 or end <= start:
+        raise PlanUnusable("no JSON object in the answer")
+    try:
+        data = json.loads(candidate[start:end + 1])
+    except ValueError as exc:
+        raise PlanUnusable(f"invalid JSON: {exc}") from exc
+    raw = data.get("subtasks") if isinstance(data, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raise PlanUnusable("no subtasks list")
+    if len(raw) > MAX_SUBTASKS:
+        raise PlanUnusable(f"{len(raw)} subtasks, at most {MAX_SUBTASKS} allowed")
+    root = Path(working_dir).resolve()
+    subtasks: list[Subtask] = []
+    for number, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise PlanUnusable(f"subtask {number} is not an object")
+        goal = item.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            raise PlanUnusable(f"subtask {number} has no goal")
+        files = item.get("files")
+        if isinstance(files, str):
+            files = [files]
+        if not isinstance(files, list) or not 1 <= len(files) <= MAX_SUBTASK_FILES:
+            raise PlanUnusable(f"subtask {number} must name 1 to {MAX_SUBTASK_FILES} files")
+        paths = tuple(dict.fromkeys(_relative_path(f, root, f"subtask {number} file") for f in files))
+        tests = item.get("tests") or []
+        if isinstance(tests, str):
+            tests = [tests]
+        if not isinstance(tests, list) or len(tests) > MAX_SUBTASK_TESTS:
+            raise PlanUnusable(f"subtask {number} names more than {MAX_SUBTASK_TESTS} tests")
+        named_tests: list[str] = []
+        for test in tests:
+            if not isinstance(test, str):
+                raise PlanUnusable(f"subtask {number} test is not a path")
+            path, _, node = test.strip().partition("::")
+            path = _relative_path(path, root, f"subtask {number} test")
+            if not path.endswith(".py"):
+                raise PlanUnusable(f"subtask {number} test {test!r} is not a .py file")
+            named_tests.append(f"{path}::{node}" if node else path)
+        subtasks.append(Subtask(goal=goal.strip()[:2000], files=paths, tests=tuple(named_tests)))
+    return subtasks
+
+
+def free_tier_plan(prompt: str, *, models: list[Any] | None = None, transport: Any | None = None) -> Any:
+    """Exactly one call to the first available free registry model, never a paid one.
+
+    Returns the :class:`modules.model_registry.ChatResult`, or ``None`` when no free
+    model is configured. A failed call is not retried on another model: the codex
+    finding on experiment 26c4f98d was a loop over paid providers.
+    """
+    from modules import model_registry
+
+    pool = models if models is not None else model_registry.load_models()
+    free = [m for m in model_registry.candidates(pool, role="planning", max_cost="free") if m.cost == "free"]
+    if not free:
+        return None
+    return model_registry.chat(free[0], prompt, max_tokens=PLAN_MAX_TOKENS, transport=transport)
 
 
 # Applying, checking and rolling back one round's patch
@@ -574,14 +746,55 @@ def _git_apply(args: list[str], working_dir: str, patch: str, timeout: float) ->
     return done.stderr.strip() or done.stdout.strip() or "unknown git apply error"
 
 
-def apply_and_check(patch: str, working_dir: str, timeout: float) -> None:
+def run_named_tests(working_dir: str, tests: list[str] | tuple[str, ...], timeout: float) -> str | None:
+    """``None`` when the named tests pass, else why not (#598).
+
+    No bytecode or pytest cache is written, so a rollback leaves the tree as it was.
+    """
+    if not tests:
+        return None
+    root = Path(working_dir).resolve()
+    for test in tests:
+        path = test.split("::", 1)[0]
+        full = _inside(root, path)
+        if full is None or not full.is_file():
+            return f"named test {test} not found"
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    limit = min(timeout, NAMED_TEST_TIMEOUT_SECONDS)
+    try:
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests],
+            cwd=working_dir, env=env, text=True, capture_output=True, timeout=limit,
+        )
+    except subprocess.TimeoutExpired:
+        return f"named tests timed out after {limit:g}s: {', '.join(tests)}"
+    if done.returncode == 0:
+        return None
+    output = (done.stdout + "\n" + done.stderr).strip()
+    return f"pytest exited {done.returncode}:\n{output[-FEEDBACK_ERROR_CHARS:]}"
+
+
+def apply_and_check(patch: str, working_dir: str, timeout: float, *,
+                    allowed_paths: set[str] | None = None,
+                    tests: list[str] | tuple[str, ...] = ()) -> None:
     """Apply *patch* and compile its ``.py`` files, or roll back and raise.
+
+    For a subtask (#598) the patch may only touch *allowed_paths*, and the named
+    *tests* must pass after it is applied.
 
     Raises :class:`_PatchRejected` after a successful rollback, and
     :class:`RollbackError` when the tree could not be restored.
     """
     if not patch:
         raise _PatchRejected("no_diff", "local model did not return a unified diff")
+    if allowed_paths is not None:
+        outside = sorted(patch_paths(patch) - allowed_paths)
+        if outside:
+            raise _PatchRejected(
+                "outside_subtask",
+                f"local model patch touches files outside this subtask: {', '.join(outside)}; "
+                f"only change {', '.join(sorted(allowed_paths))}",
+            )
     reason = _git_apply(["--check"], working_dir, patch, timeout)
     if reason is not None:
         raise _PatchRejected("does_not_apply", f"local model patch does not apply: {reason}")
@@ -598,6 +811,9 @@ def apply_and_check(patch: str, working_dir: str, timeout: float) -> None:
         reason = _compile_check(working_dir, changed_py, timeout)
         if reason is not None:
             raise _PatchRejected("compile_failed", f"local model patch breaks py_compile: {reason}")
+        reason = run_named_tests(working_dir, tests, timeout)
+        if reason is not None:
+            raise _PatchRejected("tests_failed", f"named tests fail after the patch: {reason}")
     except BaseException:
         restore_snapshot(snapshot, timeout)
         raise
@@ -606,16 +822,46 @@ def apply_and_check(patch: str, working_dir: str, timeout: float) -> None:
 class LocalCodingWorker:
     provider = PROVIDER
 
-    def __init__(self, *, client: LlamaCppClient | None = None, max_tokens: int = 4096, **_: Any) -> None:
+    def __init__(self, *, client: LlamaCppClient | None = None, max_tokens: int = 4096,
+                 split_tasks: bool = False, planner: Callable[[str], Any] | None = None,
+                 **_: Any) -> None:
         self.client = client or LlamaCppClient()
         self.max_tokens = max_tokens
+        # #598: split the task into small subtasks first. Off by default here; the
+        # production factory turns it on via ``LOCAL_TASK_SPLIT``.
+        self.split_tasks = split_tasks
+        # The one free-tier fallback call when the local split is unusable.
+        self.planner = planner or free_tier_plan
         self.last_plan: PromptPlan | None = None
+        self.last_split: SplitOutcome | None = None
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
             phase: str = "implementation", **_: Any) -> WorkerResult:
         started = time.monotonic()
         self.last_plan = None
+        # Replaced by _plan_subtasks when splitting is on and the task reaches planning.
+        self.last_split = SplitOutcome(
+            reason="not planned" if self.split_tasks else f"splitting is off ({ENV_TASK_SPLIT})",
+        )
+        result: WorkerResult | None = None
+        try:
+            result = self._run(task, working_dir, sandbox, timeout_seconds, experiment_logger, phase, started)
+            return result
+        finally:
+            # One record per run, split or not, so split vs. one-shot success can be compared.
+            split = self.last_split
+            success = bool(result and result.success)
+            self._log(
+                experiment_logger, phase, "local_task_split_result",
+                (f"Local subtasks: {split.succeeded}/{len(split.subtasks)} succeeded"
+                 + (f", subtask {split.failed_subtask} failed" if split.failed_subtask else "")
+                 if split.split else f"Local task ran one-shot ({split.reason})"),
+                warning=not success, success=success, **split.log_fields(),
+            )
+
+    def _run(self, task: str, working_dir: str, sandbox: str, timeout_seconds: float,
+             experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
         try:
             validate_worker_config(task, working_dir, sandbox)
             try:
@@ -632,6 +878,11 @@ class LocalCodingWorker:
                 f"({plan.n_ctx_source}, counted by {plan.token_source})",
                 **plan.log_fields(),
             )
+            if self.split_tasks:
+                split = self._plan_subtasks(plan, working_dir, experiment_logger, phase)
+                if split.split:
+                    return self._run_subtasks(split, plan, task, working_dir, timeout_seconds,
+                                              experiment_logger, phase, started)
             return self._correction_loop(plan, task, working_dir, timeout_seconds,
                                          experiment_logger, phase, started)
         except subprocess.TimeoutExpired:
@@ -640,25 +891,185 @@ class LocalCodingWorker:
         except Exception as exc:  # worker failures are represented, never leaked into the pipeline
             return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
 
+    # Splitting (#598)
+
+    def _plan_subtasks(self, plan: PromptPlan, working_dir: str, experiment_logger: Any | None,
+                       phase: str) -> SplitOutcome:
+        """Local model first; if its plan is unusable, exactly one free-tier call."""
+        outcome = SplitOutcome()
+        self.last_split = outcome
+        local_reason = ""
+        subtasks: list[Subtask] = []
+        unreachable = False
+        try:
+            prompt = asyncio.run(self._local_plan_prompt(plan))
+            answer = asyncio.run(self.client.complete(
+                prompt, system=_PLAN_SYSTEM_PROMPT, temperature=0.0,
+                max_tokens=min(self.max_tokens, PLAN_MAX_TOKENS),
+            ))
+            subtasks = parse_plan(answer, working_dir)
+            outcome.planner, outcome.planner_model = "local", "local"
+        except PlanUnusable as exc:  # the free-tier planner is next
+            local_reason = f"local plan unusable: {exc}"
+        except Exception as exc:
+            # The local model is down: the one-shot fails the same way, so a
+            # free-tier call would be wasted.
+            unreachable = True
+            outcome.reason = f"local planner call failed: {type(exc).__name__}: {exc}"
+        if not subtasks and not unreachable:
+            subtasks, fallback_reason = self._free_tier_subtasks(plan, working_dir, outcome)
+            if not subtasks:
+                outcome.reason = f"{local_reason}; {fallback_reason}"
+        if len(subtasks) == 1:
+            outcome.reason = f"{outcome.planner} planner returned a single subtask; running one-shot"
+            subtasks = []
+        if subtasks:
+            outcome.split = True
+            outcome.subtasks = subtasks
+            outcome.reason = local_reason
+        else:
+            outcome.planner = outcome.planner_model = ""
+        self._log(
+            experiment_logger, phase, "local_task_split",
+            (f"Task split into {len(subtasks)} subtasks by the {outcome.planner} planner"
+             if outcome.split else f"Task not split: {outcome.reason}"),
+            warning=not outcome.split, **outcome.log_fields(),
+            subtask_goals=[s.goal[:200] for s in subtasks],
+        )
+        return outcome
+
+    async def _local_plan_prompt(self, plan: PromptPlan) -> str:
+        count = plan.counter or TokenCounter(self.client)
+        budget = plan.n_ctx - min(self.max_tokens, PLAN_MAX_TOKENS) - CONTEXT_MARGIN_TOKENS
+
+        async def total(handover: str) -> int:
+            return await count(_PLAN_SYSTEM_PROMPT) + await count(
+                _render_plan_prompt(plan.essential, plan.named_files, handover))
+
+        if await total("") > budget:
+            raise PlanUnusable("the planning prompt does not fit the local context")
+        kept = await _fit_part(plan.handover, budget, total, count)
+        return _render_plan_prompt(plan.essential, plan.named_files, kept)
+
+    def _free_tier_subtasks(self, plan: PromptPlan, working_dir: str,
+                            outcome: SplitOutcome) -> tuple[list[Subtask], str]:
+        handover = plan.handover
+        if len(handover) > _FREE_TIER_HANDOVER_CHARS:
+            handover = handover[:_FREE_TIER_HANDOVER_CHARS].rstrip() + _CUT_MARKER
+        prompt = _render_plan_prompt(plan.essential[:_FREE_TIER_ESSENTIAL_CHARS], plan.named_files, handover)
+        outcome.free_tier_calls += 1
+        try:
+            answer = self.planner(prompt)
+        except Exception as exc:
+            return [], f"free-tier planner failed: {type(exc).__name__}: {exc}"
+        if answer is None:
+            outcome.free_tier_calls -= 1  # no free model configured: nothing was called
+            return [], "no free-tier planner configured"
+        if getattr(answer, "cost", "free") not in ("free", "local"):
+            return [], f"planner answered from a {answer.cost} model; refused"
+        if not getattr(answer, "success", True):
+            return [], f"free-tier planner failed: {getattr(answer, 'error', 'unknown')}"
+        content = answer if isinstance(answer, str) else getattr(answer, "content", "")
+        try:
+            subtasks = parse_plan(content, working_dir)
+        except PlanUnusable as exc:
+            return [], f"free-tier plan unusable: {exc}"
+        outcome.planner = "free_tier"
+        outcome.planner_model = str(getattr(answer, "model_id", "") or "free_tier")
+        return subtasks, ""
+
+    def _run_subtasks(self, split: SplitOutcome, plan: PromptPlan, task: str, working_dir: str,
+                      timeout: float, experiment_logger: Any | None, phase: str,
+                      started: float) -> WorkerResult:
+        """Each subtask on the same tree, seeing the earlier diffs; stop at the first failure."""
+        total = len(split.subtasks)
+        applied: list[str] = []
+        outputs: list[str] = []
+        for number, subtask in enumerate(split.subtasks, start=1):
+            label = f"subtask {number}/{total}"
+            self._log(experiment_logger, phase, "local_subtask_started",
+                      f"Local {label}: {subtask.goal[:200]}", subtask=number, subtasks=total,
+                      files=list(subtask.files), tests=list(subtask.tests))
+            try:
+                sub_plan = asyncio.run(self._subtask_plan(plan, subtask, number, total, applied, working_dir))
+            except ContextTooSmallError as exc:
+                ok, output, reason = False, "", f"subtask prompt does not fit: {exc}"
+            else:
+                ok, output, reason = self._patch_rounds(
+                    sub_plan, working_dir, timeout, experiment_logger, phase,
+                    allowed_paths=set(subtask.files) | {t.split("::", 1)[0] for t in subtask.tests},
+                    tests=subtask.tests, subtask=number,
+                )
+            self._log(experiment_logger, phase, "local_subtask_finished",
+                      f"Local {label}: {'applied' if ok else 'failed'}" + (f" ({reason[:300]})" if reason else ""),
+                      warning=not ok, subtask=number, subtasks=total, success=ok, reason=reason)
+            if not ok:
+                split.failed_subtask = number
+                kept = (f"; the changes of subtasks 1-{number - 1} stay in the working tree "
+                        "but the task is not done") if number > 1 else ""
+                return self._result(
+                    task, working_dir, "",
+                    f"local {label} failed ({subtask.goal[:200]}): {reason}{kept}",
+                    started, success=False, exit_code=1,
+                )
+            split.succeeded += 1
+            applied.append(_extract_diff(output))
+            outputs.append(output)
+        return self._result(task, working_dir, "\n".join(outputs), None, started, success=True, exit_code=0)
+
+    async def _subtask_plan(self, plan: PromptPlan, subtask: Subtask, number: int, total: int,
+                            applied: list[str], working_dir: str) -> PromptPlan:
+        tests = ", ".join(subtask.tests) if subtask.tests else "none named"
+        essential = (
+            f"Subtask {number} of {total} of a larger task. Make only this change now; "
+            "the other subtasks do the rest.\n"
+            f"Subtask: {subtask.goal}\n"
+            f"Files to change (only these): {', '.join(subtask.files)}\n"
+            f"Tests that must pass afterwards: {tests}"
+        )
+        earlier = "".join(applied).strip() or "(none yet)"
+        context = (
+            f"Changes already made by the earlier subtasks (git diff, already applied):\n{earlier}\n\n"
+            f"Overall task (context only; do not do the other subtasks):\n{plan.essential}"
+        )
+        return await build_prompt_parts(
+            essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
+            n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
+        )
+
+    # The correction loop (#597)
+
     def _correction_loop(self, plan: PromptPlan, task: str, working_dir: str, timeout: float,
                          experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
+        ok, output, reason = self._patch_rounds(plan, working_dir, timeout, experiment_logger, phase)
+        if ok:
+            return self._result(task, working_dir, output, None, started, success=True, exit_code=0)
+        return self._result(task, working_dir, "", reason, started, success=False, exit_code=1)
+
+    def _patch_rounds(self, plan: PromptPlan, working_dir: str, timeout: float,
+                      experiment_logger: Any | None, phase: str, *,
+                      allowed_paths: set[str] | None = None, tests: tuple[str, ...] = (),
+                      subtask: int | None = None) -> tuple[bool, str, str]:
+        """``(applied, model output, failure reason)`` after at most ``MAX_PATCH_ROUNDS``."""
         reason = ""
         previous_diff = ""
+        tag: dict[str, Any] = {"subtask": subtask} if subtask is not None else {}
         for round_no in range(1, MAX_PATCH_ROUNDS + 1):
-            prompt, extra = plan.prompt, {"prompt_tokens": plan.prompt_tokens}
+            prompt, extra = plan.prompt, {"prompt_tokens": plan.prompt_tokens, **tag}
             if round_no > 1:
                 fb = asyncio.run(build_feedback_prompt(
                     plan, self.client, round_no=round_no, error=reason, previous_diff=previous_diff,
                 ))
                 prompt = fb.prompt
                 extra = {"prompt_tokens": fb.prompt_tokens, "feedback_error_chars": fb.error_chars,
-                         "feedback_diff_cut": fb.diff_cut, "handover_tokens_kept": fb.handover_tokens_kept}
+                         "feedback_diff_cut": fb.diff_cut, "handover_tokens_kept": fb.handover_tokens_kept,
+                         **tag}
             output = asyncio.run(self.client.complete(
                 prompt, system=_SYSTEM_PROMPT, temperature=0.0, max_tokens=self.max_tokens,
             ))
             patch = _extract_diff(output)
             try:
-                apply_and_check(patch, working_dir, timeout)
+                apply_and_check(patch, working_dir, timeout, allowed_paths=allowed_paths, tests=tests)
             except _PatchRejected as exc:
                 reason = exc.reason
                 previous_diff = patch or output.strip()
@@ -667,18 +1078,14 @@ class LocalCodingWorker:
             except RollbackError as exc:
                 reason = f"local model patch rollback failed in round {round_no}: {exc}"
                 self._log_round(experiment_logger, phase, round_no, "rollback_failed", reason, **extra)
-                return self._result(task, working_dir, "", reason, started, success=False, exit_code=1)
+                return False, "", reason
             except subprocess.TimeoutExpired:
                 self._log_round(experiment_logger, phase, round_no, "timed_out",
                                 "local model patch application timed out", **extra)
                 raise
             self._log_round(experiment_logger, phase, round_no, "applied", "", **extra)
-            return self._result(task, working_dir, output, None, started, success=True, exit_code=0)
-        return self._result(
-            task, working_dir, "",
-            f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}",
-            started, success=False, exit_code=1,
-        )
+            return True, output, ""
+        return False, "", f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}"
 
     def _log_round(self, experiment_logger: Any | None, phase: str, round_no: int, outcome: str,
                    reason: str, **fields: Any) -> None:
