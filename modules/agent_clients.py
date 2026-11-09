@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 from agents.mcp import MCPServerStdio
 
 from modules.env import get_required_env
+from modules.github_mcp import SERVER_NAME as GITHUB_SERVER_NAME, GitHubMcpConfig
 
 
 def build_openai_client() -> AsyncOpenAI:
@@ -34,4 +35,20 @@ def build_filesystem_server() -> MCPServerStdio:
         name="filesystem",
         params={"command": command, "args": args},
         cache_tools_list=True,
+    )
+
+
+def build_github_server(config: GitHubMcpConfig | None = None) -> MCPServerStdio | None:
+    """The official GitHub MCP server (#41), or ``None`` when it is not configured.
+
+    ``None`` keeps the agent working without GitHub instead of failing to start.
+    """
+    config = config or GitHubMcpConfig.from_env()
+    if not config.configured:
+        return None
+    return MCPServerStdio(
+        name=GITHUB_SERVER_NAME,
+        params=config.stdio_params(),
+        cache_tools_list=True,
+        client_session_timeout_seconds=config.timeout_seconds,
     )

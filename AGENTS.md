@@ -40,6 +40,10 @@ Primary objective: learn how far the system can improve itself safely and measur
   - Nexus chooses the action; `new_experiment` runs in a background daemon thread
   - State machine: `queued → submitted → running → succeeded/failed/needs_review`
   - Legacy `pending_approval`/`rejected` records stay readable and are never run
+- GitHub MCP integration (#41): `modules/github_mcp.py` runs the official
+  `github-mcp-server` over stdio; controller operations `github_mcp_tools` /
+  `github_mcp_call`. GitHub Issues are the durable todo/problem list
+  (`docs/github-mcp.md`).
 - FastAPI + nginx are running on VM with HTTPS and Let's Encrypt.
 - Azure OpenAI API connectivity has been tested successfully.
 

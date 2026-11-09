@@ -225,6 +225,17 @@ CLI runner):
   fails before an experiment starts.
 - Run tests: `AGENT_API_KEY=test-key .venv/bin/python -m unittest discover -s tests -q`
 
+## GitHub MCP server
+
+Nexus works with GitHub Issues, pull requests and commits through the official
+`github/github-mcp-server` over stdio (#41). The controller gets two
+operations: `github_mcp_tools` and `github_mcp_call(tool, arguments)`.
+`agent.py` adds the server next to the filesystem server. It needs the
+`github-mcp-server` binary and `GITHUB_PERSONAL_ACCESS_TOKEN` (or
+`GITHUB_TOKEN`). GitHub Issues are the durable list for Nexus todos and
+problems. Setup, variables and the one-time migration
+(`scripts/migrate_work_items_to_github.py`) are in `docs/github-mcp.md`.
+
 ## MCP endpoint quick start
 
 The FastAPI service also mounts a read-only MCP HTTP endpoint for Nexus at
