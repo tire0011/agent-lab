@@ -40,12 +40,19 @@ MACHINE_REBOOT_COMMAND = ("sudo", "-n", "systemd-run", "--collect", "--on-active
 # Experiment statuses that a reboot would interrupt. Queued work has not
 # started and remains durable across a reboot, so it must not prevent one.
 _ACTIVE_EXPERIMENT_STATUSES = ("selecting", "implementing", "verifying")
+_GITHUB_MCP_MAX_LINES = 400
 
 
 def _default_github_work_tracking_factory(*, db_path: str, repo_root: str) -> Any:
     from modules.github_work_tracking import GitHubWorkTrackingService
 
     return GitHubWorkTrackingService(db_path=db_path, repo_root=repo_root)
+
+
+def _default_github_mcp_config() -> Any:
+    from modules.github_mcp import GitHubMcpConfig
+
+    return GitHubMcpConfig.from_env()
 
 
 # Re-exported, not redefined: these live in a leaf module so
@@ -82,6 +89,7 @@ class OperationsRegistry:
         subprocess_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         meminfo_path: str = "/proc/meminfo",
         github_work_tracking_factory: Callable[..., Any] | None = None,
+        github_mcp_config_factory: Callable[[], Any] | None = None,
     ) -> None:
         self.experiment_service = experiment_service
         self.db_path = db_path
@@ -96,6 +104,9 @@ class OperationsRegistry:
         self.github_work_tracking_factory = (
             github_work_tracking_factory or _default_github_work_tracking_factory
         )
+        # #41: read from the environment per call, so a changed token or
+        # server path takes effect without a restart.
+        self.github_mcp_config_factory = github_mcp_config_factory or _default_github_mcp_config
         conn = init_db(db_path)
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -375,6 +386,34 @@ class OperationsRegistry:
                     "specification", "acceptance criteria", "task",
                 ],
                 mutates_state=False,
+            ),
+            "github_mcp_tools": OperationSpec(
+                "github_mcp_tools",
+                "Die Tools des offiziellen GitHub-MCP-Servers auflisten (Name und Kurzbeschreibung), "
+                "z. B. list_issues, issue_read, issue_write, add_issue_comment, list_commits (#41).",
+                tags=["github", "mcp", "tools", "catalog", "issues", "commits", "repository"],
+                mutates_state=False,
+            ),
+            "github_mcp_call": OperationSpec(
+                "github_mcp_call",
+                "Ein Tool des offiziellen GitHub-MCP-Servers aufrufen: Issues auflisten, lesen, "
+                "anlegen, kommentieren, aktualisieren und schließen, Commits und Repository-Inhalte "
+                "lesen. Standard-Repository: GITHUB_REPOSITORY (tire0011/agent-lab) (#41).",
+                [
+                    OperationArgSpec("tool", "string", "Name des GitHub-MCP-Tools, z. B. list_issues.", required=True),
+                    OperationArgSpec(
+                        "arguments",
+                        "string",
+                        'Tool-Argumente als JSON-Objekt, z. B. {"owner": "tire0011", "repo": "agent-lab", "state": "OPEN"}.',
+                        default="{}",
+                    ),
+                ],
+                [
+                    "github", "mcp", "issue", "issues", "create issue", "comment", "close issue",
+                    "update issue", "list issues", "commits", "repository", "pull request", "todo", "problem",
+                ],
+                mutates_state=True,
+                controller_allowed=True,
             ),
             "problems_list": OperationSpec("problems_list", "Liste der letzten Probleme.", [limit20, since_timestamp], tags=["problems", "errors", "failures", "issues"], mutates_state=False),
             "web_research": OperationSpec(
@@ -1159,6 +1198,69 @@ class OperationsRegistry:
                     close()
                 except Exception:  # noqa: BLE001
                     logger.warning("github_status: could not close tracking service", exc_info=True)
+
+    def _op_github_mcp_tools(self, args: dict[str, Any]) -> OperationResult:
+        if args:
+            raise OperationValidationError("github_mcp_tools akzeptiert keine Argumente.")
+        from modules import github_mcp
+
+        started = time.perf_counter()
+        tools = github_mcp.list_tools(self.github_mcp_config_factory())
+        lines = []
+        for tool in sorted(tools, key=lambda item: item.name):
+            description = (getattr(tool, "description", "") or "").strip().splitlines()
+            lines.append(f"{tool.name}: {description[0][:160] if description else ''}".rstrip(": "))
+        return OperationResult(
+            operation="github_mcp_tools",
+            success=True,
+            output_lines=lines[:300],
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            metrics={"tool_count": len(tools)},
+        )
+
+    def _op_github_mcp_call(self, args: dict[str, Any]) -> OperationResult:
+        unexpected = sorted(set(args) - {"tool", "arguments"})
+        if unexpected:
+            raise OperationValidationError(
+                f"github_mcp_call kennt diese Argumente nicht: {', '.join(unexpected)}"
+            )
+        tool = args.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise OperationValidationError("tool muss ein nicht leerer Tool-Name sein.")
+        raw_arguments = args.get("arguments")
+        if raw_arguments is None or raw_arguments == "":
+            arguments: Any = {}
+        elif isinstance(raw_arguments, dict):
+            arguments = raw_arguments
+        elif isinstance(raw_arguments, str):
+            try:
+                arguments = json.loads(raw_arguments)
+            except ValueError as exc:
+                raise OperationValidationError("arguments muss ein JSON-Objekt sein.") from exc
+        else:
+            arguments = None
+        if not isinstance(arguments, dict):
+            raise OperationValidationError("arguments muss ein JSON-Objekt sein.")
+        from modules import github_mcp
+
+        started = time.perf_counter()
+        result = github_mcp.call_tool(tool.strip(), arguments, self.github_mcp_config_factory())
+        decoded = result.json()
+        text = (
+            json.dumps(decoded, ensure_ascii=False, indent=1)
+            if decoded is not None
+            else result.text
+        )
+        # Head, not tail: a JSON listing starts with what matters.
+        lines = [redact(line)[:500] for line in text.splitlines()[:_GITHUB_MCP_MAX_LINES]]
+        return OperationResult(
+            operation="github_mcp_call",
+            success=not result.is_error,
+            output_lines=lines,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            error_summary=sanitized_reason(result.text[:500]) if result.is_error else None,
+            metrics={"tool": tool.strip()},
+        )
 
     def _op_github_issue(self, args: dict[str, Any]) -> OperationResult:
         unexpected = sorted(set(args) - {"issue_number"})
