@@ -933,7 +933,7 @@ class PipelineCrashAttemptsTests(unittest.TestCase):
 
 
 class GateChangeRequeueTests(unittest.TestCase):
-    """#511: changed quality policy gets one fresh, retry-free verification."""
+    """#511: a changed quality gate earns one fresh, retry-free verification."""
 
     def setUp(self):
         self.fx = InitiativeFixture()
@@ -959,8 +959,13 @@ class GateChangeRequeueTests(unittest.TestCase):
                     "INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES (?, ?)",
                     (exp_id, number),
                 )
+        patcher = patch("modules.nexus_initiative.gate_recheck", side_effect=lambda _s: self._results())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def _results(self):
+    @staticmethod
+    def _results():
+        # Fake gate_recheck store answer: only #1 is a newly passing quality stop.
         return [
             {"id": "quality-pass", "issue_number": 1,
              "old_reason": "quality evaluation: nur Tests geändert", "new_verdict": "would_pass"},
@@ -970,18 +975,21 @@ class GateChangeRequeueTests(unittest.TestCase):
              "old_reason": "review rejected the change", "new_verdict": "would_pass"},
         ]
 
-    def test_only_newly_passing_quality_stop_is_requeued_once_without_attempt(self):
+    def _creating_controller(self, *, fail=False):
         fx = self.fx
 
         class CreatingController(RecordingController):
             def handle_issue(self, number, *, title, body):
                 super().handle_issue(number, title=title, body=body)
-                exp_id = f"fresh-{number}"
+                if fail:
+                    raise RuntimeError("controller unavailable")
+                exp_id = f"fresh-{number}-{len(self.issues)}"
                 with sqlite3.connect(fx.db_path) as conn:
                     conn.execute(
                         "INSERT INTO experiments (id, goal, status, created_at, error) "
                         "VALUES (?, ?, 'queued', ?, NULL)",
-                        (exp_id, f"GitHub Issue #{number}: {title}", datetime.now(timezone.utc).isoformat()),
+                        (exp_id, f"GitHub Issue #{number}: {title}",
+                         datetime.now(timezone.utc).isoformat()),
                     )
                     conn.execute(
                         "INSERT INTO github_experiment_links (experiment_id, issue_number) VALUES (?, ?)",
@@ -990,32 +998,82 @@ class GateChangeRequeueTests(unittest.TestCase):
 
         controller = CreatingController()
         fx.controller = controller
-        svc = fx.service(issue_lister=lambda: self.issues)
+        return controller
+
+    def _finish(self, exp_id, status="failed"):
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                "UPDATE experiments SET status=?, ended_at=?, error='quality evaluation: x' WHERE id=?",
+                (status, datetime.now(timezone.utc).isoformat(), exp_id),
+            )
+
+    def _rows(self, sql, *args):
+        with sqlite3.connect(self.fx.db_path) as conn:
+            return conn.execute(sql, args).fetchall()
+
+    def test_only_newly_passing_quality_stop_is_requeued_once_without_attempt(self):
+        controller = self._creating_controller()
+        svc = self.fx.service(issue_lister=lambda: self.issues)
         self.addCleanup(svc.close)
-        with patch("modules.nexus_initiative.gate_recheck", return_value=self._results()):
-            first = svc.tick()
-            self.assertEqual(first.candidate.ref, "1")
-            self.assertEqual(controller.issues, [1])
-            with sqlite3.connect(fx.db_path) as conn:
-                linked = conn.execute(
-                    "SELECT rechecked_experiment_id FROM experiments WHERE id='fresh-1'"
-                ).fetchone()[0]
-                event = conn.execute(
-                    "SELECT event, message FROM activity_log WHERE entity_id='fresh-1'"
-                ).fetchone()
-            self.assertEqual(linked, "quality-pass")
-            self.assertEqual(event[0], "gate_recheck_requeued")
-            self.assertIn("quality-pass", event[1])
-            self.assertEqual(svc.tick().decision, "busy")
-            self.assertEqual(controller.issues, [1])
-            with sqlite3.connect(fx.db_path) as conn:
-                conn.execute(
-                    "UPDATE experiments SET status='failed', ended_at=? WHERE id='fresh-1'",
-                    (datetime.now(timezone.utc).isoformat(),),
-                )
-            # Two stored failures would normally exhaust the issue. The gate
-            # recheck run is free, so the ordinary attempt count remains one.
-            self.assertNotIn(1, svc._issue_attempts()[0])
+
+        self.assertEqual([c.ref for c in svc._gate_recheck_candidates()], ["1"])
+        blocked_before, exhausted_before = svc._issue_attempts()
+
+        first = svc.tick()
+        self.assertEqual(first.decision, "dispatched")
+        self.assertEqual(first.candidate.ref, "1")
+        self.assertEqual(first.candidate.reason, nexus_initiative.GATE_RECHECK_REASON)
+        self.assertEqual(controller.issues, [1])
+        self.assertEqual(
+            self._rows("SELECT id FROM experiments WHERE rechecked_experiment_id='quality-pass'"),
+            [("fresh-1-1",)],
+        )
+        self.assertEqual(
+            self._rows("SELECT source_experiment_id, experiment_id FROM nexus_gate_rechecks"),
+            [("quality-pass", "fresh-1-1")],
+        )
+        events = self._rows("SELECT entity_id, event, message FROM activity_log ORDER BY id")
+        self.assertIn("gate_recheck_claimed", [e[1] for e in events if e[0] == "quality-pass"])
+        requeued = [e for e in events if e[0] == "fresh-1-1" and e[1] == "gate_recheck_requeued"]
+        self.assertEqual(len(requeued), 1)
+        self.assertIn("quality-pass", requeued[0][2])
+
+        # The fresh run ends. A second stored stop would normally exhaust the
+        # issue (two attempts); the gate-recheck run is free.
+        self._finish("fresh-1-1")
+        blocked_after, exhausted_after = svc._issue_attempts()
+        self.assertNotIn(1, blocked_after)
+        self.assertNotIn(1, exhausted_after)
+        self.assertEqual(1 in blocked_before, 1 in blocked_after)
+        self.assertEqual(exhausted_before, exhausted_after)
+
+        # Idempotent: the same stored experiment is never re-queued again.
+        self.assertEqual(svc._gate_recheck_candidates(), [])
+        second = svc.tick()
+        if second.candidate is not None:
+            self.assertNotEqual(second.candidate.reason, nexus_initiative.GATE_RECHECK_REASON)
+        self.assertEqual(len(self._rows("SELECT 1 FROM nexus_gate_rechecks")), 1)
+        self.assertEqual(
+            self._rows("SELECT COUNT(*) FROM experiments WHERE rechecked_experiment_id IS NOT NULL"),
+            [(1,)],
+        )
+
+    def test_failed_dispatch_still_consumes_the_source(self):
+        controller = self._creating_controller(fail=True)
+        svc = self.fx.service(issue_lister=lambda: self.issues)
+        self.addCleanup(svc.close)
+
+        first = svc.tick()
+        self.assertEqual(first.decision, "error")
+        self.assertEqual(controller.issues, [1])
+        self.assertEqual(
+            self._rows("SELECT source_experiment_id, experiment_id FROM nexus_gate_rechecks"),
+            [("quality-pass", None)],
+        )
+        # The claim was written before the dispatch, so nothing re-queues it.
+        self.assertEqual(svc._gate_recheck_candidates(), [])
+        with self.assertRaises(RuntimeError):
+            svc._claim_gate_recheck("quality-pass", 1, datetime.now(timezone.utc).isoformat())
 
     def test_existing_running_experiment_prevents_requeue(self):
         with sqlite3.connect(self.fx.db_path) as conn:
@@ -1031,9 +1089,11 @@ class GateChangeRequeueTests(unittest.TestCase):
         self.fx.controller = controller
         svc = self.fx.service(issue_lister=lambda: self.issues)
         self.addCleanup(svc.close)
-        with patch("modules.nexus_initiative.gate_recheck", return_value=self._results()):
-            self.assertEqual(svc.tick().decision, "busy")
+        # #418 filter itself, independent of the global busy gate.
+        self.assertEqual(svc._gate_recheck_candidates(), [])
+        self.assertEqual(svc.tick().decision, "busy")
         self.assertEqual(controller.issues, [])
+        self.assertEqual(self._rows("SELECT 1 FROM nexus_gate_rechecks"), [])
 
 
 if __name__ == "__main__":

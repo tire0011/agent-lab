@@ -303,6 +303,19 @@ class NexusInitiativeService:
                     )
             except sqlite3.OperationalError:
                 pass
+            # #511: one row per needs_review experiment that a gate change
+            # re-queued. Written *before* the dispatch, so a failed or crashed
+            # dispatch still consumes the source and it is re-queued at most once.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS nexus_gate_rechecks (
+                    source_experiment_id TEXT PRIMARY KEY,
+                    issue_number INTEGER NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    experiment_id TEXT NULL
+                )
+                """
+            )
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_initiative_created
@@ -645,6 +658,9 @@ class NexusInitiativeService:
             # The source can be linked only once, and #418 forbids starting
             # beside any active experiment for this issue.
             already = self._conn.execute(
+                "SELECT 1 FROM nexus_gate_rechecks WHERE source_experiment_id = ? LIMIT 1",
+                (source_id,),
+            ).fetchone() or self._conn.execute(
                 "SELECT 1 FROM experiments WHERE rechecked_experiment_id = ? LIMIT 1",
                 (source_id,),
             ).fetchone()
@@ -1519,40 +1535,79 @@ class NexusInitiativeService:
         if self.controller is None:
             raise RuntimeError("no controller configured")
         if candidate.kind == KIND_ISSUE:
-            self._announce_plan(candidate)
+            source_id = str(candidate.payload.get("rechecked_experiment_id") or "")
             started_at = _utcnow().isoformat()
+            if source_id:
+                # Claim first: whatever happens to the dispatch below, this
+                # stored experiment is never re-queued again (#511).
+                self._claim_gate_recheck(source_id, int(candidate.ref), started_at)
+            self._announce_plan(candidate)
             self.controller.handle_issue(
                 int(candidate.ref),
                 title=candidate.title,
                 body=str(candidate.payload.get("body") or "") + self._earlier_attempts(int(candidate.ref)),
             )
-            source_id = candidate.payload.get("rechecked_experiment_id")
             if source_id:
-                row = self._conn.execute(
-                    """
-                    SELECT e.id FROM experiments e JOIN github_experiment_links l ON l.experiment_id=e.id
-                    WHERE l.issue_number=? AND e.created_at>=? AND e.id != ?
-                    ORDER BY e.created_at DESC, e.id DESC LIMIT 1
-                    """,
-                    (int(candidate.ref), started_at, str(source_id)),
-                ).fetchone()
-                if row is None:
-                    raise RuntimeError("gate recheck dispatch did not create an experiment")
-                with self._conn:
-                    self._conn.execute(
-                        "UPDATE experiments SET rechecked_experiment_id=? WHERE id=?",
-                        (str(source_id), str(row["id"])),
-                    )
-                    insert_activity(
-                        self._conn, timestamp=_utcnow().isoformat(), entity_type="experiment",
-                        entity_id=str(row["id"]), event="gate_recheck_requeued",
-                        message=f"rechecked_experiment_id={source_id}",
-                    )
+                self._link_gate_recheck(source_id, int(candidate.ref), started_at)
             return
         if candidate.kind == KIND_IDEA:
             self.controller.handle_idea(candidate.ref)
             return
         raise RuntimeError(f"unknown candidate kind {candidate.kind!r}")
+
+    def _claim_gate_recheck(self, source_id: str, issue_number: int, claimed_at: str) -> None:
+        """Durably mark ``source_id`` as re-queued, before anything is dispatched."""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO nexus_gate_rechecks "
+                    "(source_experiment_id, issue_number, claimed_at) VALUES (?, ?, ?)",
+                    (source_id, issue_number, claimed_at),
+                )
+                insert_activity(
+                    self._conn, timestamp=claimed_at, entity_type="experiment",
+                    entity_id=source_id, event="gate_recheck_claimed",
+                    message=f"issue=#{issue_number}; {GATE_RECHECK_REASON}",
+                )
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError(
+                f"experiment {source_id} was already re-queued after a gate change"
+            ) from exc
+
+    def _link_gate_recheck(self, source_id: str, issue_number: int, started_at: str) -> None:
+        """Record the rechecked source on the experiment the dispatch created."""
+        row = self._conn.execute(
+            """
+            SELECT e.id FROM experiments e JOIN github_experiment_links l ON l.experiment_id=e.id
+            WHERE l.issue_number=? AND e.created_at>=? AND e.id != ?
+              AND e.rechecked_experiment_id IS NULL
+            ORDER BY e.created_at DESC, e.id DESC LIMIT 1
+            """,
+            (issue_number, started_at, source_id),
+        ).fetchone()
+        if row is None:
+            # The claim stays: the source is consumed even though nothing ran.
+            with self._conn:
+                insert_activity(
+                    self._conn, timestamp=_utcnow().isoformat(), entity_type="experiment",
+                    entity_id=source_id, event="gate_recheck_not_started",
+                    message=f"issue=#{issue_number}; the dispatch created no experiment",
+                )
+            raise RuntimeError("gate recheck dispatch did not create an experiment")
+        new_id = str(row["id"])
+        with self._conn:
+            self._conn.execute(
+                "UPDATE experiments SET rechecked_experiment_id=? WHERE id=?", (source_id, new_id)
+            )
+            self._conn.execute(
+                "UPDATE nexus_gate_rechecks SET experiment_id=? WHERE source_experiment_id=?",
+                (new_id, source_id),
+            )
+            insert_activity(
+                self._conn, timestamp=_utcnow().isoformat(), entity_type="experiment",
+                entity_id=new_id, event="gate_recheck_requeued",
+                message=f"rechecked_experiment_id={source_id}",
+            )
 
     def _announce_plan(self, candidate: Candidate) -> None:
         """Say on GitHub why this issue is next, and open a suggested one (#354).
