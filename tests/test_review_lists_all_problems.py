@@ -34,5 +34,21 @@ class ReviewListsAllProblemsTests(unittest.TestCase):
         self.assertEqual(parse_review('{"verdict": "block", "summary": "bug in x"}'), ("block", "bug in x"))
 
 
+class FullReasonIsKeptTests(unittest.TestCase):
+    def test_a_long_review_reason_is_stored_whole(self):
+        # It was cut at 500 chars, so the retry saw only half a finding.
+        from unittest.mock import MagicMock
+
+        from modules.experiment_adoption_service import ExperimentAdoptionService
+
+        service = ExperimentAdoptionService.__new__(ExperimentAdoptionService)
+        service._set_status = MagicMock()
+        service._report_issue_progress = MagicMock()
+        service.get = MagicMock()
+        reason = "Review by codex blocked the merge: " + "x" * 2000 + " (2) the last problem"
+        service._finish_failure("exp", reason=reason)
+        self.assertTrue(service._set_status.call_args.kwargs["reason"].endswith("(2) the last problem"))
+
+
 if __name__ == "__main__":
     unittest.main()

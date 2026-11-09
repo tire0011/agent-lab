@@ -14,6 +14,9 @@ from modules.experiment_service import (
 from modules.github_work_tracking import LIFECYCLE_READINESS_MESSAGE
 from modules.redaction import sanitized_reason
 
+# A blocking review lists every problem (#611); the retry needs all of them.
+_REASON_CHARS = 4000
+
 from modules.experiment_adoption_parts.core import (
     ExperimentAdoption,
     REVIEW_BLOCKER_GITHUB_LIFECYCLE,
@@ -232,12 +235,12 @@ class FailureMixin:
             actual_files_json=json.dumps(_safe_list(actual_files)),
             test_exit_code=test_exit_code,
             test_output=_truncate_text(test_output, 32 * 1024, label="test output"),
-            reason=sanitized_reason(reason),
+            reason=sanitized_reason(reason, max_chars=_REASON_CHARS),
             diagnostic_worktree_path=diagnostic_worktree_path,
             updated_at=_utcnow_iso(),
         )
         self._report_issue_progress(
-            experiment_id, "failed", f"Reason: {sanitized_reason(reason)}"
+            experiment_id, "failed", f"Reason: {sanitized_reason(reason, max_chars=_REASON_CHARS)}"
         )
         return self.get(experiment_id)
 
@@ -280,11 +283,11 @@ class FailureMixin:
             actual_files_json=json.dumps(_safe_list(actual_files)),
             test_exit_code=test_exit_code,
             test_output=_truncate_text(test_output, 32 * 1024, label="test output"),
-            reason=sanitized_reason(reason),
+            reason=sanitized_reason(reason, max_chars=_REASON_CHARS),
             diagnostic_worktree_path=diagnostic_worktree_path,
             updated_at=_utcnow_iso(),
         )
         self._report_issue_progress(
-            experiment_id, "needs_review", f"Reason: {sanitized_reason(reason)}"
+            experiment_id, "needs_review", f"Reason: {sanitized_reason(reason, max_chars=_REASON_CHARS)}"
         )
         return self.get(experiment_id)
