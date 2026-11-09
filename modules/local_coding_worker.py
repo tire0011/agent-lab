@@ -912,7 +912,12 @@ class LocalCodingWorker:
             ))
             subtasks = parse_plan(answer, working_dir)
             outcome.planner, outcome.planner_model = "local", "local"
+            if len(subtasks) == 1:
+                # One subtask is no split: as unusable as a broken plan.
+                raise PlanUnusable("a single subtask is not a split")
         except PlanUnusable as exc:  # the free-tier planner is next
+            subtasks = []
+            outcome.planner = outcome.planner_model = ""
             local_reason = f"local plan unusable: {exc}"
         except Exception as exc:
             # The local model is down: the one-shot fails the same way, so a

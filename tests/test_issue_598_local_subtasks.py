@@ -239,11 +239,27 @@ class Issue598SubtaskTests(unittest.TestCase):
         planner.assert_not_called()
         self.assertIn("local planner call failed", log.last("local_task_split")["reason"])
 
-    def test_single_subtask_plan_runs_one_shot(self):
-        server = _Server(_plan({"goal": "all of it", "files": ["value.txt"]}), [_ONE_SHOT])
-        _worker, result, log = self._run(server)
+    def test_single_local_subtask_falls_back_to_one_free_tier_call(self):
+        # Review of 8d81f164: one subtask is no split, so it is unusable too.
+        free_plan = _plan({"goal": "first", "files": ["value.txt"]}, {"goal": "second", "files": ["value.txt"]})
+        transport = _Transport(free_plan)
+        planner = functools.partial(free_tier_plan, models=[_PAID, _FREE], transport=transport)
+        server = _Server(_plan({"goal": "all of it", "files": ["value.txt"]}), [_STEP1, _STEP2])
+        _worker, result, log = self._run(server, planner=planner)
         self.assertTrue(result.success, result.error)
-        self.assertNotIn("Subtask 1 of", server.patch_calls[0])
+        self.assertEqual(["https://free.example/v1/chat/completions"], transport.urls)
+        split = log.last("local_task_split")
+        self.assertEqual(("free_tier", 1), (split["planner"], split["free_tier_calls"]))
+        self.assertIn("single subtask", split["reason"])
+
+    def test_single_subtask_from_both_planners_runs_one_shot(self):
+        single = _plan({"goal": "all of it", "files": ["value.txt"]})
+        transport = _Transport(single)
+        planner = functools.partial(free_tier_plan, models=[_FREE], transport=transport)
+        server = _Server(single, [_ONE_SHOT])
+        _worker, result, log = self._run(server, planner=planner)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(1, len(transport.urls))
         self.assertFalse(log.last("local_task_split")["split"])
 
     def test_named_tests_must_pass_and_a_failing_round_is_rolled_back(self):
