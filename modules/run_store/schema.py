@@ -154,6 +154,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             complexity TEXT NULL,
             source_type TEXT NULL,
             source_id TEXT NULL,
+            rechecked_experiment_id TEXT NULL,
             implementation_started_at TEXT NULL,
             implementation_ended_at TEXT NULL,
             ended_at TEXT NULL,
@@ -277,6 +278,10 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         """
     )
     _migrate_experiments_columns(conn)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_experiments_rechecked_once "
+        "ON experiments(rechecked_experiment_id) WHERE rechecked_experiment_id IS NOT NULL"
+    )
     _migrate_codex_tasks_columns(conn)
     _migrate_mailbox_messages_task_body(conn)
     _migrate_mailbox_messages_chain_columns(conn)
@@ -315,6 +320,7 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("complexity", "TEXT"),
     ("source_type", "TEXT"),
     ("source_id", "TEXT"),
+    ("rechecked_experiment_id", "TEXT"),
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
     ("base_commit_sha", "TEXT"),

@@ -22,6 +22,7 @@ from modules import github_authorization
 from modules import issue_approvals
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
+from modules.experiment_service import gate_recheck
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
 from modules.nexus_planner import PROPOSAL_LABEL
 from modules.nexus_sources import issue_source
@@ -57,6 +58,7 @@ _LOCAL_ONLY = "local_only"
 REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findings"
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
+GATE_RECHECK_REASON = "a changed quality gate would now pass the earlier experiment"
 
 _DEFAULT_DAILY_BUDGET = 5
 # A restart hand-off can fail without replacing the API process.  Retrying on
@@ -857,6 +859,13 @@ class NexusInitiativeService:
         # issue -> experiment -> (when it ended, the crash)
         crashes: dict[int, dict[str, tuple[str, str]]] = {}
         blocked: set[int] = set()
+        experiment_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(experiments)")
+        }
+        rechecked_select = (
+            "e.rechecked_experiment_id" if "rechecked_experiment_id" in experiment_columns
+            else "NULL"
+        )
         for table in ("github_experiment_links", "github_work_links"):
             try:
                 rows = self._conn.execute(
@@ -864,7 +873,8 @@ class NexusInitiativeService:
                     SELECT l.issue_number AS issue_number,
                            l.experiment_id AS experiment_id, e.status AS status,
                            e.error AS error, e.created_at AS created_at, e.ended_at AS ended_at,
-                           a.status AS adoption_status, a.reason AS adoption_reason
+                           a.status AS adoption_status, a.reason AS adoption_reason,
+                           {rechecked_select} AS rechecked_experiment_id
                     FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
                     LEFT JOIN experiment_adoptions a ON a.experiment_id = l.experiment_id
                     """
@@ -879,6 +889,8 @@ class NexusInitiativeService:
                 # ensure_for_source records the source before any experiment
                 # exists (#464): a link without an experiment is no work.
                 if row["experiment_id"] is None:
+                    continue
+                if row["rechecked_experiment_id"] is not None:
                     continue
                 # A goal-policy rejection is neither an attempt nor a block
                 # (#408): the preflight in _issue_candidates judges the text.
@@ -1081,6 +1093,54 @@ class NexusInitiativeService:
             found.extend(self._idea_candidates())
         return found
 
+    def _gate_recheck_candidate(self) -> Candidate | None:
+        """Return one open issue whose quality-only block is obsolete."""
+        if (
+            self.controller is None
+            or self._issue_lister is None
+            or not callable(getattr(self.experiment_service, "list_gate_recheck_candidates", None))
+        ):
+            return None
+        try:
+            issues = {
+                int(issue["number"]): issue
+                for issue in (self._issue_lister() or [])
+                if issue.get("number") is not None
+                and str(issue.get("state") or "open").lower() == "open"
+            }
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(experiments)")}
+            consumed = set()
+            if "rechecked_experiment_id" in columns:
+                consumed = {
+                    str(row[0]) for row in self._conn.execute(
+                        "SELECT rechecked_experiment_id FROM experiments "
+                        "WHERE rechecked_experiment_id IS NOT NULL"
+                    ).fetchall()
+                }
+            verdicts = gate_recheck(self.experiment_service)
+        except (Exception, sqlite3.Error) as exc:  # best effort; normal initiative continues
+            logger.warning("initiative: gate recheck failed: %s", exc)
+            return None
+        for verdict in verdicts:
+            source_id = str(verdict.get("id") or "")
+            number = verdict.get("issue_number")
+            if (
+                verdict.get("new_verdict") != "would_pass"
+                or not str(verdict.get("old_reason") or "").startswith("quality evaluation:")
+                or source_id in consumed
+                or number not in issues
+            ):
+                continue
+            issue = issues[number]
+            candidate = Candidate(
+                KIND_ISSUE, str(number), str(issue.get("title") or f"Issue #{number}"),
+                GATE_RECHECK_REASON,
+                {"body": str(issue.get("body") or ""), "rechecked_experiment_id": source_id},
+            )
+            if self._execution_allowed(candidate).allowed:
+                return candidate
+        return None
+
     def _recent_experiments(self, limit: int = 10) -> list[dict[str, str]]:
         """What Nexus tried lately and how it ended, including the newest adoption outcome (#439)."""
         with_adoption = True
@@ -1220,7 +1280,15 @@ class NexusInitiativeService:
                     self._record(decision, update=True)
             return decision
 
-        if self.daily_budget and self._spent_today() >= self.daily_budget:
+        recheck = self._gate_recheck_candidate()
+        if recheck is not None:
+            found = [recheck]
+        else:
+            found = None
+
+        if found is not None:
+            pass  # Gate-change verification is a free retry, independent of the daily budget.
+        elif self.daily_budget and self._spent_today() >= self.daily_budget:
             # Verified work is still adopted, and review findings still go back
             # to the coder, when the budget for new work is used up (#538).
             found = [
@@ -1416,11 +1484,13 @@ class NexusInitiativeService:
             raise RuntimeError("no controller configured")
         if candidate.kind == KIND_ISSUE:
             self._announce_plan(candidate)
-            self.controller.handle_issue(
-                int(candidate.ref),
-                title=candidate.title,
-                body=str(candidate.payload.get("body") or "") + self._earlier_attempts(int(candidate.ref)),
-            )
+            kwargs = {
+                "title": candidate.title,
+                "body": str(candidate.payload.get("body") or "") + self._earlier_attempts(int(candidate.ref)),
+            }
+            if candidate.payload.get("rechecked_experiment_id"):
+                kwargs["rechecked_experiment_id"] = candidate.payload["rechecked_experiment_id"]
+            self.controller.handle_issue(int(candidate.ref), **kwargs)
             return
         if candidate.kind == KIND_IDEA:
             self.controller.handle_idea(candidate.ref)

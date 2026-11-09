@@ -250,6 +250,7 @@ class RecordsMixin:
         complexity: str | None = None,
         source_type: str | None = None,
         source_id: str | None = None,
+        rechecked_experiment_id: str | None = None,
     ) -> Experiment:
         if not goal or not goal.strip():
             raise ValueError("goal must not be empty")
@@ -294,14 +295,31 @@ class RecordsMixin:
                     )
                     if active is not None:
                         raise ExperimentAlreadyActiveError(active["id"], active["status"])
+                if rechecked_experiment_id:
+                    source = self._conn.execute(
+                        "SELECT status, error FROM experiments WHERE id = ?",
+                        (rechecked_experiment_id,),
+                    ).fetchone()
+                    if source is None or source["status"] != STATUS_NEEDS_REVIEW or not str(
+                        source["error"] or ""
+                    ).startswith("quality evaluation:"):
+                        raise ValueError("recheck source is not a quality-gate needs_review experiment")
+                    consumed = self._conn.execute(
+                        "SELECT id FROM experiments WHERE rechecked_experiment_id = ? LIMIT 1",
+                        (rechecked_experiment_id,),
+                    ).fetchone()
+                    if consumed is not None:
+                        raise ExperimentAlreadyActiveError(consumed["id"], "rechecked")
                 self._conn.execute(
                     """
                     INSERT INTO experiments
-                        (id, goal, status, created_at, complexity, source_type, source_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (id, goal, status, created_at, complexity, source_type, source_id,
+                         rechecked_experiment_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (experiment_id, normalized_goal, STATUS_QUEUED, created_at,
-                     normalized_complexity, normalized_source_type, normalized_source_id),
+                     normalized_complexity, normalized_source_type, normalized_source_id,
+                     rechecked_experiment_id),
                 )
                 insert_activity(
                     self._conn,
@@ -310,7 +328,10 @@ class RecordsMixin:
                     entity_id=experiment_id,
                     event="created",
                     to_status=STATUS_QUEUED,
-                    message=normalized_goal,
+                    message=(
+                        f"{normalized_goal}\n\nrechecked_experiment_id={rechecked_experiment_id}"
+                        if rechecked_experiment_id else normalized_goal
+                    ),
                 )
             except BaseException:
                 self._conn.rollback()
@@ -658,4 +679,3 @@ class RecordsMixin:
                     self._active_processes.pop(row["id"], None)
                 marked.append(row["id"])
         return marked
-
