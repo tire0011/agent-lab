@@ -841,18 +841,33 @@ class NexusInitiativeService:
             update=True,
         )
 
+    def _issue_attempt_counts(self) -> dict[int, int]:
+        """Counted retry attempts per issue (what ``_MAX_ISSUE_ATTEMPTS`` limits)."""
+        return self._scan_issue_attempts()[2]
+
     def _issue_attempts(self) -> tuple[set[int], dict[int, dict[str, Any]]]:
-        """Issues not to start again (#374), and those among them out of attempts.
+        """Issues not to start again (#374), and those among them out of attempts."""
+        blocked, exhausted, _counted = self._scan_issue_attempts()
+        return blocked, exhausted
+
+    def _scan_issue_attempts(
+        self,
+    ) -> tuple[set[int], dict[int, dict[str, Any]], dict[int, int]]:
+        """Blocked issues, exhausted issues and the counted attempts per issue.
 
         An issue is free again after a failed experiment, up to
         ``_MAX_ISSUE_ATTEMPTS``; a running or succeeded experiment keeps it
         blocked. Pipeline crashes are not attempts (#467): after
         ``_MAX_ISSUE_ATTEMPTS`` crashes the issue waits for a newer commit on
         main. The newest integration-conflict stop is not an attempt (#485),
-        older ones are.
+        older ones are. A run started because a changed quality gate would now
+        pass an earlier experiment (#614) is not an attempt either; its status,
+        crash and review/adoption outcome are handled like any other run.
         """
         # issue -> experiment -> (when, why it failed)
         failed: dict[int, dict[str, tuple[str, str]]] = {}
+        # issue -> failed gate-recheck runs: named, but not counted (#614)
+        free: dict[int, set[str]] = {}
         # issues with an adoption stopped by a merge conflict; exactly one
         # such stop, the newest, is left out of the count
         conflicted: set[int] = set()
@@ -890,8 +905,7 @@ class NexusInitiativeService:
                 # exists (#464): a link without an experiment is no work.
                 if row["experiment_id"] is None:
                     continue
-                if row["rechecked_experiment_id"] is not None:
-                    continue
+                recheck_run = row["rechecked_experiment_id"] is not None
                 # A goal-policy rejection is neither an attempt nor a block
                 # (#408): the preflight in _issue_candidates judges the text.
                 if _is_goal_policy_rejection(row["status"], row["error"]):
@@ -916,15 +930,19 @@ class NexusInitiativeService:
                         str(row["created_at"] or row["ended_at"] or ""),
                         str(first or second or ""),
                     )
-                    if merge_stopped and _is_integration_conflict(
+                    if recheck_run:
+                        free.setdefault(number, set()).add(str(row["experiment_id"]))
+                    elif merge_stopped and _is_integration_conflict(
                         row["adoption_status"], row["adoption_reason"]
                     ):
                         conflicted.add(number)
                 else:
                     blocked.add(number)
-        # The exempted stop still names the experiments and the last reason.
+        # The exempted stops still name the experiments and the last reason.
         counted = {
-            number: len(attempts) - (number in conflicted)
+            number: len(attempts)
+            - len(free.get(number, set()) & set(attempts))
+            - (number in conflicted)
             for number, attempts in failed.items()
         }
         exhausted = {
@@ -949,7 +967,7 @@ class NexusInitiativeService:
                     "pipeline_crash": True,
                 }
             blocked.add(number)
-        return blocked, exhausted
+        return blocked, exhausted, counted
 
     def _main_commit_time(self) -> datetime | None:
         """When origin/main last moved, from the local ref; ``None`` if unreadable."""
@@ -1132,10 +1150,28 @@ class NexusInitiativeService:
             ):
                 continue
             issue = issues[number]
+            labels = {
+                str(label.get("name") if isinstance(label, dict) else label).lower()
+                for label in issue.get("labels") or []
+            }
+            if PROPOSAL_LABEL in labels:
+                continue  # still waits for a human (#354)
+            raw_title = str(issue.get("title") or f"Issue #{number}")
+            raw_body = str(issue.get("body") or "")
+            author_trusted = github_authorization.is_trusted_actor(
+                github_authorization.api_actor_login(issue.get("author"))
+            )
+            # The same validated snapshot as a normal issue candidate, so the
+            # dispatch boundary in tick() checks it the same way.
             candidate = Candidate(
-                KIND_ISSUE, str(number), str(issue.get("title") or f"Issue #{number}"),
-                GATE_RECHECK_REASON,
-                {"body": str(issue.get("body") or ""), "rechecked_experiment_id": source_id},
+                KIND_ISSUE, str(number), raw_title[:200], GATE_RECHECK_REASON,
+                {
+                    "body": raw_body[:16000],
+                    "raw_title": raw_title,
+                    "raw_body": raw_body,
+                    "author_trusted": author_trusted,
+                    "rechecked_experiment_id": source_id,
+                },
             )
             if self._execution_allowed(candidate).allowed:
                 return candidate
@@ -1280,15 +1316,9 @@ class NexusInitiativeService:
                     self._record(decision, update=True)
             return decision
 
-        recheck = self._gate_recheck_candidate()
-        if recheck is not None:
-            found = [recheck]
-        else:
-            found = None
-
-        if found is not None:
-            pass  # Gate-change verification is a free retry, independent of the daily budget.
-        elif self.daily_budget and self._spent_today() >= self.daily_budget:
+        if self.daily_budget and self._spent_today() >= self.daily_budget:
+            # A gate-recheck run (#614) is new work: it waits for the budget
+            # like any other start. It is only exempt from issue retry attempts.
             # Verified work is still adopted, and review findings still go back
             # to the coder, when the budget for new work is used up (#538).
             found = [
@@ -1306,7 +1336,10 @@ class NexusInitiativeService:
                     )
                 )
         else:
-            found = self.candidates()
+            # A finished experiment that today's quality gate would pass goes
+            # first: its issue is verified again on the existing branch (#614).
+            recheck = self._gate_recheck_candidate()
+            found = [recheck] if recheck is not None else self.candidates()
         if not found:
             return self._record(
                 InitiativeDecision("idle", detail="no actionable work found", tick_id=tick_id)
@@ -1488,8 +1521,17 @@ class NexusInitiativeService:
                 "title": candidate.title,
                 "body": str(candidate.payload.get("body") or "") + self._earlier_attempts(int(candidate.ref)),
             }
-            if candidate.payload.get("rechecked_experiment_id"):
-                kwargs["rechecked_experiment_id"] = candidate.payload["rechecked_experiment_id"]
+            rechecked = candidate.payload.get("rechecked_experiment_id")
+            if rechecked:
+                # The link is stored with the new experiment row itself
+                # (create_experiment), so a start that never creates a row
+                # leaves the source free for a later tick (#614).
+                kwargs["rechecked_experiment_id"] = rechecked
+                kwargs["body"] += (
+                    f"\n\nNexus re-queued this issue: experiment {rechecked} stopped at the "
+                    "quality evaluation, and today's quality gate would pass it. Start a new "
+                    "experiment on the existing issue branch so it is verified again."
+                )
             self.controller.handle_issue(int(candidate.ref), **kwargs)
             return
         if candidate.kind == KIND_IDEA:
