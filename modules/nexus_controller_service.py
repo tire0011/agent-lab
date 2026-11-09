@@ -242,14 +242,19 @@ class NexusControllerService:
                 raise
 
             try:
+                create_kwargs = {
+                    "complexity": decision.complexity,
+                    "source_type": lifecycle_source.source_type,
+                    "source_id": lifecycle_source.source_id,
+                }
+                rechecked_experiment_id = lifecycle_source.metadata.get(
+                    "rechecked_experiment_id"
+                )
+                if rechecked_experiment_id:
+                    create_kwargs["rechecked_experiment_id"] = rechecked_experiment_id
                 experiment = self.experiment_service.create_experiment(
                     with_handover(source_content, decision.experiment_handover),
-                    complexity=decision.complexity,
-                    source_type=lifecycle_source.source_type,
-                    source_id=lifecycle_source.source_id,
-                    rechecked_experiment_id=lifecycle_source.metadata.get(
-                        "rechecked_experiment_id"
-                    ),
+                    **create_kwargs,
                 )
             except ExperimentAlreadyActiveError as exc:
                 self._record_execution(
