@@ -83,6 +83,18 @@ API at startup and every `nexus_tick` run remove those that are no longer needed
   `worktree_removed` activity event, and each failure as
   `worktree_cleanup_failed`. A failure never blocks startup or a tick.
 
+Optional, for per-experiment coding-agent token budgets (issues #532/#533):
+
+- `NEXUS_EXPERIMENT_TOKEN_BUDGET` sets the total token limit across the
+  experiment's implementation and repair runs. Claude usage is accumulated
+  live from unique stream-json assistant message IDs. Codex currently exposes
+  usage only on `turn.completed`, so its budget can only be checked when the
+  run ends.
+- `NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE=enforce` stops a live Claude worker when
+  the total exceeds the limit and ends the experiment in `needs_review`.
+  Any other value is shadow mode: usage and a single crossing warning are
+  recorded, but execution continues.
+
 Optional, for the experiment stall sweep (issue #400). The API every 5 minutes,
 and every `nexus_tick` run (at the start and every 5 minutes while it waits for
 its experiment), fail active experiments (`queued`, `selecting`,

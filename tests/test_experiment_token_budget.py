@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from modules.claude_worker import _LiveUsageParser
 from modules.experiment_service.service import ExperimentService, worker_run_token_total
 
 
@@ -20,13 +21,17 @@ class ExperimentTokenBudgetTests(unittest.TestCase):
         self.db_path = str(root / "agent.db")
         self.log_dir = str(root / "logs")
 
-    def _service(self, budget: str | None) -> ExperimentService:
+    def _service(self, budget: str | None, mode: str | None = None) -> ExperimentService:
         env = {}
         if budget is not None:
             env["NEXUS_EXPERIMENT_TOKEN_BUDGET"] = budget
+        if mode is not None:
+            env["NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE"] = mode
         with patch.dict(os.environ, env, clear=False):
             if budget is None:
                 os.environ.pop("NEXUS_EXPERIMENT_TOKEN_BUDGET", None)
+            if mode is None:
+                os.environ.pop("NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE", None)
             service = ExperimentService(
                 selection_worker=object(),
                 worker_factory=lambda _path: object(),
@@ -135,6 +140,63 @@ class ExperimentTokenBudgetTests(unittest.TestCase):
         codex = {"input_tokens": 10, "output_tokens": 5, "cached_input_tokens": 9}
         self.assertEqual(worker_run_token_total(claude), 30)
         self.assertEqual(worker_run_token_total(codex), 24)
+
+    def test_claude_live_stream_counts_each_message_id_once(self) -> None:
+        calls = []
+        parser = _LiveUsageParser(lambda usage: calls.append(usage) or False)
+        events = [
+            {"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 10}}},
+            {"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 10}}},
+            {"type": "assistant", "message": {"id": "m2", "usage": {"output_tokens": 5}}},
+        ]
+
+        for event in events:
+            self.assertFalse(parser.consume(json.dumps(event)))
+
+        self.assertEqual(calls, [{"input_tokens": 10}, {"output_tokens": 5}])
+
+    def test_enforce_live_crossing_stops_and_records_needs_review(self) -> None:
+        service = self._service("10", "enforce")
+        experiment = service.create_experiment("Stop a runaway Claude stream")
+        callback, state = service._live_worker_usage_callback(
+            experiment.id, service.get_experiment_logger(experiment.id)
+        )
+
+        self.assertFalse(callback({"input_tokens": 6}))
+        self.assertTrue(callback({"output_tokens": 5}))
+
+        result = service.get_experiment(experiment.id)
+        self.assertEqual(state, {"tokens": 11, "calls": 2})
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("budget=10", result.error)
+        self.assertIn("consumed=11", result.error)
+
+    def test_shadow_live_crossing_logs_but_does_not_stop(self) -> None:
+        service = self._service("10", "shadow")
+        experiment = service.create_experiment("Observe a Claude stream")
+        callback, _state = service._live_worker_usage_callback(
+            experiment.id, service.get_experiment_logger(experiment.id)
+        )
+
+        self.assertFalse(callback({"input_tokens": 11}))
+
+        self.assertEqual(service.get_experiment(experiment.id).status, "queued")
+        warnings = self._warning_entries(service, experiment.id)
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["mode"], "shadow")
+
+    def test_enforce_end_of_run_usage_handles_codex_limit(self) -> None:
+        service = self._service("10", "enforce")
+        experiment = service.create_experiment("Count Codex at turn completion")
+
+        service._record_worker_run_usage(
+            experiment.id, {"input_tokens": 8, "output_tokens": 3},
+            service.get_experiment_logger(experiment.id),
+        )
+
+        result = service.get_experiment(experiment.id)
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("completed before usage was available", result.error)
 
 
 if __name__ == "__main__":

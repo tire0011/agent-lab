@@ -46,6 +46,7 @@ from ..models import (
 from ..text_utils import _utcnow_iso
 from .core import (
     EXPERIMENT_TOKEN_BUDGET_ENV_VAR,
+    EXPERIMENT_TOKEN_BUDGET_MODE_ENV_VAR,
     _DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
     _DEFAULT_MAX_DIAGNOSTIC_LOG_BYTES,
     _DEFAULT_MAX_DIFF_BYTES,
@@ -149,6 +150,10 @@ class RecordsMixin:
         self.max_repair_iterations = max(0, max_repair_iterations)
         self.experiment_token_budget = _experiment_token_budget(
             os.environ.get(EXPERIMENT_TOKEN_BUDGET_ENV_VAR)
+        )
+        self.experiment_token_budget_mode = (
+            "enforce" if os.environ.get(EXPERIMENT_TOKEN_BUDGET_MODE_ENV_VAR, "").strip().lower() == "enforce"
+            else "shadow"
         )
         self.base_ref = base_ref
         self.test_command = test_command
@@ -449,8 +454,8 @@ class RecordsMixin:
     ) -> str | None:
         """Accumulate one finished implementation/fallback/repair run.
 
-        When shadow mode is disabled this returns the historical raw usage JSON
-        without changing the database.  With a configured budget, the update and
+        Without a configured budget this returns the historical raw usage JSON
+        without changing the database. With a budget, accounting and the
         warning-deduplication flag are committed atomically.
         """
         if self.experiment_token_budget is None:
@@ -488,14 +493,29 @@ class RecordsMixin:
             )
 
         if crossed:
+            enforcing = self.experiment_token_budget_mode == "enforce"
             elog.warning(
                 "implementation",
                 "token_budget_exceeded",
-                "Experiment token budget exceeded (shadow mode; execution continues)",
+                (
+                    "Experiment token budget exceeded; worker run ended for review"
+                    if enforcing else
+                    "Experiment token budget exceeded (shadow mode; execution continues)"
+                ),
                 budget=self.experiment_token_budget,
                 total=total,
                 run_count=run_count,
+                mode=self.experiment_token_budget_mode,
             )
+            if enforcing:
+                self._force_status(
+                    experiment_id, STATUS_NEEDS_REVIEW,
+                    ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
+                    error=(
+                        f"experiment token budget exceeded: budget={self.experiment_token_budget}, "
+                        f"consumed={total}; worker run completed before usage was available"
+                    ),
+                )
         else:
             # ``nexus logs`` reads this same structured stream, so the current
             # shadow total is visible even before crossing (and after the one
@@ -509,6 +529,85 @@ class RecordsMixin:
                 run_count=run_count,
             )
         return encoded
+
+
+    def _live_worker_usage_callback(
+        self, experiment_id: str, elog: ExperimentLogger
+    ) -> tuple[Callable[[dict[str, Any]], bool] | None, dict[str, int]]:
+        """Build a per-run Claude usage observer; its state prevents final double count."""
+        state = {"tokens": 0, "calls": 0}
+        if self.experiment_token_budget is None:
+            return None, state
+
+        def observe(usage: dict[str, Any]) -> bool:
+            increment = worker_run_token_total(usage)
+            state["tokens"] += increment
+            state["calls"] += 1
+            with self._lock, self._conn:
+                row = self._conn.execute(
+                    "SELECT implementation_usage_json FROM experiments WHERE id = ?",
+                    (experiment_id,),
+                ).fetchone()
+                previous: dict[str, Any] = {}
+                if row is not None and row[0]:
+                    try:
+                        decoded = json.loads(row[0])
+                        if isinstance(decoded, dict):
+                            previous = decoded
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+                total = int(previous.get("tokens_consumed", 0)) + increment
+                run_count = int(previous.get("token_run_count", 0)) + (1 if state["calls"] == 1 else 0)
+                already_warned = bool(previous.get("token_budget_warning_logged", False))
+                crossed = total > self.experiment_token_budget
+                for key, value in usage.items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        previous[key] = int(previous.get(key, 0)) + int(value)
+                previous.update(
+                    token_budget=self.experiment_token_budget,
+                    tokens_consumed=total,
+                    token_run_count=run_count,
+                    token_budget_warning_logged=already_warned or crossed,
+                    live_api_call_count=int(previous.get("live_api_call_count", 0)) + 1,
+                )
+                self._conn.execute(
+                    "UPDATE experiments SET implementation_usage_json = ? WHERE id = ?",
+                    (json.dumps(previous), experiment_id),
+                )
+
+            if crossed and not already_warned:
+                enforcing = self.experiment_token_budget_mode == "enforce"
+                message = (
+                    "Experiment token budget exceeded; worker stopped for review"
+                    if enforcing else
+                    "Experiment token budget exceeded (shadow mode; execution continues)"
+                )
+                elog.warning(
+                    "implementation", "token_budget_exceeded", message,
+                    budget=self.experiment_token_budget, total=total,
+                    run_count=run_count, mode=self.experiment_token_budget_mode,
+                )
+                if enforcing:
+                    reason = (
+                        f"experiment token budget exceeded: budget={self.experiment_token_budget}, "
+                        f"consumed={total}; worker stopped"
+                    )
+                    self._force_status(
+                        experiment_id, STATUS_NEEDS_REVIEW,
+                        ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
+                        error=reason,
+                    )
+                    return True
+            else:
+                elog.info(
+                    "implementation", "token_budget_updated",
+                    f"Experiment token usage updated ({self.experiment_token_budget_mode} mode)",
+                    budget=self.experiment_token_budget, total=total,
+                    run_count=run_count, live=True,
+                )
+            return False
+
+        return observe, state
 
 
     def _transition(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:
@@ -658,4 +757,3 @@ class RecordsMixin:
                     self._active_processes.pop(row["id"], None)
                 marked.append(row["id"])
         return marked
-

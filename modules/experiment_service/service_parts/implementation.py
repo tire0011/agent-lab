@@ -254,6 +254,7 @@ class ImplementationMixin:
 
         stall_seconds, max_seconds = agent_watchdog_limits()
 
+        live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
         implementation_result: CodexResult = worker.run(
             task=implementation_prompt,
             working_dir=worktree_path,
@@ -263,9 +264,12 @@ class ImplementationMixin:
             experiment_logger=elog,
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
+            on_live_usage=live_usage,
         )
-        implementation_usage_json = self._record_worker_run_usage(
-            experiment_id, implementation_result.usage, elog
+        implementation_usage_json = (
+            json.dumps(self.get_experiment(experiment_id).implementation_usage)
+            if live_state["calls"] else
+            self._record_worker_run_usage(experiment_id, implementation_result.usage, elog)
         )
 
         if (
@@ -288,6 +292,7 @@ class ImplementationMixin:
                 experiment_id, STATUS_IMPLEMENTING,
                 implementation_provider=implementation_provider,
             )
+            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
             implementation_result = worker.run(
                 task=implementation_prompt,
                 working_dir=worktree_path,
@@ -297,9 +302,12 @@ class ImplementationMixin:
                 experiment_logger=elog,
                 phase="implementation",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_live_usage=live_usage,
             )
-            implementation_usage_json = self._record_worker_run_usage(
-                experiment_id, implementation_result.usage, elog
+            implementation_usage_json = (
+                json.dumps(self.get_experiment(experiment_id).implementation_usage)
+                if live_state["calls"] else
+                self._record_worker_run_usage(experiment_id, implementation_result.usage, elog)
             )
 
         fallback = (
@@ -327,6 +335,7 @@ class ImplementationMixin:
                 experiment_id, STATUS_IMPLEMENTING,
                 implementation_provider=implementation_provider,
             )
+            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
             implementation_result = worker.run(
                 task=implementation_prompt,
                 working_dir=worktree_path,
@@ -336,9 +345,12 @@ class ImplementationMixin:
                 experiment_logger=elog,
                 phase="implementation",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_live_usage=live_usage,
             )
-            implementation_usage_json = self._record_worker_run_usage(
-                experiment_id, implementation_result.usage, elog
+            implementation_usage_json = (
+                json.dumps(self.get_experiment(experiment_id).implementation_usage)
+                if live_state["calls"] else
+                self._record_worker_run_usage(experiment_id, implementation_result.usage, elog)
             )
 
         if self._ended_from_outside(experiment_id):
@@ -492,6 +504,7 @@ class ImplementationMixin:
                 iteration=repair_iteration,
                 provider=provider_of(worker) or "",
             )
+            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
             repair_result = worker.run(
                 task=_build_repair_implementation_prompt(result.goal, feedback),
                 working_dir=worktree_path,
@@ -501,8 +514,10 @@ class ImplementationMixin:
                 experiment_logger=elog,
                 phase="implementation_repair",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_live_usage=live_usage,
             )
-            self._record_worker_run_usage(experiment_id, repair_result.usage, elog)
+            if not live_state["calls"]:
+                self._record_worker_run_usage(experiment_id, repair_result.usage, elog)
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:

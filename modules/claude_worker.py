@@ -155,6 +155,39 @@ def _model_from_result(result: dict[str, Any]) -> str:
     return "claude"
 
 
+class _LiveUsageParser:
+    """Emit each Claude API call's usage once from stream-json assistant events."""
+
+    def __init__(self, callback: Any | None) -> None:
+        self.callback = callback
+        self.message_ids: set[str] = set()
+
+    def consume(self, line: str) -> bool:
+        if self.callback is None:
+            return False
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            return False
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return False
+        message_id = message.get("id")
+        usage = message.get("usage")
+        if not isinstance(message_id, str) or not message_id or message_id in self.message_ids:
+            return False
+        if not isinstance(usage, dict):
+            return False
+        flattened = {
+            key: int(value) for key, value in usage.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        self.message_ids.add(message_id)
+        return bool(self.callback(flattened)) if flattened else False
+
+
 class ClaudeWorker:
     """Runs a coding task non-interactively via the ``claude`` CLI.
 
@@ -220,6 +253,7 @@ class ClaudeWorker:
         stall_seconds: float | None = None,
         on_process: Any | None = None,
         extra_args: list[str] | None = None,
+        on_live_usage: Any | None = None,
     ) -> WorkerResult:
         """Execute *task* non-interactively via the ``claude`` CLI.
 
@@ -288,9 +322,11 @@ class ClaudeWorker:
                 timeout_seconds=timeout_seconds,
             )
 
+        live_parser = _LiveUsageParser(on_live_usage)
         result = self._execute(
             cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process,
             on_heartbeat=progress_heartbeat(experiment_logger, phase, "Claude"),
+            on_stdout_line=live_parser.consume,
         )
 
         if experiment_logger is not None:
@@ -421,6 +457,7 @@ class ClaudeWorker:
         stall_seconds: float | None = None,
         on_process: Any | None = None,
         on_heartbeat: Any | None = None,
+        on_stdout_line: Any | None = None,
     ) -> WorkerResult:
         timed_out = False
         proc_error: str | None = None
@@ -436,6 +473,7 @@ class ClaudeWorker:
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
                     on_process=on_process,
                     on_heartbeat=on_heartbeat,
+                    on_stdout_line=on_stdout_line,
                 )
                 stdout_raw, stderr_raw = watched.stdout, watched.stderr
                 if watched.stop_reason:

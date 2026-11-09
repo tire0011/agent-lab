@@ -146,6 +146,7 @@ MIN_AGENT_MAX_SECONDS = 30 * 60
 
 STOP_STALLED = "stalled"
 STOP_MAX_RUNTIME = "max_runtime"
+STOP_REQUESTED = "requested"
 
 # Output kept while the agent runs (#328 review): head and tail only, never all.
 CAPTURE_HEAD_BYTES = 64 * 1024
@@ -178,7 +179,7 @@ class WatchedRun:
     exit_code: int | None
     stdout: str
     stderr: str
-    stop_reason: str | None  # None, STOP_STALLED or STOP_MAX_RUNTIME
+    stop_reason: str | None  # None or one of the STOP_* constants
 
 
 class _BoundedCapture:
@@ -240,6 +241,7 @@ def run_watched(
     grace_seconds: float = TERMINATE_GRACE_SECONDS,
     on_process: Callable[[subprocess.Popen | None], None] | None = None,
     on_heartbeat: Callable[[float, float], None] | None = None,
+    on_stdout_line: Callable[[str], bool] | None = None,
     heartbeat_seconds: float = PROGRESS_HEARTBEAT_SECONDS,
 ) -> WatchedRun:
     """Run *cmd*, stopping it only on a stall or at the absolute cap. Any output
@@ -264,14 +266,23 @@ def run_watched(
     stdout_capture = _BoundedCapture()
     stderr_capture = _BoundedCapture()
 
-    def pump(stream: Any, sink: _BoundedCapture) -> None:
+    stop_requested = threading.Event()
+
+    def pump(stream: Any, sink: _BoundedCapture, line_callback: Callable[[str], bool] | None = None) -> None:
         for line in iter(stream.readline, ""):
             sink.add(line)
             last_output[0] = time.monotonic()
+            if line_callback is not None:
+                try:
+                    if line_callback(line):
+                        stop_requested.set()
+                        break
+                except Exception:  # noqa: BLE001 - observers must not break capture
+                    pass
         stream.close()
 
     readers = [
-        threading.Thread(target=pump, args=(proc.stdout, stdout_capture), daemon=True),
+        threading.Thread(target=pump, args=(proc.stdout, stdout_capture, on_stdout_line), daemon=True),
         threading.Thread(target=pump, args=(proc.stderr, stderr_capture), daemon=True),
     ]
     for reader in readers:
@@ -294,7 +305,9 @@ def run_watched(
                 on_heartbeat(now - started, now - last_output[0])
             except Exception:  # noqa: BLE001 - logging must not stop the watchdog
                 pass
-        if now - last_output[0] > stall_seconds:
+        if stop_requested.is_set():
+            stop_reason = STOP_REQUESTED
+        elif now - last_output[0] > stall_seconds:
             stop_reason = STOP_STALLED
         elif now - started > max_seconds:
             stop_reason = STOP_MAX_RUNTIME
@@ -340,4 +353,6 @@ def progress_heartbeat(
 def watchdog_error(agent: str, run: WatchedRun, stall_seconds: float, max_seconds: float) -> str:
     if run.stop_reason == STOP_STALLED:
         return f"{agent} stalled: no output for {int(stall_seconds)}s"
+    if run.stop_reason == STOP_REQUESTED:
+        return f"{agent} stopped by the run observer"
     return f"{agent} reached the absolute cap of {int(max_seconds)}s"
