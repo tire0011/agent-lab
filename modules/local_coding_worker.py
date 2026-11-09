@@ -27,7 +27,9 @@ not retried elsewhere. Without a usable plan of at least two subtasks the task
 runs one-shot as before. Subtasks run in order on the same working tree, each
 through the correction loop with its own prompt (its files, the diff of the
 earlier subtasks, the overall goal as cuttable context); a patch may only touch
-the subtask's files and named tests, and the named tests must pass. The first
+the subtask's one or two declared files, and the named tests must pass. Named
+tests are verification only: a patch may not edit them unless the subtask also
+declares them in ``files`` (so a model cannot weaken its own checks). The first
 failing subtask stops the run: the result fails and names it, earlier subtasks'
 changes stay in the tree but never count as success. Every run logs
 ``local_task_split`` (when planned) and ``local_task_split_result`` (split,
@@ -471,7 +473,8 @@ _PLAN_INSTRUCTIONS = (
     f"model. At most {MAX_SUBTASKS} subtasks. Each subtask is one small change to one or two "
     "files (repository-relative paths) and must leave the code compiling. A later subtask "
     "sees the changes of the earlier ones. Name test files only if they already exist or an "
-    "earlier or the same subtask creates them.\n"
+    "earlier or the same subtask creates them. Tests are only run, never edited: a "
+    "subtask that must change a test file lists it in files.\n"
     "Answer with JSON only, no prose, in exactly this shape:\n"
     '{"subtasks": [{"goal": "what to change", "files": ["path/a.py"], '
     '"tests": ["tests/test_a.py"]}]}'
@@ -997,7 +1000,9 @@ class LocalCodingWorker:
             else:
                 ok, output, reason = self._patch_rounds(
                     sub_plan, working_dir, timeout, experiment_logger, phase,
-                    allowed_paths=set(subtask.files) | {t.split("::", 1)[0] for t in subtask.tests},
+                    # Only the declared files: named tests are checks, editable only
+                    # when the subtask lists them in ``files`` too.
+                    allowed_paths=set(subtask.files),
                     tests=subtask.tests, subtask=number,
                 )
             self._log(experiment_logger, phase, "local_subtask_finished",
@@ -1025,7 +1030,8 @@ class LocalCodingWorker:
             "the other subtasks do the rest.\n"
             f"Subtask: {subtask.goal}\n"
             f"Files to change (only these): {', '.join(subtask.files)}\n"
-            f"Tests that must pass afterwards: {tests}"
+            f"Tests that must pass afterwards (run only; do not edit them unless listed "
+            f"above): {tests}"
         )
         earlier = "".join(applied).strip() or "(none yet)"
         context = (

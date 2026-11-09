@@ -29,7 +29,11 @@ _STEP2 = "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-step1\n+step2\n"
 _MOD2 = "--- a/mod.py\n+++ b/mod.py\n@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n"
 _MOD3 = "--- a/mod.py\n+++ b/mod.py\n@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 3\n"
 _BROKEN_PY = "--- a/mod.py\n+++ b/mod.py\n@@ -1 +1 @@\n-VALUE = 1\n+VALUE = (\n"
-_ONE_SHOT = "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-original\n+one-shot\n"
+_WEAKEN_TEST = ("--- a/test_mod.py\n+++ b/test_mod.py\n@@ -4,2 +4,2 @@\n def test_value():\n"
+                "-    assert mod.VALUE == 2\n+    assert True\n")
+_TEST_EXPECTS_3 = ("--- a/test_mod.py\n+++ b/test_mod.py\n@@ -4,2 +4,2 @@\n def test_value():\n"
+                   "-    assert mod.VALUE == 2\n+    assert mod.VALUE == 3\n")
+_ONE_SHOT ="--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-original\n+one-shot\n"
 
 
 def _plan(*subtasks: dict) -> str:
@@ -265,6 +269,49 @@ class Issue598SubtaskTests(unittest.TestCase):
         self.assertTrue(result.success, result.error)
         self.assertEqual(["outside_subtask", "applied", "applied"],
                          [r["outcome"] for r in log.all("local_patch_round")])
+
+    def test_named_test_not_declared_in_files_cannot_be_edited(self):
+        # codex finding on 1830c2db: a model must not weaken its own validation tests.
+        plan = _plan(
+            {"goal": "Set VALUE to 3", "files": ["mod.py"], "tests": ["test_mod.py"]},
+            {"goal": "Change original to step1", "files": ["value.txt"]},
+        )
+        server = _Server(plan, [_MOD3 + _WEAKEN_TEST, _WEAKEN_TEST, _MOD3])
+        _worker, result, log = self._run(server)
+
+        self.assertFalse(result.success)
+        self.assertIn("subtask 1/2 failed", result.error)
+        rounds = log.all("local_patch_round")
+        self.assertEqual(["outside_subtask", "outside_subtask", "tests_failed"],
+                         [r["outcome"] for r in rounds])
+        self.assertIn("test_mod.py", rounds[0]["reason"])
+        self.assertIn("assert mod.VALUE == 2", (self.repo / "test_mod.py").read_text())
+        self.assertEqual("", self._status())
+        self.assertEqual(1, log.last("local_task_split_result")["failed_subtask"])
+
+    def test_named_test_declared_in_files_may_be_edited(self):
+        plan = _plan(
+            {"goal": "Set VALUE to 3 and update its test", "files": ["mod.py", "test_mod.py"],
+             "tests": ["test_mod.py"]},
+            {"goal": "Change original to step1", "files": ["value.txt"]},
+        )
+        server = _Server(plan, [_MOD3 + _TEST_EXPECTS_3, _STEP1])
+        _worker, result, _log = self._run(server)
+
+        self.assertTrue(result.success, result.error)
+        self.assertIn("assert mod.VALUE == 3", (self.repo / "test_mod.py").read_text())
+
+    def test_subtask_prompt_says_named_tests_are_run_only(self):
+        plan = _plan(
+            {"goal": "Set VALUE to 2", "files": ["mod.py"], "tests": ["test_mod.py"]},
+            {"goal": "Change original to step1", "files": ["value.txt"]},
+        )
+        server = _Server(plan, [_MOD2, _STEP1])
+        _worker, result, _log = self._run(server)
+        self.assertTrue(result.success, result.error)
+        self.assertIn("Files to change (only these): mod.py\n", server.patch_calls[0])
+        self.assertIn("run only; do not edit them", server.patch_calls[0])
+        self.assertIn("Tests are only run, never edited", server.plan_calls[0])
 
     def test_split_off_runs_one_shot_and_still_logs_the_result(self):
         server = _Server(_TWO_STEPS, [_ONE_SHOT])
