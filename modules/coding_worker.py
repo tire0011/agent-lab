@@ -275,8 +275,10 @@ def run_watched(
             if line_callback is not None:
                 try:
                     if line_callback(line):
+                        # Ask the watchdog to stop the agent (#533); keep draining the
+                        # pipe so the agent never blocks on a full stdout meanwhile.
                         stop_requested.set()
-                        break
+                        line_callback = None
                 except Exception:  # noqa: BLE001 - observers must not break capture
                     pass
         stream.close()

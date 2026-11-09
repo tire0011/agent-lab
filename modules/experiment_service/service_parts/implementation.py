@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import uuid
@@ -266,11 +267,13 @@ class ImplementationMixin:
             on_process=lambda process: self._track_process(experiment_id, process),
             on_live_usage=live_usage,
         )
-        implementation_usage_json = (
-            json.dumps(self.get_experiment(experiment_id).implementation_usage)
-            if live_state["calls"] else
-            self._record_worker_run_usage(experiment_id, implementation_result.usage, elog)
+        implementation_usage_json = self._usage_after_run(
+            experiment_id, implementation_result, live_state, elog
         )
+        # Cancelled, stalled or stopped by the token budget (#533): keep that outcome and
+        # start no fallback run.
+        if self._ended_from_outside(experiment_id):
+            return self.get_experiment(experiment_id)
 
         if (
             implementation_provider == "local"
@@ -304,11 +307,11 @@ class ImplementationMixin:
                 on_process=lambda process: self._track_process(experiment_id, process),
                 on_live_usage=live_usage,
             )
-            implementation_usage_json = (
-                json.dumps(self.get_experiment(experiment_id).implementation_usage)
-                if live_state["calls"] else
-                self._record_worker_run_usage(experiment_id, implementation_result.usage, elog)
+            implementation_usage_json = self._usage_after_run(
+                experiment_id, implementation_result, live_state, elog
             )
+            if self._ended_from_outside(experiment_id):
+                return self.get_experiment(experiment_id)
 
         fallback = (
             other_provider(implementation_provider)
@@ -347,11 +350,11 @@ class ImplementationMixin:
                 on_process=lambda process: self._track_process(experiment_id, process),
                 on_live_usage=live_usage,
             )
-            implementation_usage_json = (
-                json.dumps(self.get_experiment(experiment_id).implementation_usage)
-                if live_state["calls"] else
-                self._record_worker_run_usage(experiment_id, implementation_result.usage, elog)
+            implementation_usage_json = self._usage_after_run(
+                experiment_id, implementation_result, live_state, elog
             )
+            if self._ended_from_outside(experiment_id):
+                return self.get_experiment(experiment_id)
 
         if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
@@ -411,6 +414,22 @@ class ImplementationMixin:
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
         )
+
+
+    def _usage_after_run(
+        self, experiment_id: str, run_result: Any, live_state: dict[str, int],
+        elog: ExperimentLogger,
+    ) -> str | None:
+        """Account one finished worker run once (#532/#533).
+
+        A run whose usage was already counted live (Claude stream-json) is not counted
+        again from its final usage; any other run (Codex, local, unstreamed) is counted
+        here at its end, which is also where enforce mode can first stop it.
+        """
+        if live_state.get("calls"):
+            usage = self.get_experiment(experiment_id).implementation_usage
+            return json.dumps(usage) if usage else None
+        return self._record_worker_run_usage(experiment_id, run_result.usage, elog)
 
 
     def _merge_current_main(self, worktree_path: str, elog: ExperimentLogger) -> str:
@@ -516,8 +535,8 @@ class ImplementationMixin:
                 on_process=lambda process: self._track_process(experiment_id, process),
                 on_live_usage=live_usage,
             )
-            if not live_state["calls"]:
-                self._record_worker_run_usage(experiment_id, repair_result.usage, elog)
+            self._usage_after_run(experiment_id, repair_result, live_state, elog)
+            # Also a budget stop (#533): it must not become timed_out/failed or repair again.
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:

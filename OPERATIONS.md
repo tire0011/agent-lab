@@ -86,14 +86,21 @@ API at startup and every `nexus_tick` run remove those that are no longer needed
 Optional, for per-experiment coding-agent token budgets (issues #532/#533):
 
 - `NEXUS_EXPERIMENT_TOKEN_BUDGET` sets the total token limit across the
-  experiment's implementation and repair runs. Claude usage is accumulated
-  live from unique stream-json assistant message IDs. Codex currently exposes
-  usage only on `turn.completed`, so its budget can only be checked when the
-  run ends.
-- `NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE=enforce` stops a live Claude worker when
-  the total exceeds the limit and ends the experiment in `needs_review`.
-  Any other value is shadow mode: usage and a single crossing warning are
-  recorded, but execution continues.
+  experiment's implementation, fallback and repair runs. Claude usage is
+  counted live: each stream-json `assistant` event's `message.usage` is the
+  usage of that one API call, so the calls are summed and each `message.id`
+  is counted once. Codex `exec --json` reports usage only in `turn.completed`
+  (its `item.*` events carry none; see `_parse_jsonl` in
+  `modules/codex_worker.py`), so a Codex run - like a local or unstreamed
+  run - can only be checked when it ends.
+- `NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE=enforce`: when earlier runs plus the
+  current count exceed the limit, a live Claude worker is stopped at once, a
+  Codex run is judged at its end, and the experiment ends in `needs_review`
+  with `experiment token budget exceeded: stop_reason=<live_count_worker_stopped|end_of_run_count>, budget=<N>, consumed=<M>`.
+  No fallback, verification or repair run starts after that, and a
+  cancellation or stall-sweep outcome is never overwritten. Any other value is
+  shadow mode: usage and a single crossing warning are recorded, but
+  execution continues.
 
 Optional, for the experiment stall sweep (issue #400). The API every 5 minutes,
 and every `nexus_tick` run (at the start and every 5 minutes while it waits for

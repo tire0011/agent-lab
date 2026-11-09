@@ -15,6 +15,7 @@ from modules.verification_runner import VerificationRunResult
 from ..models import (
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
+    STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_SELECTING,
     STATUS_VERIFYING,
@@ -96,6 +97,15 @@ def stall_grace_seconds(raw: str | None = None) -> float:
 def _is_stalled(status: str | None, error: str | None) -> bool:
     """Whether the stall sweep ended this experiment (#400)."""
     return status == STATUS_FAILED and str(error or "").startswith(_STALLED_ERROR_PREFIX)
+
+
+# Error prefix of experiments ended by the token budget in enforce mode (#533).
+TOKEN_BUDGET_STOP_PREFIX = "experiment token budget exceeded"
+
+
+def _is_budget_stop(status: str | None, error: str | None) -> bool:
+    """Whether enforce mode ended this experiment for its token budget (#533)."""
+    return status == STATUS_NEEDS_REVIEW and str(error or "").startswith(TOKEN_BUDGET_STOP_PREFIX)
 
 
 def worktree_retention_hours(raw: str | None = None) -> float:

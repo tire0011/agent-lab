@@ -58,7 +58,9 @@ from .core import (
     _GITHUB_ISSUE_GOAL_RE,
     _INTERRUPTED_BY_RESTART_ERROR,
     _WARNING_STATUSES,
+    TOKEN_BUDGET_STOP_PREFIX,
     _experiment_token_budget,
+    _is_budget_stop,
     _is_stalled,
     worker_run_token_total,
 )
@@ -194,13 +196,37 @@ class RecordsMixin:
 
 
     def _ended_from_outside(self, experiment_id: str) -> bool:
-        """Cancelled by an operator or failed by the stall sweep while running.
+        """Cancelled by an operator, failed by the stall sweep, or stopped by the
+        token budget in enforce mode (#533) while running.
 
         The pipeline thread checks this after every blocking step and stops instead of
-        overwriting the outcome.
+        overwriting the outcome or starting another paid run.
         """
         experiment = self.get_experiment(experiment_id)
-        return experiment.status == STATUS_CANCELLED or _is_stalled(experiment.status, experiment.error)
+        return (
+            experiment.status == STATUS_CANCELLED
+            or _is_stalled(experiment.status, experiment.error)
+            or _is_budget_stop(experiment.status, experiment.error)
+        )
+
+
+    def _stop_for_token_budget(
+        self, experiment_id: str, total: int, stop_reason: str
+    ) -> None:
+        """End the experiment in ``needs_review`` because enforce mode's budget is crossed.
+
+        An outcome set from outside (cancel, stall sweep, an earlier budget stop) wins.
+        """
+        if self._ended_from_outside(experiment_id):
+            return
+        self._force_status(
+            experiment_id, STATUS_NEEDS_REVIEW,
+            ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
+            error=(
+                f"{TOKEN_BUDGET_STOP_PREFIX}: stop_reason={stop_reason}, "
+                f"budget={self.experiment_token_budget}, consumed={total}"
+            ),
+        )
 
 
     @staticmethod
@@ -478,7 +504,8 @@ class RecordsMixin:
             total = int(previous.get("tokens_consumed", 0)) + run_tokens
             run_count = int(previous.get("token_run_count", 0)) + 1
             already_warned = bool(previous.get("token_budget_warning_logged", False))
-            crossed = total > self.experiment_token_budget and not already_warned
+            over = total > self.experiment_token_budget
+            crossed = over and not already_warned
             persisted = dict(usage) if isinstance(usage, dict) else {}
             persisted.update(
                 token_budget=self.experiment_token_budget,
@@ -492,13 +519,14 @@ class RecordsMixin:
                 (encoded, experiment_id),
             )
 
+        enforcing = self.experiment_token_budget_mode == "enforce"
         if crossed:
-            enforcing = self.experiment_token_budget_mode == "enforce"
             elog.warning(
                 "implementation",
                 "token_budget_exceeded",
                 (
-                    "Experiment token budget exceeded; worker run ended for review"
+                    "Experiment token budget exceeded at the end of a worker run; "
+                    "experiment ends for review"
                     if enforcing else
                     "Experiment token budget exceeded (shadow mode; execution continues)"
                 ),
@@ -507,15 +535,6 @@ class RecordsMixin:
                 run_count=run_count,
                 mode=self.experiment_token_budget_mode,
             )
-            if enforcing:
-                self._force_status(
-                    experiment_id, STATUS_NEEDS_REVIEW,
-                    ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
-                    error=(
-                        f"experiment token budget exceeded: budget={self.experiment_token_budget}, "
-                        f"consumed={total}; worker run completed before usage was available"
-                    ),
-                )
         else:
             # ``nexus logs`` reads this same structured stream, so the current
             # shadow total is visible even before crossing (and after the one
@@ -528,6 +547,10 @@ class RecordsMixin:
                 total=total,
                 run_count=run_count,
             )
+        if enforcing and over:
+            # Codex reports usage only on ``turn.completed`` (and Claude only when no
+            # live count was possible), so the run has already finished here.
+            self._stop_for_token_budget(experiment_id, total, "end_of_run_count")
         return encoded
 
 
@@ -575,36 +598,28 @@ class RecordsMixin:
                     (json.dumps(previous), experiment_id),
                 )
 
+            enforcing = self.experiment_token_budget_mode == "enforce"
             if crossed and not already_warned:
-                enforcing = self.experiment_token_budget_mode == "enforce"
-                message = (
-                    "Experiment token budget exceeded; worker stopped for review"
-                    if enforcing else
-                    "Experiment token budget exceeded (shadow mode; execution continues)"
-                )
                 elog.warning(
-                    "implementation", "token_budget_exceeded", message,
+                    "implementation", "token_budget_exceeded",
+                    (
+                        "Experiment token budget exceeded; worker stopped for review"
+                        if enforcing else
+                        "Experiment token budget exceeded (shadow mode; execution continues)"
+                    ),
                     budget=self.experiment_token_budget, total=total,
-                    run_count=run_count, mode=self.experiment_token_budget_mode,
+                    run_count=run_count, mode=self.experiment_token_budget_mode, live=True,
                 )
-                if enforcing:
-                    reason = (
-                        f"experiment token budget exceeded: budget={self.experiment_token_budget}, "
-                        f"consumed={total}; worker stopped"
-                    )
-                    self._force_status(
-                        experiment_id, STATUS_NEEDS_REVIEW,
-                        ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
-                        error=reason,
-                    )
-                    return True
-            else:
+            elif not crossed:
                 elog.info(
                     "implementation", "token_budget_updated",
                     f"Experiment token usage updated ({self.experiment_token_budget_mode} mode)",
                     budget=self.experiment_token_budget, total=total,
                     run_count=run_count, live=True,
                 )
+            if enforcing and crossed:
+                self._stop_for_token_budget(experiment_id, total, "live_count_worker_stopped")
+                return True
             return False
 
         return observe, state
