@@ -191,7 +191,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             error TEXT NULL,
             policy_rule TEXT NULL,
             quality_evaluation_json TEXT NULL,
-            baseline_test_classifications_json TEXT NULL
+            baseline_test_classifications_json TEXT NULL,
+            rechecked_experiment_id TEXT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
@@ -321,6 +322,8 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # Process group of the live worker, so the stall sweep (#400) can stop it
     # from another process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),
+    # Source needs_review run whose quality gate was re-evaluated (#511).
+    ("rechecked_experiment_id", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
@@ -338,6 +341,11 @@ def _migrate_experiments_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE experiments ADD COLUMN {column_name} {column_type} NULL"
             )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_experiments_rechecked_source "
+        "ON experiments(rechecked_experiment_id) "
+        "WHERE rechecked_experiment_id IS NOT NULL"
+    )
 
 
 def _migrate_codex_tasks_columns(conn: sqlite3.Connection) -> None:

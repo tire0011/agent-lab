@@ -22,11 +22,13 @@ from modules import github_authorization
 from modules import issue_approvals
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
+from modules.experiment_service.gate_recheck import gate_recheck
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
 from modules.nexus_planner import PROPOSAL_LABEL
 from modules.nexus_sources import issue_source
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH
+from modules.run_store import insert_activity
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,7 @@ _LOCAL_ONLY = "local_only"
 # An issue whose last attempt the reviewer blocked: retried at once and free of
 # the daily budget, so review findings go straight back to the coder.
 REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findings"
+GATE_RECHECK_REASON = "today's quality gate would accept the previous experiment"
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
@@ -284,6 +287,22 @@ class NexusInitiativeService:
                 )
                 """
             )
+            # ExperimentService normally performs this additive migration. Keep
+            # initiative usable with small/fake stores and during rolling deploys.
+            try:
+                columns = {row[1] for row in self._conn.execute("PRAGMA table_info(experiments)")}
+                if columns and "rechecked_experiment_id" not in columns:
+                    self._conn.execute(
+                        "ALTER TABLE experiments ADD COLUMN rechecked_experiment_id TEXT NULL"
+                    )
+                if columns:
+                    self._conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_experiments_rechecked_source "
+                        "ON experiments(rechecked_experiment_id) "
+                        "WHERE rechecked_experiment_id IS NOT NULL"
+                    )
+            except sqlite3.OperationalError:
+                pass
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_initiative_created
@@ -404,9 +423,9 @@ class NexusInitiativeService:
             """
             SELECT COUNT(*) AS n FROM nexus_initiative_log
             WHERE decision = 'dispatched' AND created_at >= ?
-              AND COALESCE(reason, '') != ?
+              AND COALESCE(reason, '') NOT IN (?, ?)
             """,
-            (since, REVIEW_RETRY_REASON),
+            (since, REVIEW_RETRY_REASON, GATE_RECHECK_REASON),
         ).fetchone()
         spent = int(row["n"]) if row else 0
         # The first adoption of fresh verified work is not new work (#538).
@@ -589,6 +608,73 @@ class NexusInitiativeService:
             if self._fails_goal_policy(candidate, skipped, policy_hash, record=record_skips):
                 continue
             candidates.append(candidate)
+        return candidates
+
+    def _gate_recheck_candidates(self) -> list[Candidate]:
+        """Quality-gate stops that became viable since they were judged (#511)."""
+        if (
+            self.controller is None
+            or self._issue_lister is None
+            or not callable(getattr(self.experiment_service, "list_gate_recheck_candidates", None))
+        ):
+            return []
+        try:
+            issues = self._issue_lister() or []
+            open_issues = {
+                int(issue["number"]): issue
+                for issue in issues
+                if issue.get("number") is not None
+                and str(issue.get("state") or "open").lower() == "open"
+            }
+            results = gate_recheck(self.experiment_service)
+        except Exception as exc:  # noqa: BLE001 - recheck must not disable initiative
+            logger.warning("initiative: quality gate recheck failed: %s", exc)
+            return []
+
+        candidates: list[Candidate] = []
+        for result in results:
+            source_id = str(result.get("id") or "")
+            number = result.get("issue_number")
+            if (
+                result.get("new_verdict") != "would_pass"
+                or not str(result.get("old_reason") or "").startswith("quality evaluation:")
+                or number not in open_issues
+                or not source_id
+            ):
+                continue
+            # The source can be linked only once, and #418 forbids starting
+            # beside any active experiment for this issue.
+            already = self._conn.execute(
+                "SELECT 1 FROM experiments WHERE rechecked_experiment_id = ? LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            source = self._conn.execute(
+                "SELECT status FROM experiments WHERE id = ? LIMIT 1", (source_id,)
+            ).fetchone()
+            active = self._conn.execute(
+                """
+                SELECT 1 FROM github_experiment_links l JOIN experiments e ON e.id=l.experiment_id
+                WHERE l.issue_number=? AND e.status IN ('queued','selecting','implementing','verifying')
+                LIMIT 1
+                """,
+                (int(number),),
+            ).fetchone()
+            if already or active or source is None or source["status"] != "needs_review":
+                continue
+            issue = open_issues[int(number)]
+            candidates.append(Candidate(
+                KIND_ISSUE, str(number), str(issue.get("title") or f"Issue #{number}")[:200],
+                GATE_RECHECK_REASON,
+                payload={
+                    "body": str(issue.get("body") or "")[:16000],
+                    "raw_title": str(issue.get("title") or f"Issue #{number}"),
+                    "raw_body": str(issue.get("body") or ""),
+                    "author_trusted": github_authorization.is_trusted_actor(
+                        github_authorization.api_actor_login(issue.get("author"))
+                    ),
+                    "rechecked_experiment_id": source_id,
+                },
+            ))
         return candidates
 
     def _comment_waiting_for_approval(self, number: int, reason: str) -> None:
@@ -864,6 +950,7 @@ class NexusInitiativeService:
                     SELECT l.issue_number AS issue_number,
                            l.experiment_id AS experiment_id, e.status AS status,
                            e.error AS error, e.created_at AS created_at, e.ended_at AS ended_at,
+                           e.rechecked_experiment_id AS rechecked_experiment_id,
                            a.status AS adoption_status, a.reason AS adoption_reason
                     FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
                     LEFT JOIN experiment_adoptions a ON a.experiment_id = l.experiment_id
@@ -886,6 +973,12 @@ class NexusInitiativeService:
                     continue
                 # An overloaded provider says nothing about the issue: not an attempt.
                 if _is_provider_overload(row["status"], row["error"]):
+                    continue
+                # This fresh verification exists because a gate changed; it is
+                # deliberately free of the ordinary issue retry allowance.
+                if "rechecked_experiment_id" in row.keys() and row["rechecked_experiment_id"]:
+                    if row["status"] not in _RETRYABLE_EXPERIMENT_STATUSES:
+                        blocked.add(number)
                     continue
                 if _is_pipeline_crash(row["status"], row["error"]):
                     crashes.setdefault(number, {})[str(row["experiment_id"])] = (
@@ -1060,7 +1153,9 @@ class NexusInitiativeService:
             self._record(decision, update=True)
         return decision
 
-    def candidates(self, *, record_skips: bool = True) -> list[Candidate]:
+    def candidates(
+        self, *, record_skips: bool = True, gate_rechecks: list[Candidate] | None = None
+    ) -> list[Candidate]:
         """All dispatchable work, best first.
 
         Work without a configured dispatcher is left out. ``record_skips=False``
@@ -1068,6 +1163,9 @@ class NexusInitiativeService:
         """
         found = list(self._integration_candidates()) if self.adoption_service is not None else []
         if self.controller is not None:
+            rechecks = self._gate_recheck_candidates() if gate_rechecks is None else gate_rechecks
+            if rechecks:
+                return found + rechecks
             issues = self._issue_candidates(record_skips=record_skips)
             retries = [c for c in issues if c.reason == REVIEW_RETRY_REASON]
             if retries:
@@ -1220,6 +1318,11 @@ class NexusInitiativeService:
                     self._record(decision, update=True)
             return decision
 
+        # Re-evaluate terminal quality decisions on every otherwise runnable
+        # tick, including when the new-work budget is exhausted. This is a
+        # verification retry caused by Nexus's gate changing, not new work.
+        gate_rechecks = self._gate_recheck_candidates()
+
         if self.daily_budget and self._spent_today() >= self.daily_budget:
             # Verified work is still adopted, and review findings still go back
             # to the coder, when the budget for new work is used up (#538).
@@ -1228,6 +1331,7 @@ class NexusInitiativeService:
                 if _FRESH_ADOPTION in c.reason and not self._adoption_dispatched_before(c.ref)
             ]
             if self.controller:
+                found += gate_rechecks
                 found += [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON]
             if not found:
                 return self._record(
@@ -1238,7 +1342,7 @@ class NexusInitiativeService:
                     )
                 )
         else:
-            found = self.candidates()
+            found = self.candidates(gate_rechecks=gate_rechecks)
         if not found:
             return self._record(
                 InitiativeDecision("idle", detail="no actionable work found", tick_id=tick_id)
@@ -1416,11 +1520,34 @@ class NexusInitiativeService:
             raise RuntimeError("no controller configured")
         if candidate.kind == KIND_ISSUE:
             self._announce_plan(candidate)
+            started_at = _utcnow().isoformat()
             self.controller.handle_issue(
                 int(candidate.ref),
                 title=candidate.title,
                 body=str(candidate.payload.get("body") or "") + self._earlier_attempts(int(candidate.ref)),
             )
+            source_id = candidate.payload.get("rechecked_experiment_id")
+            if source_id:
+                row = self._conn.execute(
+                    """
+                    SELECT e.id FROM experiments e JOIN github_experiment_links l ON l.experiment_id=e.id
+                    WHERE l.issue_number=? AND e.created_at>=? AND e.id != ?
+                    ORDER BY e.created_at DESC, e.id DESC LIMIT 1
+                    """,
+                    (int(candidate.ref), started_at, str(source_id)),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("gate recheck dispatch did not create an experiment")
+                with self._conn:
+                    self._conn.execute(
+                        "UPDATE experiments SET rechecked_experiment_id=? WHERE id=?",
+                        (str(source_id), str(row["id"])),
+                    )
+                    insert_activity(
+                        self._conn, timestamp=_utcnow().isoformat(), entity_type="experiment",
+                        entity_id=str(row["id"]), event="gate_recheck_requeued",
+                        message=f"rechecked_experiment_id={source_id}",
+                    )
             return
         if candidate.kind == KIND_IDEA:
             self.controller.handle_idea(candidate.ref)

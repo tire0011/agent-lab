@@ -162,6 +162,7 @@ class Experiment:
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
     baseline_test_classifications: dict[str, str] | None = None
+    rechecked_experiment_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -219,6 +220,7 @@ class Experiment:
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
             "baseline_test_classifications": self.baseline_test_classifications,
+            "rechecked_experiment_id": self.rechecked_experiment_id,
         }
 
 
@@ -290,6 +292,8 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
             _json_or_none(row["baseline_test_classifications_json"])
             if "baseline_test_classifications_json" in row.keys() else None
         ),
+        rechecked_experiment_id=(
+            row["rechecked_experiment_id"] if "rechecked_experiment_id" in row.keys() else None
+        ),
     )
-
 
