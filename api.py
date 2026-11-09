@@ -783,6 +783,7 @@ from api_routers.experiments import (  # noqa: E402
     cancel_experiment,
     get_experiment,
     get_experiment_adoption,
+    get_experiment_drift,
     get_public_experiment,
     list_experiments,
 )

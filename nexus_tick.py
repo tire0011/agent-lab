@@ -82,6 +82,13 @@ def _main_commit_date(repo_root: str) -> str:
     return proc.stdout.strip()
 
 
+def _branch_drift(repo_root: str, branch: str, worktree: str | None, fetch: bool) -> dict:
+    """How far an experiment branch is behind ``origin/main`` (#489)."""
+    from modules.branch_drift import branch_drift
+
+    return branch_drift(branch, repo_root=repo_root, worktree_path=worktree, fetch=fetch)
+
+
 def _list_open_issues(repo_root: str) -> list[dict]:
     """The open GitHub issue backlog available to Nexus (no label gate).
 
@@ -295,6 +302,7 @@ def _build_service(args) -> NexusInitiativeService:
         diagnostics_client=_service_diagnostics,
         checkout_revision=lambda: _checkout_revision(args.repo_root),
         main_commit_date=lambda: _main_commit_date(args.repo_root),
+        branch_drift=lambda branch, worktree, fetch=True: _branch_drift(args.repo_root, branch, worktree, fetch),
         restart_hook=_restart_stale_service,
         daily_budget=args.daily_budget,
     )

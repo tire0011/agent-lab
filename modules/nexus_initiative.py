@@ -213,6 +213,7 @@ class NexusInitiativeService:
         restart_hook: Callable[[], None] | None = None,
         main_commit_date: Callable[[], str] | None = None,
         repository: str | None = None,
+        branch_drift: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -230,6 +231,9 @@ class NexusInitiativeService:
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
+        # #489: ``(branch, worktree_path, fetch=bool) -> drift dict`` so the
+        # planner sees how stale an unmerged experiment branch is.
+        self._branch_drift = branch_drift
         # The repository whose issues this service may execute; checked against
         # the approval registry at candidate scan and again at dispatch.
         self._repository = issue_approvals.normalize_repository(
@@ -1085,8 +1089,14 @@ class NexusInitiativeService:
         """What Nexus tried lately and how it ended, including the newest adoption outcome (#439)."""
         with_adoption = True
         try:
+            columns = {r[1] for r in self._conn.execute("PRAGMA table_info(experiments)").fetchall()}
+            branch_columns = (
+                "e.branch_name, e.worktree_path"
+                if {"branch_name", "worktree_path"} <= columns
+                else "NULL AS branch_name, NULL AS worktree_path"
+            )
             rows = self._conn.execute(
-                "SELECT e.goal, e.status, e.error, "
+                "SELECT e.goal, e.status, e.error, " + branch_columns + ", "
                 "a.status AS adoption_status, a.reason AS adoption_reason "
                 "FROM experiments e "
                 "LEFT JOIN experiment_adoptions a ON a.rowid = ("
@@ -1106,6 +1116,7 @@ class NexusInitiativeService:
             except sqlite3.OperationalError:
                 return []
         recent = []
+        fetched = False
         for row in rows:
             lines = str(row["goal"] or "").strip().splitlines()
             entry = {
@@ -1116,8 +1127,31 @@ class NexusInitiativeService:
             if with_adoption:
                 entry["adoption_status"] = str(row["adoption_status"] or "")
                 entry["adoption_reason"] = " ".join(str(row["adoption_reason"] or "").split())[:200]
+                fetched = self._add_drift(entry, row, fetched)
             recent.append(entry)
         return recent
+
+    def _add_drift(self, entry: dict[str, str], row: sqlite3.Row, fetched: bool) -> bool:
+        """Add ``commits_behind``/``overlap_files`` for an unmerged branch (#489).
+
+        ``origin/main`` is fetched once per planning call, not per experiment.
+        Returns whether that fetch already happened.
+        """
+        branch = row["branch_name"]
+        if self._branch_drift is None or not branch or entry.get("adoption_status") in ("adopted", "succeeded"):
+            return fetched
+        try:
+            drift = self._branch_drift(branch, row["worktree_path"], fetch=not fetched)
+        except Exception as exc:  # noqa: BLE001 - planning goes on without drift
+            logger.warning("initiative: branch drift for %s failed: %s", branch, exc)
+            return fetched
+        if drift.get("status") == "ok":
+            entry["commits_behind"] = str(drift.get("commits_behind"))
+            entry["overlap_files"] = ", ".join(list(drift.get("overlap_files") or [])[:5])
+        else:
+            entry["commits_behind"] = "unknown"
+            entry["overlap_files"] = ""
+        return True
 
     def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:
         """The one issue the planner picks as next, or none (#354).

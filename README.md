@@ -255,6 +255,8 @@ Available MCP tools mirror the current **read-only** Nexus API surface:
 - `codex_tasks_list`, `codex_task_get`
 - `mailbox_tasks_list`, `mailbox_task_get`, `mailbox_messages_list`
 - `experiments_list`, `experiment_get`, `experiment_logs`,
+  `experiment_drift` (`GET /experiments/{id}/drift`: commits behind
+  `origin/main`, files changed on both sides — `overlap_files`),
   `experiment_adoption_get`, `experiment_public_get`
 - `activity_public_list`, `activity_list`, `diagnostics_public_get`
 - `operations_catalog_get`, `operation_chains_list`, `operation_chain_get`
