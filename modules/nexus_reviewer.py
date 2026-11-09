@@ -59,9 +59,15 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
         "has a bug, it weakens security or safety checks, it deletes or changes "
         "unrelated behaviour, or it adds something dangerous. Style and small "
         "improvements are not a reason to block.\n\n"
+        "When you block, list EVERY blocking problem you find, not only the "
+        "first: the change gets one more attempt and must be able to fix all of "
+        "them at once. Check the failure paths too (a call that raises, a "
+        "partial write, a retry).\n\n"
         "Answer with exactly one JSON object and nothing else:\n"
         '{"verdict": "approve" or "block", "summary": "<two or three sentences: '
-        'what the change does and, if blocked, exactly what is wrong>"}\n\n'
+        'what the change does>", "problems": ["<each blocking problem: what is '
+        'wrong, where, and what to change>", ...]}\n'
+        '"problems" is empty when you approve.\n\n'
         + (
             "QUALITY GATE FINDINGS: a deterministic check that reads file paths "
             "out of the task text flagged this change: "
@@ -84,6 +90,13 @@ def parse_review(raw: str) -> tuple[str, str] | None:
     summary = " ".join(str(data.get("summary") or "").split())[:1500]
     if verdict not in (VERDICT_APPROVE, VERDICT_BLOCK) or not summary:
         return None
+    problems = data.get("problems")
+    if verdict == VERDICT_BLOCK and isinstance(problems, list):
+        items = [" ".join(str(p).split()) for p in problems if str(p).strip()]
+        if items:
+            # Every finding in one reason, so the retry can fix them all.
+            listed = " ".join(f"({i}) {p[:600]}" for i, p in enumerate(items[:8], 1))
+            summary = f"{summary} Blocking problems: {listed}"[:4000]
     return verdict, summary
 
 
