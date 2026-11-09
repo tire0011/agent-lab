@@ -538,6 +538,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         # Before the busy check, so a hung experiment does not block this tick.
         _sweep_stalled_experiments(service)
+        from modules import nexus_status_issue
+
+        nexus_status_issue.update_for(service, args.repo_root)
     try:
         if not args.dry_run and service.controller is not None:
             resume = service.resume_blocked_capability()

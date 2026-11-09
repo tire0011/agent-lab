@@ -565,6 +565,8 @@ class NexusInitiativeService:
                             tick_id=uuid.uuid4().hex,
                         )
                     )
+                    # Once per issue: say why it waits and what unlocks it (SKILL.md).
+                    self._comment_waiting_for_approval(int(number), verdict.reason)
                 logger.info("initiative: issue #%s not eligible: %s", number, verdict.reason)
                 continue
             candidate = Candidate(
@@ -588,6 +590,21 @@ class NexusInitiativeService:
                 continue
             candidates.append(candidate)
         return candidates
+
+    def _comment_waiting_for_approval(self, number: int, reason: str) -> None:
+        if self._issue_commenter is None:
+            return
+        try:
+            self._issue_commenter(
+                number,
+                "Nexus has not started this issue: it waits for the owner's approval.\n\n"
+                f"- rule: `owner-approval-required`\n- reason: {reason}\n"
+                "- unlock: the owner approves this issue through the private mailbox. "
+                "Editing the issue after approval needs a new approval.\n\n"
+                "See SKILL.md for how outside agents take part.",
+            )
+        except Exception as exc:  # noqa: BLE001 - a comment never blocks the tick
+            logger.warning("initiative: approval comment failed for #%s: %s", number, exc)
 
     def _unapproved_issue_skips(self) -> set[str]:
         """Issue refs already recorded as skipped for missing/invalid approval."""
