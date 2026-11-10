@@ -15,6 +15,7 @@ from modules.verification_runner import VerificationRunResult
 from ..models import (
     STATUS_FAILED,
     STATUS_IMPLEMENTING,
+    STATUS_NEEDS_REVIEW,
     STATUS_QUEUED,
     STATUS_SELECTING,
     STATUS_VERIFYING,
@@ -50,6 +51,7 @@ _DEFAULT_MAX_REPAIR_ITERATIONS = 2
 BASELINE_RECHECK_ENV_VAR = "NEXUS_BASELINE_RECHECK_SECONDS"
 DEFAULT_BASELINE_RECHECK_SECONDS = 120.0
 EXPERIMENT_TOKEN_BUDGET_ENV_VAR = "NEXUS_EXPERIMENT_TOKEN_BUDGET"
+EXPERIMENT_TOKEN_BUDGET_MODE_ENV_VAR = "NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE"
 
 # Error recorded on experiments whose thread died with the process (#281).
 _INTERRUPTED_BY_RESTART_ERROR = "interrupted by service restart"
@@ -95,6 +97,15 @@ def stall_grace_seconds(raw: str | None = None) -> float:
 def _is_stalled(status: str | None, error: str | None) -> bool:
     """Whether the stall sweep ended this experiment (#400)."""
     return status == STATUS_FAILED and str(error or "").startswith(_STALLED_ERROR_PREFIX)
+
+
+# Error prefix of experiments ended by the token budget in enforce mode (#533).
+TOKEN_BUDGET_STOP_PREFIX = "experiment token budget exceeded"
+
+
+def _is_budget_stop(status: str | None, error: str | None) -> bool:
+    """Whether enforce mode ended this experiment for its token budget (#533)."""
+    return status == STATUS_NEEDS_REVIEW and str(error or "").startswith(TOKEN_BUDGET_STOP_PREFIX)
 
 
 def worktree_retention_hours(raw: str | None = None) -> float:
@@ -226,5 +237,4 @@ def _baseline_verdict(test_id: str, result: VerificationRunResult) -> str:
 # Default test interpreter inside a worktree: the main repo's venv python, so no files
 # are copied and no package installed - the worktree is only the command's cwd.
 _DEFAULT_TEST_PYTHON_EXECUTABLE = "/agent/.venv/bin/python"
-
 

@@ -671,6 +671,31 @@ class IssuesOutOfAttemptsTests(unittest.TestCase):
         svc = self._service(issues=self.ISSUES[:1])
         return svc._issue_attempts()
 
+    def _review_block(self, exp_id, ended):
+        self._fail(exp_id, status="succeeded", adoption="failed",
+                   reason="Review by codex blocked the merge: edge case", ended=ended)
+
+    def test_two_review_blocks_leave_a_third_attempt(self):
+        # #598, #614, #489, #533: each second attempt was close and stopped
+        # only at a new reviewer's findings.
+        self._review_block("e1", "2026-10-01T00:00:00+00:00")
+        self._review_block("e2", "2026-10-02T00:00:00+00:00")
+        blocked, exhausted = self._attempts()
+        self.assertNotIn(232, blocked)
+        self.assertNotIn(232, exhausted)
+
+        self._review_block("e3", "2026-10-03T00:00:00+00:00")
+        blocked, exhausted = self._attempts()
+        self.assertIn(232, blocked)
+        self.assertEqual(exhausted[232]["experiment_ids"], ["e1", "e2", "e3"])
+
+    def test_a_test_failure_plus_a_review_block_stays_at_two_attempts(self):
+        self._fail("e1", error="tests failed", ended="2026-10-01T00:00:00+00:00")
+        self._review_block("e2", "2026-10-02T00:00:00+00:00")
+        blocked, exhausted = self._attempts()
+        self.assertIn(232, blocked)
+        self.assertIn(232, exhausted)
+
     def test_a_single_integration_conflict_leaves_the_issue_free(self):
         self._conflict("e1", ended="2026-10-01T00:00:00+00:00")
 
