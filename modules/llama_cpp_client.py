@@ -184,6 +184,28 @@ class LlamaCppClient:
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
 
+    async def busy_slots(self) -> int | None:
+        """How many server slots are processing a request (``GET /slots``).
+
+        ``None`` when the server does not expose ``/slots`` (it is off unless
+        llama-server runs with ``--slots``/``--metrics`` on some versions), so a
+        caller can tell "idle" from "unknown". Connection errors propagate.
+        """
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{self.server_root}/slots")
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        if not isinstance(data, list):
+            return None
+        return sum(
+            1 for slot in data
+            if isinstance(slot, dict) and (slot.get("is_processing") or slot.get("state") == 1)
+        )
+
     # Instance method kept for backward compatibility; delegates to the module-level
     # function, which needs no client state.
     def extract_json(self, text: str) -> dict[str, Any]:

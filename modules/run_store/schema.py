@@ -307,6 +307,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_failure_analyses(conn)
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
+    _migrate_local_replays(conn)
     conn.commit()
     return conn
 
@@ -915,5 +916,47 @@ def _migrate_benchmark_runs(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_benchmark_runs_started_at
             ON benchmark_runs(started_at);
+        """
+    )
+
+
+def _migrate_local_replays(conn: sqlite3.Connection) -> None:
+    """Create local_replays (#637): one local shadow replay of a merged experiment.
+
+    One row per (experiment, prompt variant). ``status`` is ``pending`` while a
+    replay holds the claim (``claim_token``/``lease_expires_at``), ``scored``
+    when the merged tests ran on the local result, ``no_tests`` when the merged
+    diff changed no test file, and ``error`` when the replay could not be set up.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS local_replays (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL,
+            issue INTEGER NULL,
+            model TEXT NOT NULL DEFAULT '',
+            prompt_variant TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'scored', 'no_tests', 'error')),
+            patch_applied INTEGER NOT NULL DEFAULT 0 CHECK (patch_applied IN (0, 1)),
+            compiled INTEGER NOT NULL DEFAULT 0 CHECK (compiled IN (0, 1)),
+            tests_total INTEGER NOT NULL DEFAULT 0,
+            tests_passed INTEGER NOT NULL DEFAULT 0,
+            rounds INTEGER NOT NULL DEFAULT 0,
+            tokens INTEGER NOT NULL DEFAULT 0,
+            seconds REAL NOT NULL DEFAULT 0,
+            error TEXT NULL,
+            base_commit TEXT NULL,
+            merged_commit TEXT NULL,
+            test_files_json TEXT NULL,
+            created_at TEXT NOT NULL,
+            finished_at TEXT NULL,
+            claim_token TEXT NULL,
+            lease_expires_at TEXT NULL,
+            UNIQUE(experiment_id, prompt_variant)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_local_replays_created_at
+            ON local_replays(created_at);
         """
     )

@@ -252,6 +252,7 @@ class OperationsRegistry:
             "branch_drift": OperationSpec("branch_drift", "Branch-Abstand und überlappende Dateien eines Experiments zu aktuellem main.", [experiment_id], ["experiment", "branch", "drift", "conflict", "overlap"], mutates_state=False),
             "experiment_reflection": OperationSpec("experiment_reflection", "Gespeicherte Reflexion (Verbesserungsvorschläge) zu einem Experiment.", [experiment_id], ["experiment", "reflection", "suggestions", "lessons", "ideas"], mutates_state=False),
             "reflections_list": OperationSpec("reflections_list", "Neueste gespeicherte Experiment-Reflexionen mit ihren Vorschlägen.", [limit10], ["reflection", "suggestions", "lessons", "ideas", "history"], mutates_state=False),
+            "local_replays_list": OperationSpec("local_replays_list", "Lokale Shadow-Replays gemergter Experimente mit lokaler Test-Passrate je Prompt-Variante.", [limit10], ["local", "replay", "benchmark", "pass rate", "variant", "local model"], mutates_state=False),
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
             "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
@@ -647,6 +648,43 @@ class OperationsRegistry:
         for stored in list_reflections(limit, db_path=self.db_path):
             lines.extend(self._reflection_lines(stored))
         return OperationResult("reflections_list", True, lines or ["(no reflections stored)"], 0)
+
+    def _op_local_replays_list(self, args: dict[str, Any]) -> OperationResult:
+        from modules.local_shadow_replay import list_replays, variant_summary
+
+        limit = self._limit(args, default=10, maximum=200)
+        summary = variant_summary(db_path=self.db_path)
+        lines: list[str] = []
+        for stats in summary["variants"]:
+            rate = stats["test_pass_rate"]
+            full = stats["full_pass_rate"]
+            lines.append(
+                f"variant {stats['prompt_variant']}: {stats['replays']} replays, {stats['scored']} scored, "
+                f"tests {stats['tests_passed']}/{stats['tests_total']}"
+                + (f" ({rate:.0%})" if rate is not None else "")
+                + f", all tests passed in {stats['full_passes']}/{stats['scored']}"
+                + (f" ({full:.0%})" if full is not None else "")
+                + f", no tests {stats['no_tests']}, errors {stats['errors']}"
+            )
+        if summary["common"]:
+            lines.append(f"on the {summary['common_experiments']} experiments scored under every variant:")
+            for stats in summary["common"]:
+                lines.append(
+                    f"  {stats['prompt_variant']}: tests {stats['tests_passed']}/{stats['tests_total']}, "
+                    f"all passed {stats['full_passes']}/{stats['scored']}"
+                )
+        for row in list_replays(limit, db_path=self.db_path):
+            line = (
+                f"replay {row['experiment_id']} [{row['prompt_variant']}] issue "
+                f"{'#' + str(row['issue']) if row['issue'] else '-'}: {row['status']}, "
+                f"tests {row['tests_passed']}/{row['tests_total']}, patch "
+                f"{'applied' if row['patch_applied'] else 'none'}, rounds {row['rounds']}, "
+                f"{row['seconds']:.0f}s"
+            )
+            if row.get("error"):
+                line += f" | {sanitized_reason(str(row['error']))}"
+            lines.append(redact(line)[:500])
+        return OperationResult("local_replays_list", True, lines or ["(no local replays stored)"], 0)
 
     def _op_branch_drift(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)

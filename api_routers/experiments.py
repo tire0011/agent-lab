@@ -5,10 +5,12 @@ from models import (
     ExperimentDrift,
     ExperimentReflection,
     ExperimentsResponse,
+    LocalReplay,
+    LocalReplaysResponse,
     PublicExperimentSummary,
     ReflectionsResponse,
 )
-from modules import experiment_reflection
+from modules import experiment_reflection, local_shadow_replay
 from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import ExperimentService
 
@@ -30,6 +32,8 @@ EXPERIMENTS_DEFAULT_LIMIT = 20
 EXPERIMENTS_MAX_LIMIT = 100
 REFLECTIONS_DEFAULT_LIMIT = 20
 REFLECTIONS_MAX_LIMIT = 100
+LOCAL_REPLAYS_DEFAULT_LIMIT = 20
+LOCAL_REPLAYS_MAX_LIMIT = 200
 
 
 # Experiment and activity log endpoints: thin routes over the existing
@@ -135,6 +139,28 @@ def list_reflections(
     stored = experiment_reflection.list_reflections(limit, db_path=_reflection_db_path(service))
     reflections = [_reflection_payload(item) for item in stored]
     return ReflectionsResponse(count=len(reflections), reflections=reflections)
+
+
+@router.get("/local-replays", response_model=LocalReplaysResponse)
+def list_local_replays(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=LOCAL_REPLAYS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=LOCAL_REPLAYS_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> LocalReplaysResponse:
+    """Local shadow replays (#637), newest first, with the local pass rate per variant.
+
+    ``variants`` aggregates every finished replay (not only the listed ones);
+    ``common`` only the experiments scored under every variant.
+    """
+    api.authorize(x_api_key)
+    db_path = _reflection_db_path(service)
+    replays = []
+    for item in local_shadow_replay.list_replays(limit, db_path=db_path):
+        if item.get("error"):
+            item["error"] = redaction.redact(str(item["error"]))
+        replays.append(LocalReplay(**item))
+    summary = local_shadow_replay.variant_summary(db_path=db_path)
+    return LocalReplaysResponse(count=len(replays), replays=replays, **summary)
 
 
 @router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)

@@ -413,6 +413,31 @@ def _wait_for_experiments(service=None) -> None:
                     _sweep_stalled_experiments(service)
 
 
+def _shadow_replay(repo_root: str, db_path: str) -> None:
+    """One local shadow replay of a merged paid experiment (#637), best effort.
+
+    Runs after this tick's own work has ended, only when the local
+    llama-server is reachable and idle; free resources only, it never touches
+    main, a branch or GitHub. A failure never fails the tick.
+    """
+    from modules import local_shadow_replay
+
+    try:
+        outcome = local_shadow_replay.replay_next(repo_root=repo_root, db_path=db_path)
+    except Exception as exc:  # noqa: BLE001 - the replay never owns the tick
+        logger.warning("local shadow replay failed: %s", exc)
+        return
+    if outcome["ran"]:
+        row = outcome["replay"] or {}
+        logger.info(
+            "local shadow replay of %s (%s): %s, %s/%s tests passed",
+            outcome["experiment_id"], row.get("prompt_variant"), row.get("status"),
+            row.get("tests_passed"), row.get("tests_total"),
+        )
+    else:
+        logger.info("no local shadow replay: %s", outcome["reason"])
+
+
 def _finished_badly(db_path: str, since: str) -> list[str]:
     """Experiments and adoptions that ended without success since *since*."""
     found: list[str] = []
@@ -611,6 +636,8 @@ def main(argv: list[str] | None = None) -> int:
         _wait_for_experiments(None if args.dry_run else service)
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
+            if not args.integration_only:
+                _shadow_replay(args.repo_root, args.db_path)
         service.close()
         if not args.dry_run:
             if decision is not None and decision.decision == "error":

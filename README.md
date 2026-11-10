@@ -113,7 +113,9 @@ them.
   retries while it is 1; running experiments finish. Note that
   `daily_budget` 0 means no limit, not a pause. `reflection_enabled` (1/0,
   default 1) enables or disables the bounded local-model sweep that reflects
-  finished experiments after each initiative tick.
+  finished experiments after each initiative tick. `shadow_replay_enabled`
+  (1/0, default 1) enables or disables the local shadow replay of merged paid
+  experiments after each tick (#637).
   `planner_mission` replaces the planner's mission text with the message
   body (up to 4000 characters); a body of `default` restores the built-in one.
 
@@ -260,6 +262,9 @@ Available MCP tools mirror the current **read-only** Nexus API surface:
   `experiment_adoption_get`, `experiment_public_get`
 - `experiment_reflection_get`, `reflections_list` (stored post-experiment
   reflections; `GET /experiments/{id}/reflection`, `GET /reflections?limit=`)
+- `local_replays_list` (local shadow replays of merged paid experiments with
+  the local pass rate per prompt variant; `GET /local-replays?limit=`, #637;
+  see `OPERATIONS.md` "Local shadow replay")
 - `activity_public_list`, `activity_list`, `diagnostics_public_get`
 - `operations_catalog_get`, `operation_chains_list`, `operation_chain_get`
 - `maintenance_status_get`, `maintenance_audit_get`
