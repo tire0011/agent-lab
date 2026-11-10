@@ -248,6 +248,7 @@ class OperationsRegistry:
         return {
             "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts.", tags=["disk", "storage", "filesystem", "usage"], mutates_state=False),
             "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50], ["experiment", "logs", "jsonl", "history"], mutates_state=False),
+            "experiment_drift": OperationSpec("experiment_drift", "Wie weit der Branch eines Experiments hinter main liegt und welche seiner Dateien main seitdem geändert hat (nur lesend; aktualisiert nur origin/main).", [experiment_id], ["experiment", "branch", "drift", "behind", "main", "conflict", "overlap", "stale", "merge"], mutates_state=False),
             "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id], ["experiment", "status", "summary", "inspect"], mutates_state=False),
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
@@ -597,6 +598,36 @@ class OperationsRegistry:
                 lines.append("test_failure_tail:")
                 lines.extend(f"  {line}" for line in tail)
         return OperationResult("experiment_show", True, lines, 0)
+
+    def _op_experiment_drift(self, args: dict[str, Any]) -> OperationResult:
+        from modules.branch_drift import branch_drift
+
+        started = time.perf_counter()
+        experiment = self._experiment(args)
+        drift = branch_drift(
+            experiment.branch_name,
+            repo_root=str(self.repo_root),
+            worktree_path=experiment.worktree_path,
+            runner=self.subprocess_runner,
+        )
+        lines = [
+            f"id: {experiment.id}",
+            f"branch: {drift['branch'] or '-'}",
+            f"drift_status: {drift['status']}",
+        ]
+        if drift["status"] != "ok":
+            lines.append(f"reason: {drift['reason']}")
+        else:
+            lines += [
+                f"commits_behind: {drift['commits_behind']}",
+                f"commits_ahead: {drift['commits_ahead']}",
+                f"files_changed_on_branch: {', '.join(drift['files_changed_on_branch']) or '-'}",
+                f"files_changed_on_main_since_base: {', '.join(drift['files_changed_on_main_since_base'][:50]) or '-'}",
+                f"overlap_files: {', '.join(drift['overlap_files']) or '-'}",
+            ]
+        if drift.get("fetch_error"):
+            lines.append(f"fetch_error: {sanitized_reason(drift['fetch_error'])}")
+        return OperationResult("experiment_drift", True, lines, int((time.perf_counter() - started) * 1000))
 
     def _op_experiment_logs(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)

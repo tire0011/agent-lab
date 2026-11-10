@@ -181,6 +181,26 @@ class ExperimentAdoptionFailure(BaseModel):
     superseded_by: str
 
 
+class ExperimentDrift(BaseModel):
+    """How far an experiment's branch is behind origin/main (#489)."""
+
+    experiment_id: str
+    status: str
+    reason: str | None = None
+    branch: str | None = None
+    main_ref: str = "origin/main"
+    merge_base: str | None = None
+    commits_behind: int | None = None
+    commits_ahead: int | None = None
+    files_changed_on_branch: list[str] = Field(default_factory=list)
+    files_changed_on_main_since_base: list[str] = Field(default_factory=list)
+    overlap_files: list[str] = Field(default_factory=list)
+    worktree_path: str | None = None
+    worktree_exists: bool = False
+    fetched: bool = False
+    fetch_error: str | None = None
+
+
 class ExperimentAdoptionStatus(BaseModel):
     id: str | None = None
     experiment_id: str

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Header, Query
 from models import (
     ExperimentAdoptionStatus,
     ExperimentDetail,
+    ExperimentDrift,
     ExperimentsResponse,
     PublicExperimentSummary,
 )
@@ -62,6 +63,25 @@ def get_experiment(
     if adoption.status != "not_started":
         payload["adoption"] = adoption.to_dict()
     return ExperimentDetail(**payload)
+
+
+@router.get("/experiments/{experiment_id}/drift", response_model=ExperimentDrift)
+def get_experiment_drift(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ExperimentDrift:
+    """Read-only (#489): commits behind origin/main and files both sides changed."""
+    from modules.branch_drift import experiment_drift
+
+    api.authorize(x_api_key)
+    try:
+        drift = experiment_drift(service, experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    if drift.get("fetch_error"):
+        drift["fetch_error"] = redaction.sanitized_reason(drift["fetch_error"])
+    return ExperimentDrift(**drift)
 
 
 @router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)

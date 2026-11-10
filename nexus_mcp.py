@@ -431,6 +431,20 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(
+        description="GET /experiments/{experiment_id}/drift - how far the experiment's branch is "
+        "behind main and which of its files main changed since (read-only).",
+        structured_output=True,
+    )
+    def experiment_drift(experiment_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_experiment_drift,
+            experiment_id=experiment_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_experiment_service(),
+        )
+
     @mcp.tool(description="GET /experiments/{experiment_id}/adoption", structured_output=True)
     def experiment_adoption_get(experiment_id: str) -> dict[str, Any]:
         nexus_api = _api()

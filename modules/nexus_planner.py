@@ -41,7 +41,9 @@ _EXPLORE = (
     "Grep). The nexus MCP tools give you everything else, for example "
     "github_issues (open and closed, body previews), github_issue (one issue's "
     "full text and comments), experiments_list, "
-    "experiment_get, experiment_logs, activity_list, problems and git_log. The "
+    "experiment_get, experiment_logs, experiment_drift (how far an experiment's "
+    "branch is behind main and which of its files main changed), activity_list, "
+    "problems and git_log. The "
     "lists below are only a summary. Before you suggest a new issue, check the "
     "code and the closed issues that it is not already done. If a read tool you "
     "would need is missing, adding it is a good idea of your own.\n\n"
@@ -68,7 +70,26 @@ def _history_line(r: dict[str, str]) -> str:
         reason = r.get("adoption_reason") or ""
         detail = reason or r.get("error") or ""
         head = f"- {r.get('status', '')} / merge: {_merge_label(r['adoption_status'], reason)}"
-    return f"{head}: {r.get('title', '')}" + (f" ({detail})" if detail else "")
+    line = f"{head}: {r.get('title', '')}" + (f" ({detail})" if detail else "")
+    drift = _drift_note(r)
+    return line + (f" [{drift}]" if drift else "")
+
+
+_DRIFT_HINT = (
+    "commits_behind says how many commits main is ahead of that experiment's "
+    "branch; overlap_files are files both the branch and main changed since "
+    "they split. A branch far behind main or with overlap_files will likely "
+    "hit an integration conflict: prefer a fresh new_experiment over resuming "
+    "or adopting it.\n\n"
+)
+
+
+def _drift_note(r: dict[str, str]) -> str:
+    """How stale the branch is (#489): resuming it vs. a fresh new_experiment."""
+    if "commits_behind" not in r:
+        return ""
+    behind = r.get("commits_behind") or "unknown"
+    return f"branch commits_behind={behind}; overlap_files=[{r.get('overlap_files') or ''}]"
 
 
 def _exhausted_section(exhausted: list[dict[str, Any]] | None) -> str:
@@ -139,7 +160,8 @@ def planning_prompt(
         '{"issue": <number>, "reason": "<one sentence why this is next>", '
         '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
         "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
-        "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
+        + (_DRIFT_HINT if any("commits_behind" in r for r in recent or []) else "")
+        + "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
         + _proposals_section(proposals) + _decisions_section(decisions)
     )
 
