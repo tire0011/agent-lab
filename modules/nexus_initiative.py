@@ -59,6 +59,9 @@ REVIEW_RETRY_REASON = "the review blocked the last attempt; retry with its findi
 KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 GATE_RECHECK_REASON = "a changed quality gate would now pass the earlier experiment"
+# A failed/no-op recheck start leaves its source unconsumed, but must not be
+# selected on every minute tick and monopolize the daily budget (#614).
+_GATE_RECHECK_RETRY_COOLDOWN = timedelta(minutes=30)
 
 _DEFAULT_DAILY_BUDGET = 5
 # A restart hand-off can fail without replacing the API process.  Retrying on
@@ -1147,6 +1150,7 @@ class NexusInitiativeService:
                     ).fetchall()
                 }
             verdicts = gate_recheck(self.experiment_service)
+            blocked, exhausted = self._issue_attempts()
         except (Exception, sqlite3.Error) as exc:  # best effort; normal initiative continues
             logger.warning("initiative: gate recheck failed: %s", exc)
             return None
@@ -1158,6 +1162,11 @@ class NexusInitiativeService:
                 or not str(verdict.get("old_reason") or "").startswith("quality evaluation:")
                 or source_id in consumed
                 or number not in issues
+                # A changed gate may override only the retry-attempt limit. A
+                # live/succeeded run, adoption, or crash block still owns the
+                # issue (#418). ``exhausted`` contains pure attempt limits.
+                or (number in blocked and number not in exhausted)
+                or self._gate_recheck_in_cooldown(number)
             ):
                 continue
             issue = issues[number]
@@ -1187,6 +1196,21 @@ class NexusInitiativeService:
             if self._execution_allowed(candidate).allowed:
                 return candidate
         return None
+
+    def _gate_recheck_in_cooldown(self, issue_number: int) -> bool:
+        """Whether this issue's unconsumed recheck was just dispatched."""
+        row = self._conn.execute(
+            """
+            SELECT created_at FROM nexus_initiative_log
+            WHERE source_kind = ? AND source_ref = ? AND reason = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (KIND_ISSUE, str(issue_number), GATE_RECHECK_REASON),
+        ).fetchone()
+        if row is None:
+            return False
+        attempted_at = _parse_timestamp(row["created_at"])
+        return attempted_at is not None and _utcnow() - attempted_at < _GATE_RECHECK_RETRY_COOLDOWN
 
     def _recent_experiments(self, limit: int = 10) -> list[dict[str, str]]:
         """What Nexus tried lately and how it ended, including the newest adoption outcome (#439)."""
@@ -1350,6 +1374,9 @@ class NexusInitiativeService:
             # A finished experiment that today's quality gate would pass goes
             # first: its issue is verified again on the existing branch (#614).
             recheck = self._gate_recheck_candidate()
+            # Do not invoke the paid planner for a choice that this tick will
+            # discard. After a no-op/failure, the cooldown makes normal work
+            # eligible on following ticks instead of repeating the recheck.
             found = [recheck] if recheck is not None else self.candidates()
         if not found:
             return self._record(

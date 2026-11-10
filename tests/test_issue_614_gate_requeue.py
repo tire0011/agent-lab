@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import tempfile
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +20,12 @@ from unittest.mock import MagicMock, patch
 from modules.experiment_service import ExperimentAlreadyActiveError, ExperimentService
 from modules.github_work_tracking import GitHubWorkTrackingError
 from modules.nexus_controller_service import NexusControllerService
-from modules.nexus_initiative import GATE_RECHECK_REASON, NexusInitiativeService
+from modules.nexus_initiative import (
+    GATE_RECHECK_REASON,
+    KIND_ISSUE,
+    Candidate,
+    NexusInitiativeService,
+)
 from modules.task_orchestrator import ACTION_ANSWER, ACTION_NEW_EXPERIMENT, TaskDecision
 
 
@@ -158,6 +163,14 @@ class GateRequeueTests(unittest.TestCase):
         with self.service._lock:
             return {row[0] for row in self.service._conn.execute("SELECT id FROM experiments")}
 
+    def expire_recheck_cooldown(self, initiative: NexusInitiativeService) -> None:
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        with initiative._conn:
+            initiative._conn.execute(
+                "UPDATE nexus_initiative_log SET created_at = ? WHERE reason = ?",
+                (old, GATE_RECHECK_REASON),
+            )
+
     def finish(self, experiment_id: str, error: str = "quality evaluation: failed again") -> None:
         self.service._force_status(
             experiment_id, "needs_review", ended_at="2026-01-02T00:00:00+00:00", error=error,
@@ -239,13 +252,17 @@ class GateRequeueTests(unittest.TestCase):
                 "('running', 'GitHub Issue #1: live', 'implementing', ?)",
                 (datetime.now(timezone.utc).isoformat(),),
             )
+            self.service._conn.execute(
+                "INSERT INTO github_experiment_links (experiment_id, issue_number) "
+                "VALUES ('running', 1)"
+            )
         initiative = self.initiative()
         ids_before = self.all_ids()
         self.assertEqual(self.tick(initiative).decision, "busy")
         self.assertEqual(self.all_ids(), ids_before)
         # Even past the busy guard, the per-issue guard refuses the start and
         # leaves the source free.
-        self.assertEqual(self.tick(initiative, busy_reason=None).decision, "dispatched")
+        self.assertEqual(self.tick(initiative, busy_reason=None).decision, "idle")
         self.assertEqual(self.all_ids(), ids_before)
         self.assertEqual(self.rechecks(), [])
         self.started.assert_not_called()
@@ -271,14 +288,28 @@ class GateRequeueTests(unittest.TestCase):
         self.started.assert_not_called()
         # The claim was never taken: a later tick may still re-queue it.
         self.next_action = ACTION_NEW_EXPERIMENT
+        self.expire_recheck_cooldown(initiative)
         self.assertEqual(self.tick(initiative).decision, "dispatched")
         self.assertEqual(len(self.rechecks()), 1)
+
+    def test_no_start_does_not_starve_normal_candidates_or_repeat_immediately(self):
+        initiative = self.initiative()
+        self.next_action = ACTION_ANSWER
+        self.assertEqual(self.tick(initiative).candidate.ref, "1")
+
+        normal = Candidate(KIND_ISSUE, "99", "normal work", "normal candidate", {"body": ""})
+        decision = self.tick(initiative, candidates=[normal])
+
+        self.assertEqual(decision.decision, "dispatched")
+        self.assertEqual(decision.candidate.ref, "99")
+        self.assertEqual(self.rechecks(), [])
 
     def test_failure_before_creation_does_not_consume_source(self):
         initiative = self.initiative()
         before = initiative._issue_attempt_counts()
         for fault in ("orchestrator", "tracking"):
             with self.subTest(fault=fault):
+                self.expire_recheck_cooldown(initiative)
                 self.orchestrator_raises = (
                     RuntimeError("orchestration failed") if fault == "orchestrator" else None
                 )
@@ -290,6 +321,7 @@ class GateRequeueTests(unittest.TestCase):
                 self.assertEqual(initiative._issue_attempt_counts(), before)
         self.orchestrator_raises = None
         self.tracking.fail_ensure = False
+        self.expire_recheck_cooldown(initiative)
         self.assertEqual(self.tick(initiative).decision, "dispatched")
         self.assertEqual(len(self.rechecks()), 1)
 
