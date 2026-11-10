@@ -397,6 +397,107 @@ def reflect(
         conn.close()
 
 
+# ---- read side (#630) ------------------------------------------------------
+# Only completed rows are reflections; a 'pending' row is a claim in flight.
+# Readers never create the table: a database without it has no reflections.
+
+_READ_COLUMNS = "experiment_id, created_at, model, suggestions_json, error"
+
+
+def _stored(row: sqlite3.Row | tuple) -> dict[str, Any]:
+    experiment_id, created_at, model, suggestions_json, error = tuple(row)
+    try:
+        suggestions = json.loads(suggestions_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        suggestions = []
+    if not isinstance(suggestions, list):
+        suggestions = []
+    return {
+        "experiment_id": experiment_id,
+        "created_at": created_at,
+        "model": model,
+        "suggestions": [s for s in suggestions if isinstance(s, dict)],
+        "error": error,
+    }
+
+
+def _read_conn(db_path: str) -> sqlite3.Connection:
+    return sqlite3.connect(db_path, timeout=_BUSY_TIMEOUT_MS / 1000)
+
+
+def get_reflection(experiment_id: str, *, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any] | None:
+    """The stored reflection of one experiment, or ``None`` when there is none."""
+    conn = _read_conn(db_path)
+    try:
+        row = conn.execute(
+            f"""SELECT {_READ_COLUMNS} FROM experiment_reflections
+                WHERE experiment_id=? AND status='completed'""",
+            (experiment_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+    return _stored(row) if row is not None else None
+
+
+def list_reflections(limit: int = 20, *, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    """Up to *limit* stored reflections, newest first."""
+    if limit <= 0:
+        return []
+    conn = _read_conn(db_path)
+    try:
+        rows = conn.execute(
+            f"""SELECT {_READ_COLUMNS} FROM experiment_reflections
+                WHERE status='completed'
+                ORDER BY created_at DESC, experiment_id DESC
+                LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    return [_stored(row) for row in rows]
+
+
+def recent_suggestions(conn: sqlite3.Connection, limit: int = 5) -> list[dict[str, str]]:
+    """Up to *limit* recent suggestions that duplicate no open issue.
+
+    Suggestions marked ``duplicate_of`` are left out, and a title repeated by
+    several reflections is shown once (its newest copy). Each result carries
+    the ``experiment_id`` it came from. A missing table means no suggestions.
+    """
+    if limit <= 0:
+        return []
+    try:
+        rows = conn.execute(
+            f"""SELECT {_READ_COLUMNS} FROM experiment_reflections
+                WHERE status='completed'
+                ORDER BY created_at DESC, experiment_id DESC"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    found: list[dict[str, str]] = []
+    seen: set[frozenset[str]] = set()
+    for row in rows:
+        stored = _stored(row)
+        for suggestion in stored["suggestions"]:
+            if suggestion.get("duplicate_of"):
+                continue
+            title = str(suggestion.get("title") or "").strip()
+            key = frozenset(_tokens(title))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            entry = {field: str(suggestion.get(field) or "").strip() for field in _FIELDS}
+            entry["experiment_id"] = str(stored["experiment_id"])
+            found.append(entry)
+            if len(found) >= limit:
+                return found
+    return found
+
+
 def reflect_pending(
     limit: int = 2,
     open_issue_titles: Iterable[str] = (),

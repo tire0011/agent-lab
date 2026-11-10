@@ -25,6 +25,9 @@ _BODY_CHARS = 600
 _REASON_CHARS = 300
 _PROPOSAL_TITLE_CHARS = 120
 _PROPOSAL_BODY_CHARS = 3000
+# Ideas from stored reflections shown to the planner (#630).
+MAX_REFLECTION_IDEAS = 5
+_REFLECTION_FIELD_CHARS = 200
 
 
 # Splitting (#626): a stuck or too large issue becomes 2-4 small parts.
@@ -135,6 +138,7 @@ def planning_prompt(
     decisions: list[dict[str, str]] | None = None,
     mission: str | None = None,
     budget_left: int | None = None,
+    reflections: list[dict[str, str]] | None = None,
 ) -> str:
     lines = []
     for issue in issues:
@@ -166,6 +170,26 @@ def planning_prompt(
         "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
         "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
         + _proposals_section(proposals) + _decisions_section(decisions)
+        + _reflections_section(reflections)
+    )
+
+
+def _reflections_section(reflections: list[dict[str, str]] | None) -> str:
+    """Ideas from your own post-experiment reflections (#630), with their evidence."""
+    if not reflections:
+        return ""
+    lines = []
+    for r in reflections[:MAX_REFLECTION_IDEAS]:
+        parts = [f"benefit: {r.get('benefit', '')}", f"cost: {r.get('cost', '')}",
+                 f"risk: {r.get('risk', '')}", f"measure: {r.get('measure', '')}"]
+        detail = "; ".join(" ".join(str(p).split())[:_REFLECTION_FIELD_CHARS] for p in parts)
+        source = f" (from experiment {r['experiment_id']})" if r.get("experiment_id") else ""
+        title = " ".join(str(r.get("title", "")).split())[:_PROPOSAL_TITLE_CHARS]
+        lines.append(f"- {title}{source}: {detail}")
+    return (
+        "\n\nIDEAS FROM YOUR OWN REFLECTIONS (what you suggested after recent "
+        "experiments; none duplicates an open issue). Your own new issue may build "
+        "on one of these:\n\n" + "\n".join(lines)
     )
 
 
@@ -283,6 +307,7 @@ class IssuePlanner:
         decisions: list[dict[str, str]] | None = None,
         mission: str | None = None,
         budget_left: int | None = None,
+        reflections: list[dict[str, str]] | None = None,
     ) -> PlanChoice | None:
         allowed = {int(issue["number"]) for issue in issues}
         splittable = allowed | {int(i["number"]) for i in exhausted or []}
@@ -290,7 +315,7 @@ class IssuePlanner:
             return None
         context = dict(
             exhausted=exhausted, proposals=proposals, decisions=decisions,
-            mission=mission, budget_left=budget_left,
+            mission=mission, budget_left=budget_left, reflections=reflections,
         )
         choice = None
         if self._explore is not None:

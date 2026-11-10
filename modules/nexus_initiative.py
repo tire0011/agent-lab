@@ -1212,6 +1212,7 @@ class NexusInitiativeService:
             decisions=self._owner_decisions(),
             mission=self._text_setting("nexus.planner_mission"),
             budget_left=(self.daily_budget - self._spent_today()) if self.daily_budget else None,
+            reflections=self._reflection_ideas(),
         )
         if choice is None:
             return []
@@ -1322,6 +1323,21 @@ class NexusInitiativeService:
             return list(self._decision_lister() or [])
         except Exception as exc:  # noqa: BLE001 - planning goes on without them
             logger.warning("initiative: owner decisions unavailable: %s", exc)
+            return []
+
+    def _reflection_ideas(self) -> list[dict[str, str]]:
+        """Recent non-duplicate suggestions from stored reflections (#630).
+
+        Empty when the table is missing or holds nothing usable, so the
+        planner prompt is then exactly what it was without reflections.
+        """
+        from modules.experiment_reflection import recent_suggestions
+        from modules.nexus_planner import MAX_REFLECTION_IDEAS
+
+        try:
+            return recent_suggestions(self._conn, limit=MAX_REFLECTION_IDEAS)
+        except Exception as exc:  # noqa: BLE001 - planning goes on without them
+            logger.warning("initiative: reflection ideas unavailable: %s", exc)
             return []
 
     def _proposal_slot_free(self) -> bool:

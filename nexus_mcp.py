@@ -419,6 +419,28 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(description="GET /experiments/{experiment_id}/reflection", structured_output=True)
+    def experiment_reflection_get(experiment_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_experiment_reflection,
+            experiment_id=experiment_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_experiment_service(),
+        )
+
+    @mcp.tool(description="GET /reflections", structured_output=True)
+    def reflections_list(limit: int | None = None) -> dict[str, Any]:
+        nexus_api = _api()
+        limit = nexus_api.REFLECTIONS_DEFAULT_LIMIT if limit is None else limit
+        limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.REFLECTIONS_MAX_LIMIT)
+        return _call_api(
+            nexus_api.list_reflections,
+            x_api_key=_internal_api_key(),
+            limit=limit,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
     @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
     def experiment_logs(
         experiment_id: str,

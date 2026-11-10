@@ -352,6 +352,19 @@ class ExperimentDrift(BaseModel):
     reason: str | None = None
 
 
+class ExperimentReflection(BaseModel):
+    experiment_id: str
+    created_at: str
+    model: str
+    suggestions: list[dict[str, str]]
+    error: str | None = None
+
+
+class ReflectionsResponse(BaseModel):
+    count: int
+    reflections: list[ExperimentReflection]
+
+
 class ActivityEntry(BaseModel):
     id: int
     timestamp: str

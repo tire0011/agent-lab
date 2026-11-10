@@ -250,6 +250,8 @@ class OperationsRegistry:
             "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50], ["experiment", "logs", "jsonl", "history"], mutates_state=False),
             "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id], ["experiment", "status", "summary", "inspect"], mutates_state=False),
             "branch_drift": OperationSpec("branch_drift", "Branch-Abstand und überlappende Dateien eines Experiments zu aktuellem main.", [experiment_id], ["experiment", "branch", "drift", "conflict", "overlap"], mutates_state=False),
+            "experiment_reflection": OperationSpec("experiment_reflection", "Gespeicherte Reflexion (Verbesserungsvorschläge) zu einem Experiment.", [experiment_id], ["experiment", "reflection", "suggestions", "lessons", "ideas"], mutates_state=False),
+            "reflections_list": OperationSpec("reflections_list", "Neueste gespeicherte Experiment-Reflexionen mit ihren Vorschlägen.", [limit10], ["reflection", "suggestions", "lessons", "ideas", "history"], mutates_state=False),
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
             "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
@@ -610,6 +612,41 @@ class OperationsRegistry:
             for entry in entries
         ]
         return OperationResult("experiment_logs", True, lines, 0)
+
+    @staticmethod
+    def _reflection_lines(stored: dict[str, Any]) -> list[str]:
+        lines = [f"reflection {stored['experiment_id']} ({stored['created_at']}, {stored['model']})"]
+        if stored.get("error"):
+            lines.append(f"  error: {sanitized_reason(str(stored['error']))}")
+        if not stored["suggestions"]:
+            lines.append("  (no suggestions)")
+        for suggestion in stored["suggestions"]:
+            duplicate = suggestion.get("duplicate_of")
+            lines.append(redact(
+                f"  - {suggestion.get('title', '')}"
+                + (f" [duplicate of: {duplicate}]" if duplicate else "")
+                + f" | benefit: {suggestion.get('benefit', '')} | cost: {suggestion.get('cost', '')}"
+                + f" | risk: {suggestion.get('risk', '')} | measure: {suggestion.get('measure', '')}"
+            )[:500])
+        return lines
+
+    def _op_experiment_reflection(self, args: dict[str, Any]) -> OperationResult:
+        from modules.experiment_reflection import get_reflection
+
+        experiment = self._experiment(args)
+        stored = get_reflection(experiment.id, db_path=self.db_path)
+        if stored is None:
+            return OperationResult("experiment_reflection", True, [f"no reflection stored for {experiment.id}"], 0)
+        return OperationResult("experiment_reflection", True, self._reflection_lines(stored), 0)
+
+    def _op_reflections_list(self, args: dict[str, Any]) -> OperationResult:
+        from modules.experiment_reflection import list_reflections
+
+        limit = self._limit(args, default=10, maximum=100)
+        lines: list[str] = []
+        for stored in list_reflections(limit, db_path=self.db_path):
+            lines.extend(self._reflection_lines(stored))
+        return OperationResult("reflections_list", True, lines or ["(no reflections stored)"], 0)
 
     def _op_branch_drift(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)
