@@ -3,9 +3,12 @@ from models import (
     ExperimentAdoptionStatus,
     ExperimentDetail,
     ExperimentDrift,
+    ExperimentReflection,
     ExperimentsResponse,
     PublicExperimentSummary,
+    ReflectionsResponse,
 )
+from modules import experiment_reflection
 from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import ExperimentService
 
@@ -25,6 +28,8 @@ public_router = APIRouter(dependency_overrides_provider=app)
 
 EXPERIMENTS_DEFAULT_LIMIT = 20
 EXPERIMENTS_MAX_LIMIT = 100
+REFLECTIONS_DEFAULT_LIMIT = 20
+REFLECTIONS_MAX_LIMIT = 100
 
 
 # Experiment and activity log endpoints: thin routes over the existing
@@ -85,6 +90,51 @@ def get_experiment_drift(
         return ExperimentDrift(**tracking.branch_drift(experiment.id, experiment.worktree_path))
     finally:
         tracking.close()
+
+
+def _reflection_db_path(service: ExperimentService) -> str:
+    return str(getattr(service, "db_path", api.DEFAULT_DB_PATH))
+
+
+def _reflection_payload(stored: dict) -> ExperimentReflection:
+    payload = dict(stored)
+    if payload.get("error"):
+        payload["error"] = redaction.redact(str(payload["error"]))
+    payload["suggestions"] = [
+        {str(k): str(v) for k, v in suggestion.items()} for suggestion in payload["suggestions"]
+    ]
+    return ExperimentReflection(**payload)
+
+
+@router.get("/experiments/{experiment_id}/reflection", response_model=ExperimentReflection)
+def get_experiment_reflection(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ExperimentReflection:
+    """The stored post-experiment reflection (#630); 404 when there is none."""
+    api.authorize(x_api_key)
+    try:
+        experiment = service.resolve_experiment(experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    stored = experiment_reflection.get_reflection(experiment.id, db_path=_reflection_db_path(service))
+    if stored is None:
+        raise HTTPException(status_code=404, detail="no reflection stored for this experiment")
+    return _reflection_payload(stored)
+
+
+@router.get("/reflections", response_model=ReflectionsResponse)
+def list_reflections(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=REFLECTIONS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=REFLECTIONS_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ReflectionsResponse:
+    """Stored post-experiment reflections, newest first (#630)."""
+    api.authorize(x_api_key)
+    stored = experiment_reflection.list_reflections(limit, db_path=_reflection_db_path(service))
+    reflections = [_reflection_payload(item) for item in stored]
+    return ReflectionsResponse(count=len(reflections), reflections=reflections)
 
 
 @router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)
