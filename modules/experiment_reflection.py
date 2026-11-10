@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from modules import heartbeat
+from modules.experiment_service.models import _TERMINAL_STATUSES
 from modules.llama_cpp_client import LlamaCppClient
 from modules.local_llm_jobs import (
     ROLE_EXPERIMENT_REFLECTION,
@@ -394,3 +395,44 @@ def reflect(
         return json.loads(stored_row["suggestions_json"])
     finally:
         conn.close()
+
+
+def reflect_pending(
+    limit: int = 2,
+    open_issue_titles: Iterable[str] = (),
+    *,
+    llm: Any | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> list[str]:
+    """Reflect up to *limit* finished experiments that have no reflection row.
+
+    The database is the source of truth, so this covers experiments regardless
+    of which entry point created or completed them.  ``reflect`` retains the
+    atomic claim that protects concurrent sweep callers from duplicate model
+    work.  Returned IDs are the experiments offered to ``reflect``; model or
+    parsing errors are recorded by that function and do not stop the sweep.
+    """
+    if limit <= 0:
+        return []
+    conn = _connect(db_path)
+    try:
+        placeholders = ",".join("?" for _ in _TERMINAL_STATUSES)
+        rows = conn.execute(
+            f"""SELECT e.id
+                FROM experiments AS e
+                LEFT JOIN experiment_reflections AS r ON r.experiment_id = e.id
+                WHERE e.status IN ({placeholders}) AND r.experiment_id IS NULL
+                ORDER BY COALESCE(e.ended_at, e.created_at), e.id
+                LIMIT ?""",
+            (*_TERMINAL_STATUSES, int(limit)),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    reflected: list[str] = []
+    titles = tuple(open_issue_titles)
+    for row in rows:
+        experiment_id = str(row[0])
+        reflect(experiment_id, titles, llm=llm, db_path=db_path)
+        reflected.append(experiment_id)
+    return reflected

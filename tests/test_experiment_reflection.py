@@ -4,11 +4,17 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from functools import partial
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 import modules.experiment_reflection as reflection
-from modules.experiment_reflection import MAX_SUMMARY_CHARS, reflect
+from modules.experiment_reflection import MAX_SUMMARY_CHARS, reflect, reflect_pending
+from modules.experiment_service import ExperimentService
+from modules.experiment_service.models import STATUS_SUCCEEDED
+from modules.nexus_initiative import NexusInitiativeService
 from modules.run_store import init_db
 
 
@@ -57,6 +63,112 @@ def _row(path):
     status = conn.execute("SELECT status FROM experiments WHERE id='exp-1'").fetchone()[0]
     conn.close()
     return row, status
+
+
+def _initiative(path, sweep, **kwargs):
+    return NexusInitiativeService(
+        db_path=path,
+        experiment_service=SimpleNamespace(),
+        idea_lister=lambda: [],
+        issue_lister=lambda: [],
+        reflection_sweep=sweep,
+        **kwargs,
+    )
+
+
+def test_tick_reflects_experiment_finished_outside_mailbox(tmp_path):
+    path = str(tmp_path / "direct.db")
+    experiments = ExperimentService(
+        selection_worker=MagicMock(),
+        worker_factory=MagicMock(),
+        plan_worker_factory=MagicMock(),
+        db_path=path,
+        repo_root=str(tmp_path),
+        worktrees_root=str(tmp_path / "worktrees"),
+    )
+    experiment = experiments.create_experiment("Direct service experiment")
+    experiments._force_status(experiment.id, STATUS_SUCCEEDED, ended_at="2026-01-01T00:00:00Z")
+    llm = FakeLlm('{"suggestions":[]}')
+    initiative = _initiative(path, partial(reflect_pending, llm=llm))
+    try:
+        initiative.tick()
+        conn = init_db(path)
+        assert conn.execute(
+            "SELECT status FROM experiment_reflections WHERE experiment_id=?", (experiment.id,)
+        ).fetchone()[0] == "completed"
+        conn.close()
+    finally:
+        initiative.close()
+        experiments.close()
+
+
+def test_reflect_pending_skips_running_and_limit_advances_between_ticks(tmp_path):
+    path = str(tmp_path / "pending.db")
+    conn = init_db(path)
+    for number in range(4):
+        conn.execute(
+            "INSERT INTO experiments (id, goal, status, created_at, ended_at) VALUES (?, ?, 'succeeded', ?, ?)",
+            (f"done-{number}", "done", f"2026-01-0{number + 1}", f"2026-01-0{number + 1}"),
+        )
+    conn.execute(
+        "INSERT INTO experiments (id, goal, status, created_at) VALUES ('running', 'run', 'implementing', '2026-01-01')"
+    )
+    conn.commit()
+    conn.close()
+    initiative = _initiative(path, partial(reflect_pending, llm=FakeLlm('{"suggestions":[]}')))
+    try:
+        initiative.tick()
+        initiative.tick()
+    finally:
+        initiative.close()
+    conn = init_db(path)
+    assert conn.execute("SELECT COUNT(*) FROM experiment_reflections").fetchone()[0] == 4
+    assert conn.execute(
+        "SELECT 1 FROM experiment_reflections WHERE experiment_id='running'"
+    ).fetchone() is None
+    conn.close()
+
+
+def test_raising_reflector_does_not_change_tick_or_experiment_status(tmp_path):
+    path = _db(tmp_path)
+    expected = _initiative(path, lambda **_kwargs: None)
+    actual = _initiative(path, MagicMock(side_effect=RuntimeError("broken")))
+    try:
+        assert actual.tick().decision == expected.tick().decision
+    finally:
+        actual.close()
+        expected.close()
+    assert _row(path)[1] == "succeeded"
+
+
+def test_reflection_setting_disables_sweep(tmp_path):
+    path = _db(tmp_path)
+    sweep = MagicMock()
+    initiative = _initiative(path, sweep)
+    initiative._conn.execute(
+        "INSERT INTO service_settings (key, value, updated_at) VALUES ('nexus.reflection_enabled', '0', 'now')"
+    )
+    initiative._conn.commit()
+    try:
+        initiative.tick()
+    finally:
+        initiative.close()
+    sweep.assert_not_called()
+
+
+def test_slow_reflector_does_not_hold_up_tick(tmp_path):
+    path = _db(tmp_path)
+
+    def slow(**_kwargs):
+        time.sleep(0.3)
+
+    initiative = _initiative(path, slow, reflection_timeout_seconds=0.02)
+    started = time.monotonic()
+    try:
+        initiative.tick()
+    finally:
+        initiative.close()
+    assert time.monotonic() - started < 0.2
 
 
 def test_zero_suggestions_and_compact_prompt(tmp_path):

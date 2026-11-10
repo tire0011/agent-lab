@@ -111,7 +111,9 @@ them.
   (no planner, no Azure, no paid delegation, no coding experiment) is free.
   `paused` (1/0) stops and resumes all new work: no starts, adoptions or
   retries while it is 1; running experiments finish. Note that
-  `daily_budget` 0 means no limit, not a pause.
+  `daily_budget` 0 means no limit, not a pause. `reflection_enabled` (1/0,
+  default 1) enables or disables the bounded local-model sweep that reflects
+  finished experiments after each initiative tick.
   `planner_mission` replaces the planner's mission text with the message
   body (up to 4000 characters); a body of `default` restores the built-in one.
 
