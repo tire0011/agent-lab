@@ -11,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -250,6 +251,22 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(self.fx.replay_worktrees(), [])
         self.assertFalse(row["full_pass"])
 
+    def test_interruption_releases_lease_claim_and_worktree(self):
+        class InterruptedWorker(FakeWorker):
+            def run(self, **kwargs):
+                super().run(**kwargs)
+                raise KeyboardInterrupt("stopped")
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.fx.replay(InterruptedWorker(FULL_CALC))
+        self.assertEqual(self.fx.replay_worktrees(), [])
+        self.assertEqual(self.fx.rows(), [])
+        conn = sqlite3.connect(self.fx.db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM local_replay_lease").fetchone()[0], 0)
+        finally:
+            conn.close()
+
     def test_worktree_is_removed_when_the_test_runner_raises(self):
         def broken(*_args):
             raise OSError("disk full")
@@ -450,12 +467,78 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(self.sweep(FakeClient())["reason"], "disabled")
         self.assertEqual(self.built, [])
 
-    def test_stale_replay_worktrees_are_cleaned_before_a_replay(self):
+    def test_unowned_replay_named_worktree_is_never_guessed_stale(self):
         os.makedirs(self.fx.worktrees, exist_ok=True)
         leftover = os.path.join(self.fx.worktrees, lsr.WORKTREE_PREFIX + "leftover")
         _git(self.fx.repo, "worktree", "add", "--detach", leftover, self.fx.base)
         self.assertTrue(self.sweep(FakeClient())["ran"])
+        self.assertTrue(Path(leftover).exists())
+
+    def test_concurrent_sweeps_run_only_one_worker_and_preserve_its_worktree(self):
+        entered, release = threading.Event(), threading.Event()
+        results = []
+
+        class BlockingWorker(FakeWorker):
+            def run(self, **kwargs):
+                entered.set()
+                self.assert_release = release.wait(5)
+                return super().run(**kwargs)
+
+        def first():
+            results.append(lsr.replay_next(
+                repo_root=self.fx.repo, db_path=self.fx.db_path, client=FakeClient(),
+                worker_factory=lambda _client: BlockingWorker(FULL_CALC),
+            ))
+
+        thread = threading.Thread(target=first)
+        thread.start()
+        self.assertTrue(entered.wait(5))
+        live = self.fx.replay_worktrees()
+        self.assertTrue(live)
+        second = self.sweep(FakeClient())
+        self.assertFalse(second["ran"])
+        self.assertIn("another local replay", second["reason"])
+        self.assertEqual(self.fx.replay_worktrees(), live)
+        release.set()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(results[0]["ran"])
+        self.assertEqual(len(self.fx.rows()), 1)
         self.assertEqual(self.fx.replay_worktrees(), [])
+
+    def test_expired_live_lease_is_not_reclaimed_or_cleaned(self):
+        os.makedirs(self.fx.worktrees, exist_ok=True)
+        live = os.path.join(self.fx.worktrees, lsr.WORKTREE_PREFIX + "live")
+        _git(self.fx.repo, "worktree", "add", "--detach", live, self.fx.base)
+        conn = sqlite3.connect(self.fx.db_path)
+        with conn:
+            conn.execute(
+                "INSERT INTO local_replay_lease VALUES (1, 'live', ?, ?, ?, 'old', ?, ?)",
+                (lsr.socket.gethostname(), os.getpid(), lsr._process_started(os.getpid()),
+                 (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(), live),
+            )
+        conn.close()
+        outcome = self.sweep(FakeClient())
+        self.assertFalse(outcome["ran"])
+        self.assertTrue(Path(live).exists())
+
+    def test_expired_dead_lease_is_recovered_and_only_its_worktree_removed(self):
+        os.makedirs(self.fx.worktrees, exist_ok=True)
+        orphan = os.path.join(self.fx.worktrees, lsr.WORKTREE_PREFIX + "orphan")
+        unrelated = os.path.join(self.fx.worktrees, lsr.WORKTREE_PREFIX + "unrelated")
+        _git(self.fx.repo, "worktree", "add", "--detach", orphan, self.fx.base)
+        _git(self.fx.repo, "worktree", "add", "--detach", unrelated, self.fx.base)
+        conn = sqlite3.connect(self.fx.db_path)
+        with conn:
+            conn.execute(
+                "INSERT INTO local_replay_lease VALUES (1, 'dead', ?, ?, 'impossible', 'old', ?, ?)",
+                (lsr.socket.gethostname(), os.getpid(),
+                 (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(), orphan),
+            )
+        conn.close()
+        self.assertTrue(self.sweep(FakeClient())["ran"])
+        self.assertFalse(Path(orphan).exists())
+        self.assertTrue(Path(unrelated).exists())
 
     def test_tick_never_fails_because_of_the_replay(self):
         with patch.object(lsr, "replay_next", side_effect=RuntimeError("boom")):

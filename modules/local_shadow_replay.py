@@ -31,6 +31,10 @@ corpus. A replay of an experiment already stored for the variant is skipped.
 
 :func:`replay_next` is the nexus_tick sweep: at most one replay per call, only
 when the local llama-server is reachable and idle (fail closed otherwise).
+All entry points share one process-identified SQLite lease.  It covers the
+idle check, candidate claim, worktree lifecycle and worker/test execution.
+After a crash, takeover requires both an expired lease and proof that its exact
+owner process is dead; only that lease's recorded worktree may be cleaned.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -96,6 +101,12 @@ class ReplayError(RuntimeError):
     """The replay could not be set up (missing commit, bad experiment, ...)."""
 
 
+@dataclass(frozen=True)
+class GlobalLease:
+    token: str
+    orphaned_worktree: str | None = None
+
+
 # ---- configuration -----------------------------------------------------------
 
 def prompt_variant() -> str:
@@ -121,7 +132,7 @@ def tests_timeout_seconds() -> float:
 
 
 def lease_seconds() -> float:
-    """How long a claim lives without its owner finishing; covers a whole replay."""
+    """Minimum stale age for claims/leases; a live global owner is never preempted."""
     default = worker_timeout_seconds() + tests_timeout_seconds() + 900.0
     return _float_env(ENV_LEASE, default)
 
@@ -258,6 +269,73 @@ def _release(conn: sqlite3.Connection, experiment_id: str, variant: str, token: 
     )
 
 
+def _process_started(pid: int) -> str | None:
+    """Linux process start ticks, used with PID to avoid PID-reuse mistakes."""
+    try:
+        # Field 22 follows a parenthesized comm which may contain spaces.
+        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _owner_is_dead(host: str, pid: int, started: str) -> bool:
+    """True only when this host can prove that the exact owner no longer exists."""
+    if host != socket.gethostname():
+        return False
+    actual = _process_started(pid)
+    return actual is None or actual != started
+
+
+def _acquire_global_lease(conn: sqlite3.Connection, duration: float) -> GlobalLease | None:
+    """Acquire the one replay lease, reclaiming only an expired, provably dead owner."""
+    token = uuid.uuid4().hex
+    host, pid = socket.gethostname(), os.getpid()
+    started = _process_started(pid)
+    if started is None:
+        raise ReplayError("cannot identify the local replay owner process")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT * FROM local_replay_lease WHERE singleton=1").fetchone()
+        now = _utcnow()
+        orphan = None
+        if row is not None:
+            expired = str(row["lease_expires_at"]) <= _iso(now)
+            dead = _owner_is_dead(str(row["owner_host"]), int(row["owner_pid"]),
+                                  str(row["owner_started"]))
+            if not (expired and dead):
+                conn.execute("COMMIT")
+                return None
+            orphan = str(row["worktree_path"]) if row["worktree_path"] else None
+        conn.execute(
+            "INSERT OR REPLACE INTO local_replay_lease "
+            "(singleton, token, owner_host, owner_pid, owner_started, acquired_at, "
+            "lease_expires_at, worktree_path) VALUES (1, ?, ?, ?, ?, ?, ?, NULL)",
+            (token, host, pid, started, _iso(now),
+             _iso(now + timedelta(seconds=duration))),
+        )
+        conn.execute("COMMIT")
+        return GlobalLease(token, orphan)
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+def _release_global_lease(conn: sqlite3.Connection, token: str) -> None:
+    conn.execute("DELETE FROM local_replay_lease WHERE singleton=1 AND token=?", (token,))
+
+
+def _set_lease_worktree(db_path: str, token: str, path: str | None) -> bool:
+    conn = _connect(db_path)
+    try:
+        return conn.execute(
+            "UPDATE local_replay_lease SET worktree_path=? WHERE singleton=1 AND token=?",
+            (path, token),
+        ).rowcount == 1
+    finally:
+        conn.close()
+
+
 # ---- git ---------------------------------------------------------------------
 
 def _git(repo: str, args: list[str], *, check: bool = True, text: bool = True,
@@ -373,10 +451,17 @@ def import_merged_tests(repo: str, worktree: str, new: str,
     return to_run
 
 
-def _create_worktree(repo: str, base: str) -> str:
+def _create_worktree(repo: str, base: str, *, db_path: str | None = None,
+                     lease_token: str | None = None) -> str:
     parent = os.environ.get(ENV_WORKTREE_DIR) or tempfile.gettempdir()
     Path(parent).mkdir(parents=True, exist_ok=True)
-    path = tempfile.mkdtemp(prefix=WORKTREE_PREFIX, dir=parent)
+    if lease_token:
+        path = str(Path(parent) / f"{WORKTREE_PREFIX}{lease_token}")
+        if db_path is None or not _set_lease_worktree(db_path, lease_token, path):
+            raise ReplayError("lost the global replay lease before creating the worktree")
+        Path(path).mkdir()
+    else:
+        path = tempfile.mkdtemp(prefix=WORKTREE_PREFIX, dir=parent)
     try:
         _git(repo, ["worktree", "add", "--detach", path, base], timeout=300)
     except BaseException:
@@ -398,20 +483,12 @@ def remove_worktree(repo: str, path: str) -> None:
         logger.warning("local replay: git worktree prune failed", exc_info=True)
 
 
-def cleanup_stale_worktrees(repo: str) -> list[str]:
-    """Remove replay worktrees left by a killed process (no live claim may own one)."""
-    try:
-        listing = _git(repo, ["worktree", "list", "--porcelain"], check=False).stdout
-    except Exception:  # noqa: BLE001
+def cleanup_orphaned_worktree(repo: str, path: str | None) -> list[str]:
+    """Remove only the path recorded by a lease whose dead owner was reclaimed."""
+    if not path or not Path(path).name.startswith(WORKTREE_PREFIX):
         return []
-    removed = []
-    for line in listing.splitlines():
-        if line.startswith("worktree "):
-            path = line[len("worktree "):].strip()
-            if Path(path).name.startswith(WORKTREE_PREFIX):
-                remove_worktree(repo, path)
-                removed.append(path)
-    return removed
+    remove_worktree(repo, path)
+    return [path]
 
 
 def _changed_paths(worktree: str) -> list[str]:
@@ -607,7 +684,8 @@ def _load(conn: sqlite3.Connection, experiment_id: str) -> tuple[sqlite3.Row, sq
 
 def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: ReplayOutcome,
                 client: Any, worker_factory: Callable[[Any], Any],
-                test_runner: Callable[[str, list[str], float], MergedTestRun]) -> None:
+                test_runner: Callable[[str, list[str], float], MergedTestRun], *,
+                db_path: str | None = None, lease_token: str | None = None) -> None:
     base = str(row["base_commit_sha"]).strip()
     outcome.base_commit = base
     if not _commit_exists(repo, base):
@@ -621,7 +699,7 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
         outcome.test_files = [c.path for c in changes]
         return
 
-    worktree = _create_worktree(repo, base)
+    worktree = _create_worktree(repo, base, db_path=db_path, lease_token=lease_token)
     try:
         counter = _RoundCounter()
         worker = worker_factory(client)
@@ -656,6 +734,8 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
         outcome.error = "; ".join(errors) if errors else None
     finally:
         remove_worktree(repo, worktree)
+        if db_path and lease_token:
+            _set_lease_worktree(db_path, lease_token, None)
 
 
 def replay(
@@ -667,6 +747,7 @@ def replay(
     client: Any | None = None,
     worker_factory: Callable[[Any], Any] | None = None,
     test_runner: Callable[[str, list[str], float], MergedTestRun] | None = None,
+    _global_lease: GlobalLease | None = None,
 ) -> dict[str, Any] | None:
     """Replay one merged paid experiment locally and store one ``local_replays`` row.
 
@@ -677,7 +758,13 @@ def replay(
     """
     variant = variant or prompt_variant()
     conn = _connect(db_path)
+    owned_lease = _global_lease is None
+    global_lease = _global_lease or _acquire_global_lease(conn, lease_seconds())
+    if global_lease is None:
+        conn.close()
+        return None
     try:
+        cleanup_orphaned_worktree(repo_root, global_lease.orphaned_worktree)
         row, adoption = _load(conn, experiment_id)
         token = uuid.uuid4().hex
         if _claim(conn, experiment_id, variant, token, lease_seconds()) != "claimed":
@@ -689,7 +776,8 @@ def replay(
                                     model=str(getattr(client, "model", "") or ""))
             try:
                 _run_replay(repo_root, row, adoption, outcome, client,
-                            worker_factory or default_worker_factory, test_runner or run_merged_tests)
+                            worker_factory or default_worker_factory, test_runner or run_merged_tests,
+                            db_path=db_path, lease_token=global_lease.token)
             except Exception as exc:  # stored, so a broken case is not retried every tick
                 outcome.status = STATUS_ERROR
                 outcome.error = f"{type(exc).__name__}: {exc}" if not isinstance(exc, ReplayError) else str(exc)
@@ -703,6 +791,8 @@ def replay(
                     logger.exception("local replay: could not release claim %s", experiment_id)
         return get_replay(experiment_id, variant, db_path=db_path)
     finally:
+        if owned_lease:
+            _release_global_lease(conn, global_lease.token)
         conn.close()
 
 
@@ -792,25 +882,32 @@ def replay_next(
     if not enabled(db_path):
         return {"ran": False, "reason": "disabled", "experiment_id": None, "replay": None}
     conn = _connect(db_path)
+    lease = _acquire_global_lease(conn, lease_seconds())
+    if lease is None:
+        conn.close()
+        return {"ran": False, "reason": "another local replay sweep is running",
+                "experiment_id": None, "replay": None}
     try:
         experiment_id = next_candidate(conn, variant)
+        if experiment_id is None:
+            return {"ran": False, "reason": "no merged paid experiment left to replay",
+                    "experiment_id": None, "replay": None}
+        client = client if client is not None else _UsageCountingClient()
+        idle, reason = server_state(client, db_path)
+        if not idle:
+            return {"ran": False, "reason": reason, "experiment_id": experiment_id, "replay": None}
+        cleanup_orphaned_worktree(repo_root, lease.orphaned_worktree)
+        stored = replay(experiment_id, repo_root=repo_root, db_path=db_path, variant=variant,
+                        client=client, worker_factory=worker_factory, test_runner=test_runner,
+                        _global_lease=lease)
+        if stored is None:
+            return {"ran": False, "reason": "already replayed or claimed",
+                    "experiment_id": experiment_id, "replay": None}
+        return {"ran": True, "reason": stored["status"], "experiment_id": experiment_id,
+                "replay": stored}
     finally:
+        _release_global_lease(conn, lease.token)
         conn.close()
-    if experiment_id is None:
-        return {"ran": False, "reason": "no merged paid experiment left to replay",
-                "experiment_id": None, "replay": None}
-    client = client if client is not None else _UsageCountingClient()
-    idle, reason = server_state(client, db_path)
-    if not idle:
-        return {"ran": False, "reason": reason, "experiment_id": experiment_id, "replay": None}
-    # No live claim exists (checked above), so every replay worktree is a leftover.
-    cleanup_stale_worktrees(repo_root)
-    stored = replay(experiment_id, repo_root=repo_root, db_path=db_path, variant=variant,
-                    client=client, worker_factory=worker_factory, test_runner=test_runner)
-    if stored is None:
-        return {"ran": False, "reason": "already replayed or claimed",
-                "experiment_id": experiment_id, "replay": None}
-    return {"ran": True, "reason": stored["status"], "experiment_id": experiment_id, "replay": stored}
 
 
 # ---- read side ---------------------------------------------------------------

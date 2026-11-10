@@ -958,5 +958,16 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_local_replays_created_at
             ON local_replays(created_at);
+
+        CREATE TABLE IF NOT EXISTS local_replay_lease (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            token TEXT NOT NULL,
+            owner_host TEXT NOT NULL,
+            owner_pid INTEGER NOT NULL,
+            owner_started TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            worktree_path TEXT NULL
+        );
         """
     )
