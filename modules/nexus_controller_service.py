@@ -110,16 +110,18 @@ class NexusControllerService:
         body: str,
         state: str | None = None,
         url: str | None = None,
+        rechecked_experiment_id: str | None = None,
     ) -> TaskDecision | dict[str, str]:
-        return self.handle_source(
-            issue_source(
-                issue_number,
-                title=title,
-                body=body,
-                state=state,
-                url=url,
-            )
+        source = issue_source(
+            issue_number,
+            title=title,
+            body=body,
+            state=state,
+            url=url,
         )
+        if rechecked_experiment_id:
+            source.metadata["rechecked_experiment_id"] = rechecked_experiment_id
+        return self.handle_source(source)
 
     def reply(self, session_id: str, message: str) -> TaskDecision | dict[str, str]:
         decision = self.orchestrator.continue_session(session_id, message)
@@ -240,11 +242,19 @@ class NexusControllerService:
                 raise
 
             try:
+                create_kwargs = {
+                    "complexity": decision.complexity,
+                    "source_type": lifecycle_source.source_type,
+                    "source_id": lifecycle_source.source_id,
+                }
+                rechecked_experiment_id = lifecycle_source.metadata.get(
+                    "rechecked_experiment_id"
+                )
+                if rechecked_experiment_id:
+                    create_kwargs["rechecked_experiment_id"] = rechecked_experiment_id
                 experiment = self.experiment_service.create_experiment(
                     with_handover(source_content, decision.experiment_handover),
-                    complexity=decision.complexity,
-                    source_type=lifecycle_source.source_type,
-                    source_id=lifecycle_source.source_id,
+                    **create_kwargs,
                 )
             except ExperimentAlreadyActiveError as exc:
                 self._record_execution(
