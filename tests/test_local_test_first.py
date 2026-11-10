@@ -27,7 +27,7 @@ class FakeClient:
         return json.dumps({"path": "tests/test_value.py", "content": content})
 
 
-def test_source(body):
+def _test_source(body):
     return "import unittest\nimport value\nclass ValueTests(unittest.TestCase):\n" + body
 
 
@@ -42,7 +42,7 @@ class LocalTestFirstTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_passing_test_is_dropped(self):
-        client = FakeClient(test_source(" def test_value(self): self.assertEqual(value.value(), 1)\n"))
+        client = FakeClient(_test_source(" def test_value(self): self.assertEqual(value.value(), 1)\n"))
         ids, content = generate_failing_tests(ISSUE, str(self.root), client)
         self.assertEqual((ids, content), ([], ""))
         self.assertEqual(len(client.calls), 1)
@@ -54,13 +54,13 @@ class LocalTestFirstTests(unittest.TestCase):
         self.assertIn("does not compile", client.calls[1])
 
     def test_failing_test_is_kept(self):
-        source = test_source(" def test_value(self): self.assertEqual(value.value(), 2)\n")
+        source = _test_source(" def test_value(self): self.assertEqual(value.value(), 2)\n")
         ids, content = generate_failing_tests(ISSUE, str(self.root), FakeClient(source))
         self.assertEqual(ids, ["tests.test_value.ValueTests.test_value"])
         self.assertEqual(content, source)
 
     def test_only_failing_methods_are_returned(self):
-        source = test_source(
+        source = _test_source(
             " def test_passes(self): self.assertEqual(value.value(), 1)\n"
             " def test_fails(self): self.assertEqual(value.value(), 2)\n"
         )
