@@ -126,6 +126,9 @@ class CodexWorker:
         phase: str = "codex",
         stall_seconds: float | None = None,
         on_process: Any | None = None,
+        # Codex JSON reports usage only on turn.completed, so this compatibility
+        # hook cannot provide an earlier live count (unlike Claude stream-json).
+        on_live_usage: Any | None = None,
     ) -> CodexResult:
         """Execute *task* non-interactively via ``codex exec``.
 

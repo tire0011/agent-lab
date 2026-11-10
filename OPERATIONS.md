@@ -83,6 +83,32 @@ API at startup and every `nexus_tick` run remove those that are no longer needed
   `worktree_removed` activity event, and each failure as
   `worktree_cleanup_failed`. A failure never blocks startup or a tick.
 
+Optional, for per-experiment coding-agent token budgets (issues #532/#533):
+
+- `NEXUS_EXPERIMENT_TOKEN_BUDGET` sets the total token limit across the
+  experiment's implementation, fallback and repair runs. Claude usage is
+  counted live: each stream-json `assistant` event's `message.usage` is the
+  usage of that one API call, so the calls are summed and each `message.id`
+  is counted once. Codex `exec --json` reports usage only in `turn.completed`
+  (its `item.*` events carry none; see `_parse_jsonl` in
+  `modules/codex_worker.py`), so a Codex run - like a local or unstreamed
+  run - can only be checked when it ends.
+- `NEXUS_EXPERIMENT_TOKEN_BUDGET_MODE=enforce`: when earlier runs plus the
+  current count exceed the limit, a live Claude worker is stopped at once, a
+  Codex run is judged at its end, and the experiment ends in `needs_review`
+  with `experiment token budget exceeded: stop_reason=<live_count_worker_stopped|end_of_run_count>, budget=<N>, consumed=<M>`.
+  No fallback, verification or repair run starts after that, and a
+  cancellation or stall-sweep outcome is never overwritten. Any other value is
+  shadow mode: usage and a single crossing warning are recorded, but
+  execution continues.
+- Live counting fails closed: if a live database write fails, the usage is
+  kept and written with the next call or at the end of the run (logged as
+  `token_budget_accounting_failed`), and enforce mode still stops the worker
+  using the total from before the run plus every call seen. At the end of a
+  live-counted run, usage the stream missed (final usage above the live
+  count) is added once as `end_of_run_reconciled_tokens`, and enforce mode is
+  checked again.
+
 Optional, for the experiment stall sweep (issue #400). The API every 5 minutes,
 and every `nexus_tick` run (at the start and every 5 minutes while it waits for
 its experiment), fail active experiments (`queued`, `selecting`,

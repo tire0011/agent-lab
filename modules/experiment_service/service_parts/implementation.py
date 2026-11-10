@@ -254,6 +254,7 @@ class ImplementationMixin:
 
         stall_seconds, max_seconds = agent_watchdog_limits()
 
+        live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
         implementation_result: CodexResult = worker.run(
             task=implementation_prompt,
             working_dir=worktree_path,
@@ -263,10 +264,15 @@ class ImplementationMixin:
             experiment_logger=elog,
             phase="implementation",
             on_process=lambda process: self._track_process(experiment_id, process),
+            on_live_usage=live_usage,
         )
-        implementation_usage_json = self._record_worker_run_usage(
-            experiment_id, implementation_result.usage, elog
+        implementation_usage_json = self._usage_after_run(
+            experiment_id, implementation_result, live_state, elog
         )
+        # Cancelled, stalled or stopped by the token budget (#533): keep that outcome and
+        # start no fallback run.
+        if self._ended_from_outside(experiment_id):
+            return self.get_experiment(experiment_id)
 
         if (
             implementation_provider == "local"
@@ -288,6 +294,7 @@ class ImplementationMixin:
                 experiment_id, STATUS_IMPLEMENTING,
                 implementation_provider=implementation_provider,
             )
+            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
             implementation_result = worker.run(
                 task=implementation_prompt,
                 working_dir=worktree_path,
@@ -297,10 +304,13 @@ class ImplementationMixin:
                 experiment_logger=elog,
                 phase="implementation",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_live_usage=live_usage,
             )
-            implementation_usage_json = self._record_worker_run_usage(
-                experiment_id, implementation_result.usage, elog
+            implementation_usage_json = self._usage_after_run(
+                experiment_id, implementation_result, live_state, elog
             )
+            if self._ended_from_outside(experiment_id):
+                return self.get_experiment(experiment_id)
 
         fallback = (
             other_provider(implementation_provider)
@@ -327,6 +337,7 @@ class ImplementationMixin:
                 experiment_id, STATUS_IMPLEMENTING,
                 implementation_provider=implementation_provider,
             )
+            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
             implementation_result = worker.run(
                 task=implementation_prompt,
                 working_dir=worktree_path,
@@ -336,10 +347,13 @@ class ImplementationMixin:
                 experiment_logger=elog,
                 phase="implementation",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_live_usage=live_usage,
             )
-            implementation_usage_json = self._record_worker_run_usage(
-                experiment_id, implementation_result.usage, elog
+            implementation_usage_json = self._usage_after_run(
+                experiment_id, implementation_result, live_state, elog
             )
+            if self._ended_from_outside(experiment_id):
+                return self.get_experiment(experiment_id)
 
         if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
@@ -399,6 +413,23 @@ class ImplementationMixin:
             experiment_id, worktree_path, elog, result,
             github_work_tracking=github_work_tracking,
         )
+
+
+    def _usage_after_run(
+        self, experiment_id: str, run_result: Any, live_state: dict[str, int],
+        elog: ExperimentLogger,
+    ) -> str | None:
+        """Account one finished worker run once (#532/#533).
+
+        A run the live observer saw at least one API call of (Claude stream-json) is
+        completed by :meth:`_finish_live_usage`: usage whose live write failed is added
+        now, nothing committed live is counted twice, and enforce mode is applied
+        again. Any other run (Codex, local, unstreamed) is counted here at its end,
+        which is also where enforce mode can first stop it.
+        """
+        if live_state.get("calls") or live_state.get("pending_calls"):
+            return self._finish_live_usage(experiment_id, run_result.usage, live_state, elog)
+        return self._record_worker_run_usage(experiment_id, run_result.usage, elog)
 
 
     def _merge_current_main(self, worktree_path: str, elog: ExperimentLogger) -> str:
@@ -492,6 +523,7 @@ class ImplementationMixin:
                 iteration=repair_iteration,
                 provider=provider_of(worker) or "",
             )
+            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
             repair_result = worker.run(
                 task=_build_repair_implementation_prompt(result.goal, feedback),
                 working_dir=worktree_path,
@@ -501,8 +533,10 @@ class ImplementationMixin:
                 experiment_logger=elog,
                 phase="implementation_repair",
                 on_process=lambda process: self._track_process(experiment_id, process),
+                on_live_usage=live_usage,
             )
-            self._record_worker_run_usage(experiment_id, repair_result.usage, elog)
+            self._usage_after_run(experiment_id, repair_result, live_state, elog)
+            # Also a budget stop (#533): it must not become timed_out/failed or repair again.
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if repair_result.timed_out or repair_result.error:
