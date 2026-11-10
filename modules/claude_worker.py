@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -183,6 +184,7 @@ class _LiveUsageParser:
         flattened = {
             key: int(value) for key, value in usage.items()
             if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value)
         }
         self.message_ids.add(message_id)
         return bool(self.callback(flattened)) if flattened else False

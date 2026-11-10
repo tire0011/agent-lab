@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import uuid
@@ -422,13 +421,14 @@ class ImplementationMixin:
     ) -> str | None:
         """Account one finished worker run once (#532/#533).
 
-        A run whose usage was already counted live (Claude stream-json) is not counted
-        again from its final usage; any other run (Codex, local, unstreamed) is counted
-        here at its end, which is also where enforce mode can first stop it.
+        A run the live observer saw at least one API call of (Claude stream-json) is
+        completed by :meth:`_finish_live_usage`: usage whose live write failed is added
+        now, nothing committed live is counted twice, and enforce mode is applied
+        again. Any other run (Codex, local, unstreamed) is counted here at its end,
+        which is also where enforce mode can first stop it.
         """
-        if live_state.get("calls"):
-            usage = self.get_experiment(experiment_id).implementation_usage
-            return json.dumps(usage) if usage else None
+        if live_state.get("calls") or live_state.get("pending_calls"):
+            return self._finish_live_usage(experiment_id, run_result.usage, live_state, elog)
         return self._record_worker_run_usage(experiment_id, run_result.usage, elog)
 
 

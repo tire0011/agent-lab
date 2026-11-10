@@ -101,6 +101,13 @@ Optional, for per-experiment coding-agent token budgets (issues #532/#533):
   cancellation or stall-sweep outcome is never overwritten. Any other value is
   shadow mode: usage and a single crossing warning are recorded, but
   execution continues.
+- Live counting fails closed: if a live database write fails, the usage is
+  kept and written with the next call or at the end of the run (logged as
+  `token_budget_accounting_failed`), and enforce mode still stops the worker
+  using the total from before the run plus every call seen. At the end of a
+  live-counted run, usage the stream missed (final usage above the live
+  count) is added once as `end_of_run_reconciled_tokens`, and enforce mode is
+  checked again.
 
 Optional, for the experiment stall sweep (issue #400). The API every 5 minutes,
 and every `nexus_tick` run (at the start and every 5 minutes while it waits for

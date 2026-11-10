@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -172,7 +173,7 @@ class ExperimentTokenBudgetTests(unittest.TestCase):
         self.assertTrue(callback({"output_tokens": 5}))
 
         result = service.get_experiment(experiment.id)
-        self.assertEqual(state, {"tokens": 11, "calls": 2})
+        self.assertEqual((state["tokens"], state["calls"]), (11, 2))
         self.assertEqual(result.status, "needs_review")
         self.assertIn("budget=10", result.error)
         self.assertIn("consumed=11", result.error)
@@ -217,6 +218,113 @@ class ExperimentTokenBudgetTests(unittest.TestCase):
         )
 
         self.assertEqual(service.get_experiment(experiment.id).status, "cancelled")
+
+    def _flaky_live_writes(self, service: ExperimentService, failures: int):
+        """Make the first *failures* live database writes raise (#533 review)."""
+        real = service._add_live_token_usage
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= failures:
+                raise sqlite3.OperationalError("database is locked")
+            return real(*args, **kwargs)
+
+        return patch.object(service, "_add_live_token_usage", side_effect=flaky)
+
+    def test_failed_live_write_is_retried_and_never_lost(self) -> None:
+        service = self._service("1000", "enforce")
+        experiment = service.create_experiment("Transient database error")
+        elog = service.get_experiment_logger(experiment.id)
+        callback, state = service._live_worker_usage_callback(experiment.id, elog)
+
+        with self._flaky_live_writes(service, failures=1):
+            self.assertFalse(callback({"input_tokens": 30}))  # write fails, kept pending
+            self.assertEqual((state["calls"], state["pending_tokens"]), (0, 30))
+            self.assertFalse(callback({"input_tokens": 20}))  # carries the pending call
+
+        usage = service.get_experiment(experiment.id).implementation_usage
+        self.assertEqual(usage["tokens_consumed"], 50)
+        self.assertEqual(usage["live_api_call_count"], 2)
+        self.assertEqual(usage["token_run_count"], 1)
+        self.assertEqual((state["tokens"], state["calls"], state["pending_calls"]), (50, 2, 0))
+
+    def test_enforce_stops_from_memory_when_the_database_write_fails(self) -> None:
+        service = self._service("100", "enforce")
+        experiment = service.create_experiment("Database down while over budget")
+        elog = service.get_experiment_logger(experiment.id)
+        service._record_worker_run_usage(experiment.id, {"input_tokens": 60}, elog)
+        callback, state = service._live_worker_usage_callback(experiment.id, elog)
+
+        with self._flaky_live_writes(service, failures=99), \
+                patch.object(service, "_stop_for_token_budget", side_effect=sqlite3.OperationalError("locked")):
+            # Earlier run (60) + this call (50) crosses 100: stop although nothing was written.
+            self.assertTrue(callback({"input_tokens": 50}))
+        self.assertTrue(state["stop_requested"])
+        self.assertEqual(service.get_experiment(experiment.id).status, "queued")
+
+        # At the end of the run the pending usage is written and the stop is recorded.
+        service._finish_live_usage(experiment.id, None, state, elog)
+
+        result = service.get_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertIn("stop_reason=live_count_worker_stopped", result.error)
+        self.assertIn("consumed=110", result.error)
+        self.assertEqual(result.implementation_usage["tokens_consumed"], 110)
+        self.assertEqual(result.implementation_usage["token_run_count"], 2)
+
+    def test_end_of_run_adds_only_what_the_live_count_missed(self) -> None:
+        service = self._service("1000", "shadow")
+        experiment = service.create_experiment("Final usage reports more")
+        elog = service.get_experiment_logger(experiment.id)
+        callback, state = service._live_worker_usage_callback(experiment.id, elog)
+        callback({"input_tokens": 40})
+
+        # The final result reports 40 too: nothing is counted twice.
+        service._finish_live_usage(experiment.id, {"input_tokens": 40}, state, elog)
+        self.assertEqual(service._current_tokens_consumed(experiment.id), 40)
+
+        # A second run whose stream missed a call: the difference is added once.
+        callback, state = service._live_worker_usage_callback(experiment.id, elog)
+        callback({"input_tokens": 10})
+        service._finish_live_usage(experiment.id, {"input_tokens": 25}, state, elog)
+        usage = service.get_experiment(experiment.id).implementation_usage
+        self.assertEqual(usage["tokens_consumed"], 65)
+        self.assertEqual(usage["end_of_run_reconciled_tokens"], 15)
+        self.assertEqual(usage["token_run_count"], 2)
+
+    def test_end_of_run_enforces_a_crossing_the_live_count_missed(self) -> None:
+        service = self._service("100", "enforce")
+        experiment = service.create_experiment("Crossing only in the final usage")
+        elog = service.get_experiment_logger(experiment.id)
+        callback, state = service._live_worker_usage_callback(experiment.id, elog)
+        self.assertFalse(callback({"input_tokens": 40}))
+
+        service._finish_live_usage(experiment.id, {"input_tokens": 140}, state, elog)
+
+        result = service.get_experiment(experiment.id)
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        self.assertIn("stop_reason=end_of_run_count", result.error)
+        self.assertIn("consumed=140", result.error)
+
+    def test_live_observer_never_raises_on_logging_errors(self) -> None:
+        service = self._service("10", "enforce")
+        experiment = service.create_experiment("Broken log")
+        elog = MagicMock()
+        elog.warning.side_effect = OSError("disk full")
+        elog.info.side_effect = OSError("disk full")
+        callback, _state = service._live_worker_usage_callback(experiment.id, elog)
+
+        self.assertFalse(callback({"input_tokens": 5}))
+        self.assertTrue(callback({"input_tokens": 6}))
+        self.assertEqual(service.get_experiment(experiment.id).status, STATUS_NEEDS_REVIEW)
+
+    def test_parser_skips_non_finite_counters(self) -> None:
+        calls = []
+        parser = _LiveUsageParser(lambda usage: calls.append(usage) or False)
+        parser.consume('{"type": "assistant", "message": {"id": "m1", '
+                       '"usage": {"input_tokens": 3, "output_tokens": Infinity}}}')
+        self.assertEqual(calls, [{"input_tokens": 3}])
 
 
 
@@ -372,7 +480,7 @@ class LiveEnforcementThroughTheWorkerTests(unittest.TestCase):
 
         self.assertTrue(result.success, result.error)
         self.assertFalse(result.timed_out)
-        self.assertEqual(state, {"tokens": 120, "calls": 2})
+        self.assertEqual((state["tokens"], state["calls"]), (120, 2))
         current = service.get_experiment(experiment.id)
         self.assertEqual(current.status, "queued")
         self.assertIsNone(current.error)

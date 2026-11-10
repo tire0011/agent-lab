@@ -554,75 +554,227 @@ class RecordsMixin:
         return encoded
 
 
+    def _current_tokens_consumed(self, experiment_id: str) -> int:
+        usage = self.get_experiment(experiment_id).implementation_usage
+        if isinstance(usage, dict):
+            try:
+                return int(usage.get("tokens_consumed", 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+
+    def _add_live_token_usage(
+        self,
+        experiment_id: str,
+        usage: dict[str, int],
+        tokens: int,
+        *,
+        new_run: bool,
+        live_calls: int,
+    ) -> tuple[int, int, bool, bool]:
+        """Add live-counted usage atomically; return ``(total, run_count, first_crossing, over)``.
+
+        Unlike the end-of-run record, per-counter values are summed, because one run
+        arrives here in several pieces (one per API call, #533).
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT implementation_usage_json FROM experiments WHERE id = ?",
+                (experiment_id,),
+            ).fetchone()
+            previous: dict[str, Any] = {}
+            if row is not None and row[0]:
+                try:
+                    decoded = json.loads(row[0])
+                    if isinstance(decoded, dict):
+                        previous = decoded
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            total = int(previous.get("tokens_consumed", 0)) + tokens
+            run_count = int(previous.get("token_run_count", 0)) + (1 if new_run else 0)
+            already_warned = bool(previous.get("token_budget_warning_logged", False))
+            over = total > self.experiment_token_budget
+            for key, value in usage.items():
+                previous[key] = int(previous.get(key, 0)) + int(value)
+            previous.update(
+                token_budget=self.experiment_token_budget,
+                tokens_consumed=total,
+                token_run_count=run_count,
+                token_budget_warning_logged=already_warned or over,
+                live_api_call_count=int(previous.get("live_api_call_count", 0)) + live_calls,
+            )
+            self._conn.execute(
+                "UPDATE experiments SET implementation_usage_json = ? WHERE id = ?",
+                (json.dumps(previous), experiment_id),
+            )
+        return total, run_count, over and not already_warned, over
+
+
     def _live_worker_usage_callback(
         self, experiment_id: str, elog: ExperimentLogger
-    ) -> tuple[Callable[[dict[str, Any]], bool] | None, dict[str, int]]:
-        """Build a per-run Claude usage observer; its state prevents final double count."""
-        state = {"tokens": 0, "calls": 0}
+    ) -> tuple[Callable[[dict[str, Any]], bool] | None, dict[str, Any]]:
+        """Build a per-run Claude usage observer (#533).
+
+        ``state["tokens"]``/``state["calls"]`` count only what is committed to the
+        database. Usage whose write failed stays in ``pending_*`` and is retried with
+        the next call and once more by :meth:`_finish_live_usage` at the end of the
+        run, so a transient error never loses usage. The observer never raises, and
+        in enforce mode its stop decision does not depend on the database: when the
+        write fails it uses the experiment total from before the run plus every call
+        seen so far (fail closed).
+        """
+        state: dict[str, Any] = {
+            "tokens": 0, "calls": 0,
+            "pending_usage": {}, "pending_tokens": 0, "pending_calls": 0,
+            "seen_tokens": 0, "run_counted": False, "failures": 0,
+            "stop_requested": False, "base_total": 0,
+        }
         if self.experiment_token_budget is None:
             return None, state
+        try:
+            state["base_total"] = self._current_tokens_consumed(experiment_id)
+        except Exception:  # noqa: BLE001 - the database is re-read on every call
+            pass
+        enforcing = self.experiment_token_budget_mode == "enforce"
 
         def observe(usage: dict[str, Any]) -> bool:
-            increment = worker_run_token_total(usage)
-            state["tokens"] += increment
-            state["calls"] += 1
-            with self._lock, self._conn:
-                row = self._conn.execute(
-                    "SELECT implementation_usage_json FROM experiments WHERE id = ?",
-                    (experiment_id,),
-                ).fetchone()
-                previous: dict[str, Any] = {}
-                if row is not None and row[0]:
-                    try:
-                        decoded = json.loads(row[0])
-                        if isinstance(decoded, dict):
-                            previous = decoded
-                    except (TypeError, json.JSONDecodeError):
-                        pass
-                total = int(previous.get("tokens_consumed", 0)) + increment
-                run_count = int(previous.get("token_run_count", 0)) + (1 if state["calls"] == 1 else 0)
-                already_warned = bool(previous.get("token_budget_warning_logged", False))
-                crossed = total > self.experiment_token_budget
-                for key, value in usage.items():
-                    if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        previous[key] = int(previous.get(key, 0)) + int(value)
-                previous.update(
-                    token_budget=self.experiment_token_budget,
-                    tokens_consumed=total,
-                    token_run_count=run_count,
-                    token_budget_warning_logged=already_warned or crossed,
-                    live_api_call_count=int(previous.get("live_api_call_count", 0)) + 1,
-                )
-                self._conn.execute(
-                    "UPDATE experiments SET implementation_usage_json = ? WHERE id = ?",
-                    (json.dumps(previous), experiment_id),
-                )
+            try:
+                tokens = worker_run_token_total(usage)
+                flat = {
+                    key: int(value) for key, value in (usage or {}).items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+            except Exception:  # noqa: BLE001 - malformed usage counts as zero, see end of run
+                tokens, flat = 0, {}
+            state["seen_tokens"] += tokens
+            for key, value in flat.items():
+                state["pending_usage"][key] = state["pending_usage"].get(key, 0) + value
+            state["pending_tokens"] += tokens
+            state["pending_calls"] += 1
 
-            enforcing = self.experiment_token_budget_mode == "enforce"
-            if crossed and not already_warned:
+            accounted = False
+            try:
+                total, run_count, first_crossing, over = self._add_live_token_usage(
+                    experiment_id, state["pending_usage"], state["pending_tokens"],
+                    new_run=not state["run_counted"], live_calls=state["pending_calls"],
+                )
+                accounted = True
+                state["tokens"] += state["pending_tokens"]
+                state["calls"] += state["pending_calls"]
+                state["run_counted"] = True
+                state["pending_usage"], state["pending_tokens"], state["pending_calls"] = {}, 0, 0
+            except Exception as exc:  # noqa: BLE001 - keep the usage pending and decide anyway
+                state["failures"] += 1
+                total = int(state["base_total"]) + int(state["seen_tokens"])
+                run_count = None
+                over = total > self.experiment_token_budget
+                first_crossing = over
+                error = f"{type(exc).__name__}: {exc}"
+
+            if enforcing and over:
+                # Stop the worker first; recording the outcome may fail and is retried
+                # at the end of the run.
+                state["stop_requested"] = True
+                try:
+                    self._stop_for_token_budget(experiment_id, total, "live_count_worker_stopped")
+                except Exception:  # noqa: BLE001 - _finish_live_usage records it again
+                    pass
+
+            try:
+                if not accounted:
+                    elog.warning(
+                        "implementation", "token_budget_accounting_failed",
+                        "Live token accounting failed; usage kept and retried",
+                        error=error, estimated_total=total,
+                        pending_tokens=state["pending_tokens"],
+                        budget=self.experiment_token_budget,
+                        mode=self.experiment_token_budget_mode,
+                    )
+                if first_crossing and accounted:
+                    elog.warning(
+                        "implementation", "token_budget_exceeded",
+                        (
+                            "Experiment token budget exceeded; worker stopped for review"
+                            if enforcing else
+                            "Experiment token budget exceeded (shadow mode; execution continues)"
+                        ),
+                        budget=self.experiment_token_budget, total=total,
+                        run_count=run_count, mode=self.experiment_token_budget_mode, live=True,
+                    )
+                elif accounted and not over:
+                    elog.info(
+                        "implementation", "token_budget_updated",
+                        f"Experiment token usage updated ({self.experiment_token_budget_mode} mode)",
+                        budget=self.experiment_token_budget, total=total,
+                        run_count=run_count, live=True,
+                    )
+            except Exception:  # noqa: BLE001 - logging must not change the decision
+                pass
+            return bool(state["stop_requested"])
+
+        return observe, state
+
+
+    def _finish_live_usage(
+        self,
+        experiment_id: str,
+        final_usage: dict[str, Any] | None,
+        state: dict[str, Any],
+        elog: ExperimentLogger,
+    ) -> str | None:
+        """Close the books for a run that was (partly) counted live (#533).
+
+        Adds whatever the live count could not commit: the pending usage, or - when
+        the run's final usage reports more than was committed live - the difference
+        (whichever is larger). Then enforce mode is applied again, so a live stop
+        whose status write failed, or a crossing only seen here, still ends the
+        experiment. Errors propagate; the pipeline then fails instead of going on.
+        """
+        final_tokens = worker_run_token_total(final_usage)
+        extra = max(int(state["pending_tokens"]), final_tokens - int(state["tokens"]))
+        if extra > 0 or state["pending_calls"]:
+            usage = dict(state["pending_usage"])
+            unattributed = extra - int(state["pending_tokens"])
+            if unattributed > 0:
+                usage["end_of_run_reconciled_tokens"] = unattributed
+            total, run_count, first_crossing, over = self._add_live_token_usage(
+                experiment_id, usage, extra,
+                new_run=not state["run_counted"], live_calls=int(state["pending_calls"]),
+            )
+            state["tokens"] += extra
+            state["calls"] += int(state["pending_calls"])
+            state["run_counted"] = True
+            state["pending_usage"], state["pending_tokens"], state["pending_calls"] = {}, 0, 0
+            elog.info(
+                "implementation", "token_budget_reconciled",
+                "Live token count completed at the end of the worker run",
+                added=extra, total=total, run_count=run_count,
+                budget=self.experiment_token_budget,
+            )
+            if first_crossing:
                 elog.warning(
                     "implementation", "token_budget_exceeded",
                     (
-                        "Experiment token budget exceeded; worker stopped for review"
-                        if enforcing else
+                        "Experiment token budget exceeded at the end of a worker run; "
+                        "experiment ends for review"
+                        if self.experiment_token_budget_mode == "enforce" else
                         "Experiment token budget exceeded (shadow mode; execution continues)"
                     ),
                     budget=self.experiment_token_budget, total=total,
-                    run_count=run_count, mode=self.experiment_token_budget_mode, live=True,
+                    run_count=run_count, mode=self.experiment_token_budget_mode,
                 )
-            elif not crossed:
-                elog.info(
-                    "implementation", "token_budget_updated",
-                    f"Experiment token usage updated ({self.experiment_token_budget_mode} mode)",
-                    budget=self.experiment_token_budget, total=total,
-                    run_count=run_count, live=True,
-                )
-            if enforcing and crossed:
-                self._stop_for_token_budget(experiment_id, total, "live_count_worker_stopped")
-                return True
-            return False
-
-        return observe, state
+        else:
+            total = self._current_tokens_consumed(experiment_id)
+        if self.experiment_token_budget_mode == "enforce" and (
+            state["stop_requested"] or total > self.experiment_token_budget
+        ):
+            self._stop_for_token_budget(
+                experiment_id, total,
+                "live_count_worker_stopped" if state["stop_requested"] else "end_of_run_count",
+            )
+        usage = self.get_experiment(experiment_id).implementation_usage
+        return json.dumps(usage) if usage else None
 
 
     def _transition(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:
