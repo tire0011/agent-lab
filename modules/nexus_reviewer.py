@@ -46,7 +46,8 @@ class ReviewResult:
         return self.verdict == VERDICT_BLOCK
 
 
-def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: str = "") -> str:
+def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: str = "",
+                  earlier_findings: str = "") -> str:
     look = (
         "You are in the repository with the change applied and may read any file "
         "to check the change in context.\n\n"
@@ -77,6 +78,16 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
             "false alarm (an example path, a file the task only mentions, or a "
             "task that asks for tests only: approve and say why).\n\n"
             if gate_findings else ""
+        )
+        + (
+            "FOLLOW-UP REVIEW: you blocked an earlier attempt at this task with "
+            f"these findings:\n{earlier_findings[:4000]}\n"
+            "First check each of them against this new attempt. Block again if "
+            "one of them is not fixed. Block for a NEW problem only when it is "
+            "serious: it breaks existing behaviour, loses data, weakens a "
+            "security, safety or budget check, or can loop. Mention smaller new "
+            "findings in the summary without blocking.\n\n"
+            if earlier_findings else ""
         )
         + f"TASK:\n{goal[:8000]}\n\nDIFF:\n{diff[:_DIFF_CHARS]}"
     )
@@ -140,18 +151,44 @@ class NexusReviewer:
         start = (REVIEWERS.index(row[0]) + 1) % len(REVIEWERS) if row and row[0] in REVIEWERS else 0
         return [REVIEWERS[(start + i) % len(REVIEWERS)] for i in range(len(REVIEWERS))]
 
+    def _earlier_block(self, experiment_id: str) -> tuple[str, str] | None:
+        """``(reviewer, findings)`` of the latest review that blocked another
+        attempt at the same issue, so that reviewer checks its own findings."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT r.reviewer, r.summary FROM nexus_pr_reviews r
+                    JOIN github_experiment_links other ON other.experiment_id = r.experiment_id
+                    JOIN github_experiment_links mine ON mine.issue_number = other.issue_number
+                    WHERE mine.experiment_id = ? AND r.experiment_id != ? AND r.verdict = ?
+                    ORDER BY r.id DESC LIMIT 1
+                    """,
+                    (experiment_id, experiment_id, VERDICT_BLOCK),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        return (str(row[0]), str(row[1])) if row and row[0] in REVIEWERS else None
+
     def review(
         self, *, experiment_id: str, goal: str, worktree_path: str, base_sha: str,
         gate_findings: str = "",
     ) -> ReviewResult:
         diff = _diff(worktree_path, base_sha)
         result = None
-        for name in self._order():
+        order = self._order()
+        earlier = self._earlier_block(experiment_id)
+        if earlier is not None:
+            # A retry goes back to the reviewer that blocked it: a new reviewer
+            # each time found new edge cases until the attempts ran out.
+            order = [earlier[0], *[name for name in order if name != earlier[0]]]
+        for name in order:
             runner = self._runners.get(name)
             if runner is None:
                 continue
             prompt = review_prompt(
-                goal, diff, can_read_files=name != "azure", gate_findings=gate_findings
+                goal, diff, can_read_files=name != "azure", gate_findings=gate_findings,
+                earlier_findings=earlier[1] if earlier is not None and name == earlier[0] else "",
             )
             try:
                 parsed = parse_review(runner(prompt, worktree_path))

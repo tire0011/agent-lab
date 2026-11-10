@@ -70,6 +70,9 @@ _MAX_OPEN_PROPOSALS = 3
 # a failure too: nobody reviews it in autonomous runs (#185).
 _RETRYABLE_EXPERIMENT_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review")
 _MAX_ISSUE_ATTEMPTS = 2
+# Attempts that all passed the tests and stopped only at the review get one
+# more: each was close, and the retry goes back to the same reviewer.
+_MAX_REVIEW_BLOCKED_ATTEMPTS = 3
 # An open issue that used up its attempts is reported, not dropped silently
 # (#457). It stays unselectable until a human acts, unless only pipeline crashes
 # stopped it (#467): those end with a newer commit on origin/main.
@@ -818,7 +821,7 @@ class NexusInitiativeService:
                 "origin/main has a commit newer than the last crash; no human decision is needed."
             )
         else:
-            stop = f"Nexus stopped working on this issue: it used up its {_MAX_ISSUE_ATTEMPTS} attempts."
+            stop = f"Nexus stopped working on this issue: it used up its {len(detail['experiment_ids'])} attempts."
             how_on = "Nexus does not start it again on its own; a human has to decide how it goes on."
         try:
             self._issue_commenter(
@@ -915,15 +918,23 @@ class NexusInitiativeService:
             number: len(attempts) - (number in conflicted)
             for number, attempts in failed.items()
         }
+        limit = {
+            number: (
+                _MAX_REVIEW_BLOCKED_ATTEMPTS
+                if all(why.startswith("Review by ") for _, why in attempts.values())
+                else _MAX_ISSUE_ATTEMPTS
+            )
+            for number, attempts in failed.items()
+        }
         exhausted = {
             number: {
                 "experiment_ids": sorted(attempts),
                 "last_reason": _last_reason(attempts),
             }
             for number, attempts in failed.items()
-            if counted[number] >= _MAX_ISSUE_ATTEMPTS and number not in blocked
+            if counted[number] >= limit[number] and number not in blocked
         }
-        blocked.update(n for n, count in counted.items() if count >= _MAX_ISSUE_ATTEMPTS)
+        blocked.update(n for n, count in counted.items() if count >= limit[n])
         crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
         main_commit = self._main_commit_time() if crash_limited else None
         for number, attempts in crash_limited.items():
