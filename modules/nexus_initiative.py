@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -60,6 +61,7 @@ KIND_ISSUE = "open_issue"
 KIND_IDEA = "new_idea"
 
 _DEFAULT_DAILY_BUDGET = 5
+_DEFAULT_REFLECTION_TIMEOUT_SECONDS = 5.0
 # A restart hand-off can fail without replacing the API process.  Retrying on
 # every minute tick adds noise and can contend with recovery work, so failed
 # hand-offs get a fixed backoff before another attempt.
@@ -230,6 +232,8 @@ class NexusInitiativeService:
         drift_reader: Callable[[str, str | None], dict[str, Any]] | None = None,
         issue_creator: Callable[[str, str], int | None] | None = None,
         issue_closer: Callable[[int, str], None] | None = None,
+        reflection_sweep: Callable[..., Any] | None = None,
+        reflection_timeout_seconds: float | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -251,6 +255,22 @@ class NexusInitiativeService:
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
         self._drift_reader = drift_reader
+        if reflection_sweep is None:
+            from modules.experiment_reflection import reflect_pending
+
+            reflection_sweep = reflect_pending
+        self._reflection_sweep = reflection_sweep
+        if reflection_timeout_seconds is None:
+            try:
+                reflection_timeout_seconds = float(
+                    os.environ.get(
+                        "NEXUS_REFLECTION_TICK_TIMEOUT_SECONDS",
+                        str(_DEFAULT_REFLECTION_TIMEOUT_SECONDS),
+                    )
+                )
+            except ValueError:
+                reflection_timeout_seconds = _DEFAULT_REFLECTION_TIMEOUT_SECONDS
+        self._reflection_timeout_seconds = max(0.0, reflection_timeout_seconds)
         # The repository whose issues this service may execute; checked against
         # the approval registry at candidate scan and again at dispatch.
         self._repository = issue_approvals.normalize_repository(
@@ -1320,6 +1340,26 @@ class NexusInitiativeService:
 
     # ---- the tick --------------------------------------------------------
 
+    def _reflect_pending(self) -> None:
+        """Best-effort bounded reflection, independent of the tick decision."""
+        if (self._text_setting("nexus.reflection_enabled") or "1").strip() == "0":
+            return
+
+        def run() -> None:
+            try:
+                self._reflection_sweep(limit=2, db_path=self.db_path)
+            except Exception as exc:  # noqa: BLE001 - reflection never owns lifecycle
+                logger.warning("initiative: pending-reflection sweep failed: %s", exc)
+
+        worker = threading.Thread(target=run, name="experiment-reflection-sweep", daemon=True)
+        worker.start()
+        worker.join(timeout=self._reflection_timeout_seconds)
+        if worker.is_alive():
+            logger.warning(
+                "initiative: pending-reflection sweep exceeded %.3fs; tick continues",
+                self._reflection_timeout_seconds,
+            )
+
     def _sweep_stalled_experiments(self) -> None:
         """Best-effort stall recovery before the initiative gates.
 
@@ -1343,6 +1383,7 @@ class NexusInitiativeService:
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
         self._planner_called = False
+        self._reflect_pending()
         if self._paused():
             return self._record(InitiativeDecision(DECISION_PAUSED, detail="paused by the owner", tick_id=tick_id))
         self._sweep_stalled_experiments()

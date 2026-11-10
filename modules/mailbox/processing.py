@@ -360,6 +360,8 @@ SETTINGS: dict[str, tuple[str, int, int]] = {
     "extra_budget": ("nexus.extra_budget", 0, 20),
     # 1 pauses all new work (no starts, adoptions or retries); 0 resumes.
     "paused": ("nexus.paused", 0, 1),
+    # 0 disables the free post-experiment reflection sweep; 1 enables it.
+    "reflection_enabled": ("nexus.reflection_enabled", 0, 1),
 }
 
 
