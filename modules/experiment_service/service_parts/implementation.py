@@ -75,6 +75,21 @@ def _final_issue_progress(experiment: Experiment) -> tuple[tuple[str, str | None
     return ()
 
 
+def _last_logged_phase(elog: Any) -> str | None:
+    """The phase of the last entry the pipeline logged before it raised (#410)."""
+    try:
+        from modules.central_logging import read_log_entries
+
+        entries = read_log_entries(elog.path, tail_bytes=64 * 1024)
+    except Exception:  # noqa: BLE001 - diagnostics must not mask the crash
+        return None
+    for entry in reversed(entries):
+        phase = str(entry.get("phase") or "")
+        if phase and phase != "pipeline":
+            return phase[:64]
+    return None
+
+
 class ImplementationMixin:
     """Implementation runs (workers, provider fallback, repair) of :class:`ExperimentService`."""
 
@@ -120,11 +135,16 @@ class ImplementationMixin:
                 "Unhandled exception in experiment pipeline; forcing status=failed",
                 exc=exc,
             )
+            phase = _last_logged_phase(elog)
+            failure_type = type(exc).__name__
             self._force_status(
                 experiment_id,
                 STATUS_FAILED,
                 ended_at=_utcnow_iso(),
-                error=f"{PIPELINE_CRASH_ERROR_PREFIX}{exc}",
+                # The prefix stays first: it marks a pipeline crash (#467).
+                error=f"{PIPELINE_CRASH_ERROR_PREFIX}{failure_type} in phase {phase or 'unknown'}: {exc}",
+                failure_phase=phase,
+                failure_type=failure_type,
             )
             result = self.get_experiment(experiment_id)
         for state, detail in _final_issue_progress(result):
