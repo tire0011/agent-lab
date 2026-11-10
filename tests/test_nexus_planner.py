@@ -75,7 +75,10 @@ class RecentExperimentAdoptionTests(unittest.TestCase):
                 "INSERT INTO experiments (id, goal, status, ended_at, error) VALUES ('e1', 'Goal', 'failed', '2026-10-01', 'boom')"
             )
         recent = self._recent()
-        self.assertEqual(recent, [{"title": "Goal", "status": "failed", "error": "boom"}])
+        self.assertEqual(recent, [{
+            "title": "Goal", "status": "failed", "error": "boom",
+            "commits_behind": "unknown", "overlap_files": "unknown",
+        }])
         prompt = planning_prompt([], recent)
         self.assertIn("- failed: Goal (boom)", prompt)
         self.assertNotIn("merge:", prompt)

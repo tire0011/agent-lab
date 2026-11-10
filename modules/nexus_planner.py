@@ -59,7 +59,7 @@ def _merge_label(status: str, reason: str) -> str:
     return status
 
 
-def _history_line(r: dict[str, str]) -> str:
+def _history_line(r: dict[str, Any]) -> str:
     """One recent experiment; with its merge outcome when that is known."""
     if "adoption_status" not in r:
         detail = r.get("error") or ""
@@ -68,7 +68,11 @@ def _history_line(r: dict[str, str]) -> str:
         reason = r.get("adoption_reason") or ""
         detail = reason or r.get("error") or ""
         head = f"- {r.get('status', '')} / merge: {_merge_label(r['adoption_status'], reason)}"
-    return f"{head}: {r.get('title', '')}" + (f" ({detail})" if detail else "")
+    drift = (
+        f" [commits_behind={r.get('commits_behind', 'unknown')}, "
+        f"overlap_files={r.get('overlap_files', 'unknown')}]"
+    )
+    return f"{head}: {r.get('title', '')}" + (f" ({detail})" if detail else "") + drift
 
 
 def _exhausted_section(exhausted: list[dict[str, Any]] | None) -> str:
@@ -113,7 +117,7 @@ def _budget_line(budget_left: int | None) -> str:
 
 def planning_prompt(
     issues: list[dict[str, Any]],
-    recent: list[dict[str, str]] | None = None,
+    recent: list[dict[str, Any]] | None = None,
     *,
     explore: bool = False,
     exhausted: list[dict[str, Any]] | None = None,
@@ -222,7 +226,7 @@ class IssuePlanner:
     def choose(
         self,
         issues: list[dict[str, Any]],
-        recent: list[dict[str, str]] | None = None,
+        recent: list[dict[str, Any]] | None = None,
         exhausted: list[dict[str, Any]] | None = None,
         proposals: list[str] | None = None,
         decisions: list[dict[str, str]] | None = None,

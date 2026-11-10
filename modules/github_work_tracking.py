@@ -233,6 +233,18 @@ class GitHubWorkTrackingError(RuntimeError):
     pass
 
 
+def unknown_branch_drift(reason: str = "unknown") -> dict[str, Any]:
+    """Stable, non-throwing shape for drift that could not be established."""
+    return {
+        "status": "unknown",
+        "commits_behind": "unknown",
+        "files_changed_on_branch": "unknown",
+        "files_changed_on_main_since_base": "unknown",
+        "overlap_files": "unknown",
+        "reason": reason,
+    }
+
+
 class MergeForbiddenError(GitHubWorkTrackingError):
     """The originating task forbids this merge; the pull request stays open."""
 
@@ -608,6 +620,76 @@ class GitHubWorkTrackingService:
             (experiment_id,),
         ).fetchone()
         return self._source_row_to_ref(legacy) if legacy is not None else None
+
+    def branch_drift(
+        self, experiment_id: str, worktree_path: str | None = None
+    ) -> dict[str, Any]:
+        """Compare an experiment branch with freshly fetched main.
+
+        This diagnostic deliberately fails closed.  Any failed/timed-out git
+        operation makes the whole answer unknown, rather than mixing stale
+        refs or incomplete file inventories into an apparently valid result.
+        """
+        ref = self.for_experiment(experiment_id)
+        if ref is None:
+            return unknown_branch_drift("experiment branch link is missing")
+        branch_ref = f"refs/heads/{ref.branch_name}"
+        try:
+            self._git(["show-ref", "--verify", "--quiet", branch_ref], cwd=self.repo_root)
+            if worktree_path:
+                worktree = Path(worktree_path)
+                if not worktree.is_dir():
+                    return unknown_branch_drift("experiment worktree is missing")
+                actual = self._git(
+                    ["symbolic-ref", "--quiet", "HEAD"], cwd=str(worktree)
+                ).stdout.strip()
+                common = self._git(
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=str(worktree),
+                ).stdout.strip()
+                expected_common = self._git(
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=self.repo_root,
+                ).stdout.strip()
+                if actual != branch_ref or Path(common).resolve() != Path(expected_common).resolve():
+                    return unknown_branch_drift(
+                        "experiment worktree does not belong to the experiment branch"
+                    )
+
+            # An explicit destination is essential: restricted fetch refspecs
+            # otherwise update FETCH_HEAD but leave origin/main stale (#623).
+            self._git(
+                [
+                    "fetch", "--no-tags", "origin",
+                    f"refs/heads/{self.target_branch}:refs/remotes/origin/{self.target_branch}",
+                ],
+                cwd=self.repo_root,
+            )
+            main_ref = f"refs/remotes/origin/{self.target_branch}"
+            base = self._git(["merge-base", branch_ref, main_ref], cwd=self.repo_root).stdout.strip()
+            behind_text = self._git(
+                ["rev-list", "--count", f"{branch_ref}..{main_ref}"], cwd=self.repo_root
+            ).stdout.strip()
+
+            def inventory(cwd: str, *revisions: str) -> set[str]:
+                output = self._git(
+                    ["diff", "--no-renames", "--name-only", "-z", *revisions], cwd=cwd
+                ).stdout
+                return {path for path in output.split("\0") if path}
+
+            branch_files = inventory(self.repo_root, f"{base}..{branch_ref}")
+            if worktree_path:
+                branch_files.update(inventory(worktree_path, "HEAD"))
+            main_files = inventory(self.repo_root, f"{base}..{main_ref}")
+            return {
+                "status": "ok",
+                "commits_behind": int(behind_text),
+                "files_changed_on_branch": sorted(branch_files),
+                "files_changed_on_main_since_base": sorted(main_files),
+                "overlap_files": sorted(branch_files & main_files),
+            }
+        except (OSError, ValueError, subprocess.SubprocessError, GitHubWorkTrackingError) as exc:
+            return unknown_branch_drift(str(exc)[:300] or "git drift check failed")
 
     def ensure_for_experiment(self, experiment_id: str) -> GitHubWorkRef:
         self.require_lifecycle_ready()
