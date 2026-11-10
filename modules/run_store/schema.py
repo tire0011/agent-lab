@@ -202,6 +202,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             model TEXT NOT NULL,
             suggestions_json TEXT NOT NULL,
             error TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'completed'
+                CHECK (status IN ('pending', 'completed')),
             FOREIGN KEY (experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
         );
 
@@ -288,6 +290,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         """
     )
     _migrate_experiments_columns(conn)
+    _migrate_experiment_reflections_columns(conn)
     _migrate_codex_tasks_columns(conn)
     _migrate_mailbox_messages_task_body(conn)
     _migrate_mailbox_messages_chain_columns(conn)
@@ -301,6 +304,18 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_benchmark_runs(conn)
     conn.commit()
     return conn
+
+
+def _migrate_experiment_reflections_columns(conn: sqlite3.Connection) -> None:
+    """Add reservation state without re-running completed legacy reflections."""
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(experiment_reflections)")
+    }
+    if "status" not in existing:
+        conn.execute(
+            "ALTER TABLE experiment_reflections "
+            "ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'"
+        )
 
 
 # Columns an older ``experiments`` table may lack; ``CREATE TABLE IF NOT

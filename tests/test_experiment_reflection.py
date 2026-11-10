@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from modules.experiment_reflection import MAX_SUMMARY_CHARS, reflect
 from modules.run_store import init_db
@@ -112,3 +114,32 @@ def test_second_call_is_idempotent_and_does_not_run_model(tmp_path):
     assert reflect("exp-1", llm=second, db_path=path) == []
     assert len(first.calls) == 1
     assert second.calls == []
+
+
+def test_concurrent_calls_submit_exactly_one_model_job(tmp_path):
+    path = _db(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingLlm(FakeLlm):
+        async def complete(self, **kwargs):
+            self.calls.append(kwargs)
+            entered.set()
+            assert release.wait(timeout=5)
+            return '{"suggestions":[]}'
+
+    llm = BlockingLlm()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(reflect, "exp-1", llm=llm, db_path=path)
+        assert entered.wait(timeout=5)
+        second = pool.submit(reflect, "exp-1", llm=llm, db_path=path)
+        assert second.result(timeout=5) == []
+        release.set()
+        assert first.result(timeout=5) == []
+
+    assert len(llm.calls) == 1
+    conn = init_db(path)
+    assert conn.execute(
+        "SELECT status FROM experiment_reflections WHERE experiment_id='exp-1'"
+    ).fetchone()[0] == "completed"
+    conn.close()

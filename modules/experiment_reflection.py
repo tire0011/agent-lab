@@ -130,13 +130,6 @@ def reflect(
     """Reflect once on an experiment and persist at most three suggestions."""
     conn = init_db(db_path)
     try:
-        existing = conn.execute(
-            "SELECT suggestions_json FROM experiment_reflections WHERE experiment_id=?",
-            (experiment_id,),
-        ).fetchone()
-        if existing is not None:
-            return json.loads(existing[0])
-
         conn.row_factory = __import__("sqlite3").Row
         record = conn.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
         if record is None:
@@ -144,6 +137,25 @@ def reflect(
         row = dict(record)
         client = llm or LlamaCppClient()
         model = str(getattr(client, "model", client.__class__.__name__))
+
+        # Reserve before inference.  The UNIQUE constraint makes this an atomic
+        # cross-thread/process claim: only the successful inserter may submit a
+        # local-model job.  A pending row is also a durable idempotency marker if
+        # its worker is interrupted.
+        claimed = conn.execute(
+            """INSERT OR IGNORE INTO experiment_reflections
+               (experiment_id, created_at, model, suggestions_json, error, status)
+               VALUES (?, ?, ?, '[]', NULL, 'pending')""",
+            (experiment_id, datetime.now(timezone.utc).isoformat(), model),
+        ).rowcount
+        conn.commit()
+        if not claimed:
+            existing = conn.execute(
+                "SELECT suggestions_json FROM experiment_reflections WHERE experiment_id=?",
+                (experiment_id,),
+            ).fetchone()
+            return json.loads(existing[0])
+
         prompt = (
             "Review this completed experiment and propose at most three concrete improvements. "
             "No useful improvement is valid: return {\"suggestions\":[]}. Otherwise return "
@@ -171,11 +183,11 @@ def reflect(
             if jobs is not None:
                 release_local_llm_job_service(jobs)
         conn.execute(
-            """INSERT OR IGNORE INTO experiment_reflections
-               (experiment_id, created_at, model, suggestions_json, error)
-               VALUES (?, ?, ?, ?, ?)""",
-            (experiment_id, datetime.now(timezone.utc).isoformat(), model,
-             json.dumps(suggestions, ensure_ascii=False, separators=(",", ":")), error),
+            """UPDATE experiment_reflections
+               SET suggestions_json=?, error=?, status='completed'
+               WHERE experiment_id=? AND status='pending'""",
+            (json.dumps(suggestions, ensure_ascii=False, separators=(",", ":")),
+             error, experiment_id),
         )
         conn.commit()
         stored = conn.execute(
