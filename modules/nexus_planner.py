@@ -27,12 +27,21 @@ _PROPOSAL_TITLE_CHARS = 120
 _PROPOSAL_BODY_CHARS = 3000
 
 
+# Splitting (#626): a stuck or too large issue becomes 2-4 small parts.
+SPLIT_MIN_PARTS = 2
+SPLIT_MAX_PARTS = 4
+_SPLIT_TITLE_CHARS = 120
+_SPLIT_BODY_CHARS = 3000
+
+
 @dataclass(slots=True)
 class PlanChoice:
-    issue: int
+    issue: int  # 0 when the answer only splits an issue
     reason: str
     proposal_title: str = ""
     proposal_body: str = ""
+    split_issue: int = 0
+    split_parts: list[tuple[str, str]] | None = None
 
 
 _EXPLORE = (
@@ -86,7 +95,8 @@ def _exhausted_section(exhausted: list[dict[str, Any]] | None) -> str:
     return (
         "\n\nISSUES OUT OF ATTEMPTS:\n\n"
         "You cannot pick these. Each shows the last failure. If that failure points "
-        "at a fault in your own pipeline, your suggested new issue may fix the cause.\n\n"
+        "at a fault in your own pipeline, your suggested new issue may fix the cause. "
+        "You may split one of them into smaller parts (see SPLIT).\n\n"
         + "\n".join(lines)
     )
 
@@ -139,9 +149,20 @@ def planning_prompt(
         "improvement that no listed issue covers and that makes you work more "
         "reliably or more autonomously. Base it on your own experience: what went "
         "wrong or slowed you down in your recent experiments. No web UI work.\n\n"
+        "You may also SPLIT one issue that is out of attempts or too large to "
+        "do in one experiment into 2 to 4 smaller parts. Each part is one "
+        "concrete change with its own test that one experiment can finish. "
+        "A part may also be a probe: try one approach, measure it, and write "
+        "the result as a comment, so that you can decide the next step on "
+        "evidence. Parts become issues you can pick on later ticks; the "
+        "split issue stays open until all of its parts are closed. Do not "
+        "split an issue you can still pick and do in one go.\n\n"
         "Answer with exactly one JSON object and nothing else:\n"
-        '{"issue": <number>, "reason": "<one sentence why this is next>", '
-        '"proposal": {"title": "...", "body": "what to change, where, how to test"}}\n\n'
+        '{"issue": <number or null>, "reason": "<one sentence why this is next>", '
+        '"proposal": {"title": "...", "body": "what to change, where, how to test"}, '
+        '"split": {"issue": <number>, "parts": [{"title": "...", "body": "what to '
+        'change, where, how to test"}, ...]}}\n'
+        '"split" is optional. "issue" may be null only when you split.\n\n'
         "YOUR RECENT EXPERIMENTS:\n\n" + ("\n".join(history) or "(none yet)") + "\n\n"
         "OPEN ISSUES:\n\n" + "\n\n".join(lines) + _exhausted_section(exhausted)
         + _proposals_section(proposals) + _decisions_section(decisions)
@@ -185,19 +206,49 @@ def _json_object(raw: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def parse_choice(raw: str, allowed: set[int]) -> PlanChoice | None:
-    """The model's answer, or ``None`` when it does not name an allowed issue."""
+def _parse_split(data: dict[str, Any], splittable: set[int]) -> tuple[int, list[tuple[str, str]]] | None:
+    split = data.get("split")
+    if not isinstance(split, dict):
+        return None
+    try:
+        number = int(split.get("issue"))
+    except (TypeError, ValueError):
+        return None
+    parts = split.get("parts")
+    if number not in splittable or not isinstance(parts, list):
+        return None
+    cleaned = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        title = " ".join(str(part.get("title") or "").split())[:_SPLIT_TITLE_CHARS]
+        body = str(part.get("body") or "").strip()[:_SPLIT_BODY_CHARS]
+        if title and body:
+            cleaned.append((title, body))
+    if not SPLIT_MIN_PARTS <= len(cleaned) <= SPLIT_MAX_PARTS:
+        return None
+    return number, cleaned
+
+
+def parse_choice(raw: str, allowed: set[int], splittable: set[int] | None = None) -> PlanChoice | None:
+    """The model's answer, or ``None`` when it neither names an allowed issue
+    nor splits one in *splittable*."""
     data = _json_object(raw or "")
     if data is None:
         return None
+    reason = " ".join(str(data.get("reason") or "").split())[:_REASON_CHARS]
+    split = _parse_split(data, splittable or set())
     try:
         issue = int(data.get("issue"))
     except (TypeError, ValueError):
-        return None
-    reason = " ".join(str(data.get("reason") or "").split())[:_REASON_CHARS]
-    if issue not in allowed or not reason:
+        issue = 0
+    if issue not in allowed:
+        issue = 0
+    if not reason or (issue == 0 and split is None):
         return None
     choice = PlanChoice(issue=issue, reason=reason)
+    if split is not None:
+        choice.split_issue, choice.split_parts = split
     proposal = data.get("proposal")
     if isinstance(proposal, dict):
         title = " ".join(str(proposal.get("title") or "").split())[:_PROPOSAL_TITLE_CHARS]
@@ -233,28 +284,31 @@ class IssuePlanner:
         mission: str | None = None,
         budget_left: int | None = None,
     ) -> PlanChoice | None:
-        if not issues:
-            return None
         allowed = {int(issue["number"]) for issue in issues}
+        splittable = allowed | {int(i["number"]) for i in exhausted or []}
+        if not splittable:
+            return None
         context = dict(
             exhausted=exhausted, proposals=proposals, decisions=decisions,
             mission=mission, budget_left=budget_left,
         )
         choice = None
         if self._explore is not None:
-            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, **context), allowed)
+            choice = self._ask(self._explore, planning_prompt(issues, recent, explore=True, **context),
+                               allowed, splittable)
         if choice is None:
-            choice = self._ask(self._complete, planning_prompt(issues, recent, **context), allowed)
+            choice = self._ask(self._complete, planning_prompt(issues, recent, **context), allowed, splittable)
         return choice
 
     @staticmethod
-    def _ask(model: Callable[[str], str], prompt: str, allowed: set[int]) -> PlanChoice | None:
+    def _ask(model: Callable[[str], str], prompt: str, allowed: set[int],
+             splittable: set[int] | None = None) -> PlanChoice | None:
         try:
             raw = model(prompt)
         except Exception as exc:  # noqa: BLE001 - no plan is a valid outcome
             logger.warning("planner: model call failed: %s", exc)
             return None
-        choice = parse_choice(raw, allowed)
+        choice = parse_choice(raw, allowed, splittable)
         if choice is None:
             logger.warning("planner: no usable choice in answer %r", (raw or "")[:300])
         return choice
