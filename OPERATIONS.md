@@ -294,6 +294,73 @@ and compares a run to a stored baseline; see `benchmarks/README.md`. A run makes
 billed coding-agent calls. Results stay in `benchmark.db`, not in the production
 database.
 
+## Local shadow replay (#637)
+
+`modules/local_shadow_replay.py` turns every merged experiment of a paid coder
+(`implementation_provider` codex/claude, adoption status `adopted`) into a free
+benchmark case for the local coding worker. After each initiative tick has
+finished its own work, `nexus_tick.py` runs at most one replay, and only when
+the local llama-server is reachable and idle: `GET /v1/models` answers, no
+`local_llm_jobs` row is queued/running, no local experiment is
+selecting/implementing/verifying, no other replay holds a live claim, and
+`GET /slots` (when the server exposes it) shows no slot processing. Otherwise
+it does nothing (fail closed).
+
+One replay: a detached throwaway worktree at the experiment's
+`base_commit_sha` (under `NEXUS_SHADOW_REPLAY_DIR`, default the system temp
+dir), the rebuilt coder task (`_build_direct_implementation_prompt(goal)`),
+`LocalCodingWorker` only (no paid fallback, free-tier planner disabled), then
+the merged test paths under `tests/` are copied in from the merged commit
+(`integrated_commit_sha` against its first parent; else the experiment commit
+against its base). Deleted/renamed tests are removed at their old path; no
+source file of the merged diff is ever copied. The test files among them
+(`test_*.py`, `*_test.py`) run with pytest (JUnit counts; skipped tests are not
+counted, a collection error counts as a failed test; `AGENT_DB_PATH` points at
+a temporary database). The worktree is always removed; leftovers of a killed
+process are removed before the next replay. Nothing is committed, fetched or
+pushed.
+
+One row per (experiment, variant) in `local_replays`: `experiment_id`,
+`issue`, `model`, `prompt_variant`, `status` (`scored`, `no_tests` when the
+merged diff changed no test file, `error` when the replay could not be set
+up), `patch_applied` (the local result changed the tree), `compiled` (it did
+and every changed `.py` file compiles), `tests_total`, `tests_passed`,
+`rounds` (local patch rounds), `tokens` (as reported by the server), `seconds`
+(local worker wall time), `error`. A stored experiment/variant pair is never
+replayed again; a claim of a killed process expires after its lease.
+
+Configuration (environment of `nexus-tick.service`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NEXUS_SHADOW_REPLAY_VARIANT` | `baseline` | label stored as `prompt_variant` |
+| `NEXUS_SHADOW_REPLAY` | `1` | `0` disables the sweep |
+| `NEXUS_SHADOW_REPLAY_TIMEOUT_SECONDS` | `1800` | timeout passed to the local worker |
+| `NEXUS_SHADOW_REPLAY_TEST_TIMEOUT_SECONDS` | `600` | bound for the merged test run |
+| `NEXUS_SHADOW_REPLAY_LEASE_SECONDS` | worker + test timeout + 900 | claim lifetime |
+| `NEXUS_SHADOW_REPLAY_DIR` | system temp dir | parent of the throwaway worktrees |
+
+The mailbox setting `shadow_replay_enabled` (1/0) and `paused` = 1 also stop it.
+A replay runs inside the oneshot tick, so a tick that replays ends later (up to
+the timeouts above).
+
+Reading the numbers: `GET /local-replays?limit=` (authenticated) or the MCP
+tool `local_replays_list`. `variants` gives per variant `tests_passed /
+tests_total` (`test_pass_rate`) and `full_passes / scored`
+(`full_pass_rate`: every merged test passed, the worker reported success, at
+least one test); zero-test, `no_tests` and `error` rows are never full passes.
+`common` repeats the numbers on only the experiments scored under every
+variant.
+
+Baseline and comparison: leave `NEXUS_SHADOW_REPLAY_VARIANT` unset for a week;
+once `variants[baseline].replays` is at least 20, report `test_pass_rate` and
+`full_pass_rate` as the baseline. To test a local-model change (prompt,
+context, test-first #615, model swap, `LOCAL_TASK_SPLIT`), deploy it, set a new
+variant label (for example `NEXUS_SHADOW_REPLAY_VARIANT=test-first-615`); the
+sweep replays the same merged experiments again, oldest first, under that
+label. Keep the change only if its numbers in `common` beat the baseline's on
+the same experiments.
+
 ## Known limitations
 
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.

@@ -362,6 +362,8 @@ SETTINGS: dict[str, tuple[str, int, int]] = {
     "paused": ("nexus.paused", 0, 1),
     # 0 disables the free post-experiment reflection sweep; 1 enables it.
     "reflection_enabled": ("nexus.reflection_enabled", 0, 1),
+    # 0 disables the free local shadow replay sweep (#637); 1 enables it.
+    "shadow_replay_enabled": ("nexus.shadow_replay_enabled", 0, 1),
 }
 
 

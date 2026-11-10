@@ -365,6 +365,50 @@ class ReflectionsResponse(BaseModel):
     reflections: list[ExperimentReflection]
 
 
+class LocalReplay(BaseModel):
+    """One local shadow replay of a merged paid experiment (#637)."""
+
+    experiment_id: str
+    issue: int | None = None
+    model: str
+    prompt_variant: str
+    status: str
+    patch_applied: bool
+    compiled: bool
+    tests_total: int
+    tests_passed: int
+    full_pass: bool
+    rounds: int
+    tokens: int
+    seconds: float
+    error: str | None = None
+    base_commit: str | None = None
+    merged_commit: str | None = None
+    created_at: str
+    finished_at: str | None = None
+
+
+class LocalReplayVariantStats(BaseModel):
+    prompt_variant: str
+    replays: int
+    scored: int
+    no_tests: int
+    errors: int
+    tests_total: int
+    tests_passed: int
+    test_pass_rate: float | None = None
+    full_passes: int
+    full_pass_rate: float | None = None
+
+
+class LocalReplaysResponse(BaseModel):
+    count: int
+    replays: list[LocalReplay]
+    variants: list[LocalReplayVariantStats]
+    common_experiments: int
+    common: list[LocalReplayVariantStats]
+
+
 class ActivityEntry(BaseModel):
     id: int
     timestamp: str

@@ -777,6 +777,8 @@ from api_routers.diagnostics import (  # noqa: E402
 from api_routers.experiments import (  # noqa: E402
     EXPERIMENTS_DEFAULT_LIMIT,
     EXPERIMENTS_MAX_LIMIT,
+    LOCAL_REPLAYS_DEFAULT_LIMIT,
+    LOCAL_REPLAYS_MAX_LIMIT,
     REFLECTIONS_DEFAULT_LIMIT,
     REFLECTIONS_MAX_LIMIT,
     _public_experiment,
@@ -789,6 +791,7 @@ from api_routers.experiments import (  # noqa: E402
     get_experiment_reflection,
     get_public_experiment,
     list_experiments,
+    list_local_replays,
     list_reflections,
 )
 from api_routers.health import health, secure_health  # noqa: E402
