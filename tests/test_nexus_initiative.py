@@ -699,6 +699,8 @@ class IssuesOutOfAttemptsTests(unittest.TestCase):
         text = svc._earlier_attempts(232)
         self.assertIn("Review by codex blocked the merge: edge case", text)
         self.assertTrue(text.endswith(REVIEW_FIX_REQUIRED))
+        # A fix once added the next failure (ab3026a2): a lock left behind on a crash.
+        self.assertIn("interrupted, crashes, fails halfway or runs twice", text)
 
     def test_a_test_failure_does_not_claim_review_findings(self):
         from modules.experiment_handover import REVIEW_FIX_REQUIRED

@@ -18,7 +18,9 @@ REVIEW_FIX_REQUIRED = (
     "REQUIRED IN THIS ATTEMPT: the last review blocked the merge. Fix EVERY "
     "blocking problem it lists above, with the tests it asks for. That is the "
     "task of this attempt; a narrower goal anywhere below, including a "
-    "'Nexus goal', does not replace it."
+    "'Nexus goal', does not replace it. Then check that your fix adds no new "
+    "failure: what happens when a step is interrupted, crashes, fails halfway "
+    "or runs twice? Cover those cases with tests."
 )
 _MAX_SECTION_ITEM_CHARS = 1500
 _MAX_ATTEMPT_CHARS = 300
