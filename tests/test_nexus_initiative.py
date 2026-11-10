@@ -689,6 +689,24 @@ class IssuesOutOfAttemptsTests(unittest.TestCase):
         self.assertIn(232, blocked)
         self.assertEqual(exhausted[232]["experiment_ids"], ["e1", "e2", "e3"])
 
+    def test_after_a_review_block_the_findings_are_the_required_task(self):
+        # #489: the controller's own goal named one small fix, the coder did
+        # only that, and the same findings blocked the third attempt.
+        from modules.experiment_handover import REVIEW_FIX_REQUIRED
+
+        self._review_block("e1", "2026-10-01T00:00:00+00:00")
+        svc = self._service(issues=self.ISSUES[:1])
+        text = svc._earlier_attempts(232)
+        self.assertIn("Review by codex blocked the merge: edge case", text)
+        self.assertTrue(text.endswith(REVIEW_FIX_REQUIRED))
+
+    def test_a_test_failure_does_not_claim_review_findings(self):
+        from modules.experiment_handover import REVIEW_FIX_REQUIRED
+
+        self._fail("e1", error="tests failed", ended="2026-10-01T00:00:00+00:00")
+        svc = self._service(issues=self.ISSUES[:1])
+        self.assertNotIn(REVIEW_FIX_REQUIRED, svc._earlier_attempts(232))
+
     def test_a_test_failure_plus_a_review_block_stays_at_two_attempts(self):
         self._fail("e1", error="tests failed", ended="2026-10-01T00:00:00+00:00")
         self._review_block("e2", "2026-10-02T00:00:00+00:00")

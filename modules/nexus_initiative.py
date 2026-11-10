@@ -1384,7 +1384,7 @@ class NexusInitiativeService:
         A review that blocked the merge (#396) explains exactly what was
         wrong; without it the next attempt would make the same mistake.
         """
-        from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING
+        from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, REVIEW_FIX_REQUIRED
 
         try:
             rows = self._conn.execute(
@@ -1402,6 +1402,7 @@ class NexusInitiativeService:
         except sqlite3.OperationalError:
             return ""
         lines = []
+        review_blocked_last = False
         for row in rows:
             # Its reason quotes the rejected text, which would reject the retry.
             if _is_goal_policy_rejection(row["status"], row["error"]):
@@ -1412,10 +1413,12 @@ class NexusInitiativeService:
                 outcome = f"{row['status']}: {row['error'] or ''}"
             else:
                 continue
+            review_blocked_last = outcome.startswith("merge stopped: Review by ")
             lines.append(f"- experiment {str(row['id'])[:8]}, {' '.join(outcome.split())[:4000]}")
         if not lines:
             return ""
-        return f"\n\n{EARLIER_ATTEMPTS_HEADING}\n" + "\n".join(lines)
+        required = f"\n\n{REVIEW_FIX_REQUIRED}" if review_blocked_last else ""
+        return f"\n\n{EARLIER_ATTEMPTS_HEADING}\n" + "\n".join(lines) + required
 
     def _dispatch(self, candidate: Candidate) -> None:
         if candidate.kind == KIND_INTEGRATION:
