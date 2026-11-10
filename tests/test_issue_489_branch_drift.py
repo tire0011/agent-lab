@@ -365,15 +365,27 @@ class PlannerDriftTests(unittest.TestCase):
 
     def test_a_failing_drift_reader_does_not_block_planning(self):
         fx = self._fixture_with_branches()
+        calls = []
 
         def broken(branch, worktree, fetch=True):
+            calls.append((branch, fetch))
             raise RuntimeError("git exploded")
 
         planner = _Planner(_answer(351))
         svc = fx.service(issue_lister=lambda: ISSUES[:2], planner=planner, branch_drift=broken)
         self.addCleanup(svc.close)
         svc.tick()
-        self.assertIn("- needs_review / merge: none: Goal for e1\n", planner.prompts[0])
+        prompt = planner.prompts[0]
+        # A raising reader must say "unknown" explicitly, never drop the
+        # fields so the line looks like a branch without drift (PR #617).
+        self.assertIn(
+            "- needs_review / merge: none: Goal for e1 [branch commits_behind=unknown; overlap_files=[]]\n",
+            prompt,
+        )
+        self.assertIn("- failed / merge: none: Goal for e2 [branch commits_behind=unknown; overlap_files=[]]\n", prompt)
+        self.assertIn("- succeeded / merge: merged: Goal for e3\n", prompt)
+        # No fetch was confirmed, so the next experiment must try it again.
+        self.assertEqual(calls, [("experiment/e1", True), ("experiment/e2", True)])
 
 
 if __name__ == "__main__":

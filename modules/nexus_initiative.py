@@ -1155,6 +1155,10 @@ class NexusInitiativeService:
             drift = self._branch_drift(branch, row["worktree_path"], fetch=not fetched)
         except Exception as exc:  # noqa: BLE001 - planning goes on without drift
             logger.warning("initiative: branch drift for %s failed: %s", branch, exc)
+            # Omitting the fields would look like "no drift info needed";
+            # say explicitly that the drift is unknown instead (PR #617).
+            entry["commits_behind"] = "unknown"
+            entry["overlap_files"] = ""
             return fetched
         if drift.get("status") == "ok":
             entry["commits_behind"] = str(drift.get("commits_behind"))
