@@ -160,6 +160,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             cancelled_at TEXT NULL,
             cancelled_by TEXT NULL,
             worker_pgid INTEGER NULL,
+            failure_phase TEXT NULL,
+            failure_type TEXT NULL,
             plan_json TEXT NULL,
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
@@ -321,6 +323,9 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # Process group of the live worker, so the stall sweep (#400) can stop it
     # from another process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),
+    # Where and how an unhandled pipeline exception happened (#410); NULL otherwise.
+    ("failure_phase", "TEXT"),
+    ("failure_type", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

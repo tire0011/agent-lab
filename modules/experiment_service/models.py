@@ -116,6 +116,9 @@ class Experiment:
     # pre-second-agent experiments.
     implementation_provider: str | None = None
     complexity: str | None = None
+    # Phase and exception class of an unhandled pipeline crash (#410).
+    failure_phase: str | None = None
+    failure_type: str | None = None
     source_type: str | None = None
     source_id: str | None = None
     implementation_started_at: str | None = None
@@ -173,6 +176,8 @@ class Experiment:
             "selection_ended_at": self.selection_ended_at,
             "implementation_provider": self.implementation_provider,
             "complexity": self.complexity,
+            "failure_phase": self.failure_phase,
+            "failure_type": self.failure_type,
             "source_type": self.source_type,
             "source_id": self.source_id,
             "implementation_started_at": self.implementation_started_at,
@@ -239,6 +244,8 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
             else None
         ),
         complexity=row["complexity"] if "complexity" in row.keys() else None,
+        failure_phase=row["failure_phase"] if "failure_phase" in row.keys() else None,
+        failure_type=row["failure_type"] if "failure_type" in row.keys() else None,
         source_type=row["source_type"] if "source_type" in row.keys() else None,
         source_id=row["source_id"] if "source_id" in row.keys() else None,
         implementation_started_at=row["implementation_started_at"],
