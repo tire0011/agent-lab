@@ -44,6 +44,44 @@ class ReviewerTests(unittest.TestCase):
         names = [self._review(reviewer).reviewer for _ in range(4)]
         self.assertEqual(names, ["claude", "codex", "azure", "claude"])
 
+    def _link(self, issue, experiment_id):
+        import sqlite3
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS github_experiment_links (issue_number INTEGER, experiment_id TEXT)")
+            conn.execute("INSERT INTO github_experiment_links VALUES (?, ?)", (issue, experiment_id))
+
+    def test_a_retry_goes_back_to_the_reviewer_that_blocked_it(self):
+        prompts = {}
+
+        def runner(name, answer):
+            def run(prompt, worktree):
+                self.calls.append(name)
+                prompts[name] = prompt
+                return answer
+            return run
+
+        blocked = '{"verdict": "block", "summary": "s", "problems": ["link is stored too late"]}'
+        reviewer = NexusReviewer(db_path=self.db, runners={
+            "claude": runner("claude", blocked), "codex": runner("codex", APPROVE), "azure": runner("azure", APPROVE),
+        })
+        self._link(511, "first")
+        self._link(511, "second")
+        self._link(999, "other")
+        self.assertTrue(reviewer.review(experiment_id="first", goal="g", worktree_path=".", base_sha="").blocks)
+        # Another issue moves the rotation on; the retry still returns to claude.
+        reviewer.review(experiment_id="other", goal="g", worktree_path=".", base_sha="")
+        self.calls.clear()
+        reviewer.review(experiment_id="second", goal="g", worktree_path=".", base_sha="")
+        self.assertEqual(self.calls, ["claude"])
+        self.assertIn("FOLLOW-UP REVIEW", prompts["claude"])
+        self.assertIn("link is stored too late", prompts["claude"])
+        self.assertNotIn("FOLLOW-UP REVIEW", prompts["codex"])
+
+    def test_without_an_earlier_block_the_rotation_is_unchanged(self):
+        reviewer = NexusReviewer(db_path=self.db, runners={n: self._runner(n) for n in ("claude", "codex", "azure")})
+        self._link(1, "e")
+        self.assertEqual([self._review(reviewer).reviewer for _ in range(2)], ["claude", "codex"])
+
     def test_a_reviewer_that_cannot_run_is_skipped(self):
         reviewer = NexusReviewer(db_path=self.db, runners={
             "claude": self._runner("claude", fail=True),
