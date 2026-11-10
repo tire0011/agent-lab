@@ -196,6 +196,22 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             baseline_test_classifications_json TEXT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS experiment_reflections (
+            experiment_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            model TEXT NOT NULL,
+            suggestions_json TEXT NOT NULL,
+            error TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'completed'
+                CHECK (status IN ('pending', 'completed')),
+            -- Ownership of a 'pending' claim: only the holder of claim_token
+            -- may finalize it, and a claim whose lease_expires_at has passed
+            -- belonged to a caller that stopped and may be taken over.
+            claim_token TEXT NULL,
+            lease_expires_at TEXT NULL,
+            FOREIGN KEY (experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_tool_calls_run_id ON tool_calls(run_id);
         CREATE INDEX IF NOT EXISTS idx_model_prices_lookup ON model_prices(provider, model, valid_from);
@@ -279,6 +295,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         """
     )
     _migrate_experiments_columns(conn)
+    _migrate_experiment_reflections_columns(conn)
     _migrate_codex_tasks_columns(conn)
     _migrate_mailbox_messages_task_body(conn)
     _migrate_mailbox_messages_chain_columns(conn)
@@ -292,6 +309,25 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_benchmark_runs(conn)
     conn.commit()
     return conn
+
+
+def _migrate_experiment_reflections_columns(conn: sqlite3.Connection) -> None:
+    """Add reservation state without re-running completed legacy reflections."""
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(experiment_reflections)")
+    }
+    if "status" not in existing:
+        conn.execute(
+            "ALTER TABLE experiment_reflections "
+            "ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'"
+        )
+    # A pending row without a lease (written before leases existed) counts
+    # as expired, so it is recoverable instead of blocking forever.
+    for column in ("claim_token", "lease_expires_at"):
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE experiment_reflections ADD COLUMN {column} TEXT NULL"
+            )
 
 
 # Columns an older ``experiments`` table may lack; ``CREATE TABLE IF NOT
