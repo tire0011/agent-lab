@@ -12,6 +12,14 @@ MAX_HANDOVER_CHARS = 12000
 HANDOVER_HEADING = "What Nexus already found (handover):"
 # Appended to an issue that is tried again (#374): how earlier attempts ended.
 EARLIER_ATTEMPTS_HEADING = "Earlier attempts at this issue (do not repeat their mistakes):"
+# After a review block the findings are the task. A controller goal once
+# replaced them with one small fix, and the retry was blocked again (#489).
+REVIEW_FIX_REQUIRED = (
+    "REQUIRED IN THIS ATTEMPT: the last review blocked the merge. Fix EVERY "
+    "blocking problem it lists above, with the tests it asks for. That is the "
+    "task of this attempt; a narrower goal anywhere below, including a "
+    "'Nexus goal', does not replace it."
+)
 _MAX_SECTION_ITEM_CHARS = 1500
 _MAX_ATTEMPT_CHARS = 300
 
@@ -29,7 +37,7 @@ def experiment_handover(nexus_goal: Any, observations: list[dict[str, Any]]) -> 
     sections: list[str] = []
     goal = _clip(nexus_goal, 2000)
     if goal:
-        sections.append(f"Nexus goal:\n{goal}")
+        sections.append(f"Nexus goal (a summary; it never narrows the task above):\n{goal}")
 
     briefings: list[str] = []
     findings: list[str] = []

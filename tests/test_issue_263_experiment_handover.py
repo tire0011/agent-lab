@@ -37,7 +37,7 @@ class HandoverTextTests(unittest.TestCase):
                  "result": "**Exit code:** 0"},
             ],
         )
-        self.assertIn("Nexus goal:\nFilter controller bookkeeping", handover)
+        self.assertIn("Nexus goal (a summary; it never narrows the task above):\nFilter controller bookkeeping", handover)
         self.assertIn(BRIEFING, handover)
         # A delegate's analysis is a model's opinion, not evidence.
         self.assertIn("Delegate findings (unverified):\nAdd a kind filter.", handover)
@@ -87,7 +87,7 @@ class OrchestratorHandoverTests(unittest.TestCase):
                 orchestrator.close()
 
         self.assertEqual(result.action, ACTION_NEW_EXPERIMENT)
-        self.assertIn("Nexus goal:\nadd a kind filter", result.experiment_handover)
+        self.assertIn("Nexus goal (a summary; it never narrows the task above):\nadd a kind filter", result.experiment_handover)
         self.assertIn("- command echo checked", result.experiment_handover)
         self.assertIn('"name":"new_experiment"', client.prompts[0])
         self.assertIn("the concrete change to make and why", client.prompts[0])
