@@ -196,6 +196,15 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             baseline_test_classifications_json TEXT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS experiment_reflections (
+            experiment_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            model TEXT NOT NULL,
+            suggestions_json TEXT NOT NULL,
+            error TEXT NULL,
+            FOREIGN KEY (experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_tool_calls_run_id ON tool_calls(run_id);
         CREATE INDEX IF NOT EXISTS idx_model_prices_lookup ON model_prices(provider, model, valid_from);
