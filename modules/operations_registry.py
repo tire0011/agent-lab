@@ -249,6 +249,7 @@ class OperationsRegistry:
             "disk": OperationSpec("disk", "Datenträgerbelegung des Hosts.", tags=["disk", "storage", "filesystem", "usage"], mutates_state=False),
             "experiment_logs": OperationSpec("experiment_logs", "Gekürzte JSONL-Logausgabe eines Experiments.", [experiment_id, limit50], ["experiment", "logs", "jsonl", "history"], mutates_state=False),
             "experiment_show": OperationSpec("experiment_show", "Sichere Kurzübersicht zu einem Experiment.", [experiment_id], ["experiment", "status", "summary", "inspect"], mutates_state=False),
+            "branch_drift": OperationSpec("branch_drift", "Branch-Abstand und überlappende Dateien eines Experiments zu aktuellem main.", [experiment_id], ["experiment", "branch", "drift", "conflict", "overlap"], mutates_state=False),
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
             "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
@@ -609,6 +610,21 @@ class OperationsRegistry:
             for entry in entries
         ]
         return OperationResult("experiment_logs", True, lines, 0)
+
+    def _op_branch_drift(self, args: dict[str, Any]) -> OperationResult:
+        experiment = self._experiment(args)
+        service = self.github_work_tracking_factory(
+            db_path=self.db_path, repo_root=str(self.repo_root)
+        )
+        try:
+            drift = service.branch_drift(experiment.id, experiment.worktree_path)
+        finally:
+            close = getattr(service, "close", None)
+            if callable(close):
+                close()
+        lines = [f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in drift.items()]
+        return OperationResult("branch_drift", drift.get("status") == "ok", lines, 0,
+                               error_summary=drift.get("reason") if drift.get("status") != "ok" else None)
 
     def _op_local_model_schema_check(self, args: dict[str, Any]) -> OperationResult:
         """Ask the model server whether it applies Nexus's own JSON schema.

@@ -343,6 +343,15 @@ class ExperimentsResponse(BaseModel):
     experiments: list[ExperimentSummary]
 
 
+class ExperimentDrift(BaseModel):
+    status: str
+    commits_behind: int | str
+    files_changed_on_branch: list[str] | str
+    files_changed_on_main_since_base: list[str] | str
+    overlap_files: list[str] | str
+    reason: str | None = None
+
+
 class ActivityEntry(BaseModel):
     id: int
     timestamp: str

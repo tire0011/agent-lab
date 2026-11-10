@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Header, Query
 from models import (
     ExperimentAdoptionStatus,
     ExperimentDetail,
+    ExperimentDrift,
     ExperimentsResponse,
     PublicExperimentSummary,
 )
@@ -14,6 +15,7 @@ from modules import redaction
 from modules.experiment_adoption_service import ExperimentAdoptionError
 from modules.experiment_service import ExperimentNotCancellableError
 from modules.experiment_service import ExperimentNotFoundError
+from modules.github_work_tracking import GitHubWorkTrackingService
 import api
 
 router = APIRouter(dependency_overrides_provider=app)
@@ -62,6 +64,27 @@ def get_experiment(
     if adoption.status != "not_started":
         payload["adoption"] = adoption.to_dict()
     return ExperimentDetail(**payload)
+
+
+@router.get("/experiments/{experiment_id}/drift", response_model=ExperimentDrift)
+def get_experiment_drift(
+    experiment_id: str,
+    x_api_key: str | None = Header(default=None),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> ExperimentDrift:
+    api.authorize(x_api_key)
+    try:
+        experiment = service.resolve_experiment(experiment_id)
+    except ExperimentNotFoundError:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    tracking = GitHubWorkTrackingService(
+        db_path=str(getattr(service, "db_path", api.DEFAULT_DB_PATH)),
+        repo_root=str(getattr(service, "repo_root", "/agent")),
+    )
+    try:
+        return ExperimentDrift(**tracking.branch_drift(experiment.id, experiment.worktree_path))
+    finally:
+        tracking.close()
 
 
 @router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)

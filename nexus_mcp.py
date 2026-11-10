@@ -409,6 +409,16 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(description="GET /experiments/{experiment_id}/drift", structured_output=True)
+    def experiment_drift_get(experiment_id: str) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_experiment_drift,
+            experiment_id=experiment_id,
+            x_api_key=_internal_api_key(),
+            service=nexus_api._resolve_experiment_service(),
+        )
+
     @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
     def experiment_logs(
         experiment_id: str,

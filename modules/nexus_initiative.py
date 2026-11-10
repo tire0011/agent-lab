@@ -216,6 +216,7 @@ class NexusInitiativeService:
         restart_hook: Callable[[], None] | None = None,
         main_commit_date: Callable[[], str] | None = None,
         repository: str | None = None,
+        drift_reader: Callable[[str, str | None], dict[str, Any]] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -233,6 +234,7 @@ class NexusInitiativeService:
         self._checkout_revision = checkout_revision
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
+        self._drift_reader = drift_reader
         # The repository whose issues this service may execute; checked against
         # the approval registry at candidate scan and again at dispatch.
         self._repository = issue_approvals.normalize_repository(
@@ -1092,12 +1094,12 @@ class NexusInitiativeService:
             found.extend(self._idea_candidates())
         return found
 
-    def _recent_experiments(self, limit: int = 10) -> list[dict[str, str]]:
+    def _recent_experiments(self, limit: int = 10) -> list[dict[str, Any]]:
         """What Nexus tried lately and how it ended, including the newest adoption outcome (#439)."""
         with_adoption = True
         try:
             rows = self._conn.execute(
-                "SELECT e.goal, e.status, e.error, "
+                "SELECT e.id, e.goal, e.status, e.error, "
                 "a.status AS adoption_status, a.reason AS adoption_reason "
                 "FROM experiments e "
                 "LEFT JOIN experiment_adoptions a ON a.rowid = ("
@@ -1110,7 +1112,7 @@ class NexusInitiativeService:
             with_adoption = False
             try:
                 rows = self._conn.execute(
-                    "SELECT goal, status, error FROM experiments "
+                    "SELECT id, goal, status, error FROM experiments "
                     "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
@@ -1127,6 +1129,28 @@ class NexusInitiativeService:
             if with_adoption:
                 entry["adoption_status"] = str(row["adoption_status"] or "")
                 entry["adoption_reason"] = " ".join(str(row["adoption_reason"] or "").split())[:200]
+            try:
+                worktree_path = None
+                get_experiment = getattr(self.experiment_service, "get", None)
+                if callable(get_experiment):
+                    experiment = get_experiment(str(row["id"]))
+                    worktree_path = getattr(experiment, "worktree_path", None)
+                if self._drift_reader is not None:
+                    drift = self._drift_reader(str(row["id"]), worktree_path)
+                else:
+                    from modules.github_work_tracking import GitHubWorkTrackingService
+                    tracker = GitHubWorkTrackingService(
+                        db_path=self.db_path,
+                        repo_root=str(getattr(self.experiment_service, "repo_root", "/agent")),
+                    )
+                    try:
+                        drift = tracker.branch_drift(str(row["id"]), worktree_path)
+                    finally:
+                        tracker.close()
+            except Exception:
+                drift = {"commits_behind": "unknown", "overlap_files": "unknown"}
+            entry["commits_behind"] = drift.get("commits_behind", "unknown")
+            entry["overlap_files"] = drift.get("overlap_files", "unknown")
             recent.append(entry)
         return recent
 
