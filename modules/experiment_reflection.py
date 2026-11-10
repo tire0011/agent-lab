@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import re
-from datetime import datetime, timezone
+import sqlite3
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
+from modules import heartbeat
 from modules.llama_cpp_client import LlamaCppClient
 from modules.local_llm_jobs import (
     ROLE_EXPERIMENT_REFLECTION,
@@ -24,6 +30,16 @@ MAX_SUMMARY_CHARS = 2000
 MAX_SUGGESTIONS = 3
 MAX_TOKENS = 500
 _FIELDS = ("title", "benefit", "cost", "risk", "measure")
+
+# A pending claim states its owner's liveness through ``lease_expires_at``,
+# refreshed while inference is in flight. A lease that has run out belonged to
+# a caller that stopped (crash, kill, failed finalization) and may be taken
+# over, so an interrupted reflection is retried instead of suppressed forever.
+_LEASE_ENV_VAR = "NEXUS_REFLECTION_LEASE_SECONDS"
+_DEFAULT_LEASE_SECONDS = 300
+_BUSY_TIMEOUT_MS = 10_000
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _compact_json(value: Any) -> str:
@@ -120,6 +136,195 @@ def _parse(raw: str, open_titles: Iterable[str]) -> list[dict[str, str]]:
     return result
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _lease_seconds() -> int:
+    return heartbeat.resolve_stale_timeout(
+        os.environ.get(_LEASE_ENV_VAR, _DEFAULT_LEASE_SECONDS)
+    )
+
+
+def _lease_deadline(lease_seconds: float) -> str:
+    return (_utcnow() + timedelta(seconds=lease_seconds)).isoformat()
+
+
+def _lease_expired(value: str | None) -> bool:
+    """A missing or unreadable lease counts as expired: it cannot prove liveness."""
+    if not value:
+        return True
+    try:
+        deadline = datetime.fromisoformat(value)
+    except ValueError:
+        return True
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return deadline <= _utcnow()
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = init_db(db_path)
+    # Autocommit, so the claim below is one explicit IMMEDIATE transaction.
+    conn.isolation_level = None
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def _claim(
+    conn: sqlite3.Connection, experiment_id: str, model: str, token: str, lease_seconds: float
+) -> tuple[str, list[dict[str, str]]]:
+    """Atomically decide who runs the reflection.
+
+    Returns ``("claimed", [])`` when this caller now owns the row,
+    ``("completed", suggestions)`` when it is already done, and
+    ``("busy", [])`` while another live caller holds an unexpired claim.
+    BEGIN IMMEDIATE takes the write lock before reading, so two callers can
+    never both see "no row" or both take over the same stale claim.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            """SELECT status, suggestions_json, lease_expires_at
+               FROM experiment_reflections WHERE experiment_id=?""",
+            (experiment_id,),
+        ).fetchone()
+        if row is not None and row["status"] == "completed":
+            conn.execute("COMMIT")
+            return "completed", json.loads(row["suggestions_json"])
+        if row is not None and not _lease_expired(row["lease_expires_at"]):
+            conn.execute("COMMIT")
+            return "busy", []
+        now = _utcnow().isoformat()
+        deadline = _lease_deadline(lease_seconds)
+        if row is None:
+            conn.execute(
+                """INSERT INTO experiment_reflections
+                   (experiment_id, created_at, model, suggestions_json, error,
+                    status, claim_token, lease_expires_at)
+                   VALUES (?, ?, ?, '[]', NULL, 'pending', ?, ?)""",
+                (experiment_id, now, model, token, deadline),
+            )
+        else:
+            # Stale pending claim: its owner stopped. Take it over.
+            _LOGGER.warning(
+                "experiment_reflection reclaiming stale claim experiment_id=%s", experiment_id
+            )
+            conn.execute(
+                """UPDATE experiment_reflections
+                   SET created_at=?, model=?, suggestions_json='[]', error=NULL,
+                       claim_token=?, lease_expires_at=?
+                   WHERE experiment_id=? AND status='pending'""",
+                (now, model, token, deadline, experiment_id),
+            )
+        conn.execute("COMMIT")
+        return "claimed", []
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+def _finalize(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    token: str,
+    suggestions: list[dict[str, str]],
+    error: str | None,
+) -> bool:
+    """Complete the claim. Owner-conditional: a caller whose stale claim was
+    taken over cannot overwrite the new owner's row."""
+    return conn.execute(
+        """UPDATE experiment_reflections
+           SET suggestions_json=?, error=?, status='completed',
+               claim_token=NULL, lease_expires_at=NULL
+           WHERE experiment_id=? AND claim_token=? AND status='pending'""",
+        (json.dumps(suggestions, ensure_ascii=False, separators=(",", ":")),
+         error, experiment_id, token),
+    ).rowcount == 1
+
+
+def _release(conn: sqlite3.Connection, experiment_id: str, token: str) -> None:
+    """Give an unfinished claim back so the next call can retry immediately."""
+    conn.execute(
+        """DELETE FROM experiment_reflections
+           WHERE experiment_id=? AND claim_token=? AND status='pending'""",
+        (experiment_id, token),
+    )
+
+
+class _LeaseKeeper:
+    """Refreshes a claim's lease while its owner is alive and working."""
+
+    def __init__(
+        self, db_path: str, experiment_id: str, token: str, lease_seconds: float,
+        *, interval: float | None = None,
+    ) -> None:
+        self._db_path = db_path
+        self._experiment_id = experiment_id
+        self._token = token
+        self._lease_seconds = lease_seconds
+        self._interval = interval if interval is not None else max(1.0, lease_seconds / 3)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"reflection-lease-{experiment_id}", daemon=True
+        )
+
+    def start(self) -> "_LeaseKeeper":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                conn = sqlite3.connect(self._db_path, timeout=_BUSY_TIMEOUT_MS / 1000)
+                try:
+                    with conn:
+                        owned = conn.execute(
+                            """UPDATE experiment_reflections SET lease_expires_at=?
+                               WHERE experiment_id=? AND claim_token=? AND status='pending'""",
+                            (_lease_deadline(self._lease_seconds), self._experiment_id, self._token),
+                        ).rowcount
+                finally:
+                    conn.close()
+            except Exception:  # a missed refresh only shortens the lease
+                _LOGGER.exception(
+                    "experiment_reflection lease refresh failed experiment_id=%s",
+                    self._experiment_id,
+                )
+                continue
+            if not owned:
+                return  # finalized, released or taken over: nothing left to keep alive
+
+
+def _run_model(
+    client: Any, db_path: str, experiment_id: str, prompt: str, open_titles: tuple[str, ...]
+) -> tuple[list[dict[str, str]], str | None]:
+    jobs = None
+    try:
+        jobs = acquire_local_llm_job_service(db_path=db_path, llama_client=client)
+        job_id = jobs.submit(
+            prompt,
+            system="Return strict JSON only. Do not include markdown or commentary.",
+            temperature=0.0,
+            max_tokens=MAX_TOKENS,
+            session_id=experiment_id,
+            role=ROLE_EXPERIMENT_REFLECTION,
+        )
+        raw = asyncio.run(jobs.wait(job_id))
+        return _parse(raw, open_titles), None
+    except Exception as exc:  # model and malformed output are persisted, never lifecycle failures
+        return [], f"{type(exc).__name__}: {exc}"[:1000]
+    finally:
+        if jobs is not None:
+            release_local_llm_job_service(jobs)
+
+
 def reflect(
     experiment_id: str,
     open_issue_titles: Iterable[str] = (),
@@ -127,34 +332,28 @@ def reflect(
     llm: Any | None = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> list[dict[str, str]]:
-    """Reflect once on an experiment and persist at most three suggestions."""
-    conn = init_db(db_path)
+    """Reflect once on an experiment and persist at most three suggestions.
+
+    Exactly one caller runs the model: the one holding the claim. A completed
+    reflection is returned as stored; while another live caller holds the
+    claim, ``[]`` is returned without running the model. A claim left behind
+    by a caller that stopped (its lease ran out) is taken over and retried.
+    Never changes the experiment row and never acts on a suggestion.
+    """
+    conn = _connect(db_path)
     try:
-        conn.row_factory = __import__("sqlite3").Row
         record = conn.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
         if record is None:
             raise ValueError(f"unknown experiment: {experiment_id}")
         row = dict(record)
         client = llm or LlamaCppClient()
         model = str(getattr(client, "model", client.__class__.__name__))
+        token = uuid.uuid4().hex
+        lease_seconds = _lease_seconds()
 
-        # Reserve before inference.  The UNIQUE constraint makes this an atomic
-        # cross-thread/process claim: only the successful inserter may submit a
-        # local-model job.  A pending row is also a durable idempotency marker if
-        # its worker is interrupted.
-        claimed = conn.execute(
-            """INSERT OR IGNORE INTO experiment_reflections
-               (experiment_id, created_at, model, suggestions_json, error, status)
-               VALUES (?, ?, ?, '[]', NULL, 'pending')""",
-            (experiment_id, datetime.now(timezone.utc).isoformat(), model),
-        ).rowcount
-        conn.commit()
-        if not claimed:
-            existing = conn.execute(
-                "SELECT suggestions_json FROM experiment_reflections WHERE experiment_id=?",
-                (experiment_id,),
-            ).fetchone()
-            return json.loads(existing[0])
+        state, stored = _claim(conn, experiment_id, model, token, lease_seconds)
+        if state != "claimed":
+            return stored
 
         prompt = (
             "Review this completed experiment and propose at most three concrete improvements. "
@@ -162,38 +361,36 @@ def reflect(
             "{\"suggestions\":[{\"title\":\"...\",\"benefit\":\"...\",\"cost\":\"...\","
             "\"risk\":\"...\",\"measure\":\"...\"}]}.\n\n" + _summary(row)
         )
-        error: str | None = None
-        suggestions: list[dict[str, str]] = []
-        jobs = None
+        keeper = _LeaseKeeper(db_path, experiment_id, token, lease_seconds).start()
+        finalized = False
         try:
-            jobs = acquire_local_llm_job_service(db_path=db_path, llama_client=client)
-            job_id = jobs.submit(
-                prompt,
-                system="Return strict JSON only. Do not include markdown or commentary.",
-                temperature=0.0,
-                max_tokens=MAX_TOKENS,
-                session_id=experiment_id,
-                role=ROLE_EXPERIMENT_REFLECTION,
+            suggestions, error = _run_model(
+                client, db_path, experiment_id, prompt, tuple(open_issue_titles)
             )
-            raw = asyncio.run(jobs.wait(job_id))
-            suggestions = _parse(raw, tuple(open_issue_titles))
-        except Exception as exc:  # model and malformed output are persisted, never lifecycle failures
-            error = f"{type(exc).__name__}: {exc}"[:1000]
+            finalized = _finalize(conn, experiment_id, token, suggestions, error)
+            if not finalized:
+                _LOGGER.warning(
+                    "experiment_reflection claim lost before finalization experiment_id=%s",
+                    experiment_id,
+                )
         finally:
-            if jobs is not None:
-                release_local_llm_job_service(jobs)
-        conn.execute(
-            """UPDATE experiment_reflections
-               SET suggestions_json=?, error=?, status='completed'
-               WHERE experiment_id=? AND status='pending'""",
-            (json.dumps(suggestions, ensure_ascii=False, separators=(",", ":")),
-             error, experiment_id),
-        )
-        conn.commit()
-        stored = conn.execute(
-            "SELECT suggestions_json FROM experiment_reflections WHERE experiment_id=?",
+            keeper.stop()
+            if not finalized:
+                # Interrupted or failed finalization: hand the claim back. If
+                # even this fails (or the process dies), the lease expires.
+                try:
+                    _release(conn, experiment_id, token)
+                except Exception:
+                    _LOGGER.exception(
+                        "experiment_reflection release failed experiment_id=%s; "
+                        "claim recovers when its lease expires", experiment_id,
+                    )
+        stored_row = conn.execute(
+            "SELECT status, suggestions_json FROM experiment_reflections WHERE experiment_id=?",
             (experiment_id,),
         ).fetchone()
-        return json.loads(stored[0])
+        if stored_row is None or stored_row["status"] != "completed":
+            return []
+        return json.loads(stored_row["suggestions_json"])
     finally:
         conn.close()
