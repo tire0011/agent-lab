@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -85,6 +86,16 @@ DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
 # is never dispatched: pending, revoked, content-changed and corrupted records
 # all land here. Approvals come only from the trusted private mailbox.
 DECISION_SKIPPED_UNAPPROVED_ISSUE = "skipped_unapproved_issue"
+# The planner split an issue into parts (#626); detail holds the part numbers.
+DECISION_SPLIT = "split"
+_MAX_SPLIT_DEPTH = 2
+_SPLIT_MARKER = "<!-- nexus-split-depth: {depth} -->"
+_SPLIT_DEPTH_RE = re.compile(r"<!-- nexus-split-depth: (\d+) -->")
+
+
+def _split_depth(body: str) -> int:
+    match = _SPLIT_DEPTH_RE.search(body or "")
+    return int(match.group(1)) if match else 0
 # The owner paused Nexus: no new work, no adoption, no retries. Experiments
 # already running finish.
 DECISION_PAUSED = "paused"
@@ -217,6 +228,8 @@ class NexusInitiativeService:
         main_commit_date: Callable[[], str] | None = None,
         repository: str | None = None,
         drift_reader: Callable[[str, str | None], dict[str, Any]] | None = None,
+        issue_creator: Callable[[str, str], int | None] | None = None,
+        issue_closer: Callable[[int, str], None] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -228,6 +241,9 @@ class NexusInitiativeService:
         self._planner = planner
         self._issue_commenter = issue_commenter
         self._proposal_creator = proposal_creator
+        # Splitting a stuck or large issue into parts (#626).
+        self._issue_creator = issue_creator
+        self._issue_closer = issue_closer
         self._proposal_counter = proposal_counter
         self._decision_lister = decision_lister
         self._diagnostics_client = diagnostics_client
@@ -520,6 +536,8 @@ class NexusInitiativeService:
         except Exception as exc:  # noqa: BLE001 - a source outage must not stop the tick
             logger.warning("initiative: issue lookup failed: %s", exc)
             return []
+        if record_skips:
+            self._close_finished_splits({int(i["number"]) for i in issues if i.get("number") is not None})
         linked, exhausted = self._issue_attempts()
         reported = self._exhausted_reports()
         review_blocked = self._review_blocked_issues()
@@ -529,6 +547,7 @@ class NexusInitiativeService:
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues = []
+        self._exhausted_bodies: dict[int, str] = {}
         unapproved_skips = self._unapproved_issue_skips()
         for issue in issues:
             number = issue.get("number")
@@ -797,6 +816,7 @@ class NexusInitiativeService:
         self._exhausted_issues.append(
             {"number": int(ref), "title": title, "last_reason": attempts["last_reason"]}
         )
+        self._exhausted_bodies[int(ref)] = str(issue.get("body") or "")
         if not record:
             return
         key = (ref, tuple(attempts["experiment_ids"]))
@@ -1089,7 +1109,7 @@ class NexusInitiativeService:
             # Integration work is dispatched first; asking the planner then
             # would be a paid call whose answer is thrown away.
             elif self._planner is not None and not found:
-                issues = self._planned_issue(issues)
+                issues = self._planned_issue(issues, act=record_skips)
             found.extend(issues)
             found.extend(self._idea_candidates())
         return found
@@ -1154,13 +1174,14 @@ class NexusInitiativeService:
             recent.append(entry)
         return recent
 
-    def _planned_issue(self, issues: list[Candidate]) -> list[Candidate]:
+    def _planned_issue(self, issues: list[Candidate], *, act: bool = True) -> list[Candidate]:
         """The one issue the planner picks as next, or none (#354).
 
         No plan means no issue work this tick: taking issues in list order
-        is what the planning step replaces.
+        is what the planning step replaces. The planner may also split a stuck
+        or large issue into parts (#626), even when nothing else is open.
         """
-        if not issues:
+        if not issues and not (act and self._exhausted_issues and self._issue_creator is not None):
             return []
         self._planner_called = True
         choice = self._planner.choose(
@@ -1174,12 +1195,104 @@ class NexusInitiativeService:
         )
         if choice is None:
             return []
+        if act and choice.split_parts:
+            self._split_issue(choice.split_issue, choice.split_parts, choice.reason, issues)
+        if not choice.issue:
+            return []
         chosen = next(c for c in issues if int(c.ref) == choice.issue)
         chosen.reason = choice.reason
         chosen.payload["planned"] = True
         if choice.proposal_title and self._proposal_slot_free():
             chosen.payload["proposal"] = {"title": choice.proposal_title, "body": choice.proposal_body}
         return [chosen]
+
+    # ---- splitting (#626) --------------------------------------------------
+
+    def _splits(self) -> dict[int, tuple[str, dict[str, Any]]]:
+        """Parent issue -> (tick id, detail) of every recorded split."""
+        try:
+            rows = self._conn.execute(
+                "SELECT tick_id, source_ref, detail FROM nexus_initiative_log WHERE decision = ?",
+                (DECISION_SPLIT,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        found: dict[int, tuple[str, dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                found[int(row["source_ref"])] = (row["tick_id"], json.loads(row["detail"] or "{}"))
+            except (TypeError, ValueError):
+                continue
+        return found
+
+    def _split_issue(self, parent: int, parts: list[tuple[str, str]], reason: str,
+                     issues: list[Candidate]) -> None:
+        """Open the parts as issues of their own and note the split on the parent.
+
+        The parts are Nexus' own issues, so they need no new approval; the
+        parent was approved already. One level of splitting a part is allowed.
+        """
+        if self._issue_creator is None or parent in self._splits():
+            return
+        body = next((str(c.payload.get("body") or "") for c in issues if int(c.ref) == parent), None)
+        if body is None:
+            body = getattr(self, "_exhausted_bodies", {}).get(parent, "")
+        depth = _split_depth(body)
+        if depth >= _MAX_SPLIT_DEPTH:
+            logger.info("initiative: #%s is already a part of a part; not split again", parent)
+            return
+        children: list[int] = []
+        for index, (title, text) in enumerate(parts, 1):
+            try:
+                number = self._issue_creator(
+                    title,
+                    f"{text}\n\n---\nPart {index} of {len(parts)} of #{parent}, split by the "
+                    f"Nexus planning step: {reason}\n{_SPLIT_MARKER.format(depth=depth + 1)}",
+                )
+            except Exception as exc:  # noqa: BLE001 - the parts made so far stay
+                logger.warning("initiative: could not open part %s of #%s: %s", index, parent, exc)
+                break
+            if number:
+                children.append(int(number))
+        if not children:
+            return
+        tick_id = uuid.uuid4().hex
+        self._record(InitiativeDecision(
+            DECISION_SPLIT,
+            candidate=Candidate(KIND_ISSUE, str(parent), "", reason),
+            detail=json.dumps({"children": children, "closed": False}),
+            tick_id=tick_id,
+        ))
+        if self._issue_commenter is not None:
+            try:
+                self._issue_commenter(
+                    parent,
+                    f"Nexus split this issue into {', '.join(f'#{n}' for n in children)}: {reason}\n\n"
+                    "It closes this issue once all parts are closed.",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("initiative: split comment failed for #%s: %s", parent, exc)
+
+    def _close_finished_splits(self, open_numbers: set[int]) -> None:
+        """Close a split issue once none of its parts is open any more."""
+        if self._issue_closer is None or not open_numbers:
+            return
+        for parent, (tick_id, detail) in self._splits().items():
+            children = [int(n) for n in detail.get("children") or []]
+            if detail.get("closed") or parent not in open_numbers or not children:
+                continue
+            if any(n in open_numbers for n in children):
+                continue
+            try:
+                self._issue_closer(
+                    parent, f"All parts ({', '.join(f'#{n}' for n in children)}) are closed.",
+                )
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                logger.warning("initiative: could not close split issue #%s: %s", parent, exc)
+                continue
+            detail["closed"] = True
+            self._record(InitiativeDecision(DECISION_SPLIT, detail=json.dumps(detail), tick_id=tick_id),
+                         update=True)
 
     def _owner_decisions(self) -> list[dict[str, str]]:
         """Proposals the owner closed, with why; none when they cannot be read."""

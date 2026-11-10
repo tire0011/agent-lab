@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -137,6 +138,24 @@ def _open_proposal(repo_root: str, title: str, body: str) -> None:
     footer = "\n\n---\nSuggested by the Nexus planning step. Remove the `proposal` label to let Nexus work on it."
     _gh(repo_root, ["issue", "create", "--title", title, "--body", body + footer, "--label", PROPOSAL_LABEL])
     _events.append(f"New proposal issue: {title}")
+
+
+def _open_part_issue(repo_root: str, title: str, body: str) -> int | None:
+    """A part of a split issue (#626): no proposal label, it is ready to work on."""
+    proc = subprocess.run(
+        ["gh", "issue", "create", "--title", title, "--body", body],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+    match = re.search(r"/issues/(\d+)", proc.stdout or "")
+    _events.append(f"New part issue: {title}")
+    return int(match.group(1)) if match else None
+
+
+def _close_issue(repo_root: str, number: int, text: str) -> None:
+    _gh(repo_root, ["issue", "close", str(number), "--comment", text])
+    _events.append(f"Closed split issue #{number}: {text}")
 
 
 def _count_open_proposals(repo_root: str) -> int:
@@ -290,6 +309,8 @@ def _build_service(args) -> NexusInitiativeService:
         planner=_planner(args.repo_root) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
+        issue_creator=lambda title, body: _open_part_issue(args.repo_root, title, body),
+        issue_closer=lambda number, text: _close_issue(args.repo_root, number, text),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
         decision_lister=lambda: _owner_decisions(args.repo_root),
         diagnostics_client=_service_diagnostics,
