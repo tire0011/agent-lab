@@ -31,6 +31,7 @@ VERDICT_APPROVE = "approve"
 VERDICT_BLOCK = "block"
 
 _DIFF_CHARS = 60000
+_MODEL_WRITTEN_TESTS_CHARS = 10000
 _AGENT_TIMEOUT_SECONDS = 900
 _AGENT_STALL_SECONDS = 300
 
@@ -47,7 +48,7 @@ class ReviewResult:
 
 
 def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: str = "",
-                  earlier_findings: str = "") -> str:
+                  earlier_findings: str = "", model_written_tests: str = "") -> str:
     look = (
         "You are in the repository with the change applied and may read any file "
         "to check the change in context.\n\n"
@@ -89,7 +90,17 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
             "findings in the summary without blocking.\n\n"
             if earlier_findings else ""
         )
-        + f"TASK:\n{goal[:8000]}\n\nDIFF:\n{diff[:_DIFF_CHARS]}"
+        + f"TASK:\n{goal[:8000]}\n\n"
+        + (
+            # #636: the coder got these as suggestions; they are not part of the
+            # task, so a diff without them is not missing anything.
+            "The coder was handed these generated tests as a suggestion. Leaving "
+            "them out of the diff, or changing them, is not a reason to block; "
+            "block for them only if they are in the diff and wrong.\n"
+            f"{model_written_tests[:_MODEL_WRITTEN_TESTS_CHARS]}\n\n"
+            if model_written_tests else ""
+        )
+        + f"DIFF:\n{diff[:_DIFF_CHARS]}"
     )
 
 
@@ -172,7 +183,7 @@ class NexusReviewer:
 
     def review(
         self, *, experiment_id: str, goal: str, worktree_path: str, base_sha: str,
-        gate_findings: str = "",
+        gate_findings: str = "", model_written_tests: str = "",
     ) -> ReviewResult:
         diff = _diff(worktree_path, base_sha)
         result = None
@@ -191,6 +202,7 @@ class NexusReviewer:
                 # A stand-in for that reviewer checks the same findings (#642: claude
                 # gave no verdict, and codex reviewed the retry from scratch).
                 earlier_findings=earlier[1] if earlier is not None else "",
+                model_written_tests=model_written_tests,
             )
             try:
                 parsed = parse_review(runner(prompt, worktree_path))

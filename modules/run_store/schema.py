@@ -363,6 +363,9 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # Where and how an unhandled pipeline exception happened (#410); NULL otherwise.
     ("failure_phase", "TEXT"),
     ("failure_type", "TEXT"),
+    # The marked MODEL-WRITTEN TESTS block handed to the paid coder (#636), so the
+    # reviewer sees the same suggestion; NULL when no generated tests were handed over.
+    ("model_written_tests", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
@@ -918,6 +921,21 @@ def _migrate_benchmark_runs(conn: sqlite3.Connection) -> None:
             ON benchmark_runs(started_at);
         """
     )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(benchmark_runs)")}
+    for column_name, column_type in _BENCHMARK_RUNS_ADDITIVE_COLUMNS:
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE benchmark_runs ADD COLUMN {column_name} {column_type} NULL")
+
+
+# Test-first measurements (#636); NULL for runs that did not measure them.
+_BENCHMARK_RUNS_ADDITIVE_COLUMNS = [
+    ("test_first", "INTEGER"),
+    ("tests_generated", "INTEGER"),
+    ("generated_tests_failing_on_start", "INTEGER"),
+    ("generated_tests_passing_on_merge", "INTEGER"),
+    ("local_only_success", "INTEGER"),
+    ("paid_calls", "INTEGER"),
+]
 
 
 def _migrate_local_replays(conn: sqlite3.Connection) -> None:

@@ -78,3 +78,35 @@ def experiment_handover(nexus_goal: Any, observations: list[dict[str, Any]]) -> 
 def with_handover(goal: str, handover: str | None) -> str:
     """The experiment goal: the caller's task text followed by the handover."""
     return f"{goal}\n\n{handover}" if handover else goal
+
+
+# Test-first part 3 (#636): the local model's generated failing tests go to the
+# paid coder and the reviewer as a suggestion, never as a required artifact.
+MODEL_WRITTEN_TESTS_HEADING = "MODEL-WRITTEN TESTS (may be rejected)"
+MAX_MODEL_WRITTEN_TESTS_CHARS = 8000
+
+
+def model_written_tests_block(path: str | None, content: str | None,
+                              test_ids: list[str] | tuple[str, ...] = ()) -> str:
+    """The marked block for one generated test file; empty without a file."""
+    content = redact_secrets(str(content or "")).rstrip()
+    path = str(path or "").strip()
+    if not path or not content:
+        return ""
+    if len(content) > MAX_MODEL_WRITTEN_TESTS_CHARS:
+        content = content[: MAX_MODEL_WRITTEN_TESTS_CHARS - 4] + "\n..."
+    ids = "".join(f"\n- {test_id}" for test_id in test_ids)
+    return (
+        f"{MODEL_WRITTEN_TESTS_HEADING}\n"
+        f"A local model wrote `{path}` from the task's Test section; each test below "
+        "failed on the unchanged tree. They are unreviewed suggestions, not part of "
+        "the task: keep, fix or drop them. The file is NOT in the working tree and is "
+        "not required in the final diff; add it yourself only if you keep it."
+        + (f"\nTests that failed on the base tree:{ids}" if ids else "")
+        + f"\n\n```python\n{content}\n```"
+    )
+
+
+def with_model_written_tests(task: str, block: str | None) -> str:
+    """*task* followed by the marked block, unchanged when there is none."""
+    return f"{task}\n\n{block}" if block else task

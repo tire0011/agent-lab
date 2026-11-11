@@ -546,6 +546,7 @@ class PipelineMixin:
                 blocked = self._review_blocks(
                     experiment_id, experiment.goal, work_ref, integration_path, elog,
                     gate_findings="; ".join(dict.fromkeys(review_findings)),
+                    model_written_tests=getattr(experiment, "model_written_tests", None) or "",
                 )
                 if blocked is not None:
                     return self._finish_failure(

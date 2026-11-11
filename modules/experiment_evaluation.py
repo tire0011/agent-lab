@@ -131,9 +131,14 @@ def _change_section(task: str) -> str:
 
 def extract_explicit_goal_artifacts(goal: str) -> list[str]:
     # Handover command output is evidence, not requested artifacts (#263).
-    from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING
+    # Model-written tests are suggestions, never required in the final diff (#636).
+    from modules.experiment_handover import (
+        EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING, MODEL_WRITTEN_TESTS_HEADING,
+    )
 
-    task = (goal or "").split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0]
+    task = (goal or "")
+    for heading in (HANDOVER_HEADING, EARLIER_ATTEMPTS_HEADING, MODEL_WRITTEN_TESTS_HEADING):
+        task = task.split(heading, 1)[0]
     task = _change_section(task)
     found: list[str] = []
     for match in _GOAL_PATH_RE.finditer(task):
