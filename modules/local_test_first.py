@@ -55,7 +55,7 @@ _TIMEOUT = 20.0  # seconds per subprocess (collection, one test run)
 _STALE_SECONDS = 3600.0
 _CANDIDATE_PREFIX = "_nexus_test_first_"
 
-_SYSTEM = "You write small Python unittest regression tests. Return strict JSON only."
+_SYSTEM = "You are a repository coding worker. Follow the requested output format exactly."
 
 _SECTION_NAMES = r"problem|changes?|tests?|why|context|background|notes?|acceptance(?:[ \t]+criteria)?"
 # Accepts "## Test", "**Test**", "**Test:**", "**Test** (`tests/x.py`) ..." and "Test: ..."

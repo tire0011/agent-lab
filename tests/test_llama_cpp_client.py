@@ -178,6 +178,25 @@ def test_cache_can_be_disabled_and_n_past_is_not_reuse(monkeypatch):
     assert "tokens_cached" not in client.last_timings
 
 
+def test_top_level_tokens_cached_is_slot_state_not_reuse(monkeypatch):
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "choices": [{"message": {"content": "ok"}}],
+        "timings": {"prompt_n": 30},
+        "tokens_cached": 500,
+    }
+    with patch("modules.llama_cpp_client.httpx.AsyncClient") as cls:
+        http = AsyncMock()
+        http.__aenter__ = AsyncMock(return_value=http)
+        http.__aexit__ = AsyncMock(return_value=None)
+        http.post = AsyncMock(return_value=response)
+        cls.return_value = http
+        client = make_client()
+        import asyncio
+        asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
+    assert client.last_timings == {"prompt_n": 30}
+
+
 @pytest.mark.asyncio
 async def test_chat_completion_http_error_raises():
     mock_response = MagicMock()

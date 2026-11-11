@@ -74,7 +74,7 @@ CONTEXT_MARGIN_TOKENS = 256
 SAFE_BYTES_PER_TOKEN = 3
 _MAX_FILES = 8
 _MAX_FILE_BYTES = 16 * 1024
-_SYSTEM_PROMPT = "You are a coding worker. Produce a minimal correct unified diff."
+_SYSTEM_PROMPT = "You are a repository coding worker. Follow the requested output format exactly."
 _CLOSING = "Return only one unified git diff. Do not use Markdown prose or fences."
 _CUT_MARKER = "\n...[handover cut to fit the local model's context]"
 _DIFF_CUT_MARKER = "\n...[previous diff cut to fit the local model's context]"
@@ -192,16 +192,20 @@ def _render_feedback(round_no: int, error: str, previous_diff: str) -> str:
 def _render_prompt(essential: str, files_text: str, handover: str, feedback: str = "") -> str:
     # Keep the expensive, run-stable repository snapshot first. llama-server
     # can then reuse its KV prefix while goals and correction feedback change.
-    prompt = (
-        f"Repository context (stable for this run):\n"
-        f"Contents of target files (relevant parts):{files_text or ' none'}\n\n"
-        f"Goal and instructions:\n{essential}\n\n"
-    )
+    prompt = _render_stable_prefix(files_text) + f"Goal and instructions:\n{essential}\n\n"
     if handover:
         prompt += f"{handover}\n\n"
     if feedback:
         prompt += f"{feedback}\n"
     return prompt + _CLOSING
+
+
+def _render_stable_prefix(files_text: str) -> str:
+    """Deterministic portion preceding every changing instruction or error."""
+    return (
+        "Repository context:\n"
+        f"Contents of target files (relevant parts):{files_text or ' none'}\n\n"
+    )
 
 
 def _extract_diff(text: str) -> str:
@@ -282,6 +286,7 @@ class PromptPlan:
     # Optional renderer for plans whose stable prefix is shared with a parent
     # run while their fresh file state lives in the tail (subtasks).
     prompt_renderer: Callable[[str, str], str] | None = field(default=None, repr=False)
+    stable_prefix: str = field(default="", repr=False)
 
     def log_fields(self) -> dict[str, Any]:
         return {
@@ -463,6 +468,7 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         time_budget_tokens=time_budget_tokens, time_budget_limited=limited,
         time_budget_exceeded=exceeded, output_tokens=output_tokens,
         essential=essential, files_text=files_text, handover=handover, counter=count,
+        stable_prefix=_render_stable_prefix(files_text),
     )
 
 
@@ -564,9 +570,9 @@ MAX_SUBTASK_FILES = 2
 MAX_SUBTASK_TESTS = 3
 PLAN_MAX_TOKENS = 1024
 NAMED_TEST_TIMEOUT_SECONDS = 300.0
-# The system message is part of llama-server's cached prefix.  Planning and
-# patching deliberately share it; planning-specific rules live in the changing
-# user-message tail.
+# The neutral system message is part of llama-server's cached prefix. Planning
+# and patching deliberately share it; format-specific rules live in the user
+# message so they cannot conflict.
 _PLAN_SYSTEM_PROMPT = _SYSTEM_PROMPT
 _PLAN_INSTRUCTIONS = (
     "Split the coding task below into an ordered list of small subtasks for a small local "
@@ -1183,7 +1189,7 @@ class LocalCodingWorker:
     async def _local_plan_prompt(self, plan: PromptPlan) -> str:
         count = plan.counter or TokenCounter(self.client)
         budget = plan.n_ctx - min(self.max_tokens, PLAN_MAX_TOKENS) - CONTEXT_MARGIN_TOKENS
-        stable = plan.prompt.split("\n\nGoal and instructions:\n", 1)[0]
+        stable = plan.stable_prefix or _render_stable_prefix(plan.files_text)
 
         async def total(handover: str) -> int:
             return await count(_PLAN_SYSTEM_PROMPT) + await count(
@@ -1278,57 +1284,13 @@ class LocalCodingWorker:
             f"Changes already made by the earlier subtasks (git diff, already applied):\n{earlier}\n\n"
             f"Overall task (context only; do not do the other subtasks):\n{plan.essential}"
         )
-        # Fit against the files that are actually on disk now.  This preserves
-        # #598: subtask N sees edits made by subtask N-1, and files named only by
-        # this subtask are included.  The parent snapshot remains an identical
-        # prefix; the fresh subtask snapshot is changing tail context.
-        fresh_plan = await build_prompt_parts(
+        # Re-read and fit exactly the files that will be sent. This preserves
+        # #598 (later subtasks see earlier edits), includes files named only by
+        # the subtask, and avoids duplicating a stale parent snapshot.
+        return await build_prompt_parts(
             essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
             n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
             rates=self.rates.medians(),
-        )
-        count = plan.counter or TokenCounter(self.client)
-        stable = plan.prompt.split("\n\nGoal and instructions:\n", 1)[0]
-
-        def render(handover: str, feedback: str = "") -> str:
-            return (
-                stable + "\n\n"
-                + "Current files for this subtask (fresh working-tree state):\n"
-                + (fresh_plan.files_text or " none") + "\n\n"
-                + f"Goal and instructions:\n{essential}\n\n"
-                + (f"{handover}\n\n" if handover else "")
-                + (f"{feedback}\n" if feedback else "")
-                + _CLOSING
-            )
-
-        system_tokens = await count(_SYSTEM_PROMPT)
-        hard_budget = plan.n_ctx - self.max_tokens - CONTEXT_MARGIN_TOKENS
-        async def total(handover: str) -> int:
-            return system_tokens + await count(render(handover))
-        base_tokens = await total("")
-        if base_tokens > hard_budget:
-            raise ContextTooSmallError(
-                f"{CONTEXT_TOO_SMALL}: stable run prefix, fresh subtask files and instructions "
-                f"need {base_tokens} tokens, but n_ctx {plan.n_ctx} ({plan.n_ctx_source}) "
-                f"leaves {hard_budget}; the local model was not called"
-            )
-        # The time budget is soft.  It may remove the changing handover, never
-        # the stable prefix or fresh file state needed for a correct diff.
-        budget = max(base_tokens, min(hard_budget, fresh_plan.budget_tokens))
-        kept = await _fit_part(context, budget, total, count)
-        prompt = render(kept)
-        tokens = await total(kept)
-        return PromptPlan(
-            prompt=prompt, n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source,
-            budget_tokens=budget, prompt_tokens=tokens, token_source=count.source,
-            named_files=list(fresh_plan.named_files), file_level=fresh_plan.file_level,
-            handover_tokens_kept=await count(kept) if kept else 0,
-            handover_cut=kept != context, time_budget_tokens=fresh_plan.time_budget_tokens,
-            time_budget_limited=fresh_plan.time_budget_limited or kept != context,
-            time_budget_exceeded=base_tokens > min(hard_budget, fresh_plan.budget_tokens),
-            output_tokens=fresh_plan.output_tokens, essential=essential,
-            files_text=fresh_plan.files_text, handover=context, counter=count,
-            prompt_renderer=render,
         )
 
     # The correction loop (#597)

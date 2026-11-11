@@ -140,18 +140,15 @@ class LlamaCppClient:
             }
             # llama-server versions have used several names and locations for
             # the reused prefix. Normalize them for callers and structured logs.
-            for source in (data, timings):
-                if not isinstance(source, dict):
-                    continue
-                # ``n_past`` is the slot state after the request on current
-                # llama-server versions.  It can include both the prompt and
-                # generated tokens, so it is not evidence of prefix reuse.
-                for name in ("tokens_cached", "cache_n"):
-                    value = source.get(name)
-                    if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        self.last_timings["tokens_cached"] = value
-                        break
-                if "tokens_cached" in self.last_timings:
+            # Only timing-scoped fields describe work reused for this request.
+            # Top-level ``tokens_cached``/``n_past`` describe the slot state on
+            # llama-server versions in the field and can include newly evaluated
+            # prompt and generated tokens.  Treating those as hits produces cache
+            # ratios greater than one and makes the #645 measurement meaningless.
+            for name in ("cache_n", "tokens_cached", "n_past"):
+                value = timings.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    self.last_timings["tokens_cached"] = value
                     break
         return data  # type: ignore[no-any-return]
 
