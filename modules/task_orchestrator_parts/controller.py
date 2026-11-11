@@ -614,6 +614,28 @@ class ControllerLoopMixin:
                     experiment_id = self.experiment_service.resolve_experiment(str(experiment_id)).id
                 except Exception as exc:
                     raise TaskOrchestratorError(f"unknown experiment {experiment_id!r}") from exc
+                if self._adoption_decided(experiment_id):
+                    # Its adoption is over (merged, or stopped by the review): there is
+                    # nothing left to resume. #642 resumed one every tick for hours.
+                    rejection = {
+                        "event": "terminal_decision_rejected",
+                        "terminal_action": ACTION_RESUME_EXPERIMENT,
+                        "reason": (
+                            f"experiment {experiment_id[:8]} is finished and its adoption is "
+                            "decided; it cannot be resumed. To fix review findings, choose "
+                            "new_experiment."
+                        ),
+                        "retryable": True,
+                    }
+                    rejection["event_id"] = self.task_store.append_event(
+                        session.id,
+                        role="system",
+                        kind="terminal_decision_rejected",
+                        content=json.dumps(rejection, separators=(",", ":")),
+                        metadata={"controller_action": action, "experiment_id": experiment_id},
+                    )
+                    observations.append(rejection)
+                    continue
                 if not self._may_resume_experiment(session.id, task, experiment_id):
                     # An experiment named in a refusal is someone else's work - resuming it turned
                     # a refused reboot into an unrelated merged change (#330).

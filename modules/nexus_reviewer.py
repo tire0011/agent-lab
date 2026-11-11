@@ -188,7 +188,9 @@ class NexusReviewer:
                 continue
             prompt = review_prompt(
                 goal, diff, can_read_files=name != "azure", gate_findings=gate_findings,
-                earlier_findings=earlier[1] if earlier is not None and name == earlier[0] else "",
+                # A stand-in for that reviewer checks the same findings (#642: claude
+                # gave no verdict, and codex reviewed the retry from scratch).
+                earlier_findings=earlier[1] if earlier is not None else "",
             )
             try:
                 parsed = parse_review(runner(prompt, worktree_path))

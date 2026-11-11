@@ -27,6 +27,12 @@ class ReviewerTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.db = str(Path(tmp.name) / "agent.db")
         self.calls = []
+        # The diff is the checkout's own HEAD; its text must not leak into prompt assertions.
+        from unittest import mock
+        import modules.nexus_reviewer as nexus_reviewer
+        patcher = mock.patch.object(nexus_reviewer, "_diff", return_value="diff --git a/x b/x")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _runner(self, name, answer=APPROVE, fail=False):
         def run(prompt, worktree):
@@ -76,6 +82,28 @@ class ReviewerTests(unittest.TestCase):
         self.assertIn("FOLLOW-UP REVIEW", prompts["claude"])
         self.assertIn("link is stored too late", prompts["claude"])
         self.assertNotIn("FOLLOW-UP REVIEW", prompts["codex"])
+
+    def test_a_stand_in_for_the_blocking_reviewer_gets_the_same_findings(self):
+        prompts = {}
+
+        def runner(name, answer):
+            def run(prompt, worktree):
+                prompts[name] = prompt
+                return answer
+            return run
+
+        blocked = '{"verdict": "block", "summary": "s", "problems": ["timeout error is empty"]}'
+        reviewer = NexusReviewer(db_path=self.db, runners={
+            "claude": runner("claude", blocked), "codex": runner("codex", APPROVE), "azure": runner("azure", APPROVE),
+        })
+        self._link(642, "first")
+        self._link(642, "second")
+        reviewer.review(experiment_id="first", goal="g", worktree_path=".", base_sha="")
+        reviewer._runners["claude"] = runner("claude", "not json")
+        result = reviewer.review(experiment_id="second", goal="g", worktree_path=".", base_sha="")
+        self.assertEqual(result.reviewer, "codex")
+        self.assertIn("FOLLOW-UP REVIEW", prompts["codex"])
+        self.assertIn("timeout error is empty", prompts["codex"])
 
     def test_without_an_earlier_block_the_rotation_is_unchanged(self):
         reviewer = NexusReviewer(db_path=self.db, runners={n: self._runner(n) for n in ("claude", "codex", "azure")})
