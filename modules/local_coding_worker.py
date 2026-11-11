@@ -1319,6 +1319,10 @@ class LocalCodingWorker:
         self.last_plan: PromptPlan | None = None
         self.last_split: SplitOutcome | None = None
         self.generated_tests: tuple[str, ...] = ()
+        # Where the generated tests were installed and what was written (#636), so a
+        # paid fallback can take them out of the tree and hand them over instead.
+        self.generated_test_file: str | None = None
+        self.generated_test_content: str = ""
         self.local_attempt_passed_generated_tests: bool | None = None
         # #639: best-of-N patch sampling. 1 keeps the single greedy answer per round.
         self.samples = max(1, min(MAX_LOCAL_SAMPLES, int(samples or 1)))
@@ -1336,6 +1340,8 @@ class LocalCodingWorker:
         started = time.monotonic()
         self.last_plan = None
         self.generated_tests = ()
+        self.generated_test_file = None
+        self.generated_test_content = ""
         self.local_attempt_passed_generated_tests = None
         self.last_sample_stats = []
         self.last_run_metrics = None
@@ -1385,6 +1391,9 @@ class LocalCodingWorker:
                 if ids and content and target is not None and not target.exists():
                     if _install_generated_test(target, content):
                         self.generated_tests = tuple(ids)
+                        self.generated_test_file = target.relative_to(
+                            Path(working_dir).resolve()).as_posix()
+                        self.generated_test_content = content
                 self._log(
                     experiment_logger, phase, "local_test_first_generated",
                     f"Generated {len(self.generated_tests)} failing acceptance test(s)",

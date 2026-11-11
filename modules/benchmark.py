@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from modules.coding_provider import build_worker, random_worker_factory
+from modules.coding_provider import build_worker, provider_of, random_worker_factory
 from modules.experiment_evaluation import parse_git_status_short
 from modules.experiment_service import Experiment, ExperimentService
 from modules.experiment_service.prompts import _build_direct_implementation_prompt
@@ -171,6 +171,7 @@ class _UsageMeter:
     def __init__(self) -> None:
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.paid_calls = 0
 
     def add(self, usage: dict[str, int] | None) -> None:
         if not usage:
@@ -192,6 +193,9 @@ class _MeteredWorker:
 
     def run(self, *, task: str, **kwargs: Any) -> Any:
         prompt = f"{task}\n\n{self._prompt_text}" if self._prompt_text else task
+        if provider_of(self._worker) != "local":
+            # Every call that is not the local model costs money (#636).
+            self._meter.paid_calls += 1
         result = self._worker.run(task=prompt, **kwargs)
         self._meter.add(result.usage)
         return result
@@ -257,6 +261,60 @@ class _PeakMemorySampler:
         self._thread.join()
 
 
+# Generated tests (#636)
+
+
+@dataclass(frozen=True)
+class _GeneratedTests:
+    generated: int = 0
+    failing_on_start: int = 0
+    # None when there is no merge candidate to measure (no tests or a failed run).
+    passing_on_merge: int | None = None
+
+
+GENERATED_TEST_TIMEOUT_SECONDS = 120.0
+
+
+def measure_generated_tests(local_worker: Any, experiment: Experiment | None) -> _GeneratedTests:
+    """How many generated tests failed on start and pass on the tree that would merge.
+
+    Every kept test failed on the base tree (``local_test_first`` keeps only those).
+    The original generated file is written under a fresh module name, so neither a
+    coder's own version at the same path nor a dropped file changes the answer, and
+    it is removed again before the worktree is cleaned up.
+    """
+    from modules.local_coding_worker import run_named_tests
+
+    ids = tuple(getattr(local_worker, "generated_tests", ()) or ())
+    rel = getattr(local_worker, "generated_test_file", None)
+    content = getattr(local_worker, "generated_test_content", "") or ""
+    if not ids or not rel or not content:
+        return _GeneratedTests()
+    worktree = getattr(experiment, "worktree_path", None) if experiment is not None else None
+    if (
+        experiment is None or experiment.status != "succeeded"
+        or not worktree or not Path(worktree).is_dir()
+    ):
+        return _GeneratedTests(len(ids), len(ids), None)
+    module = rel[: -len(".py")].replace("/", ".") if rel.endswith(".py") else ""
+    probe_rel = str(Path(rel).with_name(f"_nexus_bench_generated_{uuid.uuid4().hex}.py"))
+    probe_module = probe_rel[: -len(".py")].replace("/", ".")
+    probe = Path(worktree) / probe_rel
+    passing = 0
+    try:
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text(content, encoding="utf-8")
+        for test_id in ids:
+            probe_id = probe_module + test_id[len(module):] if module and test_id.startswith(module + ".") else ""
+            if probe_id and run_named_tests(worktree, [probe_id], GENERATED_TEST_TIMEOUT_SECONDS) is None:
+                passing += 1
+    except OSError:
+        return _GeneratedTests(len(ids), len(ids), None)
+    finally:
+        probe.unlink(missing_ok=True)
+    return _GeneratedTests(len(ids), len(ids), passing)
+
+
 # Runner
 
 
@@ -284,6 +342,8 @@ class BenchmarkRunner:
         read_rss: Callable[[], int | None] = process_tree_rss_bytes,
         memory_sample_seconds: float = _MEMORY_SAMPLE_SECONDS,
         experiment_log_dir: str | None = None,
+        test_first: bool | None = None,
+        local_worker_factory: Callable[[str], Any] | None = None,
     ) -> None:
         if model and not provider:
             raise ValueError("a model needs a provider: the rotation runs several agents")
@@ -305,6 +365,13 @@ class BenchmarkRunner:
             Path(self.db_path).with_name("benchmark-logs")
         )
         self.worker_factory = worker_factory or self._default_worker_factory()
+        # ``None`` keeps the old benchmark (every task large, no local model). True or
+        # False sends every task to the local model first, with or without its
+        # generated failing tests (#636), so the two runs can be compared.
+        self.test_first = test_first
+        self.local_worker_factory = local_worker_factory or (
+            lambda _path: build_worker("local", db_path=self.db_path, test_first=bool(test_first))
+        )
 
     def _default_worker_factory(self) -> Callable[[str], Any]:
         kwargs = {"model": self.model} if self.model else {}
@@ -331,6 +398,18 @@ class BenchmarkRunner:
         def metered_factory(path: str) -> _MeteredWorker:
             return _MeteredWorker(self.worker_factory(path), meter, self.prompt_text)
 
+        local_workers: list[Any] = []
+
+        def metered_local_factory(path: str) -> _MeteredWorker:
+            worker = self.local_worker_factory(path)
+            local_workers.append(worker)
+            return _MeteredWorker(worker, meter, self.prompt_text)
+
+        local_kwargs = (
+            {"local_worker_factory": metered_local_factory} if self.test_first is not None else {}
+        )
+        generated = _GeneratedTests()
+
         started_at, started = _utcnow(), time.monotonic()
         sampler = _PeakMemorySampler(self.read_rss, self.memory_sample_seconds)
         experiment: Experiment | None = None
@@ -348,15 +427,26 @@ class BenchmarkRunner:
             experiment_log_dir=self.experiment_log_dir,
             base_ref=task.base_commit,
             test_command=task.test_command,
+            **local_kwargs,
         )
         try:
             with sampler:
-                experiment = service.create_experiment(task.goal)
+                experiment = service.create_experiment(
+                    task.goal, **self._routing(run_id, task),
+                )
                 experiment = service.run_experiment(experiment.id)
         except Exception as exc:  # noqa: BLE001 - one broken task must not end the run
             error = str(exc)
         finally:
             try:
+                if experiment is not None and local_workers:
+                    # Measured on the final tree, before the cleanup removes it.
+                    try:
+                        generated = measure_generated_tests(
+                            local_workers[-1], service.get_experiment(experiment.id)
+                        )
+                    except Exception:  # noqa: BLE001 - a measurement must not skip cleanup
+                        generated = _GeneratedTests()
                 if experiment is not None:
                     # The diff stays in the database; the checkout would fill the disk.
                     service.cleanup_worktree(experiment.id)
@@ -396,7 +486,35 @@ class BenchmarkRunner:
             "started_at": started_at,
             "ended_at": _utcnow(),
             "error": sanitized_reason(error or (experiment.error if experiment else None)),
+            "test_first": None if self.test_first is None else int(self.test_first),
+            "tests_generated": generated.generated if self.test_first is not None else None,
+            "generated_tests_failing_on_start": (
+                generated.failing_on_start if self.test_first is not None else None
+            ),
+            "generated_tests_passing_on_merge": generated.passing_on_merge,
+            "local_only_success": (
+                int(
+                    experiment is not None and error is None
+                    and experiment.status == "succeeded"
+                    and experiment.implementation_provider == "local"
+                    and meter.paid_calls == 0
+                )
+                if self.test_first is not None else None
+            ),
+            "paid_calls": meter.paid_calls,
         }
+
+    def _routing(self, run_id: str, task: BenchmarkTask) -> dict[str, Any]:
+        """Send a test-first task to the local model first, as its own source.
+
+        Each task names its GitHub issue, so the issue would be the source and a
+        local failure of an earlier run on the same database would force this run
+        to a paid coder (``_must_use_external_provider``). One source per run and
+        task keeps the runs independent (#636).
+        """
+        if self.test_first is None:
+            return {}
+        return {"complexity": "small", "source_type": "benchmark", "source_id": f"{run_id}/{task.id}"}
 
     def _estimate_cost(
         self, provider: str | None, meter: _UsageMeter, at_timestamp: str
@@ -614,4 +732,73 @@ def format_report(comparison: BenchmarkComparison) -> str:
     lines.append(
         _report_line("Total", _summary(comparison.baseline), _summary(comparison.run))
     )
+    return "\n".join(lines) + "\n"
+
+
+# Test-first comparison (#636)
+
+
+def _test_first_summary(rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    values = list(rows.values())
+    count = len(values)
+    measured = [row["generated_tests_passing_on_merge"] for row in values
+                if row.get("generated_tests_passing_on_merge") is not None]
+    local_only = [row.get("local_only_success") for row in values]
+    paid = [row.get("paid_calls") for row in values]
+    return {
+        "tasks": count,
+        "tests_generated": sum(row.get("tests_generated") or 0 for row in values),
+        "failing_on_start": sum(row.get("generated_tests_failing_on_start") or 0 for row in values),
+        "passing_on_merge": sum(measured) if measured else None,
+        "local_only_success": sum(value or 0 for value in local_only),
+        "local_only_rate": (
+            None if not count or any(value is None for value in local_only)
+            else sum(local_only) / count
+        ),
+        "paid_calls_per_task": (
+            None if not count or any(value is None for value in paid) else sum(paid) / count
+        ),
+    }
+
+
+def format_test_first_report(conn: sqlite3.Connection, run_on: str, run_off: str) -> str:
+    """Markdown for #615: test-first on next to off, per task and in total."""
+    on, off = load_run(conn, run_on), load_run(conn, run_off)
+    for name, rows, expected in (("on", on, 1), ("off", off, 0)):
+        flags = {row.get("test_first") for row in rows.values()}
+        if flags != {expected}:
+            raise BenchmarkError(f"run {name!r} was not a test-first {name} run: {sorted(map(str, flags))}")
+    son, soff = _test_first_summary(on), _test_first_summary(off)
+
+    def rate(value: Any) -> str:
+        return "n/a" if value is None else f"{value:.0%}"
+
+    def per_task(value: Any) -> str:
+        return "n/a" if value is None else f"{value:.2f}"
+
+    lines = [
+        "# Test-first benchmark (#636)",
+        "",
+        f"Test-first on: {run_on} ({_setup(on)}); off: {run_off} ({_setup(off)})",
+        "",
+        "| Metric | off | on |",
+        "|---|---:|---:|",
+        f"| Tasks | {soff['tasks']} | {son['tasks']} |",
+        f"| Generated tests that fail on start | {soff['failing_on_start']} | {son['failing_on_start']} |",
+        f"| ... of them passing on merge | {_cell(soff['passing_on_merge'])} | {_cell(son['passing_on_merge'])} |",
+        f"| Local-only success rate | {rate(soff['local_only_rate'])} ({soff['local_only_success']}/{soff['tasks']}) "
+        f"| {rate(son['local_only_rate'])} ({son['local_only_success']}/{son['tasks']}) |",
+        f"| Paid calls per task | {per_task(soff['paid_calls_per_task'])} | {per_task(son['paid_calls_per_task'])} |",
+        "",
+        "| Task | Status (off -> on) | Fail on start / pass on merge (on) | Local only (off -> on) | Paid calls (off -> on) |",
+        "|---|---|---:|---|---:|",
+    ]
+    for task_id in sorted(set(on) | set(off)):
+        a, b = off.get(task_id) or {}, on.get(task_id) or {}
+        lines.append(
+            f"| {task_id} | {_cell(a.get('status'))} -> {_cell(b.get('status'))} "
+            f"| {_cell(b.get('generated_tests_failing_on_start'))} / {_cell(b.get('generated_tests_passing_on_merge'))} "
+            f"| {_cell(a.get('local_only_success'))} -> {_cell(b.get('local_only_success'))} "
+            f"| {_cell(a.get('paid_calls'))} -> {_cell(b.get('paid_calls'))} |"
+        )
     return "\n".join(lines) + "\n"

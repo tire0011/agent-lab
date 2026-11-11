@@ -53,6 +53,7 @@ class GitHubPrMixin:
 
     def _review_blocks(
         self, experiment_id, goal, work_ref, integration_path, elog, *, gate_findings: str = "",
+        model_written_tests: str = "",
     ) -> str | None:
         """Review the change before the merge (#396); the reason if it is blocked.
         The result goes on the PR either way; a review that cannot run does not
@@ -65,6 +66,9 @@ class GitHubPrMixin:
         if self.reviewer is None:
             return no_verdict
         kwargs = {"gate_findings": gate_findings} if gate_findings else {}
+        if model_written_tests:
+            # #636: the reviewer sees the generated tests the coder was offered.
+            kwargs["model_written_tests"] = model_written_tests
         try:
             result = self.reviewer.review(
                 experiment_id=experiment_id,

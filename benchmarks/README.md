@@ -54,3 +54,24 @@ Unknown values stay `NULL` and the report shows `n/a`, never 0. Cost is unknown
 without `--model` or without a matching `model_prices` row. Tokens are what each
 CLI reports as `input_tokens`/`output_tokens`; the two count cached input
 differently, so compare tokens across providers with care.
+
+## Test-first on and off (#636)
+
+    python scripts/run_benchmark.py run --test-first on    # prints RUN_ON
+    python scripts/run_benchmark.py run --test-first off   # prints RUN_OFF
+    python scripts/run_benchmark.py test-first-report RUN_ON RUN_OFF
+
+With `--test-first` every task goes to the local model first (as a `small`
+experiment), with or without its generated failing tests (`LocalCodingWorker`
+`test_first`); without the flag the benchmark runs as before. When the local
+attempt falls back to a paid coder, the generated test file is taken out of the
+worktree and handed to the paid coder and the reviewer under
+`MODEL-WRITTEN TESTS (may be rejected)`; it is never required in the final diff.
+
+| Column | Source |
+|---|---|
+| `test_first` | 1 on, 0 off, `NULL` for a run without `--test-first` |
+| `tests_generated`, `generated_tests_failing_on_start` | Generated tests the local worker kept; each failed on the base tree |
+| `generated_tests_passing_on_merge` | Of those, how many pass on the final tree of a succeeded experiment (the original generated file, run under a fresh module name); `NULL` without a merge candidate |
+| `local_only_success` | 1 when the experiment succeeded on the local model with no paid call |
+| `paid_calls` | Coding-agent calls that were not the local model, repairs included |

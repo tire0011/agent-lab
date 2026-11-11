@@ -119,6 +119,8 @@ class Experiment:
     # Phase and exception class of an unhandled pipeline crash (#410).
     failure_phase: str | None = None
     failure_type: str | None = None
+    # MODEL-WRITTEN TESTS block handed to the paid coder and the reviewer (#636).
+    model_written_tests: str | None = None
     source_type: str | None = None
     source_id: str | None = None
     implementation_started_at: str | None = None
@@ -178,6 +180,7 @@ class Experiment:
             "complexity": self.complexity,
             "failure_phase": self.failure_phase,
             "failure_type": self.failure_type,
+            "model_written_tests": self.model_written_tests,
             "source_type": self.source_type,
             "source_id": self.source_id,
             "implementation_started_at": self.implementation_started_at,
@@ -246,6 +249,9 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         complexity=row["complexity"] if "complexity" in row.keys() else None,
         failure_phase=row["failure_phase"] if "failure_phase" in row.keys() else None,
         failure_type=row["failure_type"] if "failure_type" in row.keys() else None,
+        model_written_tests=(
+            row["model_written_tests"] if "model_written_tests" in row.keys() else None
+        ),
         source_type=row["source_type"] if "source_type" in row.keys() else None,
         source_id=row["source_id"] if "source_id" in row.keys() else None,
         implementation_started_at=row["implementation_started_at"],

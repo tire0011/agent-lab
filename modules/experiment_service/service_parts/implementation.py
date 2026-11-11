@@ -18,6 +18,7 @@ from modules.coding_provider import (
     provider_of,
 )
 from modules.coding_worker import agent_watchdog_limits
+from modules.experiment_handover import model_written_tests_block, with_model_written_tests
 from modules.local_coding_worker import is_context_too_small
 
 from ..git_utils import _run_git
@@ -42,6 +43,31 @@ from ..prompts import (
 )
 from ..text_utils import _truncate_text, _utcnow_iso
 from modules.redaction import sanitized_reason
+
+
+def _take_model_written_tests(worker: Any, worktree_path: str) -> str:
+    """Hand the local worker's generated test file over instead of leaving it (#636).
+
+    The file is removed from the worktree, so a paid coder that ignores it does not
+    ship it: it reaches the final diff only when that coder writes it again. Returns
+    the marked block, empty when the local attempt kept no generated tests.
+    """
+    rel = getattr(worker, "generated_test_file", None)
+    content = getattr(worker, "generated_test_content", "") or ""
+    tests = tuple(getattr(worker, "generated_tests", ()) or ())
+    if not rel or not content or not tests:
+        return ""
+    root = Path(worktree_path).resolve()
+    target = root / str(rel)
+    try:
+        inside = root in target.parent.resolve().parents or target.parent.resolve() == root
+        # The local worker created this file (it never overwrites one), so any
+        # version of it is model-written, not work to keep.
+        if inside and target.is_file() and not target.is_symlink():
+            target.unlink()
+    except OSError:
+        pass
+    return model_written_tests_block(str(rel), content, tests)
 
 
 def _report_issue_progress(
@@ -308,6 +334,17 @@ class ImplementationMixin:
             generated_test_failure = getattr(worker, "local_attempt_passed_generated_tests", None) is False
             fallback_reason = "generated_tests_failed" if generated_test_failure else "context_too_small"
             generated_test_count = len(getattr(worker, "generated_tests", ()))
+            model_written_tests = _take_model_written_tests(worker, worktree_path)
+            if model_written_tests:
+                # The paid coder (and any overload fallback below) gets the tests as
+                # a suggestion; the reviewer reads the stored block (#636).
+                implementation_prompt = with_model_written_tests(
+                    implementation_prompt, model_written_tests
+                )
+                self._force_status(
+                    experiment_id, STATUS_IMPLEMENTING,
+                    model_written_tests=model_written_tests,
+                )
             worker = self.worker_factory(worktree_path)
             implementation_provider = provider_of(worker)
             elog.warning(
@@ -320,6 +357,7 @@ class ImplementationMixin:
                 tests_failing_on_base=generated_test_count,
                 local_attempt_passed_generated_tests=False if generated_test_failure else None,
                 paid_fallback_used=True,
+                model_written_tests_handed_over=bool(model_written_tests),
             )
             self._force_status(
                 experiment_id, STATUS_IMPLEMENTING,
@@ -556,7 +594,11 @@ class ImplementationMixin:
             )
             live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
             repair_result = worker.run(
-                task=_build_repair_implementation_prompt(result.goal, feedback),
+                # A repair coder is a paid coder too: it sees the same suggestion (#636).
+                task=with_model_written_tests(
+                    _build_repair_implementation_prompt(result.goal, feedback),
+                    getattr(result, "model_written_tests", None),
+                ),
                 working_dir=worktree_path,
                 sandbox="workspace-write",
                 timeout_seconds=agent_watchdog_limits()[1],
