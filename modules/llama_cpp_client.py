@@ -78,6 +78,7 @@ class LlamaCppClient:
             or os.getenv("LOCAL_MODEL_NAME")
             or os.getenv("LLAMA_CPP_MODEL", _DEFAULT_MODEL_NAME)
         )
+        self.last_timings: dict[str, float | int] | None = None
 
     async def chat_completion(
         self,
@@ -96,19 +97,38 @@ class LlamaCppClient:
             **kwargs,
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json"},
+        self.last_timings = None
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.TimeoutException as exc:
+            prompt_tokens = sum(
+                max(1, len(str(message.get("content", "")).encode("utf-8")) // 3)
+                for message in messages
             )
+            raise LlamaCppClientError(
+                f"local model call timed out after {self.timeout:g}s "
+                f"(prompt ~{prompt_tokens} tokens, max_tokens {max_tokens})"
+            ) from exc
 
         if resp.status_code != 200:
             raise LlamaCppClientError(
                 f"llama-cpp server returned HTTP {resp.status_code}: {resp.text[:500]}"
             )
 
-        return resp.json()  # type: ignore[no-any-return]
+        data = resp.json()
+        timings = data.get("timings") if isinstance(data, dict) else None
+        if isinstance(timings, dict):
+            names = ("prompt_n", "prompt_ms", "predicted_n", "predicted_ms")
+            self.last_timings = {
+                name: timings[name] for name in names
+                if isinstance(timings.get(name), (int, float))
+            }
+        return data  # type: ignore[no-any-return]
 
     async def complete(
         self,

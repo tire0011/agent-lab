@@ -57,6 +57,7 @@ from typing import Any, Awaitable, Callable
 from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
 from modules.llama_cpp_client import LlamaCppClient
+from modules.local_model_rates import LocalModelRates
 from modules.local_test_first import generate_failing_tests
 
 logger = logging.getLogger(__name__)
@@ -258,6 +259,8 @@ class PromptPlan:
     file_level: int = 0
     handover_tokens_kept: int = 0
     handover_cut: bool = False
+    time_budget_tokens: int | None = None
+    time_budget_limited: bool = False
     # Parts of the fitted prompt, kept for the correction rounds (#597).
     essential: str = field(default="", repr=False)
     files_text: str = field(default="", repr=False)
@@ -271,6 +274,8 @@ class PromptPlan:
             "token_source": self.token_source, "named_files": self.named_files,
             "file_level": self.file_level, "handover_tokens_kept": self.handover_tokens_kept,
             "handover_cut": self.handover_cut,
+            "time_budget_tokens": self.time_budget_tokens,
+            "time_budget_limited": self.time_budget_limited,
         }
 
 
@@ -308,23 +313,32 @@ async def _fit_part(text: str, budget: int, measure: Callable[[str], Awaitable[i
 
 
 async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_tokens: int,
-                       margin_tokens: int = CONTEXT_MARGIN_TOKENS) -> PromptPlan:
+                       margin_tokens: int = CONTEXT_MARGIN_TOKENS,
+                       rates: tuple[float | None, float | None] = (None, None)) -> PromptPlan:
     """Fit the local prompt into the server's context, or raise :class:`ContextTooSmallError`."""
     n_ctx, n_ctx_source = await discover_context_size(client)
     essential, handover = split_handover(task)
     return await build_prompt_parts(
         essential, handover, working_dir, client, max_output_tokens=max_output_tokens,
-        margin_tokens=margin_tokens, n_ctx=n_ctx, n_ctx_source=n_ctx_source,
+        margin_tokens=margin_tokens, n_ctx=n_ctx, n_ctx_source=n_ctx_source, rates=rates,
     )
 
 
 async def build_prompt_parts(essential: str, handover: str, working_dir: str, client: Any, *,
                              max_output_tokens: int, n_ctx: int, n_ctx_source: str,
                              margin_tokens: int = CONTEXT_MARGIN_TOKENS,
-                             counter: TokenCounter | None = None) -> PromptPlan:
+                             counter: TokenCounter | None = None,
+                             rates: tuple[float | None, float | None] = (None, None)) -> PromptPlan:
     """:func:`build_prompt` for an already split task and an already known ``n_ctx``."""
     count = counter or TokenCounter(client)
-    budget = n_ctx - max_output_tokens - margin_tokens
+    context_budget = n_ctx - max_output_tokens - margin_tokens
+    prompt_rate, generation_rate = rates
+    time_budget_tokens: int | None = None
+    timeout = getattr(client, "timeout", None)
+    if prompt_rate and generation_rate and isinstance(timeout, (int, float)) and timeout > 0:
+        seconds_for_prompt = timeout * 0.8 - max_output_tokens / generation_rate
+        time_budget_tokens = max(0, int(seconds_for_prompt * prompt_rate))
+    budget = min(context_budget, time_budget_tokens) if time_budget_tokens is not None else context_budget
     files = _named_files(essential, working_dir)
     keywords = _keywords(essential)
     names = [path for path, _ in files]
@@ -333,9 +347,16 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         return await count(_SYSTEM_PROMPT) + await count(prompt)
 
     def too_small(detail: str, tokens: int) -> ContextTooSmallError:
+        limiting = (
+            f"the 80% time budget leaves {budget} prompt tokens "
+            f"(estimated from {prompt_rate:g} prompt tokens/s and "
+            f"{generation_rate:g} generation tokens/s)"
+            if time_budget_tokens is not None and time_budget_tokens < context_budget
+            else f"n_ctx {n_ctx} ({n_ctx_source}) leaves {budget} for the prompt"
+        )
         return ContextTooSmallError(
-            f"{CONTEXT_TOO_SMALL}: {detail} need {tokens} tokens, but n_ctx {n_ctx} ({n_ctx_source}) "
-            f"leaves {budget} for the prompt after {max_output_tokens} output and {margin_tokens} "
+            f"{CONTEXT_TOO_SMALL}: {detail} need {tokens} tokens, but {limiting} "
+            f"after {max_output_tokens} output and {margin_tokens} "
             "margin tokens; the local model was not called"
         )
 
@@ -373,6 +394,8 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         prompt_tokens=prompt_tokens, token_source=count.source, named_files=names,
         file_level=level_used, handover_tokens_kept=await count(kept) if kept else 0,
         handover_cut=bool(handover) and kept != handover,
+        time_budget_tokens=time_budget_tokens,
+        time_budget_limited=time_budget_tokens is not None and time_budget_tokens < context_budget,
         essential=essential, files_text=files_text, handover=handover, counter=count,
     )
 
@@ -889,7 +912,7 @@ class LocalCodingWorker:
 
     def __init__(self, *, client: LlamaCppClient | None = None, max_tokens: int = 4096,
                  split_tasks: bool = False, planner: Callable[[str], Any] | None = None,
-                 test_first: bool = False,
+                 test_first: bool = False, rates_path: str | Path | None = None,
                  **_: Any) -> None:
         self.client = client or LlamaCppClient()
         self.max_tokens = max_tokens
@@ -899,6 +922,7 @@ class LocalCodingWorker:
         # The one free-tier fallback call when the local split is unusable.
         self.planner = planner or free_tier_plan
         self.test_first = test_first
+        self.rates = LocalModelRates(rates_path)
         self.last_plan: PromptPlan | None = None
         self.last_split: SplitOutcome | None = None
         self.generated_tests: tuple[str, ...] = ()
@@ -965,7 +989,8 @@ class LocalCodingWorker:
             try:
                 # n_ctx is read once here and holds for this whole run.
                 plan = asyncio.run(build_prompt(task, working_dir, self.client,
-                                                max_output_tokens=self.max_tokens))
+                                                max_output_tokens=self.max_tokens,
+                                                rates=self.rates.medians()))
             except ContextTooSmallError as exc:
                 self._log(experiment_logger, phase, "local_context_too_small", str(exc), warning=True)
                 return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
@@ -977,7 +1002,16 @@ class LocalCodingWorker:
                 **plan.log_fields(),
             )
             if self.split_tasks:
-                split = self._plan_subtasks(plan, working_dir, experiment_logger, phase)
+                if plan.time_budget_limited:
+                    self.last_split.reason = "planning skipped: prompt is constrained by the local time budget"
+                    self._log(
+                        experiment_logger, phase, "local_task_split",
+                        "Task planning skipped to reserve the affordable model call for the patch",
+                        time_budget_tokens=plan.time_budget_tokens, skipped=True,
+                    )
+                    split = self.last_split
+                else:
+                    split = self._plan_subtasks(plan, working_dir, experiment_logger, phase)
                 if split.split:
                     split.subtasks = [Subtask(s.goal, s.files,
                                               tuple(dict.fromkeys((*s.tests, *self.generated_tests))))
@@ -1005,10 +1039,10 @@ class LocalCodingWorker:
         unreachable = False
         try:
             prompt = asyncio.run(self._local_plan_prompt(plan))
-            answer = asyncio.run(self.client.complete(
-                prompt, system=_PLAN_SYSTEM_PROMPT, temperature=0.0,
-                max_tokens=min(self.max_tokens, PLAN_MAX_TOKENS),
-            ))
+            answer = self._model_call(
+                prompt, _PLAN_SYSTEM_PROMPT, min(self.max_tokens, PLAN_MAX_TOKENS),
+                experiment_logger, phase, call_type="plan",
+            )
             subtasks = parse_plan(answer, working_dir)
             outcome.planner, outcome.planner_model = "local", "local"
             if len(subtasks) == 1:
@@ -1145,6 +1179,7 @@ class LocalCodingWorker:
         return await build_prompt_parts(
             essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
             n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
+            rates=self.rates.medians(),
         )
 
     # The correction loop (#597)
@@ -1176,9 +1211,18 @@ class LocalCodingWorker:
                 extra = {"prompt_tokens": fb.prompt_tokens, "feedback_error_chars": fb.error_chars,
                          "feedback_diff_cut": fb.diff_cut, "handover_tokens_kept": fb.handover_tokens_kept,
                          **tag}
-            output = asyncio.run(self.client.complete(
-                prompt, system=_SYSTEM_PROMPT, temperature=0.0, max_tokens=self.max_tokens,
-            ))
+            try:
+                output = self._model_call(
+                    prompt, _SYSTEM_PROMPT, self.max_tokens, experiment_logger, phase,
+                    call_type="patch", round=round_no, **tag,
+                )
+            except Exception as exc:
+                if self._is_model_timeout(exc):
+                    limit = getattr(self.client, "timeout", timeout)
+                    reason = str(exc) or f"local model call timed out after {limit}s"
+                    self._log_round(experiment_logger, phase, round_no, "model_timeout", reason, **extra)
+                    return False, "", reason
+                raise
             patch = _extract_diff(output)
             try:
                 apply_and_check(patch, working_dir, timeout, allowed_paths=allowed_paths, tests=tests)
@@ -1211,6 +1255,44 @@ class LocalCodingWorker:
             generated_test_failure = run_named_tests(working_dir, self.generated_tests, timeout)
             self.local_attempt_passed_generated_tests = generated_test_failure is None
         return False, "", f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}"
+
+    @staticmethod
+    def _is_model_timeout(exc: Exception) -> bool:
+        return (isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                or "timed out" in str(exc).lower()
+                or "timeout" in type(exc).__name__.lower())
+
+    def _model_call(self, prompt: str, system: str, max_tokens: int,
+                    experiment_logger: Any | None, phase: str, *, call_type: str,
+                    **fields: Any) -> str:
+        """Call the local model and always leave a latency/outcome event."""
+        started = time.monotonic()
+        if hasattr(self.client, "last_timings"):
+            self.client.last_timings = None
+        outcome = "ok"
+        try:
+            answer = asyncio.run(self.client.complete(
+                prompt, system=system, temperature=0.0, max_tokens=max_tokens,
+            ))
+            return answer
+        except Exception as exc:
+            outcome = "timeout" if self._is_model_timeout(exc) else "error"
+            raise
+        finally:
+            wall_seconds = time.monotonic() - started
+            timings = getattr(self.client, "last_timings", None)
+            if outcome == "ok":
+                self.rates.record(timings)
+            prompt_rate, generation_rate = self.rates.medians()
+            self._log(
+                experiment_logger, phase, "local_model_call",
+                f"Local {call_type} model call: {outcome} in {wall_seconds:.1f}s",
+                warning=outcome != "ok", call_type=call_type, outcome=outcome,
+                wall_seconds=wall_seconds, timings=timings,
+                prompt_tokens_per_second=prompt_rate,
+                generation_tokens_per_second=generation_rate,
+                max_tokens=max_tokens, **fields,
+            )
 
     def _log_round(self, experiment_logger: Any | None, phase: str, round_no: int, outcome: str,
                    reason: str, **fields: Any) -> None:
