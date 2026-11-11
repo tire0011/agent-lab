@@ -1163,7 +1163,16 @@ class LocalCodingWorker:
                 self.local_attempt_passed_generated_tests = True
             return True, output, ""
         if self.generated_tests and set(self.generated_tests).issubset(tests):
-            self.local_attempt_passed_generated_tests = False
+            # A prior subtask may already have satisfied the generated tests even
+            # though this subtask exhausted its rounds for an unrelated reason
+            # (for example, an empty or out-of-scope patch).  Judge fallback from
+            # the current tree, not from the outcome of the last patch round.
+            # Clear a result from an earlier subtask first so an unexpected runner
+            # failure cannot leave a stale ``True`` that suppresses normal failure
+            # handling.
+            self.local_attempt_passed_generated_tests = None
+            generated_test_failure = run_named_tests(working_dir, self.generated_tests, timeout)
+            self.local_attempt_passed_generated_tests = generated_test_failure is None
         return False, "", f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}"
 
     def _log_round(self, experiment_logger: Any | None, phase: str, round_no: int, outcome: str,

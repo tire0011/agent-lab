@@ -428,6 +428,85 @@ class Issue598SubtaskTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertFalse(worker.local_attempt_passed_generated_tests)
 
+    def test_later_unrelated_failure_rechecks_generated_tests_on_current_tree(self):
+        generated = ["tests.test_generated.ValueTests.test_value"]
+        content = ("import unittest\nimport mod\n\nclass ValueTests(unittest.TestCase):\n"
+                   "    def test_value(self):\n        self.assertEqual(mod.VALUE, 2)\n")
+        plan = _plan(
+            {"goal": "Set VALUE to 2", "files": ["mod.py"]},
+            {"goal": "Make an unrelated change", "files": ["value.txt"]},
+        )
+        server = _Server(plan, [_MOD2, "no diff"])
+        seen: list[tuple[str, ...]] = []
+        real_run = local_coding_worker.run_named_tests
+
+        def recording_run(working_dir, tests, timeout):
+            seen.append(tuple(tests))
+            return real_run(working_dir, tests, timeout)
+
+        with mock.patch.object(local_coding_worker, "generate_failing_tests",
+                               return_value=(generated, content)), \
+                mock.patch.object(local_coding_worker, "run_named_tests", side_effect=recording_run):
+            worker = LocalCodingWorker(client=server, max_tokens=1024, split_tasks=True,
+                                       test_first=True)
+            result = worker.run(task="## Change\n`mod.py`\n## Test\nVALUE is 2",
+                                working_dir=str(self.repo), sandbox="workspace-write")
+
+        self.assertFalse(result.success)
+        self.assertEqual("VALUE = 2\n", (self.repo / "mod.py").read_text())
+        self.assertTrue(worker.local_attempt_passed_generated_tests)
+        self.assertEqual([tuple(generated), tuple(generated)], seen)
+
+    def test_exhaustion_runner_crash_does_not_reuse_stale_pass_state(self):
+        worker = LocalCodingWorker(client=_Server(_TWO_STEPS, ["no diff"]), test_first=True)
+        worker.generated_tests = ("tests.test_generated.T.test_value",)
+        worker.local_attempt_passed_generated_tests = True
+        plan = mock.Mock(prompt="prompt", prompt_tokens=1)
+
+        with mock.patch.object(local_coding_worker, "MAX_PATCH_ROUNDS", 1), \
+                mock.patch.object(local_coding_worker, "run_named_tests",
+                                  side_effect=RuntimeError("runner crashed")):
+            with self.assertRaisesRegex(RuntimeError, "runner crashed"):
+                worker._patch_rounds(plan, str(self.repo), 10, None, "implementation",
+                                     tests=worker.generated_tests)
+
+        self.assertIsNone(worker.local_attempt_passed_generated_tests)
+
+    def test_exhaustion_runner_interrupt_propagates_without_stale_pass_state(self):
+        worker = LocalCodingWorker(client=_Server(_TWO_STEPS, ["no diff"]), test_first=True)
+        worker.generated_tests = ("tests.test_generated.T.test_value",)
+        worker.local_attempt_passed_generated_tests = True
+        plan = mock.Mock(prompt="prompt", prompt_tokens=1)
+
+        with mock.patch.object(local_coding_worker, "MAX_PATCH_ROUNDS", 1), \
+                mock.patch.object(local_coding_worker, "run_named_tests",
+                                  side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                worker._patch_rounds(plan, str(self.repo), 10, None, "implementation",
+                                     tests=worker.generated_tests)
+
+        self.assertIsNone(worker.local_attempt_passed_generated_tests)
+
+    def test_reusing_worker_resets_generated_test_acceptance_state(self):
+        generated = ["tests.test_generated.ValueTests.test_value"]
+        content = ("import unittest\nimport mod\n\nclass ValueTests(unittest.TestCase):\n"
+                   "    def test_value(self):\n        self.assertEqual(mod.VALUE, 2)\n")
+        worker = LocalCodingWorker(client=_Server(_TWO_STEPS, [_MOD2, _MOD2]), test_first=True)
+
+        with mock.patch.object(local_coding_worker, "generate_failing_tests",
+                               side_effect=[(generated, content), ([], "")]):
+            first = worker.run(task="## Change\n`mod.py`\n## Test\nVALUE is 2",
+                               working_dir=str(self.repo), sandbox="workspace-write")
+            self.assertTrue(first.success)
+            self.assertTrue(worker.local_attempt_passed_generated_tests)
+            self._git("checkout", "--", "mod.py")
+            second = worker.run(task="Edit mod.py", working_dir=str(self.repo),
+                                sandbox="workspace-write")
+
+        self.assertTrue(second.success)
+        self.assertEqual((), worker.generated_tests)
+        self.assertIsNone(worker.local_attempt_passed_generated_tests)
+
     def test_test_first_off_or_empty_generation_preserves_current_behavior(self):
         with mock.patch.object(local_coding_worker, "generate_failing_tests") as generate:
             result = LocalCodingWorker(client=_Server(_TWO_STEPS, [_ONE_SHOT])).run(

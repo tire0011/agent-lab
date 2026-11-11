@@ -143,6 +143,26 @@ class Issue551LocalCodingTests(unittest.TestCase):
         self.assertEqual(["local", "codex"], self.calls)
         self.assertEqual("codex", result.implementation_provider)
 
+    def test_failed_local_attempt_without_generated_test_failure_uses_no_fallback(self):
+        class UnrelatedFailure(_Worker):
+            generated_tests = ("tests.test_generated.T.test_value",)
+            local_attempt_passed_generated_tests = True
+
+            def run(self, **kwargs):
+                self.calls.append(self.provider)
+                return WorkerResult(False, 1, "", "later unrelated subtask failed", 1,
+                                    False, False, False, None, None, None,
+                                    kwargs["task"], kwargs["working_dir"], kwargs["sandbox"],
+                                    None, self.provider)
+
+        self.service.local_worker_factory = lambda _p: UnrelatedFailure("local", self.calls)
+        exp = self.service.create_experiment(
+            "change value", complexity="small", source_type="issue", source_id="635-no-fallback"
+        )
+        result = self.service.run_experiment(exp.id)
+        self.assertEqual(["local"], self.calls)
+        self.assertEqual("local", result.implementation_provider)
+
 
 if __name__ == "__main__":
     unittest.main()
