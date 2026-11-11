@@ -383,9 +383,11 @@ candidates are requested one after another (never in parallel): the first at
 temperature 0.0, the rest at `NEXUS_LOCAL_SAMPLE_TEMPERATURES` (default
 `0.4,0.7,1.0`, repeated when N is larger) with seeds 640, 641, ...
 (llama-server honours `seed`; same seed, same answer). Each candidate is
-applied, compiled and tested (the subtask's named tests) in its own throwaway
-copy of the working tree under the system temp dir (`.git` and caches are not
-copied; tests that need the repository's git data therefore fail in the copy).
+applied, compiled and tested (the subtask's named tests) in its own detached
+Git worktree under the system temp dir. The current tracked and untracked state
+(including earlier subtasks) is overlaid, and `.venv`, `venv`, and
+`node_modules` are linked when present, so tests retain Git metadata and local
+dependencies. The worktree is deregistered and removed after every outcome.
 The first candidate that passes everything wins and is then applied to the real
 tree; sampling stops there, so extra samples cost time only when the greedy
 answer fails. When none passes, the one that got furthest (compiled, then

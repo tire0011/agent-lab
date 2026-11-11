@@ -29,6 +29,7 @@ from modules.local_coding_worker import (
     local_samples,
     sample_schedule,
     sample_temperatures,
+    check_in_worktree,
 )
 from modules.local_run_metrics import (
     RunMetrics,
@@ -237,6 +238,67 @@ class SingleSampleTests(RepoCase):
 
 
 class BestOfNTests(RepoCase):
+    def test_candidate_worktree_preserves_git_state_untracked_files_and_local_dependencies(self):
+        # Simulate an earlier subtask, a generated untracked acceptance test,
+        # and a repository-local installation ignored by Git.
+        (self.repo / "earlier.txt").write_text("seen\n")
+        (self.repo / ".gitignore").write_text("node_modules/\n")
+        self._git("add", ".gitignore")
+        self._git("commit", "-qm", "ignore dependencies")
+        dependencies = self.repo / "node_modules"
+        dependencies.mkdir()
+        (dependencies / "marker").write_text("installed\n")
+        acceptance = self.repo / "tests" / "test_candidate_environment.py"
+        acceptance.write_text(
+            "import pathlib, subprocess\n\n"
+            "def test_environment():\n"
+            "    assert subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'], "
+            "capture_output=True, text=True).stdout.strip() == 'true'\n"
+            "    assert pathlib.Path('earlier.txt').read_text() == 'seen\\n'\n"
+            "    assert pathlib.Path('node_modules/marker').read_text() == 'installed\\n'\n"
+            "    assert pathlib.Path('mod.py').read_text().startswith('A = 1')\n"
+        )
+
+        check = check_in_worktree(
+            ONE, str(self.repo), 120, tests=("tests/test_candidate_environment.py",),
+            tmp_root=str(self.copies),
+        )
+        self.assertTrue(check.passed, check.reason)
+        self.assertEqual((self.repo / "mod.py").read_text(), BASE)
+        self.assertEqual(list(self.copies.iterdir()), [])
+        worktrees = self._git("worktree", "list", "--porcelain")
+        self.assertNotIn("nexus-local-sample-", worktrees)
+
+    def test_exception_halfway_cleans_up_and_a_retry_succeeds(self):
+        with patch.object(lcw, "run_named_tests_detail", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                check_in_worktree(ALL, str(self.repo), 120, tests=NAMED,
+                                  tmp_root=str(self.copies))
+        self.assertEqual(list(self.copies.iterdir()), [])
+        self.assertNotIn("nexus-local-sample-", self._git("worktree", "list", "--porcelain"))
+
+        # Running the same step again must neither collide with stale metadata
+        # nor observe the failed candidate's patch.
+        check = check_in_worktree(ALL, str(self.repo), 120, tests=NAMED,
+                                  tmp_root=str(self.copies))
+        self.assertTrue(check.passed, check.reason)
+        self.assertEqual((self.repo / "mod.py").read_text(), BASE)
+        self.assertEqual(list(self.copies.iterdir()), [])
+
+    def test_timeout_during_setup_removes_partial_worktree(self):
+        real_overlay = lcw._overlay_working_state
+
+        def interrupted(source, target, timeout):
+            real_overlay(source, target, timeout)
+            raise subprocess.TimeoutExpired("overlay", timeout)
+
+        with patch.object(lcw, "_overlay_working_state", side_effect=interrupted):
+            check = check_in_worktree(ALL, str(self.repo), 120, tests=NAMED,
+                                      tmp_root=str(self.copies))
+        self.assertEqual(check.outcome, "timed_out")
+        self.assertEqual(list(self.copies.iterdir()), [])
+        self.assertNotIn("nexus-local-sample-", self._git("worktree", "list", "--porcelain"))
+
     def test_first_passing_candidate_wins_and_the_third_is_never_requested(self):
         model = FakeModel({0.0: [TWO], 0.7: [ALL], 1.0: [ALL]}, self.repo)
         worker = self.worker(model, samples=3, temperatures=(0.7, 1.0))

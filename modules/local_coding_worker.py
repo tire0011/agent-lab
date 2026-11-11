@@ -40,8 +40,11 @@ above, unchanged): with N > 1 every patch round asks the local model for up to N
 candidates, one after another (llama-server never gets parallel requests): the
 first at temperature 0.0, the others at ``NEXUS_LOCAL_SAMPLE_TEMPERATURES``
 (default 0.4, 0.7, 1.0, repeated when N is larger) with distinct seeds. Each
-candidate is applied, compiled and tested in its own throwaway copy of the
-working tree (removed afterwards). The first candidate that passes everything
+candidate is applied, compiled and tested in its own detached Git worktree.
+The source tree's tracked/untracked state is overlaid and repository-local
+dependency directories are linked, so tests see Git metadata and the same
+installed dependencies. The worktree is always deregistered and removed. The
+first candidate that passes everything
 wins and only then is applied to the real tree (``apply_and_check`` again), so
 the real tree only ever holds the winner's patch; sampling stops there. When
 none passes, the candidate that got furthest (compiled, then fewest failing
@@ -613,10 +616,10 @@ MAX_LOCAL_SAMPLES = 8
 # Seeds of the sampled candidates: SAMPLE_SEED_BASE + candidate index, so a
 # replay of the same prompt draws the same candidates.
 SAMPLE_SEED_BASE = 639
-_SAMPLE_COPY_PREFIX = "nexus-local-sample-"
-# Not copied into a candidate's throwaway tree (VCS data, caches, environments).
-_SAMPLE_COPY_IGNORE = (".git", "__pycache__", ".venv", "venv", "node_modules",
-                       ".mypy_cache", ".pytest_cache", ".ruff_cache")
+_SAMPLE_WORKTREE_PREFIX = "nexus-local-sample-"
+# Large repository-local installations are shared read-only in practice. They
+# are ignored by Git and therefore are not populated by ``git worktree add``.
+_SAMPLE_DEPENDENCY_DIRS = (".venv", "venv", "node_modules")
 
 
 def local_samples() -> int:
@@ -1119,19 +1122,77 @@ def check_rejection(exc: _PatchRejected, tests: list[str] | tuple[str, ...]) -> 
     return CandidateCheck(exc.outcome, exc.reason, stage, failing)
 
 
-def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
-    return {name for name in names if name in _SAMPLE_COPY_IGNORE}
+def _git_output(args: list[str], working_dir: str, timeout: float) -> str:
+    done = subprocess.run(["git", *args], cwd=working_dir, text=True,
+                          capture_output=True, timeout=timeout)
+    if done.returncode:
+        raise OSError(done.stderr.strip() or done.stdout.strip() or
+                      f"git {' '.join(args)} exited {done.returncode}")
+    return done.stdout
 
 
-def check_in_copy(patch: str, working_dir: str, timeout: float, *,
-                  allowed_paths: set[str] | None = None,
-                  tests: list[str] | tuple[str, ...] = (),
-                  tmp_root: str | None = None) -> CandidateCheck:
-    """Apply, compile and test *patch* in a throwaway copy of *working_dir*.
+def _overlay_working_state(source: Path, target: Path, timeout: float) -> None:
+    """Make a fresh worktree reflect *source*'s tracked and untracked state.
 
-    The copy (without ``.git`` and caches) is always removed; *working_dir* is
-    never written to. ``git apply`` outside a repository applies like ``patch``.
+    This is intentionally file based rather than a diff: it preserves symlinks,
+    untracked generated tests and deletions, including changes from an earlier
+    local subtask. Ignored dependency installations are linked separately.
     """
+    listed = _git_output(["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                         str(source), timeout)
+    for rel in listed.split("\0"):
+        if not rel:
+            continue
+        src = source / rel
+        dst = target / rel
+        if not src.exists() and not src.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink(missing_ok=True)
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        if src.is_symlink():
+            os.symlink(os.readlink(src), dst)
+        elif src.is_dir():
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+    for name in _SAMPLE_DEPENDENCY_DIRS:
+        src, dst = source / name, target / name
+        if (src.is_dir() or src.is_symlink()) and not (dst.exists() or dst.is_symlink()):
+            os.symlink(src.resolve(), dst, target_is_directory=True)
+
+
+def _remove_sample_worktree(source: str, tree: Path, parent: Path, timeout: float) -> None:
+    """Best-effort removal plus registry pruning, safe after partial setup."""
+    try:
+        try:
+            subprocess.run(["git", "worktree", "remove", "--force", str(tree)], cwd=source,
+                           text=True, capture_output=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+        # If setup/removal died halfway, do not leave a registration that makes
+        # a retry accumulate broken worktrees.
+        try:
+            subprocess.run(["git", "worktree", "prune"], cwd=source, text=True,
+                           capture_output=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def check_in_worktree(patch: str, working_dir: str, timeout: float, *,
+                      allowed_paths: set[str] | None = None,
+                      tests: list[str] | tuple[str, ...] = (),
+                      tmp_root: str | None = None) -> CandidateCheck:
+    """Apply, compile and test *patch* in a faithful throwaway Git worktree."""
     if not patch:
         return CandidateCheck("no_diff", "local model did not return a unified diff")
     if allowed_paths is not None:
@@ -1142,27 +1203,28 @@ def check_in_copy(patch: str, working_dir: str, timeout: float, *,
                 f"local model patch touches files outside this subtask: {', '.join(outside)}; "
                 f"only change {', '.join(sorted(allowed_paths))}",
             )
-    parent = tempfile.mkdtemp(prefix=_SAMPLE_COPY_PREFIX, dir=tmp_root)
-    copy = os.path.join(parent, "tree")
+    parent = Path(tempfile.mkdtemp(prefix=_SAMPLE_WORKTREE_PREFIX, dir=tmp_root))
+    tree = parent / "tree"
     try:
-        shutil.copytree(working_dir, copy, symlinks=True, ignore=_copy_ignore)
-        reason = _git_apply(["--check"], copy, patch, timeout)
+        _git_output(["worktree", "add", "--detach", str(tree), "HEAD"], working_dir, timeout)
+        _overlay_working_state(Path(working_dir).resolve(), tree, timeout)
+        reason = _git_apply(["--check"], str(tree), patch, timeout)
         if reason is not None:
             return CandidateCheck("does_not_apply", f"local model patch does not apply: {reason}")
-        root = Path(copy).resolve()
+        root = tree.resolve()
         paths = patch_paths(patch)
         before = {rel: _read_state(full) for rel in paths if (full := _inside(root, rel)) is not None}
-        reason = _git_apply([], copy, patch, timeout)
+        reason = _git_apply([], str(tree), patch, timeout)
         if reason is not None:
             return CandidateCheck("apply_failed", f"local model patch failed to apply: {reason}")
         changed_py = sorted(rel for rel in before
                             if rel.endswith(".py") and (root / rel).is_file() and not (root / rel).is_symlink()
                             and _read_state(root / rel) != before[rel])
-        reason = _compile_check(copy, changed_py, timeout)
+        reason = _compile_check(str(tree), changed_py, timeout)
         if reason is not None:
             return CandidateCheck("compile_failed", f"local model patch breaks py_compile: {reason}",
                                   _STAGE_APPLIED)
-        reason, failing = run_named_tests_detail(copy, tests, timeout)
+        reason, failing = run_named_tests_detail(str(tree), tests, timeout)
         if reason is not None:
             return CandidateCheck("tests_failed", f"named tests fail after the patch: {reason}",
                                   _STAGE_COMPILED, failing)
@@ -1170,9 +1232,9 @@ def check_in_copy(patch: str, working_dir: str, timeout: float, *,
     except subprocess.TimeoutExpired as exc:
         return CandidateCheck("timed_out", f"checking the candidate timed out: {exc}")
     except OSError as exc:
-        return CandidateCheck("copy_failed", f"could not prepare the candidate's throwaway copy: {exc}")
+        return CandidateCheck("worktree_failed", f"could not prepare the candidate worktree: {exc}")
     finally:
-        shutil.rmtree(parent, ignore_errors=True)
+        _remove_sample_worktree(working_dir, tree, parent, timeout)
 
 
 def better_candidate(current: tuple[CandidateCheck, int] | None,
@@ -1624,8 +1686,8 @@ class LocalCodingWorker:
                 patch = _extract_diff(output)
                 checked = time.monotonic()
                 if sampling:
-                    check = check_in_copy(patch, working_dir, timeout, allowed_paths=allowed_paths,
-                                          tests=tests, tmp_root=self.sample_tmp_root)
+                    check = check_in_worktree(patch, working_dir, timeout, allowed_paths=allowed_paths,
+                                              tests=tests, tmp_root=self.sample_tmp_root)
                     if check.passed:
                         # Only the winner ever reaches the real tree, checked there again.
                         check = self._apply_real(patch, working_dir, timeout, allowed_paths, tests,
