@@ -40,7 +40,7 @@ def _plain_ok_transport(calls: list):
 
 REPO_MODELS = {
     "mistral-small": ("https://api.mistral.ai/v1", "mistral-small-latest", "MISTRAL_API_KEY"),
-    "codestral": ("https://codestral.mistral.ai/v1", "codestral-latest", "CODESTRAL_API_KEY"),
+    "codestral": ("https://api.mistral.ai/v1", "codestral-latest", "MISTRAL_API_KEY"),
     "gemini-3.8-flash": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.8-flash", "GEMINI_API_KEY"),
     "gemini-3.5-flash-lite": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.5-flash-lite", "GEMINI_API_KEY"),
 }

@@ -281,6 +281,19 @@ class TaskOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.action, ACTION_ANSWER)
         self.assertIn("resume_experiment needs experiment_id", client.prompts[-1])
 
+    def test_a_delegate_call_without_task_is_sent_back_to_the_controller(self):
+        # 2026-11-11: "delegate requires task" crashed the tick for #635.
+        client = _Client([
+            '{"type":"tool","tool":"delegate","provider":"claude","reason":"ask for a plan"}',
+            '{"type":"action","action":"answer","experiment_id":null,"command":null,'
+            '"message":"Done without delegating.","reason":"no sub-task needed"}',
+        ])
+
+        result = self._orchestrator(client).run("Plan part 2", source_id="tick-2")
+
+        self.assertEqual(result.action, ACTION_ANSWER)
+        self.assertIn("delegate requires task", client.prompts[-1])
+
     def test_controller_inference_runs_through_persistent_job_service(self):
         client = _Client([
             '{"type":"action","action":"answer","experiment_id":null,"command":null,'

@@ -31,16 +31,16 @@
     },
     {
       "id": "codestral",
-      "base_url": "https://codestral.mistral.ai/v1",
+      "base_url": "https://api.mistral.ai/v1",
       "model": "codestral-latest",
-      "api_key_env": "CODESTRAL_API_KEY",
+      "api_key_env": "MISTRAL_API_KEY",
       "cost": "free",
       "roles": [
         "coding",
         "analysis",
         "review"
       ],
-      "description": "Codestral code model on its dedicated endpoint with its own key (rate-limited free tier); for code-heavy sub-problems."
+      "description": "Codestral code model on the regular Mistral endpoint with the same key as mistral-small (rate-limited free tier); for code-heavy sub-problems."
     },
     {
       "id": "gemini-3.8-flash",

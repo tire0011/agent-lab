@@ -468,11 +468,23 @@ class ControllerLoopMixin:
                     before = self._worktree_snapshot(
                         self._decision_cwd(execution_decision)
                     ) if measured else None
-                    observation = await self._execute_tool(
-                        execution_decision,
-                        budget_plan=budget_plan,
-                        task_logger=task_logger,
-                    )
+                    try:
+                        observation = await self._execute_tool(
+                            execution_decision,
+                            budget_plan=budget_plan,
+                            task_logger=task_logger,
+                        )
+                    except TaskOrchestratorError as exc:
+                        if " requires " not in str(exc):
+                            raise
+                        # A tool call with a missing argument is the model's
+                        # slip, not a crash of the task: let it correct the call.
+                        observation = {
+                            "tool": tool,
+                            "status": "invalid_arguments",
+                            "error": str(exc),
+                            "message": f"{exc}. Call the tool again with that argument, or choose another action.",
+                        }
                     if measured and self._execution_succeeded(observation):
                         after = self._worktree_snapshot(
                             self._decision_cwd(execution_decision)
