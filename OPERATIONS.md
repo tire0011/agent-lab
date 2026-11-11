@@ -361,6 +361,21 @@ sweep replays the same merged experiments again, oldest first, under that
 label. Keep the change only if its numbers in `common` beat the baseline's on
 the same experiments.
 
+Local model speed (#642): every local plan/patch call logs a `local_model_call`
+event (`call_type`, `outcome` ok/timeout/error, `wall_seconds`, llama-server
+`timings`, median `prompt_tokens_per_second` / `generation_tokens_per_second`).
+The medians (last 21 successful calls, per model name) live in
+`LOCAL_MODEL_RATES_PATH`, default `local-model-rates.json` next to
+`AGENT_DB_PATH` (`/var/lib/nexus/`). With both rates measured, the prompt is fitted
+so that prompt time + generation stays within 80 % of the client timeout:
+generation gets at most half of that time (`max_tokens` is lowered to fit, never
+below 256), the handover is cut first, then the files. The time budget is soft:
+if even the minimal prompt is over it, that minimal prompt is still sent
+(`time_budget_exceeded`) so a new rate is measured; only n_ctx refuses a call.
+When the prompt is over the time budget, subtask planning is skipped. A
+timed-out patch call is logged as `local_patch_round` outcome `model_timeout`
+and ends the run. Deleting the file resets the measurements.
+
 ## Known limitations
 
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.
