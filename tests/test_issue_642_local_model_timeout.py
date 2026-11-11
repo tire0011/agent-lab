@@ -163,6 +163,44 @@ class ClientTests(unittest.TestCase):
                 asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
         self.assertIsNone(client.last_timings)
 
+    def test_client_requests_fixed_slot_cache_and_normalizes_cached_tokens(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [],
+            "timings": {"prompt_n": 100, "prompt_ms": 50, "cache_n": 75},
+        }
+        client = LlamaCppClient(base_url="http://llama.test/v1")
+        with patch.dict(os.environ, {"LLAMA_CPP_SLOT": "3"}), \
+                patch("modules.llama_cpp_client.httpx.AsyncClient") as cls:
+            client = LlamaCppClient(base_url="http://llama.test/v1")
+            self._mock_post(cls, return_value=response)
+            asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
+            body = cls.return_value.__aenter__.return_value.post.call_args.kwargs["json"]
+        self.assertIs(True, body["cache_prompt"])
+        self.assertEqual(75, client.last_timings["tokens_cached"])
+
+    def test_slot_n_past_is_not_misreported_as_reused_tokens(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [], "timings": {"prompt_n": 10}, "n_past": 999,
+        }
+        client = LlamaCppClient(base_url="http://llama.test/v1")
+        with patch("modules.llama_cpp_client.httpx.AsyncClient") as cls:
+            self._mock_post(cls, return_value=response)
+            asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
+        self.assertNotIn("tokens_cached", client.last_timings)
+
+    def test_cache_can_be_disabled_for_replay_measurement(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"choices": [], "timings": {"prompt_n": 1}}
+        with patch.dict(os.environ, {"LLAMA_CPP_CACHE_PROMPT": "off"}), \
+                patch("modules.llama_cpp_client.httpx.AsyncClient") as cls:
+            client = LlamaCppClient(base_url="http://llama.test/v1")
+            self._mock_post(cls, return_value=response)
+            asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
+            body = cls.return_value.__aenter__.return_value.post.call_args.kwargs["json"]
+        self.assertIs(False, body["cache_prompt"])
+
 
 class WorkerTimeoutTests(_RepoCase):
     def test_patch_timeout_is_counted_and_stops_cleanly(self):
@@ -246,6 +284,15 @@ class TimingsLoggingTests(_RepoCase):
         self.assertEqual(1, event["round"])
         self.assertGreaterEqual(event["wall_seconds"], 0)
 
+    def test_cached_prompt_share_is_logged(self):
+        timings = {"prompt_n": 30, "prompt_ms": 1000, "predicted_n": 1,
+                   "predicted_ms": 100, "tokens_cached": 70}
+        _, _, log = self.run_worker(_Server("not a diff", timings=timings))
+        event = log.all("local_model_call")[0]
+        self.assertEqual(70, event["prompt_tokens_cached"])
+        self.assertEqual(100, event["prompt_tokens_total"])
+        self.assertEqual(0.7, event["prompt_cache_ratio"])
+
     def test_second_run_does_not_reuse_stale_timings(self):
         server = _Server("not a diff", timings=[_FAST])
         worker = LocalCodingWorker(client=server, max_tokens=1024, rates_path=self.rates_path)
@@ -323,7 +370,8 @@ class TimeBudgetTests(_RepoCase):
         self.assertTrue(plan.time_budget_exceeded)
         self.assertTrue(plan.time_budget_limited)
         self.assertEqual(0, plan.handover_tokens_kept)
-        self.assertEqual(len(_FILE_LEVELS) - 1, plan.file_level)
+        # The changing tail is discarded before the stable file prefix (#645).
+        self.assertEqual(0, plan.file_level)
 
     def test_n_ctx_remains_a_hard_limit(self):
         with self.assertRaises(ContextTooSmallError):

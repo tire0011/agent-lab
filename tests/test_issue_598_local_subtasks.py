@@ -56,6 +56,7 @@ class _Server:
         self.n_ctx = n_ctx
         self.plan_calls: list[str] = []
         self.patch_calls: list[str] = []
+        self.system_calls: list[str] = []
 
     async def context_size(self) -> int:
         return self.n_ctx
@@ -64,7 +65,8 @@ class _Server:
         return -(-len(text.encode()) // 4)
 
     async def complete(self, prompt: str, *, system: str = "", **_kw) -> str:
-        if system == _PLAN_SYSTEM_PROMPT:
+        self.system_calls.append(system)
+        if "Split the coding task below" in prompt:
             self.plan_calls.append(prompt)
             return self.plan
         self.patch_calls.append(prompt)
@@ -156,7 +158,10 @@ class Issue598SubtaskTests(unittest.TestCase):
         self.assertIn("Change original to step1", first)
         self.assertIn("Subtask 2 of 2", second)
         self.assertIn("-original\n+step1", second)  # the diff of subtask 1
-        self.assertIn("--- value.txt ---\nstep1", second)  # and the file as it is now
+        # Subtask 2 sees the actual post-subtask-1 file, not a stale parent
+        # snapshot or a duplicate copy that can overflow the context window.
+        self.assertNotIn("--- value.txt ---\noriginal", second)
+        self.assertIn("--- value.txt ---\nstep1", second)
         split = log.last("local_task_split")
         self.assertEqual((True, "local", 2), (split["split"], split["planner"], split["subtasks"]))
         done = log.last("local_task_split_result")
@@ -165,6 +170,29 @@ class Issue598SubtaskTests(unittest.TestCase):
                           done["failed_subtask"], done["success"]))
         self.assertEqual([1, 2], [r["subtask"] for r in log.all("local_patch_round")])
         self.assertEqual(2, worker.last_split.succeeded)
+
+    def test_subtasks_share_neutral_message_prefix_but_use_fresh_files(self):
+        server = _Server(_TWO_STEPS, [_STEP1, _STEP2])
+        _worker, result, _log = self._run(server)
+        self.assertTrue(result.success, result.error)
+        first, second = server.patch_calls
+        self.assertTrue(all(system == local_coding_worker._SYSTEM_PROMPT
+                            for system in server.system_calls))
+        self.assertIn("--- value.txt ---\noriginal", first)
+        self.assertIn("--- value.txt ---\nstep1", second)
+        self.assertLess(first.index("--- value.txt ---"), first.index("Subtask 1 of 2"))
+        self.assertLess(second.index("--- value.txt ---"), second.index("Subtask 2 of 2"))
+
+    def test_plan_and_patch_share_neutral_system_and_put_files_first(self):
+        server = _Server(_TWO_STEPS, [_STEP1, _STEP2])
+        _worker, result, _log = self._run(server)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(_PLAN_SYSTEM_PROMPT, local_coding_worker._SYSTEM_PROMPT)
+        self.assertTrue(all(system == _PLAN_SYSTEM_PROMPT for system in server.system_calls))
+        plan_prefix = server.plan_calls[0].split("Split the coding task below", 1)[0]
+        patch_prefix = server.patch_calls[0].split("Goal and instructions:", 1)[0]
+        self.assertIn("--- value.txt ---\noriginal", plan_prefix)
+        self.assertIn("--- value.txt ---\noriginal", patch_prefix)
 
     def test_failing_subtask_2_is_reported_and_subtask_1_is_no_success(self):
         server = _Server(_TWO_STEPS, [_STEP1, "no diff here", _STEP1, "still nothing"])
