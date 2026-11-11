@@ -17,6 +17,7 @@ import httpx
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 _DEFAULT_MODEL_NAME = "qwen2.5-coder-7b-instruct"
+_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 def json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -79,6 +80,11 @@ class LlamaCppClient:
             or os.getenv("LLAMA_CPP_MODEL", _DEFAULT_MODEL_NAME)
         )
         self.last_timings: dict[str, float | int] | None = None
+        self.cache_prompt = os.getenv("LLAMA_CPP_CACHE_PROMPT", "1").strip().lower() not in _FALSE_VALUES
+        try:
+            self.id_slot = int(os.getenv("LLAMA_CPP_SLOT", "0"))
+        except ValueError:
+            self.id_slot = 0
 
     async def chat_completion(
         self,
@@ -94,6 +100,8 @@ class LlamaCppClient:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "cache_prompt": self.cache_prompt,
+            "id_slot": self.id_slot,
             **kwargs,
         }
 
@@ -130,6 +138,18 @@ class LlamaCppClient:
                 name: timings[name] for name in names
                 if isinstance(timings.get(name), (int, float))
             }
+            # llama-server versions have used several names and locations for
+            # the reused prefix. Normalize them for callers and structured logs.
+            for source in (data, timings):
+                if not isinstance(source, dict):
+                    continue
+                for name in ("tokens_cached", "n_past", "cache_n"):
+                    value = source.get(name)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        self.last_timings["tokens_cached"] = value
+                        break
+                if "tokens_cached" in self.last_timings:
+                    break
         return data  # type: ignore[no-any-return]
 
     async def complete(

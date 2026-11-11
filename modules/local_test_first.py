@@ -144,9 +144,9 @@ def _prompt(sections: dict[str, str], files: list[tuple[str, str]], feedback: st
     problem_text = f"Problem:\n{problem}\n\n" if problem else ""
     return (
         "Write one focused Python unittest file for the requested test, BEFORE the change is made.\n\n"
+        f"Current base-tree files named by the Change section (stable for this run):\n{source}\n\n"
         f"{problem_text}Change (not implemented yet):\n{sections.get('change', '(not given)')}\n\n"
         f"Requested test:\n{sections['test']}\n\n"
-        f"Current base-tree files named by the Change section:\n{source}\n\n"
         'Return exactly one JSON object: {"path":"tests/test_name.py","content":"..."}.\n'
         "Use unittest.TestCase. Every test must FAIL on the current code by an assertion "
         "(not by an exception or import error: check with hasattr/getattr before calling new names) "

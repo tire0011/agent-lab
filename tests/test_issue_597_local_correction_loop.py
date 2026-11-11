@@ -118,6 +118,9 @@ class Issue597CorrectionLoopTests(unittest.TestCase):
         self.assertEqual("patched\n", (self.repo / "value.txt").read_text())
         self.assertEqual(2, len(server.calls))
         second = server.calls[1]["prompt"]
+        marker = "\n\nGoal and instructions:\n"
+        self.assertEqual(server.calls[0]["prompt"].split(marker, 1)[0],
+                         second.split(marker, 1)[0])
         self.assertIn("corrupt patch", second)  # the error was fed back
         self.assertIn("-original\n+patched", second)  # with the previous diff
         self.assertIn("Goal and instructions:", second)  # on top of the same fitted prompt

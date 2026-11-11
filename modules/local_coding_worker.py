@@ -190,9 +190,12 @@ def _render_feedback(round_no: int, error: str, previous_diff: str) -> str:
 
 
 def _render_prompt(essential: str, files_text: str, handover: str, feedback: str = "") -> str:
+    # Keep the expensive, run-stable repository snapshot first. llama-server
+    # can then reuse its KV prefix while goals and correction feedback change.
     prompt = (
+        f"Repository context (stable for this run):\n"
+        f"Contents of target files (relevant parts):{files_text or ' none'}\n\n"
         f"Goal and instructions:\n{essential}\n\n"
-        f"Contents of files named in the goal (relevant parts):{files_text or ' none'}\n\n"
     )
     if handover:
         prompt += f"{handover}\n\n"
@@ -411,14 +414,16 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     if base_tokens > budget:
         budget, exceeded = base_tokens, True
 
-    # 2. Named files, from whole to the essential excerpt.
+    # 2. Named files, from whole to the essential excerpt. The hard context
+    # limit may excerpt them; the softer time budget must not discard the
+    # stable cacheable prefix merely to retain changing tail text.
     files_text = ""
     level_used = 0
     if files:
         for level_used, level in enumerate(_FILE_LEVELS):
             files_text = _render_files(files, keywords, level)
             with_files = await total(_render_prompt(essential, files_text, ""))
-            if with_files <= budget:
+            if with_files <= context_budget:
                 break
         else:
             if with_files > context_budget:
@@ -427,6 +432,8 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
                     with_files,
                 )
             budget, exceeded = with_files, True  # smallest file level, over the time budget
+        if with_files > budget:
+            budget, exceeded = with_files, True
 
     # 3. The handover, cut from the end, re-checked on the rendered prompt.
     kept = await _fit_part(
@@ -1165,15 +1172,16 @@ class LocalCodingWorker:
     async def _local_plan_prompt(self, plan: PromptPlan) -> str:
         count = plan.counter or TokenCounter(self.client)
         budget = plan.n_ctx - min(self.max_tokens, PLAN_MAX_TOKENS) - CONTEXT_MARGIN_TOKENS
+        stable = plan.prompt.split("\n\nGoal and instructions:\n", 1)[0]
 
         async def total(handover: str) -> int:
             return await count(_PLAN_SYSTEM_PROMPT) + await count(
-                _render_plan_prompt(plan.essential, plan.named_files, handover))
+                stable + "\n\n" + _render_plan_prompt(plan.essential, plan.named_files, handover))
 
         if await total("") > budget:
             raise PlanUnusable("the planning prompt does not fit the local context")
         kept = await _fit_part(plan.handover, budget, total, count)
-        return _render_plan_prompt(plan.essential, plan.named_files, kept)
+        return stable + "\n\n" + _render_plan_prompt(plan.essential, plan.named_files, kept)
 
     def _free_tier_subtasks(self, plan: PromptPlan, working_dir: str,
                             outcome: SplitOutcome) -> tuple[list[Subtask], str]:
@@ -1259,11 +1267,19 @@ class LocalCodingWorker:
             f"Changes already made by the earlier subtasks (git diff, already applied):\n{earlier}\n\n"
             f"Overall task (context only; do not do the other subtasks):\n{plan.essential}"
         )
-        return await build_prompt_parts(
+        # Do not reread files after each applied subtask: every patch call in a
+        # run must begin with the byte-identical snapshot fitted for the run.
+        sub_plan = await build_prompt_parts(
             essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
             n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
             rates=self.rates.medians(),
         )
+        sub_plan.files_text = plan.files_text
+        sub_plan.named_files = list(plan.named_files)
+        sub_plan.prompt = _render_prompt(sub_plan.essential, plan.files_text, sub_plan.handover)
+        system_tokens = await (plan.counter or TokenCounter(self.client))(_SYSTEM_PROMPT)
+        sub_plan.prompt_tokens = system_tokens + await (plan.counter or TokenCounter(self.client))(sub_plan.prompt)
+        return sub_plan
 
     # The correction loop (#597)
 
@@ -1378,6 +1394,17 @@ class LocalCodingWorker:
                         minimum_output_tokens=MIN_OUTPUT_TOKENS,
                     )
             prompt_rate, generation_rate = self.rates.medians()
+            prompt_total = None
+            prompt_cached = None
+            if isinstance(timings, dict):
+                total_value = timings.get("prompt_n")
+                cached_value = timings.get("tokens_cached")
+                if isinstance(total_value, (int, float)) and not isinstance(total_value, bool):
+                    prompt_total = total_value
+                if isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
+                    prompt_cached = cached_value
+            cache_ratio = (prompt_cached / prompt_total
+                           if prompt_cached is not None and prompt_total and prompt_total > 0 else None)
             self._log(
                 experiment_logger, phase, "local_model_call",
                 f"Local {call_type} model call: {outcome} in {wall_seconds:.1f}s",
@@ -1385,6 +1412,9 @@ class LocalCodingWorker:
                 wall_seconds=wall_seconds, timings=timings,
                 prompt_tokens_per_second=prompt_rate,
                 generation_tokens_per_second=generation_rate,
+                prompt_tokens_cached=prompt_cached,
+                prompt_tokens_total=prompt_total,
+                prompt_cache_ratio=cache_ratio,
                 max_tokens=max_tokens, **fields,
             )
 
