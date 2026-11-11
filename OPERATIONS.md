@@ -376,6 +376,42 @@ When the prompt is over the time budget, subtask planning is skipped. A
 timed-out patch call is logged as `local_patch_round` outcome `model_timeout`
 and ends the run. Deleting the file resets the measurements.
 
+Best-of-N patch sampling (#639): `NEXUS_LOCAL_SAMPLES` (default `1`, at most
+8) is the number of candidates the local worker asks for per patch round.
+With `1` nothing changes (one greedy answer, checked in place). With N > 1 the
+candidates are requested one after another (never in parallel): the first at
+temperature 0.0, the rest at `NEXUS_LOCAL_SAMPLE_TEMPERATURES` (default
+`0.4,0.7,1.0`, repeated when N is larger) with seeds 640, 641, ...
+(llama-server honours `seed`; same seed, same answer). Each candidate is
+applied, compiled and tested (the subtask's named tests) in its own throwaway
+copy of the working tree under the system temp dir (`.git` and caches are not
+copied; tests that need the repository's git data therefore fail in the copy).
+The first candidate that passes everything wins and is then applied to the real
+tree; sampling stops there, so extra samples cost time only when the greedy
+answer fails. When none passes, the one that got furthest (compiled, then
+fewest failing tests) feeds the next correction round.
+
+Events: `local_patch_sample` per candidate (round, index, temperature, seed,
+outcome, applied/compiled/passed, failing tests, wall and check seconds, tokens
+in/out, tokens/s); `local_samples_result` per subtask or one-shot
+(`samples_requested`, `samples_applied`, `samples_compiled`, `samples_passed`,
+`winner_index`, `winner_temperature`, `winner_round`, `winner_reason`
+tests/compile/apply, `local_tokens`, `local_seconds`); `local_run_metrics` per
+run, N=1 included (wall time, per-sample wall times, llama-server CPU seconds
+and average cores, mean 1-minute load, peak `VmRSS` seen during the run and
+`VmHWM`, tokens in/out, tokens/s). llama-server is found by process name or
+`NEXUS_LLAMA_SERVER_PID`; on another host those fields are empty.
+`experiment_show` lists the last run's lines. Shadow replays store `samples`,
+`samples_requested`, `samples_passed`, `cpu_seconds`, `load_average`,
+`peak_rss_kb`, `tokens_per_second` and the full `metrics_json`;
+`local_replays_list` shows them and the median seconds/CPU per variant.
+
+To measure: set `NEXUS_LOCAL_SAMPLES=1` with
+`NEXUS_SHADOW_REPLAY_VARIANT=samples1`, then `NEXUS_LOCAL_SAMPLES=4` with
+`samples4`. Make N > 1 the default only if, on the `common` experiments,
+`full_pass_rate` rises by at least 5 points and the median seconds per task stay
+under 3x the `samples1` median.
+
 ## Known limitations
 
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.

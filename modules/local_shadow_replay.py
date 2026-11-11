@@ -48,6 +48,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -239,6 +240,13 @@ class ReplayOutcome:
     base_commit: str | None = None
     merged_commit: str | None = None
     test_files: list[str] = field(default_factory=list)
+    # #639: the worker's ``local_run_metrics`` (sampling and cost).
+    metrics: dict[str, Any] | None = None
+
+
+def _metric(metrics: dict[str, Any] | None, name: str) -> Any:
+    value = (metrics or {}).get(name)
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token: str,
@@ -249,6 +257,8 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
            SET status=?, issue=?, model=?, patch_applied=?, compiled=?, tests_total=?,
                tests_passed=?, rounds=?, tokens=?, seconds=?, error=?, base_commit=?,
                merged_commit=?, test_files_json=?, finished_at=?,
+               samples=?, samples_requested=?, samples_passed=?, cpu_seconds=?,
+               load_average=?, peak_rss_kb=?, tokens_per_second=?, metrics_json=?,
                claim_token=NULL, lease_expires_at=NULL
            WHERE experiment_id=? AND prompt_variant=? AND claim_token=? AND status=?""",
         (
@@ -256,7 +266,14 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
             int(outcome.compiled), int(outcome.tests_total), int(outcome.tests_passed),
             int(outcome.rounds), int(outcome.tokens), round(float(outcome.seconds), 3), error,
             outcome.base_commit, outcome.merged_commit, json.dumps(outcome.test_files),
-            _iso(_utcnow()), experiment_id, variant, token, STATUS_PENDING,
+            _iso(_utcnow()),
+            int(_metric(outcome.metrics, "samples_setting") or 1),
+            _metric(outcome.metrics, "samples_requested"), _metric(outcome.metrics, "samples_passed"),
+            _metric(outcome.metrics, "llama_server_cpu_seconds"), _metric(outcome.metrics, "load_average"),
+            _metric(outcome.metrics, "llama_server_peak_rss_kb"),
+            _metric(outcome.metrics, "tokens_per_second"),
+            json.dumps(outcome.metrics, default=str) if outcome.metrics is not None else None,
+            experiment_id, variant, token, STATUS_PENDING,
         ),
     ).rowcount == 1
 
@@ -616,20 +633,26 @@ class _UsageCountingClient(LlamaCppClient):
 
 def default_worker_factory(client: Any) -> Any:
     """The production local worker: subtask splitting as configured, no free tier."""
-    from modules.local_coding_worker import LocalCodingWorker, task_split_enabled
+    from modules.local_coding_worker import (
+        LocalCodingWorker, local_samples, sample_temperatures, task_split_enabled,
+    )
 
-    return LocalCodingWorker(client=client, split_tasks=task_split_enabled(), planner=_no_free_tier)
+    return LocalCodingWorker(client=client, split_tasks=task_split_enabled(), planner=_no_free_tier,
+                             samples=local_samples(), sample_temperatures=sample_temperatures())
 
 
 class _RoundCounter:
-    """An experiment logger that counts the worker's patch rounds."""
+    """An experiment logger that counts the worker's patch rounds and keeps its run metrics (#639)."""
 
     def __init__(self) -> None:
         self.rounds = 0
+        self.metrics: dict[str, Any] | None = None
 
-    def _record(self, _phase: str, event: str, _message: str = "", **_fields: Any) -> None:
+    def _record(self, _phase: str, event: str, _message: str = "", **fields: Any) -> None:
         if event == "local_patch_round":
             self.rounds += 1
+        elif event == "local_run_metrics":
+            self.metrics = dict(fields)
 
     info = warning = error = _record
 
@@ -713,9 +736,11 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
         except Exception as exc:
             outcome.seconds = time.monotonic() - started
             outcome.rounds = counter.rounds
+            outcome.metrics = counter.metrics
             raise ReplayError(f"local worker raised {type(exc).__name__}: {exc}") from exc
         outcome.seconds = time.monotonic() - started
         outcome.rounds = counter.rounds
+        outcome.metrics = counter.metrics
         outcome.tokens = int(getattr(client, "tokens_used", 0) or 0) or _usage_tokens(getattr(result, "usage", None))
         worker_error = None if getattr(result, "success", False) else (
             str(getattr(result, "error", None) or "local worker did not succeed"))
@@ -915,7 +940,8 @@ def replay_next(
 _READ_COLUMNS = (
     "experiment_id, issue, model, prompt_variant, status, patch_applied, compiled, "
     "tests_total, tests_passed, rounds, tokens, seconds, error, base_commit, "
-    "merged_commit, created_at, finished_at"
+    "merged_commit, created_at, finished_at, samples, samples_requested, samples_passed, "
+    "cpu_seconds, load_average, peak_rss_kb, tokens_per_second"
 )
 
 
@@ -978,6 +1004,9 @@ def _stats(variant: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = sum(int(r["tests_total"]) for r in scored)
     passed = sum(int(r["tests_passed"]) for r in scored)
     full = sum(1 for r in scored if is_full_pass(r))
+    seconds = [float(r["seconds"] or 0) for r in scored]
+    cpu = [float(r["cpu_seconds"]) for r in scored if r.get("cpu_seconds") is not None]
+    rss = [int(r["peak_rss_kb"]) for r in scored if r.get("peak_rss_kb") is not None]
     return {
         "prompt_variant": variant,
         "replays": len(rows),
@@ -989,6 +1018,11 @@ def _stats(variant: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "test_pass_rate": round(passed / total, 4) if total else None,
         "full_passes": full,
         "full_pass_rate": round(full / len(scored), 4) if scored else None,
+        # #639: the cost side of a variant (median local seconds per scored replay).
+        "median_seconds": round(statistics.median(seconds), 3) if seconds else None,
+        "median_cpu_seconds": round(statistics.median(cpu), 3) if cpu else None,
+        "peak_rss_kb": max(rss) if rss else None,
+        "samples": sorted({int(r.get("samples") or 1) for r in rows}),
     }
 
 

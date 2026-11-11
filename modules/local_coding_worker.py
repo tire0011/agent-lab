@@ -34,12 +34,28 @@ failing subtask stops the run: the result fails and names it, earlier subtasks'
 changes stay in the tree but never count as success. Every run logs
 ``local_task_split`` (when planned) and ``local_task_split_result`` (split,
 subtasks, subtasks_succeeded, failed_subtask, success).
+
+Best-of-N sampling (#639, ``NEXUS_LOCAL_SAMPLES``, default 1 = the behaviour
+above, unchanged): with N > 1 every patch round asks the local model for up to N
+candidates, one after another (llama-server never gets parallel requests): the
+first at temperature 0.0, the others at ``NEXUS_LOCAL_SAMPLE_TEMPERATURES``
+(default 0.4, 0.7, 1.0, repeated when N is larger) with distinct seeds. Each
+candidate is applied, compiled and tested in its own throwaway copy of the
+working tree (removed afterwards). The first candidate that passes everything
+wins and only then is applied to the real tree (``apply_and_check`` again), so
+the real tree only ever holds the winner's patch; sampling stops there. When
+none passes, the candidate that got furthest (compiled, then fewest failing
+tests, then lowest index) feeds the next correction round. Every patch sample
+is logged as ``local_patch_sample``, every subtask/one-shot as
+``local_samples_result`` and every run as ``local_run_metrics`` (wall time,
+llama-server CPU time, load, peak memory, tokens; :mod:`modules.local_run_metrics`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import codecs
+import inspect
 import logging
 import math
 import os
@@ -58,6 +74,7 @@ from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
 from modules.llama_cpp_client import LlamaCppClient
 from modules.local_model_rates import LocalModelRates
+from modules.local_run_metrics import CallRecord, RunMetrics, call_record, summary_line
 from modules.local_test_first import generate_failing_tests
 
 logger = logging.getLogger(__name__)
@@ -589,6 +606,52 @@ _FREE_TIER_ESSENTIAL_CHARS = 12000
 _FREE_TIER_HANDOVER_CHARS = 6000
 
 
+ENV_LOCAL_SAMPLES = "NEXUS_LOCAL_SAMPLES"
+ENV_SAMPLE_TEMPERATURES = "NEXUS_LOCAL_SAMPLE_TEMPERATURES"
+DEFAULT_SAMPLE_TEMPERATURES: tuple[float, ...] = (0.4, 0.7, 1.0)
+MAX_LOCAL_SAMPLES = 8
+# Seeds of the sampled candidates: SAMPLE_SEED_BASE + candidate index, so a
+# replay of the same prompt draws the same candidates.
+SAMPLE_SEED_BASE = 639
+_SAMPLE_COPY_PREFIX = "nexus-local-sample-"
+# Not copied into a candidate's throwaway tree (VCS data, caches, environments).
+_SAMPLE_COPY_IGNORE = (".git", "__pycache__", ".venv", "venv", "node_modules",
+                       ".mypy_cache", ".pytest_cache", ".ruff_cache")
+
+
+def local_samples() -> int:
+    """``NEXUS_LOCAL_SAMPLES`` (default 1), clamped to 1..``MAX_LOCAL_SAMPLES``."""
+    try:
+        value = int(os.environ.get(ENV_LOCAL_SAMPLES, "").strip() or 1)
+    except ValueError:
+        return 1
+    return max(1, min(MAX_LOCAL_SAMPLES, value))
+
+
+def sample_temperatures() -> tuple[float, ...]:
+    """``NEXUS_LOCAL_SAMPLE_TEMPERATURES`` (comma separated, 0..2), else the default spread."""
+    raw = os.environ.get(ENV_SAMPLE_TEMPERATURES, "")
+    values: list[float] = []
+    for part in raw.split(","):
+        try:
+            value = float(part)
+        except ValueError:
+            continue
+        if math.isfinite(value) and 0.0 <= value <= 2.0:
+            values.append(value)
+    return tuple(values) or DEFAULT_SAMPLE_TEMPERATURES
+
+
+def sample_schedule(samples: int, spread: tuple[float, ...] = DEFAULT_SAMPLE_TEMPERATURES
+                    ) -> list[tuple[float, int | None]]:
+    """``(temperature, seed)`` per candidate: the first greedy without seed, then the spread."""
+    spread = tuple(spread) or DEFAULT_SAMPLE_TEMPERATURES
+    schedule: list[tuple[float, int | None]] = [(0.0, None)]
+    for index in range(1, max(1, samples)):
+        schedule.append((float(spread[(index - 1) % len(spread)]), SAMPLE_SEED_BASE + index))
+    return schedule
+
+
 def task_split_enabled() -> bool:
     """``LOCAL_TASK_SPLIT`` (default on); ``0``/``false``/``off`` runs one-shot."""
     return os.environ.get(ENV_TASK_SPLIT, "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -865,8 +928,28 @@ def run_named_tests(working_dir: str, tests: list[str] | tuple[str, ...], timeou
 
     No bytecode or pytest cache is written, so a rollback leaves the tree as it was.
     """
+    return run_named_tests_detail(working_dir, tests, timeout)[0]
+
+
+_PYTEST_FAIL_RE = re.compile(r"\b(\d+) (?:failed|errors?)\b")
+_UNITTEST_FAIL_RE = re.compile(r"\b(?:failures|errors)=(\d+)")
+
+
+def failing_test_count(output: str, tests: list[str] | tuple[str, ...]) -> int:
+    """How many tests failed according to a pytest/unittest summary in *output*.
+
+    Unknown (no summary, a crash, a timeout): one per named test, at least one.
+    """
+    found = sum(int(n) for n in _PYTEST_FAIL_RE.findall(output))
+    found += sum(int(n) for n in _UNITTEST_FAIL_RE.findall(output))
+    return found if found > 0 else max(1, len(tests))
+
+
+def run_named_tests_detail(working_dir: str, tests: list[str] | tuple[str, ...],
+                           timeout: float) -> tuple[str | None, int]:
+    """:func:`run_named_tests` plus the number of failing tests (#639)."""
     if not tests:
-        return None
+        return None, 0
     root = Path(working_dir).resolve()
     pytest_tests = [test for test in tests if "::" in test or test.endswith(".py")]
     unittest_tests = [test for test in tests if test not in pytest_tests]
@@ -874,7 +957,7 @@ def run_named_tests(working_dir: str, tests: list[str] | tuple[str, ...], timeou
         path = test.split("::", 1)[0]
         full = _inside(root, path)
         if full is None or not full.is_file():
-            return f"named test {test} not found"
+            return f"named test {test} not found", max(1, len(tests))
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     limit = min(timeout, NAMED_TEST_TIMEOUT_SECONDS)
     try:
@@ -886,12 +969,14 @@ def run_named_tests(working_dir: str, tests: list[str] | tuple[str, ...], timeou
         results = [subprocess.run(command, cwd=working_dir, env=env, text=True,
                                   capture_output=True, timeout=limit) for command in commands]
     except subprocess.TimeoutExpired:
-        return f"named tests timed out after {limit:g}s: {', '.join(tests)}"
-    failed = next((done for done in results if done.returncode != 0), None)
-    if failed is None:
-        return None
+        return f"named tests timed out after {limit:g}s: {', '.join(tests)}", max(1, len(tests))
+    failures = [done for done in results if done.returncode != 0]
+    if not failures:
+        return None, 0
+    failed = failures[0]
+    count = sum(failing_test_count(done.stdout + "\n" + done.stderr, tests) for done in failures)
     output = (failed.stdout + "\n" + failed.stderr).strip()
-    return f"named test runner exited {failed.returncode}:\n{output[-FEEDBACK_ERROR_CHARS:]}"
+    return f"named test runner exited {failed.returncode}:\n{output[-FEEDBACK_ERROR_CHARS:]}", count
 
 
 def _generated_test_path(test_ids: list[str], working_dir: str) -> Path | None:
@@ -988,12 +1073,176 @@ def apply_and_check(patch: str, working_dir: str, timeout: float, *,
         raise
 
 
+# Best-of-N candidates (#639)
+
+# How far a candidate got; a higher stage is a better fallback.
+_STAGE_NONE, _STAGE_APPLIED, _STAGE_COMPILED, _STAGE_PASSED = range(4)
+_OUTCOME_STAGE = {
+    "no_diff": _STAGE_NONE, "outside_subtask": _STAGE_NONE, "does_not_apply": _STAGE_NONE,
+    "apply_failed": _STAGE_NONE, "compile_failed": _STAGE_APPLIED, "tests_failed": _STAGE_COMPILED,
+    "applied": _STAGE_PASSED,
+}
+
+
+@dataclass
+class CandidateCheck:
+    """The outcome of applying, compiling and testing one candidate patch."""
+
+    outcome: str
+    reason: str = ""
+    stage: int = _STAGE_NONE
+    failing_tests: int = 0
+    # The check that decided a passing candidate: "tests", "compile" or "apply".
+    decided_by: str = ""
+
+    @property
+    def applied(self) -> bool:
+        return self.stage >= _STAGE_APPLIED
+
+    @property
+    def compiled(self) -> bool:
+        return self.stage >= _STAGE_COMPILED
+
+    @property
+    def passed(self) -> bool:
+        return self.stage >= _STAGE_PASSED
+
+
+def _decided_by(tests: Any, changed_py: Any) -> str:
+    return "tests" if tests else "compile" if changed_py else "apply"
+
+
+def check_rejection(exc: _PatchRejected, tests: list[str] | tuple[str, ...]) -> CandidateCheck:
+    """A :class:`CandidateCheck` for a patch :func:`apply_and_check` rejected."""
+    stage = _OUTCOME_STAGE.get(exc.outcome, _STAGE_NONE)
+    failing = failing_test_count(exc.reason, tests) if exc.outcome == "tests_failed" else 0
+    return CandidateCheck(exc.outcome, exc.reason, stage, failing)
+
+
+def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
+    return {name for name in names if name in _SAMPLE_COPY_IGNORE}
+
+
+def check_in_copy(patch: str, working_dir: str, timeout: float, *,
+                  allowed_paths: set[str] | None = None,
+                  tests: list[str] | tuple[str, ...] = (),
+                  tmp_root: str | None = None) -> CandidateCheck:
+    """Apply, compile and test *patch* in a throwaway copy of *working_dir*.
+
+    The copy (without ``.git`` and caches) is always removed; *working_dir* is
+    never written to. ``git apply`` outside a repository applies like ``patch``.
+    """
+    if not patch:
+        return CandidateCheck("no_diff", "local model did not return a unified diff")
+    if allowed_paths is not None:
+        outside = sorted(patch_paths(patch) - allowed_paths)
+        if outside:
+            return CandidateCheck(
+                "outside_subtask",
+                f"local model patch touches files outside this subtask: {', '.join(outside)}; "
+                f"only change {', '.join(sorted(allowed_paths))}",
+            )
+    parent = tempfile.mkdtemp(prefix=_SAMPLE_COPY_PREFIX, dir=tmp_root)
+    copy = os.path.join(parent, "tree")
+    try:
+        shutil.copytree(working_dir, copy, symlinks=True, ignore=_copy_ignore)
+        reason = _git_apply(["--check"], copy, patch, timeout)
+        if reason is not None:
+            return CandidateCheck("does_not_apply", f"local model patch does not apply: {reason}")
+        root = Path(copy).resolve()
+        paths = patch_paths(patch)
+        before = {rel: _read_state(full) for rel in paths if (full := _inside(root, rel)) is not None}
+        reason = _git_apply([], copy, patch, timeout)
+        if reason is not None:
+            return CandidateCheck("apply_failed", f"local model patch failed to apply: {reason}")
+        changed_py = sorted(rel for rel in before
+                            if rel.endswith(".py") and (root / rel).is_file() and not (root / rel).is_symlink()
+                            and _read_state(root / rel) != before[rel])
+        reason = _compile_check(copy, changed_py, timeout)
+        if reason is not None:
+            return CandidateCheck("compile_failed", f"local model patch breaks py_compile: {reason}",
+                                  _STAGE_APPLIED)
+        reason, failing = run_named_tests_detail(copy, tests, timeout)
+        if reason is not None:
+            return CandidateCheck("tests_failed", f"named tests fail after the patch: {reason}",
+                                  _STAGE_COMPILED, failing)
+        return CandidateCheck("applied", "", _STAGE_PASSED, 0, _decided_by(tests, changed_py))
+    except subprocess.TimeoutExpired as exc:
+        return CandidateCheck("timed_out", f"checking the candidate timed out: {exc}")
+    except OSError as exc:
+        return CandidateCheck("copy_failed", f"could not prepare the candidate's throwaway copy: {exc}")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def better_candidate(current: tuple[CandidateCheck, int] | None,
+                     new: tuple[CandidateCheck, int]) -> tuple[CandidateCheck, int]:
+    """The better fallback: further stage, then fewer failing tests, then the earlier one."""
+    if current is None:
+        return new
+    (old, old_index), (cand, index) = current, new
+    key_old = (-old.stage, old.failing_tests if old.compiled else 0, old_index)
+    key_new = (-cand.stage, cand.failing_tests if cand.compiled else 0, index)
+    return new if key_new < key_old else current
+
+
+@dataclass
+class SampleStats:
+    """What one subtask's (or the one-shot's) patch rounds sampled (``local_samples_result``)."""
+
+    samples_setting: int = 1
+    requested: int = 0
+    applied: int = 0
+    compiled: int = 0
+    passed: int = 0
+    rounds: int = 0
+    winner_index: int | None = None
+    winner_temperature: float | None = None
+    winner_round: int | None = None
+    winner_reason: str | None = None
+    tokens_in: int = 0
+    tokens_out: int = 0
+    model_seconds: float = 0.0
+    check_seconds: float = 0.0
+    samples: list[dict[str, Any]] = field(default_factory=list)
+
+    def add(self, sample: dict[str, Any], check: CandidateCheck | None) -> None:
+        self.requested += 1
+        if check is not None:
+            self.applied += int(check.applied)
+            self.compiled += int(check.compiled)
+            self.passed += int(check.passed)
+        self.tokens_in += int(sample.get("tokens_in") or 0)
+        self.tokens_out += int(sample.get("tokens_out") or 0)
+        self.model_seconds += float(sample.get("wall_seconds") or 0.0)
+        self.check_seconds += float(sample.get("check_seconds") or 0.0)
+        self.samples.append(sample)
+
+    def log_fields(self) -> dict[str, Any]:
+        return {
+            "samples_setting": self.samples_setting,
+            "samples_requested": self.requested, "samples_applied": self.applied,
+            "samples_compiled": self.compiled, "samples_passed": self.passed,
+            "rounds": self.rounds,
+            "winner_index": self.winner_index, "winner_temperature": self.winner_temperature,
+            "winner_round": self.winner_round, "winner_reason": self.winner_reason,
+            "local_tokens_in": self.tokens_in, "local_tokens_out": self.tokens_out,
+            "local_tokens": self.tokens_in + self.tokens_out,
+            "local_seconds": round(self.model_seconds + self.check_seconds, 3),
+            "local_model_seconds": round(self.model_seconds, 3),
+            "local_check_seconds": round(self.check_seconds, 3),
+            "samples": [dict(s) for s in self.samples],
+        }
+
+
 class LocalCodingWorker:
     provider = PROVIDER
 
     def __init__(self, *, client: LlamaCppClient | None = None, max_tokens: int = 4096,
                  split_tasks: bool = False, planner: Callable[[str], Any] | None = None,
                  test_first: bool = False, rates_path: str | Path | None = None,
+                 samples: int = 1, sample_temperatures: tuple[float, ...] | None = None,
+                 sample_tmp_root: str | None = None,
                  **_: Any) -> None:
         self.client = client or LlamaCppClient()
         self.max_tokens = max_tokens
@@ -1009,6 +1258,15 @@ class LocalCodingWorker:
         self.last_split: SplitOutcome | None = None
         self.generated_tests: tuple[str, ...] = ()
         self.local_attempt_passed_generated_tests: bool | None = None
+        # #639: best-of-N patch sampling. 1 keeps the single greedy answer per round.
+        self.samples = max(1, min(MAX_LOCAL_SAMPLES, int(samples or 1)))
+        self.sample_temperatures = tuple(sample_temperatures or DEFAULT_SAMPLE_TEMPERATURES)
+        # Where candidates' throwaway copies go (default: the system temp dir).
+        self.sample_tmp_root = sample_tmp_root
+        self._metrics: RunMetrics | None = None
+        self._last_call: CallRecord | None = None
+        self.last_run_metrics: dict[str, Any] | None = None
+        self.last_sample_stats: list[SampleStats] = []
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
@@ -1017,6 +1275,9 @@ class LocalCodingWorker:
         self.last_plan = None
         self.generated_tests = ()
         self.local_attempt_passed_generated_tests = None
+        self.last_sample_stats = []
+        self.last_run_metrics = None
+        self._metrics = RunMetrics.start()
         # Replaced by _plan_subtasks when splitting is on and the task reaches planning.
         self.last_split = SplitOutcome(
             reason="not planned" if self.split_tasks else f"splitting is off ({ENV_TASK_SPLIT})",
@@ -1050,6 +1311,7 @@ class LocalCodingWorker:
                  if split.split else f"Local task ran one-shot ({split.reason})"),
                 warning=not success, success=success, **split.log_fields(),
             )
+            self._log_run_metrics(experiment_logger, phase, success)
 
     def _run(self, task: str, working_dir: str, sandbox: str, timeout_seconds: float,
              experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
@@ -1309,10 +1571,25 @@ class LocalCodingWorker:
                       allowed_paths: set[str] | None = None, tests: tuple[str, ...] = (),
                       subtask: int | None = None) -> tuple[bool, str, str]:
         """``(applied, model output, failure reason)`` after at most ``MAX_PATCH_ROUNDS``."""
+        stats = SampleStats(samples_setting=self.samples)
+        self.last_sample_stats.append(stats)
+        try:
+            return self._sampled_rounds(plan, working_dir, timeout, experiment_logger, phase, stats,
+                                        allowed_paths=allowed_paths, tests=tests, subtask=subtask)
+        finally:
+            self._log_samples(experiment_logger, phase, stats, subtask)
+
+    def _sampled_rounds(self, plan: PromptPlan, working_dir: str, timeout: float,
+                        experiment_logger: Any | None, phase: str, stats: SampleStats, *,
+                        allowed_paths: set[str] | None, tests: tuple[str, ...],
+                        subtask: int | None) -> tuple[bool, str, str]:
         reason = ""
         previous_diff = ""
         tag: dict[str, Any] = {"subtask": subtask} if subtask is not None else {}
+        sampling = self.samples > 1
+        schedule = sample_schedule(self.samples, self.sample_temperatures)
         for round_no in range(1, MAX_PATCH_ROUNDS + 1):
+            stats.rounds = round_no
             prompt, extra = plan.prompt, {"prompt_tokens": plan.prompt_tokens, **tag}
             if round_no > 1:
                 fb = asyncio.run(build_feedback_prompt(
@@ -1322,39 +1599,67 @@ class LocalCodingWorker:
                 extra = {"prompt_tokens": fb.prompt_tokens, "feedback_error_chars": fb.error_chars,
                          "feedback_diff_cut": fb.diff_cut, "handover_tokens_kept": fb.handover_tokens_kept,
                          **tag}
-            try:
-                output = self._model_call(
-                    prompt, _SYSTEM_PROMPT, plan.output_tokens or self.max_tokens, experiment_logger, phase,
-                    call_type="patch", round=round_no,
-                    prompt_tokens=extra["prompt_tokens"], **tag,
-                )
-            except Exception as exc:
-                if self._is_model_timeout(exc):
-                    limit = getattr(self.client, "timeout", timeout)
-                    reason = str(exc) or f"local model call timed out after {limit}s"
-                    self._log_round(experiment_logger, phase, round_no, "model_timeout", reason, **extra)
-                    return False, "", reason
-                raise
-            patch = _extract_diff(output)
-            try:
-                apply_and_check(patch, working_dir, timeout, allowed_paths=allowed_paths, tests=tests)
-            except _PatchRejected as exc:
-                reason = exc.reason
-                previous_diff = patch or output.strip()
-                self._log_round(experiment_logger, phase, round_no, exc.outcome, reason, **extra)
-                continue
-            except RollbackError as exc:
-                reason = f"local model patch rollback failed in round {round_no}: {exc}"
-                self._log_round(experiment_logger, phase, round_no, "rollback_failed", reason, **extra)
-                return False, "", reason
-            except subprocess.TimeoutExpired:
-                self._log_round(experiment_logger, phase, round_no, "timed_out",
-                                "local model patch application timed out", **extra)
-                raise
-            self._log_round(experiment_logger, phase, round_no, "applied", "", **extra)
-            if self.generated_tests and set(self.generated_tests).issubset(tests):
-                self.local_attempt_passed_generated_tests = True
-            return True, output, ""
+            best: tuple[CandidateCheck, int] | None = None
+            best_diff = ""
+            for index, (temperature, seed) in enumerate(schedule):
+                sample_fields = {"sample": index, "samples": self.samples} if sampling else {}
+                self._last_call = None
+                try:
+                    output = self._model_call(
+                        prompt, _SYSTEM_PROMPT, plan.output_tokens or self.max_tokens, experiment_logger, phase,
+                        call_type="patch", round=round_no,
+                        prompt_tokens=extra["prompt_tokens"], temperature=temperature, seed=seed,
+                        **tag, **sample_fields,
+                    )
+                except Exception as exc:
+                    self._record_sample(stats, experiment_logger, phase, round_no, index, temperature, seed,
+                                        None, 0.0, tag, outcome="model_timeout"
+                                        if self._is_model_timeout(exc) else "model_error")
+                    if self._is_model_timeout(exc):
+                        limit = getattr(self.client, "timeout", timeout)
+                        reason = str(exc) or f"local model call timed out after {limit}s"
+                        self._log_round(experiment_logger, phase, round_no, "model_timeout", reason, **extra)
+                        return False, "", reason
+                    raise
+                patch = _extract_diff(output)
+                checked = time.monotonic()
+                if sampling:
+                    check = check_in_copy(patch, working_dir, timeout, allowed_paths=allowed_paths,
+                                          tests=tests, tmp_root=self.sample_tmp_root)
+                    if check.passed:
+                        # Only the winner ever reaches the real tree, checked there again.
+                        check = self._apply_real(patch, working_dir, timeout, allowed_paths, tests,
+                                                 experiment_logger, phase, round_no, extra, check)
+                else:
+                    check = self._apply_real(patch, working_dir, timeout, allowed_paths, tests,
+                                             experiment_logger, phase, round_no, extra, None)
+                check_seconds = time.monotonic() - checked
+                if isinstance(check, tuple):  # a rollback failure ends the patch rounds
+                    self._record_sample(stats, experiment_logger, phase, round_no, index, temperature, seed,
+                                        None, check_seconds, tag, outcome="rollback_failed")
+                    return check
+                self._record_sample(stats, experiment_logger, phase, round_no, index, temperature, seed,
+                                    check, check_seconds, tag)
+                if check.passed:
+                    stats.winner_index, stats.winner_temperature = index, temperature
+                    stats.winner_round, stats.winner_reason = round_no, check.decided_by
+                    self._log_round(experiment_logger, phase, round_no, "applied", "", **extra,
+                                    **({"winner_index": index, "winner_temperature": temperature}
+                                       if sampling else {}))
+                    if self.generated_tests and set(self.generated_tests).issubset(tests):
+                        self.local_attempt_passed_generated_tests = True
+                    return True, output, ""
+                previous = best
+                best = better_candidate(best, (check, index))
+                if best is not previous:
+                    best_diff = patch or output.strip()
+            assert best is not None
+            check, index = best
+            reason = check.reason
+            previous_diff = best_diff
+            self._log_round(experiment_logger, phase, round_no, check.outcome, reason, **extra,
+                            **({"best_index": index, "best_temperature": schedule[index][0],
+                                "best_failing_tests": check.failing_tests} if sampling else {}))
         if self.generated_tests and set(self.generated_tests).issubset(tests):
             # A prior subtask may already have satisfied the generated tests even
             # though this subtask exhausted its rounds for an unrelated reason
@@ -1368,6 +1673,102 @@ class LocalCodingWorker:
             self.local_attempt_passed_generated_tests = generated_test_failure is None
         return False, "", f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}"
 
+    def _apply_real(self, patch: str, working_dir: str, timeout: float, allowed_paths: set[str] | None,
+                    tests: tuple[str, ...], experiment_logger: Any | None, phase: str, round_no: int,
+                    extra: dict[str, Any], copy_check: CandidateCheck | None
+                    ) -> CandidateCheck | tuple[bool, str, str]:
+        """Apply *patch* to the real tree; a tuple is the patch rounds' final failure."""
+        try:
+            apply_and_check(patch, working_dir, timeout, allowed_paths=allowed_paths, tests=tests)
+        except _PatchRejected as exc:
+            check = check_rejection(exc, tests)
+            if copy_check is not None:
+                # Passed in the copy, not in the real tree: report it as such.
+                check.outcome = f"real_tree_{exc.outcome}"
+            return check
+        except RollbackError as exc:
+            reason = f"local model patch rollback failed in round {round_no}: {exc}"
+            self._log_round(experiment_logger, phase, round_no, "rollback_failed", reason, **extra)
+            return False, "", reason
+        except subprocess.TimeoutExpired:
+            self._log_round(experiment_logger, phase, round_no, "timed_out",
+                            "local model patch application timed out", **extra)
+            raise
+        if copy_check is not None:
+            return copy_check
+        changed_py = [p for p in patch_paths(patch) if p.endswith(".py")]
+        return CandidateCheck("applied", "", _STAGE_PASSED, 0, _decided_by(tests, changed_py))
+
+    def _record_sample(self, stats: SampleStats, experiment_logger: Any | None, phase: str,
+                       round_no: int, index: int, temperature: float, seed: int | None,
+                       check: CandidateCheck | None, check_seconds: float, tag: dict[str, Any],
+                       outcome: str | None = None) -> None:
+        call = self._last_call
+        sample = {
+            "round": round_no, "index": index, "temperature": temperature, "seed": seed,
+            "outcome": outcome or (check.outcome if check else "unknown"),
+            "applied": bool(check and check.applied), "compiled": bool(check and check.compiled),
+            "passed": bool(check and check.passed),
+            "failing_tests": check.failing_tests if check else None,
+            "decided_by": (check.decided_by or None) if check else None,
+            "wall_seconds": round(call.wall_seconds, 3) if call else 0.0,
+            "check_seconds": round(check_seconds, 3),
+            "tokens_in": call.tokens_in if call else None,
+            "tokens_out": call.tokens_out if call else None,
+            "tokens_per_second": (round(call.tokens_per_second, 3)
+                                  if call and call.tokens_per_second is not None else None),
+            **tag,
+        }
+        stats.add(sample, check)
+        if self._metrics is not None:
+            self._metrics.record_sample(sample)
+        self._log(
+            experiment_logger, phase, "local_patch_sample",
+            f"Local patch sample {index + 1}/{self.samples} (round {round_no}, T={temperature:g}): "
+            f"{sample['outcome']}",
+            warning=not sample["passed"], samples_setting=self.samples, **sample,
+        )
+
+    def _log_samples(self, experiment_logger: Any | None, phase: str, stats: SampleStats,
+                     subtask: int | None) -> None:
+        winner = ("no winner" if stats.winner_index is None else
+                  f"winner #{stats.winner_index + 1} at T={stats.winner_temperature:g} "
+                  f"in round {stats.winner_round} (by {stats.winner_reason})")
+        self._log(
+            experiment_logger, phase, "local_samples_result",
+            (f"Local samples{f' (subtask {subtask})' if subtask is not None else ''}: "
+             f"{stats.requested} requested, {stats.applied} applied, {stats.compiled} compiled, "
+             f"{stats.passed} passed; {winner}; {stats.tokens_in + stats.tokens_out} tokens, "
+             f"{stats.model_seconds + stats.check_seconds:.1f}s"),
+            warning=stats.winner_index is None,
+            **({"subtask": subtask} if subtask is not None else {}), **stats.log_fields(),
+        )
+
+    def _log_run_metrics(self, experiment_logger: Any | None, phase: str, success: bool) -> None:
+        metrics, self._metrics = self._metrics, None
+        if metrics is None:
+            return
+        try:
+            fields = metrics.finish()
+        except Exception:  # measuring must never fail the run
+            logger.debug("local run metrics failed", exc_info=True)
+            return
+        winners = [s for s in self.last_sample_stats if s.winner_index is not None]
+        fields.update(
+            samples_setting=self.samples,
+            sample_temperatures=list(self.sample_temperatures) if self.samples > 1 else [0.0],
+            samples_requested=sum(s.requested for s in self.last_sample_stats),
+            samples_applied=sum(s.applied for s in self.last_sample_stats),
+            samples_compiled=sum(s.compiled for s in self.last_sample_stats),
+            samples_passed=sum(s.passed for s in self.last_sample_stats),
+            winners=[{"index": s.winner_index, "temperature": s.winner_temperature,
+                      "round": s.winner_round, "reason": s.winner_reason} for s in winners],
+            success=success,
+        )
+        self.last_run_metrics = fields
+        self._log(experiment_logger, phase, "local_run_metrics",
+                  summary_line(fields) + f", samples N={self.samples}", **fields)
+
     @staticmethod
     def _is_model_timeout(exc: Exception) -> bool:
         return (isinstance(exc, (TimeoutError, asyncio.TimeoutError))
@@ -1376,15 +1777,19 @@ class LocalCodingWorker:
 
     def _model_call(self, prompt: str, system: str, max_tokens: int,
                     experiment_logger: Any | None, phase: str, *, call_type: str,
+                    temperature: float = 0.0, seed: int | None = None,
                     **fields: Any) -> str:
         """Call the local model and always leave a latency/outcome event."""
         started = time.monotonic()
         if hasattr(self.client, "last_timings"):
             self.client.last_timings = None
         outcome = "ok"
+        options: dict[str, Any] = {}
+        if seed is not None and _accepts_seed(self.client):
+            options["seed"] = seed
         try:
             answer = asyncio.run(self.client.complete(
-                prompt, system=system, temperature=0.0, max_tokens=max_tokens,
+                prompt, system=system, temperature=temperature, max_tokens=max_tokens, **options,
             ))
             return answer
         except BaseException as exc:
@@ -1394,6 +1799,10 @@ class LocalCodingWorker:
         finally:
             wall_seconds = time.monotonic() - started
             timings = getattr(self.client, "last_timings", None)
+            self._last_call = call_record(call_type, outcome, wall_seconds, timings,
+                                          fields.get("prompt_tokens"), temperature=temperature, seed=seed)
+            if self._metrics is not None:
+                self._metrics.record_call(self._last_call)
             if outcome == "ok":
                 self.rates.record(timings)  # never raises
             elif outcome == "timeout" and not timings:
@@ -1431,7 +1840,9 @@ class LocalCodingWorker:
                 prompt_tokens_cached=prompt_cached,
                 prompt_tokens_total=prompt_total,
                 prompt_cache_ratio=cache_ratio,
-                max_tokens=max_tokens, **fields,
+                max_tokens=max_tokens,
+                **({"temperature": temperature, "seed": seed} if "sample" in fields else {}),
+                **fields,
             )
 
     def _log_round(self, experiment_logger: Any | None, phase: str, round_no: int, outcome: str,
@@ -1466,6 +1877,15 @@ class LocalCodingWorker:
             final_message=stdout or None, usage=None, task=task, working_dir=working_dir,
             sandbox="workspace-write", error=error, provider=PROVIDER,
         )
+
+
+def _accepts_seed(client: Any) -> bool:
+    """Whether ``client.complete`` takes a ``seed`` (llama-server does; test doubles may not)."""
+    try:
+        parameters = inspect.signature(client.complete).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return "seed" in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
 
 
 def is_context_too_small(error: str | None) -> bool:
