@@ -27,6 +27,12 @@ class ReviewerTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.db = str(Path(tmp.name) / "agent.db")
         self.calls = []
+        # The diff is the checkout's own HEAD; its text must not leak into prompt assertions.
+        from unittest import mock
+        import modules.nexus_reviewer as nexus_reviewer
+        patcher = mock.patch.object(nexus_reviewer, "_diff", return_value="diff --git a/x b/x")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _runner(self, name, answer=APPROVE, fail=False):
         def run(prompt, worktree):

@@ -154,7 +154,9 @@ def _open_part_issue(repo_root: str, title: str, body: str) -> int | None:
 
 
 def _close_issue(repo_root: str, number: int, text: str) -> None:
-    _gh(repo_root, ["issue", "close", str(number), "--comment", text])
+    # The VM's gh has no `issue close --comment`: comment first, then close.
+    _gh(repo_root, ["issue", "comment", str(number), "--body", text])
+    _gh(repo_root, ["issue", "close", str(number)])
     _events.append(f"Closed split issue #{number}: {text}")
 
 
