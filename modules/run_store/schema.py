@@ -971,3 +971,18 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # #639: what the local run cost and how best-of-N sampled, so variants
+    # (e.g. samples1 vs samples4) can be weighed on evidence.
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(local_replays)")}
+    for column, ddl in (
+        ("samples", "INTEGER NOT NULL DEFAULT 1"),
+        ("samples_requested", "INTEGER NULL"),
+        ("samples_passed", "INTEGER NULL"),
+        ("cpu_seconds", "REAL NULL"),
+        ("load_average", "REAL NULL"),
+        ("peak_rss_kb", "INTEGER NULL"),
+        ("tokens_per_second", "REAL NULL"),
+        ("metrics_json", "TEXT NULL"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE local_replays ADD COLUMN {column} {ddl}")

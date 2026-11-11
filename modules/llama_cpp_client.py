@@ -159,8 +159,13 @@ class LlamaCppClient:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         response_format: dict[str, Any] | None = None,
+        seed: int | None = None,
     ) -> str:
-        """Convenience wrapper that returns the assistant's reply as a string."""
+        """Convenience wrapper that returns the assistant's reply as a string.
+
+        *seed* is sent as llama-server's ``seed`` sampling option (#639) only
+        when given, so default requests are unchanged.
+        """
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -169,6 +174,8 @@ class LlamaCppClient:
         completion_options: dict[str, Any] = {}
         if response_format is not None:
             completion_options["response_format"] = response_format
+        if seed is not None:
+            completion_options["seed"] = int(seed)
         data = await self.chat_completion(
             messages,
             temperature=temperature,

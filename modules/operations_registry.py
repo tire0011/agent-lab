@@ -600,7 +600,26 @@ class OperationsRegistry:
             if tail:
                 lines.append("test_failure_tail:")
                 lines.extend(f"  {line}" for line in tail)
+        lines.extend(self._local_run_lines(experiment.id))
         return OperationResult("experiment_show", True, lines, 0)
+
+    _LOCAL_RUN_EVENTS = ("local_run_metrics", "local_samples_result")
+
+    def _local_run_lines(self, experiment_id: str) -> list[str]:
+        """The last local coding run's cost and best-of-N outcome (#639), if any."""
+        try:
+            path = self.experiment_service.experiment_log_path(experiment_id)
+            entries = central_logging_module.read_log_entries(path, tail_bytes=4_000_000)
+        except Exception:  # an unreadable log only hides this optional section
+            return []
+        local = [e for e in entries if e.get("event") in self._LOCAL_RUN_EVENTS]
+        last_run = max((i for i, e in enumerate(local) if e.get("event") == "local_run_metrics"), default=None)
+        if last_run is None:
+            return []
+        start = max((i for i, e in enumerate(local[:last_run]) if e.get("event") == "local_run_metrics"),
+                    default=-1) + 1
+        shown = [local[last_run]] + local[start:last_run][-6:]
+        return ["local_run:"] + [f"  {redact(str(e.get('message', '')))[:500]}" for e in shown]
 
     def _op_experiment_logs(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)
@@ -665,6 +684,11 @@ class OperationsRegistry:
                 + f", all tests passed in {stats['full_passes']}/{stats['scored']}"
                 + (f" ({full:.0%})" if full is not None else "")
                 + f", no tests {stats['no_tests']}, errors {stats['errors']}"
+                + f", samples N={'/'.join(str(n) for n in stats.get('samples') or [1])}"
+                + (f", median {stats['median_seconds']:.0f}s/task" if stats.get("median_seconds") is not None else "")
+                + (f", median llama CPU {stats['median_cpu_seconds']:.0f}s"
+                   if stats.get("median_cpu_seconds") is not None else "")
+                + (f", peak RSS {stats['peak_rss_kb'] / 1024:.0f} MiB" if stats.get("peak_rss_kb") is not None else "")
             )
         if summary["common"]:
             lines.append(f"on the {summary['common_experiments']} experiments scored under every variant:")
@@ -672,6 +696,8 @@ class OperationsRegistry:
                 lines.append(
                     f"  {stats['prompt_variant']}: tests {stats['tests_passed']}/{stats['tests_total']}, "
                     f"all passed {stats['full_passes']}/{stats['scored']}"
+                    + (f", median {stats['median_seconds']:.0f}s/task"
+                       if stats.get("median_seconds") is not None else "")
                 )
         for row in list_replays(limit, db_path=self.db_path):
             line = (
@@ -681,6 +707,15 @@ class OperationsRegistry:
                 f"{'applied' if row['patch_applied'] else 'none'}, rounds {row['rounds']}, "
                 f"{row['seconds']:.0f}s"
             )
+            if int(row.get("samples") or 1) > 1 or row.get("samples_requested") is not None:
+                line += (f", samples N={int(row.get('samples') or 1)} "
+                         f"({row.get('samples_requested') or 0} drawn, {row.get('samples_passed') or 0} passed)")
+            if row.get("cpu_seconds") is not None:
+                line += f", llama CPU {row['cpu_seconds']:.0f}s"
+            if row.get("peak_rss_kb") is not None:
+                line += f", peak RSS {row['peak_rss_kb'] / 1024:.0f} MiB"
+            if row.get("tokens_per_second") is not None:
+                line += f", {row['tokens_per_second']:.1f} tok/s"
             if row.get("error"):
                 line += f" | {sanitized_reason(str(row['error']))}"
             lines.append(redact(line)[:500])
