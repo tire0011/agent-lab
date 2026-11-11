@@ -83,3 +83,8 @@ _UNREACHABLE_LOCAL_MODEL_URL = "http://127.0.0.1:9"
 os.environ["LOCAL_MODEL_URL"] = _UNREACHABLE_LOCAL_MODEL_URL
 os.environ["LLAMA_CPP_BASE_URL"] = _UNREACHABLE_LOCAL_MODEL_URL
 os.environ["LLAMA_API_URL"] = _UNREACHABLE_LOCAL_MODEL_URL
+
+# Measured local-model throughput (#642) sizes the local worker's prompts. A
+# suite run must neither read the VM's real measurements (results would then
+# depend on the host) nor write fake ones into them. Assigned, not setdefault.
+os.environ["LOCAL_MODEL_RATES_PATH"] = str(Path(_LOG_DIR) / "local-model-rates.json")

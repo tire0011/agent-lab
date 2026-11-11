@@ -110,8 +110,10 @@ class LlamaCppClient:
                 max(1, len(str(message.get("content", "")).encode("utf-8")) // 3)
                 for message in messages
             )
+            limit = (f"{self.timeout:g}" if isinstance(self.timeout, (int, float))
+                     else str(self.timeout))
             raise LlamaCppClientError(
-                f"local model call timed out after {self.timeout:g}s "
+                f"local model call timed out after {limit}s "
                 f"(prompt ~{prompt_tokens} tokens, max_tokens {max_tokens})"
             ) from exc
 

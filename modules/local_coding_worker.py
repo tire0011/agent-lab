@@ -80,6 +80,13 @@ _CUT_MARKER = "\n...[handover cut to fit the local model's context]"
 _DIFF_CUT_MARKER = "\n...[previous diff cut to fit the local model's context]"
 _ERROR_CUT_MARKER = "\n...[error cut]"
 MAX_PATCH_ROUNDS = 3
+# #642: a local call should finish within this share of the client timeout.
+TIME_BUDGET_FRACTION = 0.8
+# At most this share of that time is reserved for generation, so a slow
+# generation rate or a large max_tokens can never leave the prompt nothing.
+MAX_GENERATION_TIME_SHARE = 0.5
+# Never ask a time-fitted call for fewer output tokens than this.
+MIN_OUTPUT_TOKENS = 256
 FEEDBACK_ERROR_CHARS = 1500
 # Where the handover ends inside the experiment prompt templates
 # (modules/experiment_service/prompts.py).
@@ -261,6 +268,9 @@ class PromptPlan:
     handover_cut: bool = False
     time_budget_tokens: int | None = None
     time_budget_limited: bool = False
+    time_budget_exceeded: bool = False
+    # max_tokens for the model calls on this prompt; the time budget may lower it.
+    output_tokens: int = 0
     # Parts of the fitted prompt, kept for the correction rounds (#597).
     essential: str = field(default="", repr=False)
     files_text: str = field(default="", repr=False)
@@ -276,7 +286,41 @@ class PromptPlan:
             "handover_cut": self.handover_cut,
             "time_budget_tokens": self.time_budget_tokens,
             "time_budget_limited": self.time_budget_limited,
+            "time_budget_exceeded": self.time_budget_exceeded,
+            "output_tokens": self.output_tokens,
         }
+
+
+@dataclass(frozen=True)
+class TimeBudget:
+    """What one local call can afford within ``TIME_BUDGET_FRACTION`` of the timeout."""
+
+    prompt_tokens: int
+    output_tokens: int
+    seconds: float
+
+
+def time_budget(timeout: Any, max_output_tokens: int,
+                rates: tuple[float | None, float | None]) -> TimeBudget | None:
+    """The prompt/output allowance from measured rates; ``None`` without both rates.
+
+    The generation reservation is capped at ``MAX_GENERATION_TIME_SHARE`` of the
+    time, and ``output_tokens`` is lowered to what that reservation can produce.
+    A slow generation rate therefore shortens the answer instead of zeroing the
+    prompt budget (the bug that blocked experiment 689600ce).
+    """
+    prompt_rate, generation_rate = rates
+    if not (isinstance(timeout, (int, float)) and math.isfinite(timeout) and timeout > 0):
+        return None
+    if not all(isinstance(r, (int, float)) and math.isfinite(r) and r > 0
+               for r in (prompt_rate, generation_rate)):
+        return None
+    seconds = float(timeout) * TIME_BUDGET_FRACTION
+    generation_seconds = min(max_output_tokens / generation_rate, seconds * MAX_GENERATION_TIME_SHARE)
+    output_tokens = min(max_output_tokens,
+                        max(MIN_OUTPUT_TOKENS, int(generation_seconds * generation_rate)))
+    prompt_tokens = max(0, int((seconds - generation_seconds) * prompt_rate))
+    return TimeBudget(prompt_tokens=prompt_tokens, output_tokens=output_tokens, seconds=seconds)
 
 
 async def _cut_to(text: str, limit: int, count: TokenCounter, marker: str = _CUT_MARKER) -> str:
@@ -331,14 +375,17 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
                              rates: tuple[float | None, float | None] = (None, None)) -> PromptPlan:
     """:func:`build_prompt` for an already split task and an already known ``n_ctx``."""
     count = counter or TokenCounter(client)
+    # n_ctx is a hard limit; the time budget (#642) is a soft one. It cuts the
+    # handover first, then the files, but never refuses the call: if even the
+    # minimal prompt is over it, the minimal prompt is sent anyway
+    # (``time_budget_exceeded``). Refusing would stop the worker from ever
+    # making the call that measures a better rate - it could never recover.
     context_budget = n_ctx - max_output_tokens - margin_tokens
-    prompt_rate, generation_rate = rates
-    time_budget_tokens: int | None = None
-    timeout = getattr(client, "timeout", None)
-    if prompt_rate and generation_rate and isinstance(timeout, (int, float)) and timeout > 0:
-        seconds_for_prompt = timeout * 0.8 - max_output_tokens / generation_rate
-        time_budget_tokens = max(0, int(seconds_for_prompt * prompt_rate))
-    budget = min(context_budget, time_budget_tokens) if time_budget_tokens is not None else context_budget
+    allowance = time_budget(getattr(client, "timeout", None), max_output_tokens, rates)
+    time_budget_tokens = allowance.prompt_tokens if allowance else None
+    output_tokens = allowance.output_tokens if allowance else max_output_tokens
+    budget = context_budget if time_budget_tokens is None else min(context_budget, time_budget_tokens)
+    exceeded = False
     files = _named_files(essential, working_dir)
     keywords = _keywords(essential)
     names = [path for path, _ in files]
@@ -347,23 +394,18 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         return await count(_SYSTEM_PROMPT) + await count(prompt)
 
     def too_small(detail: str, tokens: int) -> ContextTooSmallError:
-        limiting = (
-            f"the 80% time budget leaves {budget} prompt tokens "
-            f"(estimated from {prompt_rate:g} prompt tokens/s and "
-            f"{generation_rate:g} generation tokens/s)"
-            if time_budget_tokens is not None and time_budget_tokens < context_budget
-            else f"n_ctx {n_ctx} ({n_ctx_source}) leaves {budget} for the prompt"
-        )
         return ContextTooSmallError(
-            f"{CONTEXT_TOO_SMALL}: {detail} need {tokens} tokens, but {limiting} "
-            f"after {max_output_tokens} output and {margin_tokens} "
+            f"{CONTEXT_TOO_SMALL}: {detail} need {tokens} tokens, but n_ctx {n_ctx} ({n_ctx_source}) "
+            f"leaves {context_budget} for the prompt after {max_output_tokens} output and {margin_tokens} "
             "margin tokens; the local model was not called"
         )
 
     # 1. Instructions and goal - never cut.
     base_tokens = await total(_render_prompt(essential, "", ""))
-    if base_tokens > budget:
+    if base_tokens > context_budget:
         raise too_small("the instructions and the goal", base_tokens)
+    if base_tokens > budget:
+        budget, exceeded = base_tokens, True
 
     # 2. Named files, from whole to the essential excerpt.
     files_text = ""
@@ -375,10 +417,12 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
             if with_files <= budget:
                 break
         else:
-            raise too_small(
-                f"the instructions, the goal and the relevant parts of {', '.join(names)}",
-                with_files,
-            )
+            if with_files > context_budget:
+                raise too_small(
+                    f"the instructions, the goal and the relevant parts of {', '.join(names)}",
+                    with_files,
+                )
+            budget, exceeded = with_files, True  # smallest file level, over the time budget
 
     # 3. The handover, cut from the end, re-checked on the rendered prompt.
     kept = await _fit_part(
@@ -388,14 +432,22 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     prompt = _render_prompt(essential, files_text, kept)
     prompt_tokens = await total(prompt)
     if prompt_tokens > budget:  # only reachable if the counter is not additive at all
-        raise too_small("the rendered prompt", prompt_tokens)
+        if prompt_tokens > context_budget:
+            raise too_small("the rendered prompt", prompt_tokens)
+        exceeded = True
+    handover_cut = bool(handover) and kept != handover
+    # The full prompt is over the time budget: the time budget cut something
+    # (it is the tighter limit) or the minimal prompt is already over it.
+    limited = time_budget_tokens is not None and (
+        exceeded or (time_budget_tokens < context_budget and (handover_cut or level_used > 0))
+    )
     return PromptPlan(
         prompt=prompt, n_ctx=n_ctx, n_ctx_source=n_ctx_source, budget_tokens=budget,
         prompt_tokens=prompt_tokens, token_source=count.source, named_files=names,
         file_level=level_used, handover_tokens_kept=await count(kept) if kept else 0,
-        handover_cut=bool(handover) and kept != handover,
-        time_budget_tokens=time_budget_tokens,
-        time_budget_limited=time_budget_tokens is not None and time_budget_tokens < context_budget,
+        handover_cut=handover_cut,
+        time_budget_tokens=time_budget_tokens, time_budget_limited=limited,
+        time_budget_exceeded=exceeded, output_tokens=output_tokens,
         essential=essential, files_text=files_text, handover=handover, counter=count,
     )
 
@@ -922,7 +974,8 @@ class LocalCodingWorker:
         # The one free-tier fallback call when the local split is unusable.
         self.planner = planner or free_tier_plan
         self.test_first = test_first
-        self.rates = LocalModelRates(rates_path)
+        # Measured per model, so a smaller or quantized model starts fresh (#642).
+        self.rates = LocalModelRates(rates_path, model=getattr(self.client, "model", None))
         self.last_plan: PromptPlan | None = None
         self.last_split: SplitOutcome | None = None
         self.generated_tests: tuple[str, ...] = ()
@@ -1003,11 +1056,15 @@ class LocalCodingWorker:
             )
             if self.split_tasks:
                 if plan.time_budget_limited:
-                    self.last_split.reason = "planning skipped: prompt is constrained by the local time budget"
+                    # #642: the prompt is over the time budget, so the one call
+                    # we can afford goes to the patch, not to planning.
+                    self.last_split.reason = "planning skipped: prompt is over the local time budget"
                     self._log(
                         experiment_logger, phase, "local_task_split",
                         "Task planning skipped to reserve the affordable model call for the patch",
-                        time_budget_tokens=plan.time_budget_tokens, skipped=True,
+                        warning=True, **self.last_split.log_fields(),
+                        time_budget_tokens=plan.time_budget_tokens,
+                        time_budget_exceeded=plan.time_budget_exceeded, skipped=True,
                     )
                     split = self.last_split
                 else:
@@ -1025,7 +1082,9 @@ class LocalCodingWorker:
             return self._result(task, working_dir, "", "local model patch application timed out", started,
                                 success=False, exit_code=None, timed_out=True)
         except Exception as exc:  # worker failures are represented, never leaked into the pipeline
-            return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
+            # An httpx timeout stringifies to "" - never record an empty error (#642).
+            error = str(exc).strip() or f"{type(exc).__name__} (no message)"
+            return self._result(task, working_dir, "", error, started, success=False, exit_code=1)
 
     # Splitting (#598)
 
@@ -1040,7 +1099,7 @@ class LocalCodingWorker:
         try:
             prompt = asyncio.run(self._local_plan_prompt(plan))
             answer = self._model_call(
-                prompt, _PLAN_SYSTEM_PROMPT, min(self.max_tokens, PLAN_MAX_TOKENS),
+                prompt, _PLAN_SYSTEM_PROMPT, min(plan.output_tokens or self.max_tokens, PLAN_MAX_TOKENS),
                 experiment_logger, phase, call_type="plan",
             )
             subtasks = parse_plan(answer, working_dir)
@@ -1213,7 +1272,7 @@ class LocalCodingWorker:
                          **tag}
             try:
                 output = self._model_call(
-                    prompt, _SYSTEM_PROMPT, self.max_tokens, experiment_logger, phase,
+                    prompt, _SYSTEM_PROMPT, plan.output_tokens or self.max_tokens, experiment_logger, phase,
                     call_type="patch", round=round_no, **tag,
                 )
             except Exception as exc:
@@ -1282,7 +1341,7 @@ class LocalCodingWorker:
             wall_seconds = time.monotonic() - started
             timings = getattr(self.client, "last_timings", None)
             if outcome == "ok":
-                self.rates.record(timings)
+                self.rates.record(timings)  # never raises
             prompt_rate, generation_rate = self.rates.medians()
             self._log(
                 experiment_logger, phase, "local_model_call",
