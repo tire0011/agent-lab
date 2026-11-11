@@ -15,7 +15,8 @@ EARLIER_ATTEMPTS_HEADING = "Earlier attempts at this issue (do not repeat their 
 # After a review block the findings are the task. A controller goal once
 # replaced them with one small fix, and the retry was blocked again (#489).
 REVIEW_FIX_REQUIRED = (
-    "REQUIRED IN THIS ATTEMPT: the last review blocked the merge. Fix EVERY "
+    "REQUIRED IN THIS ATTEMPT: the last review blocked the merge. Start a "
+    "new_experiment (the blocked one is finished and cannot be resumed) and fix EVERY "
     "blocking problem it lists above, with the tests it asks for. That is the "
     "task of this attempt; a narrower goal anywhere below, including a "
     "'Nexus goal', does not replace it. Then check that your fix adds no new "
