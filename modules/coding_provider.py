@@ -23,7 +23,9 @@ from modules.claude_worker import PROVIDER as PROVIDER_CLAUDE
 from modules.claude_worker import _default_claude_bin
 from modules.codex_worker import _DEFAULT_CODEX_BIN, CodexWorker
 from modules.codex_worker import PROVIDER as PROVIDER_CODEX
-from modules.local_coding_worker import LocalCodingWorker, PROVIDER as PROVIDER_LOCAL, task_split_enabled
+from modules.local_coding_worker import (
+    LocalCodingWorker, PROVIDER as PROVIDER_LOCAL, task_split_enabled, test_first_enabled,
+)
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger("modules.coding_provider")
@@ -210,6 +212,7 @@ def build_worker(provider: str, *, db_path: str | None = None, **kwargs: Any) ->
     if provider == PROVIDER_LOCAL:
         # #598: split into small subtasks first unless LOCAL_TASK_SPLIT turns it off.
         kwargs.setdefault("split_tasks", task_split_enabled())
+        kwargs.setdefault("test_first", test_first_enabled())
         return LocalCodingWorker(**kwargs)
     raise UnknownProviderError(
         f"unknown coding provider {provider!r}; known: {KNOWN_PROVIDERS}"

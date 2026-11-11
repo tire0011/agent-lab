@@ -123,6 +123,26 @@ class Issue551LocalCodingTests(unittest.TestCase):
         self.assertEqual("local", result.implementation_provider)
         self.assertIn("patch does not apply", result.error or "")
 
+    def test_failed_generated_acceptance_tests_trigger_paid_fallback(self):
+        class GeneratedFailure(_Worker):
+            generated_tests = ("tests.test_generated.T.test_value",)
+            local_attempt_passed_generated_tests = False
+
+            def run(self, **kwargs):
+                self.calls.append(self.provider)
+                return WorkerResult(False, 1, "", "generated tests still fail", 1,
+                                    False, False, False, None, None, None,
+                                    kwargs["task"], kwargs["working_dir"], kwargs["sandbox"],
+                                    None, self.provider)
+
+        self.service.local_worker_factory = lambda _p: GeneratedFailure("local", self.calls)
+        exp = self.service.create_experiment(
+            "change value", complexity="small", source_type="issue", source_id="635-fallback"
+        )
+        result = self.service.run_experiment(exp.id)
+        self.assertEqual(["local", "codex"], self.calls)
+        self.assertEqual("codex", result.implementation_provider)
+
 
 if __name__ == "__main__":
     unittest.main()

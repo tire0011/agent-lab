@@ -296,19 +296,30 @@ class ImplementationMixin:
 
         if (
             implementation_provider == "local"
-            and is_context_too_small(implementation_result.error)
+            and (
+                is_context_too_small(implementation_result.error)
+                or getattr(worker, "local_attempt_passed_generated_tests", None) is False
+            )
             and self.get_experiment(experiment_id).status != STATUS_CANCELLED
         ):
-            # The local model was not called: its context cannot hold the goal and the
-            # files it names (#569). Hand over to an external agent now, not next time.
+            # Context exhaustion means the local model was never called. Test-first
+            # exhaustion means all bounded local correction rounds still failed the
+            # generated acceptance checks. Both are explicit same-run handoff cases.
+            generated_test_failure = getattr(worker, "local_attempt_passed_generated_tests", None) is False
+            fallback_reason = "generated_tests_failed" if generated_test_failure else "context_too_small"
+            generated_test_count = len(getattr(worker, "generated_tests", ()))
             worker = self.worker_factory(worktree_path)
             implementation_provider = provider_of(worker)
             elog.warning(
                 "implementation", "implementation_provider_fallback",
-                f"local model context too small; implementation runs on "
+                f"local attempt requires paid fallback; implementation runs on "
                 f"{implementation_provider or 'unknown'}: {implementation_result.error}",
                 provider=implementation_provider or "",
-                reason="context_too_small",
+                reason=fallback_reason,
+                tests_generated=generated_test_count,
+                tests_failing_on_base=generated_test_count,
+                local_attempt_passed_generated_tests=False if generated_test_failure else None,
+                paid_fallback_used=True,
             )
             self._force_status(
                 experiment_id, STATUS_IMPLEMENTING,

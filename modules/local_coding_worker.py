@@ -57,6 +57,7 @@ from typing import Any, Awaitable, Callable
 from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
 from modules.llama_cpp_client import LlamaCppClient
+from modules.local_test_first import generate_failing_tests
 
 logger = logging.getLogger(__name__)
 
@@ -462,6 +463,7 @@ class SplitOutcome:
 
 
 ENV_TASK_SPLIT = "LOCAL_TASK_SPLIT"
+ENV_TEST_FIRST = "LOCAL_TEST_FIRST"
 MAX_SUBTASKS = 6
 MAX_SUBTASK_FILES = 2
 MAX_SUBTASK_TESTS = 3
@@ -486,6 +488,11 @@ _FREE_TIER_HANDOVER_CHARS = 6000
 def task_split_enabled() -> bool:
     """``LOCAL_TASK_SPLIT`` (default on); ``0``/``false``/``off`` runs one-shot."""
     return os.environ.get(ENV_TASK_SPLIT, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def test_first_enabled() -> bool:
+    """``LOCAL_TEST_FIRST`` (default off); explicit truthy values enable it."""
+    return os.environ.get(ENV_TEST_FIRST, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _render_plan_prompt(essential: str, names: list[str], handover: str) -> str:
@@ -757,7 +764,9 @@ def run_named_tests(working_dir: str, tests: list[str] | tuple[str, ...], timeou
     if not tests:
         return None
     root = Path(working_dir).resolve()
-    for test in tests:
+    pytest_tests = [test for test in tests if "::" in test or test.endswith(".py")]
+    unittest_tests = [test for test in tests if test not in pytest_tests]
+    for test in pytest_tests:
         path = test.split("::", 1)[0]
         full = _inside(root, path)
         if full is None or not full.is_file():
@@ -765,16 +774,31 @@ def run_named_tests(working_dir: str, tests: list[str] | tuple[str, ...], timeou
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     limit = min(timeout, NAMED_TEST_TIMEOUT_SECONDS)
     try:
-        done = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests],
-            cwd=working_dir, env=env, text=True, capture_output=True, timeout=limit,
-        )
+        commands = []
+        if pytest_tests:
+            commands.append([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *pytest_tests])
+        if unittest_tests:
+            commands.append([sys.executable, "-B", "-m", "unittest", "-q", *unittest_tests])
+        results = [subprocess.run(command, cwd=working_dir, env=env, text=True,
+                                  capture_output=True, timeout=limit) for command in commands]
     except subprocess.TimeoutExpired:
         return f"named tests timed out after {limit:g}s: {', '.join(tests)}"
-    if done.returncode == 0:
+    failed = next((done for done in results if done.returncode != 0), None)
+    if failed is None:
         return None
-    output = (done.stdout + "\n" + done.stderr).strip()
-    return f"pytest exited {done.returncode}:\n{output[-FEEDBACK_ERROR_CHARS:]}"
+    output = (failed.stdout + "\n" + failed.stderr).strip()
+    return f"named test runner exited {failed.returncode}:\n{output[-FEEDBACK_ERROR_CHARS:]}"
+
+
+def _generated_test_path(test_ids: list[str], working_dir: str) -> Path | None:
+    """Recover the generated module path from ``module.Class.method`` IDs."""
+    if not test_ids:
+        return None
+    module = test_ids[0].rsplit(".", 2)[0]
+    if not module or any(test.rsplit(".", 2)[0] != module for test in test_ids):
+        return None
+    root = Path(working_dir).resolve()
+    return _inside(root, module.replace(".", "/") + ".py")
 
 
 def apply_and_check(patch: str, working_dir: str, timeout: float, *,
@@ -827,6 +851,7 @@ class LocalCodingWorker:
 
     def __init__(self, *, client: LlamaCppClient | None = None, max_tokens: int = 4096,
                  split_tasks: bool = False, planner: Callable[[str], Any] | None = None,
+                 test_first: bool = False,
                  **_: Any) -> None:
         self.client = client or LlamaCppClient()
         self.max_tokens = max_tokens
@@ -835,14 +860,19 @@ class LocalCodingWorker:
         self.split_tasks = split_tasks
         # The one free-tier fallback call when the local split is unusable.
         self.planner = planner or free_tier_plan
+        self.test_first = test_first
         self.last_plan: PromptPlan | None = None
         self.last_split: SplitOutcome | None = None
+        self.generated_tests: tuple[str, ...] = ()
+        self.local_attempt_passed_generated_tests: bool | None = None
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
             phase: str = "implementation", **_: Any) -> WorkerResult:
         started = time.monotonic()
         self.last_plan = None
+        self.generated_tests = ()
+        self.local_attempt_passed_generated_tests = None
         # Replaced by _plan_subtasks when splitting is on and the task reaches planning.
         self.last_split = SplitOutcome(
             reason="not planned" if self.split_tasks else f"splitting is off ({ENV_TASK_SPLIT})",
@@ -852,6 +882,20 @@ class LocalCodingWorker:
             result = self._run(task, working_dir, sandbox, timeout_seconds, experiment_logger, phase, started)
             return result
         finally:
+            if self.test_first:
+                self._log(
+                    experiment_logger, phase, "local_test_first_result",
+                    ("Local attempt passed generated tests"
+                     if self.local_attempt_passed_generated_tests is True
+                     else "Local attempt did not pass generated tests"
+                     if self.local_attempt_passed_generated_tests is False
+                     else "No generated acceptance tests were retained"),
+                    warning=self.local_attempt_passed_generated_tests is False,
+                    tests_generated=len(self.generated_tests),
+                    tests_failing_on_base=len(self.generated_tests),
+                    local_attempt_passed_generated_tests=self.local_attempt_passed_generated_tests,
+                    paid_fallback_used=False,
+                )
             # One record per run, split or not, so split vs. one-shot success can be compared.
             split = self.last_split
             success = bool(result and result.success)
@@ -867,6 +911,20 @@ class LocalCodingWorker:
              experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
         try:
             validate_worker_config(task, working_dir, sandbox)
+            if self.test_first:
+                ids, content = generate_failing_tests(task, working_dir, self.client)
+                target = _generated_test_path(ids, working_dir)
+                if ids and content and target is not None and not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+                    self.generated_tests = tuple(ids)
+                self._log(
+                    experiment_logger, phase, "local_test_first_generated",
+                    f"Generated {len(self.generated_tests)} failing acceptance test(s)",
+                    tests_generated=len(ids), tests_failing_on_base=len(self.generated_tests),
+                    local_attempt_passed_generated_tests=None, paid_fallback_used=False,
+                    tests=list(self.generated_tests),
+                )
             try:
                 # n_ctx is read once here and holds for this whole run.
                 plan = asyncio.run(build_prompt(task, working_dir, self.client,
@@ -884,10 +942,14 @@ class LocalCodingWorker:
             if self.split_tasks:
                 split = self._plan_subtasks(plan, working_dir, experiment_logger, phase)
                 if split.split:
+                    split.subtasks = [Subtask(s.goal, s.files,
+                                              tuple(dict.fromkeys((*s.tests, *self.generated_tests))))
+                                      for s in split.subtasks]
                     return self._run_subtasks(split, plan, task, working_dir, timeout_seconds,
                                               experiment_logger, phase, started)
             return self._correction_loop(plan, task, working_dir, timeout_seconds,
-                                         experiment_logger, phase, started)
+                                         experiment_logger, phase, started,
+                                         tests=self.generated_tests)
         except subprocess.TimeoutExpired:
             return self._result(task, working_dir, "", "local model patch application timed out", started,
                                 success=False, exit_code=None, timed_out=True)
@@ -1051,8 +1113,10 @@ class LocalCodingWorker:
     # The correction loop (#597)
 
     def _correction_loop(self, plan: PromptPlan, task: str, working_dir: str, timeout: float,
-                         experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
-        ok, output, reason = self._patch_rounds(plan, working_dir, timeout, experiment_logger, phase)
+                         experiment_logger: Any | None, phase: str, started: float,
+                         tests: tuple[str, ...] = ()) -> WorkerResult:
+        ok, output, reason = self._patch_rounds(plan, working_dir, timeout, experiment_logger, phase,
+                                                tests=tests)
         if ok:
             return self._result(task, working_dir, output, None, started, success=True, exit_code=0)
         return self._result(task, working_dir, "", reason, started, success=False, exit_code=1)
@@ -1095,7 +1159,11 @@ class LocalCodingWorker:
                                 "local model patch application timed out", **extra)
                 raise
             self._log_round(experiment_logger, phase, round_no, "applied", "", **extra)
+            if self.generated_tests and set(self.generated_tests).issubset(tests):
+                self.local_attempt_passed_generated_tests = True
             return True, output, ""
+        if self.generated_tests and set(self.generated_tests).issubset(tests):
+            self.local_attempt_passed_generated_tests = False
         return False, "", f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}"
 
     def _log_round(self, experiment_logger: Any | None, phase: str, round_no: int, outcome: str,
