@@ -64,7 +64,7 @@ class _Server:
         return -(-len(text.encode()) // 4)
 
     async def complete(self, prompt: str, *, system: str = "", **_kw) -> str:
-        if system == _PLAN_SYSTEM_PROMPT:
+        if "Split the coding task below" in prompt:
             self.plan_calls.append(prompt)
             return self.plan
         self.patch_calls.append(prompt)
@@ -156,9 +156,11 @@ class Issue598SubtaskTests(unittest.TestCase):
         self.assertIn("Change original to step1", first)
         self.assertIn("Subtask 2 of 2", second)
         self.assertIn("-original\n+step1", second)  # the diff of subtask 1
-        # The byte-identical base snapshot stays cacheable; the applied change
-        # is carried in the changing tail instead.
+        # The byte-identical base snapshot stays cacheable, while the changing
+        # tail also carries the fresh tree state needed for applicable hunks.
         self.assertIn("--- value.txt ---\noriginal", second)
+        self.assertIn("Current files for this subtask", second)
+        self.assertIn("--- value.txt ---\nstep1", second)
         split = log.last("local_task_split")
         self.assertEqual((True, "local", 2), (split["split"], split["planner"], split["subtasks"]))
         done = log.last("local_task_split_result")
@@ -173,10 +175,19 @@ class Issue598SubtaskTests(unittest.TestCase):
         _worker, result, _log = self._run(server)
         self.assertTrue(result.success, result.error)
         first, second = server.patch_calls
-        marker = "\n\nGoal and instructions:\n"
+        marker = "\n\nCurrent files for this subtask"
         self.assertEqual(first.split(marker, 1)[0], second.split(marker, 1)[0])
         self.assertIn("Subtask 1 of 2", first.split(marker, 1)[1])
         self.assertIn("Subtask 2 of 2", second.split(marker, 1)[1])
+
+    def test_plan_and_patch_share_system_and_repository_prefix(self):
+        server = _Server(_TWO_STEPS, [_STEP1, _STEP2])
+        _worker, result, _log = self._run(server)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(_PLAN_SYSTEM_PROMPT, local_coding_worker._SYSTEM_PROMPT)
+        marker = "\n\nCurrent files for this subtask"
+        self.assertEqual(server.plan_calls[0].split("\n\nSplit the coding task below", 1)[0],
+                         server.patch_calls[0].split(marker, 1)[0])
 
     def test_failing_subtask_2_is_reported_and_subtask_1_is_no_success(self):
         server = _Server(_TWO_STEPS, [_STEP1, "no diff here", _STEP1, "still nothing"])

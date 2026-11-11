@@ -143,7 +143,10 @@ class LlamaCppClient:
             for source in (data, timings):
                 if not isinstance(source, dict):
                     continue
-                for name in ("tokens_cached", "n_past", "cache_n"):
+                # ``n_past`` is the slot state after the request on current
+                # llama-server versions.  It can include both the prompt and
+                # generated tokens, so it is not evidence of prefix reuse.
+                for name in ("tokens_cached", "cache_n"):
                     value = source.get(name)
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         self.last_timings["tokens_cached"] = value

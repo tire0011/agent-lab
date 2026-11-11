@@ -132,6 +132,52 @@ async def test_chat_completion_success():
     assert result == response_data
 
 
+def test_chat_completion_requests_slot_cache_and_extracts_reused_tokens(monkeypatch):
+    monkeypatch.setenv("LLAMA_CPP_SLOT", "7")
+    response_data = {
+        "choices": [{"message": {"content": "ok"}}],
+        "timings": {"prompt_n": 30, "cache_n": 70, "prompt_ms": 2.0},
+        "n_past": 999,
+    }
+    response = MagicMock(status_code=200)
+    response.json.return_value = response_data
+    with patch("modules.llama_cpp_client.httpx.AsyncClient") as cls:
+        http = AsyncMock()
+        http.__aenter__ = AsyncMock(return_value=http)
+        http.__aexit__ = AsyncMock(return_value=None)
+        http.post = AsyncMock(return_value=response)
+        cls.return_value = http
+        client = make_client()
+        import asyncio
+        asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
+
+    payload = http.post.await_args.kwargs["json"]
+    assert payload["cache_prompt"] is True
+    assert payload["id_slot"] == 7
+    assert client.last_timings["prompt_n"] == 30
+    assert client.last_timings["tokens_cached"] == 70
+
+
+def test_cache_can_be_disabled_and_n_past_is_not_reuse(monkeypatch):
+    monkeypatch.setenv("LLAMA_CPP_CACHE_PROMPT", "off")
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "choices": [{"message": {"content": "ok"}}],
+        "timings": {"prompt_n": 30}, "n_past": 500,
+    }
+    with patch("modules.llama_cpp_client.httpx.AsyncClient") as cls:
+        http = AsyncMock()
+        http.__aenter__ = AsyncMock(return_value=http)
+        http.__aexit__ = AsyncMock(return_value=None)
+        http.post = AsyncMock(return_value=response)
+        cls.return_value = http
+        client = make_client()
+        import asyncio
+        asyncio.run(client.chat_completion([{"role": "user", "content": "hi"}]))
+    assert http.post.await_args.kwargs["json"]["cache_prompt"] is False
+    assert "tokens_cached" not in client.last_timings
+
+
 @pytest.mark.asyncio
 async def test_chat_completion_http_error_raises():
     mock_response = MagicMock()

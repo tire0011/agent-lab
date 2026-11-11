@@ -279,6 +279,9 @@ class PromptPlan:
     files_text: str = field(default="", repr=False)
     handover: str = field(default="", repr=False)
     counter: "TokenCounter | None" = field(default=None, repr=False)
+    # Optional renderer for plans whose stable prefix is shared with a parent
+    # run while their fresh file state lives in the tail (subtasks).
+    prompt_renderer: Callable[[str, str], str] | None = field(default=None, repr=False)
 
     def log_fields(self) -> dict[str, Any]:
         return {
@@ -484,9 +487,14 @@ async def build_feedback_prompt(plan: PromptPlan, client: Any, *, round_no: int,
     budget = plan.budget_tokens
     system_tokens = await count(_SYSTEM_PROMPT)
 
+    def render(handover: str, feedback: str) -> str:
+        if plan.prompt_renderer is not None:
+            return plan.prompt_renderer(handover, feedback)
+        return _render_prompt(plan.essential, plan.files_text, handover, feedback)
+
     async def total(err: str, diff: str, handover: str) -> int:
         feedback = _render_feedback(round_no, err, diff) if err else ""
-        return system_tokens + await count(_render_prompt(plan.essential, plan.files_text, handover, feedback))
+        return system_tokens + await count(render(handover, feedback))
 
     err = error.strip() or "unknown error"
     if len(err) > FEEDBACK_ERROR_CHARS:
@@ -506,7 +514,7 @@ async def build_feedback_prompt(plan: PromptPlan, client: Any, *, round_no: int,
             tokens = await total("", "", "")
     feedback = _render_feedback(round_no, err, diff) if err else ""
     return FeedbackPrompt(
-        prompt=_render_prompt(plan.essential, plan.files_text, handover, feedback),
+        prompt=render(handover, feedback),
         prompt_tokens=tokens, error_chars=len(err),
         diff_cut=bool(previous_diff) and diff != previous_diff,
         handover_tokens_kept=await count(handover) if handover else 0,
@@ -556,7 +564,10 @@ MAX_SUBTASK_FILES = 2
 MAX_SUBTASK_TESTS = 3
 PLAN_MAX_TOKENS = 1024
 NAMED_TEST_TIMEOUT_SECONDS = 300.0
-_PLAN_SYSTEM_PROMPT = "You are a planning worker. Split coding tasks into small ordered steps. Answer only JSON."
+# The system message is part of llama-server's cached prefix.  Planning and
+# patching deliberately share it; planning-specific rules live in the changing
+# user-message tail.
+_PLAN_SYSTEM_PROMPT = _SYSTEM_PROMPT
 _PLAN_INSTRUCTIONS = (
     "Split the coding task below into an ordered list of small subtasks for a small local "
     f"model. At most {MAX_SUBTASKS} subtasks. Each subtask is one small change to one or two "
@@ -1267,19 +1278,58 @@ class LocalCodingWorker:
             f"Changes already made by the earlier subtasks (git diff, already applied):\n{earlier}\n\n"
             f"Overall task (context only; do not do the other subtasks):\n{plan.essential}"
         )
-        # Do not reread files after each applied subtask: every patch call in a
-        # run must begin with the byte-identical snapshot fitted for the run.
-        sub_plan = await build_prompt_parts(
+        # Fit against the files that are actually on disk now.  This preserves
+        # #598: subtask N sees edits made by subtask N-1, and files named only by
+        # this subtask are included.  The parent snapshot remains an identical
+        # prefix; the fresh subtask snapshot is changing tail context.
+        fresh_plan = await build_prompt_parts(
             essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
             n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
             rates=self.rates.medians(),
         )
-        sub_plan.files_text = plan.files_text
-        sub_plan.named_files = list(plan.named_files)
-        sub_plan.prompt = _render_prompt(sub_plan.essential, plan.files_text, sub_plan.handover)
-        system_tokens = await (plan.counter or TokenCounter(self.client))(_SYSTEM_PROMPT)
-        sub_plan.prompt_tokens = system_tokens + await (plan.counter or TokenCounter(self.client))(sub_plan.prompt)
-        return sub_plan
+        count = plan.counter or TokenCounter(self.client)
+        stable = plan.prompt.split("\n\nGoal and instructions:\n", 1)[0]
+
+        def render(handover: str, feedback: str = "") -> str:
+            return (
+                stable + "\n\n"
+                + "Current files for this subtask (fresh working-tree state):\n"
+                + (fresh_plan.files_text or " none") + "\n\n"
+                + f"Goal and instructions:\n{essential}\n\n"
+                + (f"{handover}\n\n" if handover else "")
+                + (f"{feedback}\n" if feedback else "")
+                + _CLOSING
+            )
+
+        system_tokens = await count(_SYSTEM_PROMPT)
+        hard_budget = plan.n_ctx - self.max_tokens - CONTEXT_MARGIN_TOKENS
+        async def total(handover: str) -> int:
+            return system_tokens + await count(render(handover))
+        base_tokens = await total("")
+        if base_tokens > hard_budget:
+            raise ContextTooSmallError(
+                f"{CONTEXT_TOO_SMALL}: stable run prefix, fresh subtask files and instructions "
+                f"need {base_tokens} tokens, but n_ctx {plan.n_ctx} ({plan.n_ctx_source}) "
+                f"leaves {hard_budget}; the local model was not called"
+            )
+        # The time budget is soft.  It may remove the changing handover, never
+        # the stable prefix or fresh file state needed for a correct diff.
+        budget = max(base_tokens, min(hard_budget, fresh_plan.budget_tokens))
+        kept = await _fit_part(context, budget, total, count)
+        prompt = render(kept)
+        tokens = await total(kept)
+        return PromptPlan(
+            prompt=prompt, n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source,
+            budget_tokens=budget, prompt_tokens=tokens, token_source=count.source,
+            named_files=list(fresh_plan.named_files), file_level=fresh_plan.file_level,
+            handover_tokens_kept=await count(kept) if kept else 0,
+            handover_cut=kept != context, time_budget_tokens=fresh_plan.time_budget_tokens,
+            time_budget_limited=fresh_plan.time_budget_limited or kept != context,
+            time_budget_exceeded=base_tokens > min(hard_budget, fresh_plan.budget_tokens),
+            output_tokens=fresh_plan.output_tokens, essential=essential,
+            files_text=fresh_plan.files_text, handover=context, counter=count,
+            prompt_renderer=render,
+        )
 
     # The correction loop (#597)
 
@@ -1397,14 +1447,18 @@ class LocalCodingWorker:
             prompt_total = None
             prompt_cached = None
             if isinstance(timings, dict):
-                total_value = timings.get("prompt_n")
+                processed_value = timings.get("prompt_n")
                 cached_value = timings.get("tokens_cached")
-                if isinstance(total_value, (int, float)) and not isinstance(total_value, bool):
-                    prompt_total = total_value
                 if isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
-                    prompt_cached = cached_value
+                    prompt_cached = max(0, cached_value)
+                if isinstance(processed_value, (int, float)) and not isinstance(processed_value, bool):
+                    # llama-server's prompt_n is the number evaluated on this
+                    # call, excluding a reused prefix.
+                    prompt_total = max(0, processed_value) + (prompt_cached or 0)
             cache_ratio = (prompt_cached / prompt_total
                            if prompt_cached is not None and prompt_total and prompt_total > 0 else None)
+            if cache_ratio is not None:
+                cache_ratio = min(1.0, max(0.0, cache_ratio))
             self._log(
                 experiment_logger, phase, "local_model_call",
                 f"Local {call_type} model call: {outcome} in {wall_seconds:.1f}s",

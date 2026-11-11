@@ -140,6 +140,9 @@ class ContractTests(_Base):
         self.assertEqual(content, _source(FAILS))
         self.assertIn("Correction (round 2 of 3)", client.calls[1])
         self.assertIn(_source(PASSES), client.calls[1])  # previous file fed back
+        # File contents and issue rules are a byte-identical cacheable prefix;
+        # only correction feedback is appended in the changing tail.
+        self.assertTrue(client.calls[1].startswith(client.calls[0]))
 
     def test_syntax_error_is_retried_then_dropped(self):
         client = FakeClient("not python !!!", "still ???", "class broken(")
