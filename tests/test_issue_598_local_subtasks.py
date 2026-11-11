@@ -375,6 +375,115 @@ class Issue598SubtaskTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOCAL_TEST_FIRST": "0"}):
             self.assertFalse(build_worker("local").test_first)
 
+    def test_generated_test_install_is_atomic_and_repeat_safe(self):
+        target = self.repo / "tests" / "test_generated.py"
+
+        self.assertTrue(local_coding_worker._install_generated_test(target, "complete\n"))
+        self.assertEqual("complete\n", target.read_text())
+        self.assertFalse(local_coding_worker._install_generated_test(target, "replacement\n"))
+        self.assertEqual("complete\n", target.read_text())
+        self.assertEqual([], list(target.parent.glob(".test_generated.py.*.tmp")))
+
+    def test_generated_test_partial_write_cleans_up_and_retry_succeeds(self):
+        target = self.repo / "tests" / "test_generated.py"
+        real_fdopen = os.fdopen
+
+        class PartialWriter:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def write(self, content):
+                self.stream.write(content[:4])
+                raise OSError("disk full")
+
+            def close(self):
+                self.stream.close()
+
+        with mock.patch.object(local_coding_worker.os, "fdopen",
+                               side_effect=lambda fd, *args, **kwargs:
+                               PartialWriter(real_fdopen(fd, *args, **kwargs))):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                local_coding_worker._install_generated_test(target, "complete\n")
+
+        self.assertFalse(target.exists())
+        self.assertEqual([], list(target.parent.glob(".test_generated.py.*.tmp")))
+        self.assertTrue(local_coding_worker._install_generated_test(target, "complete\n"))
+        self.assertEqual("complete\n", target.read_text())
+
+    def test_generated_test_interruption_leaves_no_target_or_temporary_file(self):
+        target = self.repo / "tests" / "test_generated.py"
+        real_fdopen = os.fdopen
+
+        class InterruptedWriter:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def write(self, content):
+                self.stream.write(content[:4])
+                raise KeyboardInterrupt
+
+            def close(self):
+                self.stream.close()
+
+        with mock.patch.object(local_coding_worker.os, "fdopen",
+                               side_effect=lambda fd, *args, **kwargs:
+                               InterruptedWriter(real_fdopen(fd, *args, **kwargs))):
+            with self.assertRaises(KeyboardInterrupt):
+                local_coding_worker._install_generated_test(target, "complete\n")
+
+        self.assertFalse(target.exists())
+        self.assertEqual([], list(target.parent.glob(".test_generated.py.*.tmp")))
+
+    def test_generated_test_close_interruption_still_removes_temporary_file(self):
+        target = self.repo / "tests" / "test_generated.py"
+        real_fdopen = os.fdopen
+
+        class InterruptedClose:
+            def __init__(self, stream):
+                self.stream = stream
+                self.close_calls = 0
+
+            def write(self, content):
+                return self.stream.write(content)
+
+            def flush(self):
+                return self.stream.flush()
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def close(self):
+                self.close_calls += 1
+                self.stream.close()
+                if self.close_calls == 1:
+                    raise KeyboardInterrupt
+
+        with mock.patch.object(local_coding_worker.os, "fdopen",
+                               side_effect=lambda fd, *args, **kwargs:
+                               InterruptedClose(real_fdopen(fd, *args, **kwargs))):
+            with self.assertRaises(KeyboardInterrupt):
+                local_coding_worker._install_generated_test(target, "complete\n")
+
+        self.assertFalse(target.exists())
+        self.assertEqual([], list(target.parent.glob(".test_generated.py.*.tmp")))
+
+    def test_generated_test_target_creation_race_preserves_winner(self):
+        target = self.repo / "tests" / "test_generated.py"
+
+        def lose_race(source, destination):
+            Path(destination).write_text("winner\n")
+            raise FileExistsError
+
+        with mock.patch.object(local_coding_worker.os, "link", side_effect=lose_race):
+            self.assertFalse(local_coding_worker._install_generated_test(target, "generated\n"))
+
+        self.assertEqual("winner\n", target.read_text())
+        self.assertEqual([], list(target.parent.glob(".test_generated.py.*.tmp")))
+        # Sanity-check that the patched function did not leave the real operation unusable.
+        other = target.with_name("test_other.py")
+        self.assertTrue(local_coding_worker._install_generated_test(other, "other\n"))
+        self.assertTrue(other.exists())
+
     def test_generated_tests_are_added_to_every_subtask_and_gate_the_attempt(self):
         generated = ["tests.test_generated.ValueTests.test_value"]
         content = ("import unittest\nimport mod\n\nclass ValueTests(unittest.TestCase):\n"

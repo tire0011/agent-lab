@@ -801,6 +801,44 @@ def _generated_test_path(test_ids: list[str], working_dir: str) -> Path | None:
     return _inside(root, module.replace(".", "/") + ".py")
 
 
+def _install_generated_test(target: Path, content: str) -> bool:
+    """Atomically install a generated test without replacing an existing file.
+
+    The temporary file lives beside *target*, so linking it into place is an
+    atomic same-filesystem operation.  ``False`` means another file already
+    occupied the target; in all cases the private temporary file is removed.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
+    )
+    temporary = Path(temporary_name)
+    stream = None
+    try:
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1  # ownership passed to the stream
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+        stream.close()
+        stream = None
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        try:
+            if stream is not None:
+                stream.close()
+        finally:
+            try:
+                if fd >= 0:
+                    os.close(fd)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+
 def apply_and_check(patch: str, working_dir: str, timeout: float, *,
                     allowed_paths: set[str] | None = None,
                     tests: list[str] | tuple[str, ...] = ()) -> None:
@@ -915,9 +953,8 @@ class LocalCodingWorker:
                 ids, content = generate_failing_tests(task, working_dir, self.client)
                 target = _generated_test_path(ids, working_dir)
                 if ids and content and target is not None and not target.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(content, encoding="utf-8")
-                    self.generated_tests = tuple(ids)
+                    if _install_generated_test(target, content):
+                        self.generated_tests = tuple(ids)
                 self._log(
                     experiment_logger, phase, "local_test_first_generated",
                     f"Generated {len(self.generated_tests)} failing acceptance test(s)",
