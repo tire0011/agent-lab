@@ -77,6 +77,28 @@ class ReviewerTests(unittest.TestCase):
         self.assertIn("link is stored too late", prompts["claude"])
         self.assertNotIn("FOLLOW-UP REVIEW", prompts["codex"])
 
+    def test_a_stand_in_for_the_blocking_reviewer_gets_the_same_findings(self):
+        prompts = {}
+
+        def runner(name, answer):
+            def run(prompt, worktree):
+                prompts[name] = prompt
+                return answer
+            return run
+
+        blocked = '{"verdict": "block", "summary": "s", "problems": ["timeout error is empty"]}'
+        reviewer = NexusReviewer(db_path=self.db, runners={
+            "claude": runner("claude", blocked), "codex": runner("codex", APPROVE), "azure": runner("azure", APPROVE),
+        })
+        self._link(642, "first")
+        self._link(642, "second")
+        reviewer.review(experiment_id="first", goal="g", worktree_path=".", base_sha="")
+        reviewer._runners["claude"] = runner("claude", "not json")
+        result = reviewer.review(experiment_id="second", goal="g", worktree_path=".", base_sha="")
+        self.assertEqual(result.reviewer, "codex")
+        self.assertIn("FOLLOW-UP REVIEW", prompts["codex"])
+        self.assertIn("timeout error is empty", prompts["codex"])
+
     def test_without_an_earlier_block_the_rotation_is_unchanged(self):
         reviewer = NexusReviewer(db_path=self.db, runners={n: self._runner(n) for n in ("claude", "codex", "azure")})
         self._link(1, "e")
