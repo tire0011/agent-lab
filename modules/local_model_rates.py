@@ -119,6 +119,43 @@ class LocalModelRates:
             logger.warning("could not record local model rates in %s", self.path, exc_info=True)
             return False
 
+    def record_timeout(self, *, prompt_tokens: int, timeout_seconds: float,
+                       minimum_output_tokens: int) -> bool:
+        """Bootstrap conservative rates when a timed-out call has no timings.
+
+        Conservatively assume prompt ingestion consumed the whole timeout.  In
+        the next call, half of the 80%-of-time budget is reserved for a minimal
+        useful answer; the other half therefore admits about 40% of the timed-out
+        prompt.  The inferred samples use the ordinary rolling window, so real
+        llama-server timings replace them naturally.  Like :meth:`record`, this
+        never raises.
+        """
+        try:
+            if not (isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool)
+                    and prompt_tokens > 0):
+                return False
+            if not (_valid_rate(timeout_seconds)
+                    and isinstance(minimum_output_tokens, int)
+                    and not isinstance(minimum_output_tokens, bool)
+                    and minimum_output_tokens > 0):
+                return False
+            half_budget_seconds = float(timeout_seconds) * 0.8 * 0.5
+            samples = {
+                "prompt_tokens_per_second": prompt_tokens / float(timeout_seconds),
+                "generation_tokens_per_second": minimum_output_tokens / half_budget_seconds,
+            }
+            models = self._read_all()
+            entry = models.get(self.model) or {key: [] for key in _KEYS}
+            for key, sample in samples.items():
+                entry[key] = [*entry.get(key, []), sample][-MAX_SAMPLES:]
+            models[self.model] = entry
+            self._write({"models": models})
+            return True
+        except Exception:
+            logger.warning("could not record local model timeout rates in %s", self.path,
+                           exc_info=True)
+            return False
+
     def _write(self, data: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp",

@@ -319,6 +319,10 @@ def time_budget(timeout: Any, max_output_tokens: int,
     generation_seconds = min(max_output_tokens / generation_rate, seconds * MAX_GENERATION_TIME_SHARE)
     output_tokens = min(max_output_tokens,
                         max(MIN_OUTPUT_TOKENS, int(generation_seconds * generation_rate)))
+    # The minimum useful answer can take slightly longer than the nominal
+    # generation share at a slow measured rate. Charge that real estimate to
+    # the call budget instead of silently exceeding the 80% target.
+    generation_seconds = min(seconds, output_tokens / generation_rate)
     prompt_tokens = max(0, int((seconds - generation_seconds) * prompt_rate))
     return TimeBudget(prompt_tokens=prompt_tokens, output_tokens=output_tokens, seconds=seconds)
 
@@ -527,13 +531,14 @@ class SplitOutcome:
     succeeded: int = 0
     failed_subtask: int | None = None
     free_tier_calls: int = 0
+    model_timed_out: bool = False
 
     def log_fields(self) -> dict[str, Any]:
         return {
             "split": self.split, "planner": self.planner, "planner_model": self.planner_model,
             "reason": self.reason, "subtasks": len(self.subtasks),
             "subtasks_succeeded": self.succeeded, "failed_subtask": self.failed_subtask,
-            "free_tier_calls": self.free_tier_calls,
+            "free_tier_calls": self.free_tier_calls, "model_timed_out": self.model_timed_out,
         }
 
 
@@ -1069,6 +1074,22 @@ class LocalCodingWorker:
                     split = self.last_split
                 else:
                     split = self._plan_subtasks(plan, working_dir, experiment_logger, phase)
+                    if split.model_timed_out:
+                        # The timeout supplied the conservative bootstrap rates
+                        # that were unavailable when this run first fitted its
+                        # prompt. Refit now instead of repeating the same full
+                        # prompt for the patch in this run.
+                        plan = asyncio.run(build_prompt(
+                            task, working_dir, self.client,
+                            max_output_tokens=self.max_tokens,
+                            rates=self.rates.medians(),
+                        ))
+                        self.last_plan = plan
+                        self._log(
+                            experiment_logger, phase, "local_prompt_budget",
+                            f"Local prompt refitted after planner timeout: {plan.prompt_tokens} tokens",
+                            refitted_after_timeout=True, **plan.log_fields(),
+                        )
                 if split.split:
                     split.subtasks = [Subtask(s.goal, s.files,
                                               tuple(dict.fromkeys((*s.tests, *self.generated_tests))))
@@ -1098,9 +1119,11 @@ class LocalCodingWorker:
         unreachable = False
         try:
             prompt = asyncio.run(self._local_plan_prompt(plan))
+            count = plan.counter or TokenCounter(self.client)
+            prompt_tokens = asyncio.run(count(_PLAN_SYSTEM_PROMPT)) + asyncio.run(count(prompt))
             answer = self._model_call(
                 prompt, _PLAN_SYSTEM_PROMPT, min(plan.output_tokens or self.max_tokens, PLAN_MAX_TOKENS),
-                experiment_logger, phase, call_type="plan",
+                experiment_logger, phase, call_type="plan", prompt_tokens=prompt_tokens,
             )
             subtasks = parse_plan(answer, working_dir)
             outcome.planner, outcome.planner_model = "local", "local"
@@ -1115,6 +1138,7 @@ class LocalCodingWorker:
             # The local model is down: the one-shot fails the same way, so a
             # free-tier call would be wasted.
             unreachable = True
+            outcome.model_timed_out = self._is_model_timeout(exc)
             outcome.reason = f"local planner call failed: {type(exc).__name__}: {exc}"
         if not subtasks and not unreachable:
             subtasks, fallback_reason = self._free_tier_subtasks(plan, working_dir, outcome)
@@ -1273,7 +1297,8 @@ class LocalCodingWorker:
             try:
                 output = self._model_call(
                     prompt, _SYSTEM_PROMPT, plan.output_tokens or self.max_tokens, experiment_logger, phase,
-                    call_type="patch", round=round_no, **tag,
+                    call_type="patch", round=round_no,
+                    prompt_tokens=extra["prompt_tokens"], **tag,
                 )
             except Exception as exc:
                 if self._is_model_timeout(exc):
@@ -1334,14 +1359,24 @@ class LocalCodingWorker:
                 prompt, system=system, temperature=0.0, max_tokens=max_tokens,
             ))
             return answer
-        except Exception as exc:
-            outcome = "timeout" if self._is_model_timeout(exc) else "error"
+        except BaseException as exc:
+            outcome = ("timeout" if self._is_model_timeout(exc) else
+                       "error" if isinstance(exc, Exception) else "interrupted")
             raise
         finally:
             wall_seconds = time.monotonic() - started
             timings = getattr(self.client, "last_timings", None)
             if outcome == "ok":
                 self.rates.record(timings)  # never raises
+            elif outcome == "timeout" and not timings:
+                timeout = getattr(self.client, "timeout", None)
+                prompt_tokens = fields.get("prompt_tokens")
+                if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
+                        and timeout > 0 and isinstance(prompt_tokens, int)):
+                    self.rates.record_timeout(
+                        prompt_tokens=prompt_tokens, timeout_seconds=float(timeout),
+                        minimum_output_tokens=MIN_OUTPUT_TOKENS,
+                    )
             prompt_rate, generation_rate = self.rates.medians()
             self._log(
                 experiment_logger, phase, "local_model_call",

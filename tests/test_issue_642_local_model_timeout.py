@@ -202,11 +202,36 @@ class WorkerTimeoutTests(_RepoCase):
 
     def test_plan_call_timeout_is_logged_and_patch_still_runs(self):
         server = _Server(LlamaCppClientError(_TIMEOUT_ERROR), "not a diff")
-        _, _, log = self.run_worker(server, split_tasks=True, planner=lambda _p: None)
+        worker, _, log = self.run_worker(server, split_tasks=True, planner=lambda _p: None,
+                                         task=_big_handover_task())
         calls = log.all("local_model_call")
         self.assertEqual(("plan", "timeout"), (calls[0]["call_type"], calls[0]["outcome"]))
         self.assertEqual("patch", calls[1]["call_type"])
+        self.assertEqual(MIN_OUTPUT_TOKENS, server.calls[1]["max_tokens"])
+        self.assertTrue(worker.last_plan.time_budget_limited)
+        self.assertTrue(log.all("local_prompt_budget")[-1]["refitted_after_timeout"])
         self.assertGreaterEqual(len(log.all("local_patch_round")), 1)
+
+    def test_first_patch_timeout_bootstraps_the_next_run(self):
+        task = _big_handover_task()
+        first, result, _ = self.run_worker(_Server(LlamaCppClientError(_TIMEOUT_ERROR)),
+                                           task=task)
+        self.assertFalse(result.success)
+        self.assertNotEqual((None, None), first.rates.medians())
+        second, _, log = self.run_worker(_Server("not a diff"), task=task, split_tasks=True)
+        self.assertTrue(second.last_plan.time_budget_limited)
+        self.assertTrue(second.last_plan.handover_cut)
+        self.assertEqual("patch", log.all("local_model_call")[0]["call_type"])
+
+    def test_interrupted_model_call_is_logged_and_propagated_without_a_fake_sample(self):
+        server = _Server(KeyboardInterrupt())
+        log = _Log()
+        worker = LocalCodingWorker(client=server, max_tokens=1024, rates_path=self.rates_path)
+        with self.assertRaises(KeyboardInterrupt):
+            worker.run(task="Edit value.txt", working_dir=str(self.repo),
+                       sandbox="workspace-write", experiment_logger=log)
+        self.assertEqual("interrupted", log.all("local_model_call")[0]["outcome"])
+        self.assertEqual((None, None), worker.rates.medians())
 
 
 class TimingsLoggingTests(_RepoCase):
@@ -278,7 +303,7 @@ class TimeBudgetTests(_RepoCase):
         self.seed_rates(20.0, 2.0)
         plan = asyncio.run(build_prompt(_big_handover_task(), str(self.repo), _Server(),
                                         max_output_tokens=4096, rates=(20.0, 2.0)))
-        self.assertEqual(2400, plan.time_budget_tokens)  # half of 240 s for the prompt
+        self.assertEqual(2240, plan.time_budget_tokens)  # 128 s output leaves 112 s for prompt
         self.assertEqual(MIN_OUTPUT_TOKENS, plan.output_tokens)
         server = _Server()
         _, result, log = self.run_worker(server, task=_big_handover_task(), max_tokens=4096)
@@ -380,6 +405,32 @@ class RatesStoreTests(unittest.TestCase):
     def test_write_failure_never_raises(self):
         self.path.mkdir(parents=True)  # the target is a directory: replace fails
         self.assertFalse(LocalModelRates(self.path).record(_FAST))
+        self.assertFalse(LocalModelRates(self.path).record_timeout(
+            prompt_tokens=1000, timeout_seconds=300, minimum_output_tokens=256,
+        ))
+
+    def test_timeout_bootstrap_is_conservative_repeatable_and_bounded(self):
+        store = LocalModelRates(self.path)
+        for _ in range(MAX_SAMPLES + 5):
+            self.assertTrue(store.record_timeout(
+                prompt_tokens=6000, timeout_seconds=300, minimum_output_tokens=256,
+            ))
+        prompt_rate, generation_rate = store.medians()
+        self.assertEqual(20.0, prompt_rate)
+        self.assertAlmostEqual(256 / 120, generation_rate)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        entry = data["models"]["default"]
+        self.assertTrue(all(len(entry[key]) == MAX_SAMPLES for key in entry))
+
+    def test_timeout_bootstrap_rejects_invalid_partial_observations(self):
+        store = LocalModelRates(self.path)
+        for prompt, timeout, output in ((0, 300, 256), (10, 0, 256),
+                                        (10, float("nan"), 256), (10, 300, 0)):
+            self.assertFalse(store.record_timeout(
+                prompt_tokens=prompt, timeout_seconds=timeout,
+                minimum_output_tokens=output,
+            ))
+        self.assertFalse(self.path.exists())
 
     def test_rolling_window_and_per_model_separation(self):
         slow = LocalModelRates(self.path, model="7b")
