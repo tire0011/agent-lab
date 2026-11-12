@@ -36,6 +36,8 @@ from modules.outbox_publisher import (
     TaskApprovalOutboxPublisher,
 )
 from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.task_change_classifier import classify_command, classify_task
+from modules.task_issue_planner import plan_issue
 # ``modules.task_orchestrator`` is imported lazily, not here. It imports
 # ``modules.mailbox.development``, which runs this package's ``__init__`` and
 # comes straight back to this module - so importing the orchestrator *first*
@@ -66,6 +68,9 @@ _STATUS_FAILED = "failed"
 _STATUS_NEEDS_REVIEW = "needs_review"
 # Nexus decides what follows a failed experiment; poll_running keeps out (#263).
 _STATUS_NEXUS_DECIDING = "nexus_deciding"
+# A mutating command finished, but its required GitHub result comment has not
+# been acknowledged yet.  This is deliberately non-terminal and recoverable.
+_STATUS_RESULT_PENDING = "result_comment_pending"
 
 _TERMINAL_STATUSES = {
     _LEGACY_STATUS_REJECTED, _STATUS_SUCCEEDED, _STATUS_FAILED, _STATUS_NEEDS_REVIEW,
@@ -73,6 +78,7 @@ _TERMINAL_STATUSES = {
 _NON_TERMINAL_STATUSES = {
     _STATUS_QUEUED, _LEGACY_STATUS_PENDING, _LEGACY_STATUS_APPROVED,
     _STATUS_SUBMITTED, _STATUS_RUNNING, _STATUS_NEXUS_DECIDING,
+    _STATUS_RESULT_PENDING,
 }
 _EXP_TERMINAL = {"succeeded", "failed", "timed_out", "needs_review", "rejected", "interrupted"}
 _EXP_RUNNING = {"selecting", "implementing", "verifying"}
@@ -115,19 +121,67 @@ def _row_to_approval(row: sqlite3.Row | tuple) -> MailboxTaskApproval:
     return MailboxTaskApproval(**dict(zip(keys, row)))
 
 
+_ISSUE_PLANNER_FACTS = {
+    "source": "Nexus mailbox task",
+    "note": "Nexus works on this issue through an experiment or a tracked command.",
+}
+
+
+def registry_issue_planner(task_text: str) -> dict[str, str] | None:
+    """Plan a task issue with the first available free planning model (#655).
+
+    Exactly one call (``plan_issue``) and never a paid model; no free model
+    means ``None``, so the caller keeps its placeholder issue.
+    """
+    from modules import model_registry
+
+    try:
+        free = [
+            m
+            for m in model_registry.candidates(
+                model_registry.load_models(), role="planning", max_cost="free"
+            )
+            if m.cost == "free"
+        ]
+    except Exception:
+        logger.warning("mailbox_task: no model for issue planning", exc_info=True)
+        return None
+    if not free:
+        return None
+    return plan_issue(task_text, _ISSUE_PLANNER_FACTS, free[0])
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _redact(text: str) -> str:
+    return re.sub(
+        r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
+        "[REDACTED]",
+        text,
+    )
 
 
 def _safe_error(error: str | None) -> str | None:
     if not error:
         return None
-    redacted = re.sub(
-        r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
-        "[REDACTED]",
-        error,
-    )
-    return redacted[:500]
+    return _redact(error)[:500]
+
+
+class _RecordingPlanner:
+    """Wraps the issue planner and remembers whether it produced a draft."""
+
+    def __init__(self, planner: Any) -> None:
+        self._planner = planner
+        self.planned = False
+
+    def __call__(self, task_text: str) -> dict[str, str] | None:
+        draft = self._planner(task_text)
+        self.planned = isinstance(draft, dict) and all(
+            isinstance(draft.get(key), str) and draft[key].strip() for key in ("title", "body")
+        )
+        return draft
 
 
 class MailboxTaskService:
@@ -145,8 +199,12 @@ class MailboxTaskService:
         github_work_tracking: GitHubWorkTrackingService | None = None,
         task_log_dir: str | Path | None = None,
         failure_analysis_service: Any | None = None,
+        task_issue_planner: Any | None = None,
     ) -> None:
         self.db_path = db_path
+        # Turns a change task into a planned GitHub issue (#655); ``None``
+        # from it keeps the ``Mailbox task <id>`` placeholder.
+        self.task_issue_planner = task_issue_planner or registry_issue_planner
         self.experiment_service = experiment_service
         self._task_log_dir = task_log_dir
         self.failure_analysis_service = failure_analysis_service
@@ -427,6 +485,9 @@ class MailboxTaskService:
         """Hand the oldest queued task to Nexus, which chooses the actual action."""
         if self.experiment_service is None or self.operations_registry is None:
             return
+        # Finish durable machine-work comments before accepting more work.
+        if self._retry_pending_machine_result():
+            return
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM mailbox_task_approvals WHERE status=? ORDER BY created_at LIMIT 1",
@@ -534,6 +595,7 @@ class MailboxTaskService:
         current_approval = self.get(approval.id)
         task_log = self._task_logger(approval.id)
         task_log.info("queued", "github_work_tracking_started", "starting GitHub work tracking")
+        planner = self._issue_planner_for(current_approval.task_body)
         try:
             work_ref = self.github_work_tracking.ensure_for_source(
                 SimpleNamespace(
@@ -541,7 +603,8 @@ class MailboxTaskService:
                     source_id=approval.id,
                     title=f"Mailbox task {approval.id[:8]}",
                     content=current_approval.task_body,
-                )
+                ),
+                planner=planner,
             )
         except GitHubWorkTrackingError as exc:
             task_log.error(
@@ -564,6 +627,14 @@ class MailboxTaskService:
             issue_number=work_ref.issue_number,
             branch_name=work_ref.branch_name,
         )
+        goal = current_approval.task_body
+        if planner is not None and planner.planned:
+            # #655: the experiment works on the planned issue, so its goal
+            # names it the standard way (``GitHub Issue #N: title``).
+            goal = (
+                f"GitHub Issue #{work_ref.issue_number}: "
+                f"{getattr(work_ref, 'issue_title', '') or 'planned task'}\n\n{goal}"
+            )
         with self._lock:
             current = self._conn.execute(
                 "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
@@ -574,7 +645,7 @@ class MailboxTaskService:
             try:
                 experiment = self.experiment_service.create_experiment(
                     with_handover(
-                        current_approval.task_body,
+                        goal,
                         decision.experiment_handover if decision is not None else None,
                     ),
                     complexity=decision.complexity if decision is not None else None,
@@ -636,6 +707,124 @@ class MailboxTaskService:
                 experiment.id,
             ),
         )
+
+    def _issue_planner_for(self, task_body: str) -> "_RecordingPlanner | None":
+        """The issue planner for a change task; ``None`` keeps the placeholder (#655).
+
+        A question never reaches here with a planner. Whether the planner is
+        actually called is ``ensure_for_source``'s decision: a task that
+        names its issue (``solve github issue #N``) reuses that issue.
+        """
+        if self.task_issue_planner is None or classify_task(task_body or "") != "change":
+            return None
+        return _RecordingPlanner(self.task_issue_planner)
+
+    def _track_machine_work(self, approval: MailboxTaskApproval, command: str) -> Any:
+        """Create and durably record tracking before a mutation may execute."""
+        task_log = self._task_logger(approval.id)
+        body = self.get(approval.id).task_body or command
+        work_ref = self.github_work_tracking.ensure_for_source(
+            SimpleNamespace(
+                source_type="task", source_id=approval.id,
+                title=f"Mailbox task {approval.id[:8]}", content=body,
+            ),
+            planner=self._issue_planner_for(body), create_branch=False,
+        )
+        issue_number = getattr(work_ref, "issue_number", None)
+        if not isinstance(issue_number, int):
+            raise GitHubWorkTrackingError("machine work did not receive a GitHub issue")
+        now = _now_iso()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO mailbox_machine_work
+                   (task_id, command, issue_number, state, created_at, updated_at)
+                   VALUES (?, ?, ?, 'tracked', ?, ?)
+                   ON CONFLICT(task_id) DO NOTHING""",
+                (approval.id, command, issue_number, now, now),
+            )
+            row = self._conn.execute(
+                "SELECT command, issue_number FROM mailbox_machine_work WHERE task_id=?",
+                (approval.id,),
+            ).fetchone()
+            self._conn.commit()
+        if row is None or row["command"] != command or row["issue_number"] != issue_number:
+            raise RuntimeError("machine-work tracking could not be persisted consistently")
+        task_log.info(
+            "queued", "github_work_tracking_linked",
+            f"machine work tracked on GitHub issue #{issue_number}",
+            issue_number=issue_number,
+        )
+        return work_ref
+
+    def _comment_machine_result(
+        self, approval: MailboxTaskApproval, work_ref: Any, command: str, status: str, result_body: str
+    ) -> None:
+        """Post the required result comment; failures remain retryable."""
+        marker = self._machine_result_marker(approval.id)
+        self.github_work_tracking.comment(
+            work_ref.issue_number,
+            (
+                f"Nexus ran a command for mailbox task `{approval.id[:8]}`.\n\n"
+                f"**Status:** {status}\n\n"
+                f"```text\n$ {command[:2000]}\n```\n\n"
+                f"{_redact(result_body)[:50000]}\n\n{marker}"
+            ),
+        )
+
+    @staticmethod
+    def _machine_result_marker(task_id: str) -> str:
+        return f"<!-- nexus-mailbox-machine-result:{task_id} -->"
+
+    def _machine_result_comment_exists(self, issue_number: int, task_id: str) -> bool:
+        return self.github_work_tracking.issue_comment_contains(
+            issue_number, self._machine_result_marker(task_id)
+        )
+
+    def _retry_pending_machine_result(self) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT m.*, a.* FROM mailbox_machine_work m
+                   JOIN mailbox_task_approvals a ON a.id=m.task_id
+                   WHERE a.status=? ORDER BY a.updated_at LIMIT 1""",
+                (_STATUS_RESULT_PENDING,),
+            ).fetchone()
+        if row is None:
+            return False
+        approval = self.get(str(row["task_id"]))
+        work_ref = SimpleNamespace(issue_number=int(row["issue_number"]))
+        if row["state"] != "commented":
+            try:
+                if not self._machine_result_comment_exists(work_ref.issue_number, approval.id):
+                    try:
+                        self._comment_machine_result(
+                            approval, work_ref, str(row["command"]), str(row["result_status"]),
+                            str(row["result_body"] or ""),
+                        )
+                    except Exception:
+                        # A transport error does not prove the POST failed.
+                        # Reconcile before leaving it pending for another pass.
+                        if not self._machine_result_comment_exists(
+                            work_ref.issue_number, approval.id
+                        ):
+                            raise
+            except Exception as exc:
+                self._task_logger(approval.id).warning(
+                    "queued", "github_result_comment_failed",
+                    f"result comment still pending on issue #{row['issue_number']}", exc=exc,
+                )
+                return True
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE mailbox_machine_work SET state='commented', updated_at=? WHERE task_id=?",
+                    (_now_iso(), approval.id),
+                )
+                self._conn.commit()
+        summary = f"{row['result_body']}\n\nTracked on GitHub issue #{row['issue_number']}."
+        self._complete_claimed_without_experiment(
+            approval, str(row["result_status"]), summary, error=row["error"],
+            expected_status=_STATUS_RESULT_PENDING,
+        )
+        return True
 
     def _with_task_store(self, action: Any) -> Any:
         """Run *action* against the Nexus task store the orchestrator uses.
@@ -872,6 +1061,24 @@ class MailboxTaskService:
             self._conn.commit()
         if not claimed:
             return
+        # #655: machine work is a change and is tracked on an issue that gets
+        # the result; a read-only command is answered without one.
+        mutating = classify_command(command) == "mutating"
+        work_ref = None
+        if mutating:
+            try:
+                work_ref = self._track_machine_work(approval, command)
+            except Exception as exc:
+                self._task_logger(approval.id).error(
+                    "running", "github_work_tracking_failed",
+                    "mutating command blocked before execution", exc=exc,
+                )
+                self._complete_claimed_without_experiment(
+                    approval, _STATUS_NEEDS_REVIEW,
+                    f"Mutating command was not run because GitHub tracking failed: {_safe_error(str(exc))}",
+                    error=str(exc), expected_status=_STATUS_RUNNING,
+                )
+                return
         try:
             msg = SimpleNamespace(body=command, meta={})
             result_body, _ = process_command(
@@ -881,19 +1088,31 @@ class MailboxTaskService:
                 approval.mailbox_msg_id,
             )
             success = "**Exit code:** 0" in result_body
-            self._complete_claimed_without_experiment(
-                approval,
-                _STATUS_SUCCEEDED if success else _STATUS_FAILED,
-                result_body,
-                error=None if success else "command failed",
-            )
+            status = _STATUS_SUCCEEDED if success else _STATUS_FAILED
+            error = None if success else "command failed"
         except Exception as exc:
+            result_body = f"Command execution failed: {_safe_error(str(exc)) or type(exc).__name__}"
+            status = _STATUS_FAILED
+            error = str(exc)
+        if work_ref is None:
             self._complete_claimed_without_experiment(
-                approval,
-                _STATUS_FAILED,
-                f"Command execution failed: {_safe_error(str(exc)) or type(exc).__name__}",
-                error=str(exc),
+                approval, status, result_body, error=error, expected_status=_STATUS_RUNNING
             )
+            return
+        # Commit the command result before the fallible network call.  From
+        # here onward retries only post the comment; they never rerun command.
+        with self._lock:
+            self._conn.execute(
+                """UPDATE mailbox_machine_work SET state='result_pending',
+                   result_status=?, result_body=?, error=?, updated_at=? WHERE task_id=?""",
+                (status, result_body, _safe_error(error), _now_iso(), approval.id),
+            )
+            self._conn.execute(
+                "UPDATE mailbox_task_approvals SET status=?, updated_at=? WHERE id=? AND status=?",
+                (_STATUS_RESULT_PENDING, _now_iso(), approval.id, _STATUS_RUNNING),
+            )
+            self._conn.commit()
+        self._retry_pending_machine_result()
 
     def _start_thread(self, experiment_id: str, target: Any) -> None:
         def _run() -> None:
@@ -951,11 +1170,42 @@ class MailboxTaskService:
 
     def recover_after_restart(self) -> None:
         with self._lock:
+            now = _now_iso()
+            interrupted_machine_ids = [
+                str(r["id"])
+                for r in self._conn.execute(
+                    """SELECT a.id FROM mailbox_task_approvals a
+                       JOIN mailbox_machine_work m ON m.task_id=a.id
+                       WHERE a.status=? AND a.experiment_id IS NULL
+                         AND m.state='tracked'""",
+                    (_STATUS_RUNNING,),
+                ).fetchall()
+            ]
+            # The mutation may have completed immediately before process
+            # death.  Never run it again: persist an unknown/interrupted
+            # outcome and make reporting that uncertainty the retryable work.
+            for task_id in interrupted_machine_ids:
+                body = (
+                    "Nexus was interrupted after this mutating command started. "
+                    "Its outcome is unknown, and it was not run again."
+                )
+                self._conn.execute(
+                    """UPDATE mailbox_machine_work SET state='result_pending',
+                       result_status=?, result_body=?, error=?, updated_at=?
+                       WHERE task_id=? AND state='tracked'""",
+                    (_STATUS_NEEDS_REVIEW, body, "command outcome unknown after restart", now, task_id),
+                )
+                self._conn.execute(
+                    """UPDATE mailbox_task_approvals SET status=?, updated_at=?
+                       WHERE id=? AND status=?""",
+                    (_STATUS_RESULT_PENDING, now, task_id, _STATUS_RUNNING),
+                )
             interrupted_ids = [
                 str(r["id"])
                 for r in self._conn.execute(
-                    "SELECT id FROM mailbox_task_approvals WHERE status=? AND experiment_id IS NULL",
-                    (_STATUS_RUNNING,),
+                    """SELECT id FROM mailbox_task_approvals
+                       WHERE status=? AND experiment_id IS NULL""",
+                (_STATUS_RUNNING,),
                 ).fetchall()
             ]
             self._conn.execute(
@@ -980,6 +1230,14 @@ class MailboxTaskService:
                 "mailbox", "task_interrupted_by_restart",
                 "non-experiment task interrupted by restart; marked needs_review",
             )
+        for approval_id in interrupted_machine_ids:
+            self._task_logger(approval_id).warning(
+                "mailbox", "machine_work_interrupted_by_restart",
+                "mutating command outcome unknown; result comment queued without rerunning",
+            )
+        # One attempt per recovery pass. A remote outage must not turn startup
+        # into a busy loop; the ordinary worker cycle retries it later.
+        self._retry_pending_machine_result()
         self.poll_running()
 
     # ------------------------------------------------------------------
@@ -1066,12 +1324,15 @@ class MailboxTaskService:
         summary: str,
         *,
         error: str | None = None,
+        expected_status: str | None = None,
     ) -> None:
         with self._lock:
             updated = self._conn.execute(
                 """UPDATE mailbox_task_approvals
-                   SET status=?, result_summary=?, error=?, updated_at=? WHERE id=?""",
-                (status, summary[:8000], _safe_error(error), _now_iso(), approval.id),
+                   SET status=?, result_summary=?, error=?, updated_at=?
+                   WHERE id=? AND (? IS NULL OR status=?)""",
+                (status, summary[:8000], _safe_error(error), _now_iso(), approval.id,
+                 expected_status, expected_status),
             ).rowcount
             self._conn.commit()
         if updated:
