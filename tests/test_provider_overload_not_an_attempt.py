@@ -54,6 +54,20 @@ class ProviderOverloadTests(unittest.TestCase):
         self.assertEqual(svc.tick().decision, "dispatched")
         self.assertEqual(self.fx.controller.issues, [232])
 
+    def test_an_expired_login_is_no_attempt_either(self):
+        # 2026-11-12: #661's experiment ab78523a died on an expired Claude login.
+        login = ("Failed to authenticate: this login reached its time limit and cannot be renewed. "
+                 "Run `claude auth login` to sign in again; GitHub checkpoint failed: implementation "
+                 "produced no publishable source/test/documentation changes")
+        self.assertTrue(is_provider_overload(login))
+        self.assertTrue(is_provider_overload("Invalid API key · Please run /login"))
+        self.assertFalse(is_provider_overload("tests failed (exit code 1): tests/test_auth.py::test_login"))
+        for i in range(3):
+            self._attempt(f"e{i}", login)
+        svc = self.fx.service(issue_lister=lambda: ISSUE)
+        self.addCleanup(svc.close)
+        self.assertEqual(svc.tick().decision, "dispatched")
+
     def test_overloaded_runs_give_their_budget_back(self):
         svc = self.fx.service(daily_budget=1)
         self.addCleanup(svc.close)
