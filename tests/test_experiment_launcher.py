@@ -165,6 +165,31 @@ class ExperimentLauncherTests(unittest.TestCase):
         self.assertNotIn("wait_for_experiment", [c[0] for c in calls if isinstance(c, tuple)])
         self.assertIn(("background", "exp-1"), calls)
 
+    def test_resolved_work_and_before_start_preserve_caller_lifecycle(self):
+        launcher, _, _, calls, _ = self._launcher()
+        resolved = SimpleNamespace(issue_number=19, experiment_id=None)
+
+        result = launcher.launch(
+            "chat-1",
+            "Do X",
+            None,
+            SOURCE,
+            task_store=FakeTaskStore(calls),
+            work_ref=resolved,
+            before_start=lambda experiment_id, _work_ref: calls.append(
+                ("before_start", experiment_id)
+            ),
+        )
+
+        self.assertEqual(result.work_ref.issue_number, 19)
+        self.assertEqual(calls, [
+            "create_experiment",
+            "bind_experiment",
+            ("before_start", "exp-1"),
+            ("wait_for_experiment", "chat-1", "exp-1"),
+            ("background", "exp-1"),
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()
