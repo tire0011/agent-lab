@@ -470,6 +470,21 @@ def _migrate_mailbox_task_approvals(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_mta_status ON mailbox_task_approvals(status);
         CREATE INDEX IF NOT EXISTS idx_mta_mailbox_msg_id ON mailbox_task_approvals(mailbox_msg_id);
         CREATE INDEX IF NOT EXISTS idx_mta_experiment_id ON mailbox_task_approvals(experiment_id);
+
+        -- Durable journal for mutating mailbox commands (#655).  The command
+        -- result is saved before its GitHub comment is attempted, allowing a
+        -- restart to retry the comment without executing the mutation again.
+        CREATE TABLE IF NOT EXISTS mailbox_machine_work (
+            task_id TEXT PRIMARY KEY REFERENCES mailbox_task_approvals(id),
+            command TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            result_status TEXT NULL,
+            result_body TEXT NULL,
+            error TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     # Additive migration: add publish columns to pre-existing tables that were

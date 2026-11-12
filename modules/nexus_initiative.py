@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 # other part of the pipeline still owns the machine.
 _BUSY_EXPERIMENT_STATUSES = ("queued", "selecting", "implementing", "verifying")
 _BUSY_ADOPTION_STATUSES = ("queued", "adopting")
-_BUSY_APPROVAL_STATUSES = ("queued", "approved", "submitted", "running", "nexus_deciding")
+_BUSY_APPROVAL_STATUSES = (
+    "queued", "approved", "submitted", "running", "nexus_deciding",
+    "result_comment_pending",
+)
 
 # An adoption in one of these states is not going to move on its own, but the
 # experiment behind it succeeded - that is the integration backlog.

@@ -181,6 +181,84 @@ class FreeFormTaskIssueTests(unittest.TestCase):
         self.assertEqual(len(self.fake.comments), 1)
         self.assertIn("failed", self.fake.comments[0][1])
 
+    def test_tracking_failure_blocks_mutating_command(self):
+        self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
+        with patch.object(
+            self.tracker, "ensure_for_source", side_effect=RuntimeError("database unavailable")
+        ):
+            result = self._run("git branch x")
+
+        self.assertEqual(self.command_runs, 0)
+        self.assertEqual(result.status, "needs_review")
+        self.assertNotIn("Tracked on GitHub", result.result_summary)
+
+    def test_result_comment_failure_is_durable_and_retried_without_rerunning(self):
+        self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
+        self.fake.fail_comments = True
+
+        pending = self._run("git branch x")
+
+        self.assertEqual(self.command_runs, 1)
+        self.assertEqual(pending.status, "result_comment_pending")
+        self.assertNotIn("Tracked on GitHub", pending.result_summary or "")
+        self.fake.fail_comments = False
+        with patch("modules.mailbox.task_service.process_command") as rerun:
+            self.service.submit_queued()
+        done = self.service.get(pending.id)
+        self.assertEqual(done.status, "succeeded")
+        rerun.assert_not_called()
+        self.assertEqual(len(self.fake.comments), 1)
+        self.assertIn("Tracked on GitHub issue #43", done.result_summary)
+
+    def test_restart_retries_pending_comment_without_rerunning(self):
+        self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
+        self.fake.fail_comments = True
+        pending = self._run("git branch x")
+
+        self.service.recover_after_restart()
+        self.assertEqual(self.service.get(pending.id).status, "result_comment_pending")
+        self.fake.fail_comments = False
+        with patch("modules.mailbox.task_service.process_command") as rerun:
+            self.service.submit_queued()
+        rerun.assert_not_called()
+        self.assertEqual(self.service.get(pending.id).status, "succeeded")
+
+    def test_interruption_after_tracking_does_not_repeat_unknown_mutation(self):
+        self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
+        message_id = _insert_mailbox_msg(self.service)
+        approval = self.service.create_task(
+            message_id, "git branch x", "alice", "/agent/inbox/task.md", "2026-01-01T00:00:00Z"
+        )
+        with patch(
+            "modules.mailbox.task_service.process_command", side_effect=KeyboardInterrupt()
+        ) as run:
+            with self.assertRaises(KeyboardInterrupt):
+                self.service.submit_queued()
+        self.assertEqual(run.call_count, 1)
+
+        self.service.recover_after_restart()
+        with patch("modules.mailbox.task_service.process_command") as rerun:
+            self.service.submit_queued()
+        rerun.assert_not_called()
+        self.assertEqual(self.service.get(approval.id).status, "needs_review")
+
+    def test_completion_crash_does_not_duplicate_posted_comment(self):
+        self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
+        original = self.service._complete_claimed_without_experiment
+        with patch.object(
+            self.service, "_complete_claimed_without_experiment", side_effect=RuntimeError("crash")
+        ):
+            with self.assertRaises(RuntimeError):
+                self._run("git branch x")
+        self.assertEqual(len(self.fake.comments), 1)
+
+        self.service._complete_claimed_without_experiment = original
+        with patch("modules.mailbox.task_service.process_command") as rerun:
+            self.service.submit_queued()
+            self.service.submit_queued()
+        rerun.assert_not_called()
+        self.assertEqual(len(self.fake.comments), 1)
+
     def test_read_only_command_gets_no_issue(self):
         self.decision = TaskDecision(action=ACTION_COMMAND, command="git status")
 
