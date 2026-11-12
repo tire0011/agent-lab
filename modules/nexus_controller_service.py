@@ -5,10 +5,10 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
-from modules.experiment_handover import with_handover
-from modules.experiment_service import ExperimentAlreadyActiveError
-from modules.experiment_wait import resume_after_experiment, run_then_resume
+from modules.experiment_launcher import ExperimentLauncher
+from modules.experiment_wait import resume_after_experiment
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from modules.mailbox.development import process_command
@@ -231,62 +231,57 @@ class NexusControllerService:
                 source_id=decision.session_id,
                 title="Nexus controller task",
             )
+
+            def record_start(experiment_id: str, work_ref: Any) -> None:
+                self._record_execution(
+                    decision,
+                    "github_work_linked",
+                    (
+                        f"issue=#{work_ref.issue_number} "
+                        f"branch={work_ref.branch_name} experiment_id={experiment_id}"
+                    ),
+                )
+                self._record_execution(
+                    decision,
+                    "experiment_started",
+                    f"experiment_id={experiment_id}",
+                )
+
             try:
-                work_ref = self.github_work_tracking.ensure_for_source(lifecycle_source)
+                result = ExperimentLauncher(
+                    self.experiment_service,
+                    self.github_work_tracking,
+                    self._start_experiment_thread,
+                    self._resume_after_experiment,
+                ).launch(
+                    decision.session_id,
+                    source_content,
+                    decision.experiment_handover,
+                    lifecycle_source,
+                    task_store=self.orchestrator.task_store,
+                    create_kwargs={
+                        "complexity": decision.complexity,
+                        "source_type": lifecycle_source.source_type,
+                        "source_id": lifecycle_source.source_id,
+                    },
+                    before_start=record_start,
+                )
             except GitHubWorkTrackingError as exc:
                 self._record_execution(
                     decision, "github_work_tracking_unavailable", str(exc)
                 )
                 raise
-
-            try:
-                experiment = self.experiment_service.create_experiment(
-                    with_handover(source_content, decision.experiment_handover),
-                    complexity=decision.complexity,
-                    source_type=lifecycle_source.source_type,
-                    source_id=lifecycle_source.source_id,
-                )
-            except ExperimentAlreadyActiveError as exc:
+            if result.already_active:
                 self._record_execution(
                     decision,
                     "already_active",
-                    f"experiment_id={exc.experiment_id} status={exc.status}",
+                    f"experiment_id={result.experiment_id} status={result.status}",
                 )
                 return {
                     "status": "already_active",
-                    "experiment_id": exc.experiment_id,
-                    "experiment_status": exc.status,
+                    "experiment_id": result.experiment_id,
+                    "experiment_status": result.status,
                 }
-            work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
-            self._record_execution(
-                decision,
-                "github_work_linked",
-                (
-                    f"issue=#{work_ref.issue_number} "
-                    f"branch={work_ref.branch_name} experiment_id={experiment.id}"
-                ),
-            )
-            self._record_execution(
-                decision,
-                "experiment_started",
-                f"experiment_id={experiment.id}",
-            )
-            # Nexus pauses on the experiment and continues the moment it ends (#263).
-            if decision.session_id:
-                self.orchestrator.task_store.wait_for_experiment(
-                    decision.session_id, experiment.id
-                )
-            self._start_experiment_thread(
-                experiment.id,
-                lambda: run_then_resume(
-                    lambda: self.experiment_service.run_experiment(
-                        experiment.id,
-                        github_work_tracking=self.github_work_tracking,
-                    ),
-                    lambda: self._resume_after_experiment(experiment.id),
-                    experiment.id,
-                ),
-            )
             return
 
         if decision.action == ACTION_RESUME_EXPERIMENT:

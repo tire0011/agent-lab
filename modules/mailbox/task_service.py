@@ -23,9 +23,8 @@ from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
-from modules.experiment_handover import with_handover
-from modules.experiment_service import ExperimentAlreadyActiveError
-from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
+from modules.experiment_launcher import ExperimentLauncher
+from modules.experiment_wait import resume_with_new_orchestrator
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingError, GitHubWorkTrackingService
 from .development import process_command
@@ -635,78 +634,79 @@ class MailboxTaskService:
                 f"GitHub Issue #{work_ref.issue_number}: "
                 f"{getattr(work_ref, 'issue_title', '') or 'planned task'}\n\n{goal}"
             )
+        source = SimpleNamespace(
+            source_type="task",
+            source_id=approval.id,
+            title=f"Mailbox task {approval.id[:8]}",
+            content=current_approval.task_body,
+        )
+
+        def mark_submitted(experiment_id: str, _work_ref: Any) -> None:
+            with self._lock:
+                updated = self._conn.execute(
+                    """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
+                       WHERE id=? AND status=?""",
+                    (_STATUS_SUBMITTED, experiment_id, _now_iso(), approval.id, _STATUS_QUEUED),
+                ).rowcount
+                self._conn.commit()
+            if not updated:
+                raise RuntimeError(
+                    f"mailbox task {approval.id} left queued before experiment start"
+                )
+            task_log.info(
+                "queued", "experiment_created", "experiment created for mailbox task",
+                experiment_id=experiment_id,
+            )
+
         with self._lock:
             current = self._conn.execute(
                 "SELECT status FROM mailbox_task_approvals WHERE id=?", (approval.id,)
             ).fetchone()
             if current is None or current["status"] != _STATUS_QUEUED:
                 return
-            # What Nexus already learned travels with the task (#263).
-            try:
-                experiment = self.experiment_service.create_experiment(
-                    with_handover(
-                        goal,
-                        decision.experiment_handover if decision is not None else None,
-                    ),
-                    complexity=decision.complexity if decision is not None else None,
-                    source_type="task",
-                    source_id=approval.id,
-                )
-            except ExperimentAlreadyActiveError as exc:
+            result = ExperimentLauncher(
+                self.experiment_service,
+                self.github_work_tracking,
+                self._start_thread,
+                self._after_experiment,
+            ).launch(
+                decision.session_id if decision is not None else None,
+                goal,
+                decision.experiment_handover if decision is not None else None,
+                source,
+                task_store=(
+                    self._with_task_store(lambda store: store)
+                    if decision is not None and decision.session_id else None
+                ),
+                create_kwargs={
+                    "complexity": decision.complexity if decision is not None else None,
+                    "source_type": "task",
+                    "source_id": approval.id,
+                },
+                work_ref=work_ref,
+                before_start=mark_submitted,
+            )
+            if result.already_active:
                 task_log.info(
                     "queued", "already_active",
                     "mailbox task matched an active experiment",
-                    experiment_id=exc.experiment_id,
-                    experiment_status=exc.status,
+                    experiment_id=result.experiment_id,
+                    experiment_status=result.status,
                 )
                 self._complete_without_experiment(
                     approval,
                     _STATUS_NEEDS_REVIEW,
                     (
                         "already_active: an experiment for this GitHub issue is "
-                        f"already active (experiment_id={exc.experiment_id}, "
-                        f"status={exc.status})"
+                        f"already active (experiment_id={result.experiment_id}, "
+                        f"status={result.status})"
                     ),
                 )
                 return {
                     "status": "already_active",
-                    "experiment_id": exc.experiment_id,
-                    "experiment_status": exc.status,
+                    "experiment_id": result.experiment_id,
+                    "experiment_status": result.status,
                 }
-            work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment.id)
-            updated = self._conn.execute(
-                """UPDATE mailbox_task_approvals SET status=?, experiment_id=?, updated_at=?
-                   WHERE id=? AND status=?""",
-                (_STATUS_SUBMITTED, experiment.id, _now_iso(), approval.id, _STATUS_QUEUED),
-            ).rowcount
-            self._conn.commit()
-        if not updated:
-            logger.warning("mailbox_task: lost race after creating experiment %s", experiment.id)
-            return
-        # Correlating event: this is the moment the pre-experiment task
-        # log and the experiment's own log become joinable, so the
-        # unified feed can follow one task from mailbox intake through to
-        # this new experiment id.
-        task_log.info(
-            "queued", "experiment_created", "experiment created for mailbox task",
-            experiment_id=experiment.id,
-        )
-        # Nexus pauses on the experiment and continues the moment it ends (#263).
-        if decision is not None and decision.session_id:
-            self._with_task_store(
-                lambda store: store.wait_for_experiment(decision.session_id, experiment.id)
-            )
-        self._start_thread(
-            experiment.id,
-            lambda: run_then_resume(
-                lambda: self.experiment_service.run_experiment(
-                    experiment.id,
-                    github_work_tracking=self.github_work_tracking,
-                ),
-                lambda: self._after_experiment(experiment.id),
-                experiment.id,
-            ),
-        )
 
     def _issue_planner_for(self, task_body: str) -> "_RecordingPlanner | None":
         """The issue planner for a change task; ``None`` keeps the placeholder (#655).

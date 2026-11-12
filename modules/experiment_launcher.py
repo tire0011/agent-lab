@@ -58,6 +58,8 @@ class ExperimentLauncher:
         *,
         task_store: Any | None = None,
         create_kwargs: dict[str, Any] | None = None,
+        work_ref: Any | None = None,
+        before_start: Callable[[str, Any], None] | None = None,
     ) -> LaunchResult:
         """Run the launch steps in order.
 
@@ -65,6 +67,9 @@ class ExperimentLauncher:
         work tracking; its ``content`` defaults to the goal with the handover.
         *task_store* parks *session_id* on the experiment before it starts.
         *create_kwargs* are passed to ``create_experiment`` unchanged.
+        *work_ref* reuses work that a caller resolved itself (for example to
+        apply mailbox issue planning). *before_start* runs after binding but
+        before the session is parked or background execution starts.
         GitHub tracking errors propagate before any experiment is created.
         """
         full_goal = with_handover(goal, handover)
@@ -75,7 +80,8 @@ class ExperimentLauncher:
             title=getattr(source, "title", None),
             content=full_goal if content is None else content,
         )
-        work_ref = self.github_work_tracking.ensure_for_source(lifecycle_source)
+        if work_ref is None:
+            work_ref = self.github_work_tracking.ensure_for_source(lifecycle_source)
         try:
             experiment = self.experiment_service.create_experiment(
                 full_goal, **(create_kwargs or {})
@@ -89,6 +95,8 @@ class ExperimentLauncher:
             )
         experiment_id = experiment.id
         work_ref = self.github_work_tracking.bind_experiment(work_ref, experiment_id)
+        if before_start is not None:
+            before_start(experiment_id, work_ref)
         # Nexus pauses on the experiment and continues the moment it ends (#263).
         if session_id and task_store is not None:
             task_store.wait_for_experiment(session_id, experiment_id)
