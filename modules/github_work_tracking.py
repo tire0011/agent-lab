@@ -449,7 +449,23 @@ class GitHubWorkTrackingService:
                 """
             )
 
-    def ensure_for_source(self, source) -> GitHubWorkRef:
+    def ensure_for_source(
+        self,
+        source,
+        *,
+        planner: Callable[[str], dict[str, str] | None] | None = None,
+        create_branch: bool = True,
+    ) -> GitHubWorkRef:
+        """Find or open the Issue (and branch) that tracks *source*.
+
+        *planner* (#655) is consulted only where a new placeholder Issue would
+        otherwise be opened: a task that names its Issue (``solve github issue
+        #N``) or forbids a new one never reaches it. When it returns a draft
+        (``{"title", "body"}``) that Issue is opened instead of the
+        ``Mailbox task <id>`` placeholder; ``None`` or an error keeps the
+        placeholder. ``create_branch=False`` records the Issue for machine work
+        that needs no branch.
+        """
         self.require_lifecycle_ready()
 
         source_type = str(getattr(source, "source_type", "task") or "task")
@@ -467,8 +483,9 @@ class GitHubWorkTrackingService:
         if persisted is not None:
             # A link from an earlier run is no licence to re-create a branch
             # that has since been deleted: the task's own constraint decides.
-            self._require_reusable_branch(persisted.branch_name, directives)
-            self._ensure_branch(persisted.branch_name)
+            if create_branch:
+                self._require_reusable_branch(persisted.branch_name, directives)
+                self._ensure_branch(persisted.branch_name)
             return persisted
 
         issue: dict[str, Any]
@@ -489,15 +506,23 @@ class GitHubWorkTrackingService:
             # stop and say so instead of silently creating a replacement.
             raise GitHubWorkTrackingError(self._unusable_reuse_message(directives))
         else:
-            issue_title = self._issue_title(title, content)
-            issue = self._find_exact_open_issue(issue_title) or self._create_issue(issue_title, content)
+            draft = self._planned_issue(planner, content or title)
+            if draft is not None:
+                issue_title = self._issue_title(draft["title"], "")
+                issue = self._find_exact_open_issue(issue_title) or self._create_planned_issue(
+                    issue_title, draft["body"], content, source_type, source_id
+                )
+            else:
+                issue_title = self._issue_title(title, content)
+                issue = self._find_exact_open_issue(issue_title) or self._create_issue(issue_title, content)
 
         issue_number = int(issue["number"])
         issue_title = str(issue.get("title") or f"Issue {issue_number}")
         branch_name = directives.branch_name or f"nexus/{issue_number}-{_slug(issue_title)}"
         # Checked before the link is persisted, so a refused task leaves no
         # record pointing at a branch it was never allowed to create.
-        self._require_reusable_branch(branch_name, directives)
+        if create_branch:
+            self._require_reusable_branch(branch_name, directives)
         ref = GitHubWorkRef(
             issue_number=issue_number,
             issue_title=issue_title,
@@ -506,8 +531,50 @@ class GitHubWorkTrackingService:
             source_id=source_id,
         )
         self._persist_source(ref)
-        self._ensure_branch(branch_name)
+        if create_branch:
+            self._ensure_branch(branch_name)
         return ref
+
+    @staticmethod
+    def _planned_issue(
+        planner: Callable[[str], dict[str, str] | None] | None, task_text: str
+    ) -> dict[str, str] | None:
+        """The planner's draft, or ``None`` so the placeholder stays (#655)."""
+        if planner is None or not task_text:
+            return None
+        try:
+            draft = planner(task_text)
+        except Exception:
+            logger.warning("task issue planner failed; using the placeholder issue", exc_info=True)
+            return None
+        if not isinstance(draft, dict):
+            return None
+        title, body = draft.get("title"), draft.get("body")
+        if not isinstance(title, str) or not title.strip() or not isinstance(body, str) or not body.strip():
+            return None
+        return {"title": title.strip(), "body": body.strip()}
+
+    def _create_planned_issue(
+        self,
+        title: str,
+        body: str,
+        content: str,
+        source_type: str,
+        source_id: str | None,
+    ) -> dict[str, Any]:
+        origin = f"{source_type} {source_id}" if source_id else source_type
+        full_body = (
+            f"{body[:24000]}\n\n"
+            "---\n"
+            f"Planned by Nexus from {origin} before implementation.\n\n"
+            "## Nexus task\n\n"
+            f"{content[:6000]}"
+        )
+        return self._request(
+            "POST",
+            f"/repos/{self.repository}/issues",
+            {"title": title, "body": full_body},
+        )
 
     def _require_reusable_branch(self, branch_name: str, directives: WorkDirectives) -> None:
         """Refuse to *create* a branch the task said to reuse or not to add.
