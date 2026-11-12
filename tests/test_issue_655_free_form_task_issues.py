@@ -223,6 +223,17 @@ class FreeFormTaskIssueTests(unittest.TestCase):
         rerun.assert_not_called()
         self.assertEqual(self.service.get(pending.id).status, "succeeded")
 
+    def test_accepted_then_raised_comment_is_reconciled_without_duplicate(self):
+        self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
+        self.fake.accept_comment_then_raise = True
+
+        result = self._run("git branch x")
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(len(self.fake.comments), 1)
+        self.service.submit_queued()
+        self.assertEqual(len(self.fake.comments), 1)
+
     def test_interruption_after_tracking_does_not_repeat_unknown_mutation(self):
         self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
         message_id = _insert_mailbox_msg(self.service)
@@ -241,6 +252,36 @@ class FreeFormTaskIssueTests(unittest.TestCase):
             self.service.submit_queued()
         rerun.assert_not_called()
         self.assertEqual(self.service.get(approval.id).status, "needs_review")
+        self.assertEqual(len(self.fake.comments), 1)
+        self.assertIn("outcome is unknown", self.fake.comments[0][1])
+
+    def test_crash_after_remote_acceptance_before_local_ack_is_idempotent(self):
+        self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")
+        original = self.service._comment_machine_result
+        message_id = _insert_mailbox_msg(self.service)
+        approval = self.service.create_task(
+            message_id, "git branch x", "alice", "/agent/inbox/task.md", "2026-01-01T00:00:00Z"
+        )
+
+        def accepted_then_crash(*args, **kwargs):
+            original(*args, **kwargs)
+            raise KeyboardInterrupt("process died before local acknowledgement")
+
+        with patch.object(self.service, "_comment_machine_result", side_effect=accepted_then_crash):
+            with self.assertRaises(KeyboardInterrupt):
+                with patch(
+                    "modules.mailbox.task_service.process_command",
+                    return_value=("**Exit code:** 0\n", None),
+                ):
+                    self.service.submit_queued()
+        self.assertEqual(len(self.fake.comments), 1)
+
+        with patch("modules.mailbox.task_service.process_command") as rerun:
+            self.service.recover_after_restart()
+            self.service.submit_queued()
+        rerun.assert_not_called()
+        self.assertEqual(self.service.get(approval.id).status, "succeeded")
+        self.assertEqual(len(self.fake.comments), 1)
 
     def test_completion_crash_does_not_duplicate_posted_comment(self):
         self.decision = TaskDecision(action=ACTION_COMMAND, command="git branch x")

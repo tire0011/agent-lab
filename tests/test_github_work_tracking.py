@@ -30,6 +30,7 @@ class FakeGitHub:
         self.workflow_runs = []
         self.comments = []
         self.fail_comments = False
+        self.accept_comment_then_raise = False
         self.jobs = []
         self.job_log = ""
         self.calls = []
@@ -42,7 +43,18 @@ class FakeGitHub:
                 raise GitHubWorkTrackingError("GitHub HTTP 502: bad gateway")
             number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
             self.comments.append((number, payload["body"]))
+            if self.accept_comment_then_raise:
+                self.accept_comment_then_raise = False
+                raise GitHubWorkTrackingError("connection lost after server accepted comment")
             return {"id": len(self.comments)}
+
+        if method == "GET" and "/comments?" in path:
+            number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+            return [
+                {"id": index, "body": body}
+                for index, (comment_number, body) in enumerate(self.comments, 1)
+                if comment_number == number
+            ][::-1]
 
         if method == "GET" and path.startswith("/repos/tire0011/agent-lab/issues/"):
             number = int(path.rsplit("/", 1)[1])

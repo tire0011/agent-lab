@@ -1540,6 +1540,24 @@ class GitHubWorkTrackingService:
         """Comment on an issue or pull request (#396: review results)."""
         self._request("POST", f"/repos/{self.repository}/issues/{number}/comments", {"body": body[:60000]})
 
+    def issue_comment_contains(self, number: int, marker: str) -> bool:
+        """Return whether a recent issue comment contains *marker*.
+
+        Result reporters use this to reconcile an ambiguous POST (the server
+        may accept it before the client sees an error). Pages are exhausted so
+        long-lived issues cannot hide the marker beyond a fixed-size window.
+        """
+        for page in range(1, 101):
+            query = urllib.parse.urlencode({"per_page": 100, "page": page})
+            comments = self._request(
+                "GET", f"/repos/{self.repository}/issues/{number}/comments?{query}"
+            )
+            if any(marker in str(comment.get("body") or "") for comment in comments):
+                return True
+            if len(comments) < 100:
+                return False
+        raise GitHubWorkTrackingError("issue comment reconciliation exceeded 100 pages")
+
     def post_progress(self, experiment_id: str, state: str, *, detail: str | None = None) -> bool:
         """Comment one lifecycle state on the experiment's Issue (#43).
 

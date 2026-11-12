@@ -760,14 +760,24 @@ class MailboxTaskService:
         self, approval: MailboxTaskApproval, work_ref: Any, command: str, status: str, result_body: str
     ) -> None:
         """Post the required result comment; failures remain retryable."""
+        marker = self._machine_result_marker(approval.id)
         self.github_work_tracking.comment(
             work_ref.issue_number,
             (
                 f"Nexus ran a command for mailbox task `{approval.id[:8]}`.\n\n"
                 f"**Status:** {status}\n\n"
                 f"```text\n$ {command[:2000]}\n```\n\n"
-                f"{_redact(result_body)[:50000]}"
+                f"{_redact(result_body)[:50000]}\n\n{marker}"
             ),
+        )
+
+    @staticmethod
+    def _machine_result_marker(task_id: str) -> str:
+        return f"<!-- nexus-mailbox-machine-result:{task_id} -->"
+
+    def _machine_result_comment_exists(self, issue_number: int, task_id: str) -> bool:
+        return self.github_work_tracking.issue_comment_contains(
+            issue_number, self._machine_result_marker(task_id)
         )
 
     def _retry_pending_machine_result(self) -> bool:
@@ -784,10 +794,19 @@ class MailboxTaskService:
         work_ref = SimpleNamespace(issue_number=int(row["issue_number"]))
         if row["state"] != "commented":
             try:
-                self._comment_machine_result(
-                    approval, work_ref, str(row["command"]), str(row["result_status"]),
-                    str(row["result_body"] or ""),
-                )
+                if not self._machine_result_comment_exists(work_ref.issue_number, approval.id):
+                    try:
+                        self._comment_machine_result(
+                            approval, work_ref, str(row["command"]), str(row["result_status"]),
+                            str(row["result_body"] or ""),
+                        )
+                    except Exception:
+                        # A transport error does not prove the POST failed.
+                        # Reconcile before leaving it pending for another pass.
+                        if not self._machine_result_comment_exists(
+                            work_ref.issue_number, approval.id
+                        ):
+                            raise
             except Exception as exc:
                 self._task_logger(approval.id).warning(
                     "queued", "github_result_comment_failed",
@@ -1151,12 +1170,42 @@ class MailboxTaskService:
 
     def recover_after_restart(self) -> None:
         with self._lock:
+            now = _now_iso()
+            interrupted_machine_ids = [
+                str(r["id"])
+                for r in self._conn.execute(
+                    """SELECT a.id FROM mailbox_task_approvals a
+                       JOIN mailbox_machine_work m ON m.task_id=a.id
+                       WHERE a.status=? AND a.experiment_id IS NULL
+                         AND m.state='tracked'""",
+                    (_STATUS_RUNNING,),
+                ).fetchall()
+            ]
+            # The mutation may have completed immediately before process
+            # death.  Never run it again: persist an unknown/interrupted
+            # outcome and make reporting that uncertainty the retryable work.
+            for task_id in interrupted_machine_ids:
+                body = (
+                    "Nexus was interrupted after this mutating command started. "
+                    "Its outcome is unknown, and it was not run again."
+                )
+                self._conn.execute(
+                    """UPDATE mailbox_machine_work SET state='result_pending',
+                       result_status=?, result_body=?, error=?, updated_at=?
+                       WHERE task_id=? AND state='tracked'""",
+                    (_STATUS_NEEDS_REVIEW, body, "command outcome unknown after restart", now, task_id),
+                )
+                self._conn.execute(
+                    """UPDATE mailbox_task_approvals SET status=?, updated_at=?
+                       WHERE id=? AND status=?""",
+                    (_STATUS_RESULT_PENDING, now, task_id, _STATUS_RUNNING),
+                )
             interrupted_ids = [
                 str(r["id"])
                 for r in self._conn.execute(
                     """SELECT id FROM mailbox_task_approvals
                        WHERE status=? AND experiment_id IS NULL""",
-                    (_STATUS_RUNNING,),
+                (_STATUS_RUNNING,),
                 ).fetchall()
             ]
             self._conn.execute(
@@ -1181,6 +1230,14 @@ class MailboxTaskService:
                 "mailbox", "task_interrupted_by_restart",
                 "non-experiment task interrupted by restart; marked needs_review",
             )
+        for approval_id in interrupted_machine_ids:
+            self._task_logger(approval_id).warning(
+                "mailbox", "machine_work_interrupted_by_restart",
+                "mutating command outcome unknown; result comment queued without rerunning",
+            )
+        # One attempt per recovery pass. A remote outage must not turn startup
+        # into a busy loop; the ordinary worker cycle retries it later.
+        self._retry_pending_machine_result()
         self.poll_running()
 
     # ------------------------------------------------------------------
