@@ -172,15 +172,20 @@ def choose_provider(
 
 
 # A provider's usage limit (e.g. Claude's weekly limit) counts as overload: the
-# other agent takes over and the attempt does not count.
+# other agent takes over and the attempt does not count. So does an expired or
+# missing login (2026-11-12: "Failed to authenticate: this login reached its
+# time limit") - the provider could not run, the work was never tried.
 _OVERLOAD_RE = re.compile(
-    r"\b(?:529|429)\b|overloaded|rate[ _-]?limit|usage[ _-]?limit|limit (?:reached|exceeded)",
+    r"\b(?:529|429)\b|overloaded|rate[ _-]?limit|usage[ _-]?limit|limit (?:reached|exceeded)"
+    r"|failed to authenticate|authentication (?:failed|error)|not logged in|invalid api key"
+    r"|\b401\b[^\n]{0,40}unauthorized|claude auth login|claude setup-token",
     re.IGNORECASE,
 )
 
 
 def is_provider_overload(error: Any) -> bool:
-    """The provider was busy, not the work wrong ("API Error: 529 Overloaded")."""
+    """The provider was busy or could not log in, not the work wrong
+    ("API Error: 529 Overloaded", "Failed to authenticate")."""
     return bool(_OVERLOAD_RE.search(str(error or "")))
 
 
