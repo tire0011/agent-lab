@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from modules.experiment_launcher import ExperimentLauncher
 from modules.experiment_wait import resume_with_new_orchestrator
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
+from modules.nexus_task_store import NexusTaskStore
 from modules.task_orchestrator import (
     ACTION_ANSWER,
     ACTION_CLARIFICATION,
@@ -26,6 +28,8 @@ from modules.task_orchestrator import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_EXPERIMENTS_PER_SESSION = 3
 
 _EXECUTION_RE = re.compile(
     r"^(?:bitte\s+)?(?:mach(?:e)?(?:\s+das|\b.*\bweiter\b)|setz(?:e)?(?:\s+das\s+um|\b.*\bfort\b)|implementier(?:e)?\b|beheb(?:e)?\b|fix(?:e)?\b|führ(?:e)?\b|starte\b|änder(?:e)?\b|füg(?:e)?\b|entfern(?:e)?\b|integrier(?:e)?\b|do\s+it\b|implement\b|fix\b|execute\b|apply\b|run\s+it\b|go\s+ahead\b)",
@@ -224,6 +228,7 @@ class NexusChatService:
                         title="Nexus chat",
                     ),
                     task_store=orchestrator.task_store,
+                    allow_mutation=allow_mutation,
                 )
                 if launch.already_active:
                     return NexusChatResult(
@@ -283,15 +288,76 @@ class NexusChatService:
             self.experiment_service,
             self.github_work_tracking,
             self.background_starter,
-            lambda experiment_id: resume_with_new_orchestrator(
-                self.orchestrator_factory,
-                self.experiment_service,
-                self.github_work_tracking,
-                experiment_id,
-                operations_registry=self.operations_registry,
-                allow_mutation=False,
-            ),
+            self._resume_after_experiment,
         )
+
+    def _resume_after_experiment(self, experiment_id: str) -> list[TaskDecision]:
+        decisions = resume_with_new_orchestrator(
+            self.orchestrator_factory,
+            self.experiment_service,
+            self.github_work_tracking,
+            experiment_id,
+            restore_allow_mutation=True,
+            operations_registry=self.operations_registry,
+        )
+        for decision in decisions:
+            if decision.action == ACTION_NEW_EXPERIMENT and decision.session_id:
+                self._launch_resumed_experiment(decision)
+        return decisions
+
+    def _launch_resumed_experiment(self, decision: TaskDecision) -> None:
+        store = NexusTaskStore(db_path=str(self.operations_registry.db_path))
+        try:
+            session = store.get(decision.session_id or "")
+            if session is None or not session.allow_mutation:
+                return
+            try:
+                limit = int(os.environ.get(
+                    "NEXUS_MAX_EXPERIMENTS_PER_SESSION",
+                    str(_DEFAULT_MAX_EXPERIMENTS_PER_SESSION),
+                ))
+            except ValueError:
+                limit = _DEFAULT_MAX_EXPERIMENTS_PER_SESSION
+            attempts = len(store.recent_events(
+                session.id, role="tool", kind=ACTION_NEW_EXPERIMENT, limit=max(1, limit + 1)
+            ))
+            if attempts >= max(1, limit):
+                message = (
+                    f"needs_review: the limit of {max(1, limit)} experiments per "
+                    "session is reached."
+                )
+                store.append_event(
+                    session.id, role="system", kind="needs_review", content=message
+                )
+                store.set_status(session.id, "needs_review")
+                return
+            goal = self._implementation_goal_from_store(store, decision)
+            self._experiment_launcher().launch(
+                session.id,
+                goal,
+                decision.experiment_handover,
+                SimpleNamespace(
+                    source_type="chat", source_id=session.id, title="Nexus chat"
+                ),
+                task_store=store,
+                allow_mutation=True,
+            )
+        finally:
+            store.close()
+
+    @staticmethod
+    def _implementation_goal_from_store(store: Any, decision: TaskDecision) -> str:
+        history = store.history(decision.session_id, limit=18, max_chars=9000)
+        conversation = [
+            f"{event.get('role', '')}: {str(event.get('content', '')).strip()}"
+            for event in history
+            if event.get("role") != "tool" and str(event.get("content", "")).strip()
+        ]
+        return (
+            "Implement the change explicitly agreed in this Nexus chat. Preserve the "
+            "intent and constraints from the conversation.\n\nConversation context:\n"
+            + "\n".join(conversation)
+        )[:12000]
 
     def _implementation_goal(self, orchestrator: NexusTaskOrchestrator, decision: TaskDecision, current_input: str) -> str:
         history = orchestrator.task_store.history(decision.session_id, limit=18, max_chars=9000)

@@ -82,6 +82,7 @@ class NexusTaskSession:
     completion_evidence_key: str | None = None
     verification_evidence_key: str | None = None
     waiting_experiment_id: str | None = None
+    allow_mutation: bool = False
 
 
 class NexusTaskStore:
@@ -177,6 +178,11 @@ class NexusTaskStore:
                 self._conn.execute(
                     f"ALTER TABLE nexus_task_sessions ADD COLUMN {column} TEXT NULL"
                 )
+        if "allow_mutation" not in existing:
+            self._conn.execute(
+                "ALTER TABLE nexus_task_sessions "
+                "ADD COLUMN allow_mutation INTEGER NOT NULL DEFAULT 0"
+            )
         self._conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_nexus_task_heartbeat
                    ON nexus_task_sessions(status, last_heartbeat_at)"""
@@ -787,19 +793,28 @@ class NexusTaskStore:
                 break
         return blocked
 
-    def wait_for_experiment(self, session_id: str, experiment_id: str) -> bool:
+    def wait_for_experiment(
+        self, session_id: str, experiment_id: str, *, allow_mutation: bool | None = None
+    ) -> bool:
         """Park a session whose turn ended in new_experiment until it finishes.
 
         Called once the experiment exists. The session holds no claim while it
         waits, so the local model stays free for other work (#263).
         """
         with self._lock:
+            mutation = (
+                "allow_mutation" if allow_mutation is None else "?"
+            )
+            params: list[Any] = [STATUS_WAITING_FOR_EXPERIMENT, str(experiment_id)]
+            if allow_mutation is not None:
+                params.append(int(allow_mutation))
+            params.extend([_now(), session_id])
             cursor = self._conn.execute(
-                """UPDATE nexus_task_sessions
-                   SET status=?, waiting_experiment_id=?, last_heartbeat_at=NULL,
-                       updated_at=?
-                   WHERE id=?""",
-                (STATUS_WAITING_FOR_EXPERIMENT, str(experiment_id), _now(), session_id),
+                f"""UPDATE nexus_task_sessions
+                    SET status=?, waiting_experiment_id=?, allow_mutation={mutation},
+                        last_heartbeat_at=NULL, updated_at=?
+                    WHERE id=?""",
+                params,
             )
             self._conn.commit()
         return cursor.rowcount > 0
@@ -950,5 +965,8 @@ class NexusTaskStore:
                 row["verification_evidence_key"]
                 if "verification_evidence_key" in keys
                 else None
+            ),
+            allow_mutation=(
+                bool(row["allow_mutation"]) if "allow_mutation" in keys else False
             ),
         )

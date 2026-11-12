@@ -66,9 +66,22 @@ def resume_with_new_orchestrator(
     experiment_service: Any,
     github_work_tracking: Any | None,
     experiment_id: str,
+    restore_allow_mutation: bool = False,
     **factory_kwargs: Any,
 ) -> list[Any]:
     """Resume with an orchestrator that lives only for this continuation."""
+    if restore_allow_mutation:
+        from modules.nexus_task_store import NexusTaskStore
+
+        registry = factory_kwargs.get("operations_registry")
+        store = NexusTaskStore(db_path=str(getattr(registry, "db_path")))
+        try:
+            waiting = store.sessions_waiting_for_experiments(experiment_id)
+            factory_kwargs["allow_mutation"] = bool(
+                waiting and waiting[0].allow_mutation
+            )
+        finally:
+            store.close()
     orchestrator = orchestrator_factory(experiment_service=experiment_service, **factory_kwargs)
     try:
         decisions = resume_after_experiment(
