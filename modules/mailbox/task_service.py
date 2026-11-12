@@ -676,7 +676,7 @@ class MailboxTaskService:
                 source,
                 task_store=(
                     self._with_task_store(lambda store: store)
-                    if decision is not None else None
+                    if decision is not None and decision.session_id else None
                 ),
                 create_kwargs={
                     "complexity": decision.complexity if decision is not None else None,

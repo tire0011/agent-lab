@@ -95,6 +95,7 @@ def test_sequential_redelivery_returns_original_task_and_dispatches_once(svc):
     assert late.experiment_id == "exp-idem"
     svc.experiment_service.create_experiment.assert_called_once()
     assert _task_count(svc.db_path) == 1
+    assert getattr(svc, "_nexus_task_store", None) is None
 
 
 def test_explicit_key_deduplicates_across_source_messages(svc):
