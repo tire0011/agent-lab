@@ -49,6 +49,19 @@ class WaitingStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_parking_persists_mutation_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = NexusTaskStore(db_path=str(Path(tmp) / "n.db"))
+            try:
+                allowed = store.get_or_create(source_type="chat", source_id="allowed")
+                denied = store.get_or_create(source_type="chat", source_id="denied")
+                store.wait_for_experiment(allowed.id, "exp-a", allow_mutation=True)
+                store.wait_for_experiment(denied.id, "exp-b", allow_mutation=False)
+                self.assertTrue(store.get(allowed.id).allow_mutation)
+                self.assertFalse(store.get(denied.id).allow_mutation)
+            finally:
+                store.close()
+
 
 class ExperimentResultTests(unittest.TestCase):
     def test_success_carries_status_and_pr_without_reason(self):

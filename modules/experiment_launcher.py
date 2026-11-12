@@ -60,6 +60,7 @@ class ExperimentLauncher:
         create_kwargs: dict[str, Any] | None = None,
         work_ref: Any | None = None,
         before_start: Callable[[str, Any], None] | None = None,
+        allow_mutation: bool | None = None,
     ) -> LaunchResult:
         """Run the launch steps in order.
 
@@ -99,7 +100,12 @@ class ExperimentLauncher:
             before_start(experiment_id, work_ref)
         # Nexus pauses on the experiment and continues the moment it ends (#263).
         if session_id and task_store is not None:
-            task_store.wait_for_experiment(session_id, experiment_id)
+            if allow_mutation is None:
+                task_store.wait_for_experiment(session_id, experiment_id)
+            else:
+                task_store.wait_for_experiment(
+                    session_id, experiment_id, allow_mutation=allow_mutation
+                )
         self.background_starter(
             experiment_id,
             lambda: run_then_resume(

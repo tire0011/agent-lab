@@ -20,7 +20,7 @@ class FakeTaskStore:
     def history(self, session_id, limit=18, max_chars=9000):
         return list(self._history)
 
-    def wait_for_experiment(self, session_id, experiment_id):
+    def wait_for_experiment(self, session_id, experiment_id, *, allow_mutation=None):
         self.waiting.append((session_id, experiment_id))
         return True
 
