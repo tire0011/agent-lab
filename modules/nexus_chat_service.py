@@ -8,9 +8,8 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from modules.central_logging import DEFAULT_LOG_DIR, get_chat_logger
-from modules.experiment_handover import with_handover
-from modules.experiment_service import ExperimentAlreadyActiveError
-from modules.experiment_wait import resume_with_new_orchestrator, run_then_resume
+from modules.experiment_launcher import ExperimentLauncher
+from modules.experiment_wait import resume_with_new_orchestrator
 from modules.experiment_resume import resume_experiment
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.task_orchestrator import (
@@ -213,55 +212,35 @@ class NexusChatService:
 
             if decision.action == ACTION_NEW_EXPERIMENT:
                 goal = self._implementation_goal(orchestrator, decision, text)
-                # What Nexus already learned travels with the conversation (#263).
-                goal = with_handover(goal, decision.experiment_handover)
-                work_ref = self.github_work_tracking.ensure_for_source(
+                # What Nexus already learned travels with the conversation (#263);
+                # the launcher appends it and parks the session (#659).
+                launch = self._experiment_launcher().launch(
+                    decision.session_id,
+                    goal,
+                    decision.experiment_handover,
                     SimpleNamespace(
                         source_type="chat",
                         source_id=decision.session_id,
                         title="Nexus chat",
-                        content=goal,
-                    )
+                    ),
+                    task_store=orchestrator.task_store,
                 )
-                try:
-                    experiment = self.experiment_service.create_experiment(goal)
-                except ExperimentAlreadyActiveError as exc:
+                if launch.already_active:
                     return NexusChatResult(
                         reply=(
                             "Für dieses GitHub-Issue läuft bereits ein Experiment "
-                            f"({exc.experiment_id}, Status: {exc.status})."
+                            f"({launch.experiment_id}, Status: {launch.status})."
                         ),
                         session_id=decision.session_id,
                         action=decision.action,
-                        experiment_id=exc.experiment_id,
+                        experiment_id=launch.experiment_id,
                         status="already_active",
                     )
-                self.github_work_tracking.bind_experiment(work_ref, experiment.id)
-                # Nexus pauses on the experiment and continues the moment it ends (#263).
-                orchestrator.task_store.wait_for_experiment(decision.session_id, experiment.id)
-                self.background_starter(
-                    experiment.id,
-                    lambda: run_then_resume(
-                        lambda: self.experiment_service.run_experiment(
-                            experiment.id,
-                            github_work_tracking=self.github_work_tracking,
-                        ),
-                        lambda: resume_with_new_orchestrator(
-                            self.orchestrator_factory,
-                            self.experiment_service,
-                            self.github_work_tracking,
-                            experiment.id,
-                            operations_registry=self.operations_registry,
-                            allow_mutation=False,
-                        ),
-                        experiment.id,
-                    ),
-                )
                 return NexusChatResult(
                     reply=decision.message or "Ich habe die vereinbarte Änderung als Experiment gestartet.",
                     session_id=decision.session_id,
                     action=decision.action,
-                    experiment_id=experiment.id,
+                    experiment_id=launch.experiment_id,
                     status="submitted",
                 )
 
@@ -297,6 +276,22 @@ class NexusChatService:
             close = getattr(orchestrator, "close", None)
             if close:
                 close()
+
+    def _experiment_launcher(self) -> ExperimentLauncher:
+        # Built per launch so a replaced background_starter is honoured.
+        return ExperimentLauncher(
+            self.experiment_service,
+            self.github_work_tracking,
+            self.background_starter,
+            lambda experiment_id: resume_with_new_orchestrator(
+                self.orchestrator_factory,
+                self.experiment_service,
+                self.github_work_tracking,
+                experiment_id,
+                operations_registry=self.operations_registry,
+                allow_mutation=False,
+            ),
+        )
 
     def _implementation_goal(self, orchestrator: NexusTaskOrchestrator, decision: TaskDecision, current_input: str) -> str:
         history = orchestrator.task_store.history(decision.session_id, limit=18, max_chars=9000)
