@@ -767,6 +767,8 @@ class OperationsRegistry:
                 f"{'applied' if row['patch_applied'] else 'none'}, rounds {row['rounds']}, "
                 f"{row['seconds']:.0f}s"
             )
+            if row.get("lenient_creates"):
+                line += f", lenient creates {row['lenient_creates']}"
             if row.get("file_level") is not None:
                 line += f", file level {row['file_level']}"
             if row.get("cold_time_limited"):

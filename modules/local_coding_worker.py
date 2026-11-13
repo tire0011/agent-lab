@@ -1459,6 +1459,7 @@ class LocalCodingWorker:
         self._last_call: CallRecord | None = None
         self.last_run_metrics: dict[str, Any] | None = None
         self.last_sample_stats: list[SampleStats] = []
+        self.lenient_creates = 0
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
@@ -1471,6 +1472,7 @@ class LocalCodingWorker:
         self.local_attempt_passed_generated_tests = None
         self.last_sample_stats = []
         self.last_run_metrics = None
+        self.lenient_creates = 0
         self._metrics = RunMetrics.start()
         # Replaced by _plan_subtasks when splitting is on and the task reaches planning.
         self.last_split = SplitOutcome(
@@ -1504,6 +1506,7 @@ class LocalCodingWorker:
                  + (f", subtask {split.failed_subtask} failed" if split.failed_subtask else "")
                  if split.split else f"Local task ran one-shot ({split.reason})"),
                 warning=not success, success=success, **split.log_fields(),
+                lenient_creates=self.lenient_creates,
             )
             self._log_run_metrics(experiment_logger, phase, success)
 
@@ -1746,6 +1749,11 @@ class LocalCodingWorker:
             f"Tests that must pass afterwards (run only; do not edit them unless listed "
             f"above): {tests}"
         )
+        missing = [path for path in subtask.files if not (Path(working_dir) / path).is_file()]
+        if missing:
+            essential += "\n" + "\n".join(
+                f"NEW FILE: {path} (use an empty SEARCH)" for path in missing
+            )
         earlier = "".join(applied).strip() or "(none yet)"
         context = (
             f"Changes already made by the earlier subtasks (git diff, already applied):\n{earlier}\n\n"
@@ -1830,6 +1838,10 @@ class LocalCodingWorker:
                 format_error = ""
                 try:
                     patch = _response_patch(output, working_dir, timeout, allowed_paths)
+                    lenient_creates = int(getattr(patch, "lenient_creates", 0))
+                    self.lenient_creates += lenient_creates
+                    if lenient_creates:
+                        extra = {**extra, "lenient_creates": lenient_creates}
                 except EditFormatError as exc:
                     patch = ""
                     format_error = f"local model SEARCH/REPLACE edits were rejected: {exc}"
