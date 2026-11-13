@@ -45,7 +45,9 @@ REASON_PROMPT_TOO_SLOW = "prompt_too_slow"
 REASON_GENERATION_TOO_SLOW = "generation_too_slow"
 REASON_TIMEOUT = "timeout"
 EARLY_STOP_REASONS = (REASON_PROMPT_TOO_SLOW, REASON_GENERATION_TOO_SLOW)
-_TIMING_NAMES = ("prompt_n", "prompt_ms", "predicted_n", "predicted_ms")
+_TIMING_NAMES = ("prompt_n", "prompt_ms", "predicted_n", "predicted_ms",
+                 # Speculative decoding (#669): only present with --model-draft.
+                 "draft_n", "draft_n_accepted")
 
 
 def _env_float(name: str, default: float) -> float:

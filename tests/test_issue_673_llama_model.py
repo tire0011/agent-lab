@@ -101,15 +101,18 @@ class LlamaStartTests(unittest.TestCase):
     def test_start_builds_args_from_the_conf_without_sourcing_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             conf = Path(tmp) / "llama.env"
-            conf.write_text("MODEL_DIR=/m\nMODEL=a.gguf\nDRAFT_MODEL=d.gguf\nCTX=16384\n$(touch /tmp/x)=1\n")
+            models = Path(tmp) / "m"
+            models.mkdir()
+            (models / "d.gguf").write_text("draft")  # #669: a missing draft gives no flag
+            conf.write_text(f"MODEL_DIR={models}\nMODEL=a.gguf\nDRAFT_MODEL=d.gguf\nCTX=16384\n$(touch /tmp/x)=1\n")
             fake = Path(tmp) / "llama-server"
             fake.write_text('#!/usr/bin/env bash\necho "$@"\n')
             fake.chmod(0o755)
             out = subprocess.run(["bash", str(START)], capture_output=True, text=True,
                                  env={**os.environ, "NEXUS_LLAMA_CONF": str(conf), "LLAMA_SERVER_BIN": str(fake)})
-        self.assertIn("--model /m/a.gguf", out.stdout)
+        self.assertIn(f"--model {models}/a.gguf", out.stdout)
         self.assertIn("--ctx-size 16384", out.stdout)
-        self.assertIn("--model-draft /m/d.gguf", out.stdout)
+        self.assertIn(f"--model-draft {models}/d.gguf", out.stdout)
 
 
 class LlamaModelOperationTests(unittest.TestCase):

@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from modules.local_model_rates import draft_from_timings
+
 ENV_SERVER_PID = "NEXUS_LLAMA_SERVER_PID"
 _PROCESS_NAMES = ("llama-server", "llama_server", "llama-cpp-server")
 _PROC = Path("/proc")
@@ -113,6 +115,15 @@ class CallRecord:
     tokens_out: int | None
     temperature: float = 0.0
     seed: int | None = None
+    # Speculative decoding (#669); None when the server drafted nothing.
+    draft_n: int | None = None
+    draft_n_accepted: int | None = None
+
+    @property
+    def draft_acceptance_rate(self) -> float | None:
+        if not self.draft_n or self.draft_n_accepted is None:
+            return None
+        return self.draft_n_accepted / self.draft_n
 
     @property
     def tokens_per_second(self) -> float | None:
@@ -138,8 +149,9 @@ def call_record(call_type: str, outcome: str, wall_seconds: float, timings: Any,
             tokens_out = int(max(0, predicted))
     if tokens_in is None and isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool):
         tokens_in = prompt_tokens
+    draft = draft_from_timings(timings if isinstance(timings, dict) else None)
     return CallRecord(call_type, outcome, max(0.0, float(wall_seconds)), tokens_in, tokens_out,
-                      temperature, seed)
+                      temperature, seed, draft.get("draft_n"), draft.get("draft_n_accepted"))
 
 
 @dataclass
@@ -193,6 +205,8 @@ class RunMetrics:
         tokens_out = sum(c.tokens_out or 0 for c in self.calls)
         model_seconds = sum(c.wall_seconds for c in self.calls)
         patch_calls = [c for c in self.calls if c.call_type == "patch"]
+        drafted = sum(c.draft_n or 0 for c in self.calls)
+        accepted = sum(c.draft_n_accepted or 0 for c in self.calls if c.draft_n)
         return {
             "wall_seconds": round(wall, 3),
             "model_calls": len(self.calls),
@@ -200,6 +214,9 @@ class RunMetrics:
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "tokens_per_second": round(tokens_out / model_seconds, 3) if model_seconds > 0 else None,
+            "draft_n": drafted or None,
+            "draft_n_accepted": accepted if drafted else None,
+            "draft_acceptance_rate": round(accepted / drafted, 3) if drafted else None,
             "patch_samples": len(patch_calls),
             "sample_wall_seconds": [round(c.wall_seconds, 3) for c in patch_calls],
             "sample_wall_seconds_median": (round(statistics.median(c.wall_seconds for c in patch_calls), 3)

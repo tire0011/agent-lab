@@ -21,6 +21,12 @@ generation rate is a real measurement. Admission also uses conservative
 estimates: that is what prevents a zero-token timeout from immediately being
 repeated. Files written before #667 have no ``estimated_*`` keys.
 
+Speculative decoding (#669): when llama-server runs with a draft model its
+``timings`` carry ``draft_n`` and ``draft_n_accepted``;
+:func:`draft_from_timings` turns them into an acceptance rate, which
+:meth:`LocalModelRates.record` keeps in its own rolling window
+(:meth:`LocalModelRates.draft_acceptance`). Without them nothing changes.
+
 Failure behaviour: a missing, unreadable, corrupt or half-written file reads
 as "no measurements yet", which leaves prompts untouched; a failed write is
 dropped. Writes go to a unique temporary file that is atomically renamed, so a
@@ -46,7 +52,10 @@ RATES_FILE_NAME = "local-model-rates.json"
 MAX_SAMPLES = 21
 _KEYS = ("prompt_tokens_per_second", "generation_tokens_per_second")
 _ESTIMATED = {key: f"estimated_{key}" for key in _KEYS}
-_ALL_KEYS = (*_KEYS, *_ESTIMATED.values())
+# Rolling share of drafted tokens the main model accepted (#669). Recorded with
+# the measured rates; never used for the time budget.
+_DRAFT_KEY = "draft_acceptance_rate"
+_ALL_KEYS = (*_KEYS, *_ESTIMATED.values(), _DRAFT_KEY)
 _DEFAULT_DB_PATH = "/var/lib/nexus/agent.db"
 
 
@@ -58,9 +67,35 @@ def default_rates_path() -> Path:
     return Path(db_path).parent / RATES_FILE_NAME
 
 
+def _valid_sample(key: str, value: Any) -> bool:
+    if key == _DRAFT_KEY:  # an acceptance rate of 0 is a real measurement
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and 0 <= value <= 1)
+    return _valid_rate(value)
+
+
 def _valid_rate(value: Any) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value) and value > 0)
+
+
+def draft_from_timings(timings: dict[str, Any] | None) -> dict[str, float | int]:
+    """Speculative-decoding counters from llama-server ``timings`` (#669).
+
+    ``{"draft_n", "draft_n_accepted", "draft_acceptance_rate"}`` when the server
+    reports drafted tokens (only with ``--model-draft``); ``{}`` when they are
+    missing, malformed or nothing was drafted.
+    """
+    if not isinstance(timings, dict):
+        return {}
+    drafted, accepted = timings.get("draft_n"), timings.get("draft_n_accepted")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+               and v >= 0 for v in (drafted, accepted)):
+        return {}
+    if drafted <= 0 or accepted > drafted:
+        return {}
+    return {"draft_n": int(drafted), "draft_n_accepted": int(accepted),
+            "draft_acceptance_rate": float(accepted) / float(drafted)}
 
 
 def rates_from_timings(timings: dict[str, Any] | None) -> dict[str, float]:
@@ -98,7 +133,7 @@ class LocalModelRates:
             if not isinstance(entry, dict):
                 continue
             result[str(name)] = {
-                key: [float(v) for v in entry.get(key, []) if _valid_rate(v)]
+                key: [float(v) for v in entry.get(key, []) if _valid_sample(key, v)]
                 if isinstance(entry.get(key), list) else []
                 for key in _ALL_KEYS
             }
@@ -119,16 +154,28 @@ class LocalModelRates:
             result.append(statistics.median(values) if values else None)
         return result[0], result[1]
 
+    def draft_acceptance(self) -> float | None:
+        """Median draft acceptance rate (0-1); ``None`` without speculative decoding."""
+        values = self._samples().get(_DRAFT_KEY) or []
+        return statistics.median(values) if values else None
+
     def generation_measured(self) -> bool:
         """Whether the generation rate comes from real timings, not a guess."""
         return bool(self._samples().get("generation_tokens_per_second"))
 
     def record(self, timings: dict[str, Any] | None) -> bool:
-        """Add one call's rates; ``True`` if something was stored. Never raises."""
+        """Add one call's rates; ``True`` if something was stored. Never raises.
+
+        With speculative decoding the call's draft acceptance rate is stored
+        with them (#669); it alone does not count as a stored measurement.
+        """
         try:
-            samples = rates_from_timings(timings)
+            samples: dict[str, float] = rates_from_timings(timings)
             if not samples:
                 return False
+            draft = draft_from_timings(timings)
+            if draft:
+                samples[_DRAFT_KEY] = float(draft["draft_acceptance_rate"])
             self._append(samples)
             return True
         except Exception:  # measuring must never fail a model call

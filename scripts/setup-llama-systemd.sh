@@ -6,6 +6,16 @@
 # Usage:
 #   sudo bash scripts/setup-llama-systemd.sh
 #
+# Speculative decoding (#669, optional):
+#   sudo LLAMA_DRAFT_MODEL_FILE=qwen2.5-coder-0.5b-instruct-q8_0.gguf \
+#        bash scripts/setup-llama-systemd.sh
+# A bare name is looked up in the model directory; a path must point into it.
+# If the file exists, DRAFT_MODEL/DRAFT_MAX=16/DRAFT_MIN=4 go into
+# /etc/agent-lab/llama.env and nexus-llama-start adds
+# --model-draft <file> --draft-max 16 --draft-min 4. Unset/empty (default) or a
+# missing file leaves everything as it was. Fetch the file with
+# scripts/fetch-draft-model.sh.
+#
 # After setup:
 #   systemctl status llama-server
 #   journalctl -u llama-server -f
@@ -17,7 +27,7 @@ LOG_PREFIX="[setup-llama-systemd]"
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Override any of these with environment variables before running the script.
 SERVICE_NAME="llama-server"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SERVICE_FILE="${LLAMA_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
 
 # Model file path.  Set LOCAL_MODEL_PATH to the directory and MODEL_FILE to
 # the filename, or set MODEL_FULL_PATH directly to skip the join.
@@ -36,6 +46,10 @@ CTX_SIZE="${LOCAL_MODEL_CONTEXT:-8192}"
 SERVER_PORT="${LOCAL_MODEL_PORT:-8080}"
 # One slot = one concurrent request; avoids memory pressure on CPU-only.
 N_PARALLEL="${LOCAL_MODEL_PARALLEL:-1}"
+# Optional draft model for speculative decoding (#669); empty = none.
+DRAFT_MODEL_INPUT="${LLAMA_DRAFT_MODEL_FILE:-}"
+DRAFT_MAX="${LLAMA_DRAFT_MAX:-16}"
+DRAFT_MIN="${LLAMA_DRAFT_MIN:-4}"
 
 echo "$LOG_PREFIX Configuring systemd service '$SERVICE_NAME'  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "$LOG_PREFIX Model path   : $MODEL_FULL_PATH"
@@ -43,6 +57,28 @@ echo "$LOG_PREFIX Port         : 127.0.0.1:$SERVER_PORT"
 echo "$LOG_PREFIX Context      : $CTX_SIZE tokens"
 echo "$LOG_PREFIX Threads      : $N_THREADS"
 echo "$LOG_PREFIX Parallel slots: $N_PARALLEL"
+
+# nexus-llama-start resolves the draft as MODEL_DIR/DRAFT_MODEL, so only a file
+# that exists in the model directory is accepted.
+DRAFT_MODEL_NAME=""
+if [[ -n "$DRAFT_MODEL_INPUT" ]]; then
+    if [[ "$DRAFT_MODEL_INPUT" == */* ]]; then
+        draft_path="$DRAFT_MODEL_INPUT"
+    else
+        draft_path="$MODEL_DIR/$DRAFT_MODEL_INPUT"
+    fi
+    if [[ ! -f "$draft_path" ]]; then
+        echo "$LOG_PREFIX WARNING: draft model $draft_path not found - no speculative decoding." >&2
+        echo "$LOG_PREFIX Run scripts/fetch-draft-model.sh first." >&2
+    elif [[ "$(cd "$(dirname "$draft_path")" && pwd -P)" != "$(cd "$MODEL_DIR" 2>/dev/null && pwd -P)" ]]; then
+        echo "$LOG_PREFIX WARNING: draft model must be in $MODEL_DIR - no speculative decoding." >&2
+    elif ! [[ "$DRAFT_MAX" =~ ^[0-9]+$ && "$DRAFT_MIN" =~ ^[0-9]+$ ]]; then
+        echo "$LOG_PREFIX WARNING: LLAMA_DRAFT_MAX/LLAMA_DRAFT_MIN must be integers - no speculative decoding." >&2
+    else
+        DRAFT_MODEL_NAME="$(basename "$draft_path")"
+        echo "$LOG_PREFIX Draft model  : $draft_path (draft-max $DRAFT_MAX, draft-min $DRAFT_MIN)"
+    fi
+fi
 
 # Warn if the model file does not exist yet (download can happen later).
 if [[ ! -f "$MODEL_FULL_PATH" ]]; then
@@ -66,16 +102,31 @@ LLAMA_SERVER_BIN="$(command -v llama-server)"
 # rolls back a switch that leaves llama-server unhealthy. An existing file is
 # kept; a new one keeps the context size of the unit it replaces.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LLAMA_CONF="/etc/agent-lab/llama.env"
-install --owner=root --group=root --mode=0755 "$SCRIPT_DIR/nexus-llama-start.sh" /usr/local/sbin/nexus-llama-start
-if [[ ! -f "$LLAMA_CONF" ]]; then
+LLAMA_CONF="${NEXUS_LLAMA_CONF:-/etc/agent-lab/llama.env}"
+START_BIN="${NEXUS_LLAMA_START_BIN:-/usr/local/sbin/nexus-llama-start}"
+install --owner=root --group=root --mode=0755 "$SCRIPT_DIR/nexus-llama-start.sh" "$START_BIN"
+draft_lines=()
+if [[ -n "$DRAFT_MODEL_NAME" ]]; then
+    draft_lines=("DRAFT_MODEL=${DRAFT_MODEL_NAME}" "DRAFT_MAX=${DRAFT_MAX}" "DRAFT_MIN=${DRAFT_MIN}")
+fi
+if [[ -f "$LLAMA_CONF" && ${#draft_lines[@]} -gt 0 ]]; then
+    # An explicitly requested, existing draft model replaces the DRAFT_* keys
+    # of an existing configuration; every other key is kept.
+    tmp_conf="$(mktemp)"
+    grep -vE '^DRAFT_(MODEL|MAX|MIN)=' "$LLAMA_CONF" > "$tmp_conf" || true
+    printf '%s\n' "${draft_lines[@]}" >> "$tmp_conf"
+    install --mode=0644 "$tmp_conf" "$LLAMA_CONF"
+    rm -f "$tmp_conf"
+    echo "$LOG_PREFIX Updated draft model in $LLAMA_CONF"
+elif [[ ! -f "$LLAMA_CONF" ]]; then
     if [[ -z "${LOCAL_MODEL_CONTEXT:-}" && -f "$SERVICE_FILE" ]]; then
         old_ctx="$(grep -oE -- '--ctx-size [0-9]+' "$SERVICE_FILE" | awk '{print $2}' | head -1 || true)"
         CTX_SIZE="${old_ctx:-$CTX_SIZE}"
     fi
-    install -d --mode=0755 /etc/agent-lab
+    install -d --mode=0755 "$(dirname "$LLAMA_CONF")"
     printf '%s\n' "MODEL_DIR=${MODEL_DIR}" "MODEL=$(basename "$MODEL_FULL_PATH")" \
-        "CTX=${CTX_SIZE}" "THREADS=${N_THREADS}" "PARALLEL=${N_PARALLEL}" "PORT=${SERVER_PORT}" > "$LLAMA_CONF"
+        "CTX=${CTX_SIZE}" "THREADS=${N_THREADS}" "PARALLEL=${N_PARALLEL}" "PORT=${SERVER_PORT}" \
+        ${draft_lines[@]+"${draft_lines[@]}"} > "$LLAMA_CONF"
     chmod 0644 "$LLAMA_CONF"
     echo "$LOG_PREFIX Wrote $LLAMA_CONF (context $CTX_SIZE)"
 fi
@@ -92,7 +143,7 @@ Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${MODEL_DIR}
 Environment=LLAMA_SERVER_BIN=${LLAMA_SERVER_BIN}
-ExecStart=/usr/local/sbin/nexus-llama-start
+ExecStart=${START_BIN}
 Restart=on-failure
 RestartSec=15
 StandardOutput=journal
