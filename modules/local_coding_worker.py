@@ -2096,6 +2096,10 @@ class LocalCodingWorker:
                 prompt_tokens_cached=prompt_cached,
                 prompt_tokens_total=prompt_total,
                 prompt_cache_ratio=cache_ratio,
+                **({"draft_n": self._last_call.draft_n,
+                    "draft_n_accepted": self._last_call.draft_n_accepted,
+                    "draft_acceptance_rate": self._last_call.draft_acceptance_rate}
+                   if self._last_call.draft_n else {}),
                 max_tokens=max_tokens,
                 **({"stream": stream} if (stream := getattr(self.client, "last_stream", None))
                    and isinstance(stream, dict) else {}),

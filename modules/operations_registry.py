@@ -39,7 +39,7 @@ LLAMA_MODEL_COMMAND = ("sudo", "-n", "/usr/local/sbin/nexus-llama-model")
 _HF_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _GGUF_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.gguf$")
 _LLAMA_SWITCH_KEYS = {"model": "MODEL", "draft_model": "DRAFT_MODEL", "draft_max": "DRAFT_MAX",
-                      "ctx": "CTX", "threads": "THREADS", "parallel": "PARALLEL"}
+                      "draft_min": "DRAFT_MIN", "ctx": "CTX", "threads": "THREADS", "parallel": "PARALLEL"}
 _PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{1,62}$")
 MACHINE_REBOOT_COMMAND = ("sudo", "-n", "systemd-run", "--collect", "--on-active=60", "systemctl", "reboot")
 # Experiment statuses that a reboot would interrupt. Queued work has not
@@ -388,6 +388,7 @@ class OperationsRegistry:
                     OperationArgSpec("model", "string", "Dateiname des Hauptmodells (.gguf)."),
                     OperationArgSpec("draft_model", "string", "Draft-Modell für Speculative Decoding; leer schaltet es ab."),
                     OperationArgSpec("draft_max", "integer", "Höchstzahl Draft-Tokens (1-64)."),
+                    OperationArgSpec("draft_min", "integer", "Mindestzahl Draft-Tokens (0-64)."),
                     OperationArgSpec("ctx", "integer", "Kontextgröße in Tokens (512-65536)."),
                     OperationArgSpec("threads", "integer", "CPU-Threads."),
                     OperationArgSpec("parallel", "integer", "Parallele Slots (1-4)."),

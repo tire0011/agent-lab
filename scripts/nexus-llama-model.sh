@@ -4,7 +4,7 @@
 #
 #   nexus-llama-model list
 #   nexus-llama-model download <hf-owner/repo> <file.gguf>
-#   nexus-llama-model switch KEY=VALUE ...   (MODEL DRAFT_MODEL DRAFT_MAX CTX THREADS PARALLEL)
+#   nexus-llama-model switch KEY=VALUE ...   (MODEL DRAFT_MODEL DRAFT_MAX DRAFT_MIN CTX THREADS PARALLEL)
 #
 # Downloads come only from huggingface.co, only .gguf, within a size limit and
 # with disk space to spare. A switch that leaves llama-server unhealthy is
@@ -53,7 +53,7 @@ switch)
     shift
     [[ $# -ge 1 ]] || die "usage: switch KEY=VALUE ..."
     declare -A new
-    for key in MODEL_DIR MODEL DRAFT_MODEL DRAFT_MAX CTX THREADS PARALLEL PORT; do
+    for key in MODEL_DIR MODEL DRAFT_MODEL DRAFT_MAX DRAFT_MIN CTX THREADS PARALLEL PORT; do
         new[$key]="$(conf_get "$key")"
     done
     new[MODEL_DIR]="${new[MODEL_DIR]:-$MODEL_DIR}"
@@ -63,6 +63,7 @@ switch)
             MODEL) [[ "$value" =~ $NAME_RE && -f "$MODEL_DIR/$value" ]] || die "MODEL must be a downloaded .gguf in $MODEL_DIR" ;;
             DRAFT_MODEL) [[ -z "$value" || ( "$value" =~ $NAME_RE && -f "$MODEL_DIR/$value" ) ]] || die "DRAFT_MODEL must be empty or a downloaded .gguf" ;;
             DRAFT_MAX) [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 && "$value" -le 64 ]] || die "DRAFT_MAX must be 1-64" ;;
+            DRAFT_MIN) [[ "$value" =~ ^[0-9]+$ && "$value" -le 64 ]] || die "DRAFT_MIN must be 0-64" ;;
             CTX) [[ "$value" =~ ^[0-9]+$ && "$value" -ge 512 && "$value" -le 65536 ]] || die "CTX must be 512-65536" ;;
             THREADS) [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 && "$value" -le "$(nproc)" ]] || die "THREADS must be 1-$(nproc)" ;;
             PARALLEL) [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 && "$value" -le 4 ]] || die "PARALLEL must be 1-4" ;;
@@ -73,7 +74,7 @@ switch)
     backup="$CONF.previous"
     [[ -f "$CONF" ]] && cp -p "$CONF" "$backup"
     tmpconf="$(mktemp)"
-    for key in MODEL_DIR MODEL DRAFT_MODEL DRAFT_MAX CTX THREADS PARALLEL PORT; do
+    for key in MODEL_DIR MODEL DRAFT_MODEL DRAFT_MAX DRAFT_MIN CTX THREADS PARALLEL PORT; do
         [[ -n "${new[$key]}" ]] && echo "$key=${new[$key]}"
     done > "$tmpconf"
     install -m 0644 "$tmpconf" "$CONF"; rm -f "$tmpconf"

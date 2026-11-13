@@ -461,6 +461,35 @@ To measure: set `NEXUS_LOCAL_SAMPLES=1` with
 `full_pass_rate` rises by at least 5 points and the median seconds per task stay
 under 3x the `samples1` median.
 
+### Speculative decoding with a draft model (#669)
+
+A small model with the same tokenizer as the 7B guesses tokens ahead, and the
+7B checks those guesses. This should speed up output that mostly copies the
+given file text, such as SEARCH blocks. The setting is off by default.
+
+    bash scripts/fetch-draft-model.sh            # qwen2.5-coder-0.5b-instruct-q8_0.gguf, sha256-checked
+    python scripts/bench_local_speed.py --url http://127.0.0.1:8080 > /tmp/no-draft.json
+    sudo LLAMA_DRAFT_MODEL_FILE=qwen2.5-coder-0.5b-instruct-q8_0.gguf bash scripts/setup-llama-systemd.sh
+    #   (or: nexus-llama-model switch DRAFT_MODEL=qwen2.5-coder-0.5b-instruct-q8_0.gguf DRAFT_MAX=16 DRAFT_MIN=4)
+    python scripts/bench_local_speed.py --url http://127.0.0.1:8080 --baseline /tmp/no-draft.json
+
+The setup writes `DRAFT_MODEL`/`DRAFT_MAX`/`DRAFT_MIN` to
+`/etc/agent-lab/llama.env`. From those keys, `nexus-llama-start` adds
+`--model-draft <file> --draft-max 16 --draft-min 4`. If the draft file is
+missing, `nexus-llama-start` starts without it and logs a warning. The
+`fetch-draft-model.sh` script checks the download against `DRAFT_MODEL_SHA256`
+if that is set. Otherwise it uses the sha256 that huggingface.co sends in
+`X-Linked-Etag`, and it refuses the download if neither is available.
+
+With a draft model, llama-server's `timings` contain `draft_n` and
+`draft_n_accepted`. Each `local_model_call` event then logs them along with
+`draft_acceptance_rate`. `local_run_metrics` adds the totals, and the rates file
+keeps a rolling `draft_acceptance_rate`. The bench output includes
+`speedup.edit`, the output tok/s ratio on the edit prompt. The draft is a
+success at 1.4 or above and a negative result below 1.2. Compare
+`memory.before`/`after` with `free -m`. After a switch, delete the rates file:
+the old rates were measured without a draft.
+
 ## Known limitations
 
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.
