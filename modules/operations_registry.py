@@ -690,6 +690,14 @@ class OperationsRegistry:
                    if stats.get("median_cpu_seconds") is not None else "")
                 + (f", peak RSS {stats['peak_rss_kb'] / 1024:.0f} MiB" if stats.get("peak_rss_kb") is not None else "")
             )
+        for stats in summary.get("unit_variants", []):
+            lines.append(
+                f"hunk variant {stats['prompt_variant']}: {stats['units']} units, "
+                f"applied {stats['applied']}, compiled {stats['compiled']}, tests passed "
+                f"{stats['tests_passed']}/{stats['units']} ({stats['unit_pass_rate']:.0%}), "
+                f"overlap {stats['average_overlap']:.0%}, {stats['average_seconds']:.1f}s/unit, "
+                f"prompt/cache tokens {stats['prompt_tokens']}/{stats['cached_tokens']}"
+            )
         if summary["common"]:
             lines.append(f"on the {summary['common_experiments']} experiments scored under every variant:")
             for stats in summary["common"]:

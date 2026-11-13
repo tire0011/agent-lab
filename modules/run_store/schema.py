@@ -992,6 +992,27 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_local_replays_created_at
             ON local_replays(created_at);
 
+        CREATE TABLE IF NOT EXISTS local_replay_units (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL,
+            file TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            prompt_variant TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            applied INTEGER NOT NULL DEFAULT 0 CHECK (applied IN (0, 1)),
+            compiled INTEGER NOT NULL DEFAULT 0 CHECK (compiled IN (0, 1)),
+            tests_passed INTEGER NOT NULL DEFAULT 0 CHECK (tests_passed IN (0, 1)),
+            overlap REAL NOT NULL DEFAULT 0,
+            seconds REAL NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(experiment_id, file, symbol, prompt_variant)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_local_replay_units_variant
+            ON local_replay_units(prompt_variant, created_at);
+
         CREATE TABLE IF NOT EXISTS local_replay_lease (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             token TEXT NOT NULL,

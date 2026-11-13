@@ -40,6 +40,8 @@ owner process is dead; only that lease's recorded worktree may be cleaned.
 from __future__ import annotations
 
 import asyncio
+import ast
+import difflib
 import json
 import logging
 import os
@@ -66,6 +68,7 @@ from modules.run_store import DEFAULT_DB_PATH, init_db
 logger = logging.getLogger(__name__)
 
 ENV_VARIANT = "NEXUS_SHADOW_REPLAY_VARIANT"
+ENV_UNIT = "NEXUS_SHADOW_REPLAY_UNIT"
 DEFAULT_VARIANT = "baseline"
 ENV_ENABLED = "NEXUS_SHADOW_REPLAY"
 SETTING_ENABLED = "nexus.shadow_replay_enabled"
@@ -80,6 +83,8 @@ _GIT_TIMEOUT_SECONDS = 60.0
 _BUSY_TIMEOUT_MS = 10_000
 _MAX_ERROR_CHARS = 2000
 _MAX_VARIANT_CHARS = 64
+MAX_HUNK_GROUPS = 5
+_MAX_MICRO_FILE_BYTES = 16 * 1024
 
 # Coders that cost money; only their merged work is replayed.
 PAID_PROVIDERS = ("codex", "claude")
@@ -404,6 +409,110 @@ class MergedTestChange:
     delete: bool
 
 
+@dataclass(frozen=True)
+class HunkUnit:
+    """Merged Python hunks belonging to one enclosing symbol."""
+
+    file: str
+    symbol: str
+    old_start: int
+    old_end: int
+    new_start: int
+    new_end: int
+    base_text: str
+    merged_text: str
+    merged_lines: frozenset[str]
+
+
+def _source_at(repo: str, commit: str, path: str) -> str:
+    shown = _git(repo, ["show", f"{commit}:{path}"], check=False)
+    return shown.stdout if shown.returncode == 0 else ""
+
+
+def _symbols(source: str) -> list[tuple[int, int, str]]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    found: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            found.append((node.lineno, getattr(node, "end_lineno", node.lineno), node.name))
+    return sorted(found, key=lambda item: (item[1] - item[0], item[0]))
+
+
+def _is_test_file(path: str) -> bool:
+    name = Path(path).name
+    return path.startswith(TESTS_DIR) or bool(_TEST_FILE_RE.match(name))
+
+
+def hunk_units(repo: str, old: str, new: str, limit: int = MAX_HUNK_GROUPS) -> list[HunkUnit]:
+    """Return at most *limit* non-test Python changes grouped by merged AST symbol."""
+    names = _git(repo, ["diff", "--name-only", "--diff-filter=AM", old, new]).stdout.splitlines()
+    units: list[HunkUnit] = []
+    for path in names:
+        if not path.endswith(".py") or _is_test_file(path):
+            continue
+        before, after = _source_at(repo, old, path), _source_at(repo, new, path)
+        symbols = _symbols(after)
+        old_symbols = {name: (start, end) for start, end, name in _symbols(before)}
+        matcher = difflib.SequenceMatcher(a=before.splitlines(), b=after.splitlines())
+        opcodes = matcher.get_opcodes()
+        globally_changed = {
+            line.strip() for tag, _i1, _i2, j1, j2 in opcodes if tag != "equal"
+            for line in after.splitlines()[j1:j2] if line.strip()
+        }
+        grouped: dict[str, list[tuple[int, int, int, int]]] = {}
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == "equal":
+                continue
+            touched = [s for s in symbols if s[0] <= max(j1 + 1, j2) and s[1] >= j1 + 1]
+            if not touched:
+                grouped.setdefault("<module>", []).append((i1, i2, j1, j2))
+            for start, end, symbol in touched:
+                old_range = old_symbols.get(symbol)
+                oi1, oi2 = ((old_range[0] - 1, old_range[1]) if old_range else (i1, i1))
+                grouped.setdefault(symbol, []).append((oi1, oi2, start - 1, end))
+        for symbol, chunks in grouped.items():
+            i1, i2 = min(x[0] for x in chunks), max(x[1] for x in chunks)
+            j1, j2 = min(x[2] for x in chunks), max(x[3] for x in chunks)
+            changed = frozenset(
+                line.strip() for _, _, a, b in chunks
+                for line in after.splitlines()[a:b]
+                if line.strip() and line.strip() in globally_changed
+            )
+            units.append(HunkUnit(path, symbol, i1 + 1, i2, j1 + 1, j2,
+                                  before, after, changed))
+            if len(units) >= limit:
+                return units
+    return units
+
+
+def splice_unit(unit: HunkUnit, local_text: str) -> str:
+    """Put the local version of this unit into the merged file, preserving other merged hunks."""
+    if unit.symbol != "<module>":
+        local_symbol = next((item for item in _symbols(local_text) if item[2] == unit.symbol), None)
+        if local_symbol is None:
+            return unit.merged_text
+        local_lines = local_text.splitlines(keepends=True)
+        merged_lines = unit.merged_text.splitlines(keepends=True)
+        replacement = local_lines[local_symbol[0] - 1:local_symbol[1]]
+        return "".join(merged_lines[:unit.new_start - 1] + replacement + merged_lines[unit.new_end:])
+    base_lines, local_lines, merged_lines = (x.splitlines(keepends=True)
+                                              for x in (unit.base_text, local_text, unit.merged_text))
+    matcher = difflib.SequenceMatcher(a=base_lines, b=local_lines)
+    replacement: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        old_start = unit.old_start - 1
+        overlaps = (i1 < unit.old_end and i2 > old_start) or (i1 == i2 and old_start <= i1 < unit.old_end)
+        if not overlaps:
+            continue
+        if tag in {"equal", "replace", "insert"}:
+            replacement.extend(local_lines[j1:j2])
+    start, end = unit.new_start - 1, unit.new_end
+    return "".join(merged_lines[:start] + replacement + merged_lines[end:])
+
+
 def _safe_test_path(path: str) -> bool:
     parts = path.split("/")
     return (path.startswith(TESTS_DIR) and not path.startswith("/") and ".." not in parts
@@ -647,6 +756,14 @@ def default_worker_factory(client: Any) -> Any:
                              samples=local_samples(), sample_temperatures=sample_temperatures())
 
 
+def hunk_worker_factory(client: Any) -> Any:
+    """The same correcting local worker, with task splitting disabled for a micro-task."""
+    from modules.local_coding_worker import LocalCodingWorker, local_samples, sample_temperatures
+
+    return LocalCodingWorker(client=client, split_tasks=False, planner=_no_free_tier,
+                             samples=local_samples(), sample_temperatures=sample_temperatures())
+
+
 class _RoundCounter:
     """An experiment logger that counts the worker's patch rounds and keeps its run metrics (#639)."""
 
@@ -675,6 +792,61 @@ def _task_text(goal: str) -> str:
     from modules.experiment_service.prompts import _build_direct_implementation_prompt
 
     return _build_direct_implementation_prompt(goal)
+
+
+def _micro_task(row: sqlite3.Row, summary: str, unit: HunkUnit) -> str:
+    source = unit.base_text
+    if len(source.encode()) > _MAX_MICRO_FILE_BYTES:
+        lines = source.splitlines()
+        imports = [line for line in lines if line.startswith(("import ", "from "))]
+        body = lines[max(0, unit.old_start - 1):unit.old_end]
+        source = "\n".join(imports + ["", *body]) + "\n"
+    goal = f"{summary}: update {unit.symbol}"
+    return _task_text(
+        f"{row['goal']}\n\nOne-line goal: {goal}\n"
+        f"Change only {unit.file}, specifically {unit.symbol}. Do not split this task.\n\n"
+        f"Base source for {unit.file}:\n```python\n{source}\n```"
+    )
+
+
+def _changed_line_overlap(unit: HunkUnit, local_text: str) -> float:
+    changed: set[str] = set()
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(
+            a=unit.base_text.splitlines(), b=local_text.splitlines()).get_opcodes():
+        if tag != "equal":
+            changed.update(line.strip() for line in local_text.splitlines()[j1:j2] if line.strip())
+    if not unit.merged_lines:
+        return 1.0 if not changed else 0.0
+    return len(changed & set(unit.merged_lines)) / len(unit.merged_lines)
+
+
+def _relevant_tests(repo: str, new: str, changes: list[MergedTestChange], unit: HunkUnit) -> list[MergedTestChange]:
+    module = Path(unit.file).stem
+    selected = []
+    for change in changes:
+        if change.delete:
+            continue
+        content = _source_at(repo, new, change.path)
+        if module in Path(change.path).stem or re.search(rf"\b{re.escape(module)}\b", content):
+            selected.append(change)
+    return selected
+
+
+def run_unit_tests(worktree: str, tests: list[str], module: str, timeout: float) -> MergedTestRun:
+    """Run merged tests selected by the changed module name."""
+    if not tests:
+        return MergedTestRun(0, 0, "no merged tests touch this module")
+    with tempfile.TemporaryDirectory(prefix="nexus-shadow-unit-tests-") as tmp:
+        report = str(Path(tmp) / "junit.xml")
+        cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+               f"--junitxml={report}", "-k", module, *tests]
+        code, output = _run_bounded(cmd, worktree, _test_env(tmp), timeout)
+        if code is None:
+            return MergedTestRun(0, 0, f"unit tests timed out after {timeout:g}s")
+        if not Path(report).is_file():
+            return MergedTestRun(0, 0, f"pytest exited {code} without a report: {output[-500:]}")
+        total, passed = parse_junit(report)
+        return MergedTestRun(total, passed, None if code == 0 else output[-500:])
 
 
 # ---- the replay --------------------------------------------------------------
@@ -778,8 +950,9 @@ def replay(
     client: Any | None = None,
     worker_factory: Callable[[Any], Any] | None = None,
     test_runner: Callable[[str, list[str], float], MergedTestRun] | None = None,
+    unit: str = "whole",
     _global_lease: GlobalLease | None = None,
-) -> dict[str, Any] | None:
+) -> Any:
     """Replay one merged paid experiment locally and store one ``local_replays`` row.
 
     Returns the stored row, or ``None`` when the experiment is already stored
@@ -787,6 +960,14 @@ def replay(
     ``ValueError`` for an experiment that is unknown, not merged, not paid or
     without base commit. Set-up failures are stored as status ``error``.
     """
+    if unit == "hunk":
+        return replay_hunks(
+            experiment_id, repo_root=repo_root, db_path=db_path, variant=variant,
+            client=client, worker_factory=worker_factory, test_runner=test_runner,
+            _global_lease=_global_lease,
+        )
+    if unit != "whole":
+        raise ValueError("unit must be 'whole' or 'hunk'")
     variant = variant or prompt_variant()
     conn = _connect(db_path)
     owned_lease = _global_lease is None
@@ -809,7 +990,7 @@ def replay(
                 _run_replay(repo_root, row, adoption, outcome, client,
                             worker_factory or default_worker_factory, test_runner or run_merged_tests,
                             db_path=db_path, lease_token=global_lease.token)
-            except Exception as exc:  # stored, so a broken case is not retried every tick
+            except Exception as exc:
                 outcome.status = STATUS_ERROR
                 outcome.error = f"{type(exc).__name__}: {exc}" if not isinstance(exc, ReplayError) else str(exc)
                 logger.warning("local replay of %s failed: %s", experiment_id, outcome.error)
@@ -818,12 +999,110 @@ def replay(
             if not finalized:
                 try:
                     _release(conn, experiment_id, variant, token)
-                except Exception:  # noqa: BLE001 - the lease expires anyway
+                except Exception:
                     logger.exception("local replay: could not release claim %s", experiment_id)
         return get_replay(experiment_id, variant, db_path=db_path)
     finally:
         if owned_lease:
             _release_global_lease(conn, global_lease.token)
+        conn.close()
+
+
+def replay_hunks(
+    experiment_id: str,
+    *,
+    repo_root: str,
+    db_path: str = DEFAULT_DB_PATH,
+    variant: str | None = None,
+    client: Any | None = None,
+    worker_factory: Callable[[Any], Any] | None = None,
+    test_runner: Callable[[str, list[str], float], MergedTestRun] | None = None,
+    _global_lease: GlobalLease | None = None,
+) -> list[dict[str, Any]]:
+    """Score up to five merged AST hunk groups as independent micro-tasks."""
+    variant = variant or prompt_variant()
+    conn = _connect(db_path)
+    owned_lease = _global_lease is None
+    lease = _global_lease or _acquire_global_lease(conn, lease_seconds())
+    if lease is None:
+        conn.close()
+        return []
+    try:
+        cleanup_orphaned_worktree(repo_root, lease.orphaned_worktree)
+        row, adoption = _load(conn, experiment_id)
+        base = str(row["base_commit_sha"]).strip()
+        old, new = merged_range(repo_root, adoption["integrated_commit_sha"],
+                                adoption["experiment_commit_sha"], base)
+        units = hunk_units(repo_root, old, new)
+        summary = _git(repo_root, ["show", "-s", "--format=%s", new]).stdout.strip()
+        test_changes = merged_test_changes(repo_root, old, new)
+        client = client if client is not None else _UsageCountingClient()
+        factory = worker_factory or hunk_worker_factory
+        results: list[dict[str, Any]] = []
+        for item in units:
+            existing = conn.execute(
+                "SELECT * FROM local_replay_units WHERE experiment_id=? AND file=? AND symbol=? "
+                "AND prompt_variant=?", (experiment_id, item.file, item.symbol, variant),
+            ).fetchone()
+            if existing is not None:
+                results.append(_unit_row(existing))
+                continue
+            worktree = _create_worktree(repo_root, base, db_path=db_path, lease_token=lease.token)
+            started = time.monotonic()
+            applied = compiled = passed = False
+            overlap = 0.0
+            usage: dict[str, Any] = {}
+            try:
+                worker = factory(client)
+                result = worker.run(
+                    task=_micro_task(row, summary, item), working_dir=worktree,
+                    sandbox="workspace-write", timeout_seconds=worker_timeout_seconds(),
+                    experiment_logger=_RoundCounter(), phase="local_shadow_replay_hunk",
+                )
+                usage = getattr(result, "usage", None) or {}
+                target = Path(worktree) / item.file
+                local_text = target.read_text(encoding="utf-8") if target.is_file() else ""
+                applied = bool(getattr(result, "success", False) and local_text != item.base_text)
+                overlap = _changed_line_overlap(item, local_text) if applied else 0.0
+                if applied:
+                    target.write_text(splice_unit(item, local_text), encoding="utf-8")
+                    compiled = _compiles(worktree, [item.file])
+                    relevant = _relevant_tests(repo_root, new, test_changes, item)
+                    tests = import_merged_tests(repo_root, worktree, new, relevant)
+                    runner = test_runner
+                    run = (runner(worktree, tests, tests_timeout_seconds()) if runner else
+                           run_unit_tests(worktree, tests, Path(item.file).stem, tests_timeout_seconds()))
+                    passed = bool(compiled and run.total > 0 and run.passed == run.total and not run.error)
+            except Exception as exc:  # one bad unit must not discard the other measurements
+                logger.warning("local hunk replay %s %s:%s failed: %s",
+                               experiment_id, item.file, item.symbol, exc)
+            finally:
+                seconds = time.monotonic() - started
+                remove_worktree(repo_root, worktree)
+                _set_lease_worktree(db_path, lease.token, None)
+            prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            cached_tokens = int(usage.get("cached_tokens") or
+                                (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO local_replay_units "
+                    "(experiment_id,file,symbol,prompt_variant,model,applied,compiled,tests_passed,"
+                    "overlap,seconds,prompt_tokens,cached_tokens,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (experiment_id, item.file, item.symbol, variant,
+                     str(getattr(client, "model", "") or ""), int(applied), int(compiled),
+                     int(passed), round(overlap, 6), round(seconds, 3), prompt_tokens,
+                     cached_tokens, _iso(_utcnow())),
+                )
+            stored = conn.execute(
+                "SELECT * FROM local_replay_units WHERE experiment_id=? AND file=? AND symbol=? "
+                "AND prompt_variant=?", (experiment_id, item.file, item.symbol, variant),
+            ).fetchone()
+            results.append(_unit_row(stored))
+        return results
+    finally:
+        if owned_lease:
+            _release_global_lease(conn, lease.token)
         conn.close()
 
 
@@ -847,6 +1126,21 @@ def next_candidate(conn: sqlite3.Connection, variant: str) -> str | None:
             ORDER BY COALESCE(a.ended_at, a.updated_at, e.created_at), e.id
             LIMIT 1""",
         (MERGED_ADOPTION_STATUS, *PAID_PROVIDERS, variant, STATUS_PENDING, _iso(_utcnow())),
+    ).fetchone()
+    return str(found[0]) if found else None
+
+
+def next_hunk_candidate(conn: sqlite3.Connection, variant: str) -> str | None:
+    found = conn.execute(
+        f"""SELECT e.id FROM experiments AS e
+            JOIN experiment_adoptions AS a ON a.experiment_id=e.id
+            WHERE a.status=?
+              AND e.implementation_provider IN ({','.join('?' for _ in PAID_PROVIDERS)})
+              AND TRIM(COALESCE(e.base_commit_sha, '')) != ''
+              AND NOT EXISTS (SELECT 1 FROM local_replay_units u
+                              WHERE u.experiment_id=e.id AND u.prompt_variant=?)
+            ORDER BY COALESCE(a.ended_at, a.updated_at, e.created_at), e.id LIMIT 1""",
+        (MERGED_ADOPTION_STATUS, *PAID_PROVIDERS, variant),
     ).fetchone()
     return str(found[0]) if found else None
 
@@ -904,12 +1198,17 @@ def replay_next(
     client: Any | None = None,
     worker_factory: Callable[[Any], Any] | None = None,
     test_runner: Callable[[str, list[str], float], MergedTestRun] | None = None,
+    unit: str | None = None,
 ) -> dict[str, Any]:
     """The tick sweep: at most one replay, only on an idle reachable server.
 
     Returns ``{"ran": bool, "reason": str, "experiment_id": ..., "replay": row}``.
     """
     variant = variant or prompt_variant()
+    unit = unit or os.environ.get(ENV_UNIT, "whole").strip().lower()
+    if unit not in {"whole", "hunk"}:
+        return {"ran": False, "reason": "unit must be whole or hunk",
+                "experiment_id": None, "replay": None}
     if not enabled(db_path):
         return {"ran": False, "reason": "disabled", "experiment_id": None, "replay": None}
     conn = _connect(db_path)
@@ -919,7 +1218,8 @@ def replay_next(
         return {"ran": False, "reason": "another local replay sweep is running",
                 "experiment_id": None, "replay": None}
     try:
-        experiment_id = next_candidate(conn, variant)
+        experiment_id = (next_hunk_candidate(conn, variant) if unit == "hunk" else
+                         next_candidate(conn, variant))
         if experiment_id is None:
             return {"ran": False, "reason": "no merged paid experiment left to replay",
                     "experiment_id": None, "replay": None}
@@ -930,11 +1230,12 @@ def replay_next(
         cleanup_orphaned_worktree(repo_root, lease.orphaned_worktree)
         stored = replay(experiment_id, repo_root=repo_root, db_path=db_path, variant=variant,
                         client=client, worker_factory=worker_factory, test_runner=test_runner,
-                        _global_lease=lease)
-        if stored is None:
+                        unit=unit, _global_lease=lease)
+        if stored is None or (unit == "hunk" and not stored):
             return {"ran": False, "reason": "already replayed or claimed",
                     "experiment_id": experiment_id, "replay": None}
-        return {"ran": True, "reason": stored["status"], "experiment_id": experiment_id,
+        reason = "scored" if unit == "hunk" else stored["status"]
+        return {"ran": True, "reason": reason, "experiment_id": experiment_id,
                 "replay": stored}
     finally:
         _release_global_lease(conn, lease.token)
@@ -957,6 +1258,54 @@ def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
     data["compiled"] = bool(data["compiled"])
     data["full_pass"] = is_full_pass(data)
     return data
+
+
+def _unit_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    for key in ("applied", "compiled", "tests_passed"):
+        data[key] = bool(data[key])
+    return data
+
+
+def list_replay_units(limit: int = 100, *, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    conn = _read_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM local_replay_units ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    return [_unit_row(row) for row in rows]
+
+
+def unit_variant_summary(*, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    """Aggregate hunk completion, pass rate, overlap and cost by prompt variant."""
+    conn = _read_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT prompt_variant, COUNT(*) units, SUM(applied) applied, SUM(compiled) compiled, "
+            "SUM(tests_passed) passed, AVG(overlap) overlap, AVG(seconds) seconds, "
+            "SUM(prompt_tokens) prompt_tokens, SUM(cached_tokens) cached_tokens "
+            "FROM local_replay_units GROUP BY prompt_variant ORDER BY prompt_variant"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    return [{
+        "prompt_variant": row["prompt_variant"], "units": int(row["units"]),
+        "applied": int(row["applied"] or 0), "compiled": int(row["compiled"] or 0),
+        "tests_passed": int(row["passed"] or 0),
+        "unit_pass_rate": round(int(row["passed"] or 0) / int(row["units"]), 4),
+        "average_overlap": round(float(row["overlap"] or 0), 4),
+        "average_seconds": round(float(row["seconds"] or 0), 3),
+        "prompt_tokens": int(row["prompt_tokens"] or 0),
+        "cached_tokens": int(row["cached_tokens"] or 0),
+    } for row in rows]
 
 
 def is_full_pass(row: dict[str, Any]) -> bool:
@@ -1062,4 +1411,5 @@ def variant_summary(*, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
         _stats(name, [r for r in by_variant[name] if r["experiment_id"] in common_ids])
         for name in sorted(by_variant)
     ] if common_ids else []
-    return {"variants": variants, "common_experiments": len(common_ids), "common": common}
+    return {"variants": variants, "common_experiments": len(common_ids), "common": common,
+            "unit_variants": unit_variant_summary(db_path=db_path)}

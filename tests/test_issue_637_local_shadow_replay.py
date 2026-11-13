@@ -192,6 +192,39 @@ class ReplayTests(unittest.TestCase):
     def setUp(self):
         self.fx = ReplayFixture(self)
 
+    def test_hunk_units_exclude_tests_and_splice_preserves_other_merged_changes(self):
+        units = lsr.hunk_units(self.fx.repo, self.fx.base, self.fx.merged)
+        self.assertGreaterEqual(len(units), 2)
+        self.assertFalse(any(unit.file.startswith("tests/") for unit in units))
+        add = next(unit for unit in units if unit.symbol == "add")
+        spliced = lsr.splice_unit(add, PARTIAL_CALC)
+        self.assertIn("return a + b", spliced)
+        self.assertIn("def mul(a, b):", spliced)
+        self.assertIn("return a * b", spliced)
+
+    def test_hunk_replay_scores_identical_and_wrong_local_patch(self):
+        identical = self.fx.replay(FakeWorker(FULL_CALC), variant="hunk-good")
+        # Whole mode remains the default.
+        self.assertEqual(identical["status"], lsr.STATUS_SCORED)
+        rows = lsr.replay("exp-1", repo_root=self.fx.repo, db_path=self.fx.db_path,
+                          variant="hunk-identical", unit="hunk", client=FakeClient(),
+                          worker_factory=lambda _client: FakeWorker(FULL_CALC))
+        calc_rows = [row for row in rows if row["file"] == "pkg/calc.py"]
+        self.assertGreaterEqual(len(calc_rows), 2)
+        self.assertTrue(all(row["applied"] and row["compiled"] and row["tests_passed"] for row in calc_rows))
+        self.assertTrue(all(row["overlap"] == 1.0 for row in calc_rows))
+
+        wrong = lsr.replay("exp-1", repo_root=self.fx.repo, db_path=self.fx.db_path,
+                           variant="hunk-wrong", unit="hunk", client=FakeClient(),
+                           worker_factory=lambda _client: FakeWorker(
+                               "VERSION = 1\n\ndef add(a, b):\n    return -1\n\n"
+                               "def sub(a, b):\n    return -1\n\n"
+                               "def mul(a, b):\n    return -1\n"))
+        self.assertTrue(any(not row["tests_passed"] for row in wrong))
+        summary = lsr.variant_summary(db_path=self.fx.db_path)["unit_variants"]
+        self.assertEqual({item["prompt_variant"] for item in summary},
+                         {"hunk-identical", "hunk-wrong"})
+
     def test_only_merged_test_files_come_in_never_source_files(self):
         seen = {}
 
@@ -571,6 +604,14 @@ class AggregateTests(unittest.TestCase):
                     "tests_passed, error, created_at, finished_at, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'm')",
                     (exp, variant, status, total, passed, error, f"2026-11-0{i % 9 + 1}", f"2026-11-0{i % 9 + 1}"),
                 )
+            for symbol, passed, overlap in (("add", 1, 1.0), ("sub", 0, 0.25)):
+                conn.execute(
+                    "INSERT INTO local_replay_units "
+                    "(experiment_id,file,symbol,prompt_variant,model,applied,compiled,tests_passed,"
+                    "overlap,seconds,prompt_tokens,cached_tokens,created_at) "
+                    "VALUES ('e1','pkg/calc.py',?,'baseline','m',1,1,?,?,2,100,25,'2026-11-01')",
+                    (symbol, passed, overlap),
+                )
         conn.close()
 
     def test_pass_rates_per_variant(self):
@@ -622,6 +663,9 @@ class ReadToolTests(unittest.TestCase):
         variants = {v["prompt_variant"]: v for v in body["variants"]}
         self.assertEqual(variants["baseline"]["full_pass_rate"], 0.25)
         self.assertEqual(body["common_experiments"], 2)
+        units = body["unit_variants"][0]
+        self.assertEqual((units["units"], units["tests_passed"], units["unit_pass_rate"]),
+                         (2, 1, 0.5))
         self.assertEqual(self.client.get("/local-replays?limit=0", headers=HEADERS).status_code, 422)
 
     def test_mcp_tool_is_read_only_and_calls_the_api(self):

@@ -401,12 +401,26 @@ class LocalReplayVariantStats(BaseModel):
     full_pass_rate: float | None = None
 
 
+class LocalReplayUnitVariantStats(BaseModel):
+    prompt_variant: str
+    units: int
+    applied: int
+    compiled: int
+    tests_passed: int
+    unit_pass_rate: float
+    average_overlap: float
+    average_seconds: float
+    prompt_tokens: int
+    cached_tokens: int
+
+
 class LocalReplaysResponse(BaseModel):
     count: int
     replays: list[LocalReplay]
     variants: list[LocalReplayVariantStats]
     common_experiments: int
     common: list[LocalReplayVariantStats]
+    unit_variants: list[LocalReplayUnitVariantStats] = Field(default_factory=list)
 
 
 class ActivityEntry(BaseModel):
