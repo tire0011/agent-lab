@@ -315,23 +315,25 @@ class VerificationMixin:
     ) -> "timing_check_module.TimingCheckResult | None":
         """Slow-machine check (#681): rerun the affected tests with clock drift.
 
-        Runs only on the built-in suite - a custom ``test_command`` belongs to
-        a layout this check knows nothing about. Never raises: a check that
-        cannot run must not fail a change.
+        Operational failures become inconclusive results so enabled
+        verification fails closed.
         """
         if not timing_check_module.timing_check_enabled():
             elog.info("verifying", "timing_check_skipped",
                       "Timing check disabled", reason="disabled")
-            return None
-        if self.test_command is not None:
-            elog.info("verifying", "timing_check_skipped",
-                      "Timing check runs only on the built-in suite", reason="custom_test_command")
             return None
         try:
             changed = self._timing_check_changed_paths(
                 experiment_id, worktree_path, git_status, elog,
             )
             affected = timing_check_module.select_affected_test_files(changed, worktree_path)
+            if affected.discovery_errors:
+                return timing_check_module.TimingCheckResult(
+                    timing_check_module.STATUS_INCONCLUSIVE,
+                    test_files=affected.files,
+                    detail="affected-test discovery incomplete: "
+                    + "; ".join(affected.discovery_errors[:10]),
+                )
             if not affected.files:
                 elog.info("verifying", "timing_check_skipped",
                           "No test file is affected by this change", reason="no_affected_tests")
@@ -346,10 +348,13 @@ class VerificationMixin:
                 self.test_python_executable, worktree_path, affected.files,
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
-        except Exception as exc:  # noqa: BLE001 - the check is advisory when it cannot run
+        except Exception as exc:  # noqa: BLE001 - turn crashes into a closed gate
             elog.warning("verifying", "timing_check_inconclusive",
                          "Timing check could not run", reason=str(exc)[:1000])
-            return None
+            return timing_check_module.TimingCheckResult(
+                timing_check_module.STATUS_INCONCLUSIVE,
+                detail=f"timing check crashed: {exc}",
+            )
         if result.status == timing_check_module.STATUS_INCONCLUSIVE:
             elog.warning("verifying", "timing_check_inconclusive",
                          "Timing check gave no verdict", reason=result.detail[:1000])
@@ -701,6 +706,21 @@ class VerificationMixin:
                 drift_ms=timing_result.drift_ms,
                 iteration=repair_iteration,
             )
+        elif (timing_result is not None
+              and timing_result.status == timing_check_module.STATUS_INCONCLUSIVE):
+            final_status = STATUS_NEEDS_REVIEW
+            error = f"timing check inconclusive: {timing_result.detail or 'no verdict'}"
+            if timing_result.output:
+                test_output_capped = _truncate_text(
+                    f"{test_output_capped}\n\n--- timing check incomplete ---\n"
+                    f"{timing_result.output}",
+                    self.max_test_output_bytes, label="test output",
+                )
+            elog.error(
+                "verifying", "timing_check_failed_closed", error,
+                test_files=timing_result.test_files,
+                iteration=repair_iteration,
+            )
         else:
             elog.info("verifying", "tests_passed", "Verification tests passed")
 
@@ -812,4 +832,3 @@ class VerificationMixin:
                     error=combined_error,
                 )
         return self.get_experiment(experiment_id)
-

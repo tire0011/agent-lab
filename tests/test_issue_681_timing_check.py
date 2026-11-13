@@ -189,7 +189,7 @@ class RunTimingCheckTests(unittest.TestCase):
         result = run_timing_check("python", ".", ["tests/test_x.py"], runner=runner)
         self.assertEqual(result.status, "passed")
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][timing_check.CLOCK_DRIFT_ENV_VAR], "10")
+        self.assertEqual(calls[0][timing_check.CLOCK_DRIFT_ENV_VAR], "50")
         self.assertNotIn(timing_check.CLOCK_DRIFT_ENV_VAR, calls[1])
 
     def test_unparsable_failure_is_inconclusive_not_a_failure(self) -> None:
@@ -206,6 +206,35 @@ class RunTimingCheckTests(unittest.TestCase):
             runner=lambda *args: PytestRun(None, "", [], timed_out=True, error="timed out"),
         )
         self.assertEqual(result.status, "inconclusive")
+
+    def test_partial_control_run_is_inconclusive(self) -> None:
+        calls = 0
+
+        def runner(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return PytestRun(1, f"FAILED {SENSITIVE_ID} - mismatch\n", [SENSITIVE_ID])
+            return PytestRun(None, "halfway", [], error="runner crashed")
+
+        result = run_timing_check("python", ".", ["tests/test_x.py"], runner=runner)
+        self.assertEqual(result.status, "inconclusive")
+        self.assertIn("runner crashed", result.detail)
+
+    def test_interruption_propagates_instead_of_recording_a_verdict(self) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            run_timing_check(
+                "python", ".", ["tests/test_x.py"],
+                runner=lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+            )
+
+    def test_repeated_runs_are_independent_and_complete(self) -> None:
+        def runner(*args):
+            return PytestRun(0, "1 passed", [])
+
+        first = run_timing_check("python", ".", ["tests/test_x.py"], runner=runner)
+        second = run_timing_check("python", ".", ["tests/test_x.py"], runner=runner)
+        self.assertEqual((first.status, second.status), ("passed", "passed"))
 
     def test_no_files_is_skipped(self) -> None:
         self.assertEqual(run_timing_check("python", ".", []).status, "skipped")
@@ -263,14 +292,24 @@ class AffectedFileSelectionTests(unittest.TestCase):
             "tests/test_imports_plain.py",
         ])
         self.assertEqual(affected.dropped, [])
+        self.assertTrue(any("test_broken_syntax.py" in item for item in affected.discovery_errors))
 
-    def test_cap_keeps_changed_tests_first(self) -> None:
+    def test_compatibility_cap_does_not_drop_required_tests(self) -> None:
         affected = select_affected_test_files(
             ["tests/test_new_budget.py", "modules/budget.py"], self.root, max_files=2,
         )
-        self.assertEqual(affected.files[0], "tests/test_new_budget.py")
-        self.assertEqual(len(affected.files), 2)
-        self.assertEqual(len(affected.dropped), 2)
+        self.assertEqual(len(affected.files), 4)
+        self.assertEqual(affected.dropped, [])
+
+    def test_more_than_forty_changed_tests_are_all_selected(self) -> None:
+        paths = []
+        for number in range(45):
+            relative = f"tests/test_changed_{number}.py"
+            (self.root / relative).write_text("def test_ok(): pass\n", encoding="utf-8")
+            paths.append(relative)
+        affected = select_affected_test_files(paths, self.root)
+        self.assertEqual(len(affected.files), 45)
+        self.assertEqual(set(affected.files), set(paths))
 
     def test_missing_files_and_non_python_changes_select_nothing(self) -> None:
         affected = select_affected_test_files(
@@ -279,9 +318,9 @@ class AffectedFileSelectionTests(unittest.TestCase):
         self.assertEqual(affected.files, [])
 
     def test_drift_defaults_to_the_measured_value(self) -> None:
-        self.assertEqual(timing_check.drift_from_env({}), 10.0)
+        self.assertEqual(timing_check.drift_from_env({}), 50.0)
         self.assertEqual(timing_check.drift_from_env({"NEXUS_TIMING_CHECK_DRIFT_MS": "50"}), 50.0)
-        self.assertEqual(timing_check.drift_from_env({"NEXUS_TIMING_CHECK_DRIFT_MS": "x"}), 10.0)
+        self.assertEqual(timing_check.drift_from_env({"NEXUS_TIMING_CHECK_DRIFT_MS": "x"}), 50.0)
 
     def test_switch_defaults_on(self) -> None:
         self.assertTrue(timing_check.timing_check_enabled({}))
@@ -337,7 +376,7 @@ class VerifyReportsTimingSensitiveTests(unittest.TestCase):
         self.assertEqual(result.test_exit_code, 0)
         self.assertTrue(result.error.startswith(f"timing_sensitive: {SENSITIVE_ID}"), result.error)
         self.assertIn("Inject the clock", result.error)
-        self.assertIn("timing check (NEXUS_TEST_CLOCK_DRIFT_MS=10)", result.test_output)
+        self.assertIn("timing check (NEXUS_TEST_CLOCK_DRIFT_MS=50)", result.test_output)
 
     def test_injected_clock_change_passes(self) -> None:
         self._touch("test_injected_clock_budget.py")
@@ -353,6 +392,23 @@ class VerifyReportsTimingSensitiveTests(unittest.TestCase):
             result = self._verify()
         rerun.assert_not_called()
         self.assertFalse((result.error or "").startswith("timing_sensitive"))
+
+    def test_inconclusive_check_fails_closed(self) -> None:
+        self._touch("test_injected_clock_budget.py")
+        inconclusive = timing_check.TimingCheckResult(
+            timing_check.STATUS_INCONCLUSIVE, detail="pytest missing",
+        )
+        with patch.object(self.service, "_run_timing_check", return_value=inconclusive):
+            result = self._verify()
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("timing check inconclusive: pytest missing", result.error)
+
+    def test_check_crash_fails_closed(self) -> None:
+        self._touch("test_injected_clock_budget.py")
+        with patch.object(timing_check, "select_affected_test_files", side_effect=RuntimeError("boom")):
+            result = self._verify()
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("timing check crashed: boom", result.error)
 
 
 if __name__ == "__main__":

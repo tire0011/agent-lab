@@ -15,10 +15,10 @@ A test that fails under drift is run once more without drift. Only a test
 that passes there counts as ``timing_sensitive``. A failure that also happens
 without drift belongs to the normal verification, not to this check. Anything
 that leaves the answer open (pytest missing, collection error, timeout) is
-reported as ``inconclusive`` and never fails a change.
+reported as ``inconclusive``; verification fails closed on that result.
 
 Switch: ``NEXUS_TIMING_CHECK=1|0``, on by default; the drift per clock read is
-``NEXUS_TIMING_CHECK_DRIFT_MS`` (default 10, see ``DEFAULT_DRIFT_MS``). The rerun covers only the
+``NEXUS_TIMING_CHECK_DRIFT_MS`` (default 50, see ``DEFAULT_DRIFT_MS``). The rerun covers only the
 affected files, so it stays cheap.
 """
 
@@ -38,18 +38,10 @@ from modules.verification_env import build_verification_test_env
 
 TIMING_CHECK_ENV_VAR = "NEXUS_TIMING_CHECK"
 CLOCK_DRIFT_ENV_VAR = "NEXUS_TEST_CLOCK_DRIFT_MS"
-MAX_FILES_ENV_VAR = "NEXUS_TIMING_CHECK_MAX_FILES"
 TIMEOUT_ENV_VAR = "NEXUS_TIMING_CHECK_TIMEOUT_SECONDS"
 DRIFT_ENV_VAR = "NEXUS_TIMING_CHECK_DRIFT_MS"
 
-# Measured, not guessed (#681): replaying 67c00298 at 10 ms flags exactly the
-# two tests CI failed on (3776 != 3775 in test_issue_642, 359 vs 360 in
-# test_issue_667) and nothing on the last 10 merges. 5 ms finds neither; from
-# 20 ms on, two #667 streaming tests fail on every commit - they pace a fake
-# server's real sleeps against the client clock, and a drift that large per
-# clock read is a slower machine than any CI runner. The issue proposed 50.
-DEFAULT_DRIFT_MS = 10.0
-DEFAULT_MAX_FILES = 40
+DEFAULT_DRIFT_MS = 50.0
 DEFAULT_TIMEOUT_SECONDS = 900.0
 
 #: Prefix of the verification error, read by the repair and retry prompts.
@@ -85,11 +77,6 @@ def _positive_float(raw: str | None, default: float) -> float:
     except ValueError:
         return default
     return value if 0 < value < float("inf") else default
-
-
-def max_files_from_env(env: Mapping[str, str] | None = None) -> int:
-    source = os.environ if env is None else env
-    return int(_positive_float(source.get(MAX_FILES_ENV_VAR), DEFAULT_MAX_FILES))
 
 
 def drift_from_env(env: Mapping[str, str] | None = None) -> float:
@@ -190,8 +177,10 @@ class AffectedTests:
     changed: list[str] = field(default_factory=list)
     #: Test files that import a changed module.
     importers: list[str] = field(default_factory=list)
-    #: Files left out because of the cap.
+    #: Retained for compatibility. Required coverage is never dropped.
     dropped: list[str] = field(default_factory=list)
+    #: Importer candidates that could not be inspected completely.
+    discovery_errors: list[str] = field(default_factory=list)
 
 
 def select_affected_test_files(
@@ -202,11 +191,10 @@ def select_affected_test_files(
 ) -> AffectedTests:
     """Test files the change adds or edits, plus test files importing a changed module.
 
-    Changed test files come first, so the cap never drops what the change
-    wrote itself. Only files that exist in *repo_root* are returned.
+    Only files that exist in *repo_root* are returned. ``max_files`` is an
+    ignored compatibility argument: required coverage must never be omitted.
     """
     root = Path(repo_root)
-    limit = max_files if max_files is not None else max_files_from_env()
     changed_tests: list[str] = []
     changed_modules: set[str] = set()
     for raw in changed_paths:
@@ -222,6 +210,7 @@ def select_affected_test_files(
                 changed_modules.add(module)
 
     importers: list[str] = []
+    discovery_errors: list[str] = []
     tests_dir = root / "tests"
     if changed_modules and tests_dir.is_dir():
         for test_file in sorted(tests_dir.rglob("test_*.py")):
@@ -230,17 +219,24 @@ def select_affected_test_files(
                 continue
             try:
                 source = test_file.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as exc:
+                discovery_errors.append(f"{relative}: {exc}")
+                continue
+            try:
+                ast.parse(source)
+            except (SyntaxError, ValueError) as exc:
+                discovery_errors.append(f"{relative}: cannot parse imports: {exc}")
                 continue
             if _imports_any(imported_modules(source), changed_modules):
                 importers.append(relative)
 
     ordered = sorted(changed_tests) + importers
     return AffectedTests(
-        files=ordered[:limit],
+        files=ordered,
         changed=sorted(changed_tests),
         importers=importers,
-        dropped=ordered[limit:],
+        dropped=[],
+        discovery_errors=discovery_errors,
     )
 
 
@@ -330,6 +326,14 @@ def _run_pytest(
         output, _ = process.communicate()
         return PytestRun(None, output or "", parse_pytest_failures(output or ""),
                          timed_out=True, error=f"timed out after {timeout:.0f}s")
+    except BaseException:
+        # Cancellation must not leave a partial pytest run alive.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
+        process.communicate()
+        raise
     finally:
         if on_process is not None:
             on_process(None)
@@ -389,8 +393,7 @@ def run_timing_check(
     if drifted.timed_out:
         return TimingCheckResult(STATUS_INCONCLUSIVE, test_files=files, drift_ms=drift_ms,
                                  detail=f"drift run {drifted.error}", output=_clip(drifted.output))
-    # 5: pytest collected nothing - nothing to judge.
-    if drifted.exit_code in (0, 5):
+    if drifted.exit_code == 0:
         return TimingCheckResult(STATUS_PASSED, test_files=files, drift_ms=drift_ms,
                                  output=_clip(drifted.output))
     if not drifted.failed_ids:
