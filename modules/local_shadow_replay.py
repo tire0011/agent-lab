@@ -71,15 +71,11 @@ DEFAULT_VARIANT = "baseline"
 ENV_ENABLED = "NEXUS_SHADOW_REPLAY"
 SETTING_ENABLED = "nexus.shadow_replay_enabled"
 ENV_WORKER_TIMEOUT = "NEXUS_SHADOW_REPLAY_TIMEOUT_SECONDS"
-ENV_CALL_TIMEOUT = "NEXUS_SHADOW_REPLAY_CALL_TIMEOUT_SECONDS"
 ENV_TEST_TIMEOUT = "NEXUS_SHADOW_REPLAY_TEST_TIMEOUT_SECONDS"
 ENV_LEASE = "NEXUS_SHADOW_REPLAY_LEASE_SECONDS"
 ENV_WORKTREE_DIR = "NEXUS_SHADOW_REPLAY_DIR"
 DEFAULT_WORKER_TIMEOUT_SECONDS = 1800.0
 DEFAULT_TEST_TIMEOUT_SECONDS = 600.0
-# Lease slack over worker + tests by default; never less than the margin (#675).
-DEFAULT_LEASE_SLACK_SECONDS = 900.0
-LEASE_MARGIN_SECONDS = 60.0
 _COLLECT_TIMEOUT_SECONDS = 120.0
 _GIT_TIMEOUT_SECONDS = 60.0
 _BUSY_TIMEOUT_MS = 10_000
@@ -141,41 +137,14 @@ def worker_timeout_seconds() -> float:
     return _float_env(ENV_WORKER_TIMEOUT, DEFAULT_WORKER_TIMEOUT_SECONDS)
 
 
-def call_timeout_seconds() -> float:
-    """Per-call limit, leaving a minute for worker shutdown and bookkeeping."""
-    default = min(1500.0, max(1.0, worker_timeout_seconds() - 60.0))
-    return _float_env(ENV_CALL_TIMEOUT, default)
-
-
 def tests_timeout_seconds() -> float:
     return _float_env(ENV_TEST_TIMEOUT, DEFAULT_TEST_TIMEOUT_SECONDS)
 
 
-def min_lease_seconds(work_seconds: float | None = None) -> float:
-    """The shortest lease that still covers one worker run plus its tests (#675).
-
-    *work_seconds* defaults to the whole-replay worker timeout; a hunk unit
-    passes its own (unit timeout plus the baseline test run).
-    """
-    work = worker_timeout_seconds() if work_seconds is None else float(work_seconds)
-    return work + tests_timeout_seconds() + LEASE_MARGIN_SECONDS
-
-
-def lease_seconds(work_seconds: float | None = None) -> float:
-    """Minimum stale age for claims/leases; a live global owner is never preempted.
-
-    Never shorter than :func:`min_lease_seconds`: a configured lease below the
-    worker timeout plus the test timeout would let a long but healthy call lose
-    its lease, so it is raised to that floor (#675).
-    """
-    floor = min_lease_seconds(work_seconds)
-    default = floor - LEASE_MARGIN_SECONDS + DEFAULT_LEASE_SLACK_SECONDS
-    configured = _float_env(ENV_LEASE, default)
-    if configured < floor:
-        logger.warning("local replay: %s=%gs is below worker+tests+margin; using %gs",
-                       ENV_LEASE, configured, floor)
-        return floor
-    return configured
+def lease_seconds() -> float:
+    """Minimum stale age for claims/leases; a live global owner is never preempted."""
+    default = worker_timeout_seconds() + tests_timeout_seconds() + 900.0
+    return _float_env(ENV_LEASE, default)
 
 
 def _setting(db_path: str, key: str) -> str | None:
@@ -376,42 +345,6 @@ def _acquire_global_lease(conn: sqlite3.Connection, duration: float) -> GlobalLe
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         raise
-
-
-def _renew_global_lease(conn: sqlite3.Connection, token: str, duration: float) -> bool:
-    """Extend this owner's lease to *duration* from now; False if it is not ours.
-
-    Called before every worker run, so a sweep that runs several long units
-    in a row never runs on a lease sized for the first one only (#675). It
-    never shortens a lease and never touches another owner's row.
-    """
-    now = _utcnow()
-    deadline = _iso(now + timedelta(seconds=duration))
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = conn.execute("SELECT lease_expires_at FROM local_replay_lease "
-                           "WHERE singleton=1 AND token=?", (token,)).fetchone()
-        if row is None:
-            conn.execute("COMMIT")
-            return False
-        if str(row["lease_expires_at"]) < deadline:
-            conn.execute("UPDATE local_replay_lease SET lease_expires_at=? "
-                         "WHERE singleton=1 AND token=?", (deadline, token))
-        conn.execute("COMMIT")
-        return True
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
-
-
-def renew_lease(db_path: str, token: str, duration: float) -> bool:
-    """:func:`_renew_global_lease` on its own connection."""
-    conn = _connect(db_path)
-    try:
-        return _renew_global_lease(conn, token, duration)
-    finally:
-        conn.close()
 
 
 def _release_global_lease(conn: sqlite3.Connection, token: str) -> None:
@@ -810,8 +743,6 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
 
     worktree = _create_worktree(repo, base, db_path=db_path, lease_token=lease_token)
     try:
-        if db_path and lease_token and not renew_lease(db_path, lease_token, lease_seconds()):
-            raise ReplayError("lost the global replay lease before running the worker")
         counter = _RoundCounter()
         worker = worker_factory(client)
         started = time.monotonic()
@@ -904,8 +835,7 @@ def replay(
             return None
         finalized = False
         try:
-            client = client if client is not None else _UsageCountingClient(
-                timeout=call_timeout_seconds())
+            client = client if client is not None else _UsageCountingClient()
             outcome = ReplayOutcome(issue=_issue_number(conn, row),
                                     model=str(getattr(client, "model", "") or ""))
             try:
@@ -1039,8 +969,7 @@ def replay_next(
         if experiment_id is None:
             return {"ran": False, "reason": "no merged paid experiment left to replay",
                     "experiment_id": None, "replay": None}
-        client = client if client is not None else _UsageCountingClient(
-            timeout=call_timeout_seconds())
+        client = client if client is not None else _UsageCountingClient()
         idle, reason = server_state(client, db_path)
         if not idle:
             return {"ran": False, "reason": reason, "experiment_id": experiment_id, "replay": None}

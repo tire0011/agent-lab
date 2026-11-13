@@ -12,7 +12,6 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -446,47 +445,6 @@ class RobustnessTests(unittest.TestCase):
         self.assertIn("interrupted 2 times", rows[(SHAPES, "area")]["error"])
         self.assertTrue(rows[(SHAPES, "perimeter")]["tests_passed"])
         self.assertEqual(len(good.calls), 1)
-        self.assertEqual(summary["status"], lsh.RUN_DONE)
-
-    def test_lease_is_renewed_for_every_unit_to_cover_unit_and_tests(self):
-        db_path = self.fx.db_path
-        seen = []
-
-        def read_lease(_n):
-            conn = sqlite3.connect(db_path)
-            try:
-                seen.append(datetime.fromisoformat(
-                    conn.execute("SELECT lease_expires_at FROM local_replay_lease").fetchone()[0]))
-            finally:
-                conn.close()
-
-        env = {lsh.ENV_UNIT_TIMEOUT: "4000", lsr.ENV_TEST_TIMEOUT: "3000",
-               lsr.ENV_WORKER_TIMEOUT: "100", lsr.ENV_LEASE: "10"}
-        with patch.dict(os.environ, env):
-            before = datetime.now(timezone.utc)
-            self.fx.replay(FakeWorker({SHAPES: MERGED_SHAPES}, per_call=read_lease))
-        self.assertEqual(len(seen), 2)  # both units ran
-        for expires in seen:
-            self.assertGreater(expires, before + timedelta(seconds=4000 + 3000))
-        self.assertGreater(lsh.unit_lease_seconds(), lsh.unit_timeout_seconds() + lsr.tests_timeout_seconds())
-
-    def test_lost_lease_mid_loop_leaves_the_rest_resumable(self):
-        answers = iter([True, False])
-        worker = FakeWorker({SHAPES: MERGED_SHAPES})
-        with patch.object(lsr, "renew_lease", side_effect=lambda *_a: next(answers)):
-            self.fx.replay(worker)
-        self.assertEqual(len(worker.calls), 1)
-        rows = self.fx.units()
-        self.assertEqual(len(rows), 1)  # the second unit was never claimed
-        self.assertEqual(self.fx.run_row()["status"], "running")
-        self.assertEqual(self.fx.leftover_worktrees(), [])
-        conn = sqlite3.connect(self.fx.db_path)
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM local_replay_lease").fetchone()[0], 0)
-        conn.close()
-        # The next replay picks up the remaining unit and finishes the run.
-        again = FakeWorker({SHAPES: MERGED_SHAPES})
-        summary = self.fx.replay(again)
-        self.assertEqual(len(again.calls), 1)
         self.assertEqual(summary["status"], lsh.RUN_DONE)
 
     def test_interrupted_unit_resumes_and_scores(self):

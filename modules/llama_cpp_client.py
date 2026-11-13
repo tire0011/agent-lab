@@ -37,8 +37,6 @@ _FALSE_VALUES = {"0", "false", "no", "off"}
 ENV_STREAM = "LOCAL_MODEL_STREAM"
 ENV_TTFT_FRACTION = "LOCAL_MODEL_TTFT_FRACTION"
 ENV_STREAM_MIN_TOKENS = "LOCAL_MODEL_STREAM_MIN_TOKENS"
-ENV_CALL_TIMEOUT = "LOCAL_MODEL_CALL_TIMEOUT_SECONDS"
-DEFAULT_CALL_TIMEOUT_SECONDS = 300.0
 # TTFT_LIMIT: no first token within this share of the timeout -> prompt_too_slow.
 DEFAULT_TTFT_FRACTION = 0.6
 # The generation projection is only trusted after this many streamed tokens.
@@ -155,7 +153,7 @@ class LlamaCppClient:
     def __init__(
         self,
         base_url: str | None = None,
-        timeout: float | None = None,
+        timeout: float = 300.0,
         model: str | None = None,
         *,
         stream: bool | None = None,
@@ -167,8 +165,7 @@ class LlamaCppClient:
             or os.getenv("LOCAL_MODEL_URL")
             or os.getenv("LLAMA_CPP_BASE_URL", _DEFAULT_BASE_URL)
         ).rstrip("/")
-        self.timeout = (_env_float(ENV_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT_SECONDS)
-                        if timeout is None else timeout)
+        self.timeout = timeout
         # Prefer the generic LOCAL_MODEL_NAME; fall back to legacy LLAMA_CPP_MODEL.
         self.model = (
             model

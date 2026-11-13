@@ -85,16 +85,6 @@ class FakeClient:
         return self.busy
 
 
-class ConstructedClient(FakeClient):
-    instances = []
-
-    def __init__(self, *, timeout):
-        super().__init__()
-        self.timeout = timeout
-        self.tokens_used = 0
-        self.__class__.instances.append(self)
-
-
 class FakeWorker:
     """Writes *calc* (or nothing) and records what it saw."""
 
@@ -462,115 +452,6 @@ class SweepTests(unittest.TestCase):
             outcome = self.sweep(FakeClient())
         self.assertEqual(outcome["replay"]["prompt_variant"], "ctx v2+sr")
         self.assertEqual(lsr.prompt_variant(), "baseline+sr")
-
-    def test_replay_constructs_client_with_replay_call_timeout(self):
-        ConstructedClient.instances.clear()
-        with patch.object(lsr, "_UsageCountingClient", ConstructedClient):
-            outcome = lsr.replay_next(
-                repo_root=self.fx.repo, db_path=self.fx.db_path,
-                worker_factory=lambda _client: FakeWorker(FULL_CALC),
-            )
-        self.assertTrue(outcome["ran"])
-        self.assertEqual(ConstructedClient.instances[0].timeout, 1500.0)
-
-        self.fx.add_experiment("exp-env", merged=self.fx.merged, base=self.fx.base)
-        ConstructedClient.instances.clear()
-        with patch.dict(os.environ, {lsr.ENV_CALL_TIMEOUT: "1234"}), \
-                patch.object(lsr, "_UsageCountingClient", ConstructedClient):
-            outcome = lsr.replay_next(
-                repo_root=self.fx.repo, db_path=self.fx.db_path,
-                worker_factory=lambda _client: FakeWorker(FULL_CALC),
-            )
-        self.assertTrue(outcome["ran"])
-        self.assertEqual(ConstructedClient.instances[0].timeout, 1234.0)
-
-    def test_lease_exceeds_worker_and_test_timeouts(self):
-        with patch.dict(os.environ, {}, clear=False):
-            for name in (lsr.ENV_LEASE, lsr.ENV_WORKER_TIMEOUT, lsr.ENV_TEST_TIMEOUT,
-                         lsr.ENV_CALL_TIMEOUT):
-                os.environ.pop(name, None)
-            self.assertGreater(
-                lsr.lease_seconds(),
-                lsr.worker_timeout_seconds() + lsr.tests_timeout_seconds(),
-            )
-            # The worker's own per-call limit fits inside its budget.
-            self.assertLess(lsr.call_timeout_seconds(), lsr.worker_timeout_seconds())
-
-    def test_lease_follows_non_default_timeouts_and_a_too_short_env_is_raised(self):
-        big = {lsr.ENV_WORKER_TIMEOUT: "5000", lsr.ENV_TEST_TIMEOUT: "2000"}
-        with patch.dict(os.environ, big):
-            os.environ.pop(lsr.ENV_LEASE, None)
-            self.assertGreater(lsr.lease_seconds(), 7000)
-            for short in ("100", "7000", "-5", "junk"):
-                with patch.dict(os.environ, {lsr.ENV_LEASE: short}):
-                    self.assertGreater(lsr.lease_seconds(), 7000, short)
-            with patch.dict(os.environ, {lsr.ENV_LEASE: "99999"}):
-                self.assertEqual(lsr.lease_seconds(), 99999.0)
-            # An explicit work length (a hunk unit) is covered the same way.
-            self.assertGreater(lsr.lease_seconds(9000), 9000 + 2000)
-
-    def _lease_row(self):
-        conn = sqlite3.connect(self.fx.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            return conn.execute("SELECT * FROM local_replay_lease").fetchone()
-        finally:
-            conn.close()
-
-    def test_lease_is_renewed_to_cover_the_worker_even_with_a_short_env(self):
-        seen = {}
-        fx = self.fx
-
-        class LeaseWorker(FakeWorker):
-            def run(self, **kwargs):
-                conn = sqlite3.connect(fx.db_path)
-                try:
-                    seen["expires"] = conn.execute(
-                        "SELECT lease_expires_at FROM local_replay_lease").fetchone()[0]
-                finally:
-                    conn.close()
-                seen["timeout"] = kwargs["timeout_seconds"]
-                return super().run(**kwargs)
-
-        env = {lsr.ENV_WORKER_TIMEOUT: "5000", lsr.ENV_TEST_TIMEOUT: "2000", lsr.ENV_LEASE: "10"}
-        with patch.dict(os.environ, env):
-            before = datetime.now(timezone.utc)
-            outcome = lsr.replay_next(repo_root=fx.repo, db_path=fx.db_path, client=FakeClient(),
-                                      worker_factory=lambda _client: LeaseWorker(FULL_CALC))
-        self.assertTrue(outcome["ran"])
-        self.assertEqual(seen["timeout"], 5000.0)
-        expires = datetime.fromisoformat(seen["expires"])
-        self.assertGreater(expires, before + timedelta(seconds=7000))
-        self.assertIsNone(self._lease_row())  # released afterwards
-
-    def test_renewal_is_owner_only_never_shortens_and_is_repeatable(self):
-        conn = lsr._connect(self.fx.db_path)
-        try:
-            lease = lsr._acquire_global_lease(conn, 10_000)
-            first = self._lease_row()["lease_expires_at"]
-            self.assertTrue(lsr.renew_lease(self.fx.db_path, lease.token, 10))
-            self.assertEqual(self._lease_row()["lease_expires_at"], first)  # not shortened
-            self.assertTrue(lsr.renew_lease(self.fx.db_path, lease.token, 20_000))
-            longer = self._lease_row()["lease_expires_at"]
-            self.assertGreater(longer, first)
-            self.assertTrue(lsr.renew_lease(self.fx.db_path, lease.token, 20_000))  # twice is fine
-            self.assertFalse(lsr.renew_lease(self.fx.db_path, "someone-else", 99_999))
-            self.assertEqual(self._lease_row()["token"], lease.token)
-            lsr._release_global_lease(conn, lease.token)
-            self.assertFalse(lsr.renew_lease(self.fx.db_path, lease.token, 20_000))  # not resurrected
-            self.assertIsNone(self._lease_row())
-        finally:
-            conn.close()
-
-    def test_lost_lease_before_the_worker_stops_cleanly(self):
-        worker = FakeWorker(FULL_CALC)
-        with patch.object(lsr, "renew_lease", return_value=False):
-            row = self.fx.replay(worker)
-        self.assertEqual(row["status"], lsr.STATUS_ERROR)
-        self.assertIn("lost the global replay lease", row["error"])
-        self.assertEqual(worker.calls, [])
-        self.assertEqual(self.fx.replay_worktrees(), [])
-        self.assertIsNone(self._lease_row())
 
     def test_disabled_by_setting_env_or_pause(self):
         with patch.dict(os.environ, {lsr.ENV_ENABLED: "0"}):

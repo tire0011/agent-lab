@@ -71,7 +71,6 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import contextlib
 import inspect
 import logging
 import math
@@ -85,7 +84,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator
+from typing import Any, Awaitable, Callable
 
 from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
@@ -510,9 +509,7 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         prompt_rate, generation_rate = rates
         rate_detail = (
             f"generation {generation_rate:.2f} tok/s, prompt {prompt_rate:.2f} tok/s, "
-            # .4g: a timeout capped at the run's remaining budget (#675) reads
-            # 300s, not 299.996s of deadline-clock jitter.
-            f"{allowance.seconds:.4g}s of the {float(getattr(client, 'timeout')):.4g}s timeout, at most "
+            f"{allowance.seconds:g}s of the {float(getattr(client, 'timeout')):g}s timeout, at most "
             f"{MAX_GENERATION_TIME_SHARE:.0%} of it for generation"
             if allowance is not None else f"configured max_output_tokens {max_output_tokens}"
         )
@@ -1453,86 +1450,11 @@ class LocalCodingWorker:
         self._last_call: CallRecord | None = None
         self.last_run_metrics: dict[str, Any] | None = None
         self.last_sample_stats: list[SampleStats] = []
-        self._run_deadline: float | None = None
-        self._configured_call_timeout: Any = None
-        self._last_applied_timeout: Any = None
-
-    def _capped_call_timeout(self) -> Any:
-        """The configured call timeout, capped at this run's remaining budget (#675).
-
-        Pure: it never changes the client. Outside a run the client's own
-        timeout is returned unchanged.
-        """
-        configured = (self._configured_call_timeout if self._run_deadline is not None
-                      else getattr(self.client, "timeout", None))
-        if self._run_deadline is None:
-            return configured
-        remaining = max(0.001, self._run_deadline - time.monotonic())
-        if (isinstance(configured, (int, float)) and not isinstance(configured, bool)
-                and math.isfinite(configured) and configured > 0):
-            # Do not turn a nominal 300 s limit into 299.999... merely because
-            # a few setup instructions ran between starting the worker and
-            # applying the cap. Materially depleted budgets are capped exactly.
-            return (float(configured) if remaining >= float(configured) - 0.01
-                    else remaining)
-        return remaining
-
-    @contextlib.contextmanager
-    def _call_timeout(self) -> Iterator[Any]:
-        """Apply the capped timeout to the client for one call or admission only.
-
-        The client is shared (the replay passes one client to every worker), so
-        the cap is set just for the duration of the ``with`` block and the
-        previous value is restored on every exit - success, exception,
-        KeyboardInterrupt. Nested blocks restore in order.
-        """
-        applied = self._capped_call_timeout()
-        self._last_applied_timeout = applied
-        if not hasattr(self.client, "timeout"):
-            yield applied
-            return
-        previous = self.client.timeout
-        self.client.timeout = applied
-        try:
-            yield applied
-        finally:
-            self.client.timeout = previous
-
-    @staticmethod
-    def _timeout_label(timeout: Any) -> str:
-        """Format an applied timeout without exposing deadline-clock jitter."""
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
-            value = float(timeout)
-            nearest_second = round(value)
-            if abs(value - nearest_second) < 0.05:
-                return f"{nearest_second:g}"
-            return f"{value:g}"
-        return str(timeout)
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
             phase: str = "implementation", **_: Any) -> WorkerResult:
         started = time.monotonic()
-        # #675: remember the client's own timeout and this run's deadline. The
-        # outer finally restores both on every exit, even when the logging in
-        # the inner finally raises, so a failed or interrupted run never leaves
-        # a reduced timeout on the shared client or a stale deadline behind.
-        has_timeout = hasattr(self.client, "timeout")
-        original_timeout = getattr(self.client, "timeout", None)
-        saved = (self._configured_call_timeout, self._run_deadline, self._last_applied_timeout)
-        self._configured_call_timeout = original_timeout
-        self._run_deadline = started + max(0.0, float(timeout_seconds))
-        self._last_applied_timeout = None
-        try:
-            return self._run_and_log(task, working_dir, sandbox, timeout_seconds,
-                                     experiment_logger, phase, started)
-        finally:
-            if has_timeout:
-                self.client.timeout = original_timeout
-            self._configured_call_timeout, self._run_deadline, self._last_applied_timeout = saved
-
-    def _run_and_log(self, task: str, working_dir: str, sandbox: str, timeout_seconds: float,
-                     experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
         self.last_plan = None
         self.generated_tests = ()
         self.generated_test_file = None
@@ -1598,11 +1520,10 @@ class LocalCodingWorker:
                 )
             try:
                 # n_ctx is read once here and holds for this whole run.
-                with self._call_timeout():  # admission sees the applied timeout
-                    plan = asyncio.run(build_prompt(task, working_dir, self.client,
-                                                    max_output_tokens=self.max_tokens,
-                                                    rates=self.rates.medians(),
-                                                    admission=True))
+                plan = asyncio.run(build_prompt(task, working_dir, self.client,
+                                                max_output_tokens=self.max_tokens,
+                                                rates=self.rates.medians(),
+                                                admission=True))
             except ContextTooSmallError as exc:
                 self._log(experiment_logger, phase, "local_context_too_small", str(exc), warning=True)
                 return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
@@ -1636,13 +1557,12 @@ class LocalCodingWorker:
                         # that were unavailable when this run first fitted its
                         # prompt. Refit now instead of repeating the same full
                         # prompt for the patch in this run.
-                        with self._call_timeout():
-                            plan = asyncio.run(build_prompt(
-                                task, working_dir, self.client,
-                                max_output_tokens=self.max_tokens,
-                                rates=self.rates.medians(),
-                                admission=True,
-                            ))
+                        plan = asyncio.run(build_prompt(
+                            task, working_dir, self.client,
+                            max_output_tokens=self.max_tokens,
+                            rates=self.rates.medians(),
+                            admission=True,
+                        ))
                         self.last_plan = plan
                         self._log(
                             experiment_logger, phase, "local_prompt_budget",
@@ -1778,9 +1698,7 @@ class LocalCodingWorker:
                       f"Local {label}: {subtask.goal[:200]}", subtask=number, subtasks=total,
                       files=list(subtask.files), tests=list(subtask.tests))
             try:
-                with self._call_timeout():
-                    sub_plan = asyncio.run(self._subtask_plan(plan, subtask, number, total, applied,
-                                                              working_dir))
+                sub_plan = asyncio.run(self._subtask_plan(plan, subtask, number, total, applied, working_dir))
             except ContextTooSmallError as exc:
                 ok, output, reason = False, "", f"subtask prompt does not fit: {exc}"
             else:
@@ -1894,11 +1812,8 @@ class LocalCodingWorker:
                                         None, 0.0, tag, outcome="model_timeout"
                                         if self._is_model_timeout(exc) else "model_error")
                     if self._is_model_timeout(exc):
-                        limit = (self._last_applied_timeout
-                                 if self._last_applied_timeout is not None
-                                 else getattr(self.client, "timeout", timeout))
-                        reason = (str(exc) or
-                                  f"local model call timed out after {self._timeout_label(limit)}s")
+                        limit = getattr(self.client, "timeout", timeout)
+                        reason = str(exc) or f"local model call timed out after {limit}s"
                         self._log_round(experiment_logger, phase, round_no, "model_timeout", reason,
                                         stop_reason=getattr(exc, "reason", None) or "timeout", **extra)
                         return False, "", reason
@@ -2069,9 +1984,7 @@ class LocalCodingWorker:
                   prompt_tokens_per_second=prompt_rate,
                   generation_tokens_per_second=generation_rate,
                   min_useful_patch_tokens=_min_useful_patch_tokens(),
-                  timeout_seconds=(self._last_applied_timeout
-                                   if self._last_applied_timeout is not None
-                                   else getattr(self.client, "timeout", None)))
+                  timeout_seconds=getattr(self.client, "timeout", None))
 
     @staticmethod
     def _stop_reason(exc: BaseException) -> str | None:
@@ -2091,15 +2004,6 @@ class LocalCodingWorker:
                     temperature: float = 0.0, seed: int | None = None,
                     **fields: Any) -> str:
         """Call the local model and always leave a latency/outcome event."""
-        with self._call_timeout() as applied_timeout:
-            return self._timed_model_call(prompt, system, max_tokens, experiment_logger, phase,
-                                          applied_timeout, call_type=call_type,
-                                          temperature=temperature, seed=seed, **fields)
-
-    def _timed_model_call(self, prompt: str, system: str, max_tokens: int,
-                          experiment_logger: Any | None, phase: str, applied_timeout: Any, *,
-                          call_type: str, temperature: float = 0.0, seed: int | None = None,
-                          **fields: Any) -> str:
         started = time.monotonic()
         if hasattr(self.client, "last_timings"):
             self.client.last_timings = None
@@ -2138,7 +2042,7 @@ class LocalCodingWorker:
                 # unknown and admission could repeat the hopeless call.
                 # record_prompt_stop writes the measured prompt and generation
                 # fallback in one atomic rates-file replacement.
-                timeout = applied_timeout
+                timeout = getattr(self.client, "timeout", None)
                 prompt_tokens = fields.get("prompt_tokens")
                 if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
                         and timeout > 0 and isinstance(prompt_tokens, int)):
@@ -2158,7 +2062,7 @@ class LocalCodingWorker:
                 pass  # #667: the measured partial rates, not guesses
             elif outcome in ("timeout", "early_stop"):
                 # Not one usable measurement arrived: fall back to the guess.
-                timeout = applied_timeout
+                timeout = getattr(self.client, "timeout", None)
                 prompt_tokens = fields.get("prompt_tokens")
                 if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
                         and timeout > 0 and isinstance(prompt_tokens, int)):
@@ -2197,7 +2101,6 @@ class LocalCodingWorker:
                     "draft_acceptance_rate": self._last_call.draft_acceptance_rate}
                    if self._last_call.draft_n else {}),
                 max_tokens=max_tokens,
-                timeout_seconds=applied_timeout,
                 **({"stream": stream} if (stream := getattr(self.client, "last_stream", None))
                    and isinstance(stream, dict) else {}),
                 **stop,
