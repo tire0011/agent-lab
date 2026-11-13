@@ -246,6 +246,21 @@ class _CountingServer:
         return "not a diff"
 
 
+class _PromptTimingStopServer(_CountingServer):
+    """A zero-content stop where llama-server nevertheless supplied prompt timings."""
+
+    async def complete(self, *_args, **_kwargs):
+        self.calls += 1
+        self.last_timings = {"prompt_n": 120, "prompt_ms": 400.0}
+        raise LlamaCppClientError(
+            "stopped early (prompt_too_slow)",
+            reason=REASON_PROMPT_TOO_SLOW,
+            timings=self.last_timings,
+            rates={"elapsed_seconds": 0.6, "tokens_streamed": 0},
+            busy_slots=1,
+        )
+
+
 class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -309,6 +324,22 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(second_client.calls, 0)
         self.assertTrue(second.error.startswith(LOCAL_TOO_SLOW), second.error)
         self.assertEqual(len(second_log.all("local_too_slow")), 1)
+
+    def test_prompt_too_slow_with_server_prompt_timings_also_stores_generation_fallback(self):
+        client = _PromptTimingStopServer(timeout=1.0)
+        _, result, _ = self.run_worker(client)
+
+        self.assertIn("prompt_too_slow", result.error)
+        rates = LocalModelRates(self.rates_path, model="m")
+        self.assertEqual(rates.medians(), (300.0, 640.0))
+        self.assertFalse(rates.generation_measured())
+
+        # A retry can make an admission decision instead of losing another
+        # TTFT interval because generation remained unknown.
+        retry = _CountingServer(timeout=1.0)
+        _, retry_result, _ = self.run_worker(retry)
+        self.assertEqual(retry.calls, 0)
+        self.assertTrue(retry_result.error.startswith(LOCAL_TOO_SLOW), retry_result.error)
 
     def test_record_timeout_stays_the_fallback_without_any_measurement(self):
         rates = LocalModelRates(self.rates_path, model="m")

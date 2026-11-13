@@ -90,7 +90,7 @@ from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
 from modules.llama_cpp_client import EARLY_STOP_REASONS, LlamaCppClient
 from modules.local_edit_format import EditFormatError, edits_to_diff
-from modules.local_model_rates import LocalModelRates
+from modules.local_model_rates import LocalModelRates, rates_from_timings
 from modules.local_run_metrics import CallRecord, RunMetrics, call_record, summary_line
 from modules.local_test_first import generate_failing_tests
 
@@ -2035,20 +2035,31 @@ class LocalCodingWorker:
                 self._metrics.record_call(self._last_call)
             if outcome == "ok":
                 self.rates.record(timings)  # never raises
-            elif outcome in ("timeout", "early_stop") and self.rates.record(timings):
-                pass  # #667: the measured partial rates, not guesses
             elif stop.get("stop_reason") == "prompt_too_slow":
-                # Preserve the measured prompt upper bound and bootstrap
-                # generation in one atomic rates-file replacement.
+                # Do this before the generic partial-timings path.  A server may
+                # report prompt timings without producing a content token; if
+                # record() consumed that sample first, generation would remain
+                # unknown and admission could repeat the hopeless call.
+                # record_prompt_stop writes the measured prompt and generation
+                # fallback in one atomic rates-file replacement.
                 timeout = getattr(self.client, "timeout", None)
                 prompt_tokens = fields.get("prompt_tokens")
                 if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
                         and timeout > 0 and isinstance(prompt_tokens, int)):
-                    self.rates.record_prompt_stop(
-                        _prompt_bound_timings(prompt_tokens, stop), prompt_tokens=prompt_tokens,
+                    prompt_timings = (timings if rates_from_timings(timings).get(
+                        "prompt_tokens_per_second") else _prompt_bound_timings(prompt_tokens, stop))
+                    stored = self.rates.record_prompt_stop(
+                        prompt_timings, prompt_tokens=prompt_tokens,
                         timeout_seconds=float(timeout),
                         minimum_output_tokens=MIN_OUTPUT_TOKENS,
                     )
+                    if not stored:
+                        self.rates.record_timeout(
+                            prompt_tokens=prompt_tokens, timeout_seconds=float(timeout),
+                            minimum_output_tokens=MIN_OUTPUT_TOKENS,
+                        )
+            elif outcome in ("timeout", "early_stop") and self.rates.record(timings):
+                pass  # #667: the measured partial rates, not guesses
             elif outcome in ("timeout", "early_stop"):
                 # Not one usable measurement arrived: fall back to the guess.
                 timeout = getattr(self.client, "timeout", None)
