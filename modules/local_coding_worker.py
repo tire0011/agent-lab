@@ -1471,6 +1471,17 @@ class LocalCodingWorker:
         self.client.timeout = applied
         return applied
 
+    @staticmethod
+    def _timeout_label(timeout: Any) -> str:
+        """Format an applied timeout without exposing deadline-clock jitter."""
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+            value = float(timeout)
+            nearest_second = round(value)
+            if abs(value - nearest_second) < 0.05:
+                return f"{nearest_second:g}"
+            return f"{value:g}"
+        return str(timeout)
+
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
             phase: str = "implementation", **_: Any) -> WorkerResult:
@@ -1839,7 +1850,8 @@ class LocalCodingWorker:
                                         if self._is_model_timeout(exc) else "model_error")
                     if self._is_model_timeout(exc):
                         limit = getattr(self.client, "timeout", timeout)
-                        reason = str(exc) or f"local model call timed out after {limit}s"
+                        reason = (str(exc) or
+                                  f"local model call timed out after {self._timeout_label(limit)}s")
                         self._log_round(experiment_logger, phase, round_no, "model_timeout", reason,
                                         stop_reason=getattr(exc, "reason", None) or "timeout", **extra)
                         return False, "", reason
