@@ -111,9 +111,15 @@ class GlobalLease:
 # ---- configuration -----------------------------------------------------------
 
 def prompt_variant() -> str:
-    """The variant label from ``NEXUS_SHADOW_REPLAY_VARIANT`` (default ``baseline``)."""
+    """Variant label including the local model's edit-format treatment."""
     value = " ".join(os.environ.get(ENV_VARIANT, "").split())[:_MAX_VARIANT_CHARS]
-    return value or DEFAULT_VARIANT
+    value = value or DEFAULT_VARIANT
+    from modules.local_coding_worker import local_edit_format
+    # The historical unsuffixed treatment is unified diff; name the new arm so
+    # reports naturally compare ``baseline+sr`` against ``baseline``.
+    if local_edit_format() == "diff" or value.endswith("+sr"):
+        return value
+    return value[:_MAX_VARIANT_CHARS - len("+sr")] + "+sr"
 
 
 def _float_env(name: str, default: float) -> float:
