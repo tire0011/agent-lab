@@ -268,6 +268,7 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
                merged_commit=?, test_files_json=?, finished_at=?,
                samples=?, samples_requested=?, samples_passed=?, cpu_seconds=?,
                load_average=?, peak_rss_kb=?, tokens_per_second=?, metrics_json=?,
+               file_level=?, cold_time_limited=?,
                claim_token=NULL, lease_expires_at=NULL
            WHERE experiment_id=? AND prompt_variant=? AND claim_token=? AND status=?""",
         (
@@ -282,6 +283,10 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
             _metric(outcome.metrics, "llama_server_peak_rss_kb"),
             _metric(outcome.metrics, "tokens_per_second"),
             json.dumps(outcome.metrics, default=str) if outcome.metrics is not None else None,
+            _metric(outcome.metrics, "file_level"),
+            (int(outcome.metrics["cold_time_limited"])
+             if outcome.metrics is not None and isinstance(outcome.metrics.get("cold_time_limited"), bool)
+             else None),
             experiment_id, variant, token, STATUS_PENDING,
         ),
     ).rowcount == 1
@@ -994,6 +999,7 @@ _READ_COLUMNS = (
     "tests_total, tests_passed, rounds, tokens, seconds, error, base_commit, "
     "merged_commit, created_at, finished_at, samples, samples_requested, samples_passed, "
     "cpu_seconds, load_average, peak_rss_kb, tokens_per_second"
+    ", file_level, cold_time_limited"
 )
 
 
@@ -1001,6 +1007,8 @@ def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["patch_applied"] = bool(data["patch_applied"])
     data["compiled"] = bool(data["compiled"])
+    if data.get("cold_time_limited") is not None:
+        data["cold_time_limited"] = bool(data["cold_time_limited"])
     data["full_pass"] = is_full_pass(data)
     return data
 

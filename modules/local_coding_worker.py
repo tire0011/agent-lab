@@ -373,6 +373,7 @@ class PromptPlan:
     time_budget_tokens: int | None = None
     time_budget_limited: bool = False
     time_budget_exceeded: bool = False
+    cold_time_limited: bool = False
     # max_tokens for the model calls on this prompt; the time budget may lower it.
     output_tokens: int = 0
     # Parts of the fitted prompt, kept for the correction rounds (#597).
@@ -395,6 +396,7 @@ class PromptPlan:
             "time_budget_tokens": self.time_budget_tokens,
             "time_budget_limited": self.time_budget_limited,
             "time_budget_exceeded": self.time_budget_exceeded,
+            "cold_time_limited": self.cold_time_limited,
             "output_tokens": self.output_tokens,
         }
 
@@ -471,7 +473,7 @@ async def _fit_part(text: str, budget: int, measure: Callable[[str], Awaitable[i
 async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_tokens: int,
                        margin_tokens: int = CONTEXT_MARGIN_TOKENS,
                        rates: tuple[float | None, float | None] = (None, None),
-                       admission: bool = True) -> PromptPlan:
+                       admission: bool = True, cold: bool = True) -> PromptPlan:
     """Fit the local prompt into the server's context, or raise :class:`ContextTooSmallError`
     (or :class:`LocalTooSlowError` when *admission* is on and the rates cannot afford a patch)."""
     n_ctx, n_ctx_source = await discover_context_size(client)
@@ -479,7 +481,7 @@ async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_t
     return await build_prompt_parts(
         essential, handover, working_dir, client, max_output_tokens=max_output_tokens,
         margin_tokens=margin_tokens, n_ctx=n_ctx, n_ctx_source=n_ctx_source, rates=rates,
-        admission=admission,
+        admission=admission, cold=cold,
     )
 
 
@@ -488,7 +490,7 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
                              margin_tokens: int = CONTEXT_MARGIN_TOKENS,
                              counter: TokenCounter | None = None,
                              rates: tuple[float | None, float | None] = (None, None),
-                             admission: bool = True) -> PromptPlan:
+                             admission: bool = True, cold: bool = True) -> PromptPlan:
     """:func:`build_prompt` for an already split task and an already known ``n_ctx``."""
     count = counter or TokenCounter(client)
     # n_ctx is a hard limit; the time budget (#642) is a soft one. It cuts the
@@ -543,24 +545,30 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     if base_tokens > budget:
         budget, exceeded = base_tokens, True
 
-    # 2. Named files, from whole to the essential excerpt. The hard context
-    # limit may excerpt them; the softer time budget must not discard the
-    # stable cacheable prefix merely to retain changing tail text.
+    # 2. Named files, from whole to the essential excerpt. On the first call,
+    # there is no cached prefix yet, so fit the files to the time budget as
+    # well as n_ctx. Warm calls retain the historical n_ctx-only choice.
     files_text = ""
     level_used = 0
+    cold_time_limited = False
     if files:
+        file_budget = budget if cold and time_budget_tokens is not None else context_budget
         for level_used, level in enumerate(_FILE_LEVELS):
             files_text = _render_files(files, keywords, level)
             with_files = await total(_render_prompt(essential, files_text, ""))
-            if with_files <= context_budget:
+            if with_files <= file_budget:
                 break
+            if with_files <= context_budget:
+                cold_time_limited = True
         else:
             if with_files > context_budget:
                 raise too_small(
                     f"the instructions, the goal and the relevant parts of {', '.join(names)}",
                     with_files,
                 )
-            budget, exceeded = with_files, True  # smallest file level, over the time budget
+            # The smallest excerpt still exceeds the soft time budget. Send it
+            # so the worker can measure a better rate; n_ctx remains hard.
+            budget, exceeded = with_files, True
         if with_files > budget:
             budget, exceeded = with_files, True
 
@@ -587,7 +595,8 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         file_level=level_used, handover_tokens_kept=await count(kept) if kept else 0,
         handover_cut=handover_cut,
         time_budget_tokens=time_budget_tokens, time_budget_limited=limited,
-        time_budget_exceeded=exceeded, output_tokens=output_tokens,
+        time_budget_exceeded=exceeded, cold_time_limited=cold_time_limited,
+        output_tokens=output_tokens,
         essential=essential, files_text=files_text, handover=handover, counter=count,
         stable_prefix=_render_stable_prefix(files_text),
     )
@@ -1974,6 +1983,9 @@ class LocalCodingWorker:
                       "round": s.winner_round, "reason": s.winner_reason} for s in winners],
             success=success,
         )
+        if self.last_plan is not None:
+            fields.update(file_level=self.last_plan.file_level,
+                          cold_time_limited=self.last_plan.cold_time_limited)
         self.last_run_metrics = fields
         self._log(experiment_logger, phase, "local_run_metrics",
                   summary_line(fields) + f", samples N={self.samples}", **fields)

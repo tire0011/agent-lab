@@ -499,7 +499,8 @@ class ReplayStoresMetricsTests(unittest.TestCase):
                 Path(working_dir, "calc.py").write_text("def add(a, b):\n    return a + b\n")
                 experiment_logger.info("x", "local_run_metrics", "m", samples_setting=4, samples_requested=3,
                                        samples_passed=1, llama_server_cpu_seconds=12.5, load_average=1.5,
-                                       llama_server_peak_rss_kb=2048, tokens_per_second=7.5)
+                                       llama_server_peak_rss_kb=2048, tokens_per_second=7.5,
+                                       file_level=2, cold_time_limited=True)
                 from modules.coding_worker import WorkerResult
                 return WorkerResult(success=True, exit_code=0, stdout="", stderr="", runtime_ms=1,
                                     timed_out=False, stdout_truncated=False, stderr_truncated=False,
@@ -514,6 +515,7 @@ class ReplayStoresMetricsTests(unittest.TestCase):
                          client=Client(), worker_factory=lambda _c: Worker())
         self.assertEqual((row["samples"], row["samples_requested"], row["samples_passed"]), (4, 3, 1))
         self.assertEqual((row["cpu_seconds"], row["peak_rss_kb"], row["tokens_per_second"]), (12.5, 2048, 7.5))
+        self.assertEqual((row["file_level"], row["cold_time_limited"]), (2, True))
         conn = sqlite3.connect(self.db)
         stored = json.loads(conn.execute("SELECT metrics_json FROM local_replays").fetchone()[0])
         conn.close()

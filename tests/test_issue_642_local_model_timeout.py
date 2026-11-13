@@ -385,8 +385,9 @@ class TimeBudgetTests(_RepoCase):
         self.assertTrue(plan.time_budget_exceeded)
         self.assertTrue(plan.time_budget_limited)
         self.assertEqual(0, plan.handover_tokens_kept)
-        # The changing tail is discarded before the stable file prefix (#645).
-        self.assertEqual(0, plan.file_level)
+        # On a cold call the file prefix is minimized too (#677); it is still
+        # sent when even that smallest excerpt exceeds the soft budget.
+        self.assertEqual(len(_FILE_LEVELS) - 1, plan.file_level)
 
     def test_n_ctx_remains_a_hard_limit(self):
         with self.assertRaises(ContextTooSmallError):
