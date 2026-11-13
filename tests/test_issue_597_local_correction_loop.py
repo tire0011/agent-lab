@@ -17,8 +17,8 @@ from modules.local_coding_worker import (
 )
 
 _GOOD = "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-original\n+patched\n"
-# Hunk header claims more lines than follow: git reports "corrupt patch".
-_CORRUPT = "--- a/value.txt\n+++ b/value.txt\n@@ -1,3 +1,3 @@\n-original\n+patched\n"
+# Invalid hunk body remains corrupt even after the worker's --recount retry.
+_CORRUPT = "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-original\nnot-a-hunk-line\n+patched\n"
 _NOT_APPLYING = "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-not-there\n+x\n"
 # Applies cleanly, but leaves mod.py with a syntax error.
 _BROKEN_PY = "--- a/mod.py\n+++ b/mod.py\n@@ -1 +1 @@\n-VALUE = 1\n+VALUE = (\n"
@@ -122,7 +122,8 @@ class Issue597CorrectionLoopTests(unittest.TestCase):
         self.assertEqual(server.calls[0]["prompt"].split(marker, 1)[0],
                          second.split(marker, 1)[0])
         self.assertIn("corrupt patch", second)  # the error was fed back
-        self.assertIn("-original\n+patched", second)  # with the previous diff
+        self.assertIn("-original", second)  # with the previous answer
+        self.assertIn("+patched", second)
         self.assertIn("Goal and instructions:", second)  # on top of the same fitted prompt
         self.assertIn("--- value.txt ---\noriginal", second)
         rounds = log.rounds()
@@ -191,7 +192,7 @@ class Issue597CorrectionLoopTests(unittest.TestCase):
         _worker, result, log = self._run(server)
         self.assertTrue(result.success, result.error)
         self.assertEqual(["no_diff", "applied"], [r["outcome"] for r in log.rounds()])
-        self.assertIn("did not return a unified diff", server.calls[1]["prompt"])
+        self.assertIn("did not return any SEARCH/REPLACE", server.calls[1]["prompt"])
 
     def test_feedback_prompt_stays_within_n_ctx_and_cuts_handover_first(self):
         n_ctx = 4096

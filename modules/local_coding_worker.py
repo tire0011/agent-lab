@@ -7,8 +7,9 @@ named files, then the handover cut from the end. When the first two do not fit, 
 model is not called: the run ends ``context_too_small`` and the experiment hands
 the task to an external agent.
 
-Correction loop (#597): each answer must be a unified diff that passes
-``git apply --check``, applies, and leaves every changed ``.py`` file passing
+Correction loop (#597): each answer is converted to a unified diff
+(SEARCH/REPLACE blocks by default), must pass ``git apply --check``, apply, and
+leave every changed ``.py`` file passing
 ``python -m py_compile``. On a failure the round's changes are rolled back to the
 pre-round working tree (pre-existing changes kept, new files removed) and the model
 is asked again with the same fitted prompt plus a bounded feedback section: the
@@ -76,6 +77,7 @@ from typing import Any, Awaitable, Callable
 from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
 from modules.llama_cpp_client import LlamaCppClient
+from modules.local_edit_format import EditFormatError, edits_to_diff
 from modules.local_model_rates import LocalModelRates
 from modules.local_run_metrics import CallRecord, RunMetrics, call_record, summary_line
 from modules.local_test_first import generate_failing_tests
@@ -95,7 +97,12 @@ SAFE_BYTES_PER_TOKEN = 3
 _MAX_FILES = 8
 _MAX_FILE_BYTES = 16 * 1024
 _SYSTEM_PROMPT = "You are a repository coding worker. Follow the requested output format exactly."
-_CLOSING = "Return only one unified git diff. Do not use Markdown prose or fences."
+_DIFF_CLOSING = "Return only one unified git diff. Do not use Markdown prose or fences."
+_SR_CLOSING = (
+    "Return only SEARCH/REPLACE edit blocks, one or more, in exactly this form:\n"
+    "path/to/file.py\n<<<<<<< SEARCH\nexact existing text\n=======\nreplacement text\n>>>>>>> REPLACE\n"
+    "Do not use Markdown prose or fences. Use an empty SEARCH only to create a new file."
+)
 _CUT_MARKER = "\n...[handover cut to fit the local model's context]"
 _DIFF_CUT_MARKER = "\n...[previous diff cut to fit the local model's context]"
 _ERROR_CUT_MARKER = "\n...[error cut]"
@@ -205,7 +212,8 @@ def _render_feedback(round_no: int, error: str, previous_diff: str) -> str:
         f"Error:\n{error}\n"
     )
     if previous_diff:
-        text += f"\nPrevious diff (fix it, do not repeat the mistake):\n{previous_diff}\n"
+        label = "edit answer" if local_edit_format() == "search_replace" else "diff"
+        text += f"\nPrevious {label} (fix it, do not repeat the mistake):\n{previous_diff}\n"
     return text
 
 
@@ -217,7 +225,7 @@ def _render_prompt(essential: str, files_text: str, handover: str, feedback: str
         prompt += f"{handover}\n\n"
     if feedback:
         prompt += f"{feedback}\n"
-    return prompt + _CLOSING
+    return prompt + (_SR_CLOSING if local_edit_format() == "search_replace" else _DIFF_CLOSING)
 
 
 def _render_stable_prefix(files_text: str) -> str:
@@ -233,6 +241,42 @@ def _extract_diff(text: str) -> str:
     candidate = fenced.group(1) if fenced else text
     starts = [p for p in (candidate.find("diff --git "), candidate.find("--- a/")) if p >= 0]
     return candidate[min(starts):].strip() + "\n" if starts else ""
+
+
+# A SEARCH marker counts only at the start of a line: inside a unified diff
+# every content line carries a ``+``/``-``/`` `` prefix, so a diff that edits
+# text containing the marker never matches this.
+_SR_MARKER_RE = re.compile(r"(?m)^<<<<<<< SEARCH[ \t]*\r?$")
+_DIFF_HEADER_RE = re.compile(r"(?m)^(?:diff --git |--- (?:a/|/dev/null))")
+
+
+def _is_search_replace_answer(text: str) -> bool:
+    """True when *text* is structurally SEARCH/REPLACE rather than a unified diff.
+
+    The decision is made from the structure of the answer, not its content: a
+    line-start SEARCH marker must exist and must come before any line-start
+    unified-diff header.  A SEARCH block whose text contains a diff header
+    stays SEARCH/REPLACE; a diff whose hunks contain the marker stays a diff.
+    """
+    marker = _SR_MARKER_RE.search(text)
+    if not marker:
+        return False
+    header = _DIFF_HEADER_RE.search(text)
+    return header is None or marker.start() < header.start()
+
+
+def _response_patch(text: str, working_dir: str, timeout: float,
+                    allowed_paths: set[str] | None) -> str:
+    """Convert the configured answer format to the worker's internal Git diff."""
+    if local_edit_format() == "search_replace" and _is_search_replace_answer(text):
+        return edits_to_diff(text, working_dir, timeout, allowed_paths)
+    # A diff remains a supported escape hatch even when SEARCH/REPLACE is the prompt.
+    diff = _extract_diff(text)
+    if diff:
+        return diff
+    if local_edit_format() == "diff":
+        return ""
+    return edits_to_diff(text, working_dir, timeout, allowed_paths)
 
 
 # Context size and token counting
@@ -585,6 +629,7 @@ class SplitOutcome:
 
 ENV_TASK_SPLIT = "LOCAL_TASK_SPLIT"
 ENV_TEST_FIRST = "LOCAL_TEST_FIRST"
+ENV_EDIT_FORMAT = "LOCAL_EDIT_FORMAT"
 MAX_SUBTASKS = 6
 MAX_SUBTASK_FILES = 2
 MAX_SUBTASK_TESTS = 3
@@ -658,6 +703,12 @@ def sample_schedule(samples: int, spread: tuple[float, ...] = DEFAULT_SAMPLE_TEM
 def task_split_enabled() -> bool:
     """``LOCAL_TASK_SPLIT`` (default on); ``0``/``false``/``off`` runs one-shot."""
     return os.environ.get(ENV_TASK_SPLIT, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def local_edit_format() -> str:
+    """Configured model answer format; SEARCH/REPLACE is the safe default."""
+    configured = os.environ.get(ENV_EDIT_FORMAT, "search_replace").strip().lower()
+    return "diff" if configured == "diff" else "search_replace"
 
 
 def test_first_enabled() -> bool:
@@ -923,6 +974,14 @@ def _git_apply(args: list[str], working_dir: str, patch: str, timeout: float) ->
                           text=True, capture_output=True, timeout=timeout)
     if done.returncode == 0:
         return None
+    # Small models commonly produce correct hunks with stale line counts.  Git
+    # can reconstruct those counts without weakening context matching.
+    if "--recount" not in args:
+        retried = subprocess.run(["git", "apply", *args, "--recount", "-"], cwd=working_dir,
+                                 input=patch, text=True, capture_output=True, timeout=timeout)
+        if retried.returncode == 0:
+            return None
+        done = retried
     return done.stderr.strip() or done.stdout.strip() or "unknown git apply error"
 
 
@@ -1081,7 +1140,8 @@ def apply_and_check(patch: str, working_dir: str, timeout: float, *,
 # How far a candidate got; a higher stage is a better fallback.
 _STAGE_NONE, _STAGE_APPLIED, _STAGE_COMPILED, _STAGE_PASSED = range(4)
 _OUTCOME_STAGE = {
-    "no_diff": _STAGE_NONE, "outside_subtask": _STAGE_NONE, "does_not_apply": _STAGE_NONE,
+    "no_diff": _STAGE_NONE, "edit_format": _STAGE_NONE,
+    "outside_subtask": _STAGE_NONE, "does_not_apply": _STAGE_NONE,
     "apply_failed": _STAGE_NONE, "compile_failed": _STAGE_APPLIED, "tests_failed": _STAGE_COMPILED,
     "applied": _STAGE_PASSED,
 }
@@ -1692,9 +1752,17 @@ class LocalCodingWorker:
                         self._log_round(experiment_logger, phase, round_no, "model_timeout", reason, **extra)
                         return False, "", reason
                     raise
-                patch = _extract_diff(output)
+                format_error = ""
+                try:
+                    patch = _response_patch(output, working_dir, timeout, allowed_paths)
+                except EditFormatError as exc:
+                    patch = ""
+                    format_error = f"local model SEARCH/REPLACE edits were rejected: {exc}"
                 checked = time.monotonic()
-                if sampling:
+                if format_error:
+                    outcome = "no_diff" if "did not return any SEARCH/REPLACE" in format_error else "edit_format"
+                    check = CandidateCheck(outcome, format_error)
+                elif sampling:
                     check = check_in_worktree(patch, working_dir, timeout, allowed_paths=allowed_paths,
                                               tests=tests, tmp_root=self.sample_tmp_root)
                     if check.passed:
@@ -1723,7 +1791,11 @@ class LocalCodingWorker:
                 previous = best
                 best = better_candidate(best, (check, index))
                 if best is not previous:
-                    best_diff = patch or output.strip()
+                    # In SEARCH/REPLACE mode correction feedback must show the
+                    # answer the model can revise, not our generated unified
+                    # diff.  Diff mode retains its historical normalized patch.
+                    best_diff = (output.strip() if local_edit_format() == "search_replace"
+                                 else (patch or output.strip()))
             assert best is not None
             check, index = best
             reason = check.reason

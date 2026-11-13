@@ -448,10 +448,10 @@ class SweepTests(unittest.TestCase):
 
     def test_variant_comes_from_the_environment(self):
         with patch.dict(os.environ, {lsr.ENV_VARIANT: "  ctx  v2 "}):
-            self.assertEqual(lsr.prompt_variant(), "ctx v2")
+            self.assertEqual(lsr.prompt_variant(), "ctx v2+sr")
             outcome = self.sweep(FakeClient())
-        self.assertEqual(outcome["replay"]["prompt_variant"], "ctx v2")
-        self.assertEqual(lsr.prompt_variant(), "baseline")
+        self.assertEqual(outcome["replay"]["prompt_variant"], "ctx v2+sr")
+        self.assertEqual(lsr.prompt_variant(), "baseline+sr")
 
     def test_disabled_by_setting_env_or_pause(self):
         with patch.dict(os.environ, {lsr.ENV_ENABLED: "0"}):
