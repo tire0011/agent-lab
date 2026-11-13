@@ -89,7 +89,7 @@ from typing import Any, Awaitable, Callable
 from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
 from modules.llama_cpp_client import EARLY_STOP_REASONS, LlamaCppClient
-from modules.local_edit_format import EditFormatError, edits_to_diff
+from modules.local_edit_format import EditDiff, EditFormatError, edits_to_diff
 from modules.local_model_rates import LocalModelRates, rates_from_timings
 from modules.local_run_metrics import CallRecord, RunMetrics, call_record, summary_line
 from modules.local_test_first import generate_failing_tests
@@ -299,17 +299,30 @@ def _is_search_replace_answer(text: str) -> bool:
 
 
 def _response_patch(text: str, working_dir: str, timeout: float,
-                    allowed_paths: set[str] | None) -> str:
-    """Convert the configured answer format to the worker's internal Git diff."""
+                    allowed_paths: set[str] | None) -> EditDiff:
+    """Convert the configured answer format to the worker's internal Git diff.
+
+    Every successful path returns an :class:`EditDiff`, so the caller can read
+    ``lenient_creates`` (#679) without guessing: SEARCH/REPLACE conversions
+    carry the count from :func:`edits_to_diff`, raw unified diffs carry 0.
+    Malformed answers still raise :class:`EditFormatError`.
+    """
     if local_edit_format() == "search_replace" and _is_search_replace_answer(text):
-        return edits_to_diff(text, working_dir, timeout, allowed_paths)
+        return _as_edit_diff(edits_to_diff(text, working_dir, timeout, allowed_paths))
     # A diff remains a supported escape hatch even when SEARCH/REPLACE is the prompt.
     diff = _extract_diff(text)
     if diff:
-        return diff
+        return EditDiff(diff)
     if local_edit_format() == "diff":
-        return ""
-    return edits_to_diff(text, working_dir, timeout, allowed_paths)
+        return EditDiff("")
+    return _as_edit_diff(edits_to_diff(text, working_dir, timeout, allowed_paths))
+
+
+def _as_edit_diff(patch: str) -> EditDiff:
+    """Keep *patch*'s ``lenient_creates`` count; a plain string counts as 0."""
+    if isinstance(patch, EditDiff):
+        return patch
+    return EditDiff(patch, lenient_creates=int(getattr(patch, "lenient_creates", 0) or 0))
 
 
 # Context size and token counting
@@ -1749,7 +1762,9 @@ class LocalCodingWorker:
             f"Tests that must pass afterwards (run only; do not edit them unless listed "
             f"above): {tests}"
         )
-        missing = [path for path in subtask.files if not (Path(working_dir) / path).is_file()]
+        # #679: a 7B model guesses SEARCH text for files that do not exist yet;
+        # name them explicitly so it writes an empty SEARCH instead.
+        missing = [path for path in subtask.files if not (Path(working_dir) / path).exists()]
         if missing:
             essential += "\n" + "\n".join(
                 f"NEW FILE: {path} (use an empty SEARCH)" for path in missing
@@ -1836,12 +1851,10 @@ class LocalCodingWorker:
                         return False, "", reason
                     raise
                 format_error = ""
+                lenient_creates = 0
                 try:
                     patch = _response_patch(output, working_dir, timeout, allowed_paths)
-                    lenient_creates = int(getattr(patch, "lenient_creates", 0))
-                    self.lenient_creates += lenient_creates
-                    if lenient_creates:
-                        extra = {**extra, "lenient_creates": lenient_creates}
+                    lenient_creates = patch.lenient_creates
                 except EditFormatError as exc:
                     patch = ""
                     format_error = f"local model SEARCH/REPLACE edits were rejected: {exc}"
@@ -1869,7 +1882,11 @@ class LocalCodingWorker:
                 if check.passed:
                     stats.winner_index, stats.winner_temperature = index, temperature
                     stats.winner_round, stats.winner_reason = round_no, check.decided_by
+                    # Count only lenient creates that reached the real tree (#679):
+                    # rejected samples and failed rounds were never applied.
+                    self.lenient_creates += lenient_creates
                     self._log_round(experiment_logger, phase, round_no, "applied", "", **extra,
+                                    **({"lenient_creates": lenient_creates} if lenient_creates else {}),
                                     **({"winner_index": index, "winner_temperature": temperature}
                                        if sampling else {}))
                     if self.generated_tests and set(self.generated_tests).issubset(tests):

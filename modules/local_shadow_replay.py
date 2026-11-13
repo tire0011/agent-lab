@@ -731,6 +731,14 @@ def _load(conn: sqlite3.Connection, experiment_id: str) -> tuple[sqlite3.Row, sq
     return row, adoption
 
 
+def _lenient_creates(worker: Any) -> int:
+    """The worker's applied lenient-create count (#679); 0 when it has none or a bad value."""
+    try:
+        return max(0, int(getattr(worker, "lenient_creates", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: ReplayOutcome,
                 client: Any, worker_factory: Callable[[Any], Any],
                 test_runner: Callable[[str, list[str], float], MergedTestRun], *,
@@ -763,11 +771,12 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
             outcome.seconds = time.monotonic() - started
             outcome.rounds = counter.rounds
             outcome.metrics = counter.metrics
+            outcome.lenient_creates = _lenient_creates(worker)
             raise ReplayError(f"local worker raised {type(exc).__name__}: {exc}") from exc
         outcome.seconds = time.monotonic() - started
         outcome.rounds = counter.rounds
         outcome.metrics = counter.metrics
-        outcome.lenient_creates = int(getattr(worker, "lenient_creates", 0))
+        outcome.lenient_creates = _lenient_creates(worker)
         outcome.tokens = int(getattr(client, "tokens_used", 0) or 0) or _usage_tokens(getattr(result, "usage", None))
         worker_error = None if getattr(result, "success", False) else (
             str(getattr(result, "error", None) or "local worker did not succeed"))
