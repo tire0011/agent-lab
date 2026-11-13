@@ -9,7 +9,56 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+# Capture these before any test can replace them.  Besides being the clocks
+# exposed by ``real_clock``, their identities make the no-drift path a genuine
+# no-op (important for tests which patch clocks themselves).
+_REAL_CLOCK = SimpleNamespace(
+    monotonic=time.monotonic,
+    perf_counter=time.perf_counter,
+    time=time.time,
+)
+
+
+@pytest.fixture
+def real_clock():
+    """Return the process clocks and opt this test out of clock drift."""
+
+    return _REAL_CLOCK
+
+
+@pytest.fixture(autouse=True)
+def _clock_drift(request, monkeypatch):
+    """Advance each wall-clock read by the configured amount per call."""
+
+    configured_ms = os.environ.get("NEXUS_TEST_CLOCK_DRIFT_MS")
+    if configured_ms is None or "real_clock" in request.fixturenames:
+        yield
+        return
+
+    drift_seconds = float(configured_ms) / 1000.0
+
+    def make_drifting_clock(original):
+        calls = 0
+
+        def drifting_clock():
+            nonlocal calls
+            calls += 1
+            return original() + calls * drift_seconds
+
+        return drifting_clock
+
+    for name in ("monotonic", "perf_counter", "time"):
+        original = getattr(_REAL_CLOCK, name)
+        monkeypatch.setattr(time, name, make_drifting_clock(original))
+
+    yield
 
 # Keep the suite out of the production log directory. `DEFAULT_LOG_DIR` is a
 # relative path, so without this a test run writes into
