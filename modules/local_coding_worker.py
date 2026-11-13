@@ -500,15 +500,22 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     allowance = time_budget(getattr(client, "timeout", None), max_output_tokens, rates)
     # #667 admission: a slow generation rate cannot be fixed by a smaller
     # prompt, so a call that cannot afford a useful answer is not made. The
-    # worker turns it off while the generation rate is only a timeout guess.
-    useful = min(_min_useful_patch_tokens(), max_output_tokens)
-    if admission and allowance is not None and allowance.output_tokens < useful:
+    # Estimates are deliberately eligible here.  A zero-token TTFT stop has no
+    # generation measurement, but its conservative fallback is exactly what
+    # prevents the next call from repeating the same hopeless cycle.
+    useful = _min_useful_patch_tokens()
+    affordable_output = allowance.output_tokens if allowance is not None else max_output_tokens
+    if admission and affordable_output < useful:
         prompt_rate, generation_rate = rates
-        raise LocalTooSlowError(
-            f"{LOCAL_TOO_SLOW}: the time budget allows only {allowance.output_tokens} output tokens "
-            f"(generation {generation_rate:.2f} tok/s, prompt {prompt_rate:.2f} tok/s, "
+        rate_detail = (
+            f"generation {generation_rate:.2f} tok/s, prompt {prompt_rate:.2f} tok/s, "
             f"{allowance.seconds:g}s of the {float(getattr(client, 'timeout')):g}s timeout, at most "
-            f"{MAX_GENERATION_TIME_SHARE:.0%} of it for generation); a useful patch needs {useful}; "
+            f"{MAX_GENERATION_TIME_SHARE:.0%} of it for generation"
+            if allowance is not None else f"configured max_output_tokens {max_output_tokens}"
+        )
+        raise LocalTooSlowError(
+            f"{LOCAL_TOO_SLOW}: the time budget allows only {affordable_output} output tokens "
+            f"({rate_detail}); a useful patch needs {useful}; "
             "the local model was not called"
         )
     time_budget_tokens = allowance.prompt_tokens if allowance else None
@@ -1516,7 +1523,7 @@ class LocalCodingWorker:
                 plan = asyncio.run(build_prompt(task, working_dir, self.client,
                                                 max_output_tokens=self.max_tokens,
                                                 rates=self.rates.medians(),
-                                                admission=self.rates.generation_measured()))
+                                                admission=True))
             except ContextTooSmallError as exc:
                 self._log(experiment_logger, phase, "local_context_too_small", str(exc), warning=True)
                 return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
@@ -1554,7 +1561,7 @@ class LocalCodingWorker:
                             task, working_dir, self.client,
                             max_output_tokens=self.max_tokens,
                             rates=self.rates.medians(),
-                            admission=self.rates.generation_measured(),
+                            admission=True,
                         ))
                         self.last_plan = plan
                         self._log(
@@ -1741,7 +1748,7 @@ class LocalCodingWorker:
         return await build_prompt_parts(
             essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
             n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
-            rates=self.rates.medians(), admission=self.rates.generation_measured(),
+            rates=self.rates.medians(), admission=True,
         )
 
     # The correction loop (#597)
@@ -2030,9 +2037,18 @@ class LocalCodingWorker:
                 self.rates.record(timings)  # never raises
             elif outcome in ("timeout", "early_stop") and self.rates.record(timings):
                 pass  # #667: the measured partial rates, not guesses
-            elif (stop.get("stop_reason") == "prompt_too_slow"
-                  and self.rates.record(_prompt_bound_timings(fields.get("prompt_tokens"), stop))):
-                pass  # no token within the TTFT limit: a measured upper bound of the prompt rate
+            elif stop.get("stop_reason") == "prompt_too_slow":
+                # Preserve the measured prompt upper bound and bootstrap
+                # generation in one atomic rates-file replacement.
+                timeout = getattr(self.client, "timeout", None)
+                prompt_tokens = fields.get("prompt_tokens")
+                if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
+                        and timeout > 0 and isinstance(prompt_tokens, int)):
+                    self.rates.record_prompt_stop(
+                        _prompt_bound_timings(prompt_tokens, stop), prompt_tokens=prompt_tokens,
+                        timeout_seconds=float(timeout),
+                        minimum_output_tokens=MIN_OUTPUT_TOKENS,
+                    )
             elif outcome in ("timeout", "early_stop"):
                 # Not one usable measurement arrived: fall back to the guess.
                 timeout = getattr(self.client, "timeout", None)

@@ -17,8 +17,9 @@ call); :meth:`LocalModelRates.record_timeout` stores guesses under separate
 ``estimated_*`` keys. :meth:`LocalModelRates.medians` uses the measured samples
 of a rate and falls back to the estimates only when that rate was never
 measured, and :meth:`LocalModelRates.generation_measured` tells whether the
-generation rate is a real measurement (the worker's admission check only
-trusts real ones). Files written before #667 have no ``estimated_*`` keys.
+generation rate is a real measurement. Admission also uses conservative
+estimates: that is what prevents a zero-token timeout from immediately being
+repeated. Files written before #667 have no ``estimated_*`` keys.
 
 Failure behaviour: a missing, unreadable, corrupt or half-written file reads
 as "no measurements yet", which leaves prompts untouched; a failed write is
@@ -166,6 +167,38 @@ class LocalModelRates:
             return True
         except Exception:
             logger.warning("could not record local model timeout rates in %s", self.path,
+                           exc_info=True)
+            return False
+
+    def record_prompt_stop(self, timings: dict[str, Any] | None, *, prompt_tokens: int,
+                           timeout_seconds: float, minimum_output_tokens: int) -> bool:
+        """Atomically store a TTFT prompt bound and generation fallback.
+
+        Keeping both samples in one replacement means interruption cannot leave
+        a measured prompt rate without the estimate needed to admit/refuse the
+        next call. Repeating the operation is safe: the bounded rolling median
+        receives the same observations again.
+        """
+        try:
+            measured = rates_from_timings(timings)
+            if "prompt_tokens_per_second" not in measured:
+                return False
+            if not (isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool)
+                    and prompt_tokens > 0 and _valid_rate(timeout_seconds)
+                    and isinstance(minimum_output_tokens, int)
+                    and not isinstance(minimum_output_tokens, bool)
+                    and minimum_output_tokens > 0):
+                return False
+            half_budget_seconds = float(timeout_seconds) * 0.8 * 0.5
+            self._append({
+                **measured,
+                _ESTIMATED["prompt_tokens_per_second"]: prompt_tokens / float(timeout_seconds),
+                _ESTIMATED["generation_tokens_per_second"]:
+                    minimum_output_tokens / half_budget_seconds,
+            })
+            return True
+        except Exception:
+            logger.warning("could not record local model prompt stop rates in %s", self.path,
                            exc_info=True)
             return False
 

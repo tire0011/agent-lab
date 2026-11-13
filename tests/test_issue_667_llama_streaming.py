@@ -228,10 +228,10 @@ class _Log:
 class _CountingServer:
     """A fake client for the admission tests; counts model calls."""
 
-    timeout = 300.0
     model = "m"
 
-    def __init__(self):
+    def __init__(self, timeout=300.0):
+        self.timeout = timeout
         self.calls = 0
         self.last_timings = None
 
@@ -298,8 +298,17 @@ class WorkerTests(unittest.TestCase):
         # At most prompt_tokens / time waited (~0.6 s), not prompt_tokens / timeout.
         expected = call["prompt_tokens"] / call["stop_rates"]["elapsed_seconds"]
         self.assertAlmostEqual(prompt_rate, expected, places=3)
-        self.assertIsNone(generation_rate)  # nothing guessed for generation
+        # The measured prompt bound wins over record_timeout's prompt guess,
+        # while generation gets the conservative fallback needed for admission.
+        self.assertAlmostEqual(generation_rate, MIN_OUTPUT_TOKENS / (1.0 * 0.8 * 0.5))
         self.assertFalse(rates.generation_measured())
+
+        # A repeat run is refused instead of burning another TTFT interval.
+        second_client = _CountingServer(timeout=1.0)
+        _, second, second_log = self.run_worker(second_client)
+        self.assertEqual(second_client.calls, 0)
+        self.assertTrue(second.error.startswith(LOCAL_TOO_SLOW), second.error)
+        self.assertEqual(len(second_log.all("local_too_slow")), 1)
 
     def test_record_timeout_stays_the_fallback_without_any_measurement(self):
         rates = LocalModelRates(self.rates_path, model="m")
@@ -314,15 +323,31 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(rates.medians(), (10.0, 50.0))
         self.assertTrue(rates.generation_measured())
 
-    def test_a_guessed_generation_rate_never_locks_the_worker_out(self):
-        # The guess is built to afford exactly MIN_OUTPUT_TOKENS (< 768); if it
-        # counted for admission, one zero-token timeout would refuse every later call.
+    def test_prompt_stop_persists_both_rates_atomically_and_is_repeatable(self):
+        rates = LocalModelRates(self.rates_path, model="m")
+        timings = {"prompt_n": 120, "prompt_ms": 600}
+        with patch.object(rates, "_append", wraps=rates._append) as append:
+            self.assertTrue(rates.record_prompt_stop(
+                timings, prompt_tokens=120, timeout_seconds=1.0,
+                minimum_output_tokens=MIN_OUTPUT_TOKENS))
+            self.assertEqual(append.call_count, 1)
+            written = append.call_args.args[0]
+            self.assertIn("prompt_tokens_per_second", written)
+            self.assertIn("estimated_generation_tokens_per_second", written)
+        self.assertTrue(rates.record_prompt_stop(
+            timings, prompt_tokens=120, timeout_seconds=1.0,
+            minimum_output_tokens=MIN_OUTPUT_TOKENS))
+        self.assertEqual(rates.medians(), (200.0, 640.0))
+
+    def test_a_guessed_generation_rate_prevents_an_identical_hopeless_call(self):
+        # The guess affords only MIN_OUTPUT_TOKENS, so admission refuses rather
+        # than repeating a zero-token timeout.
         LocalModelRates(self.rates_path, model="m").record_timeout(
             prompt_tokens=200, timeout_seconds=300.0, minimum_output_tokens=MIN_OUTPUT_TOKENS)
         client = _CountingServer()
         _, _, log = self.run_worker(client)
-        self.assertGreater(client.calls, 0)
-        self.assertFalse(log.all("local_too_slow"))
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(len(log.all("local_too_slow")), 1)
 
     def _seed(self, prompt_rate, generation_rate):
         assert LocalModelRates(self.rates_path, model="m").record({
@@ -345,6 +370,17 @@ class WorkerTests(unittest.TestCase):
         refused = log.all("local_too_slow")
         self.assertEqual(len(refused), 1)
         self.assertEqual(refused[0]["generation_tokens_per_second"], 3.0)
+
+    def test_admission_refuses_a_configured_output_cap_below_768_without_rates(self):
+        client = _CountingServer()
+        _, result, log = self.run_worker(client, max_tokens=512)
+
+        self.assertEqual(client.calls, 0)
+        self.assertTrue(result.error.startswith(LOCAL_TOO_SLOW), result.error)
+        self.assertIn("only 512 output tokens", result.error)
+        self.assertIn("configured max_output_tokens 512", result.error)
+        self.assertIn("needs 768", result.error)
+        self.assertEqual(len(log.all("local_too_slow")), 1)
 
     def test_admission_lets_a_call_through_with_enough_output_budget(self):
         self._seed(50.0, 10.0)  # 120 s * 10 tok/s = 1200 tokens

@@ -238,28 +238,33 @@ class WorkerTimeoutTests(_RepoCase):
         self.assertEqual("RuntimeError (no message)", result.error)
         self.assertEqual("error", log.all("local_model_call")[0]["outcome"])
 
-    def test_plan_call_timeout_is_logged_and_patch_still_runs(self):
+    def test_plan_call_timeout_is_logged_and_hopeless_patch_is_refused(self):
         server = _Server(LlamaCppClientError(_TIMEOUT_ERROR), "not a diff")
-        worker, _, log = self.run_worker(server, split_tasks=True, planner=lambda _p: None,
-                                         task=_big_handover_task())
+        worker, result, log = self.run_worker(server, split_tasks=True, planner=lambda _p: None,
+                                              task=_big_handover_task())
         calls = log.all("local_model_call")
         self.assertEqual(("plan", "timeout"), (calls[0]["call_type"], calls[0]["outcome"]))
-        self.assertEqual("patch", calls[1]["call_type"])
-        self.assertEqual(MIN_OUTPUT_TOKENS, server.calls[1]["max_tokens"])
-        self.assertTrue(worker.last_plan.time_budget_limited)
-        self.assertTrue(log.all("local_prompt_budget")[-1]["refitted_after_timeout"])
-        self.assertGreaterEqual(len(log.all("local_patch_round")), 1)
+        self.assertEqual(len(calls), 1)
+        # The initial plan remains inspectable; no second, time-squeezed patch
+        # plan or model call is created after the timeout.
+        self.assertIsNotNone(worker.last_plan)
+        self.assertIsNone(worker.last_plan.time_budget_tokens)
+        self.assertTrue(result.error.startswith("local_too_slow"), result.error)
+        self.assertEqual(len(log.all("local_too_slow")), 1)
+        self.assertEqual(log.all("local_patch_round"), [])
 
-    def test_first_patch_timeout_bootstraps_the_next_run(self):
+    def test_first_patch_timeout_refuses_the_next_hopeless_run(self):
         task = _big_handover_task()
         first, result, _ = self.run_worker(_Server(LlamaCppClientError(_TIMEOUT_ERROR)),
                                            task=task)
         self.assertFalse(result.success)
         self.assertNotEqual((None, None), first.rates.medians())
-        second, _, log = self.run_worker(_Server("not a diff"), task=task, split_tasks=True)
-        self.assertTrue(second.last_plan.time_budget_limited)
-        self.assertTrue(second.last_plan.handover_cut)
-        self.assertEqual("patch", log.all("local_model_call")[0]["call_type"])
+        second, second_result, log = self.run_worker(
+            _Server("not a diff"), task=task, split_tasks=True)
+        self.assertIsNone(second.last_plan)
+        self.assertTrue(second_result.error.startswith("local_too_slow"), second_result.error)
+        self.assertEqual(log.all("local_model_call"), [])
+        self.assertEqual(len(log.all("local_too_slow")), 1)
 
     def test_interrupted_model_call_is_logged_and_propagated_without_a_fake_sample(self):
         server = _Server(KeyboardInterrupt())
