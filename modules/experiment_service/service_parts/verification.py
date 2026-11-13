@@ -309,14 +309,25 @@ class VerificationMixin:
         return [*changed.tracked_modified, *changed.untracked_new]
 
 
+    def _forget_timing_process(self, experiment_id: str) -> None:
+        """Best-effort: clear the tracked pytest handle after a failed timing check."""
+        try:
+            self._track_process(experiment_id, None)
+        except Exception:  # noqa: BLE001 - cleanup must not reopen the gate
+            pass
+
+
     def _run_timing_check(
         self, experiment_id: str, worktree_path: str, git_status: str,
         elog: ExperimentLogger,
     ) -> "timing_check_module.TimingCheckResult | None":
         """Slow-machine check (#681): rerun the affected tests with clock drift.
 
-        Operational failures become inconclusive results so enabled
-        verification fails closed.
+        Operational failures - pytest missing, collection errors, timeouts,
+        crashes, and interruptions (KeyboardInterrupt/SystemExit) - become
+        inconclusive results, which ``_verify`` records as ``needs_review``.
+        An enabled check that could not run never approves a change, and an
+        interruption never leaves the experiment stuck in ``verifying``.
         """
         if not timing_check_module.timing_check_enabled():
             elog.info("verifying", "timing_check_skipped",
@@ -341,14 +352,25 @@ class VerificationMixin:
             elog.info(
                 "verifying", "timing_check_started",
                 "Rerunning the affected tests with a sped-up clock",
-                test_files=affected.files, dropped_test_files=affected.dropped,
+                test_files=affected.files,
                 drift_ms=timing_check_module.drift_from_env(),
             )
             result = timing_check_module.run_timing_check(
                 self.test_python_executable, worktree_path, affected.files,
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # The pytest child was killed by ``_run_pytest``; drop the tracked
+            # handle in case the interruption hit before its own cleanup.
+            self._forget_timing_process(experiment_id)
+            elog.warning("verifying", "timing_check_inconclusive",
+                         "Timing check was interrupted", reason=type(exc).__name__)
+            return timing_check_module.TimingCheckResult(
+                timing_check_module.STATUS_INCONCLUSIVE,
+                detail=f"{timing_check_module.INTERRUPTED_DETAIL}: {type(exc).__name__}",
+            )
         except Exception as exc:  # noqa: BLE001 - turn crashes into a closed gate
+            self._forget_timing_process(experiment_id)
             elog.warning("verifying", "timing_check_inconclusive",
                          "Timing check could not run", reason=str(exc)[:1000])
             return timing_check_module.TimingCheckResult(

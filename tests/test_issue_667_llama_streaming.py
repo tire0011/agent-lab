@@ -17,6 +17,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 import httpx
+import pytest
 
 from modules import local_shadow_replay as lsr
 from modules.llama_cpp_client import (
@@ -191,6 +192,8 @@ class StreamingClientTests(unittest.TestCase):
         self.assertEqual(client.last_timings, error.timings)
         self.assertIn("generation_too_slow", str(error))
 
+    @pytest.mark.real_clock(reason="the fake server sleeps per token in real time; the "
+                            "client rate is measured against it (#681)")
     def test_generation_rate_from_the_client_clock_without_server_timings(self):
         server = FakeLlamaServer(token_delay=0.05, tokens=[f"t{i} " for i in range(200)],
                                  final_timings=False)
@@ -204,6 +207,8 @@ class StreamingClientTests(unittest.TestCase):
         rate = error.rates["generation_tokens_per_second"]
         self.assertTrue(10 < rate < 25, rate)  # ~20 tok/s on the client clock
 
+    @pytest.mark.real_clock(reason="the fake server sleeps per token in real time; the "
+                            "client rate is measured against it (#681)")
     def test_a_call_that_can_finish_in_time_is_not_stopped(self):
         server = FakeLlamaServer(token_delay=0.01, tokens=[f"t{i} " for i in range(30)])
         client = _client(server, stream=True, timeout=2.0)

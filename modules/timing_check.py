@@ -14,8 +14,9 @@ That is a slower machine, simulated deterministically.
 A test that fails under drift is run once more without drift. Only a test
 that passes there counts as ``timing_sensitive``. A failure that also happens
 without drift belongs to the normal verification, not to this check. Anything
-that leaves the answer open (pytest missing, collection error, timeout) is
-reported as ``inconclusive``; verification fails closed on that result.
+that leaves the answer open (pytest missing, collection error, timeout,
+interruption) is reported as ``inconclusive``; verification records that as
+``needs_review`` (fails closed). Every affected test file runs; there is no cap.
 
 Switch: ``NEXUS_TIMING_CHECK=1|0``, on by default; the drift per clock read is
 ``NEXUS_TIMING_CHECK_DRIFT_MS`` (default 50, see ``DEFAULT_DRIFT_MS``). The rerun covers only the
@@ -63,6 +64,12 @@ STATUS_PASSED = "passed"
 STATUS_TIMING_SENSITIVE = "timing_sensitive"
 STATUS_INCONCLUSIVE = "inconclusive"
 STATUS_SKIPPED = "skipped"
+
+#: ``detail`` prefix of an inconclusive result caused by an interruption
+#: (KeyboardInterrupt, SystemExit). Callers that must stop (the replay script)
+#: look for it; verification records it as ``needs_review`` like any other
+#: inconclusive result.
+INTERRUPTED_DETAIL = "interrupted"
 
 
 def timing_check_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -177,8 +184,6 @@ class AffectedTests:
     changed: list[str] = field(default_factory=list)
     #: Test files that import a changed module.
     importers: list[str] = field(default_factory=list)
-    #: Retained for compatibility. Required coverage is never dropped.
-    dropped: list[str] = field(default_factory=list)
     #: Importer candidates that could not be inspected completely.
     discovery_errors: list[str] = field(default_factory=list)
 
@@ -186,13 +191,13 @@ class AffectedTests:
 def select_affected_test_files(
     changed_paths: Iterable[str],
     repo_root: str | Path,
-    *,
-    max_files: int | None = None,
 ) -> AffectedTests:
     """Test files the change adds or edits, plus test files importing a changed module.
 
-    Only files that exist in *repo_root* are returned. ``max_files`` is an
-    ignored compatibility argument: required coverage must never be omitted.
+    Only files that exist in *repo_root* are returned. There is no cap: every
+    changed test file and every importer is required coverage (#681 review).
+    A test file whose imports cannot be read is listed in ``discovery_errors``
+    so the caller can fail closed instead of silently skipping it.
     """
     root = Path(repo_root)
     changed_tests: list[str] = []
@@ -235,7 +240,6 @@ def select_affected_test_files(
         files=ordered,
         changed=sorted(changed_tests),
         importers=importers,
-        dropped=[],
         discovery_errors=discovery_errors,
     )
 
@@ -386,6 +390,23 @@ def run_timing_check(
         return _run_pytest(command, cwd, env, remaining, on_process)
 
     files = list(test_files)
+    try:
+        return _drift_then_control(run, files, drift_ms)
+    except (KeyboardInterrupt, SystemExit) as exc:
+        # ``_run_pytest`` has already killed the pytest process group. An
+        # interrupted check has no verdict, so it must not approve the change:
+        # report it as inconclusive and let verification fail closed (#681).
+        return TimingCheckResult(
+            STATUS_INCONCLUSIVE, test_files=files, drift_ms=drift_ms,
+            detail=f"{INTERRUPTED_DETAIL}: {type(exc).__name__}",
+        )
+
+
+def _drift_then_control(
+    run: Callable[[Sequence[str], float | None], PytestRun],
+    files: list[str],
+    drift_ms: float,
+) -> TimingCheckResult:
     drifted = run(files, drift_ms)
     if drifted.error and not drifted.timed_out:
         return TimingCheckResult(STATUS_INCONCLUSIVE, test_files=files, drift_ms=drift_ms,
