@@ -10,7 +10,7 @@ from models import (
     PublicExperimentSummary,
     ReflectionsResponse,
 )
-from modules import experiment_reflection, local_shadow_replay
+from modules import experiment_reflection, local_shadow_replay, planner_shadow
 from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import ExperimentService
 
@@ -34,6 +34,8 @@ REFLECTIONS_DEFAULT_LIMIT = 20
 REFLECTIONS_MAX_LIMIT = 100
 LOCAL_REPLAYS_DEFAULT_LIMIT = 20
 LOCAL_REPLAYS_MAX_LIMIT = 200
+PLANNER_SHADOW_DEFAULT_LIMIT = 20
+PLANNER_SHADOW_MAX_LIMIT = 200
 
 
 # Experiment and activity log endpoints: thin routes over the existing
@@ -161,6 +163,22 @@ def list_local_replays(
         replays.append(LocalReplay(**item))
     summary = local_shadow_replay.variant_summary(db_path=db_path)
     return LocalReplaysResponse(count=len(replays), replays=replays, **summary)
+
+
+@router.get("/planner/shadow")
+def list_planner_shadow(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=PLANNER_SHADOW_DEFAULT_LIMIT, ge=LIMIT_MIN,
+                       le=PLANNER_SHADOW_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> dict:
+    """Recent local planning comparisons and aggregate agreement rates (#671)."""
+    api.authorize(x_api_key)
+    payload = planner_shadow.list_shadow(_reflection_db_path(service), limit)
+    for row in payload["rows"]:
+        if row.get("error"):
+            row["error"] = redaction.redact(str(row["error"]))
+    return payload
 
 
 @router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)

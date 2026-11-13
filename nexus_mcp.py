@@ -457,6 +457,18 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(description="GET /planner/shadow - local/paid planner agreement", structured_output=True)
+    def planner_shadow_list(limit: int | None = None) -> dict[str, Any]:
+        nexus_api = _api()
+        limit = nexus_api.PLANNER_SHADOW_DEFAULT_LIMIT if limit is None else limit
+        limit = _validate_limit(limit, minimum=nexus_api.LIMIT_MIN,
+                                maximum=nexus_api.PLANNER_SHADOW_MAX_LIMIT)
+        return _call_api(
+            nexus_api.list_planner_shadow,
+            x_api_key=_internal_api_key(), limit=limit,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
     @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
     def experiment_logs(
         experiment_id: str,
