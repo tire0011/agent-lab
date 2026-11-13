@@ -148,6 +148,32 @@ run continues for as long as tests keep starting and finishing.
   ends `needs_review` with the classification in
   `baseline_test_classifications_json`; a test that passes on base, or whose
   base run shows nothing about it, is a `regression` and keeps the old outcome.
+- `NEXUS_TIMING_CHECK` (default `1`; `0` turns it off, and then there is no
+  second run) - slow-machine check (#681). Once the tests are green (locally or
+  on CI), every test file the change adds or edits, plus every test file that
+  imports a changed module, runs again under pytest with
+  `NEXUS_TEST_CLOCK_DRIFT_MS` set. There is no file cap: all of that required
+  coverage is rerun. `tests/conftest.py` then moves every clock read made by
+  repository code forward by that drift (`NEXUS_TIMING_CHECK_DRIFT_MS`,
+  default 50 ms; an explicit positive value overrides it). A test that fails
+  there and passes in a control run without drift fails the verification with
+  `timing_sensitive: <test ids>` and a hint to inject the clock or compute the
+  value from configured values. A test that by design measures real elapsed
+  time against a fake that sleeps in real time (only the client clock would
+  drift, not the fake's sleeps) carries `@pytest.mark.real_clock(reason=...)`;
+  the drift pauses while it runs. This is an explicit, reviewable exemption -
+  currently two streaming tests in `tests/test_issue_667_llama_streaming.py`,
+  which flagged green `main` commits at 50 ms. The check fails closed: if it cannot give a
+  verdict - pytest missing, a collection error without a named test, a
+  timeout (`NEXUS_TIMING_CHECK_TIMEOUT_SECONDS`, default 900), an unreadable
+  test file during discovery, a crash, or an interruption (KeyboardInterrupt /
+  SystemExit; the pytest process group is killed) - the experiment ends
+  `needs_review` with `timing check inconclusive: ...` (event
+  `timing_check_failed_closed`) and is never approved. To replay merged
+  commits through the check, run
+  `python scripts/timing_check_replay.py <sha> ... | --last N`
+  (exit 0 = all passed, 1 = a commit was flagged or inconclusive, 130 =
+  interrupted).
 - `NEXUS_TEST_LOG_DIR` (default `<AGENT_LOG_DIR>/test-runs`) - where the
   dedicated per-test logs and heartbeat files are written. They are kept out
   of the global Nexus feed deliberately: the feed would otherwise gain ~3800

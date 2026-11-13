@@ -16,6 +16,7 @@ from modules.experiment_evaluation import parse_git_status_short
 from modules.github_work_tracking import failing_test_names
 from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
+from modules import timing_check as timing_check_module
 from modules.verification_runner import (
     VerificationRunResult,
     WatchdogConfig,
@@ -293,6 +294,99 @@ class VerificationMixin:
             )
 
 
+    def _timing_check_changed_paths(
+        self, experiment_id: str, worktree_path: str, git_status: str,
+        elog: ExperimentLogger,
+    ) -> list[str]:
+        """What this experiment changed: against its base, else the worktree status."""
+        base_commit = self.get_experiment(experiment_id).base_commit_sha
+        if base_commit:
+            try:
+                return sorted(self._files_changed_since(base_commit, worktree_path, elog))
+            except (OSError, subprocess.SubprocessError):
+                pass
+        changed = parse_git_status_short(git_status)
+        return [*changed.tracked_modified, *changed.untracked_new]
+
+
+    def _forget_timing_process(self, experiment_id: str) -> None:
+        """Best-effort: clear the tracked pytest handle after a failed timing check."""
+        try:
+            self._track_process(experiment_id, None)
+        except Exception:  # noqa: BLE001 - cleanup must not reopen the gate
+            pass
+
+
+    def _run_timing_check(
+        self, experiment_id: str, worktree_path: str, git_status: str,
+        elog: ExperimentLogger,
+    ) -> "timing_check_module.TimingCheckResult | None":
+        """Slow-machine check (#681): rerun the affected tests with clock drift.
+
+        Operational failures - pytest missing, collection errors, timeouts,
+        crashes, and interruptions (KeyboardInterrupt/SystemExit) - become
+        inconclusive results, which ``_verify`` records as ``needs_review``.
+        An enabled check that could not run never approves a change, and an
+        interruption never leaves the experiment stuck in ``verifying``.
+        """
+        if not timing_check_module.timing_check_enabled():
+            elog.info("verifying", "timing_check_skipped",
+                      "Timing check disabled", reason="disabled")
+            return None
+        try:
+            changed = self._timing_check_changed_paths(
+                experiment_id, worktree_path, git_status, elog,
+            )
+            affected = timing_check_module.select_affected_test_files(changed, worktree_path)
+            if affected.discovery_errors:
+                return timing_check_module.TimingCheckResult(
+                    timing_check_module.STATUS_INCONCLUSIVE,
+                    test_files=affected.files,
+                    detail="affected-test discovery incomplete: "
+                    + "; ".join(affected.discovery_errors[:10]),
+                )
+            if not affected.files:
+                elog.info("verifying", "timing_check_skipped",
+                          "No test file is affected by this change", reason="no_affected_tests")
+                return None
+            elog.info(
+                "verifying", "timing_check_started",
+                "Rerunning the affected tests with a sped-up clock",
+                test_files=affected.files,
+                drift_ms=timing_check_module.drift_from_env(),
+            )
+            result = timing_check_module.run_timing_check(
+                self.test_python_executable, worktree_path, affected.files,
+                on_process=lambda process: self._track_process(experiment_id, process),
+            )
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # The pytest child was killed by ``_run_pytest``; drop the tracked
+            # handle in case the interruption hit before its own cleanup.
+            self._forget_timing_process(experiment_id)
+            elog.warning("verifying", "timing_check_inconclusive",
+                         "Timing check was interrupted", reason=type(exc).__name__)
+            return timing_check_module.TimingCheckResult(
+                timing_check_module.STATUS_INCONCLUSIVE,
+                detail=f"{timing_check_module.INTERRUPTED_DETAIL}: {type(exc).__name__}",
+            )
+        except Exception as exc:  # noqa: BLE001 - turn crashes into a closed gate
+            self._forget_timing_process(experiment_id)
+            elog.warning("verifying", "timing_check_inconclusive",
+                         "Timing check could not run", reason=str(exc)[:1000])
+            return timing_check_module.TimingCheckResult(
+                timing_check_module.STATUS_INCONCLUSIVE,
+                detail=f"timing check crashed: {exc}",
+            )
+        if result.status == timing_check_module.STATUS_INCONCLUSIVE:
+            elog.warning("verifying", "timing_check_inconclusive",
+                         "Timing check gave no verdict", reason=result.detail[:1000])
+        elif result.status == timing_check_module.STATUS_PASSED:
+            elog.info("verifying", "timing_check_passed",
+                      "Affected tests also pass with a sped-up clock",
+                      test_files=result.test_files, detail=result.detail)
+        return result
+
+
     def _verify(
         self,
         experiment_id: str,
@@ -552,6 +646,19 @@ class VerificationMixin:
         all_failures_pre_existing = bool(baseline_classifications) and all(
             value == "pre_existing" for value in baseline_classifications.values()
         )
+        tests_green = (
+            test_exit_code == 0
+            and not test_timed_out
+            and not (use_local_tests and test_run.process_died)
+            and not all_failures_pre_existing
+            and not diff_check_issue
+        )
+        timing_result = (
+            self._run_timing_check(experiment_id, worktree_path, git_status, elog)
+            if tests_green else None
+        )
+        if self._ended_from_outside(experiment_id):
+            return self.get_experiment(experiment_id)
         if all_failures_pre_existing:
             final_status = STATUS_NEEDS_REVIEW
             error = "pre-existing failures on base: " + ", ".join(
@@ -601,6 +708,39 @@ class VerificationMixin:
                 "tests_failed" if repair_iteration == 0 else "tests_failed_repair",
                 error,
                 exit_code=test_exit_code,
+                iteration=repair_iteration,
+            )
+        elif timing_result is not None and timing_result.failed:
+            # Green here, red on a slower machine (#681): a failed verification,
+            # so the repair loop and the retry task get the hint in ``error``.
+            final_status = STATUS_FAILED
+            error = timing_result.error_message()
+            test_output_capped = _truncate_text(
+                f"{test_output_capped}\n\n--- timing check "
+                f"({timing_check_module.CLOCK_DRIFT_ENV_VAR}={timing_result.drift_ms:g}) ---\n"
+                f"{timing_result.output}",
+                self.max_test_output_bytes, label="test output",
+            )
+            elog.error(
+                "verifying", "timing_sensitive_tests", error,
+                timing_sensitive=timing_result.timing_sensitive,
+                test_files=timing_result.test_files,
+                drift_ms=timing_result.drift_ms,
+                iteration=repair_iteration,
+            )
+        elif (timing_result is not None
+              and timing_result.status == timing_check_module.STATUS_INCONCLUSIVE):
+            final_status = STATUS_NEEDS_REVIEW
+            error = f"timing check inconclusive: {timing_result.detail or 'no verdict'}"
+            if timing_result.output:
+                test_output_capped = _truncate_text(
+                    f"{test_output_capped}\n\n--- timing check incomplete ---\n"
+                    f"{timing_result.output}",
+                    self.max_test_output_bytes, label="test output",
+                )
+            elog.error(
+                "verifying", "timing_check_failed_closed", error,
+                test_files=timing_result.test_files,
                 iteration=repair_iteration,
             )
         else:
@@ -714,4 +854,3 @@ class VerificationMixin:
                     error=combined_error,
                 )
         return self.get_experiment(experiment_id)
-
