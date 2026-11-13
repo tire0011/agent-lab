@@ -189,7 +189,7 @@ RULES:
 - A knowledge_collector briefing is current factual context. used_sources lists sources already consulted.
 - Repository code changes of any size go through new_experiment. Use command or python_run for machine work and for reading.
 - Nexus services: agent-api, nexus-mailbox, llama-server.
-- find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart, machine_reboot, install_tool and request_from_owner); then use call_tool.
+- find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart, machine_reboot, install_tool, request_from_owner and llama_model_download/llama_model_switch); then use call_tool.
 - Implementation tasks are complete only after change + verification.
 - If a tool is refused because of another experiment, tell the user which experiment blocks it. Never resume that experiment: resume_experiment is only for an experiment this task started or the user asked to resume.
 - Ask clarification only when essential information is really missing.
