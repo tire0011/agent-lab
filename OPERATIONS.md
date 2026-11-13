@@ -148,6 +148,20 @@ run continues for as long as tests keep starting and finishing.
   ends `needs_review` with the classification in
   `baseline_test_classifications_json`; a test that passes on base, or whose
   base run shows nothing about it, is a `regression` and keeps the old outcome.
+- `NEXUS_TIMING_CHECK` (default `1`; `0` turns it off) - slow-machine check
+  (#681). Once the tests are green (locally or on CI), the test files the change
+  adds or edits, plus the test files that import a changed module, run again
+  under pytest with `NEXUS_TEST_CLOCK_DRIFT_MS` set. `tests/conftest.py` then
+  moves every clock read made by repository code forward by that drift
+  (`NEXUS_TIMING_CHECK_DRIFT_MS`, default 10 ms - measured: 10 ms flags exactly
+  the two CI failures of #675 with no false positives, 20 ms and up does not). A test that fails
+  there and passes in a control run without drift fails the verification with
+  `timing_sensitive: <test ids>` and a hint to inject the clock. Anything without
+  a verdict (pytest missing, timeout, collection error) is logged as
+  `timing_check_inconclusive` and never fails a change. Limits:
+  `NEXUS_TIMING_CHECK_MAX_FILES` (default 40) and
+  `NEXUS_TIMING_CHECK_TIMEOUT_SECONDS` (default 900). To replay merged commits
+  through the check, run `python scripts/timing_check_replay.py <sha> | --last N`.
 - `NEXUS_TEST_LOG_DIR` (default `<AGENT_LOG_DIR>/test-runs`) - where the
   dedicated per-test logs and heartbeat files are written. They are kept out
   of the global Nexus feed deliberately: the feed would otherwise gain ~3800
