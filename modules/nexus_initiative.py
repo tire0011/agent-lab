@@ -283,6 +283,7 @@ class NexusInitiativeService:
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues: list[dict[str, Any]] = []
         self._planner_called = False
+        self._current_tick_id: str | None = None
         if daily_budget is None:
             raw = os.environ.get("NEXUS_INITIATIVE_DAILY_BUDGET", str(_DEFAULT_DAILY_BUDGET))
             try:
@@ -1216,6 +1217,7 @@ class NexusInitiativeService:
             mission=self._text_setting("nexus.planner_mission"),
             budget_left=(self.daily_budget - self._spent_today()) if self.daily_budget else None,
             reflections=self._reflection_ideas(),
+            tick_id=self._current_tick_id,
         )
         if choice is None:
             return []
@@ -1401,6 +1403,7 @@ class NexusInitiativeService:
 
     def tick(self) -> InitiativeDecision:
         tick_id = uuid.uuid4().hex
+        self._current_tick_id = tick_id
         self._planner_called = False
         self._reflect_pending()
         if self._paused():

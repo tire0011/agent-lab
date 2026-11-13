@@ -254,7 +254,7 @@ def _explore_with_claude(repo_root: str, prompt: str) -> str:
     return result.final_message or ""
 
 
-def _planner(repo_root: str):
+def _planner(repo_root: str, db_path: str | None = None):
     """Plan as an exploring agent; a single Azure call is the fallback (#337, #354, #384)."""
     import asyncio
 
@@ -277,7 +277,26 @@ def _planner(repo_root: str):
             raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
         return str(result.get("content") or "")
 
-    return IssuePlanner(complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt))
+    from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
+
+    def shadow(prompt: str) -> str:
+        client = LlamaCppClient(timeout=55, stream=False)
+        response = asyncio.run(client.chat_completion(
+            [{"role": "user", "content": prompt}], max_tokens=120,
+            response_format=json_schema_response_format(
+                "planner_shadow",
+                {"type": "object", "properties": {
+                    "issue": {"type": "integer"}, "reason": {"type": "string"}},
+                 "required": ["issue", "reason"], "additionalProperties": False},
+            ),
+        ))
+        return str(response["choices"][0]["message"]["content"])
+
+    return IssuePlanner(
+        complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt),
+        shadow=shadow,
+        db_path=db_path or os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db"),
+    )
 
 
 def _build_service(args) -> NexusInitiativeService:
@@ -308,7 +327,7 @@ def _build_service(args) -> NexusInitiativeService:
         adoption_service=adoption_service,
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
-        planner=_planner(args.repo_root) if controller else None,
+        planner=_planner(args.repo_root, args.db_path) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         issue_creator=lambda title, body: _open_part_issue(args.repo_root, title, body),

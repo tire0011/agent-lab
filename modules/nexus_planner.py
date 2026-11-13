@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -295,9 +299,16 @@ class IssuePlanner:
         self,
         complete: Callable[[str], str],
         explore: Callable[[str], str] | None = None,
+        shadow: Callable[[str], str] | None = None,
+        *,
+        db_path: str | None = None,
+        shadow_timeout: float = 60.0,
     ) -> None:
         self._complete = complete
         self._explore = explore
+        self._shadow = shadow
+        self._db_path = db_path
+        self._shadow_timeout = shadow_timeout
 
     def choose(
         self,
@@ -309,6 +320,7 @@ class IssuePlanner:
         mission: str | None = None,
         budget_left: int | None = None,
         reflections: list[dict[str, str]] | None = None,
+        tick_id: str | None = None,
     ) -> PlanChoice | None:
         allowed = {int(issue["number"]) for issue in issues}
         splittable = allowed | {int(i["number"]) for i in exhausted or []}
@@ -324,7 +336,69 @@ class IssuePlanner:
                                allowed, splittable)
         if choice is None:
             choice = self._ask(self._complete, planning_prompt(issues, recent, **context), allowed, splittable)
+        if choice is not None and choice.issue:
+            self._start_shadow(
+                choice.issue, allowed, issues, recent, context,
+                tick_id or uuid.uuid4().hex,
+            )
         return choice
+
+    def _start_shadow(self, paid_issue: int, allowed: set[int], issues: list[dict[str, Any]],
+                      recent: list[dict[str, Any]] | None, context: dict[str, Any],
+                      tick_id: str) -> None:
+        if (self._shadow is None or not self._db_path or
+                os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() == "0"):
+            return
+        prompt = planning_prompt(issues, recent, explore=False, **context) + (
+            '\n\nLOCAL SHADOW ANSWER: Pick only from OPEN ISSUES. Return exactly a short JSON '
+            'object with only {"issue": <number>, "reason": "<short reason>"}.'
+        )
+        prompt_tokens = max(1, len(prompt.encode("utf-8")) // 4)
+
+        def monitor() -> None:
+            result: list[str] = []
+            failure: list[BaseException] = []
+
+            def call() -> None:
+                try:
+                    result.append(self._shadow(prompt))  # type: ignore[misc]
+                except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
+                    failure.append(exc)
+
+            started = time.monotonic()
+            worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
+            worker.start()
+            worker.join(self._shadow_timeout)
+            elapsed = time.monotonic() - started
+            local_issue: int | None = None
+            valid = False
+            error: str | None = None
+            if worker.is_alive():
+                error = f"timeout after {self._shadow_timeout:g}s"
+            elif failure:
+                error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
+            else:
+                data = _json_object(result[0] if result else "")
+                if data is None:
+                    error = "invalid JSON"
+                else:
+                    try:
+                        local_issue = int(data.get("issue"))
+                    except (TypeError, ValueError):
+                        error = "invalid issue"
+                    else:
+                        valid = local_issue in allowed
+                        if not valid:
+                            error = "issue is not allowed"
+            try:
+                from modules.planner_shadow import record
+                record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
+                       local_issue=local_issue, local_valid=int(valid),
+                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error)
+            except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
+                logger.warning("planner shadow: could not store result: %s", exc)
+
+        threading.Thread(target=monitor, name="planner-shadow", daemon=True).start()
 
     @staticmethod
     def _ask(model: Callable[[str], str], prompt: str, allowed: set[int],

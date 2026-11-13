@@ -292,6 +292,17 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
         CREATE INDEX IF NOT EXISTS idx_issue_approvals_lookup
             ON issue_approvals(repository, issue_number);
+
+        CREATE TABLE IF NOT EXISTS planner_shadow (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tick_id TEXT NOT NULL,
+            paid_issue INTEGER NOT NULL,
+            local_issue INTEGER,
+            local_valid INTEGER NOT NULL CHECK (local_valid IN (0, 1)),
+            prompt_tokens INTEGER NOT NULL,
+            seconds REAL NOT NULL,
+            error TEXT
+        );
         """
     )
     _migrate_experiments_columns(conn)
