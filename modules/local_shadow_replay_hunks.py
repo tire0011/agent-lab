@@ -100,6 +100,11 @@ def unit_timeout_seconds() -> float:
     return lsr._float_env(ENV_UNIT_TIMEOUT, DEFAULT_UNIT_TIMEOUT_SECONDS)
 
 
+def unit_lease_seconds() -> float:
+    """Lease for one unit: the worker, the baseline and the scored test run (#675)."""
+    return lsr.lease_seconds(unit_timeout_seconds() + lsr.tests_timeout_seconds())
+
+
 # ---- text and symbols --------------------------------------------------------
 
 def _lines(text: str) -> list[str]:
@@ -807,7 +812,8 @@ def replay_hunks(
             summary = lsr._git(repo_root, ["show", "-s", "--format=%s", new]).stdout.strip()
             title = issue_title(str(row["goal"] or ""))
             test_changes = lsr.merged_test_changes(repo_root, old, new)
-            client = client if client is not None else lsr._UsageCountingClient()
+            client = client if client is not None else lsr._UsageCountingClient(
+                timeout=lsr.call_timeout_seconds())
             model = str(getattr(client, "model", "") or "")
             factory = worker_factory or hunk_worker_factory
             baseline: dict[str, lsr.MergedTestRun] = {}
@@ -815,6 +821,11 @@ def replay_hunks(
             try:
                 for unit in units:
                     if max_units is not None and ran >= max_units:
+                        break
+                    # #675: the lease must outlast this unit's worker and both test runs.
+                    if not lsr.renew_lease(db_path, lease.token, unit_lease_seconds()):
+                        logger.warning("hunk replay %s: lost the global lease; stopping",
+                                       experiment_id)
                         break
                     if not _claim_unit(conn, experiment_id, variant, unit, model):
                         continue
