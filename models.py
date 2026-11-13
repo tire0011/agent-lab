@@ -401,12 +401,38 @@ class LocalReplayVariantStats(BaseModel):
     full_pass_rate: float | None = None
 
 
+class LocalReplayUnitVariantStats(BaseModel):
+    """Hunk-level replay aggregates for one prompt variant (#649)."""
+
+    prompt_variant: str
+    experiments: int = 0
+    units: int
+    running: int = 0
+    completed: int = 0
+    timeouts: int = 0
+    errors: int = 0
+    completion_rate: float | None = None
+    applied: int
+    compiled: int
+    tested_units: int = 0
+    tests_passed: int
+    unit_pass_rate: float | None = None
+    tested_pass_rate: float | None = None
+    average_overlap: float
+    average_seconds: float
+    prompt_tokens: int
+    cached_tokens: int
+    experiments_without_units: int = 0
+    experiment_errors: int = 0
+
+
 class LocalReplaysResponse(BaseModel):
     count: int
     replays: list[LocalReplay]
     variants: list[LocalReplayVariantStats]
     common_experiments: int
     common: list[LocalReplayVariantStats]
+    unit_variants: list[LocalReplayUnitVariantStats] = Field(default_factory=list)
 
 
 class ActivityEntry(BaseModel):

@@ -66,6 +66,7 @@ from modules.run_store import DEFAULT_DB_PATH, init_db
 logger = logging.getLogger(__name__)
 
 ENV_VARIANT = "NEXUS_SHADOW_REPLAY_VARIANT"
+ENV_UNIT = "NEXUS_SHADOW_REPLAY_UNIT"
 DEFAULT_VARIANT = "baseline"
 ENV_ENABLED = "NEXUS_SHADOW_REPLAY"
 SETTING_ENABLED = "nexus.shadow_replay_enabled"
@@ -402,6 +403,16 @@ class MergedTestChange:
 
     path: str
     delete: bool
+
+
+def _source_at(repo: str, commit: str, path: str) -> str:
+    shown = _git(repo, ["show", f"{commit}:{path}"], check=False)
+    return shown.stdout if shown.returncode == 0 else ""
+
+
+def _is_test_file(path: str) -> bool:
+    name = Path(path).name
+    return path.startswith(TESTS_DIR) or bool(_TEST_FILE_RE.match(name))
 
 
 def _safe_test_path(path: str) -> bool:
@@ -778,6 +789,8 @@ def replay(
     client: Any | None = None,
     worker_factory: Callable[[Any], Any] | None = None,
     test_runner: Callable[[str, list[str], float], MergedTestRun] | None = None,
+    unit: str = "whole",
+    max_units: int | None = None,
     _global_lease: GlobalLease | None = None,
 ) -> dict[str, Any] | None:
     """Replay one merged paid experiment locally and store one ``local_replays`` row.
@@ -786,7 +799,20 @@ def replay(
     for this variant (or another live caller is replaying it). Raises
     ``ValueError`` for an experiment that is unknown, not merged, not paid or
     without base commit. Set-up failures are stored as status ``error``.
+    ``unit="hunk"`` runs :func:`modules.local_shadow_replay_hunks.replay_hunks`
+    (at most *max_units* new units) and returns its summary dict.
     """
+    if unit == "hunk":
+        # #649: one merged symbol at a time; returns the experiment's unit summary.
+        from modules.local_shadow_replay_hunks import replay_hunks
+
+        return replay_hunks(
+            experiment_id, repo_root=repo_root, db_path=db_path, variant=variant,
+            client=client, worker_factory=worker_factory, test_runner=test_runner,
+            max_units=max_units, _global_lease=_global_lease,
+        )
+    if unit != "whole":
+        raise ValueError("unit must be 'whole' or 'hunk'")
     variant = variant or prompt_variant()
     conn = _connect(db_path)
     owned_lease = _global_lease is None
@@ -904,12 +930,20 @@ def replay_next(
     client: Any | None = None,
     worker_factory: Callable[[Any], Any] | None = None,
     test_runner: Callable[[str, list[str], float], MergedTestRun] | None = None,
+    unit: str | None = None,
 ) -> dict[str, Any]:
     """The tick sweep: at most one replay, only on an idle reachable server.
 
     Returns ``{"ran": bool, "reason": str, "experiment_id": ..., "replay": row}``.
+    With ``unit="hunk"`` (or ``NEXUS_SHADOW_REPLAY_UNIT=hunk``) one tick scores
+    at most one unit (#649), so a tick stays bounded by one unit's time limit;
+    the next tick resumes the same experiment until it is finished.
     """
     variant = variant or prompt_variant()
+    unit = unit or os.environ.get(ENV_UNIT, "whole").strip().lower()
+    if unit not in {"whole", "hunk"}:
+        return {"ran": False, "reason": "unit must be whole or hunk",
+                "experiment_id": None, "replay": None}
     if not enabled(db_path):
         return {"ran": False, "reason": "disabled", "experiment_id": None, "replay": None}
     conn = _connect(db_path)
@@ -919,7 +953,12 @@ def replay_next(
         return {"ran": False, "reason": "another local replay sweep is running",
                 "experiment_id": None, "replay": None}
     try:
-        experiment_id = next_candidate(conn, variant)
+        if unit == "hunk":
+            from modules.local_shadow_replay_hunks import next_hunk_candidate
+
+            experiment_id = next_hunk_candidate(conn, variant)
+        else:
+            experiment_id = next_candidate(conn, variant)
         if experiment_id is None:
             return {"ran": False, "reason": "no merged paid experiment left to replay",
                     "experiment_id": None, "replay": None}
@@ -930,7 +969,7 @@ def replay_next(
         cleanup_orphaned_worktree(repo_root, lease.orphaned_worktree)
         stored = replay(experiment_id, repo_root=repo_root, db_path=db_path, variant=variant,
                         client=client, worker_factory=worker_factory, test_runner=test_runner,
-                        _global_lease=lease)
+                        unit=unit, max_units=1 if unit == "hunk" else None, _global_lease=lease)
         if stored is None:
             return {"ran": False, "reason": "already replayed or claimed",
                     "experiment_id": experiment_id, "replay": None}
@@ -1062,4 +1101,11 @@ def variant_summary(*, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
         _stats(name, [r for r in by_variant[name] if r["experiment_id"] in common_ids])
         for name in sorted(by_variant)
     ] if common_ids else []
-    return {"variants": variants, "common_experiments": len(common_ids), "common": common}
+    return {"variants": variants, "common_experiments": len(common_ids), "common": common,
+            "unit_variants": _unit_variants(db_path)}
+
+
+def _unit_variants(db_path: str) -> list[dict[str, Any]]:
+    from modules.local_shadow_replay_hunks import unit_variant_summary
+
+    return unit_variant_summary(db_path=db_path)

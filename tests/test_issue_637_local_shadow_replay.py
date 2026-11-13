@@ -571,6 +571,16 @@ class AggregateTests(unittest.TestCase):
                     "tests_passed, error, created_at, finished_at, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'm')",
                     (exp, variant, status, total, passed, error, f"2026-11-0{i % 9 + 1}", f"2026-11-0{i % 9 + 1}"),
                 )
+            # #649 hunk units: one passed, one wrong, one timed out, one still running.
+            for symbol, status, passed, overlap in (("add", "scored", 1, 1.0), ("sub", "scored", 0, 0.25),
+                                                    ("mul", "timeout", 0, 0.0), ("div", "running", 0, 0.0)):
+                conn.execute(
+                    "INSERT INTO local_replay_units "
+                    "(experiment_id,file,symbol,prompt_variant,model,status,applied,compiled,has_tests,"
+                    "tests_passed,overlap,seconds,prompt_tokens,cached_tokens,created_at) "
+                    "VALUES ('e1','pkg/calc.py',?,'baseline','m',?,1,1,1,?,?,2,100,25,'2026-11-01')",
+                    (symbol, status, passed, overlap),
+                )
         conn.close()
 
     def test_pass_rates_per_variant(self):
@@ -622,6 +632,12 @@ class ReadToolTests(unittest.TestCase):
         variants = {v["prompt_variant"]: v for v in body["variants"]}
         self.assertEqual(variants["baseline"]["full_pass_rate"], 0.25)
         self.assertEqual(body["common_experiments"], 2)
+        units = body["unit_variants"][0]
+        self.assertEqual(units["prompt_variant"], "baseline")
+        self.assertEqual((units["units"], units["running"], units["completed"], units["timeouts"]),
+                         (3, 1, 2, 1))
+        self.assertEqual((units["tests_passed"], units["unit_pass_rate"], units["completion_rate"]),
+                         (1, 0.3333, 0.6667))
         self.assertEqual(self.client.get("/local-replays?limit=0", headers=HEADERS).status_code, 422)
 
     def test_mcp_tool_is_read_only_and_calls_the_api(self):
@@ -664,6 +680,8 @@ class ReadToolTests(unittest.TestCase):
         text = "\n".join(result.output_lines)
         self.assertIn("variant baseline: 6 replays, 4 scored, tests 8/10 (80%)", text)
         self.assertIn("all tests passed in 1/4 (25%)", text)
+        self.assertIn("hunk variant baseline: 3 units from 1 experiments, finished in time 2/3 (67%), "
+                      "timeouts 1", text)
 
 
 if __name__ == "__main__":
