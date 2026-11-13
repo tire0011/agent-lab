@@ -22,6 +22,7 @@ from modules.local_coding_worker import (
     _FILE_LEVELS,
     MIN_OUTPUT_TOKENS,
     ContextTooSmallError,
+    LocalTooSlowError,
     LocalCodingWorker,
     build_prompt,
     time_budget,
@@ -320,6 +321,37 @@ class TimingsLoggingTests(_RepoCase):
 
 
 class TimeBudgetTests(_RepoCase):
+    def test_shadow_replay_budget_admits_useful_output_at_measured_rates(self):
+        long = time_budget(1500, 768, (7.13, 2.61))
+        short = time_budget(300, 768, (7.13, 2.61))
+        self.assertGreaterEqual(long.output_tokens, 768)
+        self.assertGreaterEqual(long.prompt_tokens, 6000)
+        self.assertLess(short.prompt_tokens, 6000)
+        long_client = _Server()
+        long_client.timeout = 1500.0
+        plan = asyncio.run(build_prompt(
+            "Edit value.txt", str(self.repo), long_client, max_output_tokens=768,
+            rates=(7.13, 2.61),
+        ))
+        self.assertEqual(plan.output_tokens, 768)
+        short_client = _Server()
+        short_client.timeout = 300.0
+        with self.assertRaisesRegex(LocalTooSlowError, r"300s timeout"):
+            asyncio.run(build_prompt(
+                "Edit value.txt", str(self.repo), short_client, max_output_tokens=768,
+                rates=(7.13, 2.61),
+            ))
+
+    def test_each_call_timeout_is_capped_to_remaining_worker_budget(self):
+        server = _Server()
+        server.timeout = 1500.0
+        worker = LocalCodingWorker(client=server, rates_path=self.rates_path)
+        worker._configured_call_timeout = 1500.0
+        worker._run_deadline = 1000.0
+        with patch("modules.local_coding_worker.time.monotonic", return_value=250.0):
+            self.assertEqual(worker._apply_remaining_call_timeout(), 750.0)
+        self.assertEqual(server.timeout, 750.0)
+
     def test_measured_rates_cut_handover_but_absent_rates_do_not(self):
         server = _Server()
         task = _big_handover_task()

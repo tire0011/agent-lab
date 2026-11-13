@@ -71,6 +71,7 @@ DEFAULT_VARIANT = "baseline"
 ENV_ENABLED = "NEXUS_SHADOW_REPLAY"
 SETTING_ENABLED = "nexus.shadow_replay_enabled"
 ENV_WORKER_TIMEOUT = "NEXUS_SHADOW_REPLAY_TIMEOUT_SECONDS"
+ENV_CALL_TIMEOUT = "NEXUS_SHADOW_REPLAY_CALL_TIMEOUT_SECONDS"
 ENV_TEST_TIMEOUT = "NEXUS_SHADOW_REPLAY_TEST_TIMEOUT_SECONDS"
 ENV_LEASE = "NEXUS_SHADOW_REPLAY_LEASE_SECONDS"
 ENV_WORKTREE_DIR = "NEXUS_SHADOW_REPLAY_DIR"
@@ -135,6 +136,12 @@ def _float_env(name: str, default: float) -> float:
 
 def worker_timeout_seconds() -> float:
     return _float_env(ENV_WORKER_TIMEOUT, DEFAULT_WORKER_TIMEOUT_SECONDS)
+
+
+def call_timeout_seconds() -> float:
+    """Per-call limit, leaving a minute for worker shutdown and bookkeeping."""
+    default = min(1500.0, max(1.0, worker_timeout_seconds() - 60.0))
+    return _float_env(ENV_CALL_TIMEOUT, default)
 
 
 def tests_timeout_seconds() -> float:
@@ -835,7 +842,8 @@ def replay(
             return None
         finalized = False
         try:
-            client = client if client is not None else _UsageCountingClient()
+            client = client if client is not None else _UsageCountingClient(
+                timeout=call_timeout_seconds())
             outcome = ReplayOutcome(issue=_issue_number(conn, row),
                                     model=str(getattr(client, "model", "") or ""))
             try:
@@ -969,7 +977,8 @@ def replay_next(
         if experiment_id is None:
             return {"ran": False, "reason": "no merged paid experiment left to replay",
                     "experiment_id": None, "replay": None}
-        client = client if client is not None else _UsageCountingClient()
+        client = client if client is not None else _UsageCountingClient(
+            timeout=call_timeout_seconds())
         idle, reason = server_state(client, db_path)
         if not idle:
             return {"ran": False, "reason": reason, "experiment_id": experiment_id, "replay": None}

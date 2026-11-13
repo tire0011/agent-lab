@@ -85,6 +85,16 @@ class FakeClient:
         return self.busy
 
 
+class ConstructedClient(FakeClient):
+    instances = []
+
+    def __init__(self, *, timeout):
+        super().__init__()
+        self.timeout = timeout
+        self.tokens_used = 0
+        self.__class__.instances.append(self)
+
+
 class FakeWorker:
     """Writes *calc* (or nothing) and records what it saw."""
 
@@ -452,6 +462,37 @@ class SweepTests(unittest.TestCase):
             outcome = self.sweep(FakeClient())
         self.assertEqual(outcome["replay"]["prompt_variant"], "ctx v2+sr")
         self.assertEqual(lsr.prompt_variant(), "baseline+sr")
+
+    def test_replay_constructs_client_with_replay_call_timeout(self):
+        ConstructedClient.instances.clear()
+        with patch.object(lsr, "_UsageCountingClient", ConstructedClient):
+            outcome = lsr.replay_next(
+                repo_root=self.fx.repo, db_path=self.fx.db_path,
+                worker_factory=lambda _client: FakeWorker(FULL_CALC),
+            )
+        self.assertTrue(outcome["ran"])
+        self.assertEqual(ConstructedClient.instances[0].timeout, 1500.0)
+
+        self.fx.add_experiment("exp-env", merged=self.fx.merged, base=self.fx.base)
+        ConstructedClient.instances.clear()
+        with patch.dict(os.environ, {lsr.ENV_CALL_TIMEOUT: "1234"}), \
+                patch.object(lsr, "_UsageCountingClient", ConstructedClient):
+            outcome = lsr.replay_next(
+                repo_root=self.fx.repo, db_path=self.fx.db_path,
+                worker_factory=lambda _client: FakeWorker(FULL_CALC),
+            )
+        self.assertTrue(outcome["ran"])
+        self.assertEqual(ConstructedClient.instances[0].timeout, 1234.0)
+
+    def test_lease_exceeds_worker_and_test_timeouts(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(lsr.ENV_LEASE, None)
+            os.environ.pop(lsr.ENV_WORKER_TIMEOUT, None)
+            os.environ.pop(lsr.ENV_TEST_TIMEOUT, None)
+            self.assertGreater(
+                lsr.lease_seconds(),
+                lsr.worker_timeout_seconds() + lsr.tests_timeout_seconds(),
+            )
 
     def test_disabled_by_setting_env_or_pause(self):
         with patch.dict(os.environ, {lsr.ENV_ENABLED: "0"}):

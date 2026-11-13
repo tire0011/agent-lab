@@ -807,7 +807,8 @@ def replay_hunks(
             summary = lsr._git(repo_root, ["show", "-s", "--format=%s", new]).stdout.strip()
             title = issue_title(str(row["goal"] or ""))
             test_changes = lsr.merged_test_changes(repo_root, old, new)
-            client = client if client is not None else lsr._UsageCountingClient()
+            client = client if client is not None else lsr._UsageCountingClient(
+                timeout=lsr.call_timeout_seconds())
             model = str(getattr(client, "model", "") or "")
             factory = worker_factory or hunk_worker_factory
             baseline: dict[str, lsr.MergedTestRun] = {}

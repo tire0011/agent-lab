@@ -1450,11 +1450,34 @@ class LocalCodingWorker:
         self._last_call: CallRecord | None = None
         self.last_run_metrics: dict[str, Any] | None = None
         self.last_sample_stats: list[SampleStats] = []
+        self._run_deadline: float | None = None
+        self._configured_call_timeout: Any = None
+
+    def _apply_remaining_call_timeout(self) -> Any:
+        """Cap a model call at this worker run's remaining absolute budget."""
+        if self._run_deadline is None or not hasattr(self.client, "timeout"):
+            return getattr(self.client, "timeout", None)
+        remaining = max(0.001, self._run_deadline - time.monotonic())
+        configured = self._configured_call_timeout
+        if (isinstance(configured, (int, float)) and not isinstance(configured, bool)
+                and math.isfinite(configured) and configured > 0):
+            # Do not turn a nominal 300 s limit into 299.999... merely because
+            # a few setup instructions ran between starting the worker and
+            # applying the cap. Materially depleted budgets are capped exactly.
+            applied = (float(configured) if remaining >= float(configured) - 0.01
+                       else remaining)
+        else:
+            applied = remaining
+        self.client.timeout = applied
+        return applied
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
             phase: str = "implementation", **_: Any) -> WorkerResult:
         started = time.monotonic()
+        self._configured_call_timeout = getattr(self.client, "timeout", None)
+        self._run_deadline = started + max(0.0, float(timeout_seconds))
+        self._apply_remaining_call_timeout()
         self.last_plan = None
         self.generated_tests = ()
         self.generated_test_file = None
@@ -1497,6 +1520,9 @@ class LocalCodingWorker:
                 warning=not success, success=success, **split.log_fields(),
             )
             self._log_run_metrics(experiment_logger, phase, success)
+            if hasattr(self.client, "timeout"):
+                self.client.timeout = self._configured_call_timeout
+            self._run_deadline = None
 
     def _run(self, task: str, working_dir: str, sandbox: str, timeout_seconds: float,
              experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
@@ -2004,6 +2030,7 @@ class LocalCodingWorker:
                     temperature: float = 0.0, seed: int | None = None,
                     **fields: Any) -> str:
         """Call the local model and always leave a latency/outcome event."""
+        applied_timeout = self._apply_remaining_call_timeout()
         started = time.monotonic()
         if hasattr(self.client, "last_timings"):
             self.client.last_timings = None
@@ -2042,7 +2069,7 @@ class LocalCodingWorker:
                 # unknown and admission could repeat the hopeless call.
                 # record_prompt_stop writes the measured prompt and generation
                 # fallback in one atomic rates-file replacement.
-                timeout = getattr(self.client, "timeout", None)
+                timeout = applied_timeout
                 prompt_tokens = fields.get("prompt_tokens")
                 if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
                         and timeout > 0 and isinstance(prompt_tokens, int)):
@@ -2062,7 +2089,7 @@ class LocalCodingWorker:
                 pass  # #667: the measured partial rates, not guesses
             elif outcome in ("timeout", "early_stop"):
                 # Not one usable measurement arrived: fall back to the guess.
-                timeout = getattr(self.client, "timeout", None)
+                timeout = applied_timeout
                 prompt_tokens = fields.get("prompt_tokens")
                 if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
                         and timeout > 0 and isinstance(prompt_tokens, int)):
@@ -2101,6 +2128,7 @@ class LocalCodingWorker:
                     "draft_acceptance_rate": self._last_call.draft_acceptance_rate}
                    if self._last_call.draft_n else {}),
                 max_tokens=max_tokens,
+                timeout_seconds=applied_timeout,
                 **({"stream": stream} if (stream := getattr(self.client, "last_stream", None))
                    and isinstance(stream, dict) else {}),
                 **stop,

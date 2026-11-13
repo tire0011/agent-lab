@@ -25,6 +25,14 @@ def test_default_base_url(monkeypatch):
     assert client.base_url == _DEFAULT_BASE_URL.rstrip("/")
 
 
+def test_call_timeout_default_env_and_explicit_precedence(monkeypatch):
+    monkeypatch.delenv("LOCAL_MODEL_CALL_TIMEOUT_SECONDS", raising=False)
+    assert LlamaCppClient().timeout == 300.0
+    monkeypatch.setenv("LOCAL_MODEL_CALL_TIMEOUT_SECONDS", "725")
+    assert LlamaCppClient().timeout == 725.0
+    assert LlamaCppClient(timeout=42).timeout == 42
+
+
 def test_default_model_name_is_qwen():
     """Default model should be Qwen2.5-Coder-7B-Instruct, not Llama 2."""
     client = LlamaCppClient()
