@@ -541,7 +541,7 @@ class ReadOnlyBoundaryDurabilityTests(unittest.TestCase):
                 self.assertEqual(spec.read_only, not spec.mutates_state)
         self.assertEqual(
             sorted(spec.name for spec in registry.catalog() if spec.mutates_state),
-            ["github_mcp_call", "inbox_refresh", "install_tool", "machine_reboot", "request_from_owner", "service_restart"],
+            ["github_mcp_call", "inbox_refresh", "install_tool", "llama_model_download", "llama_model_switch", "machine_reboot", "request_from_owner", "service_restart"],
         )
 
 

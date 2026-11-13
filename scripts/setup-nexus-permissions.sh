@@ -41,6 +41,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_TOOL="/usr/local/sbin/nexus-install-tool"
 install --owner=root --group=root --mode=0755 "$SCRIPT_DIR/nexus-install-tool.sh" "$INSTALL_TOOL"
+# Local model management (#673): download from Hugging Face, switch with rollback.
+LLAMA_MODEL="/usr/local/sbin/nexus-llama-model"
+install --owner=root --group=root --mode=0755 "$SCRIPT_DIR/nexus-llama-model.sh" "$LLAMA_MODEL"
+install --owner=root --group=root --mode=0755 "$SCRIPT_DIR/nexus-llama-start.sh" /usr/local/sbin/nexus-llama-start
 if [[ ! -e /etc/agent-lab/tool-denylist ]]; then
     install -d --mode=0755 /etc/agent-lab
     install --owner=root --group=root --mode=0644 "$SCRIPT_DIR/../deploy/tool-denylist" /etc/agent-lab/tool-denylist
@@ -53,7 +57,8 @@ printf '%s ALL=(root) NOPASSWD: %s stop llama-server, %s start llama-server\n' "
 printf '%s ALL=(root) NOPASSWD: %s restart nexus-mailbox, %s restart llama-server\n' "$SERVICE_USER" "$SYSTEMCTL" "$SYSTEMCTL" >> "$tmp"
 printf '%s ALL=(root) NOPASSWD: %s --collect --on-active=60 systemctl reboot\n' "$SERVICE_USER" "$SYSTEMD_RUN" >> "$tmp"
 printf '%s ALL=(root) NOPASSWD: %s\n' "$SERVICE_USER" "$INSTALL_TOOL" >> "$tmp"
+printf '%s ALL=(root) NOPASSWD: %s\n' "$SERVICE_USER" "$LLAMA_MODEL" >> "$tmp"
 visudo -cq -f "$tmp"
 install --mode=0440 "$tmp" "$SUDOERS_FILE"
 
-echo "$LOG_PREFIX $SERVICE_USER may schedule an agent-api restart, stop/start llama-server restart nexus-mailbox/llama-server, schedule a reboot and install tools ($SUDOERS_FILE)."
+echo "$LOG_PREFIX $SERVICE_USER may schedule an agent-api restart, stop/start llama-server restart nexus-mailbox/llama-server, schedule a reboot, install tools and manage the local model ($SUDOERS_FILE)."

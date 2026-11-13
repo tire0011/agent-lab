@@ -60,10 +60,30 @@ fi
 
 LLAMA_SERVER_BIN="$(command -v llama-server)"
 
+# ── Model configuration Nexus may change (#673) ──────────────────────────────
+# The unit starts llama-server through nexus-llama-start, which reads
+# /etc/agent-lab/llama.env. nexus-llama-model (sudoers) rewrites that file and
+# rolls back a switch that leaves llama-server unhealthy. An existing file is
+# kept; a new one keeps the context size of the unit it replaces.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLAMA_CONF="/etc/agent-lab/llama.env"
+install --owner=root --group=root --mode=0755 "$SCRIPT_DIR/nexus-llama-start.sh" /usr/local/sbin/nexus-llama-start
+if [[ ! -f "$LLAMA_CONF" ]]; then
+    if [[ -z "${LOCAL_MODEL_CONTEXT:-}" && -f "$SERVICE_FILE" ]]; then
+        old_ctx="$(grep -oE -- '--ctx-size [0-9]+' "$SERVICE_FILE" | awk '{print $2}' | head -1 || true)"
+        CTX_SIZE="${old_ctx:-$CTX_SIZE}"
+    fi
+    install -d --mode=0755 /etc/agent-lab
+    printf '%s\n' "MODEL_DIR=${MODEL_DIR}" "MODEL=$(basename "$MODEL_FULL_PATH")" \
+        "CTX=${CTX_SIZE}" "THREADS=${N_THREADS}" "PARALLEL=${N_PARALLEL}" "PORT=${SERVER_PORT}" > "$LLAMA_CONF"
+    chmod 0644 "$LLAMA_CONF"
+    echo "$LOG_PREFIX Wrote $LLAMA_CONF (context $CTX_SIZE)"
+fi
+
 # ── Create systemd service unit ───────────────────────────────────────────────
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=llama-server — local OpenAI-compatible inference (${MODEL_FILE})
+Description=llama-server — local OpenAI-compatible inference (model in ${LLAMA_CONF})
 After=network.target
 Wants=network.target
 
@@ -71,13 +91,8 @@ Wants=network.target
 Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${MODEL_DIR}
-ExecStart=${LLAMA_SERVER_BIN} \\
-    --model ${MODEL_FULL_PATH} \\
-    --host 127.0.0.1 \\
-    --port ${SERVER_PORT} \\
-    --threads ${N_THREADS} \\
-    --ctx-size ${CTX_SIZE} \\
-    --parallel ${N_PARALLEL}
+Environment=LLAMA_SERVER_BIN=${LLAMA_SERVER_BIN}
+ExecStart=/usr/local/sbin/nexus-llama-start
 Restart=on-failure
 RestartSec=15
 StandardOutput=journal
