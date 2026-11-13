@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.local_coding_worker import LocalCodingWorker, _response_patch, apply_and_check
+from modules.local_coding_worker import (
+    LocalCodingWorker, _PatchRejected, _response_patch, apply_and_check,
+)
 from modules.local_edit_format import EditFormatError, edits_to_diff
 
 
@@ -86,6 +88,79 @@ class LocalEditFormatTests(unittest.TestCase):
         diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n"
         with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
             self.assertEqual(_response_patch(diff, str(self.repo), 10, None), diff)
+
+    MARKER_DOC = "Example:\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n"
+
+    def marker_diff(self):
+        return (
+            "diff --git a/doc.md b/doc.md\n--- a/doc.md\n+++ b/doc.md\n"
+            "@@ -1,6 +1,6 @@\n Example:\n <<<<<<< SEARCH\n-old\n+older\n"
+            " =======\n new\n >>>>>>> REPLACE\n"
+        )
+
+    def test_unified_diff_editing_text_with_search_marker_stays_a_diff(self):
+        self.commit({"doc.md": self.MARKER_DOC})
+        diff = self.marker_diff()
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+            # Twice: the classification is pure and must not touch the repo.
+            first = _response_patch(diff, str(self.repo), 10, None)
+            second = _response_patch(diff, str(self.repo), 10, None)
+        self.assertEqual(first, diff)
+        self.assertEqual(second, diff)
+        self.assertEqual((self.repo / "doc.md").read_text(), self.MARKER_DOC)
+        apply_and_check(first, str(self.repo), 10)
+        self.assertIn("older\n", (self.repo / "doc.md").read_text())
+
+    def test_unified_diff_adding_search_marker_lines_stays_a_diff(self):
+        self.commit({"doc.md": "Title\n"})
+        diff = ("--- a/doc.md\n+++ b/doc.md\n@@ -1 +1,4 @@\n Title\n"
+                "+<<<<<<< SEARCH\n+=======\n+>>>>>>> REPLACE\n")
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+            self.assertEqual(_response_patch(diff, str(self.repo), 10, None), diff)
+
+    def test_search_block_containing_diff_header_stays_search_replace(self):
+        self.commit({"notes.md": "--- a/x\n+++ b/x\nvalue 1\n"})
+        answer = self.block("notes.md", "--- a/x\n+++ b/x\nvalue 1\n", "--- a/x\n+++ b/x\nvalue 2\n")
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+            produced = _response_patch(answer, str(self.repo), 10, None)
+        self.assertNotIn("<<<<<<< SEARCH", produced)
+        apply_and_check(produced, str(self.repo), 10)
+        self.assertEqual((self.repo / "notes.md").read_text(), "--- a/x\n+++ b/x\nvalue 2\n")
+
+    def test_marker_diff_that_fails_halfway_leaves_repo_unchanged(self):
+        self.commit({"doc.md": self.MARKER_DOC, "b.txt": "two\n"})
+        diff = self.marker_diff() + "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-missing\n+TWO\n"
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+            produced = _response_patch(diff, str(self.repo), 10, None)
+        with self.assertRaises(_PatchRejected) as caught:
+            apply_and_check(produced, str(self.repo), 10)
+        self.assertIn("does not apply", str(caught.exception))
+        self.assertEqual((self.repo / "doc.md").read_text(), self.MARKER_DOC)
+        self.assertEqual((self.repo / "b.txt").read_text(), "two\n")
+
+    def test_fake_client_marker_diff_runs_through_worker_in_search_replace_mode(self):
+        self.commit({"doc.md": self.MARKER_DOC})
+        answer = self.marker_diff()
+
+        class Client:
+            model = "fake"
+
+            async def context_size(self):
+                return 4096
+
+            async def count_tokens(self, text):
+                return max(1, len(text) // 4)
+
+            async def complete(self, *args, **kwargs):
+                return answer
+
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+            result = LocalCodingWorker(client=Client(), max_tokens=512).run(
+                task="In doc.md change old to older", working_dir=str(self.repo),
+                sandbox="workspace-write", timeout_seconds=30,
+            )
+        self.assertTrue(result.success, result.error)
+        self.assertIn("older\n", (self.repo / "doc.md").read_text())
 
     def test_fake_client_search_replace_answer_runs_through_worker(self):
         self.commit({"app.py": "VALUE = 1\n"})

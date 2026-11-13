@@ -243,10 +243,32 @@ def _extract_diff(text: str) -> str:
     return candidate[min(starts):].strip() + "\n" if starts else ""
 
 
+# A SEARCH marker counts only at the start of a line: inside a unified diff
+# every content line carries a ``+``/``-``/`` `` prefix, so a diff that edits
+# text containing the marker never matches this.
+_SR_MARKER_RE = re.compile(r"(?m)^<<<<<<< SEARCH[ \t]*\r?$")
+_DIFF_HEADER_RE = re.compile(r"(?m)^(?:diff --git |--- (?:a/|/dev/null))")
+
+
+def _is_search_replace_answer(text: str) -> bool:
+    """True when *text* is structurally SEARCH/REPLACE rather than a unified diff.
+
+    The decision is made from the structure of the answer, not its content: a
+    line-start SEARCH marker must exist and must come before any line-start
+    unified-diff header.  A SEARCH block whose text contains a diff header
+    stays SEARCH/REPLACE; a diff whose hunks contain the marker stays a diff.
+    """
+    marker = _SR_MARKER_RE.search(text)
+    if not marker:
+        return False
+    header = _DIFF_HEADER_RE.search(text)
+    return header is None or marker.start() < header.start()
+
+
 def _response_patch(text: str, working_dir: str, timeout: float,
                     allowed_paths: set[str] | None) -> str:
     """Convert the configured answer format to the worker's internal Git diff."""
-    if local_edit_format() == "search_replace" and "<<<<<<< SEARCH" in text:
+    if local_edit_format() == "search_replace" and _is_search_replace_answer(text):
         return edits_to_diff(text, working_dir, timeout, allowed_paths)
     # A diff remains a supported escape hatch even when SEARCH/REPLACE is the prompt.
     diff = _extract_diff(text)
