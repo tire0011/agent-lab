@@ -97,7 +97,9 @@ def _list_open_issues(repo_root: str) -> list[dict]:
                 "--limit", str(_ISSUE_LIMIT),
                 # ``author`` decides whether the content-hash check applies
                 # (trusted authors may edit their issue after approval).
-                "--json", "number,title,body,labels,author",
+                # createdAt and comments: own proposals release themselves after
+                # a wait unless the owner said stop (#683).
+                "--json", "number,title,body,labels,author,createdAt,comments",
             ],
             cwd=repo_root,
             capture_output=True,
@@ -151,6 +153,14 @@ def _open_part_issue(repo_root: str, title: str, body: str) -> int | None:
     match = re.search(r"/issues/(\d+)", proc.stdout or "")
     _events.append(f"New part issue: {title}")
     return int(match.group(1)) if match else None
+
+
+def _release_proposal(repo_root: str, number: int, text: str) -> None:
+    from modules.nexus_planner import PROPOSAL_LABEL
+
+    _gh(repo_root, ["issue", "edit", str(number), "--remove-label", PROPOSAL_LABEL])
+    _gh(repo_root, ["issue", "comment", str(number), "--body", text])
+    _events.append(f"Released own proposal #{number}")
 
 
 def _close_issue(repo_root: str, number: int, text: str) -> None:
@@ -332,6 +342,7 @@ def _build_service(args) -> NexusInitiativeService:
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         issue_creator=lambda title, body: _open_part_issue(args.repo_root, title, body),
         issue_closer=lambda number, text: _close_issue(args.repo_root, number, text),
+        proposal_releaser=lambda number, text: _release_proposal(args.repo_root, number, text),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
         decision_lister=lambda: _owner_decisions(args.repo_root),
         diagnostics_client=_service_diagnostics,
