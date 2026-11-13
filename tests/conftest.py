@@ -88,3 +88,9 @@ os.environ["LLAMA_API_URL"] = _UNREACHABLE_LOCAL_MODEL_URL
 # suite run must neither read the VM's real measurements (results would then
 # depend on the host) nor write fake ones into them. Assigned, not setdefault.
 os.environ["LOCAL_MODEL_RATES_PATH"] = str(Path(_LOG_DIR) / "local-model-rates.json")
+
+# Streaming (#667) is on by default in production. The suite's many client
+# tests mock ``httpx.AsyncClient.post`` (the non-stream wire protocol), so the
+# suite runs non-streamed unless a test opts in (``stream=True`` or
+# monkeypatch); tests/test_issue_667_llama_streaming.py checks the default.
+os.environ["LOCAL_MODEL_STREAM"] = "0"

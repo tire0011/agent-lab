@@ -11,6 +11,15 @@ deliberately not a cwd-relative ``state/`` path: the worker runs from experiment
 worktrees, and the test suite (which points ``AGENT_DB_PATH`` at a temporary
 directory) must never read or write production measurements.
 
+Measured vs. estimated (#667): :meth:`LocalModelRates.record` stores rates
+measured from llama-server timings (also the partial timings of a stopped
+call); :meth:`LocalModelRates.record_timeout` stores guesses under separate
+``estimated_*`` keys. :meth:`LocalModelRates.medians` uses the measured samples
+of a rate and falls back to the estimates only when that rate was never
+measured, and :meth:`LocalModelRates.generation_measured` tells whether the
+generation rate is a real measurement (the worker's admission check only
+trusts real ones). Files written before #667 have no ``estimated_*`` keys.
+
 Failure behaviour: a missing, unreadable, corrupt or half-written file reads
 as "no measurements yet", which leaves prompts untouched; a failed write is
 dropped. Writes go to a unique temporary file that is atomically renamed, so a
@@ -35,6 +44,8 @@ ENV_RATES_PATH = "LOCAL_MODEL_RATES_PATH"
 RATES_FILE_NAME = "local-model-rates.json"
 MAX_SAMPLES = 21
 _KEYS = ("prompt_tokens_per_second", "generation_tokens_per_second")
+_ESTIMATED = {key: f"estimated_{key}" for key in _KEYS}
+_ALL_KEYS = (*_KEYS, *_ESTIMATED.values())
 _DEFAULT_DB_PATH = "/var/lib/nexus/agent.db"
 
 
@@ -88,19 +99,28 @@ class LocalModelRates:
             result[str(name)] = {
                 key: [float(v) for v in entry.get(key, []) if _valid_rate(v)]
                 if isinstance(entry.get(key), list) else []
-                for key in _KEYS
+                for key in _ALL_KEYS
             }
         return result
 
     def _samples(self) -> dict[str, list[float]]:
-        return self._read_all().get(self.model) or {key: [] for key in _KEYS}
+        return self._read_all().get(self.model) or {key: [] for key in _ALL_KEYS}
 
     def medians(self) -> tuple[float | None, float | None]:
-        """``(prompt tokens/s, generation tokens/s)``; ``None`` where nothing is measured."""
+        """``(prompt tokens/s, generation tokens/s)``; ``None`` where nothing is known.
+
+        Per rate the measured samples, else the timeout estimates.
+        """
         samples = self._samples()
-        prompt, generation = samples["prompt_tokens_per_second"], samples["generation_tokens_per_second"]
-        return (statistics.median(prompt) if prompt else None,
-                statistics.median(generation) if generation else None)
+        result = []
+        for key in _KEYS:
+            values = samples.get(key) or samples.get(_ESTIMATED[key]) or []
+            result.append(statistics.median(values) if values else None)
+        return result[0], result[1]
+
+    def generation_measured(self) -> bool:
+        """Whether the generation rate comes from real timings, not a guess."""
+        return bool(self._samples().get("generation_tokens_per_second"))
 
     def record(self, timings: dict[str, Any] | None) -> bool:
         """Add one call's rates; ``True`` if something was stored. Never raises."""
@@ -108,12 +128,7 @@ class LocalModelRates:
             samples = rates_from_timings(timings)
             if not samples:
                 return False
-            models = self._read_all()
-            entry = models.get(self.model) or {key: [] for key in _KEYS}
-            for key, sample in samples.items():
-                entry[key] = [*entry.get(key, []), sample][-MAX_SAMPLES:]
-            models[self.model] = entry
-            self._write({"models": models})
+            self._append(samples)
             return True
         except Exception:  # measuring must never fail a model call
             logger.warning("could not record local model rates in %s", self.path, exc_info=True)
@@ -122,6 +137,10 @@ class LocalModelRates:
     def record_timeout(self, *, prompt_tokens: int, timeout_seconds: float,
                        minimum_output_tokens: int) -> bool:
         """Bootstrap conservative rates when a timed-out call has no timings.
+
+        The guesses are stored as estimates (#667): they size the next prompt
+        only for a rate that was never measured, and never count as a measured
+        generation rate.
 
         Conservatively assume prompt ingestion consumed the whole timeout.  In
         the next call, half of the 80%-of-time budget is reserved for a minimal
@@ -140,21 +159,23 @@ class LocalModelRates:
                     and minimum_output_tokens > 0):
                 return False
             half_budget_seconds = float(timeout_seconds) * 0.8 * 0.5
-            samples = {
-                "prompt_tokens_per_second": prompt_tokens / float(timeout_seconds),
-                "generation_tokens_per_second": minimum_output_tokens / half_budget_seconds,
-            }
-            models = self._read_all()
-            entry = models.get(self.model) or {key: [] for key in _KEYS}
-            for key, sample in samples.items():
-                entry[key] = [*entry.get(key, []), sample][-MAX_SAMPLES:]
-            models[self.model] = entry
-            self._write({"models": models})
+            self._append({
+                _ESTIMATED["prompt_tokens_per_second"]: prompt_tokens / float(timeout_seconds),
+                _ESTIMATED["generation_tokens_per_second"]: minimum_output_tokens / half_budget_seconds,
+            })
             return True
         except Exception:
             logger.warning("could not record local model timeout rates in %s", self.path,
                            exc_info=True)
             return False
+
+    def _append(self, samples: dict[str, float]) -> None:
+        models = self._read_all()
+        entry = models.get(self.model) or {key: [] for key in _ALL_KEYS}
+        for key, sample in samples.items():
+            entry[key] = [*entry.get(key, []), sample][-MAX_SAMPLES:]
+        models[self.model] = entry
+        self._write({"models": models})
 
     def _write(self, data: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

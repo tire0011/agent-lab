@@ -7,6 +7,18 @@ named files, then the handover cut from the end. When the first two do not fit, 
 model is not called: the run ends ``context_too_small`` and the experiment hands
 the task to an external agent.
 
+Admission (#667): when the measured rates leave the call fewer output tokens
+than ``MIN_USEFUL_PATCH_TOKENS`` (``LOCAL_MIN_USEFUL_PATCH_TOKENS``, default 768,
+capped at the worker's ``max_tokens``), the model is not called either: the run
+ends ``local_too_slow`` with the numbers and is handed over like
+``context_too_small``. Admission only applies to a measured generation rate:
+a ``record_timeout`` guess is built to afford exactly ``MIN_OUTPUT_TOKENS`` and
+would otherwise lock the worker out after one timeout. A streamed call that the client stops early
+(``prompt_too_slow`` / ``generation_too_slow``) or that times out stores its
+measured partial rates (for ``prompt_too_slow``: prompt tokens / time waited,
+an upper bound); the guessed ``record_timeout`` rates are only a fallback when
+nothing was measured.
+
 Correction loop (#597): each answer is converted to a unified diff
 (SEARCH/REPLACE blocks by default), must pass ``git apply --check``, apply, and
 leave every changed ``.py`` file passing
@@ -76,7 +88,7 @@ from typing import Any, Awaitable, Callable
 
 from modules.coding_worker import WorkerResult, validate_worker_config
 from modules.experiment_handover import HANDOVER_HEADING
-from modules.llama_cpp_client import LlamaCppClient
+from modules.llama_cpp_client import EARLY_STOP_REASONS, LlamaCppClient
 from modules.local_edit_format import EditFormatError, edits_to_diff
 from modules.local_model_rates import LocalModelRates
 from modules.local_run_metrics import CallRecord, RunMetrics, call_record, summary_line
@@ -114,6 +126,23 @@ TIME_BUDGET_FRACTION = 0.8
 MAX_GENERATION_TIME_SHARE = 0.5
 # Never ask a time-fitted call for fewer output tokens than this.
 MIN_OUTPUT_TOKENS = 256
+# #667: below this many affordable output tokens a patch is hopeless, so the
+# model is not called at all (``local_too_slow``).
+LOCAL_TOO_SLOW = "local_too_slow"
+ENV_MIN_USEFUL_PATCH_TOKENS = "LOCAL_MIN_USEFUL_PATCH_TOKENS"
+DEFAULT_MIN_USEFUL_PATCH_TOKENS = 768
+
+
+def _min_useful_patch_tokens() -> int:
+    try:
+        value = int(os.environ.get(ENV_MIN_USEFUL_PATCH_TOKENS, "") or DEFAULT_MIN_USEFUL_PATCH_TOKENS)
+    except ValueError:
+        return DEFAULT_MIN_USEFUL_PATCH_TOKENS
+    return max(0, value)
+
+
+# Import-time default for documentation and tests; the check reads the env.
+MIN_USEFUL_PATCH_TOKENS = _min_useful_patch_tokens()
 FEEDBACK_ERROR_CHARS = 1500
 # Where the handover ends inside the experiment prompt templates
 # (modules/experiment_service/prompts.py).
@@ -128,6 +157,10 @@ _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 
 class ContextTooSmallError(RuntimeError):
     """The instructions, the goal and the named files do not fit the context."""
+
+
+class LocalTooSlowError(RuntimeError):
+    """The measured rates leave too few output tokens for a useful patch (#667)."""
 
 
 # Splitting the task and reading the named files
@@ -437,13 +470,16 @@ async def _fit_part(text: str, budget: int, measure: Callable[[str], Awaitable[i
 
 async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_tokens: int,
                        margin_tokens: int = CONTEXT_MARGIN_TOKENS,
-                       rates: tuple[float | None, float | None] = (None, None)) -> PromptPlan:
-    """Fit the local prompt into the server's context, or raise :class:`ContextTooSmallError`."""
+                       rates: tuple[float | None, float | None] = (None, None),
+                       admission: bool = True) -> PromptPlan:
+    """Fit the local prompt into the server's context, or raise :class:`ContextTooSmallError`
+    (or :class:`LocalTooSlowError` when *admission* is on and the rates cannot afford a patch)."""
     n_ctx, n_ctx_source = await discover_context_size(client)
     essential, handover = split_handover(task)
     return await build_prompt_parts(
         essential, handover, working_dir, client, max_output_tokens=max_output_tokens,
         margin_tokens=margin_tokens, n_ctx=n_ctx, n_ctx_source=n_ctx_source, rates=rates,
+        admission=admission,
     )
 
 
@@ -451,7 +487,8 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
                              max_output_tokens: int, n_ctx: int, n_ctx_source: str,
                              margin_tokens: int = CONTEXT_MARGIN_TOKENS,
                              counter: TokenCounter | None = None,
-                             rates: tuple[float | None, float | None] = (None, None)) -> PromptPlan:
+                             rates: tuple[float | None, float | None] = (None, None),
+                             admission: bool = True) -> PromptPlan:
     """:func:`build_prompt` for an already split task and an already known ``n_ctx``."""
     count = counter or TokenCounter(client)
     # n_ctx is a hard limit; the time budget (#642) is a soft one. It cuts the
@@ -461,6 +498,19 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     # making the call that measures a better rate - it could never recover.
     context_budget = n_ctx - max_output_tokens - margin_tokens
     allowance = time_budget(getattr(client, "timeout", None), max_output_tokens, rates)
+    # #667 admission: a slow generation rate cannot be fixed by a smaller
+    # prompt, so a call that cannot afford a useful answer is not made. The
+    # worker turns it off while the generation rate is only a timeout guess.
+    useful = min(_min_useful_patch_tokens(), max_output_tokens)
+    if admission and allowance is not None and allowance.output_tokens < useful:
+        prompt_rate, generation_rate = rates
+        raise LocalTooSlowError(
+            f"{LOCAL_TOO_SLOW}: the time budget allows only {allowance.output_tokens} output tokens "
+            f"(generation {generation_rate:.2f} tok/s, prompt {prompt_rate:.2f} tok/s, "
+            f"{allowance.seconds:g}s of the {float(getattr(client, 'timeout')):g}s timeout, at most "
+            f"{MAX_GENERATION_TIME_SHARE:.0%} of it for generation); a useful patch needs {useful}; "
+            "the local model was not called"
+        )
     time_budget_tokens = allowance.prompt_tokens if allowance else None
     output_tokens = allowance.output_tokens if allowance else max_output_tokens
     budget = context_budget if time_budget_tokens is None else min(context_budget, time_budget_tokens)
@@ -1465,9 +1515,13 @@ class LocalCodingWorker:
                 # n_ctx is read once here and holds for this whole run.
                 plan = asyncio.run(build_prompt(task, working_dir, self.client,
                                                 max_output_tokens=self.max_tokens,
-                                                rates=self.rates.medians()))
+                                                rates=self.rates.medians(),
+                                                admission=self.rates.generation_measured()))
             except ContextTooSmallError as exc:
                 self._log(experiment_logger, phase, "local_context_too_small", str(exc), warning=True)
+                return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
+            except LocalTooSlowError as exc:
+                self._log_too_slow(experiment_logger, phase, exc)
                 return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
             self.last_plan = plan
             self._log(
@@ -1500,6 +1554,7 @@ class LocalCodingWorker:
                             task, working_dir, self.client,
                             max_output_tokens=self.max_tokens,
                             rates=self.rates.medians(),
+                            admission=self.rates.generation_measured(),
                         ))
                         self.last_plan = plan
                         self._log(
@@ -1519,6 +1574,9 @@ class LocalCodingWorker:
         except subprocess.TimeoutExpired:
             return self._result(task, working_dir, "", "local model patch application timed out", started,
                                 success=False, exit_code=None, timed_out=True)
+        except LocalTooSlowError as exc:  # a refit or a subtask prompt after new measurements
+            self._log_too_slow(experiment_logger, phase, exc)
+            return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
         except Exception as exc:  # worker failures are represented, never leaked into the pipeline
             # An httpx timeout stringifies to "" - never record an empty error (#642).
             error = str(exc).strip() or f"{type(exc).__name__} (no message)"
@@ -1683,7 +1741,7 @@ class LocalCodingWorker:
         return await build_prompt_parts(
             essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
             n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
-            rates=self.rates.medians(),
+            rates=self.rates.medians(), admission=self.rates.generation_measured(),
         )
 
     # The correction loop (#597)
@@ -1749,7 +1807,8 @@ class LocalCodingWorker:
                     if self._is_model_timeout(exc):
                         limit = getattr(self.client, "timeout", timeout)
                         reason = str(exc) or f"local model call timed out after {limit}s"
-                        self._log_round(experiment_logger, phase, round_no, "model_timeout", reason, **extra)
+                        self._log_round(experiment_logger, phase, round_no, "model_timeout", reason,
+                                        stop_reason=getattr(exc, "reason", None) or "timeout", **extra)
                         return False, "", reason
                     raise
                 format_error = ""
@@ -1912,9 +1971,24 @@ class LocalCodingWorker:
         self._log(experiment_logger, phase, "local_run_metrics",
                   summary_line(fields) + f", samples N={self.samples}", **fields)
 
+    def _log_too_slow(self, experiment_logger: Any | None, phase: str, exc: Exception) -> None:
+        prompt_rate, generation_rate = self.rates.medians()
+        self._log(experiment_logger, phase, "local_too_slow", str(exc), warning=True,
+                  prompt_tokens_per_second=prompt_rate,
+                  generation_tokens_per_second=generation_rate,
+                  min_useful_patch_tokens=_min_useful_patch_tokens(),
+                  timeout_seconds=getattr(self.client, "timeout", None))
+
     @staticmethod
-    def _is_model_timeout(exc: Exception) -> bool:
-        return (isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+    def _stop_reason(exc: BaseException) -> str | None:
+        reason = getattr(exc, "reason", None)
+        return reason if reason in EARLY_STOP_REASONS else None
+
+    @classmethod
+    def _is_model_timeout(cls, exc: Exception) -> bool:
+        # An early stop (#667) is a timeout that was cut short: same handling.
+        return (cls._stop_reason(exc) is not None
+                or isinstance(exc, (TimeoutError, asyncio.TimeoutError))
                 or "timed out" in str(exc).lower()
                 or "timeout" in type(exc).__name__.lower())
 
@@ -1927,6 +2001,7 @@ class LocalCodingWorker:
         if hasattr(self.client, "last_timings"):
             self.client.last_timings = None
         outcome = "ok"
+        stop: dict[str, Any] = {}
         options: dict[str, Any] = {}
         if seed is not None and _accepts_seed(self.client):
             options["seed"] = seed
@@ -1936,8 +2011,13 @@ class LocalCodingWorker:
             ))
             return answer
         except BaseException as exc:
-            outcome = ("timeout" if self._is_model_timeout(exc) else
+            outcome = ("early_stop" if self._stop_reason(exc) else
+                       "timeout" if isinstance(exc, Exception) and self._is_model_timeout(exc) else
                        "error" if isinstance(exc, Exception) else "interrupted")
+            if outcome in ("early_stop", "timeout"):
+                stop = {"stop_reason": getattr(exc, "reason", None) or "timeout",
+                        "stop_rates": getattr(exc, "rates", None) or None,
+                        "busy_slots": getattr(exc, "busy_slots", None)}
             raise
         finally:
             wall_seconds = time.monotonic() - started
@@ -1948,7 +2028,13 @@ class LocalCodingWorker:
                 self._metrics.record_call(self._last_call)
             if outcome == "ok":
                 self.rates.record(timings)  # never raises
-            elif outcome == "timeout" and not timings:
+            elif outcome in ("timeout", "early_stop") and self.rates.record(timings):
+                pass  # #667: the measured partial rates, not guesses
+            elif (stop.get("stop_reason") == "prompt_too_slow"
+                  and self.rates.record(_prompt_bound_timings(fields.get("prompt_tokens"), stop))):
+                pass  # no token within the TTFT limit: a measured upper bound of the prompt rate
+            elif outcome in ("timeout", "early_stop"):
+                # Not one usable measurement arrived: fall back to the guess.
                 timeout = getattr(self.client, "timeout", None)
                 prompt_tokens = fields.get("prompt_tokens")
                 if (isinstance(timeout, (int, float)) and math.isfinite(timeout)
@@ -1984,6 +2070,9 @@ class LocalCodingWorker:
                 prompt_tokens_total=prompt_total,
                 prompt_cache_ratio=cache_ratio,
                 max_tokens=max_tokens,
+                **({"stream": stream} if (stream := getattr(self.client, "last_stream", None))
+                   and isinstance(stream, dict) else {}),
+                **stop,
                 **({"temperature": temperature, "seed": seed} if "sample" in fields else {}),
                 **fields,
             )
@@ -2022,6 +2111,16 @@ class LocalCodingWorker:
         )
 
 
+def _prompt_bound_timings(prompt_tokens: Any, stop: dict[str, Any]) -> dict[str, Any] | None:
+    """Timings for "the prompt took longer than this" after a ``prompt_too_slow`` stop."""
+    rates = stop.get("stop_rates") or {}
+    elapsed = rates.get("elapsed_seconds") if isinstance(rates, dict) else None
+    if not (isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool) and prompt_tokens > 0
+            and isinstance(elapsed, (int, float)) and elapsed > 0):
+        return None
+    return {"prompt_n": prompt_tokens, "prompt_ms": float(elapsed) * 1000.0}
+
+
 def _accepts_seed(client: Any) -> bool:
     """Whether ``client.complete`` takes a ``seed`` (llama-server does; test doubles may not)."""
     try:
@@ -2033,3 +2132,16 @@ def _accepts_seed(client: Any) -> bool:
 
 def is_context_too_small(error: str | None) -> bool:
     return bool(error) and str(error).startswith(CONTEXT_TOO_SMALL)
+
+
+def is_local_too_slow(error: str | None) -> bool:
+    return bool(error) and str(error).startswith(LOCAL_TOO_SLOW)
+
+
+def local_not_called_reason(error: str | None) -> str | None:
+    """``context_too_small`` / ``local_too_slow`` when the local model was never called."""
+    if is_context_too_small(error):
+        return CONTEXT_TOO_SMALL
+    if is_local_too_slow(error):
+        return LOCAL_TOO_SLOW
+    return None

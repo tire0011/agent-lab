@@ -959,7 +959,9 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
     One row per (experiment, prompt variant). ``status`` is ``pending`` while a
     replay holds the claim (``claim_token``/``lease_expires_at``), ``scored``
     when the merged tests ran on the local result, ``no_tests`` when the merged
-    diff changed no test file, and ``error`` when the replay could not be set up.
+    diff changed no test file, ``local_too_slow`` (#667) when the local worker
+    refused the call because the measured rates cannot afford a useful patch,
+    and ``error`` when the replay could not be set up.
 
     #649 adds ``local_replay_units`` (one hunk-level unit per experiment, file,
     symbol and variant; ``status`` running/scored/timeout/error) and
@@ -974,7 +976,7 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
             model TEXT NOT NULL DEFAULT '',
             prompt_variant TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'scored', 'no_tests', 'error')),
+                CHECK (status IN ('pending', 'scored', 'no_tests', 'error', 'local_too_slow')),
             patch_applied INTEGER NOT NULL DEFAULT 0 CHECK (patch_applied IN (0, 1)),
             compiled INTEGER NOT NULL DEFAULT 0 CHECK (compiled IN (0, 1)),
             tests_total INTEGER NOT NULL DEFAULT 0,
@@ -1072,3 +1074,48 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE local_replays ADD COLUMN {column} {ddl}")
+    _widen_local_replays_status_check(conn)
+
+
+_LOCAL_REPLAYS_OLD_CHECK = "CHECK (status IN ('pending', 'scored', 'no_tests', 'error'))"
+_LOCAL_REPLAYS_NEW_CHECK = "CHECK (status IN ('pending', 'scored', 'no_tests', 'error', 'local_too_slow'))"
+
+
+def _widen_local_replays_status_check(conn: sqlite3.Connection) -> None:
+    """#667: allow status ``local_too_slow`` in a local_replays table created earlier.
+
+    SQLite cannot alter a CHECK constraint, so the table is rebuilt from its own
+    stored definition (which includes every column added since) with only the
+    status list widened; all rows are copied. Idempotent, and re-checked inside
+    the write transaction so concurrent openers rebuild at most once.
+    """
+    def table_sql() -> str:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='local_replays'"
+        ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    if _LOCAL_REPLAYS_OLD_CHECK not in table_sql():
+        return
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        sql = table_sql()
+        if _LOCAL_REPLAYS_OLD_CHECK in sql:
+            columns = ", ".join(
+                f'"{row[1]}"' for row in conn.execute("PRAGMA table_info(local_replays)")
+            )
+            conn.execute("ALTER TABLE local_replays RENAME TO local_replays_pre_667")
+            conn.execute(sql.replace(_LOCAL_REPLAYS_OLD_CHECK, _LOCAL_REPLAYS_NEW_CHECK))
+            conn.execute(
+                f"INSERT INTO local_replays ({columns}) SELECT {columns} FROM local_replays_pre_667"
+            )
+            conn.execute("DROP TABLE local_replays_pre_667")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_local_replays_created_at ON local_replays(created_at)"
+            )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise

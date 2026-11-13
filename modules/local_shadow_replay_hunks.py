@@ -35,7 +35,8 @@ overlap and the scored tree all refer to the same files.
    unit is not counted as tested (``has_tests=0``).
 4. **Storage.** One ``local_replay_units`` row per (experiment, file,
    symbol, variant) with a ``status``: ``scored`` (the worker finished inside
-   its time limit), ``timeout`` or ``error``. ``running`` marks a unit in
+   its time limit), ``timeout``, ``local_too_slow`` (#667: the measured rates
+   could not afford a useful patch, the model was not called) or ``error``. ``running`` marks a unit in
    progress. One ``local_replay_unit_runs`` row per (experiment, variant)
    says whether the experiment is ``done``, has ``no_units`` or hit a set-up
    ``error``, so the sweep never picks the same experiment forever.
@@ -79,6 +80,7 @@ UNIT_RUNNING = "running"
 UNIT_SCORED = "scored"
 UNIT_TIMEOUT = "timeout"
 UNIT_ERROR = "error"
+UNIT_LOCAL_TOO_SLOW = lsr.STATUS_LOCAL_TOO_SLOW
 
 RUN_RUNNING = "running"
 RUN_DONE = "done"
@@ -716,6 +718,8 @@ def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str,
     timed_out = bool(getattr(result, "timed_out", False)) or outcome.seconds >= timeout or bool(
         worker_error and _TIMEOUT_RE.search(worker_error))
     outcome.status = UNIT_TIMEOUT if timed_out else UNIT_SCORED
+    if worker_error and worker_error.startswith(UNIT_LOCAL_TOO_SLOW):
+        outcome.status = UNIT_LOCAL_TOO_SLOW
     if worker_error:
         notes.insert(0, worker_error)
 
