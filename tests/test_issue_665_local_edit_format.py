@@ -1,4 +1,5 @@
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -109,6 +110,108 @@ class LocalEditFormatTests(unittest.TestCase):
             )
         self.assertTrue(result.success, result.error)
         self.assertEqual((self.repo / "app.py").read_text(), "VALUE = 2\n")
+
+    def test_correction_feedback_preserves_original_search_replace_answer(self):
+        self.commit({"app.py": "VALUE = 1\n"})
+        broken = self.block("app.py", "VALUE = 1\n", "VALUE = (\n")
+        fixed = self.block("app.py", "VALUE = 1\n", "VALUE = 2\n")
+
+        class Client:
+            model = "fake"
+
+            def __init__(self):
+                self.prompts = []
+                self.answers = iter((broken, fixed))
+
+            async def context_size(self):
+                return 4096
+
+            async def count_tokens(self, text):
+                return max(1, len(text) // 4)
+
+            async def complete(self, prompt, *args, **kwargs):
+                self.prompts.append(prompt)
+                return next(self.answers)
+
+        client = Client()
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+            result = LocalCodingWorker(client=client, max_tokens=512).run(
+                task="Change app.py VALUE to 2", working_dir=str(self.repo),
+                sandbox="workspace-write", timeout_seconds=30,
+            )
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("Previous edit answer", client.prompts[1])
+        self.assertIn("Previous edit answer (fix it, do not repeat the mistake):\n" + broken.strip(),
+                      client.prompts[1])
+        self.assertNotIn("@@ -1", client.prompts[1])
+
+    def test_existing_executable_mode_is_preserved(self):
+        self.commit({"run.sh": "#!/bin/sh\necho old\n"})
+        path = self.repo / "run.sh"
+        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        subprocess.run(["git", "add", "run.sh"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "executable"], cwd=self.repo, check=True)
+        diff = edits_to_diff(self.block("run.sh", "echo old\n", "echo new\n"), str(self.repo))
+        self.assertNotIn("old mode", diff)
+        self.assertNotIn("new mode", diff)
+        apply_and_check(diff, str(self.repo), 10)
+        self.assertTrue((path.stat().st_mode & stat.S_IXUSR) != 0)
+
+    def test_crlf_is_preserved_outside_replacement(self):
+        self.commit({"a.txt": "placeholder\n"})
+        path = self.repo / "a.txt"
+        path.write_bytes(b"first\r\nold\r\nlast\r\n")
+        subprocess.run(["git", "add", "a.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "crlf"], cwd=self.repo, check=True)
+        answer = self.block("a.txt", "old\r\n", "new\r\n")
+        apply_and_check(edits_to_diff(answer, str(self.repo)), str(self.repo), 10)
+        self.assertEqual(path.read_bytes(), b"first\r\nnew\r\nlast\r\n")
+
+    def test_non_utf8_read_is_clear_edit_error(self):
+        self.commit({"a.bin": "placeholder\n"})
+        (self.repo / "a.bin").write_bytes(b"\xff\xfe\x00")
+        with self.assertRaises(EditFormatError) as caught:
+            edits_to_diff(self.block("a.bin", "x\n", "y\n"), str(self.repo))
+        self.assertIn("edit block 1 (a.bin) could not read UTF-8 file", str(caught.exception))
+
+    def test_read_error_is_clear_edit_error(self):
+        self.commit({"a.txt": "old\n"})
+        with patch.object(Path, "read_bytes", side_effect=OSError("read interrupted")):
+            with self.assertRaises(EditFormatError) as caught:
+                edits_to_diff(self.block("a.txt", "old\n", "new\n"), str(self.repo))
+        self.assertIn("edit block 1 (a.txt)", str(caught.exception))
+        self.assertIn("read interrupted", str(caught.exception))
+
+    def test_staging_read_error_is_clear_edit_error(self):
+        self.commit({"a.txt": "old\n"})
+        with patch("modules.local_edit_format.shutil.copy2", side_effect=OSError("copy interrupted")):
+            with self.assertRaises(EditFormatError) as caught:
+                edits_to_diff(self.block("a.txt", "old\n", "new\n"), str(self.repo))
+        self.assertIn("could not stage edit block for a.txt", str(caught.exception))
+        self.assertIn("copy interrupted", str(caught.exception))
+
+    def test_failed_later_block_and_repeated_conversion_leave_repo_unchanged(self):
+        self.commit({"a.txt": "one\n", "b.txt": "two\n"})
+        before = subprocess.run(["git", "status", "--porcelain=v1"], cwd=self.repo,
+                                text=True, capture_output=True, check=True).stdout
+        answer = self.block("a.txt", "one\n", "ONE\n") + self.block("b.txt", "missing\n", "TWO\n")
+        with self.assertRaises(EditFormatError):
+            edits_to_diff(answer, str(self.repo))
+        self.assertEqual((self.repo / "a.txt").read_text(), "one\n")
+        self.assertEqual(subprocess.run(["git", "status", "--porcelain=v1"], cwd=self.repo,
+                                       text=True, capture_output=True, check=True).stdout, before)
+
+        valid = self.block("a.txt", "one\n", "ONE\n")
+        self.assertEqual(edits_to_diff(valid, str(self.repo)), edits_to_diff(valid, str(self.repo)))
+
+    def test_git_diff_timeout_leaves_repo_unchanged(self):
+        self.commit({"a.txt": "old\n"})
+        with patch("modules.local_edit_format.subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(["git", "diff"], 0.01)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                edits_to_diff(self.block("a.txt", "old\n", "new\n"), str(self.repo), timeout=0.01)
+        self.assertEqual((self.repo / "a.txt").read_text(), "old\n")
 
 
 if __name__ == "__main__":

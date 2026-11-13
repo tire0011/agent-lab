@@ -140,7 +140,15 @@ def edits_to_diff(text: str, working_dir: str, timeout: float = 30,
             if full.is_symlink() or (full.exists() and not full.is_file()):
                 raise EditFormatError(f"edit block {block.number} ({block.path}) is not a regular file")
             exists = full.is_file()
-            contents[block.path] = (exists, full.read_text(encoding="utf-8") if exists else "")
+            try:
+                # decode bytes directly: unlike Path.read_text(), this keeps CRLF
+                # sequences intact so an edit cannot rewrite unrelated newlines.
+                content = full.read_bytes().decode("utf-8") if exists else ""
+            except (OSError, UnicodeDecodeError) as exc:
+                raise EditFormatError(
+                    f"edit block {block.number} ({block.path}) could not read UTF-8 file: {exc}"
+                ) from exc
+            contents[block.path] = (exists, content)
         existed, content = contents[block.path]
         contents[block.path] = (existed, _replace(block, content, existed))
 
@@ -151,18 +159,30 @@ def edits_to_diff(text: str, working_dir: str, timeout: float = 30,
         after.mkdir()
         for path, (existed, result) in contents.items():
             source = root / path
-            if existed:
-                target = before / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
-            target = after / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(result, encoding="utf-8")
+            try:
+                if existed:
+                    before_target = before / path
+                    after_target = after / path
+                    before_target.parent.mkdir(parents=True, exist_ok=True)
+                    after_target.parent.mkdir(parents=True, exist_ok=True)
+                    # Seed both sides from the source so permissions (notably
+                    # the executable bit) and metadata remain identical.
+                    shutil.copy2(source, before_target)
+                    shutil.copy2(source, after_target)
+                else:
+                    after_target = after / path
+                    after_target.parent.mkdir(parents=True, exist_ok=True)
+                after_target.write_bytes(result.encode("utf-8"))
+            except (OSError, UnicodeEncodeError) as exc:
+                raise EditFormatError(f"could not stage edit block for {path}: {exc}") from exc
         done = subprocess.run(
             ["git", "diff", "--no-index", "--binary", "--src-prefix=", "--dst-prefix=",
              "--", "a", "b"], cwd=temp,
-            text=True, capture_output=True, timeout=timeout,
+            capture_output=True, timeout=timeout,
         )
         if done.returncode not in (0, 1):
-            raise EditFormatError(done.stderr.strip() or "git diff failed for SEARCH/REPLACE edits")
-        return done.stdout
+            detail = done.stderr.decode("utf-8", errors="replace").strip()
+            raise EditFormatError(detail or "git diff failed for SEARCH/REPLACE edits")
+        # Do not use subprocess text mode here: universal-newline conversion
+        # would strip CR bytes from patch context for CRLF source files.
+        return done.stdout.decode("utf-8")

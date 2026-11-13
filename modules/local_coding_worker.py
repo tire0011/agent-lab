@@ -1769,7 +1769,11 @@ class LocalCodingWorker:
                 previous = best
                 best = better_candidate(best, (check, index))
                 if best is not previous:
-                    best_diff = patch or output.strip()
+                    # In SEARCH/REPLACE mode correction feedback must show the
+                    # answer the model can revise, not our generated unified
+                    # diff.  Diff mode retains its historical normalized patch.
+                    best_diff = (output.strip() if local_edit_format() == "search_replace"
+                                 else (patch or output.strip()))
             assert best is not None
             check, index = best
             reason = check.reason
