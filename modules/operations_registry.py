@@ -691,12 +691,21 @@ class OperationsRegistry:
                 + (f", peak RSS {stats['peak_rss_kb'] / 1024:.0f} MiB" if stats.get("peak_rss_kb") is not None else "")
             )
         for stats in summary.get("unit_variants", []):
+            # #649: hunk-level units; completion = finished inside the worker time limit.
+            completion, rate = stats.get("completion_rate"), stats.get("unit_pass_rate")
             lines.append(
-                f"hunk variant {stats['prompt_variant']}: {stats['units']} units, "
-                f"applied {stats['applied']}, compiled {stats['compiled']}, tests passed "
-                f"{stats['tests_passed']}/{stats['units']} ({stats['unit_pass_rate']:.0%}), "
-                f"overlap {stats['average_overlap']:.0%}, {stats['average_seconds']:.1f}s/unit, "
+                f"hunk variant {stats['prompt_variant']}: {stats['units']} units from "
+                f"{stats.get('experiments', 0)} experiments, finished in time "
+                f"{stats.get('completed', 0)}/{stats['units']}"
+                + (f" ({completion:.0%})" if completion is not None else "")
+                + f", timeouts {stats.get('timeouts', 0)}, errors {stats.get('errors', 0)}"
+                + f", applied {stats['applied']}, compiled {stats['compiled']}, tests passed "
+                f"{stats['tests_passed']}/{stats['units']}"
+                + (f" ({rate:.0%})" if rate is not None else "")
+                + f" ({stats.get('tested_units', 0)} with merged tests)"
+                + f", overlap {stats['average_overlap']:.0%}, {stats['average_seconds']:.1f}s/unit, "
                 f"prompt/cache tokens {stats['prompt_tokens']}/{stats['cached_tokens']}"
+                + (f", running {stats['running']}" if stats.get("running") else "")
             )
         if summary["common"]:
             lines.append(f"on the {summary['common_experiments']} experiments scored under every variant:")

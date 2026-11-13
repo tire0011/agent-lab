@@ -361,6 +361,26 @@ sweep replays the same merged experiments again, oldest first, under that
 label. Keep the change only if its numbers in `common` beat the baseline's on
 the same experiments.
 
+Hunk-level replay (#649): whole experiments are too large for the 7B model, so
+`NEXUS_SHADOW_REPLAY_UNIT=hunk` (default `whole`) makes the sweep score one
+merged *unit* per tick instead: the merge's non-test `.py` hunks grouped by
+innermost function/class (qualified names, at most 5 per experiment). The
+worker gets the merged tree with only that unit's hunks reverted and the
+merged tests hidden, a small micro-task (issue title, commit summary + symbol)
+and `split_tasks` off; `NEXUS_SHADOW_REPLAY_UNIT_TIMEOUT_SECONDS` (default
+`900`) is its time limit. Scoring resets the worktree to the merged commit,
+splices in only the local symbol (a local file that does not parse or lost the
+symbol fails the unit), compiles, and runs the merged tests naming the module
+(`pytest -k <module>`; only counted when they pass on the merged tree). Rows go
+to `local_replay_units` (status `scored` / `timeout` / `error`, `running` while
+in progress; an interrupted unit is retried once) and one row per experiment
+to `local_replay_unit_runs` (`done`, `no_units`, `error`; never picked again).
+`unit_variants` in `GET /local-replays` and `local_replays_list` give per
+variant `completion_rate` (finished inside the limit), `unit_pass_rate`,
+`average_overlap` (changed-line Jaccard with the merged hunk) and tokens. One
+experiment by hand: `python3 -c "from modules import local_shadow_replay as l;
+print(l.replay('<experiment id>', repo_root='.', unit='hunk'))"`.
+
 Local model speed (#642): every local plan/patch call logs a `local_model_call`
 event (`call_type`, `outcome` ok/timeout/error, `wall_seconds`, llama-server
 `timings`, median `prompt_tokens_per_second` / `generation_tokens_per_second`).

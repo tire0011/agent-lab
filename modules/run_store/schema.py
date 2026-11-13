@@ -960,6 +960,10 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
     replay holds the claim (``claim_token``/``lease_expires_at``), ``scored``
     when the merged tests ran on the local result, ``no_tests`` when the merged
     diff changed no test file, and ``error`` when the replay could not be set up.
+
+    #649 adds ``local_replay_units`` (one hunk-level unit per experiment, file,
+    symbol and variant; ``status`` running/scored/timeout/error) and
+    ``local_replay_unit_runs`` (whether an experiment's hunk replay is done).
     """
     conn.executescript(
         """
@@ -1013,6 +1017,20 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_local_replay_units_variant
             ON local_replay_units(prompt_variant, created_at);
 
+        CREATE TABLE IF NOT EXISTS local_replay_unit_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL,
+            prompt_variant TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running'
+                CHECK (status IN ('running', 'done', 'no_units', 'error')),
+            units INTEGER NOT NULL DEFAULT 0,
+            error TEXT NULL,
+            merged_commit TEXT NULL,
+            created_at TEXT NOT NULL,
+            finished_at TEXT NULL,
+            UNIQUE(experiment_id, prompt_variant)
+        );
+
         CREATE TABLE IF NOT EXISTS local_replay_lease (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             token TEXT NOT NULL,
@@ -1025,6 +1043,20 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # #649: per-unit outcome, so completion inside the time limit is measurable.
+    unit_columns = {row[1] for row in conn.execute("PRAGMA table_info(local_replay_units)")}
+    for column, ddl in (
+        ("status", "TEXT NOT NULL DEFAULT 'scored'"),
+        ("error", "TEXT NULL"),
+        ("has_tests", "INTEGER NOT NULL DEFAULT 0"),
+        ("tests_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("tests_ok", "INTEGER NOT NULL DEFAULT 0"),
+        ("rounds", "INTEGER NOT NULL DEFAULT 0"),
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("finished_at", "TEXT NULL"),
+    ):
+        if column not in unit_columns:
+            conn.execute(f"ALTER TABLE local_replay_units ADD COLUMN {column} {ddl}")
     # #639: what the local run cost and how best-of-N sampled, so variants
     # (e.g. samples1 vs samples4) can be weighed on evidence.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(local_replays)")}
