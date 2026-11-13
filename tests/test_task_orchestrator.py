@@ -1435,7 +1435,7 @@ class TaskOrchestratorTests(unittest.TestCase):
             self.assertIn("command", prompt)
             self.assertIn("python_run", prompt)
             self.assertNotIn('"name":"memory_search"', prompt)
-            self.assertIn("find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart, machine_reboot, install_tool and request_from_owner)", prompt)
+            self.assertIn("find_tool discovers a concrete OperationsRegistry operation (read-only, plus service_restart, machine_reboot, install_tool, request_from_owner and llama_model_download/llama_model_switch)", prompt)
             self.assertIn("used_sources lists sources already consulted", prompt)
             self.assertNotIn("SOURCE:", prompt)
             self.assertNotIn("PERSISTENT TASK/DISCUSSION HISTORY:", prompt)

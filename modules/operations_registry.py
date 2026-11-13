@@ -35,6 +35,11 @@ _LOCAL_MODEL_RESTART_POLL_SECONDS = 2.0
 # still be written before the machine goes down. The sudoers rule from
 # scripts/setup-nexus-permissions.sh allows exactly this command.
 INSTALL_TOOL_COMMAND = ("sudo", "-n", "/usr/local/sbin/nexus-install-tool")
+LLAMA_MODEL_COMMAND = ("sudo", "-n", "/usr/local/sbin/nexus-llama-model")
+_HF_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_GGUF_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.gguf$")
+_LLAMA_SWITCH_KEYS = {"model": "MODEL", "draft_model": "DRAFT_MODEL", "draft_max": "DRAFT_MAX",
+                      "ctx": "CTX", "threads": "THREADS", "parallel": "PARALLEL"}
 _PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{1,62}$")
 MACHINE_REBOOT_COMMAND = ("sudo", "-n", "systemd-run", "--collect", "--on-active=60", "systemctl", "reboot")
 # Experiment statuses that a reboot would interrupt. Queued work has not
@@ -352,6 +357,42 @@ class OperationsRegistry:
                 "Dienste, Container und Rechte-Pakete stehen auf einer Sperrliste.",
                 [OperationArgSpec("package", "string", "Name des Ubuntu-Pakets.", required=True)],
                 ["install", "tool", "package", "apt", "missing", "executable", "command not found", "capability"],
+                mutates_state=True,
+                controller_allowed=True,
+            ),
+            "llama_model_list": OperationSpec(
+                "llama_model_list",
+                "Lokale GGUF-Modelle auf der VM und die aktuelle llama-server-Konfiguration "
+                "(Modell, Draft-Modell, Kontext, Threads) anzeigen.",
+                tags=["llama", "local model", "model", "gguf", "config", "draft", "context", "list"],
+                mutates_state=False,
+            ),
+            "llama_model_download": OperationSpec(
+                "llama_model_download",
+                "Ein GGUF-Modell von Hugging Face auf die VM laden (nur .gguf, mit Größenlimit und "
+                "Platzprüfung), um ein anderes lokales Modell oder ein Draft-Modell auszuprobieren.",
+                [
+                    OperationArgSpec("repo", "string", "Hugging-Face-Repository, z. B. Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF.", required=True),
+                    OperationArgSpec("file", "string", "Dateiname der .gguf-Datei im Repository.", required=True),
+                ],
+                ["llama", "local model", "model", "download", "gguf", "huggingface", "draft", "try"],
+                mutates_state=True,
+                controller_allowed=True,
+            ),
+            "llama_model_switch": OperationSpec(
+                "llama_model_switch",
+                "llama-server auf ein anderes heruntergeladenes Modell oder andere Einstellungen "
+                "umstellen und neu starten; wird automatisch zurückgerollt, wenn er danach nicht gesund ist. "
+                "Wird verweigert, solange ein Experiment aktiv ist.",
+                [
+                    OperationArgSpec("model", "string", "Dateiname des Hauptmodells (.gguf)."),
+                    OperationArgSpec("draft_model", "string", "Draft-Modell für Speculative Decoding; leer schaltet es ab."),
+                    OperationArgSpec("draft_max", "integer", "Höchstzahl Draft-Tokens (1-64)."),
+                    OperationArgSpec("ctx", "integer", "Kontextgröße in Tokens (512-65536)."),
+                    OperationArgSpec("threads", "integer", "CPU-Threads."),
+                    OperationArgSpec("parallel", "integer", "Parallele Slots (1-4)."),
+                ],
+                ["llama", "local model", "model", "switch", "draft", "speculative", "context", "threads", "config"],
                 mutates_state=True,
                 controller_allowed=True,
             ),
@@ -959,6 +1000,41 @@ class OperationsRegistry:
             _ACTIVE_EXPERIMENT_STATUSES,
         ).fetchall()
         return [row["id"] for row in rows]
+
+    def _op_llama_model_list(self, args: dict[str, Any]) -> OperationResult:
+        result = self._run_command([*LLAMA_MODEL_COMMAND, "list"], timeout=30)
+        result.operation = "llama_model_list"
+        return result
+
+    def _op_llama_model_download(self, args: dict[str, Any]) -> OperationResult:
+        repo, file = str(args.get("repo") or ""), str(args.get("file") or "")
+        if not _HF_REPO.match(repo) or not _GGUF_FILE.match(file):
+            raise OperationValidationError("llama_model_download braucht repo (owner/name) und eine .gguf-Datei.")
+        result = self._run_command([*LLAMA_MODEL_COMMAND, "download", repo, file], timeout=3600)
+        result.operation = "llama_model_download"
+        return result
+
+    def _op_llama_model_switch(self, args: dict[str, Any]) -> OperationResult:
+        unknown = sorted(set(args) - set(_LLAMA_SWITCH_KEYS))
+        if unknown or not args:
+            raise OperationValidationError(
+                "llama_model_switch kennt nur: " + ", ".join(_LLAMA_SWITCH_KEYS)
+            )
+        active = self._active_experiment_ids()
+        if active:
+            # The restart would cut off the experiment's local model calls.
+            raise OperationValidationError(
+                "llama_model_switch verweigert: Experiment aktiv (" + ", ".join(i[:8] for i in active[:5]) + ")."
+            )
+        pairs = []
+        for key, value in args.items():
+            text = "" if value is None else str(value)
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{0,124}", text):
+                raise OperationValidationError(f"llama_model_switch: ungültiger Wert für {key}.")
+            pairs.append(f"{_LLAMA_SWITCH_KEYS[key]}={text}")
+        result = self._run_command([*LLAMA_MODEL_COMMAND, "switch", *pairs], timeout=300)
+        result.operation = "llama_model_switch"
+        return result
 
     def _op_install_tool(self, args: dict[str, Any]) -> OperationResult:
         package = str(args.get("package") or "")
