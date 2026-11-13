@@ -12,9 +12,10 @@
 # A bare name is looked up in the model directory; a path must point into it.
 # If the file exists, DRAFT_MODEL/DRAFT_MAX=16/DRAFT_MIN=4 go into
 # /etc/agent-lab/llama.env and nexus-llama-start adds
-# --model-draft <file> --draft-max 16 --draft-min 4. Unset/empty (default) or a
-# missing file leaves everything as it was. Fetch the file with
-# scripts/fetch-draft-model.sh.
+# --model-draft <file> --draft-max 16 --draft-min 4. If the variable is not
+# supplied, an existing configuration is left alone. If it is explicitly empty
+# or names an unusable file, persisted DRAFT_* keys are removed. Fetch the file
+# with scripts/fetch-draft-model.sh.
 #
 # After setup:
 #   systemctl status llama-server
@@ -47,6 +48,8 @@ SERVER_PORT="${LOCAL_MODEL_PORT:-8080}"
 # One slot = one concurrent request; avoids memory pressure on CPU-only.
 N_PARALLEL="${LOCAL_MODEL_PARALLEL:-1}"
 # Optional draft model for speculative decoding (#669); empty = none.
+DRAFT_SETTING_SUPPLIED=0
+[[ ${LLAMA_DRAFT_MODEL_FILE+x} ]] && DRAFT_SETTING_SUPPLIED=1
 DRAFT_MODEL_INPUT="${LLAMA_DRAFT_MODEL_FILE:-}"
 DRAFT_MAX="${LLAMA_DRAFT_MAX:-16}"
 DRAFT_MIN="${LLAMA_DRAFT_MIN:-4}"
@@ -109,25 +112,34 @@ draft_lines=()
 if [[ -n "$DRAFT_MODEL_NAME" ]]; then
     draft_lines=("DRAFT_MODEL=${DRAFT_MODEL_NAME}" "DRAFT_MAX=${DRAFT_MAX}" "DRAFT_MIN=${DRAFT_MIN}")
 fi
-if [[ -f "$LLAMA_CONF" && ${#draft_lines[@]} -gt 0 ]]; then
-    # An explicitly requested, existing draft model replaces the DRAFT_* keys
-    # of an existing configuration; every other key is kept.
-    tmp_conf="$(mktemp)"
+if [[ -f "$LLAMA_CONF" && $DRAFT_SETTING_SUPPLIED -eq 1 ]]; then
+    # LLAMA_DRAFT_MODEL_FILE is authoritative when explicitly supplied. Rewrite
+    # the file atomically so an empty, missing, outside-model-dir, or otherwise
+    # invalid draft cannot leave stale speculative-decoding flags behind.
+    tmp_conf="$(mktemp "${LLAMA_CONF}.tmp.XXXXXX")"
+    trap 'rm -f "$tmp_conf"' EXIT
     grep -vE '^DRAFT_(MODEL|MAX|MIN)=' "$LLAMA_CONF" > "$tmp_conf" || true
-    printf '%s\n' "${draft_lines[@]}" >> "$tmp_conf"
-    install --mode=0644 "$tmp_conf" "$LLAMA_CONF"
-    rm -f "$tmp_conf"
-    echo "$LOG_PREFIX Updated draft model in $LLAMA_CONF"
+    if [[ ${#draft_lines[@]} -gt 0 ]]; then
+        printf '%s\n' "${draft_lines[@]}" >> "$tmp_conf"
+    fi
+    chmod 0644 "$tmp_conf"
+    mv -f "$tmp_conf" "$LLAMA_CONF"
+    trap - EXIT
+    echo "$LOG_PREFIX Updated draft settings in $LLAMA_CONF"
 elif [[ ! -f "$LLAMA_CONF" ]]; then
     if [[ -z "${LOCAL_MODEL_CONTEXT:-}" && -f "$SERVICE_FILE" ]]; then
         old_ctx="$(grep -oE -- '--ctx-size [0-9]+' "$SERVICE_FILE" | awk '{print $2}' | head -1 || true)"
         CTX_SIZE="${old_ctx:-$CTX_SIZE}"
     fi
     install -d --mode=0755 "$(dirname "$LLAMA_CONF")"
+    tmp_conf="$(mktemp "${LLAMA_CONF}.tmp.XXXXXX")"
+    trap 'rm -f "$tmp_conf"' EXIT
     printf '%s\n' "MODEL_DIR=${MODEL_DIR}" "MODEL=$(basename "$MODEL_FULL_PATH")" \
         "CTX=${CTX_SIZE}" "THREADS=${N_THREADS}" "PARALLEL=${N_PARALLEL}" "PORT=${SERVER_PORT}" \
-        ${draft_lines[@]+"${draft_lines[@]}"} > "$LLAMA_CONF"
-    chmod 0644 "$LLAMA_CONF"
+        ${draft_lines[@]+"${draft_lines[@]}"} > "$tmp_conf"
+    chmod 0644 "$tmp_conf"
+    mv -f "$tmp_conf" "$LLAMA_CONF"
+    trap - EXIT
     echo "$LOG_PREFIX Wrote $LLAMA_CONF (context $CTX_SIZE)"
 fi
 

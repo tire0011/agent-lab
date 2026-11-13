@@ -8,10 +8,10 @@
 #   sudo LLAMA_DRAFT_MODEL_FILE=qwen2.5-coder-0.5b-instruct-q8_0.gguf \
 #        bash scripts/setup-llama-systemd.sh
 #
-# Integrity: the file is accepted only if its sha256 matches. The expected value
-# is DRAFT_MODEL_SHA256 if set (pin it once known); otherwise the LFS sha256
-# that huggingface.co reports in the X-Linked-Etag header of the file. Without
-# an expected value the download is refused. A mismatch deletes the download.
+# Integrity: the default official artifact is checked against its reviewed,
+# repository-pinned sha256. Custom URL/repository/file selections must provide
+# DRAFT_MODEL_SHA256 explicitly; a hash is never learned from the download
+# source itself. A mismatch deletes the partial download.
 # An existing file is verified the same way instead of being downloaded again.
 #
 # Exit codes: 0 ok, 1 download/network error, 3 checksum missing or mismatch.
@@ -21,8 +21,12 @@ set -euo pipefail
 LOG_PREFIX="[fetch-draft-model]"
 
 MODEL_DIR="${LOCAL_MODEL_PATH:-/opt/local-models}"
-HF_REPO="${DRAFT_HF_REPO:-Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF}"
-DRAFT_FILE="${DRAFT_MODEL_FILE:-qwen2.5-coder-0.5b-instruct-q8_0.gguf}"
+DEFAULT_REPO="Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF"
+DEFAULT_FILE="qwen2.5-coder-0.5b-instruct-q8_0.gguf"
+# Official Qwen artifact at repository commit ebb2015119c907b064c512bf053e945850b5875f.
+DEFAULT_SHA256="e1a77721fa97d412f121878223eec81fb4ae6f271e18f922d746711f67b344d1"
+HF_REPO="${DRAFT_HF_REPO:-$DEFAULT_REPO}"
+DRAFT_FILE="${DRAFT_MODEL_FILE:-$DEFAULT_FILE}"
 URL="${DRAFT_MODEL_URL:-https://huggingface.co/${HF_REPO}/resolve/main/${DRAFT_FILE}}"
 EXPECTED="${DRAFT_MODEL_SHA256:-}"
 DEST="${MODEL_DIR}/${DRAFT_FILE}"
@@ -32,15 +36,13 @@ if [[ ! "$DRAFT_FILE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.gguf$ ]]; then
     exit 1
 fi
 
-if [[ -z "$EXPECTED" ]]; then
-    # huggingface.co answers HEAD on a resolve URL of an LFS file with
-    # X-Linked-Etag: "<sha256>" (before following the CDN redirect).
-    EXPECTED="$(curl -fsI "$URL" 2>/dev/null | tr -d '\r' \
-        | awk 'tolower($1)=="x-linked-etag:"{gsub(/"/, "", $2); print tolower($2)}' | tail -1 || true)"
+if [[ -z "$EXPECTED" && "$HF_REPO" == "$DEFAULT_REPO" && "$DRAFT_FILE" == "$DEFAULT_FILE" \
+      && -z "${DRAFT_MODEL_URL+x}" ]]; then
+    EXPECTED="$DEFAULT_SHA256"
 fi
 EXPECTED="$(printf '%s' "$EXPECTED" | tr 'A-F' 'a-f')"
 if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "$LOG_PREFIX ERROR: no expected sha256 (set DRAFT_MODEL_SHA256)." >&2
+    echo "$LOG_PREFIX ERROR: custom draft artifacts require DRAFT_MODEL_SHA256." >&2
     exit 3
 fi
 echo "$LOG_PREFIX Model    : $HF_REPO/$DRAFT_FILE"

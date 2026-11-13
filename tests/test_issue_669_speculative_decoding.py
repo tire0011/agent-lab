@@ -25,6 +25,7 @@ SETUP = ROOT / "scripts" / "setup-llama-systemd.sh"
 START = ROOT / "scripts" / "nexus-llama-start.sh"
 FETCH = ROOT / "scripts" / "fetch-draft-model.sh"
 DRAFT = "qwen2.5-coder-0.5b-instruct-q8_0.gguf"
+PINNED_SHA = "e1a77721fa97d412f121878223eec81fb4ae6f271e18f922d746711f67b344d1"
 
 sys.path.insert(0, str(ROOT / "scripts"))
 import bench_local_speed  # noqa: E402
@@ -60,7 +61,7 @@ class SetupExecStartTests(unittest.TestCase):
             'if [[ $d == 1 ]]; then mkdir -p "${args[@]}"; else cp "${args[0]}" "${args[1]}"; chmod +x "${args[1]}"; fi'
         ))
 
-    def _setup(self, **env):
+    def _setup(self, expected=0, **env):
         base = {k: v for k, v in os.environ.items() if not k.startswith(("LLAMA_DRAFT_", "LOCAL_MODEL_"))}
         full = {
             **base, "PATH": f"{self.bin}:{os.environ['PATH']}",
@@ -69,7 +70,7 @@ class SetupExecStartTests(unittest.TestCase):
             **env,
         }
         result = subprocess.run(["bash", str(SETUP)], env=full, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, expected, result.stderr)
         return result
 
     def _exec_start(self) -> list[str]:
@@ -129,6 +130,34 @@ class SetupExecStartTests(unittest.TestCase):
         self.assertIn("16384", args)
         self.assertEqual(args[args.index("--draft-max") + 1], "16")
 
+    def test_explicit_empty_or_missing_draft_removes_preexisting_draft_keys(self):
+        self.conf.parent.mkdir(parents=True)
+        original = (f"MODEL_DIR={self.models}\nMODEL=qwen2.5-coder-7b-instruct-q4_k_m.gguf\n"
+                    f"DRAFT_MODEL={DRAFT}\nDRAFT_MAX=8\nDRAFT_MIN=2\nCTX=8192\n")
+        for setting in ("", "missing.gguf"):
+            self.conf.write_text(original)
+            result = self._setup(LLAMA_DRAFT_MODEL_FILE=setting)
+            if setting:
+                self.assertIn("not found", result.stderr)
+            self.assertNotIn("DRAFT_", self.conf.read_text())
+            self.assertNotIn("--model-draft", self._exec_start())
+
+    def test_config_rewrite_is_atomic_and_safe_to_retry(self):
+        self.conf.parent.mkdir(parents=True)
+        original = (f"MODEL_DIR={self.models}\nMODEL=qwen2.5-coder-7b-instruct-q4_k_m.gguf\n"
+                    f"DRAFT_MODEL={DRAFT}\nDRAFT_MAX=8\nDRAFT_MIN=2\nCTX=8192\n")
+        self.conf.write_text(original)
+        _fake(self.bin, "mv", "exit 77")
+        self._setup(expected=77, LLAMA_DRAFT_MODEL_FILE="")
+        self.assertEqual(self.conf.read_text(), original)
+        self.assertEqual(list(self.conf.parent.glob("llama.env.tmp.*")), [])
+        (self.bin / "mv").unlink()
+        self._setup(LLAMA_DRAFT_MODEL_FILE="")
+        first = self.conf.read_text()
+        self._setup(LLAMA_DRAFT_MODEL_FILE="")
+        self.assertEqual(self.conf.read_text(), first)
+        self.assertNotIn("DRAFT_", first)
+
     def test_start_skips_a_draft_that_was_deleted_later(self):
         (self.models / DRAFT).write_text("draft")
         self._setup(LLAMA_DRAFT_MODEL_FILE=DRAFT)
@@ -162,12 +191,15 @@ class FetchDraftModelTests(unittest.TestCase):
                 "LOCAL_MODEL_PATH": str(self.models), "FAKE_ETAG": self.sha, **env}
         return subprocess.run(["bash", str(FETCH)], env=full, capture_output=True, text=True)
 
-    def test_download_is_verified_against_the_hf_sha256(self):
-        result = self._run()
+    def test_default_download_uses_the_repository_pinned_sha256(self):
+        _fake(self.bin, "sha256sum", f'printf "{PINNED_SHA}  %s\\n" "$1"')
+        result = self._run(FAKE_ETAG="0" * 64)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.models / DRAFT).read_bytes(), self.CONTENT)
-        self.assertIn("Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/" + DRAFT,
-                      (self.dir / "calls.log").read_text())
+        calls = (self.dir / "calls.log").read_text()
+        self.assertIn("Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/" + DRAFT, calls)
+        self.assertNotIn("-fsI", calls)
+        self.assertIn(PINNED_SHA, result.stdout)
 
     def test_a_mismatch_deletes_the_download(self):
         result = self._run(DRAFT_MODEL_SHA256="0" * 64)
@@ -175,11 +207,17 @@ class FetchDraftModelTests(unittest.TestCase):
         self.assertFalse((self.models / DRAFT).exists())
         self.assertEqual([p.name for p in self.models.iterdir()], [])
 
-    def test_no_expected_sha_refuses_without_downloading(self):
-        result = self._run(FAKE_ETAG="")
+    def test_custom_artifact_without_explicit_sha_refuses_without_downloading(self):
+        result = self._run(DRAFT_MODEL_URL="https://example.invalid/custom.gguf")
         self.assertEqual(result.returncode, 3)
         self.assertFalse((self.models / DRAFT).exists())
-        self.assertNotIn(" -o ", (self.dir / "calls.log").read_text())
+        self.assertFalse((self.dir / "calls.log").exists())
+
+    def test_custom_artifact_accepts_an_explicit_sha_override(self):
+        result = self._run(DRAFT_MODEL_URL="https://example.invalid/custom.gguf",
+                           DRAFT_MODEL_SHA256=self.sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.models / DRAFT).read_bytes(), self.CONTENT)
 
     def test_an_existing_file_is_verified_not_downloaded(self):
         self.models.mkdir()
@@ -188,6 +226,27 @@ class FetchDraftModelTests(unittest.TestCase):
         self.assertFalse((self.dir / "calls.log").exists())
         (self.models / DRAFT).write_bytes(b"corrupt")
         self.assertEqual(self._run(DRAFT_MODEL_SHA256=self.sha).returncode, 3)
+
+    def test_interrupted_download_is_resumable_and_rerun_is_idempotent(self):
+        _fake(self.bin, "curl", (
+            'out=""; while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && out="$2"; shift; done\n'
+            'printf partial > "$out"\nexit 1'
+        ))
+        first = self._run(DRAFT_MODEL_SHA256=self.sha)
+        self.assertEqual(first.returncode, 1)
+        partial = self.models / f".{DRAFT}.part"
+        self.assertTrue(partial.exists())
+        self.assertFalse((self.models / DRAFT).exists())
+        _fake(self.bin, "curl", (
+            f'echo "$*" >> {self.dir}/calls.log\n'
+            f'out=""; while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && out="$2"; shift; done; '
+            f'cp {self.dir}/payload "$out"'
+        ))
+        self.assertEqual(self._run(DRAFT_MODEL_SHA256=self.sha).returncode, 0)
+        self.assertIn("--continue-at -", (self.dir / "calls.log").read_text())
+        (self.dir / "calls.log").unlink()
+        self.assertEqual(self._run(DRAFT_MODEL_SHA256=self.sha).returncode, 0)
+        self.assertFalse((self.dir / "calls.log").exists())
 
 
 class DraftTimingsTests(unittest.TestCase):
