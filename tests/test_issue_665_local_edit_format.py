@@ -154,7 +154,10 @@ class LocalEditFormatTests(unittest.TestCase):
             async def complete(self, *args, **kwargs):
                 return answer
 
-        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+        # This test exercises edit-format plumbing with a deliberately tiny
+        # fake response cap, not #667 admission policy.
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace",
+                                     "LOCAL_MIN_USEFUL_PATCH_TOKENS": "0"}):
             result = LocalCodingWorker(client=Client(), max_tokens=512).run(
                 task="In doc.md change old to older", working_dir=str(self.repo),
                 sandbox="workspace-write", timeout_seconds=30,
@@ -178,7 +181,10 @@ class LocalEditFormatTests(unittest.TestCase):
             async def complete(self, *args, **kwargs):
                 return answer
 
-        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+        # This test exercises edit-format plumbing with a deliberately tiny
+        # fake response cap, not #667 admission policy.
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace",
+                                     "LOCAL_MIN_USEFUL_PATCH_TOKENS": "0"}):
             result = LocalCodingWorker(client=Client(), max_tokens=512).run(
                 task="Change app.py VALUE to 2", working_dir=str(self.repo),
                 sandbox="workspace-write", timeout_seconds=30,
@@ -209,7 +215,10 @@ class LocalEditFormatTests(unittest.TestCase):
                 return next(self.answers)
 
         client = Client()
-        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace"}):
+        # This test exercises correction feedback with a deliberately tiny
+        # fake response cap, not #667 admission policy.
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace",
+                                     "LOCAL_MIN_USEFUL_PATCH_TOKENS": "0"}):
             result = LocalCodingWorker(client=client, max_tokens=512).run(
                 task="Change app.py VALUE to 2", working_dir=str(self.repo),
                 sandbox="workspace-write", timeout_seconds=30,

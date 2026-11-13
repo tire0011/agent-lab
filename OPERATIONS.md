@@ -322,8 +322,9 @@ pushed.
 
 One row per (experiment, variant) in `local_replays`: `experiment_id`,
 `issue`, `model`, `prompt_variant`, `status` (`scored`, `no_tests` when the
-merged diff changed no test file, `error` when the replay could not be set
-up), `patch_applied` (the local result changed the tree), `compiled` (it did
+merged diff changed no test file, `local_too_slow` when the worker refused
+the call because the measured rates cannot afford a useful patch (#667),
+`error` when the replay could not be set up), `patch_applied` (the local result changed the tree), `compiled` (it did
 and every changed `.py` file compiles), `tests_total`, `tests_passed`,
 `rounds` (local patch rounds), `tokens` (as reported by the server), `seconds`
 (local worker wall time), `error`. A stored experiment/variant pair is never
@@ -395,6 +396,32 @@ if even the minimal prompt is over it, that minimal prompt is still sent
 When the prompt is over the time budget, subtask planning is skipped. A
 timed-out patch call is logged as `local_patch_round` outcome `model_timeout`
 and ends the run. Deleting the file resets the measurements.
+
+Streamed local calls (#667): `LOCAL_MODEL_STREAM` (default `1`; `0` = the old
+single POST) reads `/v1/chat/completions` as SSE with llama-server's
+`timings_per_token`. A call is cancelled early when no first token arrives
+within `LOCAL_MODEL_TTFT_FRACTION` (default `0.6`) of the timeout
+(`prompt_too_slow`), or when after `LOCAL_MODEL_STREAM_MIN_TOKENS` (default
+`16`) tokens the projected finish (elapsed + remaining `max_tokens` at the live
+rate) is beyond the timeout (`generation_too_slow`). The `local_model_call`
+event then has `outcome` `early_stop`, `stop_reason`, `stop_rates` (TTFT,
+tokens streamed, measured prompt/generation tok/s) and `busy_slots` from
+`GET /slots` at the stop (it counts this call, so `>1` means a competing
+request). Measured partial rates go into the rates file; a `prompt_too_slow`
+stop stores prompt tokens / time waited (an upper bound). The guessed timeout
+rates (`record_timeout`) are only the fallback when nothing was measured, and
+they are kept under separate `estimated_*` keys: they size a prompt only for a
+rate that was never measured. Admission: when the rates leave fewer than
+`LOCAL_MIN_USEFUL_PATCH_TOKENS` (default `768`, capped at the worker's
+`max_tokens`; `0` disables) output tokens, the model is not called and the run
+ends `local_too_slow` with the numbers. The experiment hands over to the paid
+coder as for `context_too_small`, and a shadow replay stores status
+`local_too_slow`. Admission only applies to a measured generation rate (a guess
+never locks the worker out). Because a refused call measures nothing, delete
+the rates file after making the server faster (threads, model), or the old
+measurements keep refusing. Rates files written before #667 may hold
+guessed values among the measured ones; delete the file once after deploying
+#667.
 
 Best-of-N patch sampling (#639): `NEXUS_LOCAL_SAMPLES` (default `1`, at most
 8) is the number of candidates the local worker asks for per patch round.

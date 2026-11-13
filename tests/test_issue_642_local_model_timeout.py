@@ -238,28 +238,33 @@ class WorkerTimeoutTests(_RepoCase):
         self.assertEqual("RuntimeError (no message)", result.error)
         self.assertEqual("error", log.all("local_model_call")[0]["outcome"])
 
-    def test_plan_call_timeout_is_logged_and_patch_still_runs(self):
+    def test_plan_call_timeout_is_logged_and_hopeless_patch_is_refused(self):
         server = _Server(LlamaCppClientError(_TIMEOUT_ERROR), "not a diff")
-        worker, _, log = self.run_worker(server, split_tasks=True, planner=lambda _p: None,
-                                         task=_big_handover_task())
+        worker, result, log = self.run_worker(server, split_tasks=True, planner=lambda _p: None,
+                                              task=_big_handover_task())
         calls = log.all("local_model_call")
         self.assertEqual(("plan", "timeout"), (calls[0]["call_type"], calls[0]["outcome"]))
-        self.assertEqual("patch", calls[1]["call_type"])
-        self.assertEqual(MIN_OUTPUT_TOKENS, server.calls[1]["max_tokens"])
-        self.assertTrue(worker.last_plan.time_budget_limited)
-        self.assertTrue(log.all("local_prompt_budget")[-1]["refitted_after_timeout"])
-        self.assertGreaterEqual(len(log.all("local_patch_round")), 1)
+        self.assertEqual(len(calls), 1)
+        # The initial plan remains inspectable; no second, time-squeezed patch
+        # plan or model call is created after the timeout.
+        self.assertIsNotNone(worker.last_plan)
+        self.assertIsNone(worker.last_plan.time_budget_tokens)
+        self.assertTrue(result.error.startswith("local_too_slow"), result.error)
+        self.assertEqual(len(log.all("local_too_slow")), 1)
+        self.assertEqual(log.all("local_patch_round"), [])
 
-    def test_first_patch_timeout_bootstraps_the_next_run(self):
+    def test_first_patch_timeout_refuses_the_next_hopeless_run(self):
         task = _big_handover_task()
         first, result, _ = self.run_worker(_Server(LlamaCppClientError(_TIMEOUT_ERROR)),
                                            task=task)
         self.assertFalse(result.success)
         self.assertNotEqual((None, None), first.rates.medians())
-        second, _, log = self.run_worker(_Server("not a diff"), task=task, split_tasks=True)
-        self.assertTrue(second.last_plan.time_budget_limited)
-        self.assertTrue(second.last_plan.handover_cut)
-        self.assertEqual("patch", log.all("local_model_call")[0]["call_type"])
+        second, second_result, log = self.run_worker(
+            _Server("not a diff"), task=task, split_tasks=True)
+        self.assertIsNone(second.last_plan)
+        self.assertTrue(second_result.error.startswith("local_too_slow"), second_result.error)
+        self.assertEqual(log.all("local_model_call"), [])
+        self.assertEqual(len(log.all("local_too_slow")), 1)
 
     def test_interrupted_model_call_is_logged_and_propagated_without_a_fake_sample(self):
         server = _Server(KeyboardInterrupt())
@@ -347,17 +352,27 @@ class TimeBudgetTests(_RepoCase):
     def test_slow_generation_and_default_max_tokens_do_not_disable_the_worker(self):
         # Regression for experiment 689600ce: 4096/2 tok/s = 2048 s > 240 s gave
         # time_budget_tokens=0 and every later run failed with context_too_small.
+        # #667: such a call cannot produce a useful patch, so with the default
+        # admission it is refused as local_too_slow (never context_too_small);
+        # with admission off (LOCAL_MIN_USEFUL_PATCH_TOKENS=0) the #642 path holds.
         self.seed_rates(20.0, 2.0)
         plan = asyncio.run(build_prompt(_big_handover_task(), str(self.repo), _Server(),
-                                        max_output_tokens=4096, rates=(20.0, 2.0)))
+                                        max_output_tokens=4096, rates=(20.0, 2.0), admission=False))
         self.assertEqual(2240, plan.time_budget_tokens)  # 128 s output leaves 112 s for prompt
         self.assertEqual(MIN_OUTPUT_TOKENS, plan.output_tokens)
-        server = _Server()
-        _, result, log = self.run_worker(server, task=_big_handover_task(), max_tokens=4096)
+        with patch.dict(os.environ, {"LOCAL_MIN_USEFUL_PATCH_TOKENS": "0"}):
+            server = _Server()
+            _, result, log = self.run_worker(server, task=_big_handover_task(), max_tokens=4096)
         self.assertFalse(log.all("local_context_too_small"))
         self.assertEqual(MIN_OUTPUT_TOKENS, server.calls[0]["max_tokens"])
         self.assertGreaterEqual(len(log.all("local_patch_round")), 1)
         self.assertNotIn("context_too_small", result.error or "")
+
+        server = _Server()
+        _, result, log = self.run_worker(server, task=_big_handover_task(), max_tokens=4096)
+        self.assertFalse(server.calls)
+        self.assertTrue(result.error.startswith("local_too_slow"), result.error)
+        self.assertFalse(log.all("local_context_too_small"))
 
     def test_prompt_over_time_budget_still_calls_with_the_minimal_prompt(self):
         # 0.1 prompt tokens/s affords ~18 tokens: less than the instructions.
@@ -468,7 +483,10 @@ class RatesStoreTests(unittest.TestCase):
         self.assertAlmostEqual(256 / 120, generation_rate)
         data = json.loads(self.path.read_text(encoding="utf-8"))
         entry = data["models"]["default"]
-        self.assertTrue(all(len(entry[key]) == MAX_SAMPLES for key in entry))
+        # #667: guesses are kept apart from measurements.
+        for key in ("estimated_prompt_tokens_per_second", "estimated_generation_tokens_per_second"):
+            self.assertEqual(MAX_SAMPLES, len(entry[key]))
+        self.assertFalse(entry["prompt_tokens_per_second"] or entry["generation_tokens_per_second"])
 
     def test_timeout_bootstrap_rejects_invalid_partial_observations(self):
         store = LocalModelRates(self.path)

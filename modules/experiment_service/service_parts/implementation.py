@@ -19,7 +19,7 @@ from modules.coding_provider import (
 )
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_handover import model_written_tests_block, with_model_written_tests
-from modules.local_coding_worker import is_context_too_small
+from modules.local_coding_worker import local_not_called_reason
 
 from ..git_utils import _run_git
 from ..models import (
@@ -323,16 +323,18 @@ class ImplementationMixin:
         if (
             implementation_provider == "local"
             and (
-                is_context_too_small(implementation_result.error)
+                local_not_called_reason(implementation_result.error) is not None
                 or getattr(worker, "local_attempt_passed_generated_tests", None) is False
             )
             and self.get_experiment(experiment_id).status != STATUS_CANCELLED
         ):
-            # Context exhaustion means the local model was never called. Test-first
+            # Context exhaustion or a too slow local model (#667) means the local
+            # model was never called. Test-first
             # exhaustion means all bounded local correction rounds still failed the
             # generated acceptance checks. Both are explicit same-run handoff cases.
             generated_test_failure = getattr(worker, "local_attempt_passed_generated_tests", None) is False
-            fallback_reason = "generated_tests_failed" if generated_test_failure else "context_too_small"
+            fallback_reason = ("generated_tests_failed" if generated_test_failure
+                               else local_not_called_reason(implementation_result.error))
             generated_test_count = len(getattr(worker, "generated_tests", ()))
             model_written_tests = _take_model_written_tests(worker, worktree_path)
             if model_written_tests:

@@ -92,6 +92,8 @@ STATUS_PENDING = "pending"
 STATUS_SCORED = "scored"
 STATUS_NO_TESTS = "no_tests"
 STATUS_ERROR = "error"
+# #667: the worker refused the call, the measured rates cannot afford a patch.
+STATUS_LOCAL_TOO_SLOW = "local_too_slow"
 
 # Experiment states in which a local coding worker may be talking to the
 # server directly (it does not go through the local_llm_jobs queue).
@@ -761,6 +763,11 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
         outcome.tokens = int(getattr(client, "tokens_used", 0) or 0) or _usage_tokens(getattr(result, "usage", None))
         worker_error = None if getattr(result, "success", False) else (
             str(getattr(result, "error", None) or "local worker did not succeed"))
+        if worker_error and worker_error.startswith(STATUS_LOCAL_TOO_SLOW):
+            # The model was never called: nothing to apply or test (#667).
+            outcome.status = STATUS_LOCAL_TOO_SLOW
+            outcome.error = worker_error
+            return
 
         changed = _changed_paths(worktree)
         outcome.patch_applied = bool(changed)
@@ -1058,6 +1065,7 @@ def _stats(variant: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "scored": len(scored),
         "no_tests": sum(1 for r in rows if r["status"] == STATUS_NO_TESTS),
         "errors": sum(1 for r in rows if r["status"] == STATUS_ERROR),
+        "local_too_slow": sum(1 for r in rows if r["status"] == STATUS_LOCAL_TOO_SLOW),
         "tests_total": total,
         "tests_passed": passed,
         "test_pass_rate": round(passed / total, 4) if total else None,

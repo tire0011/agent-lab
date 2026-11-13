@@ -725,6 +725,7 @@ class OperationsRegistry:
                 + f", all tests passed in {stats['full_passes']}/{stats['scored']}"
                 + (f" ({full:.0%})" if full is not None else "")
                 + f", no tests {stats['no_tests']}, errors {stats['errors']}"
+                + (f", local too slow {stats['local_too_slow']}" if stats.get("local_too_slow") else "")
                 + f", samples N={'/'.join(str(n) for n in stats.get('samples') or [1])}"
                 + (f", median {stats['median_seconds']:.0f}s/task" if stats.get("median_seconds") is not None else "")
                 + (f", median llama CPU {stats['median_cpu_seconds']:.0f}s"
