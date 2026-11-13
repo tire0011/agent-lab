@@ -245,6 +245,7 @@ class ReplayOutcome:
     rounds: int = 0
     tokens: int = 0
     seconds: float = 0.0
+    lenient_creates: int = 0
     error: str | None = None
     base_commit: str | None = None
     merged_commit: str | None = None
@@ -268,7 +269,7 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
                merged_commit=?, test_files_json=?, finished_at=?,
                samples=?, samples_requested=?, samples_passed=?, cpu_seconds=?,
                load_average=?, peak_rss_kb=?, tokens_per_second=?, metrics_json=?,
-               file_level=?, cold_time_limited=?,
+               file_level=?, cold_time_limited=?, lenient_creates=?,
                claim_token=NULL, lease_expires_at=NULL
            WHERE experiment_id=? AND prompt_variant=? AND claim_token=? AND status=?""",
         (
@@ -287,6 +288,7 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
             (int(outcome.metrics["cold_time_limited"])
              if outcome.metrics is not None and isinstance(outcome.metrics.get("cold_time_limited"), bool)
              else None),
+            int(outcome.lenient_creates),
             experiment_id, variant, token, STATUS_PENDING,
         ),
     ).rowcount == 1
@@ -729,6 +731,14 @@ def _load(conn: sqlite3.Connection, experiment_id: str) -> tuple[sqlite3.Row, sq
     return row, adoption
 
 
+def _lenient_creates(worker: Any) -> int:
+    """The worker's applied lenient-create count (#679); 0 when it has none or a bad value."""
+    try:
+        return max(0, int(getattr(worker, "lenient_creates", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: ReplayOutcome,
                 client: Any, worker_factory: Callable[[Any], Any],
                 test_runner: Callable[[str, list[str], float], MergedTestRun], *,
@@ -761,10 +771,12 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
             outcome.seconds = time.monotonic() - started
             outcome.rounds = counter.rounds
             outcome.metrics = counter.metrics
+            outcome.lenient_creates = _lenient_creates(worker)
             raise ReplayError(f"local worker raised {type(exc).__name__}: {exc}") from exc
         outcome.seconds = time.monotonic() - started
         outcome.rounds = counter.rounds
         outcome.metrics = counter.metrics
+        outcome.lenient_creates = _lenient_creates(worker)
         outcome.tokens = int(getattr(client, "tokens_used", 0) or 0) or _usage_tokens(getattr(result, "usage", None))
         worker_error = None if getattr(result, "success", False) else (
             str(getattr(result, "error", None) or "local worker did not succeed"))
@@ -999,7 +1011,7 @@ _READ_COLUMNS = (
     "tests_total, tests_passed, rounds, tokens, seconds, error, base_commit, "
     "merged_commit, created_at, finished_at, samples, samples_requested, samples_passed, "
     "cpu_seconds, load_average, peak_rss_kb, tokens_per_second"
-    ", file_level, cold_time_limited"
+    ", file_level, cold_time_limited, lenient_creates"
 )
 
 

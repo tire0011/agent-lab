@@ -995,6 +995,7 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
             rounds INTEGER NOT NULL DEFAULT 0,
             tokens INTEGER NOT NULL DEFAULT 0,
             seconds REAL NOT NULL DEFAULT 0,
+            lenient_creates INTEGER NOT NULL DEFAULT 0,
             error TEXT NULL,
             base_commit TEXT NULL,
             merged_commit TEXT NULL,
@@ -1084,6 +1085,7 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         ("metrics_json", "TEXT NULL"),
         ("file_level", "INTEGER NULL"),
         ("cold_time_limited", "INTEGER NULL"),
+        ("lenient_creates", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE local_replays ADD COLUMN {column} {ddl}")

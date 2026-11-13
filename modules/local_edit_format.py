@@ -21,6 +21,17 @@ class EditFormatError(ValueError):
     """A model response is malformed or cannot be matched safely."""
 
 
+class EditDiff(str):
+    """A generated diff plus conversion metadata, while remaining string-compatible."""
+
+    lenient_creates: int
+
+    def __new__(cls, value: str, *, lenient_creates: int = 0) -> EditDiff:
+        result = super().__new__(cls, value)
+        result.lenient_creates = lenient_creates
+        return result
+
+
 @dataclass(frozen=True)
 class EditBlock:
     path: str
@@ -82,17 +93,23 @@ def _closest_hint(content: str, search: str) -> str:
     return "closest file lines: " + "; ".join(f"{index + 1}: {line!r}" for _, index, line in best)
 
 
-def _replace(block: EditBlock, content: str, exists: bool) -> str:
+def _replace(block: EditBlock, content: str, exists: bool) -> tuple[str, bool]:
     if not block.search:
         if exists:
             raise EditFormatError(
                 f"edit block {block.number} ({block.path}) has empty SEARCH but the path already exists"
             )
-        return block.replacement
+        return block.replacement, False
+    # Small models sometimes guess SEARCH text while being asked to create a
+    # file.  There is nothing it could safely match when the current content is
+    # empty, so treat its REPLACE as the complete file (#679).  ``exists`` is
+    # deliberately irrelevant: this covers both a missing and an empty file.
+    if content == "":
+        return block.replacement, True
     exact = [m.start() for m in re.finditer(re.escape(block.search), content)]
     if len(exact) == 1:
         start = exact[0]
-        return content[:start] + block.replacement + content[start + len(block.search):]
+        return content[:start] + block.replacement + content[start + len(block.search):], False
     if len(exact) > 1:
         raise EditFormatError(
             f"edit block {block.number} ({block.path}) SEARCH is ambiguous ({len(exact)} exact matches); "
@@ -108,7 +125,7 @@ def _replace(block: EditBlock, content: str, exists: bool) -> str:
     if len(matches) == 1:
         start = sum(len(line) for line in file_lines[:matches[0]])
         length = sum(len(line) for line in file_lines[matches[0]:matches[0] + width])
-        return content[:start] + block.replacement + content[start + length:]
+        return content[:start] + block.replacement + content[start + length:], False
     qualifier = f"ambiguous ({len(matches)} whitespace-normalised matches)" if matches else "not found"
     raise EditFormatError(
         f"edit block {block.number} ({block.path}) SEARCH was {qualifier}; " +
@@ -117,8 +134,8 @@ def _replace(block: EditBlock, content: str, exists: bool) -> str:
 
 
 def edits_to_diff(text: str, working_dir: str, timeout: float = 30,
-                  allowed_paths: set[str] | None = None) -> str:
-    """Return a Git unified diff for *text* without changing *working_dir*."""
+                  allowed_paths: set[str] | None = None) -> EditDiff:
+    """Return a Git diff carrying ``lenient_creates``, without changing the tree."""
     root = Path(working_dir).resolve()
     blocks = parse_edit_blocks(text)
     paths = {block.path for block in blocks}
@@ -130,6 +147,7 @@ def edits_to_diff(text: str, working_dir: str, timeout: float = 30,
                 f"only change {', '.join(sorted(allowed_paths))}"
             )
     contents: dict[str, tuple[bool, str]] = {}
+    lenient_creates = 0
     for block in blocks:
         full = _safe_path(root, block.path, block.number)
         if block.path in contents and not block.search:
@@ -150,7 +168,9 @@ def edits_to_diff(text: str, working_dir: str, timeout: float = 30,
                 ) from exc
             contents[block.path] = (exists, content)
         existed, content = contents[block.path]
-        contents[block.path] = (existed, _replace(block, content, existed))
+        replacement, lenient_create = _replace(block, content, existed)
+        lenient_creates += int(lenient_create)
+        contents[block.path] = (existed, replacement)
 
     with tempfile.TemporaryDirectory(prefix="local-edit-format-") as temporary:
         temp = Path(temporary)
@@ -185,4 +205,4 @@ def edits_to_diff(text: str, working_dir: str, timeout: float = 30,
             raise EditFormatError(detail or "git diff failed for SEARCH/REPLACE edits")
         # Do not use subprocess text mode here: universal-newline conversion
         # would strip CR bytes from patch context for CRLF source files.
-        return done.stdout.decode("utf-8")
+        return EditDiff(done.stdout.decode("utf-8"), lenient_creates=lenient_creates)
