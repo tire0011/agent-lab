@@ -91,6 +91,17 @@ DECISION_SKIPPED_GOAL_POLICY = "skipped_goal_policy"
 # is never dispatched: pending, revoked, content-changed and corrupted records
 # all land here. Approvals come only from the trusted private mailbox.
 DECISION_SKIPPED_UNAPPROVED_ISSUE = "skipped_unapproved_issue"
+# Own proposals release themselves after this wait unless they touch a
+# safeguard or the owner said stop (#683); mailbox setting proposal_wait_hours.
+PROPOSAL_WAIT_HOURS = 12
+PLANNER_PROPOSAL_MARK = "Suggested by the Nexus planning step"
+SAFEGUARD_WORDS = (
+    "daily budget", "daily_budget", "extra_budget", "_spent_today", "budget limit",
+    "approval", "issue_approvals", "trusted", "sudo", "sudoers", "setup-nexus",
+    "setup-llama", "permission", "denylist", "goal policy", "main guard", "main_guard",
+    "nexus_reviewer", "review rule", "paused", "mailbox command", "process_command",
+    "proposal label", "proposal_wait",
+)
 # The planner split an issue into parts (#626); detail holds the part numbers.
 DECISION_SPLIT = "split"
 _MAX_SPLIT_DEPTH = 2
@@ -235,6 +246,7 @@ class NexusInitiativeService:
         drift_reader: Callable[[str, str | None], dict[str, Any]] | None = None,
         issue_creator: Callable[[str, str], int | None] | None = None,
         issue_closer: Callable[[int, str], None] | None = None,
+        proposal_releaser: Callable[[int, str], None] | None = None,
         reflection_sweep: Callable[..., Any] | None = None,
         reflection_timeout_seconds: float | None = None,
     ) -> None:
@@ -251,6 +263,8 @@ class NexusInitiativeService:
         # Splitting a stuck or large issue into parts (#626).
         self._issue_creator = issue_creator
         self._issue_closer = issue_closer
+        # Own proposals release themselves after a wait (#683).
+        self._proposal_releaser = proposal_releaser
         self._proposal_counter = proposal_counter
         self._decision_lister = decision_lister
         self._diagnostics_client = diagnostics_client
@@ -580,7 +594,10 @@ class NexusInitiativeService:
                 for label in issue.get("labels") or []
             }
             if PROPOSAL_LABEL in labels:
-                # Waits for a human to review it and remove the label (#354).
+                # Waits for a human to review it and remove the label (#354),
+                # unless it is Nexus' own and the wait is over (#683).
+                if record_skips and self._release_own_proposal(issue):
+                    continue
                 self._open_proposals += 1
                 self._open_proposal_titles.append(str(issue.get("title") or ""))
                 continue
@@ -1231,6 +1248,48 @@ class NexusInitiativeService:
         if choice.proposal_title and self._proposal_slot_free():
             chosen.payload["proposal"] = {"title": choice.proposal_title, "body": choice.proposal_body}
         return [chosen]
+
+    # ---- self-release of own proposals (#683) -------------------------------
+
+    def _release_own_proposal(self, issue: dict[str, Any]) -> bool:
+        """Release one of Nexus' own planner proposals after the wait.
+
+        Stays with the owner: anything not written by the planning step (the
+        status issue, "Nexus needs" requests), anything touching Nexus' own
+        safeguards, and anything the owner answered with "stop".
+        """
+        if self._proposal_releaser is None:
+            return False
+        body = str(issue.get("body") or "")
+        title = str(issue.get("title") or "")
+        if PLANNER_PROPOSAL_MARK not in body or title.lower().startswith("nexus needs"):
+            return False
+        text = f"{title}\n{body}".lower()
+        if any(word in text for word in SAFEGUARD_WORDS):
+            return False
+        for comment in issue.get("comments") or []:
+            if re.search(r"\bstop\b", str(comment.get("body") if isinstance(comment, dict) else comment), re.I):
+                return False
+        created = _parse_timestamp(str(issue.get("createdAt") or ""))
+        if created is None or _utcnow() - created < timedelta(hours=self._proposal_wait_hours()):
+            return False
+        try:
+            self._proposal_releaser(
+                int(issue["number"]),
+                f"Nexus released its own proposal after {self._proposal_wait_hours()} h without an "
+                "objection from the owner. Comment `stop` or close it to keep it from running.",
+            )
+        except Exception as exc:  # noqa: BLE001 - tried again next tick
+            logger.warning("initiative: could not release proposal #%s: %s", issue.get("number"), exc)
+            return False
+        return True
+
+    def _proposal_wait_hours(self) -> int:
+        raw = self._text_setting("nexus.proposal_wait_hours")
+        try:
+            return max(0, int(raw)) if raw is not None else PROPOSAL_WAIT_HOURS
+        except ValueError:
+            return PROPOSAL_WAIT_HOURS
 
     # ---- splitting (#626) --------------------------------------------------
 

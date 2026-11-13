@@ -364,6 +364,8 @@ SETTINGS: dict[str, tuple[str, int, int]] = {
     "reflection_enabled": ("nexus.reflection_enabled", 0, 1),
     # 0 disables the free local shadow replay sweep (#637); 1 enables it.
     "shadow_replay_enabled": ("nexus.shadow_replay_enabled", 0, 1),
+    # Hours before Nexus releases its own proposals itself (#683); 0 = at once.
+    "proposal_wait_hours": ("nexus.proposal_wait_hours", 0, 720),
 }
 
 
