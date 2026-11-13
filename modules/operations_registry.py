@@ -767,6 +767,10 @@ class OperationsRegistry:
                 f"{'applied' if row['patch_applied'] else 'none'}, rounds {row['rounds']}, "
                 f"{row['seconds']:.0f}s"
             )
+            if row.get("file_level") is not None:
+                line += f", file level {row['file_level']}"
+            if row.get("cold_time_limited"):
+                line += ", cold time limited"
             if int(row.get("samples") or 1) > 1 or row.get("samples_requested") is not None:
                 line += (f", samples N={int(row.get('samples') or 1)} "
                          f"({row.get('samples_requested') or 0} drawn, {row.get('samples_passed') or 0} passed)")

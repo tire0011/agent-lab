@@ -1071,6 +1071,8 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         ("peak_rss_kb", "INTEGER NULL"),
         ("tokens_per_second", "REAL NULL"),
         ("metrics_json", "TEXT NULL"),
+        ("file_level", "INTEGER NULL"),
+        ("cold_time_limited", "INTEGER NULL"),
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE local_replays ADD COLUMN {column} {ddl}")
