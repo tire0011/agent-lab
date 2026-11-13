@@ -100,6 +100,11 @@ def unit_timeout_seconds() -> float:
     return lsr._float_env(ENV_UNIT_TIMEOUT, DEFAULT_UNIT_TIMEOUT_SECONDS)
 
 
+def unit_lease_seconds() -> float:
+    """Lease for one unit: the worker, the baseline and the scored test run (#675)."""
+    return lsr.lease_seconds(unit_timeout_seconds() + lsr.tests_timeout_seconds())
+
+
 # ---- text and symbols --------------------------------------------------------
 
 def _lines(text: str) -> list[str]:
@@ -816,6 +821,11 @@ def replay_hunks(
             try:
                 for unit in units:
                     if max_units is not None and ran >= max_units:
+                        break
+                    # #675: the lease must outlast this unit's worker and both test runs.
+                    if not lsr.renew_lease(db_path, lease.token, unit_lease_seconds()):
+                        logger.warning("hunk replay %s: lost the global lease; stopping",
+                                       experiment_id)
                         break
                     if not _claim_unit(conn, experiment_id, variant, unit, model):
                         continue
