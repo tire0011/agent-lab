@@ -258,6 +258,7 @@ class OperationsRegistry:
             "experiment_reflection": OperationSpec("experiment_reflection", "Gespeicherte Reflexion (Verbesserungsvorschläge) zu einem Experiment.", [experiment_id], ["experiment", "reflection", "suggestions", "lessons", "ideas"], mutates_state=False),
             "reflections_list": OperationSpec("reflections_list", "Neueste gespeicherte Experiment-Reflexionen mit ihren Vorschlägen.", [limit10], ["reflection", "suggestions", "lessons", "ideas", "history"], mutates_state=False),
             "local_replays_list": OperationSpec("local_replays_list", "Lokale Shadow-Replays gemergter Experimente mit lokaler Test-Passrate je Prompt-Variante.", [limit10], ["local", "replay", "benchmark", "pass rate", "variant", "local model"], mutates_state=False),
+            "local_model_bakeoffs_list": OperationSpec("local_model_bakeoffs_list", "Ergebnisse der lokalen GGUF-Modell-Bake-offs mit Geschwindigkeit und Hunk-Passrate.", [limit10], ["local", "model", "bakeoff", "gguf", "winner", "benchmark"], mutates_state=False),
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
             "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
@@ -786,6 +787,25 @@ class OperationsRegistry:
                 line += f" | {sanitized_reason(str(row['error']))}"
             lines.append(redact(line)[:500])
         return OperationResult("local_replays_list", True, lines or ["(no local replays stored)"], 0)
+
+    def _op_local_model_bakeoffs_list(self, args: dict[str, Any]) -> OperationResult:
+        from modules.local_model_bakeoff import list_bakeoffs
+
+        limit = self._limit(args, default=10, maximum=500)
+        lines = []
+        for row in list_bakeoffs(limit, db_path=self.db_path):
+            lines.append(
+                f"bakeoff {row['run_id']} {row['model']}: {row['status']}, "
+                f"speed {row.get('prompt_tokens_per_second') or 0:.2f}/"
+                f"{row.get('output_tokens_per_second') or 0:.2f} prompt/output tok/s, "
+                f"passed {row['passing_hunks']}/{row['hunks_total']}, "
+                f"{row['passing_hunks_per_hour']:.2f} passing hunks/hour, "
+                f"too slow {row['local_too_slow']}"
+                + (", winner" if row["winner"] else "")
+                + (", switch recommended" if row["recommend_switch"] else "")
+            )
+        return OperationResult("local_model_bakeoffs_list", True,
+                               lines or ["(no local model bake-offs stored)"], 0)
 
     def _op_branch_drift(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)

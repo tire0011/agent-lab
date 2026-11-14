@@ -278,6 +278,31 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS local_model_bakeoffs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            model TEXT NOT NULL,
+            is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1)),
+            status TEXT NOT NULL,
+            prompt_tokens_per_second REAL NULL,
+            output_tokens_per_second REAL NULL,
+            hunks_total INTEGER NOT NULL DEFAULT 0,
+            hunks_applied INTEGER NOT NULL DEFAULT 0,
+            hunks_compiled INTEGER NOT NULL DEFAULT 0,
+            passing_hunks INTEGER NOT NULL DEFAULT 0,
+            local_too_slow INTEGER NOT NULL DEFAULT 0,
+            seconds REAL NOT NULL DEFAULT 0,
+            passing_hunks_per_hour REAL NOT NULL DEFAULT 0,
+            winner INTEGER NOT NULL DEFAULT 0 CHECK (winner IN (0, 1)),
+            recommend_switch INTEGER NOT NULL DEFAULT 0 CHECK (recommend_switch IN (0, 1)),
+            details_json TEXT NULL,
+            error TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_local_model_bakeoffs_created
+            ON local_model_bakeoffs(created_at DESC, id DESC);
+
         CREATE TABLE IF NOT EXISTS issue_approvals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             repository TEXT NOT NULL,
