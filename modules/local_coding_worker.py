@@ -1646,6 +1646,8 @@ class LocalCodingWorker:
              experiment_logger: Any | None, phase: str, started: float) -> WorkerResult:
         try:
             validate_worker_config(task, working_dir, sandbox)
+            from modules.local_file_localizer import add_likely_files
+            task = add_likely_files(task, working_dir, self.client)
             if self.test_first:
                 ids, content = generate_failing_tests(task, working_dir, self.client)
                 # That call used the slot without going through _model_call.

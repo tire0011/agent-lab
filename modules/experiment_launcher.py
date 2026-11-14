@@ -9,6 +9,7 @@ session with the result. :class:`ExperimentLauncher` does exactly these steps.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -74,6 +75,15 @@ class ExperimentLauncher:
         GitHub tracking errors propagate before any experiment is created.
         """
         full_goal = with_handover(goal, handover)
+        # #696 is deliberately opt-in.  With the flag off this path neither
+        # constructs a llama client nor changes a byte of the coder handover.
+        from modules.local_file_localizer import enabled as localize_enabled
+        if localize_enabled():
+            from modules.llama_cpp_client import LlamaCppClient
+            from modules.local_file_localizer import add_likely_files
+            full_goal = add_likely_files(
+                full_goal, os.getenv("REPO_ROOT", os.getcwd()), LlamaCppClient()
+            )
         content = getattr(source, "content", None)
         lifecycle_source = SimpleNamespace(
             source_type=getattr(source, "source_type", None),
